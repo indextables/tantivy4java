@@ -20,15 +20,57 @@
 use jni::objects::{JClass, JString, JByteArray, JObject};
 use jni::sys::{jlong, jboolean, jint, jobject};
 use jni::JNIEnv;
-use crate::utils::{remove_object, handle_error};
+use tantivy::TantivyDocument;
+use tantivy::schema::{Schema, OwnedValue};
+use std::collections::BTreeMap;
+use crate::utils::{register_object, remove_object, with_object_mut, handle_error};
+
+/// Intermediate document structure that stores field values by name
+#[derive(Clone)]
+pub struct DocumentBuilder {
+    field_values: BTreeMap<String, Vec<OwnedValue>>,
+}
+
+impl DocumentBuilder {
+    pub fn new() -> Self {
+        Self {
+            field_values: BTreeMap::new(),
+        }
+    }
+    
+    pub fn add_text(&mut self, field_name: String, text: String) {
+        self.field_values
+            .entry(field_name)
+            .or_default()
+            .push(OwnedValue::Str(text));
+    }
+    
+    pub fn build(self, schema: &Schema) -> Result<TantivyDocument, String> {
+        let mut doc = TantivyDocument::new();
+        
+        for (field_name, values) in self.field_values {
+            let field = schema.get_field(&field_name)
+                .map_err(|_| format!("Field '{}' not found in schema", field_name))?;
+            
+            for value in values {
+                match value {
+                    OwnedValue::Str(text) => doc.add_text(field, &text),
+                    _ => return Err(format!("Unsupported value type for field '{}'", field_name)),
+                }
+            }
+        }
+        
+        Ok(doc)
+    }
+}
 
 #[no_mangle]
 pub extern "system" fn Java_com_tantivy4java_Document_nativeNew(
-    mut env: JNIEnv,
+    _env: JNIEnv,
     _class: JClass,
 ) -> jlong {
-    handle_error(&mut env, "Document native methods not fully implemented yet");
-    0
+    let document_builder = DocumentBuilder::new();
+    register_object(document_builder) as jlong
 }
 
 #[no_mangle]
@@ -78,11 +120,40 @@ pub extern "system" fn Java_com_tantivy4java_Document_nativeExtend(
 pub extern "system" fn Java_com_tantivy4java_Document_nativeAddText(
     mut env: JNIEnv,
     _class: JClass,
-    _ptr: jlong,
-    _field_name: JString,
-    _text: JString,
+    ptr: jlong,
+    field_name: JString,
+    text: JString,
 ) {
-    handle_error(&mut env, "Document native methods not fully implemented yet");
+    let field_name_str: String = match env.get_string(&field_name) {
+        Ok(s) => s.into(),
+        Err(_) => {
+            handle_error(&mut env, "Invalid field name");
+            return;
+        }
+    };
+    
+    let text_str: String = match env.get_string(&text) {
+        Ok(s) => s.into(),
+        Err(_) => {
+            handle_error(&mut env, "Invalid text value");
+            return;
+        }
+    };
+    
+    let result = with_object_mut::<DocumentBuilder, Result<(), String>>(ptr as u64, |doc_builder| {
+        doc_builder.add_text(field_name_str, text_str);
+        Ok(())
+    });
+    
+    match result {
+        Some(Ok(())) => {},
+        Some(Err(err)) => {
+            handle_error(&mut env, &err);
+        },
+        None => {
+            handle_error(&mut env, "Invalid Document pointer");
+        }
+    }
 }
 
 #[no_mangle]

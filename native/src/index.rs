@@ -20,7 +20,10 @@
 use jni::objects::{JClass, JString, JObject};
 use jni::sys::{jlong, jboolean, jint};
 use jni::JNIEnv;
-use crate::utils::{remove_object, handle_error};
+use tantivy::{Index as TantivyIndex, IndexSettings, IndexWriter as TantivyIndexWriter};
+use tantivy::schema::Schema;
+use tantivy::directory::MmapDirectory;
+use crate::utils::{register_object, remove_object, with_object, handle_error};
 
 #[no_mangle]
 pub extern "system" fn Java_com_tantivy4java_Index_nativeNew(
@@ -30,8 +33,39 @@ pub extern "system" fn Java_com_tantivy4java_Index_nativeNew(
     _path: JString,
     _reuse: jboolean,
 ) -> jlong {
-    handle_error(&mut env, "Index native methods not fully implemented yet");
-    0
+    let path_str: String = match env.get_string(&_path) {
+        Ok(s) => s.into(),
+        Err(_) => {
+            handle_error(&mut env, "Invalid path");
+            return 0;
+        }
+    };
+    
+    let result = with_object::<Schema, Result<TantivyIndex, String>>(_schema_ptr as u64, |schema| {
+        if path_str.is_empty() {
+            // Create in-memory index
+            Ok(TantivyIndex::create_in_ram(schema.clone()))
+        } else {
+            // Create index in directory
+            let dir = MmapDirectory::open(&path_str).map_err(|e| e.to_string())?;
+            let settings = IndexSettings::default();
+            TantivyIndex::create(dir, schema.clone(), settings).map_err(|e| e.to_string())
+        }
+    });
+    
+    match result {
+        Some(Ok(index)) => {
+            register_object(index) as jlong
+        },
+        Some(Err(err)) => {
+            handle_error(&mut env, &err);
+            0
+        },
+        None => {
+            handle_error(&mut env, "Invalid Schema pointer");
+            0
+        }
+    }
 }
 
 #[no_mangle]
@@ -58,12 +92,31 @@ pub extern "system" fn Java_com_tantivy4java_Index_nativeExists(
 pub extern "system" fn Java_com_tantivy4java_Index_nativeWriter(
     mut env: JNIEnv,
     _class: JClass,
-    _ptr: jlong,
-    _heap_size: jint,
-    _num_threads: jint,
+    ptr: jlong,
+    heap_size: jint,
+    num_threads: jint,
 ) -> jlong {
-    handle_error(&mut env, "Index native methods not fully implemented yet");
-    0
+    let result = with_object::<TantivyIndex, Result<TantivyIndexWriter, String>>(ptr as u64, |index| {
+        let heap_size_mb = if heap_size > 0 { heap_size as usize } else { 50 };
+        let num_threads_val = if num_threads > 0 { num_threads as usize } else { 1 };
+        
+        index.writer_with_num_threads(num_threads_val, heap_size_mb * 1_000_000)
+            .map_err(|e| e.to_string())
+    });
+    
+    match result {
+        Some(Ok(writer)) => {
+            register_object(writer) as jlong
+        },
+        Some(Err(err)) => {
+            handle_error(&mut env, &err);
+            0
+        },
+        None => {
+            handle_error(&mut env, "Invalid Index pointer");
+            0
+        }
+    }
 }
 
 #[no_mangle]
@@ -81,10 +134,26 @@ pub extern "system" fn Java_com_tantivy4java_Index_nativeConfigReader(
 pub extern "system" fn Java_com_tantivy4java_Index_nativeSearcher(
     mut env: JNIEnv,
     _class: JClass,
-    _ptr: jlong,
+    ptr: jlong,
 ) -> jlong {
-    handle_error(&mut env, "Index native methods not fully implemented yet");
-    0
+    let result = with_object::<TantivyIndex, Result<tantivy::Searcher, String>>(ptr as u64, |index| {
+        let reader = index.reader().map_err(|e| e.to_string())?;
+        Ok(reader.searcher())
+    });
+    
+    match result {
+        Some(Ok(searcher)) => {
+            register_object(searcher) as jlong
+        },
+        Some(Err(err)) => {
+            handle_error(&mut env, &err);
+            0
+        },
+        None => {
+            handle_error(&mut env, "Invalid Index pointer");
+            0
+        }
+    }
 }
 
 #[no_mangle]

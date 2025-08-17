@@ -55,11 +55,5 @@ public class Schema implements AutoCloseable {
         }
     }
 
-    @Override
-    protected void finalize() throws Throwable {
-        close();
-        super.finalize();
-    }
-
     private static native void nativeClose(long nativePtr);
 }

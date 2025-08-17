@@ -69,12 +69,6 @@ public class TextAnalyzer implements AutoCloseable {
         }
     }
 
-    @Override
-    protected void finalize() throws Throwable {
-        close();
-        super.finalize();
-    }
-
     // Native method declarations
     private static native List<String> nativeAnalyze(long ptr, String text);
     private static native void nativeClose(long ptr);

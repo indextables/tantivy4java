@@ -300,12 +300,6 @@ public class Query implements AutoCloseable {
         }
     }
 
-    @Override
-    protected void finalize() throws Throwable {
-        close();
-        super.finalize();
-    }
-
     /**
      * Helper class for boolean query construction.
      */

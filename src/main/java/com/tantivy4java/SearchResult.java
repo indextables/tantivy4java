@@ -57,12 +57,6 @@ public class SearchResult implements AutoCloseable {
         }
     }
 
-    @Override
-    protected void finalize() throws Throwable {
-        close();
-        super.finalize();
-    }
-
     /**
      * Represents a single search hit.
      */

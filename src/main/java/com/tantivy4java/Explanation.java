@@ -56,12 +56,6 @@ public class Explanation implements AutoCloseable {
     }
 
     @Override
-    protected void finalize() throws Throwable {
-        close();
-        super.finalize();
-    }
-
-    @Override
     public String toString() {
         return toJson();
     }

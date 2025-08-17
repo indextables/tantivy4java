@@ -247,12 +247,6 @@ public class Index implements AutoCloseable {
         }
     }
 
-    @Override
-    protected void finalize() throws Throwable {
-        close();
-        super.finalize();
-    }
-
     /**
      * Helper class for fuzzy search configuration.
      */
@@ -315,11 +309,6 @@ public class Index implements AutoCloseable {
             }
         }
 
-        @Override
-        protected void finalize() throws Throwable {
-            close();
-            super.finalize();
-        }
 
         private static native long nativeGetQuery(long ptr);
         private static native List<String> nativeGetErrors(long ptr);

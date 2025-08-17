@@ -157,12 +157,6 @@ public class Searcher implements AutoCloseable {
         }
     }
 
-    @Override
-    protected void finalize() throws Throwable {
-        close();
-        super.finalize();
-    }
-
     // Native method declarations
     private static native long nativeSearch(long ptr, long queryPtr, int limit, boolean count, String orderByField, int offset, int order);
     private static native Map<String, Object> nativeAggregate(long ptr, long queryPtr, Map<String, Object> aggQuery);

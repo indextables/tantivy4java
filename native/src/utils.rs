@@ -23,7 +23,7 @@ use std::sync::Mutex;
 use once_cell::sync::Lazy;
 
 /// Global registry for native objects
-static OBJECT_REGISTRY: Lazy<Mutex<HashMap<u64, Box<dyn std::any::Any + Send + Sync>>>> = 
+pub static OBJECT_REGISTRY: Lazy<Mutex<HashMap<u64, Box<dyn std::any::Any + Send + Sync>>>> = 
     Lazy::new(|| Mutex::new(HashMap::new()));
 
 static mut NEXT_ID: u64 = 1;

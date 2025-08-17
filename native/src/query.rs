@@ -20,19 +20,76 @@
 use jni::objects::{JClass, JString, JObject};
 use jni::sys::{jlong, jboolean, jint, jdouble, jlongArray};
 use jni::JNIEnv;
-use crate::utils::{remove_object, handle_error};
+use tantivy::query::{Query as TantivyQuery, TermQuery};
+use tantivy::schema::{Schema, Term, IndexRecordOption};
+use crate::utils::{register_object, remove_object, with_object, handle_error};
 
 #[no_mangle]
 pub extern "system" fn Java_com_tantivy4java_Query_nativeTermQuery(
     mut env: JNIEnv,
     _class: JClass,
-    _schema_ptr: jlong,
-    _field_name: JString,
-    _field_value: JObject,
-    _index_option: JString,
+    schema_ptr: jlong,
+    field_name: JString,
+    field_value: JString,
+    index_option: JString,
 ) -> jlong {
-    handle_error(&mut env, "Query native methods not fully implemented yet");
-    0
+    let field_name_str: String = match env.get_string(&field_name) {
+        Ok(s) => s.into(),
+        Err(_) => {
+            handle_error(&mut env, "Invalid field name");
+            return 0;
+        }
+    };
+    
+    let field_value_str: String = match env.get_string(&field_value) {
+        Ok(s) => s.into(),
+        Err(_) => {
+            handle_error(&mut env, "Invalid field value");
+            return 0;
+        }
+    };
+    
+    let index_option_str: String = match env.get_string(&index_option) {
+        Ok(s) => s.into(),
+        Err(_) => "position".to_string(),
+    };
+    
+    let result = with_object::<Schema, Result<Box<dyn TantivyQuery>, String>>(schema_ptr as u64, |schema| {
+        // Get field by name
+        let field = match schema.get_field(&field_name_str) {
+            Ok(f) => f,
+            Err(_) => return Err(format!("Field '{}' not found in schema", field_name_str)),
+        };
+        
+        // Create term
+        let term = Term::from_field_text(field, &field_value_str);
+        
+        // Parse index option
+        let idx_option = match index_option_str.as_str() {
+            "position" => IndexRecordOption::WithFreqsAndPositions,
+            "freq" => IndexRecordOption::WithFreqs,
+            "basic" => IndexRecordOption::Basic,
+            _ => IndexRecordOption::WithFreqsAndPositions,
+        };
+        
+        // Create term query
+        let query = TermQuery::new(term, idx_option);
+        Ok(Box::new(query) as Box<dyn TantivyQuery>)
+    });
+    
+    match result {
+        Some(Ok(query)) => {
+            register_object(query) as jlong
+        },
+        Some(Err(err)) => {
+            handle_error(&mut env, &err);
+            0
+        },
+        None => {
+            handle_error(&mut env, "Invalid Schema pointer");
+            0
+        }
+    }
 }
 
 #[no_mangle]

@@ -290,11 +290,6 @@ public class Document implements AutoCloseable {
         }
     }
 
-    @Override
-    protected void finalize() throws Throwable {
-        close();
-        super.finalize();
-    }
 
     // Native method declarations
     private static native long nativeNew();

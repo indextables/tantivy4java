@@ -169,12 +169,6 @@ public class IndexWriter implements AutoCloseable {
         }
     }
 
-    @Override
-    protected void finalize() throws Throwable {
-        close();
-        super.finalize();
-    }
-
     // Native method declarations
     private static native long nativeAddDocument(long ptr, long docPtr);
     private static native long nativeAddJson(long ptr, String json);
