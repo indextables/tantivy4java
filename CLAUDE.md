@@ -1,0 +1,11 @@
+Tantivy4Java
+--------------
+- A complete port of the python tantivy language bindings targeting java instead of python.
+- Access the python bindings here: file:/Users/schenksj/tmp/x/tantivy-py
+- Implements test cases with the same coverage
+- Uses JNI with direct memory sharing for maximum speed and minimum memory use
+- Zero copy and marshalling between rust and java wherever possible
+- Targets Java 11 and above
+- Uses maven for builds
+- Creates a jar library that includes all native build components
+- Uses the package com.tantivy4java

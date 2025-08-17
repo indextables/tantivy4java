@@ -1,0 +1,25 @@
+[package]
+name = "tantivy4java"
+version = "0.24.0"
+edition = "2021"
+license = "MIT"
+authors = ["Tantivy4Java Contributors"]
+description = "JNI bindings for Tantivy search engine"
+
+[lib]
+name = "tantivy4java"
+crate-type = ["cdylib"]
+
+[dependencies]
+tantivy = "0.24.2"
+jni = "0.21.1"
+chrono = { version = "0.4.41", features = ["serde"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0.142"
+base64 = "0.22"
+itertools = "0.14.0"
+futures = "0.3.31"
+once_cell = "1.19.0"
+
+[build-dependencies]
+jni = "0.21.1"
