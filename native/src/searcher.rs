@@ -20,9 +20,10 @@
 use jni::objects::{JClass, JString, JObject};
 use jni::sys::{jlong, jboolean, jint, jobject};
 use jni::JNIEnv;
-use tantivy::{IndexWriter as TantivyIndexWriter, Searcher as TantivySearcher};
+use tantivy::{IndexWriter as TantivyIndexWriter, Searcher as TantivySearcher, DocAddress as TantivyDocAddress};
 use tantivy::query::Query as TantivyQuery;
 use crate::utils::{register_object, remove_object, with_object, with_object_mut, handle_error};
+use crate::document::{RetrievedDocument, DocumentWrapper};
 
 // Searcher native methods
 #[no_mangle]
@@ -83,33 +84,81 @@ pub extern "system" fn Java_com_tantivy4java_Searcher_nativeAggregate(
 
 #[no_mangle]
 pub extern "system" fn Java_com_tantivy4java_Searcher_nativeGetNumDocs(
-    mut env: JNIEnv,
+    _env: JNIEnv,
     _class: JClass,
-    _ptr: jlong,
+    ptr: jlong,
 ) -> jint {
-    handle_error(&mut env, "Searcher native methods not fully implemented yet");
-    0
+    with_object::<TantivySearcher, jint>(ptr as u64, |searcher| {
+        searcher.num_docs() as jint
+    }).unwrap_or(0)
 }
 
 #[no_mangle]
 pub extern "system" fn Java_com_tantivy4java_Searcher_nativeGetNumSegments(
-    mut env: JNIEnv,
+    _env: JNIEnv,
     _class: JClass,
-    _ptr: jlong,
+    ptr: jlong,
 ) -> jint {
-    handle_error(&mut env, "Searcher native methods not fully implemented yet");
-    0
+    with_object::<TantivySearcher, jint>(ptr as u64, |searcher| {
+        searcher.segment_readers().len() as jint
+    }).unwrap_or(0)
 }
 
 #[no_mangle]
 pub extern "system" fn Java_com_tantivy4java_Searcher_nativeDoc(
     mut env: JNIEnv,
     _class: JClass,
-    _ptr: jlong,
-    _doc_address_ptr: jlong,
+    searcher_ptr: jlong,
+    doc_address_ptr: jlong,
 ) -> jlong {
-    handle_error(&mut env, "Searcher native methods not fully implemented yet");
-    0
+    // Get the DocAddress object
+    let tantivy_doc_address = match with_object::<TantivyDocAddress, Option<TantivyDocAddress>>(doc_address_ptr as u64, |doc_address| {
+        Some(*doc_address)
+    }) {
+        Some(Some(addr)) => addr,
+        _ => {
+            handle_error(&mut env, "Invalid DocAddress pointer");
+            return 0;
+        }
+    };
+    
+    // Get the document from the searcher
+    let result = with_object::<TantivySearcher, Result<tantivy::schema::TantivyDocument, String>>(searcher_ptr as u64, |searcher| {
+        match searcher.doc(tantivy_doc_address) {
+            Ok(doc) => Ok(doc),
+            Err(e) => Err(e.to_string()),
+        }
+    });
+    
+    match result {
+        Some(Ok(document)) => {
+            // Get the schema from the searcher to convert the document properly
+            let schema_result = with_object::<TantivySearcher, Option<tantivy::schema::Schema>>(searcher_ptr as u64, |searcher| {
+                Some(searcher.schema().clone())
+            });
+            
+            match schema_result {
+                Some(Some(schema)) => {
+                    // Convert TantivyDocument to RetrievedDocument with proper field access
+                    let retrieved_doc = RetrievedDocument::new_with_schema(document, &schema);
+                    let wrapper = DocumentWrapper::Retrieved(retrieved_doc);
+                    register_object(wrapper) as jlong
+                },
+                _ => {
+                    handle_error(&mut env, "Failed to get schema from searcher");
+                    0
+                }
+            }
+        },
+        Some(Err(err)) => {
+            handle_error(&mut env, &err);
+            0
+        },
+        None => {
+            handle_error(&mut env, "Invalid Searcher pointer");
+            0
+        }
+    }
 }
 
 #[no_mangle]
@@ -141,15 +190,18 @@ pub extern "system" fn Java_com_tantivy4java_IndexWriter_nativeAddDocument(
     ptr: jlong,
     doc_ptr: jlong,
 ) -> jlong {
-    use crate::document::DocumentBuilder;
+    use crate::document::{DocumentWrapper, DocumentBuilder};
     
     // First, clone the DocumentBuilder to avoid nested locks
-    let doc_builder_clone = match with_object::<DocumentBuilder, DocumentBuilder>(doc_ptr as u64, |doc_builder| {
-        doc_builder.clone()
+    let doc_builder_clone = match with_object::<DocumentWrapper, Option<DocumentBuilder>>(doc_ptr as u64, |doc_wrapper| {
+        match doc_wrapper {
+            DocumentWrapper::Builder(doc_builder) => Some(doc_builder.clone()),
+            DocumentWrapper::Retrieved(_) => None,
+        }
     }) {
-        Some(doc) => doc,
-        None => {
-            handle_error(&mut env, "Invalid Document pointer");
+        Some(Some(doc)) => doc,
+        _ => {
+            handle_error(&mut env, "Invalid Document pointer or document is not in builder state");
             return 0;
         }
     };
@@ -304,64 +356,7 @@ pub extern "system" fn Java_com_tantivy4java_IndexWriter_nativeClose(
     remove_object(ptr as u64);
 }
 
-// Supporting classes native methods
-#[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_DocAddress_nativeNew(
-    _env: JNIEnv,
-    _class: JClass,
-    segment_ord: jint,
-    doc: jint,
-) -> jlong {
-    let doc_address = tantivy::DocAddress::new(segment_ord as u32, doc as u32);
-    register_object(doc_address) as jlong
-}
-
-#[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_DocAddress_nativeGetSegmentOrd(
-    mut env: JNIEnv,
-    _class: JClass,
-    ptr: jlong,
-) -> jint {
-    let result = with_object::<tantivy::DocAddress, u32>(ptr as u64, |doc_address| {
-        doc_address.segment_ord
-    });
-    
-    match result {
-        Some(segment_ord) => segment_ord as jint,
-        None => {
-            handle_error(&mut env, "Invalid DocAddress pointer");
-            0
-        }
-    }
-}
-
-#[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_DocAddress_nativeGetDoc(
-    mut env: JNIEnv,
-    _class: JClass,
-    ptr: jlong,
-) -> jint {
-    let result = with_object::<tantivy::DocAddress, u32>(ptr as u64, |doc_address| {
-        doc_address.doc_id
-    });
-    
-    match result {
-        Some(doc_id) => doc_id as jint,
-        None => {
-            handle_error(&mut env, "Invalid DocAddress pointer");
-            0
-        }
-    }
-}
-
-#[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_DocAddress_nativeClose(
-    _env: JNIEnv,
-    _class: JClass,
-    ptr: jlong,
-) {
-    remove_object(ptr as u64);
-}
+// Supporting classes native methods - moved to separate modules
 
 #[no_mangle]
 pub extern "system" fn Java_com_tantivy4java_SearchResult_nativeGetHits(
@@ -369,32 +364,15 @@ pub extern "system" fn Java_com_tantivy4java_SearchResult_nativeGetHits(
     _class: JClass,
     _ptr: jlong,
 ) -> jobject {
-    // Skip registry access for now - just return empty ArrayList
-    let result = (|| -> Result<jobject, String> {
-        // Create ArrayList
-        let array_list_class = env.find_class("java/util/ArrayList").map_err(|e| e.to_string())?;
-        let array_list = env.new_object(&array_list_class, "()V", &[]).map_err(|e| e.to_string())?;
-        
-        // Add a simple test string
-        let test_str = "getHits() method working!";
-        let java_string = env.new_string(test_str).map_err(|e| e.to_string())?;
-        
-        env.call_method(
-            &array_list,
-            "add",
-            "(Ljava/lang/Object;)Z",
-            &[jni::objects::JValue::Object(&java_string)]
-        ).map_err(|e| e.to_string())?;
-        
-        Ok(array_list.into_raw())
-    })();
-    
-    match result {
-        Ok(obj) => obj,
-        Err(err) => {
-            handle_error(&mut env, &err);
-            std::ptr::null_mut()
-        }
+    // Create a simple empty ArrayList to test basic JNI functionality
+    match env.find_class("java/util/ArrayList") {
+        Ok(array_list_class) => {
+            match env.new_object(&array_list_class, "()V", &[]) {
+                Ok(array_list) => array_list.into_raw(),
+                Err(_) => std::ptr::null_mut(),
+            }
+        },
+        Err(_) => std::ptr::null_mut(),
     }
 }
 

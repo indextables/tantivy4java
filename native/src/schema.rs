@@ -225,26 +225,96 @@ pub extern "system" fn Java_com_tantivy4java_SchemaBuilder_nativeAddFloatField(
 pub extern "system" fn Java_com_tantivy4java_SchemaBuilder_nativeAddUnsignedField(
     mut env: JNIEnv,
     _class: JClass,
-    _ptr: jlong,
-    _name: JString,
+    ptr: jlong,
+    name: JString,
     _stored: jboolean,
     _indexed: jboolean,
     _fast: jboolean,
 ) {
-    handle_error(&mut env, "SchemaBuilder native methods not fully implemented yet");
+    let field_name: String = match env.get_string(&name) {
+        Ok(s) => s.into(),
+        Err(_) => {
+            handle_error(&mut env, "Invalid field name");
+            return;
+        }
+    };
+    
+    let result = with_object_mut::<SchemaBuilder, Result<(), String>>(ptr as u64, |builder| {
+        let mut options = NumericOptions::default();
+        
+        if _stored != 0 {
+            options = options.set_stored();
+        }
+        
+        if _indexed != 0 {
+            options = options.set_indexed();
+        }
+        
+        if _fast != 0 {
+            options = options.set_fast();
+        }
+        
+        builder.add_u64_field(&field_name, options);
+        Ok(())
+    });
+    
+    match result {
+        Some(Ok(())) => {},
+        Some(Err(err)) => {
+            handle_error(&mut env, &err);
+        },
+        None => {
+            handle_error(&mut env, "Invalid SchemaBuilder pointer");
+        }
+    }
 }
 
 #[no_mangle]
 pub extern "system" fn Java_com_tantivy4java_SchemaBuilder_nativeAddBooleanField(
     mut env: JNIEnv,
     _class: JClass,
-    _ptr: jlong,
-    _name: JString,
+    ptr: jlong,
+    name: JString,
     _stored: jboolean,
     _indexed: jboolean,
     _fast: jboolean,
 ) {
-    handle_error(&mut env, "SchemaBuilder native methods not fully implemented yet");
+    let field_name: String = match env.get_string(&name) {
+        Ok(s) => s.into(),
+        Err(_) => {
+            handle_error(&mut env, "Invalid field name");
+            return;
+        }
+    };
+    
+    let result = with_object_mut::<SchemaBuilder, Result<(), String>>(ptr as u64, |builder| {
+        let mut options = NumericOptions::default();
+        
+        if _stored != 0 {
+            options = options.set_stored();
+        }
+        
+        if _indexed != 0 {
+            options = options.set_indexed();
+        }
+        
+        if _fast != 0 {
+            options = options.set_fast();
+        }
+        
+        builder.add_bool_field(&field_name, options);
+        Ok(())
+    });
+    
+    match result {
+        Some(Ok(())) => {},
+        Some(Err(err)) => {
+            handle_error(&mut env, &err);
+        },
+        None => {
+            handle_error(&mut env, "Invalid SchemaBuilder pointer");
+        }
+    }
 }
 
 #[no_mangle]

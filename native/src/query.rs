@@ -20,7 +20,7 @@
 use jni::objects::{JClass, JString, JObject};
 use jni::sys::{jlong, jboolean, jint, jdouble, jlongArray};
 use jni::JNIEnv;
-use tantivy::query::{Query as TantivyQuery, TermQuery};
+use tantivy::query::{Query as TantivyQuery, TermQuery, AllQuery, BooleanQuery, Occur};
 use tantivy::schema::{Schema, Term, IndexRecordOption};
 use crate::utils::{register_object, remove_object, with_object, handle_error};
 
@@ -106,11 +106,11 @@ pub extern "system" fn Java_com_tantivy4java_Query_nativeTermSetQuery(
 
 #[no_mangle]
 pub extern "system" fn Java_com_tantivy4java_Query_nativeAllQuery(
-    mut env: JNIEnv,
+    _env: JNIEnv,
     _class: JClass,
 ) -> jlong {
-    handle_error(&mut env, "Query native methods not fully implemented yet");
-    0
+    let query = AllQuery;
+    register_object(Box::new(query) as Box<dyn TantivyQuery>) as jlong
 }
 
 #[no_mangle]
@@ -145,10 +145,51 @@ pub extern "system" fn Java_com_tantivy4java_Query_nativePhraseQuery(
 pub extern "system" fn Java_com_tantivy4java_Query_nativeBooleanQuery(
     mut env: JNIEnv,
     _class: JClass,
-    _subqueries: JObject,
+    subqueries: JObject,
 ) -> jlong {
-    handle_error(&mut env, "Query native methods not fully implemented yet");
-    0
+    if subqueries.is_null() {
+        handle_error(&mut env, "Subqueries list cannot be null");
+        return 0;
+    }
+    
+    // Extract the list of OccurQuery objects
+    let occur_queries = match extract_occur_queries(&mut env, &subqueries) {
+        Ok(queries) => queries,
+        Err(e) => {
+            handle_error(&mut env, &e);
+            return 0;
+        }
+    };
+    
+    if occur_queries.is_empty() {
+        handle_error(&mut env, "BooleanQuery requires at least one subquery");
+        return 0;
+    }
+    
+    // Build the subqueries vector for BooleanQuery
+    let mut tantivy_subqueries = Vec::new();
+    
+    for (occur, query_ptr) in occur_queries {
+        // Get the query from the object store
+        let query_box = match with_object::<Box<dyn TantivyQuery>, Option<Box<dyn TantivyQuery>>>(query_ptr as u64, |query| {
+            // We need to clone the query to avoid ownership issues
+            Some(query.box_clone())
+        }) {
+            Some(Some(query)) => query,
+            _ => {
+                handle_error(&mut env, "Invalid query pointer in boolean query");
+                return 0;
+            }
+        };
+        
+        tantivy_subqueries.push((occur, query_box));
+    }
+    
+    // Create the BooleanQuery
+    let boolean_query = BooleanQuery::from(tantivy_subqueries);
+    let boxed_query: Box<dyn TantivyQuery> = Box::new(boolean_query);
+    
+    register_object(boxed_query) as jlong
 }
 
 #[no_mangle]
@@ -226,9 +267,12 @@ pub extern "system" fn Java_com_tantivy4java_Query_nativeRangeQuery(
     _include_lower: jboolean,
     _include_upper: jboolean,
 ) -> jlong {
-    handle_error(&mut env, "Query native methods not fully implemented yet");
+    // RangeQuery implementation is complex due to type conversion requirements
+    // For now, return a placeholder error until we implement proper type handling
+    handle_error(&mut env, "RangeQuery implementation requires proper type conversion - not fully implemented");
     0
 }
+
 
 #[no_mangle]
 pub extern "system" fn Java_com_tantivy4java_Query_nativeExplain(
@@ -249,4 +293,67 @@ pub extern "system" fn Java_com_tantivy4java_Query_nativeClose(
     ptr: jlong,
 ) {
     remove_object(ptr as u64);
+}
+
+// Helper function to extract OccurQuery objects from Java List
+fn extract_occur_queries(env: &mut JNIEnv, list_obj: &JObject) -> Result<Vec<(Occur, i64)>, String> {
+    // Get the List size
+    let size = match env.call_method(list_obj, "size", "()I", &[]) {
+        Ok(result) => match result.i() {
+            Ok(s) => s,
+            Err(_) => return Err("Failed to get list size".to_string()),
+        },
+        Err(_) => return Err("Failed to call size() on list".to_string()),
+    };
+    
+    let mut occur_queries = Vec::with_capacity(size as usize);
+    
+    // Extract each OccurQuery from the list
+    for i in 0..size {
+        let element = match env.call_method(list_obj, "get", "(I)Ljava/lang/Object;", &[i.into()]) {
+            Ok(result) => result.l().map_err(|_| "Failed to get object from list")?,
+            Err(_) => return Err("Failed to call get() on list".to_string()),
+        };
+        
+        // Get the Occur enum value
+        let occur_obj = match env.call_method(&element, "getOccur", "()Lcom/tantivy4java/Occur;", &[]) {
+            Ok(result) => result.l().map_err(|_| "Failed to get Occur object")?,
+            Err(_) => return Err("Failed to call getOccur() on OccurQuery".to_string()),
+        };
+        
+        let occur_value = match env.call_method(&occur_obj, "getValue", "()I", &[]) {
+            Ok(result) => match result.i() {
+                Ok(v) => v,
+                Err(_) => return Err("Failed to get occur value".to_string()),
+            },
+            Err(_) => return Err("Failed to call getValue() on Occur".to_string()),
+        };
+        
+        // Convert Java Occur to Tantivy Occur
+        let occur = match occur_value {
+            1 => Occur::Must,
+            2 => Occur::Should,
+            3 => Occur::MustNot,
+            _ => return Err(format!("Unknown Occur value: {}", occur_value)),
+        };
+        
+        // Get the Query object
+        let query_obj = match env.call_method(&element, "getQuery", "()Lcom/tantivy4java/Query;", &[]) {
+            Ok(result) => result.l().map_err(|_| "Failed to get Query object")?,
+            Err(_) => return Err("Failed to call getQuery() on OccurQuery".to_string()),
+        };
+        
+        // Get the native pointer from the Query
+        let query_ptr = match env.call_method(&query_obj, "getNativePtr", "()J", &[]) {
+            Ok(result) => match result.j() {
+                Ok(ptr) => ptr,
+                Err(_) => return Err("Failed to get query native pointer".to_string()),
+            },
+            Err(_) => return Err("Failed to call getNativePtr() on Query".to_string()),
+        };
+        
+        occur_queries.push((occur, query_ptr));
+    }
+    
+    Ok(occur_queries)
 }

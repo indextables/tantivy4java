@@ -26,6 +26,7 @@ mod document;
 mod query;
 mod index;
 mod searcher;
+mod doc_address;
 mod utils;
 
 pub use schema::*;
@@ -33,6 +34,7 @@ pub use document::*;
 pub use query::*;
 pub use index::*;
 pub use searcher::*;
+pub use doc_address::*;
 pub use utils::*;
 
 #[no_mangle]

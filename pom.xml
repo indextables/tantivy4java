@@ -14,8 +14,9 @@
     <url>https://github.com/tantivy-search/tantivy4java</url>
 
     <properties>
-        <maven.compiler.source>11</maven.compiler.source>
-        <maven.compiler.target>11</maven.compiler.target>
+        <!-- <maven.compiler.source>11</maven.compiler.source>
+        <maven.compiler.target>11</maven.compiler.target> -->
+        <maven.compiler.release>11</maven.compiler.release>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <junit.version>5.10.0</junit.version>
         <rust.target.dir>${project.build.directory}/rust</rust.target.dir>

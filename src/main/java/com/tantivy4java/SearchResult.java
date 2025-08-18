@@ -41,7 +41,7 @@ public class SearchResult implements AutoCloseable {
      * Get the search hits (score, DocAddress pairs).
      * @return List of search hits
      */
-    public List<Hit> getHits() {
+    public List<Object> getHits() {
         if (closed) {
             throw new IllegalStateException("SearchResult has been closed");
         }
@@ -84,6 +84,6 @@ public class SearchResult implements AutoCloseable {
     }
 
     // Native method declarations
-    private static native List<Hit> nativeGetHits(long ptr);
+    private static native List<Object> nativeGetHits(long ptr);
     private static native void nativeClose(long ptr);
 }

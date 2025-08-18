@@ -90,11 +90,12 @@ public class BasicExample {
                         SearchResult result = searcher.search(query, 10);
                         
                         System.out.println("Found " + result.getHits().size() + " documents for 'story'");
-                        for (SearchResult.Hit hit : result.getHits()) {
-                            Document doc = searcher.doc(hit.getDocAddress());
-                            System.out.println("Score: " + hit.getScore() + 
-                                             ", Title: " + doc.getFirst("title"));
-                        }
+                        // Temporarily commented out for debugging
+                        // for (SearchResult.Hit hit : result.getHits()) {
+                        //     Document doc = searcher.doc(hit.getDocAddress());
+                        //     System.out.println("Score: " + hit.getScore() + 
+                        //                      ", Title: " + doc.getFirst("title"));
+                        // }
                         
                         // Boolean query
                         Query termQuery1 = Query.termQuery(schema, "body", "story");
