@@ -364,15 +364,53 @@ pub extern "system" fn Java_com_tantivy4java_SearchResult_nativeGetHits(
     _class: JClass,
     _ptr: jlong,
 ) -> jobject {
-    // Create a simple empty ArrayList to test basic JNI functionality
-    match env.find_class("java/util/ArrayList") {
-        Ok(array_list_class) => {
-            match env.new_object(&array_list_class, "()V", &[]) {
-                Ok(array_list) => array_list.into_raw(),
-                Err(_) => std::ptr::null_mut(),
-            }
-        },
-        Err(_) => std::ptr::null_mut(),
+    // Clone the search results to avoid holding locks during object creation
+    let search_results_clone = match with_object::<Vec<(f32, tantivy::DocAddress)>, Option<Vec<(f32, tantivy::DocAddress)>>>(
+        _ptr as u64, 
+        |search_results| Some(search_results.clone())
+    ) {
+        Some(Some(results)) => results,
+        _ => {
+            handle_error(&mut env, "Invalid SearchResult pointer");
+            return std::ptr::null_mut();
+        }
+    };
+    
+    // Create the ArrayList with proper Hit objects containing scores and DocAddress
+    match (|| -> Result<jobject, String> {
+        let array_list_class = env.find_class("java/util/ArrayList").map_err(|e| e.to_string())?;
+        let array_list = env.new_object(&array_list_class, "()V", &[]).map_err(|e| e.to_string())?;
+        
+        for (score, doc_address) in search_results_clone.iter() {
+            // Create DocAddress object first
+            let doc_address_ptr = register_object(*doc_address) as jlong;
+            let doc_address_class = env.find_class("com/tantivy4java/DocAddress").map_err(|e| e.to_string())?;
+            let doc_address_obj = env.new_object(&doc_address_class, "(J)V", &[doc_address_ptr.into()]).map_err(|e| e.to_string())?;
+            
+            // Create Hit object (SearchResult$Hit is the inner class)
+            let hit_class = env.find_class("com/tantivy4java/SearchResult$Hit").map_err(|e| e.to_string())?;
+            let hit_obj = env.new_object(
+                &hit_class, 
+                "(DLcom/tantivy4java/DocAddress;)V", 
+                &[(*score as f64).into(), (&doc_address_obj).into()]
+            ).map_err(|e| e.to_string())?;
+            
+            // Add Hit to the ArrayList
+            env.call_method(
+                &array_list,
+                "add",
+                "(Ljava/lang/Object;)Z",
+                &[(&hit_obj).into()]
+            ).map_err(|e| e.to_string())?;
+        }
+        
+        Ok(array_list.into_raw())
+    })() {
+        Ok(obj) => obj,
+        Err(err) => {
+            handle_error(&mut env, &err);
+            std::ptr::null_mut()
+        }
     }
 }
 

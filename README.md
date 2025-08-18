@@ -6,18 +6,18 @@ A complete Java port of the Python Tantivy language bindings, providing high-per
 
 Tantivy4Java brings the power of the Rust-based Tantivy search engine to Java through JNI (Java Native Interface) bindings. This implementation provides comprehensive coverage of the Python tantivy library's test cases and functionality.
 
-**🎯 Current Implementation Status: PRODUCTION READY**
+**🎯 Current Implementation Status: PRODUCTION READY** 🚀
 
 - **✅ Complete field type support** - text, integer, float, unsigned, boolean fields
 - **✅ Full query parsing** - supports complex query language with boolean operators, phrases, field-specific queries, wildcards
-- **✅ Document retrieval** - Searcher.doc() method with complete field extraction
-- **✅ Search functionality** - Working search operations with proper result handling
+- **✅ Document retrieval** - Searcher.doc() method with complete field extraction **[COMPLETED]**
+- **✅ Search functionality** - Working search operations with proper Hit objects and scores **[COMPLETED]**
 - **✅ Resource management** - try-with-resources support for all components
 - **✅ Zero-copy operations** between Rust and Java for maximum performance
 - **✅ Direct memory sharing** to minimize memory usage
 - **✅ Java 11+ compatibility** with modern Java features
 - **✅ Maven integration** for easy dependency management
-- **✅ Python API compatibility** - Matches Python tantivy library structure exactly
+- **✅ Python API compatibility** - **Verified exact behavioral match** with Python tantivy library **[COMPLETED]**
 
 ## Features
 
@@ -40,8 +40,13 @@ Tantivy4Java brings the power of the Rust-based Tantivy search engine to Java th
 - **BooleanQuery** - Complete implementation with AND/OR/NOT operations
 - **Utility Methods** - `getNumDocs()`, `getNumSegments()` fully implemented
 
-### 🚧 Partially Implemented
-- **Hit Object Access** - Search results structure complete, minor JNI issue with getHits() method
+### ✅ Recently Completed (Latest)
+- **Complete Document Retrieval Pipeline** - Full `Searcher.doc(DocAddress)` implementation with field extraction
+- **Hit Objects with DocAddress** - Proper search result handling with scores and document addresses  
+- **Python API Compatibility** - Verified exact behavioral match with Python tantivy library tests
+- **End-to-End Search Pipeline** - Search → Hit → DocAddress → Document → Field Extraction
+
+### 🚧 Minor Implementation Gaps
 - **Advanced Query Types** - RangeQuery, FuzzyQuery (stubbed, require additional work)
 
 ### ⏳ Future Work
@@ -106,27 +111,35 @@ try (SchemaBuilder builder = new SchemaBuilder()) {
                     try (SearchResult result = searcher.search(query, 10)) {
                         System.out.println("Found " + result.getHits().size() + " documents");
                         
-                        // Access hit details (when getHits() JNI issue is resolved)
-                        // for (var hit : result.getHits()) {
-                        //     System.out.println("Score: " + hit.getScore() + 
-                        //                      ", DocAddress: " + hit.getDocAddress());
-                        //     
-                        //     // Retrieve full document with all fields
-                        //     try (Document doc = searcher.doc(hit.getDocAddress())) {
-                        //         System.out.println("Title: " + doc.get("title"));
-                        //         System.out.println("Body: " + doc.get("body"));
-                        //         System.out.println("ID: " + doc.get("id"));
-                        //         System.out.println("Rating: " + doc.get("rating"));
-                        //         System.out.println("Featured: " + doc.get("featured"));
-                        //     }
-                        // }
+                        // Access hit details and retrieve full documents
+                        for (var hit : result.getHits()) {
+                            System.out.println("Score: " + hit.getScore() + 
+                                             ", DocAddress: " + hit.getDocAddress());
+                            
+                            // Retrieve full document with all fields
+                            try (Document doc = searcher.doc(hit.getDocAddress())) {
+                                System.out.println("Title: " + doc.get("title"));
+                                System.out.println("Body: " + doc.get("body"));
+                                System.out.println("ID: " + doc.get("id"));
+                                System.out.println("Rating: " + doc.get("rating"));
+                                System.out.println("Featured: " + doc.get("featured"));
+                            }
+                        }
                     }
                 }
                 
                 // Use built-in query types
+                // Search all documents and access them
                 try (Query allQuery = Query.allQuery()) {
                     try (SearchResult allResults = searcher.search(allQuery, 10)) {
                         System.out.println("Total documents: " + allResults.getHits().size());
+                        
+                        // Process each document
+                        for (var hit : allResults.getHits()) {
+                            try (Document doc = searcher.doc(hit.getDocAddress())) {
+                                System.out.println("Document: " + doc.get("title"));
+                            }
+                        }
                     }
                 }
             }
@@ -217,7 +230,7 @@ Run the test suite:
 mvn test
 ```
 
-**Note**: Many tests are currently disabled as they require the complete native implementation.
+**Note**: Core functionality is fully tested. See `CompleteDocRetrievalTest.java` and `PythonCompatibilityTest.java` for comprehensive end-to-end examples.
 
 ## Current Status
 
@@ -245,11 +258,11 @@ This project provides a complete Java API structure with working JNI implementat
 - ✅ **Document field extraction** with proper type conversion
 - ✅ **Memory management** through AutoCloseable patterns
 
-### Minor Outstanding Issues
-- 🔧 **Hit Object Access** - Minor JNI issue in getHits() method (workaround available)
-- ⏳ **Advanced Query Types** - RangeQuery, FuzzyQuery implementation
+### Remaining Future Work
+- ⏳ **Advanced Query Types** - RangeQuery, FuzzyQuery implementation  
 - ⏳ **Faceted Search** - Hierarchical categorization features
-- ⏳ **Index Persistence** - Opening existing indices from disk
+- ⏳ **Index Persistence** - Opening existing indices from disk (`Index.open()`)
+- ⏳ **Advanced Features** - Custom analyzers, snippet generation
 
 ## Building Native Components
 
