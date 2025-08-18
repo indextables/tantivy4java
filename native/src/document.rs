@@ -21,8 +21,11 @@ use jni::objects::{JClass, JString, JByteArray, JObject};
 use jni::sys::{jlong, jboolean, jint, jobject};
 use jni::JNIEnv;
 use tantivy::schema::TantivyDocument;
-use tantivy::schema::{Schema, OwnedValue, Value, Document};
+use tantivy::schema::{Schema, OwnedValue, Document};
+use tantivy::DateTime;
+use std::net::IpAddr;
 use std::collections::BTreeMap;
+use chrono::{self, Datelike, Timelike};
 use crate::utils::{register_object, remove_object, with_object_mut, with_object, handle_error};
 
 /// Unified document type that can handle both creation and retrieval
@@ -86,6 +89,26 @@ impl DocumentBuilder {
             .push(OwnedValue::Bool(value));
     }
     
+    pub fn add_date(&mut self, field_name: String, value: DateTime) {
+        self.field_values
+            .entry(field_name)
+            .or_default()
+            .push(OwnedValue::Date(value));
+    }
+    
+    pub fn add_ip_addr(&mut self, field_name: String, value: IpAddr) {
+        // Convert IpAddr to Ipv6Addr (Tantivy stores all IPs as Ipv6)
+        let ipv6_value = match value {
+            IpAddr::V4(ipv4) => ipv4.to_ipv6_mapped(),
+            IpAddr::V6(ipv6) => ipv6,
+        };
+        
+        self.field_values
+            .entry(field_name)
+            .or_default()
+            .push(OwnedValue::IpAddr(ipv6_value));
+    }
+    
     pub fn build(self, schema: &Schema) -> Result<TantivyDocument, String> {
         let mut doc = TantivyDocument::new();
         
@@ -100,6 +123,8 @@ impl DocumentBuilder {
                     OwnedValue::F64(num) => doc.add_f64(field, num),
                     OwnedValue::U64(num) => doc.add_u64(field, num),
                     OwnedValue::Bool(b) => doc.add_bool(field, b),
+                    OwnedValue::Date(dt) => doc.add_date(field, dt),
+                    OwnedValue::IpAddr(ipv6) => doc.add_ip_addr(field, ipv6),
                     _ => return Err(format!("Unsupported value type for field '{}'", field_name)),
                 }
             }
@@ -230,6 +255,22 @@ pub extern "system" fn Java_com_tantivy4java_Document_nativeGet(
                         OwnedValue::Bool(b) => {
                             let boolean_class = env.find_class("java/lang/Boolean").map_err(|e| e.to_string())?;
                             env.new_object(&boolean_class, "(Z)V", &[(*b).into()]).map_err(|e| e.to_string())?
+                        },
+                        OwnedValue::Date(dt) => {
+                            // Convert DateTime to Java LocalDateTime
+                            let java_localdatetime = convert_tantivy_datetime_to_java(&mut env, dt)?;
+                            unsafe { JObject::from_raw(java_localdatetime) }
+                        },
+                        OwnedValue::IpAddr(ipv6) => {
+                            // Convert IPv6 address back to original format if it was IPv4-mapped
+                            let ip_addr = IpAddr::V6(*ipv6);
+                            let ip_string = if let Some(ipv4) = ipv6.to_ipv4_mapped() {
+                                IpAddr::V4(ipv4).to_string()
+                            } else {
+                                ip_addr.to_string()
+                            };
+                            let java_string = env.new_string(&ip_string).map_err(|e| e.to_string())?;
+                            java_string.into()
                         },
                         _ => {
                             // For other types, convert to string for now
@@ -495,11 +536,37 @@ pub extern "system" fn Java_com_tantivy4java_Document_nativeAddBoolean(
 pub extern "system" fn Java_com_tantivy4java_Document_nativeAddDate(
     mut env: JNIEnv,
     _class: JClass,
-    _ptr: jlong,
-    _field_name: JString,
-    _date: JObject,
+    ptr: jlong,
+    field_name: JString,
+    date: JObject,
 ) {
-    handle_error(&mut env, "Document native methods not fully implemented yet");
+    let field_name_str: String = match env.get_string(&field_name) {
+        Ok(s) => s.into(),
+        Err(_) => {
+            handle_error(&mut env, "Invalid field name");
+            return;
+        }
+    };
+    
+    // Convert Java LocalDateTime to DateTime
+    let tantivy_datetime = match convert_java_localdatetime_to_tantivy(&mut env, &date) {
+        Ok(dt) => dt,
+        Err(e) => {
+            handle_error(&mut env, &e);
+            return;
+        }
+    };
+    
+    with_object_mut::<DocumentWrapper, ()>(ptr as u64, |wrapper| {
+        match wrapper {
+            DocumentWrapper::Builder(doc_builder) => {
+                doc_builder.add_date(field_name_str, tantivy_datetime);
+            },
+            DocumentWrapper::Retrieved(_) => {
+                // Retrieved documents are read-only
+            }
+        }
+    });
 }
 
 #[no_mangle]
@@ -539,11 +606,45 @@ pub extern "system" fn Java_com_tantivy4java_Document_nativeAddJson(
 pub extern "system" fn Java_com_tantivy4java_Document_nativeAddIpAddr(
     mut env: JNIEnv,
     _class: JClass,
-    _ptr: jlong,
-    _field_name: JString,
-    _ip_addr: JString,
+    ptr: jlong,
+    field_name: JString,
+    ip_addr: JString,
 ) {
-    handle_error(&mut env, "Document native methods not fully implemented yet");
+    let field_name_str: String = match env.get_string(&field_name) {
+        Ok(s) => s.into(),
+        Err(_) => {
+            handle_error(&mut env, "Invalid field name");
+            return;
+        }
+    };
+    
+    let ip_addr_str: String = match env.get_string(&ip_addr) {
+        Ok(s) => s.into(),
+        Err(_) => {
+            handle_error(&mut env, "Invalid IP address string");
+            return;
+        }
+    };
+    
+    // Parse the IP address
+    let ip_addr_parsed = match ip_addr_str.parse::<IpAddr>() {
+        Ok(ip) => ip,
+        Err(_) => {
+            handle_error(&mut env, &format!("Invalid IP address format: {}", ip_addr_str));
+            return;
+        }
+    };
+    
+    with_object_mut::<DocumentWrapper, ()>(ptr as u64, |wrapper| {
+        match wrapper {
+            DocumentWrapper::Builder(doc_builder) => {
+                doc_builder.add_ip_addr(field_name_str, ip_addr_parsed);
+            },
+            DocumentWrapper::Retrieved(_) => {
+                // Retrieved documents are read-only
+            }
+        }
+    });
 }
 
 #[no_mangle]
@@ -575,4 +676,78 @@ pub extern "system" fn Java_com_tantivy4java_Document_nativeClose(
     ptr: jlong,
 ) {
     remove_object(ptr as u64);
+}
+
+// Helper function to convert Java LocalDateTime to Tantivy DateTime
+pub fn convert_java_localdatetime_to_tantivy(env: &mut JNIEnv, date_obj: &JObject) -> Result<DateTime, String> {
+    // Get year, month, day, hour, minute, second from Java LocalDateTime
+    let year = match env.call_method(date_obj, "getYear", "()I", &[]) {
+        Ok(result) => result.i().map_err(|e| format!("Failed to get year: {}", e))?,
+        Err(e) => return Err(format!("Failed to call getYear: {}", e)),
+    };
+    
+    let month = match env.call_method(date_obj, "getMonthValue", "()I", &[]) {
+        Ok(result) => result.i().map_err(|e| format!("Failed to get month: {}", e))?,
+        Err(e) => return Err(format!("Failed to call getMonthValue: {}", e)),
+    };
+    
+    let day = match env.call_method(date_obj, "getDayOfMonth", "()I", &[]) {
+        Ok(result) => result.i().map_err(|e| format!("Failed to get day: {}", e))?,
+        Err(e) => return Err(format!("Failed to call getDayOfMonth: {}", e)),
+    };
+    
+    let hour = match env.call_method(date_obj, "getHour", "()I", &[]) {
+        Ok(result) => result.i().map_err(|e| format!("Failed to get hour: {}", e))?,
+        Err(e) => return Err(format!("Failed to call getHour: {}", e)),
+    };
+    
+    let minute = match env.call_method(date_obj, "getMinute", "()I", &[]) {
+        Ok(result) => result.i().map_err(|e| format!("Failed to get minute: {}", e))?,
+        Err(e) => return Err(format!("Failed to call getMinute: {}", e)),
+    };
+    
+    let second = match env.call_method(date_obj, "getSecond", "()I", &[]) {
+        Ok(result) => result.i().map_err(|e| format!("Failed to get second: {}", e))?,
+        Err(e) => return Err(format!("Failed to call getSecond: {}", e)),
+    };
+    
+    // Convert to UTC timestamp (assuming input is UTC for simplicity)
+    let timestamp_millis = match chrono::NaiveDate::from_ymd_opt(year, month as u32, day as u32)
+        .and_then(|date| date.and_hms_opt(hour as u32, minute as u32, second as u32))
+        .map(|naive_dt| naive_dt.and_utc().timestamp_millis())
+    {
+        Some(ts) => ts,
+        None => return Err("Invalid date/time values".to_string()),
+    };
+    
+    Ok(DateTime::from_timestamp_millis(timestamp_millis))
+}
+
+// Helper function to convert Tantivy DateTime to Java LocalDateTime
+fn convert_tantivy_datetime_to_java(env: &mut JNIEnv, dt: &DateTime) -> Result<jobject, String> {
+    let timestamp_millis = dt.into_timestamp_millis();
+    
+    // Create a chrono datetime from the timestamp
+    let chrono_dt = chrono::DateTime::from_timestamp_millis(timestamp_millis)
+        .ok_or("Invalid timestamp")?;
+    let naive_dt = chrono_dt.naive_utc();
+    
+    // Extract components
+    let year = naive_dt.year();
+    let month = naive_dt.month() as i32;
+    let day = naive_dt.day() as i32;
+    let hour = naive_dt.hour() as i32;
+    let minute = naive_dt.minute() as i32;
+    let second = naive_dt.second() as i32;
+    
+    // Create Java LocalDateTime object using the static of() method
+    let localdatetime_class = env.find_class("java/time/LocalDateTime").map_err(|e| e.to_string())?;
+    let localdatetime_obj = env.call_static_method(
+        &localdatetime_class,
+        "of",
+        "(IIIIII)Ljava/time/LocalDateTime;",
+        &[year.into(), month.into(), day.into(), hour.into(), minute.into(), second.into()]
+    ).map_err(|e| e.to_string())?;
+    
+    Ok(localdatetime_obj.l().map_err(|e| e.to_string())?.into_raw())
 }

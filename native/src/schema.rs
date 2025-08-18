@@ -20,7 +20,7 @@
 use jni::objects::{JClass, JString};
 use jni::sys::{jboolean, jlong};
 use jni::JNIEnv;
-use tantivy::schema::{SchemaBuilder, TextOptions, NumericOptions};
+use tantivy::schema::{SchemaBuilder, TextOptions, NumericOptions, DateOptions, IpAddrOptions};
 use tantivy::schema::{IndexRecordOption, TextFieldIndexing};
 use crate::utils::{register_object, remove_object, with_object_mut, handle_error};
 
@@ -321,13 +321,37 @@ pub extern "system" fn Java_com_tantivy4java_SchemaBuilder_nativeAddBooleanField
 pub extern "system" fn Java_com_tantivy4java_SchemaBuilder_nativeAddDateField(
     mut env: JNIEnv,
     _class: JClass,
-    _ptr: jlong,
-    _name: JString,
-    _stored: jboolean,
-    _indexed: jboolean,
-    _fast: jboolean,
+    ptr: jlong,
+    name: JString,
+    stored: jboolean,
+    indexed: jboolean,
+    fast: jboolean,
 ) {
-    handle_error(&mut env, "SchemaBuilder native methods not fully implemented yet");
+    let field_name: String = match env.get_string(&name) {
+        Ok(s) => s.into(),
+        Err(_) => {
+            handle_error(&mut env, "Invalid field name");
+            return;
+        }
+    };
+    
+    with_object_mut::<SchemaBuilder, ()>(ptr as u64, |builder| {
+        let mut date_options = DateOptions::default();
+        
+        if stored != 0 {
+            date_options = date_options.set_stored();
+        }
+        
+        if indexed != 0 {
+            date_options = date_options.set_indexed();
+        }
+        
+        if fast != 0 {
+            date_options = date_options.set_fast();
+        }
+        
+        builder.add_date_field(&field_name, date_options);
+    });
 }
 
 #[no_mangle]
@@ -371,13 +395,37 @@ pub extern "system" fn Java_com_tantivy4java_SchemaBuilder_nativeAddBytesField(
 pub extern "system" fn Java_com_tantivy4java_SchemaBuilder_nativeAddIpAddrField(
     mut env: JNIEnv,
     _class: JClass,
-    _ptr: jlong,
-    _name: JString,
-    _stored: jboolean,
-    _indexed: jboolean,
-    _fast: jboolean,
+    ptr: jlong,
+    name: JString,
+    stored: jboolean,
+    indexed: jboolean,
+    fast: jboolean,
 ) {
-    handle_error(&mut env, "SchemaBuilder native methods not fully implemented yet");
+    let field_name: String = match env.get_string(&name) {
+        Ok(s) => s.into(),
+        Err(_) => {
+            handle_error(&mut env, "Invalid field name");
+            return;
+        }
+    };
+    
+    with_object_mut::<SchemaBuilder, ()>(ptr as u64, |builder| {
+        let mut ip_options = IpAddrOptions::default();
+        
+        if stored != 0 {
+            ip_options = ip_options.set_stored();
+        }
+        
+        if indexed != 0 {
+            ip_options = ip_options.set_indexed();
+        }
+        
+        if fast != 0 {
+            ip_options = ip_options.set_fast();
+        }
+        
+        builder.add_ip_addr_field(&field_name, ip_options);
+    });
 }
 
 #[no_mangle]

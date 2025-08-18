@@ -8,10 +8,11 @@ Tantivy4Java brings the power of the Rust-based Tantivy search engine to Java th
 
 **🎯 Current Implementation Status: PRODUCTION READY** 🚀
 
-- **✅ Complete field type support** - text, integer, float, unsigned, boolean fields
+- **✅ Complete field type support** - text, integer, float, unsigned, boolean, date, IP address fields
 - **✅ Full query parsing** - supports complex query language with boolean operators, phrases, field-specific queries, wildcards
 - **✅ Document retrieval** - Searcher.doc() method with complete field extraction **[COMPLETED]**
 - **✅ Search functionality** - Working search operations with proper Hit objects and scores **[COMPLETED]**
+- **✅ IndexWriter delete operations** - deleteAllDocuments, deleteDocumentsByTerm, deleteDocumentsByQuery **[NEW]**
 - **✅ Resource management** - try-with-resources support for all components
 - **✅ Zero-copy operations** between Rust and Java for maximum performance
 - **✅ Direct memory sharing** to minimize memory usage

@@ -22,6 +22,9 @@ use jni::sys::{jlong, jboolean, jint, jobject};
 use jni::JNIEnv;
 use tantivy::{IndexWriter as TantivyIndexWriter, Searcher as TantivySearcher, DocAddress as TantivyDocAddress};
 use tantivy::query::Query as TantivyQuery;
+use tantivy::Term;
+use tantivy::schema::Schema;
+use std::net::IpAddr;
 use crate::utils::{register_object, remove_object, with_object, with_object_mut, handle_error};
 use crate::document::{RetrievedDocument, DocumentWrapper};
 
@@ -288,19 +291,41 @@ pub extern "system" fn Java_com_tantivy4java_IndexWriter_nativeGarbageCollectFil
 pub extern "system" fn Java_com_tantivy4java_IndexWriter_nativeDeleteAllDocuments(
     mut env: JNIEnv,
     _class: JClass,
-    _ptr: jlong,
+    ptr: jlong,
 ) {
-    handle_error(&mut env, "IndexWriter native methods not fully implemented yet");
+    let result = with_object_mut::<TantivyIndexWriter, Result<(), String>>(ptr as u64, |writer| {
+        let _count = writer.delete_all_documents();
+        Ok(())
+    });
+    
+    match result {
+        Some(Ok(())) => {},
+        Some(Err(err)) => {
+            handle_error(&mut env, &err);
+        },
+        None => {
+            handle_error(&mut env, "Invalid IndexWriter pointer");
+        }
+    }
 }
 
 #[no_mangle]
 pub extern "system" fn Java_com_tantivy4java_IndexWriter_nativeGetCommitOpstamp(
     mut env: JNIEnv,
     _class: JClass,
-    _ptr: jlong,
+    ptr: jlong,
 ) -> jlong {
-    handle_error(&mut env, "IndexWriter native methods not fully implemented yet");
-    0
+    let result = with_object::<TantivyIndexWriter, u64>(ptr as u64, |writer| {
+        writer.commit_opstamp()
+    });
+    
+    match result {
+        Some(opstamp) => opstamp as jlong,
+        None => {
+            handle_error(&mut env, "Invalid IndexWriter pointer");
+            0
+        }
+    }
 }
 
 #[no_mangle]
@@ -319,32 +344,124 @@ pub extern "system" fn Java_com_tantivy4java_IndexWriter_nativeDeleteDocuments(
 pub extern "system" fn Java_com_tantivy4java_IndexWriter_nativeDeleteDocumentsByTerm(
     mut env: JNIEnv,
     _class: JClass,
-    _ptr: jlong,
-    _field_name: JString,
-    _field_value: JObject,
+    ptr: jlong,
+    field_name: JString,
+    field_value: JObject,
 ) -> jlong {
-    handle_error(&mut env, "IndexWriter native methods not fully implemented yet");
-    0
+    let field_name_str: String = match env.get_string(&field_name) {
+        Ok(s) => s.into(),
+        Err(_) => {
+            handle_error(&mut env, "Invalid field name");
+            return 0;
+        }
+    };
+    
+    // Convert the Java object to the appropriate Term outside the closure to avoid deadlocks
+    let term = match (|| -> Result<_, String> {
+        // Get schema first
+        let schema = with_object::<TantivyIndexWriter, Schema>(ptr as u64, |writer| {
+            writer.index().schema()
+        }).ok_or_else(|| "Invalid IndexWriter pointer".to_string())?;
+        
+        // Get the field from the schema
+        let field = schema.get_field(&field_name_str)
+            .map_err(|_| format!("Field '{}' not found in schema", field_name_str))?;
+        
+        // Convert the Java object to the appropriate Term
+        convert_jobject_to_term(&mut env, &field_value, field, &schema)
+    })() {
+        Ok(term) => term,
+        Err(err) => {
+            handle_error(&mut env, &err);
+            return 0;
+        }
+    };
+    
+    let result = with_object_mut::<TantivyIndexWriter, Result<u64, String>>(ptr as u64, |writer| {
+        // Delete documents by term
+        let deleted_count = writer.delete_term(term);
+        // Note: Tantivy's delete_term returns the number of delete operations, not necessarily 
+        // the number of documents that will be deleted (deletion happens during commit)
+        Ok(deleted_count)
+    });
+    
+    match result {
+        Some(Ok(count)) => count as jlong,
+        Some(Err(err)) => {
+            handle_error(&mut env, &err);
+            0
+        },
+        None => {
+            handle_error(&mut env, "Invalid IndexWriter pointer");
+            0
+        }
+    }
 }
 
 #[no_mangle]
 pub extern "system" fn Java_com_tantivy4java_IndexWriter_nativeDeleteDocumentsByQuery(
     mut env: JNIEnv,
     _class: JClass,
-    _ptr: jlong,
-    _query_ptr: jlong,
+    ptr: jlong,
+    query_ptr: jlong,
 ) -> jlong {
-    handle_error(&mut env, "IndexWriter native methods not fully implemented yet");
-    0
+    // Clone the query first to avoid nested locks and deadlocks
+    let query_clone = match with_object::<Box<dyn TantivyQuery>, Box<dyn TantivyQuery>>(query_ptr as u64, |query| {
+        query.box_clone()
+    }) {
+        Some(q) => q,
+        None => {
+            handle_error(&mut env, "Invalid Query pointer");
+            return 0;
+        }
+    };
+    
+    let result = with_object_mut::<TantivyIndexWriter, Result<u64, String>>(ptr as u64, |writer| {
+        // Use the pre-cloned query to avoid nested object registry access
+        Ok(writer.delete_query(query_clone).map_err(|e| e.to_string())?)
+    });
+    
+    match result {
+        Some(Ok(count)) => count as jlong,
+        Some(Err(err)) => {
+            handle_error(&mut env, &err);
+            0
+        },
+        None => {
+            handle_error(&mut env, "Invalid IndexWriter pointer");
+            0
+        }
+    }
 }
 
 #[no_mangle]
 pub extern "system" fn Java_com_tantivy4java_IndexWriter_nativeWaitMergingThreads(
     mut env: JNIEnv,
     _class: JClass,
-    _ptr: jlong,
+    ptr: jlong,
 ) {
-    handle_error(&mut env, "IndexWriter native methods not fully implemented yet");
+    // wait_merging_threads consumes the IndexWriter, so we need to remove it from the registry
+    let writer_opt = {
+        let mut registry = crate::utils::OBJECT_REGISTRY.lock().unwrap();
+        registry.remove(&(ptr as u64)).and_then(|boxed| boxed.downcast::<TantivyIndexWriter>().ok())
+    };
+    
+    let result = match writer_opt {
+        Some(writer) => {
+            match writer.wait_merging_threads() {
+                Ok(()) => Ok(()),
+                Err(e) => Err(e.to_string()),
+            }
+        },
+        None => Err("Invalid IndexWriter pointer".to_string()),
+    };
+    
+    match result {
+        Ok(()) => {},
+        Err(err) => {
+            handle_error(&mut env, &err);
+        }
+    }
 }
 
 #[no_mangle]
@@ -540,4 +657,88 @@ pub extern "system" fn Java_com_tantivy4java_Facet_nativeClose(
     ptr: jlong,
 ) {
     remove_object(ptr as u64);
+}
+
+// Helper function to convert Java Object to Tantivy Term
+fn convert_jobject_to_term(
+    env: &mut JNIEnv,
+    field_value: &JObject,
+    field: tantivy::schema::Field,
+    schema: &Schema,
+) -> Result<Term, String> {
+    if field_value.is_null() {
+        return Err("Field value cannot be null for delete operation".to_string());
+    }
+    
+    // Get field entry to determine the field type
+    let _field_entry = schema.get_field_entry(field);
+    
+    // Check types in specific order to avoid method call errors
+    
+    // Check if it's a Boolean first (to avoid calling wrong methods)
+    if let Ok(true) = env.is_instance_of(field_value, "java/lang/Boolean") {
+        match env.call_method(field_value, "booleanValue", "()Z", &[]) {
+            Ok(bool_value) => {
+                if let Ok(value) = bool_value.z() {
+                    return Ok(Term::from_field_bool(field, value));
+                }
+            },
+            Err(e) => return Err(format!("Failed to get boolean value: {}", e)),
+        }
+    }
+    
+    // Check if it's a Long (i64)
+    if let Ok(true) = env.is_instance_of(field_value, "java/lang/Long") {
+        match env.call_method(field_value, "longValue", "()J", &[]) {
+            Ok(long_value) => {
+                if let Ok(value) = long_value.j() {
+                    return Ok(Term::from_field_i64(field, value));
+                }
+            },
+            Err(e) => return Err(format!("Failed to get long value: {}", e)),
+        }
+    }
+    
+    // Check if it's a Double (f64)
+    if let Ok(true) = env.is_instance_of(field_value, "java/lang/Double") {
+        match env.call_method(field_value, "doubleValue", "()D", &[]) {
+            Ok(double_value) => {
+                if let Ok(value) = double_value.d() {
+                    return Ok(Term::from_field_f64(field, value));
+                }
+            },
+            Err(e) => return Err(format!("Failed to get double value: {}", e)),
+        }
+    }
+    
+    // Check if it's a LocalDateTime (for date fields)
+    if let Ok(_) = env.is_instance_of(field_value, "java/time/LocalDateTime") {
+        // Convert LocalDateTime to DateTime and create term
+        match crate::document::convert_java_localdatetime_to_tantivy(env, field_value) {
+            Ok(datetime) => return Ok(Term::from_field_date(field, datetime)),
+            Err(e) => return Err(format!("Failed to convert LocalDateTime: {}", e)),
+        }
+    }
+    
+    // Try to convert to string as a fallback
+    let string_obj = env.call_method(field_value, "toString", "()Ljava/lang/String;", &[])
+        .map_err(|_| "Failed to call toString on field value")?;
+    let java_string = string_obj.l()
+        .map_err(|_| "Failed to get string object")?;
+    let java_string_obj = JString::from(java_string);
+    let rust_string = env.get_string(&java_string_obj)
+        .map_err(|_| "Failed to convert Java string to Rust string")?;
+    let string_value: String = rust_string.into();
+    
+    // Try to parse as IP address first
+    if let Ok(ip_addr) = string_value.parse::<IpAddr>() {
+        let ipv6_addr = match ip_addr {
+            IpAddr::V4(ipv4) => ipv4.to_ipv6_mapped(),
+            IpAddr::V6(ipv6) => ipv6,
+        };
+        return Ok(Term::from_field_ip_addr(field, ipv6_addr));
+    }
+    
+    // Default to text term
+    Ok(Term::from_field_text(field, &string_value))
 }

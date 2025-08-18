@@ -173,7 +173,7 @@ pub extern "system" fn Java_com_tantivy4java_Index_nativeReload(
     _class: JClass,
     ptr: jlong,
 ) {
-    let result = with_object::<TantivyIndex, Result<(), String>>(ptr as u64, |index| {
+    let result = with_object::<TantivyIndex, Result<(), String>>(ptr as u64, |_index| {
         // In Tantivy, we don't need to explicitly reload the index
         // The reader will automatically pick up changes when a new searcher is created
         // But we can call this to ensure any pending changes are committed
