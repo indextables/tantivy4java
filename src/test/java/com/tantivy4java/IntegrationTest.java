@@ -225,7 +225,7 @@ public class IntegrationTest {
                             
                             try (Query authorQuery = Query.termQuery(schema, "author", "Sarah");
                                  Query dateRange = Query.rangeQuery(schema, "published", FieldType.DATE, startDate, endDate, true, true);
-                                 Query featuredQuery = Query.termQuery(schema, "featured", "true");
+                                 Query featuredQuery = Query.termQuery(schema, "featured", true);
                                  Query multiQuery = Query.booleanQuery(List.of(
                                      new Query.OccurQuery(Occur.SHOULD, authorQuery),
                                      new Query.OccurQuery(Occur.MUST, dateRange),

@@ -33,21 +33,13 @@ pub extern "system" fn Java_com_tantivy4java_Query_nativeTermQuery(
     _class: JClass,
     schema_ptr: jlong,
     field_name: JString,
-    field_value: JString,
+    field_value: jobject,
     index_option: JString,
 ) -> jlong {
     let field_name_str: String = match env.get_string(&field_name) {
         Ok(s) => s.into(),
         Err(_) => {
             handle_error(&mut env, "Invalid field name");
-            return 0;
-        }
-    };
-    
-    let field_value_str: String = match env.get_string(&field_value) {
-        Ok(s) => s.into(),
-        Err(_) => {
-            handle_error(&mut env, "Invalid field value");
             return 0;
         }
     };
@@ -64,8 +56,120 @@ pub extern "system" fn Java_com_tantivy4java_Query_nativeTermQuery(
             Err(_) => return Err(format!("Field '{}' not found in schema", field_name_str)),
         };
         
-        // Create term
-        let term = Term::from_field_text(field, &field_value_str);
+        // Get field type
+        let field_type = schema.get_field_entry(field).field_type();
+        
+        // Convert jobject to JObject for proper API usage
+        let field_value_obj = unsafe { JObject::from_raw(field_value) };
+        
+        // Create term based on field type and value type
+        let term = match field_type {
+            tantivy::schema::FieldType::Str(_) => {
+                // Handle string fields
+                if field_value_obj.is_null() {
+                    return Err("Field value cannot be null for text field".to_string());
+                }
+                let field_value_str: String = match env.get_string(&JString::from(field_value_obj)) {
+                    Ok(s) => s.into(),
+                    Err(_) => return Err("Invalid field value for text field".to_string()),
+                };
+                Term::from_field_text(field, &field_value_str)
+            },
+            tantivy::schema::FieldType::U64(_) => {
+                // Handle integer fields
+                if field_value_obj.is_null() {
+                    return Err("Field value cannot be null for integer field".to_string());
+                }
+                
+                // Check if it's a Long/Integer
+                if let Ok(true) = env.is_instance_of(&field_value_obj, "java/lang/Long") {
+                    let long_value = env.call_method(&field_value_obj, "longValue", "()J", &[])
+                        .map_err(|e| format!("Failed to get long value: {}", e))?
+                        .j()
+                        .map_err(|e| format!("Failed to convert long value: {}", e))?;
+                    Term::from_field_u64(field, long_value as u64)
+                } else if let Ok(true) = env.is_instance_of(&field_value_obj, "java/lang/Integer") {
+                    let int_value = env.call_method(&field_value_obj, "intValue", "()I", &[])
+                        .map_err(|e| format!("Failed to get int value: {}", e))?
+                        .i()
+                        .map_err(|e| format!("Failed to convert int value: {}", e))?;
+                    Term::from_field_u64(field, int_value as u64)
+                } else {
+                    return Err("Expected Long or Integer value for integer field".to_string());
+                }
+            },
+            tantivy::schema::FieldType::F64(_) => {
+                // Handle float fields
+                if field_value_obj.is_null() {
+                    return Err("Field value cannot be null for float field".to_string());
+                }
+                
+                // Check if it's a Double/Float
+                if let Ok(true) = env.is_instance_of(&field_value_obj, "java/lang/Double") {
+                    let double_value = env.call_method(&field_value_obj, "doubleValue", "()D", &[])
+                        .map_err(|e| format!("Failed to get double value: {}", e))?
+                        .d()
+                        .map_err(|e| format!("Failed to convert double value: {}", e))?;
+                    Term::from_field_f64(field, double_value)
+                } else if let Ok(true) = env.is_instance_of(&field_value_obj, "java/lang/Float") {
+                    let float_value = env.call_method(&field_value_obj, "floatValue", "()F", &[])
+                        .map_err(|e| format!("Failed to get float value: {}", e))?
+                        .f()
+                        .map_err(|e| format!("Failed to convert float value: {}", e))?;
+                    Term::from_field_f64(field, float_value as f64)
+                } else {
+                    return Err("Expected Double or Float value for float field".to_string());
+                }
+            },
+            tantivy::schema::FieldType::Bool(_) => {
+                // Handle boolean fields
+                if field_value_obj.is_null() {
+                    return Err("Field value cannot be null for boolean field".to_string());
+                }
+                
+                // Check if it's a Boolean
+                if let Ok(true) = env.is_instance_of(&field_value_obj, "java/lang/Boolean") {
+                    let bool_value = env.call_method(&field_value_obj, "booleanValue", "()Z", &[])
+                        .map_err(|e| format!("Failed to get boolean value: {}", e))?
+                        .z()
+                        .map_err(|e| format!("Failed to convert boolean value: {}", e))?;
+                    Term::from_field_bool(field, bool_value)
+                } else {
+                    return Err("Expected Boolean value for boolean field".to_string());
+                }
+            },
+            tantivy::schema::FieldType::Date(_) => {
+                // Handle date fields - for now, treat as string and try to parse
+                if field_value_obj.is_null() {
+                    return Err("Field value cannot be null for date field".to_string());
+                }
+                
+                // For LocalDateTime objects, convert to string representation
+                let field_value_str: String = match env.call_method(&field_value_obj, "toString", "()Ljava/lang/String;", &[]) {
+                    Ok(result) => {
+                        let string_obj = result.l().map_err(|e| format!("Failed to get string object: {}", e))?;
+                        env.get_string(&JString::from(string_obj))
+                            .map_err(|e| format!("Failed to get string value: {}", e))?
+                            .into()
+                    },
+                    Err(e) => return Err(format!("Failed to convert date to string: {}", e)),
+                };
+                
+                // Try to parse as RFC3339 timestamp  
+                let offset_datetime = chrono::DateTime::parse_from_rfc3339(&format!("{}T00:00:00Z", field_value_str))
+                    .map_err(|_| "Invalid date format, expected YYYY-MM-DD")?;
+                
+                // Convert to OffsetDateTime
+                let date_value = tantivy::DateTime::from_utc(
+                    time::OffsetDateTime::from_unix_timestamp(offset_datetime.timestamp())
+                        .map_err(|_| "Invalid timestamp conversion")?
+                );
+                Term::from_field_date(field, date_value)
+            },
+            _ => {
+                return Err(format!("Unsupported field type for term query: {:?}", field_type));
+            }
+        };
         
         // Parse index option
         let idx_option = match index_option_str.as_str() {
