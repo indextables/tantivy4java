@@ -47,7 +47,8 @@ pub extern "system" fn Java_com_tantivy4java_Index_nativeNew(
             // Create in-memory index
             Ok(TantivyIndex::create_in_ram(schema.clone()))
         } else {
-            // Create index in directory
+            // Create index in directory - create directory if it doesn't exist
+            std::fs::create_dir_all(&path_str).map_err(|e| format!("Failed to create directory '{}': {}", path_str, e))?;
             let dir = MmapDirectory::open(&path_str).map_err(|e| e.to_string())?;
             let settings = IndexSettings::default();
             TantivyIndex::create(dir, schema.clone(), settings).map_err(|e| e.to_string())
@@ -73,20 +74,73 @@ pub extern "system" fn Java_com_tantivy4java_Index_nativeNew(
 pub extern "system" fn Java_com_tantivy4java_Index_nativeOpen(
     mut env: JNIEnv,
     _class: JClass,
-    _path: JString,
+    path: JString,
 ) -> jlong {
-    handle_error(&mut env, "Index native methods not fully implemented yet");
-    0
+    let path_str: String = match env.get_string(&path) {
+        Ok(s) => s.into(),
+        Err(_) => {
+            handle_error(&mut env, "Invalid path string");
+            return 0;
+        }
+    };
+    
+    // Open existing index from directory
+    let result = match MmapDirectory::open(&path_str) {
+        Ok(directory) => {
+            match TantivyIndex::open(directory) {
+                Ok(index) => Ok(index),
+                Err(e) => Err(format!("Failed to open index: {}", e)),
+            }
+        },
+        Err(e) => Err(format!("Failed to open directory '{}': {}", path_str, e)),
+    };
+    
+    match result {
+        Ok(index) => {
+            register_object(index) as jlong
+        },
+        Err(err) => {
+            handle_error(&mut env, &err);
+            0
+        }
+    }
 }
 
 #[no_mangle]
 pub extern "system" fn Java_com_tantivy4java_Index_nativeExists(
     mut env: JNIEnv,
     _class: JClass,
-    _path: JString,
+    path: JString,
 ) -> jboolean {
-    handle_error(&mut env, "Index native methods not fully implemented yet");
-    0
+    let path_str: String = match env.get_string(&path) {
+        Ok(s) => s.into(),
+        Err(_) => {
+            handle_error(&mut env, "Invalid path string");
+            return 0;
+        }
+    };
+    
+    // Check if an index exists at the given path
+    let result = match MmapDirectory::open(&path_str) {
+        Ok(directory) => {
+            match TantivyIndex::exists(&directory) {
+                Ok(exists) => Ok(exists),
+                Err(e) => Err(format!("Failed to check if index exists: {}", e)),
+            }
+        },
+        Err(_) => {
+            // If we can't open the directory, the index doesn't exist
+            Ok(false)
+        }
+    };
+    
+    match result {
+        Ok(exists) => if exists { 1 } else { 0 },
+        Err(err) => {
+            handle_error(&mut env, &err);
+            0
+        }
+    }
 }
 
 #[no_mangle]
@@ -161,10 +215,21 @@ pub extern "system" fn Java_com_tantivy4java_Index_nativeSearcher(
 pub extern "system" fn Java_com_tantivy4java_Index_nativeGetSchema(
     mut env: JNIEnv,
     _class: JClass,
-    _ptr: jlong,
+    ptr: jlong,
 ) -> jlong {
-    handle_error(&mut env, "Index native methods not fully implemented yet");
-    0
+    let result = with_object::<TantivyIndex, Schema>(ptr as u64, |index| {
+        index.schema()
+    });
+    
+    match result {
+        Some(schema) => {
+            register_object(schema) as jlong
+        },
+        None => {
+            handle_error(&mut env, "Invalid Index pointer");
+            0
+        }
+    }
 }
 
 #[no_mangle]
