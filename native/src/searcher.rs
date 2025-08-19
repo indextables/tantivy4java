@@ -236,11 +236,39 @@ pub extern "system" fn Java_com_tantivy4java_IndexWriter_nativeAddDocument(
 pub extern "system" fn Java_com_tantivy4java_IndexWriter_nativeAddJson(
     mut env: JNIEnv,
     _class: JClass,
-    _ptr: jlong,
-    _json: JString,
+    ptr: jlong,
+    json: JString,
 ) -> jlong {
-    handle_error(&mut env, "IndexWriter native methods not fully implemented yet");
-    0
+    let json_str: String = match env.get_string(&json) {
+        Ok(s) => s.into(),
+        Err(_) => {
+            handle_error(&mut env, "Invalid JSON string");
+            return 0;
+        }
+    };
+    
+    let result = with_object_mut::<TantivyIndexWriter, Result<u64, String>>(ptr as u64, |writer| {
+        // Parse JSON and add document
+        let schema = writer.index().schema();
+        let document = match tantivy::schema::TantivyDocument::parse_json(&schema, &json_str) {
+            Ok(doc) => doc,
+            Err(e) => return Err(format!("Failed to parse JSON: {}", e)),
+        };
+        
+        writer.add_document(document).map_err(|e| e.to_string())
+    });
+    
+    match result {
+        Some(Ok(opstamp)) => opstamp as jlong,
+        Some(Err(err)) => {
+            handle_error(&mut env, &err);
+            0
+        },
+        None => {
+            handle_error(&mut env, "Invalid IndexWriter pointer");
+            0
+        }
+    }
 }
 
 #[no_mangle]
@@ -272,19 +300,48 @@ pub extern "system" fn Java_com_tantivy4java_IndexWriter_nativeCommit(
 pub extern "system" fn Java_com_tantivy4java_IndexWriter_nativeRollback(
     mut env: JNIEnv,
     _class: JClass,
-    _ptr: jlong,
+    ptr: jlong,
 ) -> jlong {
-    handle_error(&mut env, "IndexWriter native methods not fully implemented yet");
-    0
+    let result = with_object_mut::<TantivyIndexWriter, Result<u64, String>>(ptr as u64, |writer| {
+        writer.rollback().map_err(|e| e.to_string())
+    });
+    
+    match result {
+        Some(Ok(opstamp)) => opstamp as jlong,
+        Some(Err(err)) => {
+            handle_error(&mut env, &err);
+            0
+        },
+        None => {
+            handle_error(&mut env, "Invalid IndexWriter pointer");
+            0
+        }
+    }
 }
 
 #[no_mangle]
 pub extern "system" fn Java_com_tantivy4java_IndexWriter_nativeGarbageCollectFiles(
     mut env: JNIEnv,
     _class: JClass,
-    _ptr: jlong,
+    ptr: jlong,
 ) {
-    handle_error(&mut env, "IndexWriter native methods not fully implemented yet");
+    let result = with_object::<TantivyIndexWriter, Result<(), String>>(ptr as u64, |writer| {
+        // Use futures executor to handle the async garbage collection
+        match futures::executor::block_on(writer.garbage_collect_files()) {
+            Ok(_) => Ok(()),
+            Err(e) => Err(e.to_string()),
+        }
+    });
+    
+    match result {
+        Some(Ok(_)) => {},
+        Some(Err(err)) => {
+            handle_error(&mut env, &err);
+        },
+        None => {
+            handle_error(&mut env, "Invalid IndexWriter pointer");
+        }
+    }
 }
 
 #[no_mangle]
