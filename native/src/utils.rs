@@ -31,10 +31,11 @@ static mut NEXT_ID: u64 = 1;
 /// Register a native object and return its handle
 pub fn register_object<T: 'static + Send + Sync>(obj: T) -> u64 {
     unsafe {
+        let mut registry = OBJECT_REGISTRY.lock().unwrap();
+
         let id = NEXT_ID;
         NEXT_ID += 1;
-        
-        let mut registry = OBJECT_REGISTRY.lock().unwrap();
+
         registry.insert(id, Box::new(obj));
         id
     }
