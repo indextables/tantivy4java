@@ -19,6 +19,8 @@
 
 package com.tantivy4java;
 
+import java.util.List;
+
 /**
  * Writer for adding documents to a Tantivy index.
  * Provides methods for adding, updating, and deleting documents.
@@ -160,6 +162,33 @@ public class IndexWriter implements AutoCloseable {
         nativeWaitMergingThreads(nativePtr);
     }
 
+    /**
+     * Merge segments specified by their segment IDs.
+     * This operation combines multiple segments into a single segment,
+     * which can improve search performance and reduce storage overhead.
+     * 
+     * @param segmentIds List of segment ID strings to merge
+     * @return SegmentMeta of the resulting merged segment
+     * @throws IllegalArgumentException if segmentIds is null or empty
+     */
+    public SegmentMeta merge(List<String> segmentIds) {
+        if (closed) {
+            throw new IllegalStateException("IndexWriter has been closed");
+        }
+        if (segmentIds == null) {
+            throw new IllegalArgumentException("Segment IDs list cannot be null");
+        }
+        if (segmentIds.isEmpty()) {
+            throw new IllegalArgumentException("Segment IDs list cannot be empty");
+        }
+        
+        long segmentMetaPtr = nativeMerge(nativePtr, segmentIds);
+        if (segmentMetaPtr == 0) {
+            throw new RuntimeException("Failed to merge segments");
+        }
+        return new SegmentMeta(segmentMetaPtr);
+    }
+
     @Override
     public void close() {
         if (!closed) {
@@ -181,5 +210,6 @@ public class IndexWriter implements AutoCloseable {
     private static native long nativeDeleteDocumentsByTerm(long ptr, String fieldName, Object fieldValue);
     private static native long nativeDeleteDocumentsByQuery(long ptr, long queryPtr);
     private static native void nativeWaitMergingThreads(long ptr);
+    private static native long nativeMerge(long ptr, List<String> segmentIds);
     private static native void nativeClose(long ptr);
 }

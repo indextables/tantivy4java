@@ -24,9 +24,47 @@ use tantivy::{IndexWriter as TantivyIndexWriter, Searcher as TantivySearcher, Do
 use tantivy::query::Query as TantivyQuery;
 use tantivy::Term;
 use tantivy::schema::Schema;
+use tantivy::index::SegmentId;
 use std::net::IpAddr;
 use crate::utils::{register_object, remove_object, with_object, with_object_mut, handle_error};
 use crate::document::{RetrievedDocument, DocumentWrapper};
+
+// Helper function to extract segment IDs from Java List<String>
+fn extract_segment_ids(env: &mut JNIEnv, list_obj: &JObject) -> Result<Vec<String>, String> {
+    // Get the List size
+    let size = match env.call_method(list_obj, "size", "()I", &[]) {
+        Ok(result) => match result.i() {
+            Ok(s) => s,
+            Err(_) => return Err("Failed to get list size".to_string()),
+        },
+        Err(_) => return Err("Failed to call size() on list".to_string()),
+    };
+    
+    let mut segment_ids = Vec::with_capacity(size as usize);
+    
+    // Extract each segment ID string from the list
+    for i in 0..size {
+        let element = match env.call_method(list_obj, "get", "(I)Ljava/lang/Object;", &[i.into()]) {
+            Ok(result) => result.l().map_err(|_| "Failed to get object from list")?,
+            Err(_) => return Err("Failed to call get() on list".to_string()),
+        };
+        
+        let string_obj = match env.call_method(&element, "toString", "()Ljava/lang/String;", &[]) {
+            Ok(result) => result.l().map_err(|_| "Failed to convert to string")?,
+            Err(_) => return Err("Failed to call toString() on list element".to_string()),
+        };
+        
+        let java_string = JString::from(string_obj);
+        let rust_string: String = match env.get_string(&java_string) {
+            Ok(s) => s.into(),
+            Err(_) => return Err("Failed to convert Java string to Rust string".to_string()),
+        };
+        
+        segment_ids.push(rust_string);
+    }
+    
+    Ok(segment_ids)
+}
 
 // Searcher native methods
 #[no_mangle]
@@ -174,6 +212,58 @@ pub extern "system" fn Java_com_tantivy4java_Searcher_nativeDocFreq(
 ) -> jint {
     handle_error(&mut env, "Searcher native methods not fully implemented yet");
     0
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_tantivy4java_Searcher_nativeGetSegmentIds(
+    mut env: JNIEnv,
+    _class: JClass,
+    ptr: jlong,
+) -> jobject {
+    let result = with_object::<TantivySearcher, Result<Vec<String>, String>>(ptr as u64, |searcher| {
+        let segment_ids: Vec<String> = searcher
+            .segment_readers()
+            .iter()
+            .map(|segment_reader| segment_reader.segment_id().uuid_string())
+            .collect();
+        Ok(segment_ids)
+    });
+    
+    match result {
+        Some(Ok(segment_ids)) => {
+            // Create a Java ArrayList
+            match (|| -> Result<jobject, String> {
+                let array_list_class = env.find_class("java/util/ArrayList").map_err(|e| e.to_string())?;
+                let array_list = env.new_object(&array_list_class, "()V", &[]).map_err(|e| e.to_string())?;
+                
+                for segment_id in segment_ids {
+                    let java_string = env.new_string(&segment_id).map_err(|e| e.to_string())?;
+                    env.call_method(
+                        &array_list,
+                        "add",
+                        "(Ljava/lang/Object;)Z",
+                        &[(&java_string).into()]
+                    ).map_err(|e| e.to_string())?;
+                }
+                
+                Ok(array_list.into_raw())
+            })() {
+                Ok(list) => list,
+                Err(err) => {
+                    handle_error(&mut env, &err);
+                    std::ptr::null_mut()
+                }
+            }
+        },
+        Some(Err(err)) => {
+            handle_error(&mut env, &err);
+            std::ptr::null_mut()
+        },
+        None => {
+            handle_error(&mut env, "Invalid Searcher pointer");
+            std::ptr::null_mut()
+        }
+    }
 }
 
 #[no_mangle]
@@ -522,6 +612,65 @@ pub extern "system" fn Java_com_tantivy4java_IndexWriter_nativeWaitMergingThread
 }
 
 #[no_mangle]
+pub extern "system" fn Java_com_tantivy4java_IndexWriter_nativeMerge(
+    mut env: JNIEnv,
+    _class: JClass,
+    ptr: jlong,
+    segment_ids: JObject,
+) -> jlong {
+    // Extract segment IDs from Java list
+    let segment_id_vec = if !segment_ids.is_null() {
+        match extract_segment_ids(&mut env, &segment_ids) {
+            Ok(ids) => ids,
+            Err(e) => {
+                handle_error(&mut env, &e);
+                return 0;
+            }
+        }
+    } else {
+        Vec::new()
+    };
+    
+    let result = with_object_mut::<TantivyIndexWriter, Result<tantivy::SegmentMeta, String>>(ptr as u64, |writer| {
+        // Convert segment IDs to tantivy SegmentIds
+        let tantivy_segment_ids: Result<Vec<SegmentId>, String> = segment_id_vec
+            .iter()
+            .map(|id_str| {
+                SegmentId::from_uuid_string(id_str)
+                    .map_err(|e| format!("Invalid segment ID '{}': {}", id_str, e))
+            })
+            .collect();
+            
+        let segment_ids = tantivy_segment_ids?;
+        
+        // Perform the merge operation - this returns a future
+        let merge_future = writer.merge(&segment_ids);
+        
+        // Use futures executor to handle the async merge
+        match futures::executor::block_on(merge_future) {
+            Ok(Some(segment_meta)) => Ok(segment_meta),
+            Ok(None) => Err("Merge operation failed - no segment metadata returned".to_string()),
+            Err(e) => Err(format!("Merge operation failed: {}", e)),
+        }
+    });
+    
+    match result {
+        Some(Ok(segment_meta)) => {
+            // Register the resulting segment metadata and return pointer
+            register_object(segment_meta) as jlong
+        },
+        Some(Err(err)) => {
+            handle_error(&mut env, &err);
+            0
+        },
+        None => {
+            handle_error(&mut env, "Invalid IndexWriter pointer");
+            0
+        }
+    }
+}
+
+#[no_mangle]
 pub extern "system" fn Java_com_tantivy4java_IndexWriter_nativeClose(
     _env: JNIEnv,
     _class: JClass,
@@ -798,4 +947,79 @@ fn convert_jobject_to_term(
     
     // Default to text term
     Ok(Term::from_field_text(field, &string_value))
+}
+
+// SegmentMeta native methods
+#[no_mangle]
+pub extern "system" fn Java_com_tantivy4java_SegmentMeta_nativeGetSegmentId(
+    mut env: JNIEnv,
+    _class: JClass,
+    ptr: jlong,
+) -> jobject {
+    let result = with_object::<tantivy::SegmentMeta, Option<String>>(ptr as u64, |segment_meta| {
+        Some(segment_meta.id().uuid_string())
+    });
+    
+    match result {
+        Some(Some(segment_id)) => {
+            match env.new_string(&segment_id) {
+                Ok(string) => string.into_raw(),
+                Err(_) => {
+                    handle_error(&mut env, "Failed to create Java string");
+                    std::ptr::null_mut()
+                }
+            }
+        },
+        _ => {
+            handle_error(&mut env, "Invalid SegmentMeta pointer");
+            std::ptr::null_mut()
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_tantivy4java_SegmentMeta_nativeGetMaxDoc(
+    mut env: JNIEnv,
+    _class: JClass,
+    ptr: jlong,
+) -> jlong {
+    let result = with_object::<tantivy::SegmentMeta, Option<u32>>(ptr as u64, |segment_meta| {
+        Some(segment_meta.max_doc())
+    });
+    
+    match result {
+        Some(Some(max_doc)) => max_doc as jlong,
+        _ => {
+            handle_error(&mut env, "Invalid SegmentMeta pointer");
+            0
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_tantivy4java_SegmentMeta_nativeGetNumDeletedDocs(
+    mut env: JNIEnv,
+    _class: JClass,
+    ptr: jlong,
+) -> jlong {
+    let result = with_object::<tantivy::SegmentMeta, Option<u32>>(ptr as u64, |segment_meta| {
+        Some(segment_meta.num_deleted_docs())
+    });
+    
+    match result {
+        Some(Some(num_deleted)) => num_deleted as jlong,
+        _ => {
+            handle_error(&mut env, "Invalid SegmentMeta pointer");
+            0
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_tantivy4java_SegmentMeta_nativeClose(
+    _env: JNIEnv,
+    _class: JClass,
+    ptr: jlong,
+) {
+    remove_object(ptr as u64);
 }

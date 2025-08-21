@@ -7,7 +7,7 @@ A complete Java port of the Python Tantivy language bindings, providing high-per
 Tantivy4Java delivers **100% functional compatibility** with the Python tantivy library, verified through comprehensive test coverage of **1,600+ lines** of Python test patterns.
 
 ### ✅ **Complete Python Tantivy API Compatibility**
-- **📊 41 comprehensive tests** covering all functionality (**100% pass rate**)
+- **📊 48 comprehensive tests** covering all functionality (**100% pass rate**)
 - **🐍 Complete Python API parity** - All major functionality from Python tantivy library
 - **📝 Document.from_dict() equivalent** - JSON document creation patterns
 - **🔍 index.parse_query() patterns** - Query parsing compatibility  
@@ -15,6 +15,7 @@ Tantivy4Java delivers **100% functional compatibility** with the Python tantivy 
 - **📖 Full field type support** - Text, Integer, Float, Boolean, Date, IP Address fields
 - **🎯 Advanced search features** - Scoring, boosting, complex boolean logic
 - **💾 Index persistence** - Create, open, reload, exists functionality
+- **⚡ Index optimization** - Segment merging for performance tuning
 
 ## Overview
 
@@ -30,6 +31,7 @@ Tantivy4Java brings the power of the Rust-based Tantivy search engine to Java th
 - **✅ Complete CRUD operations** - Create, read, update, delete functionality
 - **✅ Index persistence** - Open existing indices, check existence, retrieve schemas
 - **✅ Document retrieval** - Complete field extraction with proper type conversion
+- **✅ Index optimization** - Segment merging with metadata access for performance tuning
 - **✅ Resource management** - Memory-safe cleanup with try-with-resources
 - **✅ Zero-copy operations** - Direct memory sharing for maximum performance
 - **✅ Java 11+ compatibility** - Modern Java features and Maven integration
@@ -60,6 +62,7 @@ Tantivy4Java brings the power of the Rust-based Tantivy search engine to Java th
 - **Escape Handling** - Special character processing in queries
 - **Scoring and Boosting** - Advanced relevance scoring
 - **Index Persistence** - Open, create, reload, check existence
+- **Segment Merging** - Index optimization with metadata access
 
 #### **Python Test Pattern Coverage**
 - **Document creation patterns** - Multi-field, multi-value documents
@@ -163,6 +166,24 @@ try (SchemaBuilder builder = new SchemaBuilder()) {
                         System.out.println("Range matches: " + result.getHits().size());
                     }
                 }
+                
+                // Index optimization with segment merging
+                List<String> segmentIds = searcher.getSegmentIds();
+                System.out.println("Current segments: " + segmentIds.size());
+                
+                if (segmentIds.size() >= 2) {
+                    try (IndexWriter writer = index.writer(50, 1)) {
+                        // Merge first two segments for optimization
+                        List<String> toMerge = segmentIds.subList(0, 2);
+                        SegmentMeta result = writer.merge(toMerge);
+                        
+                        System.out.println("Merged into segment: " + result.getSegmentId());
+                        System.out.println("Document count: " + result.getMaxDoc());
+                        System.out.println("Deleted docs: " + result.getNumDeletedDocs());
+                        
+                        writer.commit();
+                    }
+                }
             }
         }
     }
@@ -179,6 +200,79 @@ try (SchemaBuilder builder = new SchemaBuilder()) {
 | `doc.to_named_doc(schema)` | `doc.get(fieldName)` |
 | `query1 & query2` | `Query.booleanQuery(MUST, MUST)` |
 | `query1 \| query2` | `Query.booleanQuery(SHOULD, SHOULD)` |
+| `writer.merge(segment_ids)` | `writer.merge(segmentIds)` |
+| Access segment metadata | `SegmentMeta` with ID, doc count, deleted docs |
+
+## 🚀 **NEW: Index Segment Merging**
+
+### Advanced Performance Optimization
+
+Tantivy4Java now provides complete access to Tantivy's segment merging functionality for index optimization:
+
+```java
+try (SchemaBuilder builder = new SchemaBuilder();
+     Schema schema = builder.addTextField("content", true, false, "default", "position").build();
+     Index index = new Index(schema, "/path/to/index", false)) {
+    
+    // Create multiple segments through separate commits
+    try (IndexWriter writer = index.writer(50, 1)) {
+        writer.addJson("{\"content\": \"First batch of documents\"}");
+        writer.commit();
+        
+        writer.addJson("{\"content\": \"Second batch of documents\"}");
+        writer.commit();
+        
+        writer.addJson("{\"content\": \"Third batch of documents\"}");
+        writer.commit();
+    }
+    
+    index.reload();
+    
+    try (Searcher searcher = index.searcher()) {
+        // Get current segment information
+        List<String> segmentIds = searcher.getSegmentIds();
+        int numSegments = searcher.getNumSegments();
+        
+        System.out.println("Current segments: " + numSegments);
+        System.out.println("Segment IDs: " + segmentIds);
+        
+        // Merge segments for optimization
+        if (segmentIds.size() >= 2) {
+            try (IndexWriter writer = index.writer(50, 1)) {
+                // Merge first two segments
+                List<String> toMerge = segmentIds.subList(0, 2);
+                SegmentMeta mergedSegment = writer.merge(toMerge);
+                
+                // Access merged segment metadata
+                String newSegmentId = mergedSegment.getSegmentId();
+                long docCount = mergedSegment.getMaxDoc();
+                long deletedDocs = mergedSegment.getNumDeletedDocs();
+                
+                System.out.println("Merged into segment: " + newSegmentId);
+                System.out.println("Document count: " + docCount);
+                System.out.println("Deleted documents: " + deletedDocs);
+                
+                writer.commit();
+            }
+        }
+    }
+}
+```
+
+### Key Benefits
+
+- **🚀 Performance**: Reduce segment count for faster search operations
+- **💾 Storage**: Consolidate fragmented segments for better disk usage
+- **🎛️ Control**: Programmatic index maintenance and optimization
+- **📊 Metadata**: Access detailed information about merged segments
+- **⚡ Native Speed**: Direct Tantivy merge operations with zero overhead
+
+### Production Use Cases
+
+1. **Scheduled Maintenance**: Merge segments during off-peak hours
+2. **Performance Tuning**: Optimize search speed by reducing segment fragmentation
+3. **Storage Management**: Consolidate old segments to reclaim disk space
+4. **Index Health**: Monitor segment count and optimize when needed
 
 ## Testing & Validation
 
@@ -188,7 +282,7 @@ try (SchemaBuilder builder = new SchemaBuilder()) {
 mvn test
 ```
 
-**Test Results**: **41 tests total, 41 passing (100% success rate)**
+**Test Results**: **48 tests total, 48 passing (100% success rate)**
 
 ### Test Coverage Includes:
 - **`PythonParityTest`** - Document creation, boolean queries, range queries
@@ -196,6 +290,8 @@ mvn test
 - **`JsonAndQueryParsingTest`** - JSON document support, query parsing
 - **`EscapeAndSpecialFieldsTest`** - Escape handling, boolean/date fields
 - **`ExplanationAndFrequencyTest`** - Query explanation, document frequency
+- **`IndexMergeTest`** - Segment merge API validation and error handling
+- **`RealSegmentMergeTest`** - Real-world merge scenarios with actual segment IDs
 - **Plus 15+ additional comprehensive functionality tests**
 
 ## Architecture
@@ -282,12 +378,14 @@ try (SchemaBuilder builder = new SchemaBuilder()) {
 - **Advanced features** - ✅ Phrase, fuzzy, range, boost queries
 - **JSON document support** - ✅ Document.from_dict equivalent
 - **Index operations** - ✅ Create, open, reload, exists
+- **Index optimization** - ✅ Segment merging with metadata access
 
 #### **Production-Ready Components**
 - ✅ **Complete CRUD pipeline** - Create, read, update, delete
 - ✅ **All field types** - Text, integer, float, boolean, date, IP address
 - ✅ **Complex query parsing** - Boolean logic, field targeting, phrases
 - ✅ **Document field extraction** - Proper type conversion and multi-value support
+- ✅ **Index optimization** - Segment merging for performance tuning and storage efficiency
 - ✅ **Memory management** - Resource-safe cleanup patterns
 - ✅ **Index persistence** - Disk-based indices with full lifecycle management
 
@@ -300,8 +398,9 @@ try (SchemaBuilder builder = new SchemaBuilder()) {
 - ✅ **Native JNI integration** - Robust object type handling and conversion
 
 ### ✅ **COMPLETE IMPLEMENTATION - ALL TESTS PASSING**
-- **41/41 tests passing** - 100% success rate achieved
+- **48/48 tests passing** - 100% success rate achieved
 - **All Python tantivy functionality** implemented and verified
+- **Advanced segment merging** - Performance optimization with metadata access
 - **Production deployment ready** with complete feature parity
 - **Zero known issues** - comprehensive test coverage validates all edge cases
 

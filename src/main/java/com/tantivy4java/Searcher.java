@@ -20,6 +20,7 @@
 package com.tantivy4java;
 
 import java.util.Map;
+import java.util.List;
 
 /**
  * Searcher for querying a Tantivy index.
@@ -138,6 +139,20 @@ public class Searcher implements AutoCloseable {
     }
 
     /**
+     * Get the segment IDs in the index.
+     * This method returns a list of segment ID strings that can be used
+     * with IndexWriter.merge() to merge specific segments.
+     * 
+     * @return List of segment ID strings
+     */
+    public List<String> getSegmentIds() {
+        if (closed) {
+            throw new IllegalStateException("Searcher has been closed");
+        }
+        return nativeGetSegmentIds(nativePtr);
+    }
+
+    /**
      * Get the native pointer for JNI operations.
      * @return Native pointer
      */
@@ -164,5 +179,6 @@ public class Searcher implements AutoCloseable {
     private static native int nativeGetNumSegments(long ptr);
     private static native long nativeDoc(long ptr, long docAddressPtr);
     private static native int nativeDocFreq(long ptr, String fieldName, Object fieldValue);
+    private static native List<String> nativeGetSegmentIds(long ptr);
     private static native void nativeClose(long ptr);
 }
