@@ -28,6 +28,7 @@ mod index;
 mod searcher;
 mod doc_address;
 mod utils;
+mod quickwit_split;
 
 pub use schema::*;
 pub use document::*;
@@ -36,6 +37,7 @@ pub use index::*;
 pub use searcher::*;
 pub use doc_address::*;
 pub use utils::*;
+pub use quickwit_split::*;
 
 #[no_mangle]
 pub extern "system" fn Java_com_tantivy4java_Tantivy_getVersion(

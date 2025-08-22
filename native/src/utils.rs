@@ -82,3 +82,27 @@ pub fn unwrap_or_throw<T>(env: &mut JNIEnv, result: Result<T, Box<dyn std::error
         }
     }
 }
+
+/// Convert JString to Rust String
+pub fn jstring_to_string(env: &mut JNIEnv, jstr: &jni::objects::JString) -> anyhow::Result<String> {
+    Ok(env.get_string(jstr)?.into())
+}
+
+/// Convert Rust String to JString
+pub fn string_to_jstring<'a>(env: &mut JNIEnv<'a>, s: &str) -> anyhow::Result<jni::objects::JString<'a>> {
+    Ok(env.new_string(s)?)
+}
+
+/// Execute function and convert any errors to Java exceptions
+pub fn convert_throwable<T, F>(env: &mut JNIEnv, f: F) -> anyhow::Result<T>
+where
+    F: FnOnce(&mut JNIEnv) -> anyhow::Result<T>,
+{
+    match f(env) {
+        Ok(value) => Ok(value),
+        Err(error) => {
+            let _ = env.throw_new("java/lang/RuntimeException", error.to_string());
+            Err(error)
+        }
+    }
+}

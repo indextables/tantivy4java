@@ -231,7 +231,7 @@ public class Index implements AutoCloseable {
      * Get the native pointer for JNI operations.
      * @return Native pointer
      */
-    long getNativePtr() {
+    public long getNativePtr() {
         if (closed) {
             throw new IllegalStateException("Index has been closed");
         }
@@ -313,6 +313,32 @@ public class Index implements AutoCloseable {
         private static native long nativeGetQuery(long ptr);
         private static native List<String> nativeGetErrors(long ptr);
         private static native void nativeCloseParseResult(long ptr);
+    }
+
+    /**
+     * Create a QuickwitSplitGenerator for this index (if quickwit-splits4java is available).
+     * 
+     * @param targetDocsPerSplit Target number of documents per split
+     * @return QuickwitSplitGenerator instance
+     * @throws UnsupportedOperationException if quickwit-splits4java is not available
+     * @throws IllegalArgumentException if targetDocsPerSplit <= 0
+     */
+    public Object createSplitGenerator(int targetDocsPerSplit) {
+        if (closed) {
+            throw new IllegalStateException("Index has been closed");
+        }
+        
+        try {
+            // Use reflection to create QuickwitSplitGenerator if available
+            Class<?> generatorClass = Class.forName("com.tantivy4java.splits.QuickwitSplitGenerator");
+            return generatorClass.getConstructor(Index.class, int.class)
+                    .newInstance(this, targetDocsPerSplit);
+        } catch (ClassNotFoundException e) {
+            throw new UnsupportedOperationException(
+                "QuickwitSplitGenerator not available. Add quickwit-splits4java dependency.", e);
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to create QuickwitSplitGenerator", e);
+        }
     }
 
     // Native method declarations
