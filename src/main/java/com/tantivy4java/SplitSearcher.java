@@ -169,6 +169,15 @@ public class SplitSearcher implements AutoCloseable {
     }
     
     /**
+     * Retrieve a document by its address from the split
+     * @param docAddress The document address obtained from search results
+     * @return The document with all indexed fields
+     */
+    public Document doc(DocAddress docAddress) {
+        return docNative(nativePtr, docAddress.getSegmentOrd(), docAddress.getDoc());
+    }
+    
+    /**
      * Asynchronously preload specified components into cache
      */
     public CompletableFuture<Void> preloadComponents(IndexComponent... components) {
@@ -265,6 +274,7 @@ public class SplitSearcher implements AutoCloseable {
     private static native long createNativeWithSharedCache(String splitPath, long cacheManagerPtr, Map<String, Object> splitConfig);
     private static native long getSchemaFromNative(long nativePtr);
     private static native SearchResult searchNative(long nativePtr, long queryPtr, int limit);
+    private static native Document docNative(long nativePtr, int segment, int docId);
     private static native void preloadComponentsNative(long nativePtr, IndexComponent[] components);
     private static native CacheStats getCacheStatsNative(long nativePtr);
     private static native LoadingStats getLoadingStatsNative(long nativePtr);

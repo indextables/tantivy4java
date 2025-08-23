@@ -27,6 +27,7 @@ use std::net::IpAddr;
 use std::collections::BTreeMap;
 use chrono::{self, Datelike, Timelike};
 use crate::utils::{register_object, remove_object, with_object_mut, with_object, handle_error};
+use serde_json;
 
 /// Unified document type that can handle both creation and retrieval
 #[derive(Clone)]
@@ -44,7 +45,7 @@ pub struct DocumentBuilder {
 /// Document retrieved from search results with field values
 #[derive(Clone)]
 pub struct RetrievedDocument {
-    field_values: BTreeMap<String, Vec<OwnedValue>>,
+    pub field_values: BTreeMap<String, Vec<OwnedValue>>,
 }
 
 impl DocumentBuilder {
@@ -171,6 +172,33 @@ impl RetrievedDocument {
         Self {
             field_values: BTreeMap::new(),
         }
+    }
+    
+    pub fn from_json(json_str: &str) -> anyhow::Result<Self> {
+        let json_value: serde_json::Value = serde_json::from_str(json_str)?;
+        let mut field_values = BTreeMap::new();
+        
+        if let serde_json::Value::Object(obj) = json_value {
+            for (field_name, value) in obj {
+                let owned_value = match value {
+                    serde_json::Value::String(s) => OwnedValue::Str(s),
+                    serde_json::Value::Number(n) => {
+                        if let Some(i) = n.as_i64() {
+                            OwnedValue::I64(i)
+                        } else if let Some(f) = n.as_f64() {
+                            OwnedValue::F64(f)
+                        } else {
+                            continue; // Skip unsupported number format
+                        }
+                    },
+                    serde_json::Value::Bool(b) => OwnedValue::Bool(b),
+                    _ => continue, // Skip unsupported value types for now
+                };
+                field_values.insert(field_name, vec![owned_value]);
+            }
+        }
+        
+        Ok(Self { field_values })
     }
     
     pub fn new_with_schema(document: TantivyDocument, schema: &tantivy::schema::Schema) -> Self {
