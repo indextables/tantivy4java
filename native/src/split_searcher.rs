@@ -72,6 +72,8 @@ impl SplitSearcher {
         // Source S3 config from the provided API config objects
         use quickwit_config::S3StorageConfig;
         let s3_config = if let Some(aws_config) = &config.aws_config {
+            eprintln!("DEBUG: Creating S3Config with region: {}, access_key: {}, endpoint: {:?}, force_path_style: {}", 
+                     aws_config.region, aws_config.access_key, aws_config.endpoint, aws_config.force_path_style);
             S3StorageConfig {
                 region: Some(aws_config.region.clone()),
                 access_key_id: Some(aws_config.access_key.clone()),
@@ -81,6 +83,7 @@ impl SplitSearcher {
                 ..Default::default()
             }
         } else {
+            eprintln!("DEBUG: No AWS config provided, using default S3StorageConfig");
             S3StorageConfig::default()
         };
         let storage_resolver = create_storage_resolver_with_config(s3_config);
@@ -88,8 +91,23 @@ impl SplitSearcher {
         // Use enter() to ensure we're in the correct runtime context
         let _guard = runtime.enter();
         
+        // For S3 URIs, we need to resolve the parent directory, not the file itself
+        let (storage_uri, file_name) = if split_uri.protocol() == quickwit_common::uri::Protocol::S3 {
+            let uri_str = split_uri.as_str();
+            if let Some(last_slash) = uri_str.rfind('/') {
+                let parent_uri_str = &uri_str[..last_slash]; // Get s3://bucket/splits
+                let file_name = &uri_str[last_slash + 1..];  // Get filename
+                eprintln!("DEBUG: Split S3 URI into parent: {} and file: {}", parent_uri_str, file_name);
+                (Uri::from_str(parent_uri_str)?, Some(file_name.to_string()))
+            } else {
+                (split_uri.clone(), None)
+            }
+        } else {
+            (split_uri.clone(), None)
+        };
+        
         let storage = runtime.block_on(async {
-            storage_resolver.resolve(&split_uri).await
+            storage_resolver.resolve(&storage_uri).await
         }).map_err(|e| anyhow::anyhow!("Failed to resolve storage for '{}': {}", config.split_path, e))?;
         
         // Create byte range cache
@@ -100,7 +118,7 @@ impl SplitSearcher {
         // Use the new Quickwit-style opening directly (no temporary instance needed)
         let (index, hot_directory) = runtime.block_on(async {
             Self::quickwit_open_index_with_caches_static(
-                storage.clone(), &config.split_path, &byte_range_cache
+                storage.clone(), &config.split_path, &byte_range_cache, file_name.as_deref()
             ).await
         }).map_err(|e| anyhow::anyhow!("Failed to open split index '{}': {}", config.split_path, e))?;
         
@@ -136,7 +154,7 @@ impl SplitSearcher {
         
         // FIXED: Implement proper Quickwit open_index_with_caches pattern
         let (index, _hot_directory) = Self::quickwit_open_index_with_caches_static(
-            storage, split_path, byte_range_cache
+            storage, split_path, byte_range_cache, None
         ).await?;
         
         // Create an IndexReader with proper reload policy
@@ -149,9 +167,10 @@ impl SplitSearcher {
 
     /// Quickwit-style open_index_with_caches implementation (static method)
     async fn quickwit_open_index_with_caches_static(
-        _index_storage: Arc<dyn Storage>, 
+        index_storage: Arc<dyn Storage>, 
         split_path: &str,
-        ephemeral_unbounded_cache: &ByteRangeCache
+        ephemeral_unbounded_cache: &ByteRangeCache,
+        file_name: Option<&str>
     ) -> anyhow::Result<(Index, HotDirectory)> {
         // Parse the split URI to determine how to handle it
         let split_uri = Uri::from_str(split_path)?;
@@ -188,6 +207,44 @@ impl SplitSearcher {
                 } else {
                     Err(anyhow::anyhow!("Invalid file URI: {}", split_path))
                 }
+            },
+            Protocol::S3 => {
+                // For S3 splits, use the provided storage to read the split file
+                eprintln!("DEBUG: Attempting to read S3 split file: {}", split_path);
+                
+                // Use the extracted filename for S3 storage access
+                let file_path = if let Some(filename) = file_name {
+                    std::path::Path::new(filename)
+                } else {
+                    return Err(anyhow::anyhow!("No filename provided for S3 split: {}", split_path));
+                };
+                eprintln!("DEBUG: Using S3 filename: {:?}", file_path);
+                let split_data = index_storage.get_all(file_path).await
+                    .map_err(|e| {
+                        eprintln!("DEBUG: S3 storage error: {:?}", e);
+                        anyhow::anyhow!("Failed to read S3 split file '{}': {}", split_path, e)
+                    })?;
+                eprintln!("DEBUG: Successfully read {} bytes from S3", split_data.len());
+                
+                let split_owned_bytes = split_data;
+                
+                // Extract hotcache from the split
+                let hotcache_bytes = get_hotcache_from_split(split_owned_bytes.clone())
+                    .map_err(|e| anyhow::anyhow!("Failed to extract hotcache from S3 split: {}", e))?;
+                
+                // Create FileSlice and open the split using BundleDirectory  
+                let file_slice = FileSlice::new(Arc::new(split_owned_bytes));
+                let bundle_directory = BundleDirectory::open_split(file_slice)
+                    .map_err(|e| anyhow::anyhow!("Failed to open S3 split bundle: {}", e))?;
+                
+                // Create a caching directory over the bundle directory
+                let caching_directory = CachingDirectory::new(Arc::new(bundle_directory), ephemeral_unbounded_cache.clone());
+                
+                // Create HotDirectory with the extracted hotcache
+                let hot_directory = HotDirectory::open(caching_directory, hotcache_bytes)?;
+
+                let index = Index::open(hot_directory.clone())?;
+                Ok((index, hot_directory))
             },
             _ => {
                 Err(anyhow::anyhow!("Unsupported protocol for split: {}", split_path))
@@ -702,20 +759,86 @@ fn get_string_field(env: &mut JNIEnv, obj: &JObject, method_name: &str) -> anyho
     Ok(rust_string)
 }
 
+fn extract_aws_config_from_java_map(env: &mut JNIEnv, split_config: &JObject) -> anyhow::Result<Option<AwsConfig>> {
+    // Check if split_config is null/empty
+    if split_config.is_null() {
+        eprintln!("DEBUG: split_config is null");
+        return Ok(None);
+    }
+    
+    // Get the "aws_config" key from the HashMap
+    let key = env.new_string("aws_config")?;
+    let aws_config_obj = env.call_method(split_config, "get", "(Ljava/lang/Object;)Ljava/lang/Object;", &[(&key).into()])?;
+    let aws_config_obj = aws_config_obj.l()?;
+    
+    if aws_config_obj.is_null() {
+        eprintln!("DEBUG: aws_config key not found in split_config");
+        return Ok(None);
+    }
+    
+    // Extract AWS credentials from the nested Map
+    let access_key_jstr = env.new_string("access_key")?;
+    let secret_key_jstr = env.new_string("secret_key")?;
+    let region_jstr = env.new_string("region")?;
+    let endpoint_jstr = env.new_string("endpoint")?;
+    
+    let access_key = env.call_method(&aws_config_obj, "get", "(Ljava/lang/Object;)Ljava/lang/Object;", &[(&access_key_jstr).into()])?;
+    let secret_key = env.call_method(&aws_config_obj, "get", "(Ljava/lang/Object;)Ljava/lang/Object;", &[(&secret_key_jstr).into()])?;
+    let region = env.call_method(&aws_config_obj, "get", "(Ljava/lang/Object;)Ljava/lang/Object;", &[(&region_jstr).into()])?;
+    let endpoint = env.call_method(&aws_config_obj, "get", "(Ljava/lang/Object;)Ljava/lang/Object;", &[(&endpoint_jstr).into()])?;
+    
+    let access_key = if let Ok(obj) = access_key.l() {
+        if !obj.is_null() {
+            Some(env.get_string(&obj.into())?.to_string_lossy().into_owned())
+        } else { None }
+    } else { None };
+    
+    let secret_key = if let Ok(obj) = secret_key.l() {
+        if !obj.is_null() {
+            Some(env.get_string(&obj.into())?.to_string_lossy().into_owned())
+        } else { None }
+    } else { None };
+    
+    let region = if let Ok(obj) = region.l() {
+        if !obj.is_null() {
+            env.get_string(&obj.into())?.to_string_lossy().into_owned()
+        } else { "us-east-1".to_string() }
+    } else { "us-east-1".to_string() };
+    
+    let endpoint = if let Ok(obj) = endpoint.l() {
+        if !obj.is_null() {
+            Some(env.get_string(&obj.into())?.to_string_lossy().into_owned())
+        } else { None }
+    } else { None };
+    
+    if access_key.is_some() && secret_key.is_some() {
+        Ok(Some(AwsConfig {
+            access_key: access_key.unwrap(),
+            secret_key: secret_key.unwrap(),
+            region,
+            endpoint,
+            force_path_style: true, // Default for S3Mock
+        }))
+    } else {
+        eprintln!("DEBUG: Missing access_key or secret_key in aws_config");
+        Ok(None)
+    }
+}
+
 #[no_mangle]
 pub extern "system" fn Java_com_tantivy4java_SplitSearcher_createNativeWithSharedCache(
     mut env: JNIEnv,
     _class: JClass,
     split_path: JString,
     cache_manager_ptr: jlong,
-    _split_config: JObject,
+    split_config: JObject,
 ) -> jlong {
     if cache_manager_ptr == 0 {
         let _ = env.throw_new("java/lang/RuntimeException", "Invalid cache manager pointer");
         return 0;
     }
     
-    match create_split_searcher_with_shared_cache(&mut env, split_path, cache_manager_ptr) {
+    match create_split_searcher_with_shared_cache(&mut env, split_path, cache_manager_ptr, split_config) {
         Ok(ptr) => ptr,
         Err(e) => {
             let _ = env.throw_new("java/lang/RuntimeException", &format!("Failed to create SplitSearcher with shared cache: {}", e));
@@ -727,10 +850,15 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_createNativeWithShare
 fn create_split_searcher_with_shared_cache(
     env: &mut JNIEnv, 
     split_path: JString, 
-    cache_manager_ptr: jlong
+    cache_manager_ptr: jlong,
+    split_config: JObject
 ) -> anyhow::Result<jlong> {
     // Extract split path
     let split_path: String = env.get_string(&split_path)?.into();
+    
+    // Extract AWS configuration from split_config if present
+    let aws_config = extract_aws_config_from_java_map(env, &split_config)?;
+    eprintln!("DEBUG: Extracted AWS config from Java: {:?}", aws_config);
     
     // Register split with cache manager
     if cache_manager_ptr != 0 {
@@ -743,7 +871,7 @@ fn create_split_searcher_with_shared_cache(
         split_path,
         cache_size_bytes: 50_000_000, // Default 50MB
         hot_cache_capacity: 10_000,   // Default capacity
-        aws_config: None,             // Will inherit from cache manager
+        aws_config,                   // Use extracted AWS config from Java
     };
     
     let searcher = SplitSearcher::new(config)?;

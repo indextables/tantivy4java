@@ -54,6 +54,7 @@ public class SplitCacheManager implements AutoCloseable {
     private final Map<String, SplitSearcher> managedSearchers;
     private final AtomicLong totalCacheSize;
     private final long nativePtr;
+    private final Map<String, String> awsConfig;
     
     /**
      * Configuration for shared cache across multiple splits
@@ -184,6 +185,7 @@ public class SplitCacheManager implements AutoCloseable {
         this.maxCacheSize = config.getMaxCacheSize();
         this.managedSearchers = new ConcurrentHashMap<>();
         this.totalCacheSize = new AtomicLong(0);
+        this.awsConfig = new HashMap<>(config.getAwsConfig());
         this.nativePtr = createNativeCacheManager(config);
     }
     
@@ -219,7 +221,12 @@ public class SplitCacheManager implements AutoCloseable {
      * Create a split searcher that uses this shared cache
      */
     public SplitSearcher createSplitSearcher(String splitPath) {
-        return createSplitSearcher(splitPath, new HashMap<>());
+        // Pass AWS configuration from the cache manager to the searcher
+        Map<String, Object> splitConfig = new HashMap<>();
+        if (!this.awsConfig.isEmpty()) {
+            splitConfig.put("aws_config", this.awsConfig);
+        }
+        return createSplitSearcher(splitPath, splitConfig);
     }
     
     /**
