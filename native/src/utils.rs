@@ -53,11 +53,8 @@ pub fn with_object<T: 'static, R>(id: u64, f: impl FnOnce(&T) -> R) -> Option<R>
 pub fn with_object_mut<T: 'static, R>(id: u64, f: impl FnOnce(&mut T) -> R) -> Option<R> {
     let mut registry = OBJECT_REGISTRY.lock().unwrap();
     let boxed = registry.get_mut(&id)?;
-    // This is safe because we know T implements Send + Sync
-    let obj = unsafe { 
-        let ptr = boxed.as_mut() as *mut dyn std::any::Any as *mut T;
-        &mut *ptr
-    };
+    // Safe downcast using Any trait - this is the correct way to do dynamic casting
+    let obj = boxed.downcast_mut::<T>()?;
     Some(f(obj))
 }
 

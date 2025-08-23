@@ -38,6 +38,8 @@ public class SplitCacheManager implements AutoCloseable {
         private int maxConcurrentLoads = 8;
         private boolean enableQueryCache = true;
         private Map<String, String> awsConfig = new HashMap<>();
+        private Map<String, String> azureConfig = new HashMap<>();
+        private Map<String, String> gcpConfig = new HashMap<>();
         
         public CacheConfig(String cacheName) {
             this.cacheName = cacheName;
@@ -70,12 +72,48 @@ public class SplitCacheManager implements AutoCloseable {
             return this;
         }
         
+        // Azure Blob Storage configuration
+        public CacheConfig withAzureCredentials(String accountName, String accountKey) {
+            this.azureConfig.put("account_name", accountName);
+            this.azureConfig.put("account_key", accountKey);
+            return this;
+        }
+        
+        public CacheConfig withAzureConnectionString(String connectionString) {
+            this.azureConfig.put("connection_string", connectionString);
+            return this;
+        }
+        
+        public CacheConfig withAzureEndpoint(String endpoint) {
+            this.azureConfig.put("endpoint", endpoint);
+            return this;
+        }
+        
+        // GCP Cloud Storage configuration
+        public CacheConfig withGcpCredentials(String projectId, String serviceAccountKey) {
+            this.gcpConfig.put("project_id", projectId);
+            this.gcpConfig.put("service_account_key", serviceAccountKey);
+            return this;
+        }
+        
+        public CacheConfig withGcpCredentialsFile(String credentialsFilePath) {
+            this.gcpConfig.put("credentials_file", credentialsFilePath);
+            return this;
+        }
+        
+        public CacheConfig withGcpEndpoint(String endpoint) {
+            this.gcpConfig.put("endpoint", endpoint);
+            return this;
+        }
+        
         // Getters
         public String getCacheName() { return cacheName; }
         public long getMaxCacheSize() { return maxCacheSize; }
         public int getMaxConcurrentLoads() { return maxConcurrentLoads; }
         public boolean isQueryCacheEnabled() { return enableQueryCache; }
         public Map<String, String> getAwsConfig() { return awsConfig; }
+        public Map<String, String> getAzureConfig() { return azureConfig; }
+        public Map<String, String> getGcpConfig() { return gcpConfig; }
     }
     
     /**
@@ -108,6 +146,10 @@ public class SplitCacheManager implements AutoCloseable {
         public double getHitRate() { 
             long total = totalHits + totalMisses;
             return total > 0 ? (double) totalHits / total : 0.0; 
+        }
+        
+        public double getUtilization() {
+            return maxSize > 0 ? (double) currentSize / maxSize : 0.0;
         }
     }
     

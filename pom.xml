@@ -55,6 +55,45 @@
             <scope>test</scope>
         </dependency>
         
+        <!-- Azure Storage Blob -->
+        <dependency>
+            <groupId>com.azure</groupId>
+            <artifactId>azure-storage-blob</artifactId>
+            <version>12.23.0</version>
+            <scope>test</scope>
+        </dependency>
+        
+        <!-- GCP Cloud Storage -->
+        <dependency>
+            <groupId>com.google.cloud</groupId>
+            <artifactId>google-cloud-storage</artifactId>
+            <version>2.29.1</version>
+            <scope>test</scope>
+        </dependency>
+        
+        <!-- GCP NIO for LocalStorageHelper (pure Java, no Docker) -->
+        <dependency>
+            <groupId>com.google.cloud</groupId>
+            <artifactId>google-cloud-nio</artifactId>
+            <version>0.127.12</version>
+            <scope>test</scope>
+        </dependency>
+        
+        <!-- Mockito for mocking Azure and other services -->
+        <dependency>
+            <groupId>org.mockito</groupId>
+            <artifactId>mockito-core</artifactId>
+            <version>5.7.0</version>
+            <scope>test</scope>
+        </dependency>
+        
+        <dependency>
+            <groupId>org.mockito</groupId>
+            <artifactId>mockito-junit-jupiter</artifactId>
+            <version>5.7.0</version>
+            <scope>test</scope>
+        </dependency>
+        
         <!-- Adobe S3Mock for S3 testing -->
         <dependency>
             <groupId>io.findify</groupId>

@@ -140,14 +140,19 @@ pub extern "system" fn Java_com_tantivy4java_SplitCacheManager_closeNativeCacheM
     ptr: jlong,
 ) {
     if ptr != 0 {
-        let manager = unsafe { Arc::from_raw(ptr as *const GlobalSplitCacheManager) };
-        let cache_name = manager.cache_name.clone();
-        
-        // Remove from global registry
+        // Safely find and remove from global registry instead of dangerous Arc::from_raw()
         let mut managers = CACHE_MANAGERS.lock().unwrap();
-        managers.remove(&cache_name);
         
-        // manager will be dropped here, cleaning up resources
+        // Find the manager by pointer comparison
+        let cache_name_to_remove = managers
+            .iter()
+            .find(|(_, manager_arc)| Arc::as_ptr(manager_arc) as jlong == ptr)
+            .map(|(name, _)| name.clone());
+        
+        if let Some(cache_name) = cache_name_to_remove {
+            managers.remove(&cache_name);
+            // Arc will be properly dropped when removed from registry
+        }
     }
 }
 
@@ -161,7 +166,12 @@ pub extern "system" fn Java_com_tantivy4java_SplitCacheManager_getGlobalCacheSta
         return std::ptr::null_mut();
     }
     
-    let manager = unsafe { &*(ptr as *const GlobalSplitCacheManager) };
+    // Safely access through global registry instead of unsafe pointer cast
+    let managers = CACHE_MANAGERS.lock().unwrap();
+    let manager = match managers.values().find(|m| Arc::as_ptr(m) as jlong == ptr) {
+        Some(manager_arc) => manager_arc,
+        None => return std::ptr::null_mut(),
+    };
     let stats = manager.get_cache_stats();
     
     // Create GlobalCacheStats Java object
@@ -198,7 +208,12 @@ pub extern "system" fn Java_com_tantivy4java_SplitCacheManager_forceEvictionNati
         return;
     }
     
-    let manager = unsafe { &*(ptr as *const GlobalSplitCacheManager) };
+    // Safely access through global registry instead of unsafe pointer cast
+    let managers = CACHE_MANAGERS.lock().unwrap();
+    let manager = match managers.values().find(|m| Arc::as_ptr(m) as jlong == ptr) {
+        Some(manager_arc) => manager_arc,
+        None => return,
+    };
     manager.force_eviction(target_size_bytes as u64);
 }
 
@@ -214,7 +229,12 @@ pub extern "system" fn Java_com_tantivy4java_SplitCacheManager_preloadComponents
         return;
     }
     
-    let manager = unsafe { &*(ptr as *const GlobalSplitCacheManager) };
+    // Safely access through global registry instead of unsafe pointer cast
+    let managers = CACHE_MANAGERS.lock().unwrap();
+    let manager = match managers.values().find(|m| Arc::as_ptr(m) as jlong == ptr) {
+        Some(manager_arc) => manager_arc,
+        None => return,
+    };
     // Simulate preloading by updating cache stats
     manager.current_size.fetch_add(1024, Ordering::Relaxed);
 }
@@ -231,7 +251,12 @@ pub extern "system" fn Java_com_tantivy4java_SplitCacheManager_evictComponentsNa
         return;
     }
     
-    let manager = unsafe { &*(ptr as *const GlobalSplitCacheManager) };
+    // Safely access through global registry instead of unsafe pointer cast
+    let managers = CACHE_MANAGERS.lock().unwrap();
+    let manager = match managers.values().find(|m| Arc::as_ptr(m) as jlong == ptr) {
+        Some(manager_arc) => manager_arc,
+        None => return,
+    };
     // Simulate eviction by incrementing counter
     manager.total_evictions.fetch_add(1, Ordering::Relaxed);
 }
@@ -248,7 +273,12 @@ pub extern "system" fn Java_com_tantivy4java_SplitCacheManager_searchAcrossAllSp
         return std::ptr::null_mut();
     }
     
-    let manager = unsafe { &*(ptr as *const GlobalSplitCacheManager) };
+    // Safely access through global registry instead of unsafe pointer cast
+    let managers = CACHE_MANAGERS.lock().unwrap();
+    let manager = match managers.values().find(|m| Arc::as_ptr(m) as jlong == ptr) {
+        Some(manager_arc) => manager_arc,
+        None => return std::ptr::null_mut(),
+    };
     
     // Simulate cache hit
     manager.total_hits.fetch_add(1, Ordering::Relaxed);
@@ -270,7 +300,12 @@ pub extern "system" fn Java_com_tantivy4java_SplitCacheManager_searchAcrossSplit
         return std::ptr::null_mut();
     }
     
-    let manager = unsafe { &*(ptr as *const GlobalSplitCacheManager) };
+    // Safely access through global registry instead of unsafe pointer cast
+    let managers = CACHE_MANAGERS.lock().unwrap();
+    let manager = match managers.values().find(|m| Arc::as_ptr(m) as jlong == ptr) {
+        Some(manager_arc) => manager_arc,
+        None => return std::ptr::null_mut(),
+    };
     
     // Simulate cache activity
     manager.total_hits.fetch_add(1, Ordering::Relaxed);

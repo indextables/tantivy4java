@@ -417,6 +417,11 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_validateSplitNative(
         return false as jboolean;
     }
     
+    // Add basic pointer validation before unsafe dereference
+    if (ptr as *mut SplitSearcher).is_null() {
+        return false as jboolean;
+    }
+    
     let searcher = unsafe { &*(ptr as *mut SplitSearcher) };
     searcher.validate_split() as jboolean
 }

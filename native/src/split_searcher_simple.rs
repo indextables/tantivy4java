@@ -97,6 +97,11 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_validateSplitNative(
         return false as jboolean;
     }
     
+    // Add basic pointer validation before unsafe dereference
+    if (ptr as *mut SplitSearcherSimple).is_null() {
+        return false as jboolean;
+    }
+    
     let searcher = unsafe { &*(ptr as *mut SplitSearcherSimple) };
     searcher.validate_split() as jboolean
 }
@@ -108,6 +113,11 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_listSplitFilesNative(
     ptr: jlong,
 ) -> jobject {
     if ptr == 0 {
+        return std::ptr::null_mut();
+    }
+    
+    // Add basic pointer validation before unsafe dereference
+    if (ptr as *mut SplitSearcherSimple).is_null() {
         return std::ptr::null_mut();
     }
     
