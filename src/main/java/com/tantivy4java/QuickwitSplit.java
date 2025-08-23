@@ -178,7 +178,19 @@ public class QuickwitSplit {
             throw new IllegalArgumentException("Node ID cannot be null or empty");
         }
 
-        return nativeConvertIndex(index.getNativePtr(), outputPath, config);
+        // Check if this index has a stored path (file-based index)
+        String indexPath = index.getIndexPath();
+        if (indexPath != null) {
+            // Delegate to the working convertIndexFromPath method
+            return convertIndexFromPath(indexPath, outputPath, config);
+        } else {
+            // This is an in-memory index - cannot be converted directly
+            throw new IllegalArgumentException(
+                "Cannot convert in-memory index to Quickwit split. " +
+                "For in-memory indices, first save the index to disk using IndexWriter.commit(), " +
+                "then use QuickwitSplit.convertIndexFromPath(indexPath, outputPath, config) instead."
+            );
+        }
     }
 
     /**

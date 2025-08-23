@@ -6,17 +6,23 @@ use jni::JNIEnv;
 use jni::objects::{JClass, JObject, JString, JValue};
 use jni::sys::{jlong, jint, jobject};
 
-use quickwit_storage::ByteRangeCache;
+use quickwit_storage::{ByteRangeCache, SplitCache};
+use tokio::runtime::Runtime;
+// Note: LeafSearchCache might be in a different location in Quickwit codebase
+// For now, we'll implement a simpler cache structure that follows Quickwit patterns
 
 /// Global cache manager that follows Quickwit's multi-level caching architecture
 pub struct GlobalSplitCacheManager {
     cache_name: String,
     max_cache_size: u64,
     
-    // Global shared caches (following Quickwit's pattern)
+    // Runtime for async operations
+    runtime: Runtime,
+    
+    // Global shared caches following Quickwit's actual architecture
+    // Using the available Quickwit cache types
+    split_cache: Arc<SplitCache>,
     byte_range_cache: ByteRangeCache,
-    search_result_cache: Mutex<HashMap<String, Vec<u8>>>, // Simplified search cache
-    component_cache: Mutex<HashMap<String, Vec<u8>>>,     // Component data cache
     
     // Statistics
     total_hits: AtomicU64,
@@ -30,14 +36,47 @@ pub struct GlobalSplitCacheManager {
 
 impl GlobalSplitCacheManager {
     pub fn new(cache_name: String, max_cache_size: u64) -> Self {
+        // Create runtime first
+        let runtime = Runtime::new().expect("Failed to create Tokio runtime for cache manager");
+        
+        // Create proper Quickwit caches following their architecture
+        // Use the available Quickwit cache constructors
+        // Create proper SplitCache with temporary directory and storage resolver
+        use quickwit_config::SplitCacheLimits;
+        use tempfile::TempDir;
+        use std::num::NonZeroU32;
+        use bytesize::ByteSize;
+        
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        
+        // Create SplitCacheLimits manually since default() isn't available
+        let limits = SplitCacheLimits {
+            max_num_bytes: ByteSize::mb(max_cache_size / (1024 * 1024)), // Convert to MB
+            max_num_splits: NonZeroU32::new(10_000).unwrap(),
+            num_concurrent_downloads: NonZeroU32::new(1).unwrap(),
+            max_file_descriptors: NonZeroU32::new(100).unwrap(),
+        };
+        
+        let storage_resolver = crate::split_searcher::create_storage_resolver();
+        
+        // Ensure we're in the runtime context when creating SplitCache
+        let _guard = runtime.enter();
+        let split_cache = SplitCache::with_root_path(
+            temp_dir.path().to_path_buf(),
+            storage_resolver,
+            limits,
+        ).expect("Failed to create SplitCache");
+        
+        let byte_range_cache = ByteRangeCache::with_infinite_capacity(
+            &quickwit_storage::STORAGE_METRICS.shortlived_cache,
+        );
+        
         Self {
             cache_name,
             max_cache_size,
-            byte_range_cache: ByteRangeCache::with_infinite_capacity(
-                &quickwit_storage::STORAGE_METRICS.shortlived_cache,
-            ),
-            search_result_cache: Mutex::new(HashMap::new()),
-            component_cache: Mutex::new(HashMap::new()),
+            runtime,
+            split_cache,
+            byte_range_cache,
             total_hits: AtomicU64::new(0),
             total_misses: AtomicU64::new(0),
             total_evictions: AtomicU64::new(0),
@@ -64,6 +103,7 @@ impl GlobalSplitCacheManager {
     }
     
     pub fn get_cache_stats(&self) -> GlobalCacheStats {
+        // For now, use our tracking counters until we can properly access split cache stats
         GlobalCacheStats {
             total_hits: self.total_hits.load(Ordering::Relaxed),
             total_misses: self.total_misses.load(Ordering::Relaxed),
@@ -72,6 +112,15 @@ impl GlobalSplitCacheManager {
             max_size: self.max_cache_size,
             active_splits: self.get_managed_split_count() as u64,
         }
+    }
+    
+    // Accessors for the Quickwit caches
+    pub fn get_split_cache(&self) -> Arc<SplitCache> {
+        self.split_cache.clone()
+    }
+    
+    pub fn get_byte_range_cache(&self) -> &ByteRangeCache {
+        &self.byte_range_cache
     }
     
     pub fn force_eviction(&self, _target_size_bytes: u64) {

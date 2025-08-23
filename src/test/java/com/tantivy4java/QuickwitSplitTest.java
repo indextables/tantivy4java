@@ -503,7 +503,7 @@ class QuickwitSplitTest {
         
         try (IndexWriter writer = largeIndex.writer(100, 2)) {
             // Add more documents with simplified approach
-            for (int i = 0; i < 20; i++) {
+            for (int i = 0; i < 120; i++) {
                 Document doc = new Document();
                 doc.addText("title", "Document " + i);
                 doc.addText("body", "This is test document number " + i + " with more content to make it larger");

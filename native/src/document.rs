@@ -43,7 +43,7 @@ pub struct DocumentBuilder {
 }
 
 /// Document retrieved from search results with field values
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct RetrievedDocument {
     pub field_values: BTreeMap<String, Vec<OwnedValue>>,
 }

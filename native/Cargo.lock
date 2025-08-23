@@ -814,6 +814,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9555578bc9e57714c812a1f84e4fc5b4d21fcb063490c624de019f7464c91268"
 
 [[package]]
+name = "chitchat"
+version = "0.9.0"
+source = "git+https://github.com/quickwit-oss/chitchat.git?rev=bd54c81#bd54c810700814f83599a31a7e29f2a5eb8324b3"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bytes",
+ "itertools 0.14.0",
+ "lru 0.13.0",
+ "rand 0.9.2",
+ "serde",
+ "tokio",
+ "tokio-stream",
+ "tracing",
+ "zstd",
+]
+
+[[package]]
 name = "chrono"
 version = "0.4.41"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1111,6 +1129,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "difflib"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6184e33543162437515c2e2b48714794e37845ec9851711914eec9d308f6ebe8"
+
+[[package]]
 name = "digest"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1131,6 +1155,12 @@ dependencies = [
  "quote",
  "syn 2.0.106",
 ]
+
+[[package]]
+name = "downcast"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1435fa1053d8b2fbbe9be7e97eca7f33d37b28409959813daefc1446a14247f1"
 
 [[package]]
 name = "downcast-rs"
@@ -1288,6 +1318,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "float-cmp"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "98de4bbd547a563b716d8dfa9aad1cb19bfab00f4fa09a6a4ed21dbcf44ce9c4"
+dependencies = [
+ "num-traits",
+]
+
+[[package]]
 name = "flume"
 version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1319,6 +1358,12 @@ checksum = "cb4cb245038516f5f85277875cdaa4f7d2c9a0fa0468de06ed190163b1581fcf"
 dependencies = [
  "percent-encoding",
 ]
+
+[[package]]
+name = "fragile"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "28dd6caf6059519a65843af8fe2a3ae298b14b80179855aeb4adc2c1934ee619"
 
 [[package]]
 name = "fs4"
@@ -1800,9 +1845,11 @@ dependencies = [
  "percent-encoding",
  "pin-project-lite",
  "socket2 0.6.0",
+ "system-configuration",
  "tokio",
  "tower-service",
  "tracing",
+ "windows-registry",
 ]
 
 [[package]]
@@ -2012,6 +2059,15 @@ dependencies = [
 
 [[package]]
 name = "itertools"
+version = "0.10.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b0fd2260e829bddf4cb6ea802289de2f86d6a7a690192fbe91b3f46e0f2c8473"
+dependencies = [
+ "either",
+]
+
+[[package]]
+name = "itertools"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ba291022dbbd398a455acf126c1e341954079855bc60dfdda641363bd6922569"
@@ -2121,6 +2177,12 @@ name = "libm"
 version = "0.2.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f9fbbcab51052fe104eb5e5d351cf728d30a5be1fe14d9be8a3b097481fb97de"
+
+[[package]]
+name = "linked-hash-map"
+version = "0.5.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0717cef1bc8b636c6e1c1bbdefc09e6322da8a9321966e8928ef80d20f7f770f"
 
 [[package]]
 name = "linux-raw-sys"
@@ -2265,6 +2327,46 @@ dependencies = [
 ]
 
 [[package]]
+name = "mockall"
+version = "0.11.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4c84490118f2ee2d74570d114f3d0493cbf02790df303d2707606c3e14e07c96"
+dependencies = [
+ "cfg-if",
+ "downcast",
+ "fragile",
+ "lazy_static",
+ "mockall_derive",
+ "predicates",
+ "predicates-tree",
+]
+
+[[package]]
+name = "mockall_derive"
+version = "0.11.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "22ce75669015c4f47b289fd4d4f56e894e4c96003ffdf3ac51313126f94c6cbb"
+dependencies = [
+ "cfg-if",
+ "proc-macro2",
+ "quote",
+ "syn 1.0.109",
+]
+
+[[package]]
+name = "mrecordlog"
+version = "0.4.0"
+source = "git+https://github.com/quickwit-oss/mrecordlog?rev=306c0a7#306c0a708db03ee23b37288308cf03abe29b3cd9"
+dependencies = [
+ "bytes",
+ "crc32fast",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tracing",
+]
+
+[[package]]
 name = "multimap"
 version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2310,6 +2412,12 @@ dependencies = [
  "memchr",
  "minimal-lexical",
 ]
+
+[[package]]
+name = "normalize-line-endings"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "61807f77802ff30975e01f4f071c8ba10c022052f98b3294119f3e615d13e5be"
 
 [[package]]
 name = "ntapi"
@@ -2437,15 +2545,6 @@ checksum = "1a80800c0488c3a21695ea981a54918fbb37abf04f4d0720c453632255e2ff0e"
 name = "ownedbytes"
 version = "0.7.0"
 source = "git+https://github.com/quickwit-oss/tantivy/?rev=80f5f1e#80f5f1ecd4d5d30069b44e5acd3801f610d36056"
-dependencies = [
- "stable_deref_trait",
-]
-
-[[package]]
-name = "ownedbytes"
-version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2fbd56f7631767e61784dc43f8580f403f4475bd4aaa4da003e6295e1bab4a7e"
 dependencies = [
  "stable_deref_trait",
 ]
@@ -2676,6 +2775,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "predicates"
+version = "2.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "59230a63c37f3e18569bdb90e4a89cbf5bf8b06fea0b84e65ea10cc4df47addd"
+dependencies = [
+ "difflib",
+ "float-cmp",
+ "itertools 0.10.5",
+ "normalize-line-endings",
+ "predicates-core",
+ "regex",
+]
+
+[[package]]
+name = "predicates-core"
+version = "1.0.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "727e462b119fe9c93fd0eb1429a5f7647394014cf3c04ab2c0350eeb09095ffa"
+
+[[package]]
+name = "predicates-tree"
+version = "1.0.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "72dd2d6d381dfb73a193c7fca536518d7caee39fc8503f74e7dc0be0531b425c"
+dependencies = [
+ "predicates-core",
+ "termtree",
+]
+
+[[package]]
 name = "prettyplease"
 version = "0.2.36"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2869,6 +2998,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "quickwit-cluster"
+version = "0.8.0"
+source = "git+https://github.com/quickwit-oss/quickwit#15cd9e59fc09f0c4fb77c7e04582e2afe5c2df59"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bytesize",
+ "chitchat",
+ "futures",
+ "itertools 0.14.0",
+ "once_cell",
+ "pin-project",
+ "quickwit-common",
+ "quickwit-config",
+ "quickwit-proto",
+ "rand 0.8.5",
+ "serde",
+ "serde_json",
+ "time",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tracing",
+ "utoipa",
+]
+
+[[package]]
 name = "quickwit-codegen"
 version = "0.8.0"
 source = "git+https://github.com/quickwit-oss/quickwit#15cd9e59fc09f0c4fb77c7e04582e2afe5c2df59"
@@ -2901,6 +3057,7 @@ dependencies = [
  "hostname",
  "http 1.3.1",
  "hyper 1.7.0",
+ "hyper-util",
  "itertools 0.14.0",
  "once_cell",
  "pin-project",
@@ -2963,7 +3120,7 @@ dependencies = [
  "itertools 0.14.0",
  "serde",
  "serde_json",
- "tantivy 0.23.0",
+ "tantivy",
  "time",
  "time-fmt",
 ]
@@ -2979,7 +3136,7 @@ dependencies = [
  "quickwit-common",
  "quickwit-storage",
  "serde",
- "tantivy 0.23.0",
+ "tantivy",
  "time",
  "tokio",
  "tracing",
@@ -3008,9 +3165,44 @@ dependencies = [
  "serde_json",
  "serde_json_borrow",
  "siphasher",
- "tantivy 0.23.0",
+ "tantivy",
  "thiserror 2.0.15",
  "tracing",
+ "utoipa",
+]
+
+[[package]]
+name = "quickwit-ingest"
+version = "0.8.0"
+source = "git+https://github.com/quickwit-oss/quickwit#15cd9e59fc09f0c4fb77c7e04582e2afe5c2df59"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bytes",
+ "bytesize",
+ "futures",
+ "http 1.3.1",
+ "itertools 0.14.0",
+ "mrecordlog",
+ "once_cell",
+ "prost",
+ "quickwit-actors",
+ "quickwit-cluster",
+ "quickwit-codegen",
+ "quickwit-common",
+ "quickwit-config",
+ "quickwit-doc-mapper",
+ "quickwit-proto",
+ "rand 0.8.5",
+ "serde",
+ "serde_json",
+ "serde_json_borrow",
+ "thiserror 2.0.15",
+ "tokio",
+ "tonic",
+ "tower",
+ "tracing",
+ "ulid",
  "utoipa",
 ]
 
@@ -3058,6 +3250,29 @@ dependencies = [
  "tracing",
  "ulid",
  "utoipa",
+]
+
+[[package]]
+name = "quickwit-opentelemetry"
+version = "0.8.0"
+source = "git+https://github.com/quickwit-oss/quickwit#15cd9e59fc09f0c4fb77c7e04582e2afe5c2df59"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "hex",
+ "once_cell",
+ "prost",
+ "quickwit-common",
+ "quickwit-config",
+ "quickwit-ingest",
+ "quickwit-proto",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.15",
+ "time",
+ "tokio",
+ "tonic",
+ "tracing",
 ]
 
 [[package]]
@@ -3109,10 +3324,54 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_with",
- "tantivy 0.23.0",
+ "tantivy",
  "tantivy-fst",
  "thiserror 2.0.15",
  "time",
+]
+
+[[package]]
+name = "quickwit-search"
+version = "0.8.0"
+source = "git+https://github.com/quickwit-oss/quickwit#15cd9e59fc09f0c4fb77c7e04582e2afe5c2df59"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "base64 0.22.1",
+ "bytes",
+ "bytesize",
+ "fnv",
+ "futures",
+ "http 1.3.1",
+ "itertools 0.14.0",
+ "mockall",
+ "once_cell",
+ "pin-project",
+ "postcard",
+ "prost",
+ "quickwit-common",
+ "quickwit-config",
+ "quickwit-directories",
+ "quickwit-doc-mapper",
+ "quickwit-metastore",
+ "quickwit-opentelemetry",
+ "quickwit-proto",
+ "quickwit-query",
+ "quickwit-storage",
+ "rayon",
+ "serde",
+ "serde_json",
+ "serde_json_borrow",
+ "tantivy",
+ "tantivy-fst",
+ "thiserror 2.0.15",
+ "tokio",
+ "tokio-stream",
+ "tower",
+ "tracing",
+ "ttl_cache",
+ "ulid",
+ "utoipa",
 ]
 
 [[package]]
@@ -3145,7 +3404,7 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
- "tantivy 0.23.0",
+ "tantivy",
  "tempfile",
  "thiserror 2.0.15",
  "tokio",
@@ -3924,6 +4183,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "system-configuration"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3c879d448e9d986b661742763247d3693ed13609438cf3d006f51f5368a5ba6b"
+dependencies = [
+ "bitflags",
+ "core-foundation 0.9.4",
+ "system-configuration-sys",
+]
+
+[[package]]
+name = "system-configuration-sys"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8e1d1b10ced5ca923a1fcb8d03e96b8d3268065d724548c0211415ff6ac6bac4"
+dependencies = [
+ "core-foundation-sys",
+ "libc",
+]
+
+[[package]]
 name = "tantivy"
 version = "0.23.0"
 source = "git+https://github.com/quickwit-oss/tantivy/?rev=80f5f1e#80f5f1ecd4d5d30069b44e5acd3801f610d36056"
@@ -3962,14 +4242,14 @@ dependencies = [
  "serde_json",
  "sketches-ddsketch",
  "smallvec",
- "tantivy-bitpacker 0.6.0",
- "tantivy-columnar 0.3.0",
- "tantivy-common 0.7.0",
+ "tantivy-bitpacker",
+ "tantivy-columnar",
+ "tantivy-common",
  "tantivy-fst",
- "tantivy-query-grammar 0.22.0",
- "tantivy-sstable 0.3.0",
- "tantivy-stacker 0.3.0",
- "tantivy-tokenizer-api 0.3.0",
+ "tantivy-query-grammar",
+ "tantivy-sstable",
+ "tantivy-stacker",
+ "tantivy-tokenizer-api",
  "tempfile",
  "thiserror 2.0.15",
  "time",
@@ -3979,70 +4259,9 @@ dependencies = [
 ]
 
 [[package]]
-name = "tantivy"
-version = "0.24.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "64a966cb0e76e311f09cf18507c9af192f15d34886ee43d7ba7c7e3803660c43"
-dependencies = [
- "aho-corasick",
- "arc-swap",
- "base64 0.22.1",
- "bitpacking",
- "bon",
- "byteorder",
- "census",
- "crc32fast",
- "crossbeam-channel",
- "downcast-rs",
- "fastdivide",
- "fnv",
- "fs4",
- "htmlescape",
- "hyperloglogplus",
- "itertools 0.14.0",
- "levenshtein_automata",
- "log",
- "lru 0.12.5",
- "lz4_flex",
- "measure_time",
- "memmap2",
- "once_cell",
- "oneshot",
- "rayon",
- "regex",
- "rust-stemmers",
- "rustc-hash 2.1.1",
- "serde",
- "serde_json",
- "sketches-ddsketch",
- "smallvec",
- "tantivy-bitpacker 0.8.0",
- "tantivy-columnar 0.5.0",
- "tantivy-common 0.9.0",
- "tantivy-fst",
- "tantivy-query-grammar 0.24.0",
- "tantivy-stacker 0.5.0",
- "tantivy-tokenizer-api 0.5.0",
- "tempfile",
- "thiserror 2.0.15",
- "time",
- "uuid",
- "winapi",
-]
-
-[[package]]
 name = "tantivy-bitpacker"
 version = "0.6.0"
 source = "git+https://github.com/quickwit-oss/tantivy/?rev=80f5f1e#80f5f1ecd4d5d30069b44e5acd3801f610d36056"
-dependencies = [
- "bitpacking",
-]
-
-[[package]]
-name = "tantivy-bitpacker"
-version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1adc286a39e089ae9938935cd488d7d34f14502544a36607effd2239ff0e2494"
 dependencies = [
  "bitpacking",
 ]
@@ -4056,26 +4275,10 @@ dependencies = [
  "fastdivide",
  "itertools 0.14.0",
  "serde",
- "tantivy-bitpacker 0.6.0",
- "tantivy-common 0.7.0",
- "tantivy-sstable 0.3.0",
- "tantivy-stacker 0.3.0",
-]
-
-[[package]]
-name = "tantivy-columnar"
-version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6300428e0c104c4f7db6f95b466a6f5c1b9aece094ec57cdd365337908dc7344"
-dependencies = [
- "downcast-rs",
- "fastdivide",
- "itertools 0.14.0",
- "serde",
- "tantivy-bitpacker 0.8.0",
- "tantivy-common 0.9.0",
- "tantivy-sstable 0.5.0",
- "tantivy-stacker 0.5.0",
+ "tantivy-bitpacker",
+ "tantivy-common",
+ "tantivy-sstable",
+ "tantivy-stacker",
 ]
 
 [[package]]
@@ -4085,20 +4288,7 @@ source = "git+https://github.com/quickwit-oss/tantivy/?rev=80f5f1e#80f5f1ecd4d5d
 dependencies = [
  "async-trait",
  "byteorder",
- "ownedbytes 0.7.0",
- "serde",
- "time",
-]
-
-[[package]]
-name = "tantivy-common"
-version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e91b6ea6090ce03dc72c27d0619e77185d26cc3b20775966c346c6d4f7e99d7f"
-dependencies = [
- "async-trait",
- "byteorder",
- "ownedbytes 0.9.0",
+ "ownedbytes",
  "serde",
  "time",
 ]
@@ -4123,39 +4313,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "tantivy-query-grammar"
-version = "0.24.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e810cdeeebca57fc3f7bfec5f85fdbea9031b2ac9b990eb5ff49b371d52bbe6a"
-dependencies = [
- "nom",
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "tantivy-sstable"
 version = "0.3.0"
 source = "git+https://github.com/quickwit-oss/tantivy/?rev=80f5f1e#80f5f1ecd4d5d30069b44e5acd3801f610d36056"
 dependencies = [
  "futures-util",
  "itertools 0.14.0",
- "tantivy-bitpacker 0.6.0",
- "tantivy-common 0.7.0",
- "tantivy-fst",
- "zstd",
-]
-
-[[package]]
-name = "tantivy-sstable"
-version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "709f22c08a4c90e1b36711c1c6cad5ae21b20b093e535b69b18783dd2cb99416"
-dependencies = [
- "futures-util",
- "itertools 0.14.0",
- "tantivy-bitpacker 0.8.0",
- "tantivy-common 0.9.0",
+ "tantivy-bitpacker",
+ "tantivy-common",
  "tantivy-fst",
  "zstd",
 ]
@@ -4167,33 +4332,13 @@ source = "git+https://github.com/quickwit-oss/tantivy/?rev=80f5f1e#80f5f1ecd4d5d
 dependencies = [
  "murmurhash32",
  "rand_distr",
- "tantivy-common 0.7.0",
-]
-
-[[package]]
-name = "tantivy-stacker"
-version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2bcdebb267671311d1e8891fd9d1301803fdb8ad21ba22e0a30d0cab49ba59c1"
-dependencies = [
- "murmurhash32",
- "rand_distr",
- "tantivy-common 0.9.0",
+ "tantivy-common",
 ]
 
 [[package]]
 name = "tantivy-tokenizer-api"
 version = "0.3.0"
 source = "git+https://github.com/quickwit-oss/tantivy/?rev=80f5f1e#80f5f1ecd4d5d30069b44e5acd3801f610d36056"
-dependencies = [
- "serde",
-]
-
-[[package]]
-name = "tantivy-tokenizer-api"
-version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dfa942fcee81e213e09715bbce8734ae2180070b97b33839a795ba1de201547d"
 dependencies = [
  "serde",
 ]
@@ -4204,9 +4349,9 @@ version = "0.24.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
+ "bytesize",
  "chrono",
  "futures",
- "itertools 0.14.0",
  "jni",
  "lazy_static",
  "once_cell",
@@ -4215,13 +4360,14 @@ dependencies = [
  "quickwit-directories",
  "quickwit-metastore",
  "quickwit-proto",
+ "quickwit-search",
  "quickwit-storage",
  "serde",
  "serde_json",
- "tantivy 0.24.2",
+ "tantivy",
+ "tempfile",
  "time",
  "tokio",
- "tokio-metrics",
  "uuid",
 ]
 
@@ -4246,6 +4392,12 @@ checksum = "06794f8f6c5c898b3275aebefa6b8a1cb24cd2c6c79397ab15774837a0bc5755"
 dependencies = [
  "winapi-util",
 ]
+
+[[package]]
+name = "termtree"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8f50febec83f5ee1df3015341d8bd429f2d1cc62bcba7ea2076759d315084683"
 
 [[package]]
 name = "thiserror"
@@ -4630,6 +4782,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
+name = "ttl_cache"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4189890526f0168710b6ee65ceaedf1460c48a14318ceec933cb26baa492096a"
+dependencies = [
+ "linked-hash-map",
+]
+
+[[package]]
 name = "typenum"
 version = "1.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4986,6 +5147,17 @@ name = "windows-link"
 version = "0.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5e6ad25900d524eaabdbbb96d20b4311e1e7ae1699af4fb28c17ae66c80d798a"
+
+[[package]]
+name = "windows-registry"
+version = "0.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5b8a9ed28765efc97bbc954883f4e6796c33a06546ebafacbabee9696967499e"
+dependencies = [
+ "windows-link",
+ "windows-result 0.3.4",
+ "windows-strings",
+]
 
 [[package]]
 name = "windows-result"

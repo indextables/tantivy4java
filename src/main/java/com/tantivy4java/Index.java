@@ -33,6 +33,7 @@ public class Index implements AutoCloseable {
 
     private long nativePtr;
     private boolean closed = false;
+    private String indexPath; // Store the index path for file-based indices
 
     /**
      * Create a new index with the given schema.
@@ -42,6 +43,7 @@ public class Index implements AutoCloseable {
      */
     public Index(Schema schema, String path, boolean reuse) {
         this.nativePtr = nativeNew(schema.getNativePtr(), path, reuse);
+        this.indexPath = (path != null && !path.isEmpty()) ? path : null;
     }
 
     /**
@@ -68,7 +70,9 @@ public class Index implements AutoCloseable {
      */
     public static Index open(String path) {
         long ptr = nativeOpen(path);
-        return new Index(ptr);
+        Index index = new Index(ptr);
+        index.indexPath = path; // Store the path for opened indices
+        return index;
     }
 
     /**
@@ -82,6 +86,7 @@ public class Index implements AutoCloseable {
 
     Index(long nativePtr) {
         this.nativePtr = nativePtr;
+        this.indexPath = null; // Path unknown for this constructor
     }
 
     /**
@@ -236,6 +241,17 @@ public class Index implements AutoCloseable {
             throw new IllegalStateException("Index has been closed");
         }
         return nativePtr;
+    }
+
+    /**
+     * Get the index directory path if this is a file-based index.
+     * @return Index path, or null if this is an in-memory index
+     */
+    public String getIndexPath() {
+        if (closed) {
+            throw new IllegalStateException("Index has been closed");
+        }
+        return indexPath;
     }
 
     @Override

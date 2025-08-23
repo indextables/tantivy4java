@@ -7,6 +7,9 @@ use std::ops::RangeInclusive;
 use std::io::Write;
 use std::fs::File;
 
+// Add tantivy Directory trait import
+use tantivy::Directory;
+
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
@@ -15,11 +18,11 @@ use serde_json;
 use base64::{Engine, engine::general_purpose};
 
 // Quickwit imports
-use quickwit_metastore::SplitMetadata;
-use quickwit_proto::types::{IndexUid, SplitId, SourceId};
-use quickwit_storage::SplitPayloadBuilder;
+use quickwit_storage::{SplitPayloadBuilder, PutPayload, BundleStorage, RamStorage, Storage};
+use quickwit_directories::write_hotcache;
+use tantivy::directory::{OwnedBytes, FileSlice};
 
-use crate::utils::{convert_throwable, jstring_to_string, string_to_jstring};
+use crate::utils::{convert_throwable, jstring_to_string, string_to_jstring, with_object};
 
 /// Configuration for split conversion passed from Java
 #[derive(Debug)]
@@ -209,30 +212,28 @@ fn convert_tantivy_to_split(
     split_content.extend_from_slice(index_info.as_bytes());
     split_content.extend_from_slice(b"INDEX_INFO_END\n");
     
-    // Placeholder for actual index data (in a real implementation, this would contain the Tantivy files)
-    split_content.extend_from_slice(b"INDEX_DATA_START\n");
-    split_content.extend_from_slice(b"# Tantivy index files would be embedded here\n");
-    split_content.extend_from_slice(b"# This is a working placeholder implementation\n");
-    split_content.extend_from_slice(b"INDEX_DATA_END\n");
+    // Use Quickwit's SplitPayloadBuilder to create a real split bundle
+    // Create a runtime for async operations
+    let runtime = tokio::runtime::Runtime::new()
+        .map_err(|e| anyhow::anyhow!("Failed to create tokio runtime: {}", e))?;
     
-    // Write to file
-    let mut file = File::create(output_path)?;
-    file.write_all(&split_content)?;
-    file.flush()?;
+    // Unfortunately, we cannot reliably extract the directory path from a Tantivy Index object
+    // because MmapDirectory's path field is private and there's no public accessor.
+    // The Index object abstracts away the underlying directory implementation details.
     
-    Ok(split_metadata)
-}
-
-fn create_placeholder_split(output_path: &PathBuf, split_metadata: &QuickwitSplitMetadata) -> Result<(), anyhow::Error> {
-    let split_content = format!(
-        "QUICKWIT_SPLIT_V1\nMETADATA_START\n{}\nMETADATA_END\nINDEX_DATA_START\n# Placeholder data\nINDEX_DATA_END\n",
-        serde_json::to_string_pretty(&split_metadata)?
-    );
+    eprintln!("DEBUG: Cannot extract directory path from Index object - path is not publicly accessible");
     
-    let mut file = File::create(output_path)?;
-    file.write_all(split_content.as_bytes())?;
-    file.flush()?;
-    Ok(())
+    return Err(anyhow::anyhow!(
+        "Converting from Index object is not currently supported due to Tantivy API limitations. \
+        The directory path cannot be extracted from the Index object. \
+        Please use QuickwitSplit.convertIndexFromPath(indexPath, outputPath, config) instead, \
+        where you provide the directory path directly. \
+        \
+        Example: \
+        QuickwitSplit.convertIndexFromPath(\"/path/to/index\", \"/path/to/output.split\", config) \
+        \
+        This method works correctly and creates proper Quickwit split files."
+    ));
 }
 
 fn convert_index_from_path_impl(index_path: &str, output_path: &str, config: &SplitConfig) -> Result<QuickwitSplitMetadata, anyhow::Error> {
@@ -311,40 +312,41 @@ fn create_quickwit_split(
     // Create split fields metadata (required by Quickwit)
     let split_fields = b"{}"; // Minimal empty JSON for split fields
     
-    // Create minimal hotcache
-    let hotcache = b""; // Empty hotcache for now
+    // Create proper hotcache using Quickwit's write_hotcache function
+    let hotcache = {
+        let mut hotcache_buffer = Vec::new();
+        
+        // Open the index directory to generate hotcache from (use the index_dir parameter)
+        use tantivy::directory::MmapDirectory;
+        let mmap_directory = MmapDirectory::open(index_dir)?;
+        
+        // Use Quickwit's write_hotcache function exactly like they do
+        write_hotcache(mmap_directory, &mut hotcache_buffer)
+            .map_err(|e| anyhow::anyhow!("Failed to generate hotcache: {}", e))?;
+        
+        hotcache_buffer
+    };
     
-    // Use Quickwit's SplitPayloadBuilder to create the proper split format
-    let split_payload = SplitPayloadBuilder::get_split_payload(
-        &split_files,
-        split_fields,
-        hotcache
-    )?;
+    // Use Quickwit's real SplitPayloadBuilder to create proper split format
+    let runtime = tokio::runtime::Runtime::new()
+        .map_err(|e| anyhow::anyhow!("Failed to create tokio runtime: {}", e))?;
     
-    // Write the split payload to a file
-    // Since SplitPayload is async and designed for cloud storage, we'll extract the data manually
-    // This is a simplified approach that writes the split in the correct Quickwit format
-    
-    let mut file = File::create(output_path)?;
-    
-    // Write all the files manually in the correct order (since we can't use async here)
-    for split_file in &split_files {
-        let file_content = std::fs::read(split_file)?;
-        file.write_all(&file_content)?;
-    }
-    
-    // Write split fields
-    file.write_all(split_fields)?;
-    
-    // The footer (metadata + hotcache) is automatically handled by SplitPayloadBuilder
-    // For now, we'll add a minimal footer
-    let footer_json = b"{}"; // Minimal footer JSON
-    file.write_all(footer_json)?;
-    file.write_all(&(footer_json.len() as u64).to_le_bytes())?; // JSON length
-    file.write_all(hotcache)?;
-    file.write_all(&(hotcache.len() as u64).to_le_bytes())?; // Hotcache length
-    
-    file.flush()?;
+    runtime.block_on(async {
+        // Create the split payload using Quickwit's actual implementation
+        let split_payload = SplitPayloadBuilder::get_split_payload(
+            &split_files,
+            split_fields,
+            &hotcache
+        )?;
+        
+        // Write the payload to the output file
+        let payload_bytes = split_payload.read_all().await?;
+        let mut output_file = File::create(output_path)?;
+        output_file.write_all(&payload_bytes)?;
+        output_file.flush()?;
+        
+        Ok::<(), anyhow::Error>(())
+    })?;
     
     Ok(())
 }
@@ -353,35 +355,15 @@ fn create_quickwit_split(
 pub extern "system" fn Java_com_tantivy4java_QuickwitSplit_nativeConvertIndex(
     mut env: JNIEnv,
     _class: JClass,
-    index_ptr: i64,
-    output_path: JString,
-    config_obj: JObject,
+    _index_ptr: i64,
+    _output_path: JString,
+    _config_obj: JObject,
 ) -> jobject {
-    convert_throwable(&mut env, |env| {
-        let output_path_str = jstring_to_string(env, &output_path)?;
-        let config = SplitConfig::from_java_object(env, &config_obj)?;
-        
-        let output_path = PathBuf::from(output_path_str);
-        
-        // Get the index from the pointer - this should work since we're passed a valid index
-        let index_ptr_raw = index_ptr as *const tantivy::Index;
-        if index_ptr_raw.is_null() {
-            return Err(anyhow!("Invalid index pointer"));
-        }
-        
-        // For now, we can't safely access the index pointer in this JNI context
-        // So we'll fall back to creating a split with reasonable defaults
-        // TODO: Add proper getIndexPath method to Index class to support this
-        
-        // Fallback to placeholder implementation that works
-        let doc_count = if config.index_uid.contains("large") { 100 } else { 5 };
-        let size_bytes = if config.index_uid.contains("large") { 102400 } else { 5120 };
-        let split_metadata = create_split_metadata(&config, doc_count, size_bytes);
-        
-        create_placeholder_split(&output_path, &split_metadata)?;
-        
-        let metadata_obj = create_java_split_metadata(env, &split_metadata)?;
-        Ok(metadata_obj.into_raw())
+    // This native method is no longer used.
+    // The Java convertIndex method now delegates to convertIndexFromPath 
+    // after checking the stored index path, which is much cleaner.
+    convert_throwable(&mut env, |_env| {
+        Err(anyhow!("This native method should not be called. The Java convertIndex method handles the logic."))
     }).unwrap_or(std::ptr::null_mut())
 }
 
@@ -420,23 +402,39 @@ pub extern "system" fn Java_com_tantivy4java_QuickwitSplit_nativeReadSplitMetada
             return Err(anyhow!("Split file does not exist: {}", split_path_str));
         }
         
-        // Read and parse split file
-        let split_content = std::fs::read_to_string(path)?;
+        // Read the binary split file
+        let split_data = std::fs::read(path)?;
+        let owned_bytes = OwnedBytes::new(split_data);
         
-        // Parse metadata from split file
-        let metadata = if let Some(start) = split_content.find("METADATA_START\n") {
-            if let Some(end) = split_content.find("\nMETADATA_END") {
-                let metadata_json = &split_content[start + "METADATA_START\n".len()..end];
-                serde_json::from_str::<QuickwitSplitMetadata>(metadata_json)
-                    .map_err(|e| anyhow!("Failed to parse split metadata: {}", e))?
-            } else {
-                return Err(anyhow!("Invalid split file format: missing METADATA_END"));
-            }
-        } else {
-            return Err(anyhow!("Invalid split file format: missing METADATA_START"));
+        // Parse the split using Quickwit's BundleStorage
+        let ram_storage = std::sync::Arc::new(RamStorage::default());
+        let bundle_path = std::path::PathBuf::from("temp.split");
+        let (_hotcache, bundle_storage) = BundleStorage::open_from_split_data_with_owned_bytes(
+            ram_storage, bundle_path, owned_bytes
+        ).map_err(|e| anyhow!("Failed to parse Quickwit split file: {}", e))?;
+        
+        // Since we don't have the original metadata that was stored during creation,
+        // we'll create a minimal metadata object with the file count information
+        let file_count = bundle_storage.iter_files().count();
+        let split_metadata = QuickwitSplitMetadata {
+            split_id: uuid::Uuid::new_v4().to_string(), // Generate a new UUID since we can't recover the original
+            index_uid: "unknown".to_string(),
+            source_id: "unknown".to_string(),
+            node_id: "unknown".to_string(),
+            doc_mapping_uid: "unknown".to_string(),
+            partition_id: 0,
+            num_docs: 0, // Can't determine from split file alone
+            uncompressed_docs_size_in_bytes: std::fs::metadata(path)?.len(),
+            time_range: None,
+            create_timestamp: Utc::now().timestamp(),
+            tags: BTreeSet::new(),
+            delete_opstamp: 0,
+            num_merge_ops: 0,
         };
         
-        let metadata_obj = create_java_split_metadata(env, &metadata)?;
+        eprintln!("DEBUG: Successfully read Quickwit split with {} files", file_count);
+        
+        let metadata_obj = create_java_split_metadata(env, &split_metadata)?;
         Ok(metadata_obj.into_raw())
     }).unwrap_or(std::ptr::null_mut())
 }
@@ -455,35 +453,36 @@ pub extern "system" fn Java_com_tantivy4java_QuickwitSplit_nativeListSplitFiles(
             return Err(anyhow!("Split file does not exist: {}", split_path_str));
         }
         
-        // Read split file to extract file list
-        let _split_content = std::fs::read_to_string(path)?;
+        // Read the binary split file
+        let split_data = std::fs::read(path)?;
+        let owned_bytes = OwnedBytes::new(split_data);
+        
+        // Parse the split using Quickwit's BundleStorage
+        let ram_storage = std::sync::Arc::new(RamStorage::default());
+        let bundle_path = std::path::PathBuf::from("temp.split");
+        let (_hotcache, bundle_storage) = BundleStorage::open_from_split_data_with_owned_bytes(
+            ram_storage, bundle_path, owned_bytes
+        ).map_err(|e| anyhow!("Failed to parse Quickwit split file: {}", e))?;
         
         // Create ArrayList to hold file names
         let array_list_class = env.find_class("java/util/ArrayList")?;
         let file_list = env.new_object(&array_list_class, "()V", &[])?;
         
-        // For our simple format, we'll return a list of standard Tantivy files that would be in a split
-        let standard_files = vec![
-            "meta.json",
-            "settings.json", 
-            ".managed.json",
-            "store",
-            "fast",
-            "fieldnorm",
-            "pos",
-            "idx",
-        ];
-        
-        // Add files to ArrayList
-        for file_name in standard_files {
-            let file_name_jstr = string_to_jstring(env, file_name)?;
+        // Add actual files from the split bundle
+        let mut file_count = 0;
+        for file_path in bundle_storage.iter_files() {
+            let file_name = file_path.to_string_lossy();
+            let file_name_jstr = string_to_jstring(env, &file_name)?;
             env.call_method(
                 &file_list,
                 "add",
                 "(Ljava/lang/Object;)Z",
                 &[JValue::Object(&file_name_jstr.into())],
             )?;
+            file_count += 1;
         }
+        
+        eprintln!("DEBUG: Listed {} files from Quickwit split", file_count);
         
         Ok(file_list.into_raw())
     }).unwrap_or(std::ptr::null_mut())
@@ -510,49 +509,69 @@ pub extern "system" fn Java_com_tantivy4java_QuickwitSplit_nativeExtractSplit(
         // Create output directory if it doesn't exist
         std::fs::create_dir_all(output_path)?;
         
-        // Read and parse split file to get metadata
-        let split_content = std::fs::read_to_string(split_path)?;
+        // Read the binary split file
+        let split_data = std::fs::read(split_path)?;
+        let owned_bytes = OwnedBytes::new(split_data);
         
-        // Extract metadata
-        let metadata = if let Some(start) = split_content.find("METADATA_START\n") {
-            if let Some(end) = split_content.find("\nMETADATA_END") {
-                let metadata_json = &split_content[start + "METADATA_START\n".len()..end];
-                serde_json::from_str::<QuickwitSplitMetadata>(metadata_json)
-                    .map_err(|e| anyhow!("Failed to parse split metadata: {}", e))?
-            } else {
-                return Err(anyhow!("Invalid split file format: missing METADATA_END"));
+        // Parse the split using Quickwit's BundleStorage  
+        let runtime = tokio::runtime::Runtime::new()
+            .map_err(|e| anyhow::anyhow!("Failed to create tokio runtime: {}", e))?;
+        
+        let ram_storage = std::sync::Arc::new(RamStorage::default());
+        let bundle_path = std::path::PathBuf::from("temp.split");
+        
+        // Clone the owned_bytes for the storage put operation
+        let owned_bytes_clone = OwnedBytes::new(owned_bytes.as_slice().to_vec());
+        
+        // Put the split data into RamStorage first
+        runtime.block_on(async {
+            ram_storage.put(&bundle_path, Box::new(owned_bytes_clone.as_slice().to_vec())).await
+        }).map_err(|e| anyhow!("Failed to put split data into storage: {}", e))?;
+        
+        let (_hotcache, bundle_storage) = BundleStorage::open_from_split_data_with_owned_bytes(
+            ram_storage, bundle_path, owned_bytes
+        ).map_err(|e| anyhow!("Failed to parse Quickwit split file: {}", e))?;
+        
+        let mut extracted_count = 0;
+        for file_path in bundle_storage.iter_files() {
+            let output_file_path = output_path.join(file_path);
+            
+            // Create parent directories if needed
+            if let Some(parent) = output_file_path.parent() {
+                std::fs::create_dir_all(parent)?;
             }
-        } else {
-            return Err(anyhow!("Invalid split file format: missing METADATA_START"));
+            
+            // Extract file content asynchronously
+            let file_data = runtime.block_on(async {
+                bundle_storage.get_all(file_path).await
+            }).map_err(|e| anyhow!("Failed to extract file {}: {}", file_path.display(), e))?;
+            
+            std::fs::write(&output_file_path, &file_data)?;
+            extracted_count += 1;
+            
+            eprintln!("DEBUG: Extracted file {} ({} bytes)", file_path.display(), file_data.len());
+        }
+        
+        // Create a minimal metadata object for the return value
+        let split_metadata = QuickwitSplitMetadata {
+            split_id: uuid::Uuid::new_v4().to_string(),
+            index_uid: "extracted".to_string(),
+            source_id: "extracted".to_string(),
+            node_id: "local".to_string(),
+            doc_mapping_uid: "default".to_string(),
+            partition_id: 0,
+            num_docs: 0, // Can't determine from split alone
+            uncompressed_docs_size_in_bytes: std::fs::metadata(split_path)?.len(),
+            time_range: None,
+            create_timestamp: Utc::now().timestamp(),
+            tags: BTreeSet::new(),
+            delete_opstamp: 0,
+            num_merge_ops: 0,
         };
         
-        // Create a placeholder extracted index structure
-        // In a real implementation, this would extract the actual Tantivy files
-        let meta_json_path = output_path.join("meta.json");
-        let placeholder_meta = serde_json::json!({
-            "index_settings": {
-                "docstore_compression": "none",
-                "docstore_blocksize": 16384
-            },
-            "segments": []
-        });
-        std::fs::write(meta_json_path, serde_json::to_string_pretty(&placeholder_meta)?)?;
+        eprintln!("DEBUG: Successfully extracted {} files from Quickwit split to {}", extracted_count, output_path.display());
         
-        // Create settings.json
-        let settings_json_path = output_path.join("settings.json");
-        let placeholder_settings = serde_json::json!({
-            "settings": {}
-        });
-        std::fs::write(settings_json_path, serde_json::to_string_pretty(&placeholder_settings)?)?;
-        
-        // Create .managed.json to indicate this is a Tantivy index
-        let managed_json_path = output_path.join(".managed.json");
-        let managed_content = serde_json::json!({
-            "version": [0, 24, 0]
-        });
-        std::fs::write(managed_json_path, serde_json::to_string_pretty(&managed_content)?)?;
-        
-        let metadata_obj = create_java_split_metadata(env, &metadata)?;
+        let metadata_obj = create_java_split_metadata(env, &split_metadata)?;
         Ok(metadata_obj.into_raw())
     }).unwrap_or(std::ptr::null_mut())
 }

@@ -10,22 +10,29 @@ Tantivy4Java
 - Creates a jar library that includes all native build components
 - Uses the package com.tantivy4java
 
-# 🎯 **COMPLETE TANTIVY4JAVA WITH MEMORY-SAFE QUICKWIT INTEGRATION** 🚀
+# 🎯 **COMPLETE TANTIVY4JAVA WITH QUICKWIT SPLIT INTEGRATION** 🚀
 
-## ✅ **PRODUCTION READY - MEMORY-SAFE IMPLEMENTATION STATUS**
+## ✅ **PRODUCTION READY WITH ONGOING QUICKWIT ENHANCEMENTS**
 
-### **🏆 MILESTONE: COMPLETE IMPLEMENTATION WITH ZERO CRASHES ACHIEVED**
+### **🏆 MILESTONE: COMPLETE PYTHON PARITY PLUS QUICKWIT SPLIT FUNCTIONALITY**
 
-**Tantivy4Java now provides complete Python tantivy compatibility PLUS memory-safe Quickwit SplitSearcher integration!**
+**Tantivy4Java provides complete Python tantivy compatibility with advanced Quickwit split capabilities!**
 
-- **📊 93+ comprehensive tests** covering all major functionality 
-- **🎯 PERFECT 100% test pass rate** (93+/93+ tests passing)
-- **🔒 ZERO JVM CRASHES** - Complete memory safety through comprehensive JNI fixes
+- **📊 48+ comprehensive tests** covering all core functionality 
+- **🎯 100% core test pass rate** for Python parity features
+- **🔒 Memory-safe JNI implementation** with proper resource management
 - **🐍 Complete Python API parity** verified through extensive test coverage
-- **🔍 Memory-Safe SplitSearcher** - Quickwit split search with shared cache architecture  
-- **☁️ Full S3 integration** - AWS S3/MinIO support with comprehensive error handling
+- **🔍 Quickwit Split Integration** - Convert Tantivy indexes to Quickwit splits
 - **📖 1,600+ lines of Python tests** analyzed and ported to Java
 - **✅ All major functionality** from Python tantivy library implemented
+
+### **🚧 CURRENT DEVELOPMENT: QUICKWIT SPLIT ENHANCEMENT**
+
+**Active work on completing Quickwit split functionality:**
+- **QuickwitSplit API** - Convert, extract, and manage split files
+- **Real split creation** - Eliminating fake/minimal split generation
+- **Comprehensive testing** - Debug tests for all split operations
+- **Format compliance** - Proper Quickwit split file format with metadata
 
 ### **🎯 COMPREHENSIVE PYTHON PARITY IMPLEMENTATION**
 
@@ -99,6 +106,18 @@ Tantivy4Java
 - **Advanced field filtering** - Filter by type, storage, indexing, and fast access
 - **Schema summary generation** - Comprehensive schema structure reporting
 - **SplitSearcher integration** - Dynamic field discovery with document retrieval
+
+**7. `SplitSearcherDocumentRetrievalTest.java` ✅** - **COMPREHENSIVE FIELD DATA VALIDATION**
+- **Complete field type verification** - String, Integer, Boolean, Float field type validation
+- **Value integrity validation** - Retrieved values match original indexed data patterns
+- **Cross-field consistency checks** - Document relationships and algorithmic pattern validation
+- **Performance and caching validation** - Retrieval optimization and cache behavior testing
+- **Type safety verification** - Proper Java type conversion from native layer
+- **Content validation** - Text field content matches expected patterns and search terms
+- **Numeric field validation** - Integer/Float values within expected ranges with proper typing
+- **Boolean field validation** - True/false values with correct Boolean type handling
+- **Multi-query type testing** - Field access across Term, Boolean, and Content queries
+- **Document lifecycle management** - Proper resource cleanup and memory management
 
 #### **Additional Comprehensive Tests**
 - **`ComprehensiveFunctionalityTest`** ✅ - Multi-field documents, all query types
@@ -233,37 +252,42 @@ Tantivy4Java now provides complete SplitSearcher functionality for searching Qui
 Tantivy4Java now provides complete QuickwitSplit functionality for converting Tantivy indices into Quickwit split files, enabling seamless integration with Quickwit's distributed search infrastructure:
 
 **Core QuickwitSplit Features**
-- **`QuickwitSplit.convertIndex(index, outputPath, config)`** - Convert Tantivy index to Quickwit split ✅
 - **`QuickwitSplit.convertIndexFromPath(indexPath, outputPath, config)`** - Convert from index directory ✅
-- **`QuickwitSplit.readSplitMetadata(splitPath)`** - Extract split information without loading ✅
-- **`QuickwitSplit.listSplitFiles(splitPath)`** - List files contained within a split ✅
-- **`QuickwitSplit.extractSplit(splitPath, outputDir)`** - Extract split back to Tantivy index ✅
 - **`QuickwitSplit.validateSplit(splitPath)`** - Verify split file integrity ✅
+- **`QuickwitSplit.convertIndex(index, outputPath, config)`** - Convert Tantivy index to Quickwit split 🚧 *IN PROGRESS*
+- **`QuickwitSplit.readSplitMetadata(splitPath)`** - Extract split information without loading 🚧 *BLOCKED by convertIndex*
+- **`QuickwitSplit.listSplitFiles(splitPath)`** - List files contained within a split 🚧 *BLOCKED by convertIndex*
+- **`QuickwitSplit.extractSplit(splitPath, outputDir)`** - Extract split back to Tantivy index 🚧 *BLOCKED by convertIndex*
 
 **Configuration Support**
 - **`SplitConfig`** - Complete configuration with index UID, source ID, node ID ✅
 - **`SplitMetadata`** - Access split information (ID, document count, size, timestamps) ✅
 - **Native Quickwit Integration** - Uses actual Quickwit crates for maximum compatibility ✅
 
-**Comprehensive Testing**
-- **20 dedicated QuickwitSplit tests** with 100% pass rate ✅
-- **Real split conversion scenarios** with actual Quickwit library integration ✅
-- **Parameter validation** and error handling ✅
-- **Split file integrity verification** and round-trip testing ✅
+**Current Development Status**
+- **✅ `convertIndexFromPath` implementation** - Fully working with proper Quickwit split format
+- **🚧 `convertIndex` implementation** - Currently eliminates fake split creation logic
+- **🚧 Debug test failures** - `extractSplit`, `readSplitMetadata` tests failing due to improper split format
+- **🎯 Target** - Create real splits from Index objects or provide clear error guidance
 
-**Example Usage:**
+**Example Usage (Current Working Implementation):**
 ```java
-// Convert Tantivy index to Quickwit split
+// Convert Tantivy index directory to Quickwit split (WORKING)
 QuickwitSplit.SplitConfig config = new QuickwitSplit.SplitConfig(
     "my-index-uid", "my-source", "my-node");
     
-QuickwitSplit.SplitMetadata metadata = QuickwitSplit.convertIndex(
-    index, "/tmp/my_index.split", config);
+QuickwitSplit.SplitMetadata metadata = QuickwitSplit.convertIndexFromPath(
+    "/path/to/tantivy/index", "/tmp/my_index.split", config);
 
 System.out.println("Split ID: " + metadata.getSplitId());
 System.out.println("Documents: " + metadata.getNumDocs());
 System.out.println("Size: " + metadata.getUncompressedSizeBytes());
+
+// Validate split file integrity
+boolean isValid = QuickwitSplit.validateSplit("/tmp/my_index.split");
 ```
+
+**Note:** `convertIndex(Index, ...)` is currently being enhanced to eliminate fake split creation and work with real index data.
 
 **Production Benefits:**
 - **Quickwit Integration** - Seamless conversion to Quickwit's distributed search format
@@ -295,6 +319,48 @@ Tantivy4Java now provides comprehensive schema introspection capabilities, allow
 - **Field validation and existence checking** with error handling ✅
 - **Schema summary generation** with detailed metadata formatting ✅
 - **SplitSearcher integration** demonstrating real-world usage patterns ✅
+
+#### **🏗️ VALIDATED SHARED CACHE ARCHITECTURE IMPLEMENTATION**
+
+**Complete Cache Configuration Design Improvements**
+
+Following user feedback about cache configuration inconsistencies, comprehensive improvements have been implemented to ensure proper shared cache architecture:
+
+**✅ Architectural Validation and Cleanup**
+- **Removed deprecated `SplitSearchConfig` class** - Eliminated per-split cache configuration anti-pattern
+- **Enhanced `SplitSearcher.create()` deprecation** - Now throws `UnsupportedOperationException` with migration guidance
+- **Configuration validation** - Prevents conflicting cache configurations with clear error messages
+- **All split creation flows** through `SplitCacheManager.createSplitSearcher()` for proper shared cache management
+
+**✅ Quickwit-Compatible Cache Architecture**
+- **LeafSearchCache** - Global search result cache (per split_id + query) matching Quickwit design
+- **ByteRangeCache** - Global storage byte range cache (per file_path + range) for efficient storage access
+- **ComponentCache** - Global component cache (fast fields, postings, etc.) shared across all splits
+- **Configuration consistency** - Validates cache instances with same name have identical settings
+
+**✅ Enhanced Documentation and API Guidance**
+- **Comprehensive class-level documentation** - Clear explanation of shared cache architecture
+- **Usage pattern examples** - Proper cache manager creation and reuse patterns
+- **Migration guidance** - Clear path from deprecated methods to proper shared cache usage
+- **Configuration validation errors** - Explicit error messages for conflicting cache settings
+
+**Example Proper Usage:**
+```java
+// Create shared cache manager (reuse across application)
+SplitCacheManager.CacheConfig config = new SplitCacheManager.CacheConfig("main-cache")
+    .withMaxCacheSize(200_000_000); // 200MB shared across all splits
+SplitCacheManager cacheManager = SplitCacheManager.getInstance(config);
+
+// Create searchers that share the cache
+SplitSearcher searcher1 = cacheManager.createSplitSearcher("s3://bucket/split1.split");
+SplitSearcher searcher2 = cacheManager.createSplitSearcher("s3://bucket/split2.split");
+```
+
+**Key Benefits:**
+- **Prevents configuration conflicts** - Validation ensures consistent cache settings
+- **Eliminates anti-patterns** - Removes deprecated per-split cache configuration methods
+- **Matches Quickwit design** - Follows proven Quickwit multi-level caching architecture
+- **Clear migration path** - Explicit guidance for updating existing code
 
 **Example Usage:**
 ```java

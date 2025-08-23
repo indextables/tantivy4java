@@ -477,8 +477,6 @@ pub extern "system" fn Java_com_tantivy4java_Schema_nativeGetFieldNames(
     ptr: jlong,
 ) -> jobject {
     use crate::utils::with_object;
-    use jni::objects::JObject;
-    use jni::sys::jobject;
     
     if ptr == 0 {
         return std::ptr::null_mut();
