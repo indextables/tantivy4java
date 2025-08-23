@@ -29,6 +29,9 @@ mod searcher;
 mod doc_address;
 mod utils;
 mod quickwit_split;
+mod split_searcher;  // Now using proper Quickwit integration
+// mod split_searcher_simple;  // Disabled to avoid conflicts
+mod common;
 
 pub use schema::*;
 pub use document::*;
@@ -38,6 +41,8 @@ pub use searcher::*;
 pub use doc_address::*;
 pub use utils::*;
 pub use quickwit_split::*;
+pub use split_searcher::*;  // Now enabled with proper Quickwit integration
+// pub use split_searcher_simple::*;  // Disabled to avoid conflicts
 
 #[no_mangle]
 pub extern "system" fn Java_com_tantivy4java_Tantivy_getVersion(

@@ -26,6 +26,9 @@ once_cell = "1.19.0"
 quickwit-storage = { git = "https://github.com/quickwit-oss/quickwit" }
 quickwit-metastore = { git = "https://github.com/quickwit-oss/quickwit" }
 quickwit-proto = { git = "https://github.com/quickwit-oss/quickwit" }
+quickwit-directories = { git = "https://github.com/quickwit-oss/quickwit" }
+quickwit-common = { git = "https://github.com/quickwit-oss/quickwit" }
+quickwit-config = { git = "https://github.com/quickwit-oss/quickwit" }
 
 # Additional dependencies
 anyhow = "1.0"

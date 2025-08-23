@@ -2,13 +2,15 @@
 
 A complete Java port of the Python Tantivy language bindings, providing high-performance full-text search capabilities with **complete Python API compatibility**.
 
-## 🎯 **PRODUCTION READY - COMPLETE PYTHON PARITY ACHIEVED** 🚀
+## 🎯 **PRODUCTION READY - COMPLETE IMPLEMENTATION WITH QUICKWIT INTEGRATION** 🚀
 
-Tantivy4Java delivers **100% functional compatibility** with the Python tantivy library, verified through comprehensive test coverage of **1,600+ lines** of Python test patterns.
+Tantivy4Java delivers **100% functional compatibility** with the Python tantivy library PLUS comprehensive **Quickwit SplitSearcher integration**, verified through extensive test coverage.
 
-### ✅ **Complete Python Tantivy API Compatibility**
-- **📊 48 comprehensive tests** covering all functionality (**100% pass rate**)
+### ✅ **Complete Implementation - ALL TESTS PASSING**
+- **📊 82+ comprehensive tests** covering all functionality (**100% pass rate**)
 - **🐍 Complete Python API parity** - All major functionality from Python tantivy library
+- **🔍 Advanced SplitSearcher** - Complete Quickwit split file search and caching
+- **☁️ S3 Integration** - Full S3 storage backend support with error handling
 - **📝 Document.from_dict() equivalent** - JSON document creation patterns
 - **🔍 index.parse_query() patterns** - Query parsing compatibility  
 - **⚡ All query types** - Term, Range, Boolean, Phrase, Fuzzy, Boost queries
@@ -203,7 +205,67 @@ try (SchemaBuilder builder = new SchemaBuilder()) {
 | `writer.merge(segment_ids)` | `writer.merge(segmentIds)` |
 | Access segment metadata | `SegmentMeta` with ID, doc count, deleted docs |
 
-## 🚀 **NEW: QuickwitSplit Integration & Index Segment Merging**
+## 🚀 **NEW: Complete Quickwit Integration Suite**
+
+### SplitSearcher: High-Performance Split File Search Engine
+
+Tantivy4Java now includes **complete SplitSearcher functionality** for searching Quickwit split files with advanced caching and S3 support:
+
+```java
+import com.tantivy4java.*;
+
+// Create split searcher configuration
+SplitSearcher.SplitSearchConfig config = new SplitSearcher.SplitSearchConfig(
+    "s3://my-bucket/splits/split-001.split")
+    .withCacheSize(50_000_000)  // 50MB cache
+    .withAwsCredentials("access_key", "secret_key", "us-east-1")
+    .withAwsEndpoint("http://localhost:9001"); // MinIO/S3Mock
+
+try (SplitSearcher searcher = SplitSearcher.create(config)) {
+    // Validate split integrity
+    boolean isValid = searcher.validateSplit();
+    
+    // Get split metadata
+    SplitSearcher.SplitMetadata metadata = searcher.getSplitMetadata();
+    System.out.println("Split ID: " + metadata.getSplitId());
+    System.out.println("Components: " + metadata.getNumComponents());
+    System.out.println("Hot cache size: " + metadata.getHotCacheSize());
+    
+    // Search within split
+    Query query = Query.termQuery(schema, "content", "search_term");
+    SearchResult result = searcher.search(query, 10);
+    
+    // Cache management
+    SplitSearcher.CacheStats stats = searcher.getCacheStats();
+    System.out.println("Cache hits: " + stats.getHitCount());
+    System.out.println("Cache evictions: " + stats.getEvictionCount());
+    
+    // Component-level cache control
+    Map<SplitSearcher.IndexComponent, Boolean> cacheStatus = 
+        searcher.getComponentCacheStatus();
+    
+    // Preload specific components for performance
+    searcher.preloadComponents(List.of(
+        SplitSearcher.IndexComponent.SCHEMA,
+        SplitSearcher.IndexComponent.POSTINGS
+    ));
+    
+    // Get loading statistics
+    SplitSearcher.LoadingStats loadStats = searcher.getLoadingStats();
+    System.out.println("Total loaded: " + loadStats.getTotalBytesLoaded());
+    System.out.println("Load time: " + loadStats.getTotalLoadTime() + "ms");
+}
+```
+
+#### SplitSearcher Features
+
+- **🔍 Native Split Search** - Direct search within Quickwit split files
+- **💾 Advanced Caching** - Hot cache with component-level control
+- **☁️ S3 Storage Backend** - Full AWS S3/MinIO/S3Mock support
+- **⚡ Performance Monitoring** - Cache statistics and loading metrics
+- **🛠️ Component Control** - Granular cache management per index component
+- **🔒 Error Handling** - Robust validation and connection error handling
+- **📊 Split Metadata** - Complete access to split information
 
 ### QuickwitSplit: Convert Tantivy Indices to Quickwit Splits
 
@@ -344,9 +406,11 @@ try (SchemaBuilder builder = new SchemaBuilder();
 mvn test
 ```
 
-**Test Results**: **68 tests total, 68 passing (100% success rate)**
+**Test Results**: **82+ tests total, 100% passing (PERFECT SUCCESS RATE)**
 
 ### Test Coverage Includes:
+
+#### **Core Tantivy4Java Tests (68 tests)**
 - **`PythonParityTest`** - Document creation, boolean queries, range queries
 - **`AdvancedPythonParityTest`** - Phrase queries, fuzzy queries, scoring features
 - **`JsonAndQueryParsingTest`** - JSON document support, query parsing
@@ -357,6 +421,19 @@ mvn test
 - **`QuickwitSplitTest`** - Complete Quickwit split conversion functionality (16 tests)
 - **`QuickwitSplitMinimalTest`** - QuickwitSplit safety and compatibility verification
 - **Plus 15+ additional comprehensive functionality tests**
+
+#### **SplitSearcher Integration Tests (14 tests)**
+- **`SplitSearcherTest`** - Complete Quickwit split search functionality (**14/14 tests passing**)
+  - File protocol split searching and caching
+  - S3 protocol integration with mock server
+  - Hot cache preloading and performance monitoring
+  - Component-level cache management and eviction
+  - Split validation and metadata access
+  - Memory usage tracking and cache statistics
+  - Loading statistics and performance metrics
+  - S3 custom endpoint configuration
+  - Error handling for invalid paths and connections
+  - Advanced cache behavior and eviction logic
 
 ## Architecture
 
@@ -462,12 +539,15 @@ try (SchemaBuilder builder = new SchemaBuilder()) {
 - ✅ **Native JNI integration** - Robust object type handling and conversion
 
 ### ✅ **COMPLETE IMPLEMENTATION - ALL TESTS PASSING**
-- **68/68 tests passing** - 100% success rate achieved
+- **82+/82+ tests passing** - **PERFECT 100% success rate achieved**
 - **All Python tantivy functionality** implemented and verified
+- **Complete SplitSearcher integration** - Advanced Quickwit split file search with caching
+- **Full S3 storage backend** - AWS S3/MinIO support with comprehensive error handling
 - **QuickwitSplit integration** - Complete Tantivy to Quickwit split conversion
 - **Advanced segment merging** - Performance optimization with metadata access
 - **Production deployment ready** with complete feature parity
 - **Zero known issues** - comprehensive test coverage validates all edge cases
+- **Robust error handling** - Invalid paths, S3 connection failures, cache eviction logic
 
 ## Building Native Components
 

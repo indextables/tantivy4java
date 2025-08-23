@@ -46,6 +46,30 @@
             <artifactId>jackson-databind</artifactId>
             <version>2.15.2</version>
         </dependency>
+        
+        <!-- AWS SDK for S3 testing -->
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>s3</artifactId>
+            <version>2.21.29</version>
+            <scope>test</scope>
+        </dependency>
+        
+        <!-- Adobe S3Mock for S3 testing -->
+        <dependency>
+            <groupId>io.findify</groupId>
+            <artifactId>s3mock_2.13</artifactId>
+            <version>0.2.6</version>
+            <scope>test</scope>
+        </dependency>
+        
+        <!-- Scala library (required by S3Mock) -->
+        <dependency>
+            <groupId>org.scala-lang</groupId>
+            <artifactId>scala-library</artifactId>
+            <version>2.13.12</version>
+            <scope>test</scope>
+        </dependency>
     </dependencies>
 
     <build>
