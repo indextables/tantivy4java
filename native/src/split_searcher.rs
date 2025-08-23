@@ -598,30 +598,44 @@ impl SplitSearcher {
             }
         }
         
-        // Debug: Check if term dictionary is accessible
+        // Debug: Check if term dictionary is accessible for any text field
         if let Some(segment_reader) = searcher.segment_readers().first() {
-            let title_field = index_schema.get_field("title").unwrap();
-            if let Ok(inverted_index) = segment_reader.inverted_index(title_field) {
-                debug_log!("Term dictionary accessible for title field");
-                
-                // Try to check if specific terms exist
-                let terms = inverted_index.terms();
-                debug_log!("Terms dict has {} terms", terms.num_terms());
-                
-                // Check if "document" or "Document" terms exist  
-                match terms.term_ord(b"document") {
-                    Ok(Some(ord)) => debug_log!("Found 'document' term at ordinal: {}", ord),
-                    Ok(None) => debug_log!("'document' term not found in dictionary"),
-                    Err(e) => debug_log!("Error checking 'document' term: {}", e),
+            // Try to find any text field instead of assuming "title" exists
+            let mut found_text_field = None;
+            for field in index_schema.fields() {
+                let field_entry = index_schema.get_field_entry(field.0);
+                if matches!(field_entry.field_type(), tantivy::schema::FieldType::Str(_)) {
+                    found_text_field = Some(field.0);
+                    break;
                 }
-                
-                match terms.term_ord(b"Document") {
-                    Ok(Some(ord)) => debug_log!("Found 'Document' term at ordinal: {}", ord),
-                    Ok(None) => debug_log!("'Document' term not found in dictionary"),
-                    Err(e) => debug_log!("Error checking 'Document' term: {}", e),
+            }
+            
+            if let Some(text_field) = found_text_field {
+                let field_name = index_schema.get_field_name(text_field);
+                if let Ok(inverted_index) = segment_reader.inverted_index(text_field) {
+                    debug_log!("Term dictionary accessible for text field '{}'", field_name);
+                    
+                    // Try to check if specific terms exist
+                    let terms = inverted_index.terms();
+                    debug_log!("Terms dict has {} terms", terms.num_terms());
+                    
+                    // Check if "document" or "Document" terms exist  
+                    match terms.term_ord(b"document") {
+                        Ok(Some(ord)) => debug_log!("Found 'document' term at ordinal: {}", ord),
+                        Ok(None) => debug_log!("'document' term not found in dictionary"),
+                        Err(e) => debug_log!("Error checking 'document' term: {}", e),
+                    }
+                    
+                    match terms.term_ord(b"Document") {
+                        Ok(Some(ord)) => debug_log!("Found 'Document' term at ordinal: {}", ord),
+                        Ok(None) => debug_log!("'Document' term not found in dictionary"),
+                        Err(e) => debug_log!("Error checking 'Document' term: {}", e),
+                    }
+                } else {
+                    debug_log!("Cannot access inverted index for text field '{}'", field_name);
                 }
             } else {
-                debug_log!("Cannot access inverted index for title field");
+                debug_log!("No text fields found in schema for term dictionary access");
             }
         }
         

@@ -521,4 +521,116 @@ public class SplitSearcherTest {
             assertNotNull(result);
         }
     }
+
+    @Test
+    @DisplayName("Schema without title field regression test - prevents panic from hardcoded field assumptions")
+    void testSchemaWithoutTitleFieldRegression() throws Exception {
+        // Create a temporary index with a schema that deliberately does NOT have a "title" field
+        // This test prevents regression of the panic: 
+        // thread '<unnamed>' panicked at src/split_searcher.rs:603:63:
+        // called `Result::unwrap()` on an `Err` value: FieldNotFound("title")
+        
+        Path tempDir = Files.createTempDirectory("regression_test");
+        try {
+            // Create schema with different field names (no "title" field)
+            try (SchemaBuilder builder = new SchemaBuilder()) {
+                builder.addTextField("description", true, false, "default", "position")
+                       .addTextField("body_text", true, false, "default", "position") 
+                       .addIntegerField("doc_id", true, true, true)
+                       .addFloatField("score", true, true, true)
+                       .addBooleanField("active", true, true, true);
+                
+                try (Schema schema = builder.build();
+                     Index index = new Index(schema, tempDir.toString(), false)) {
+                    
+                    // Add test documents with the custom schema
+                    try (IndexWriter writer = index.writer(50, 1)) {
+                        writer.addJson("{\"description\": \"Custom schema document\", \"body_text\": \"This document uses different field names\", \"doc_id\": 1, \"score\": 0.95, \"active\": true}");
+                        writer.addJson("{\"description\": \"Another test doc\", \"body_text\": \"More content for testing\", \"doc_id\": 2, \"score\": 0.87, \"active\": false}");
+                        writer.addJson("{\"description\": \"Third document\", \"body_text\": \"Additional test content\", \"doc_id\": 3, \"score\": 0.92, \"active\": true}");
+                        writer.commit();
+                    }
+                    
+                    // Convert to split (this should not panic)
+                    Path splitPath = Files.createTempFile("regression_test", ".split");
+                    try {
+                        QuickwitSplit.SplitConfig config = new QuickwitSplit.SplitConfig(
+                            "regression-test-index", "regression-source", "test-node");
+                        
+                        // This conversion process should work without panic
+                        QuickwitSplit.SplitMetadata metadata = QuickwitSplit.convertIndexFromPath(
+                            tempDir.toString(), splitPath.toString(), config);
+                        
+                        assertNotNull(metadata, "Split conversion should succeed");
+                        assertNotNull(metadata.getSplitId(), "Split should have ID");
+                        assertTrue(metadata.getNumDocs() > 0, "Split should contain documents");
+                        
+                        // Test search functionality with the schema that lacks "title" field
+                        String splitUri = "file://" + splitPath.toAbsolutePath();
+                        
+                        SplitCacheManager.CacheConfig regressionConfig = new SplitCacheManager.CacheConfig("regression-test")
+                                .withMaxCacheSize(10_000_000);
+                        try (SplitCacheManager regressionCacheManager = SplitCacheManager.getInstance(regressionConfig)) {
+                            
+                            // This search should work without panic, even with debug logging enabled
+                            try (SplitSearcher searcher = regressionCacheManager.createSplitSearcher(splitUri)) {
+                                
+                                // Verify schema access works
+                                Schema splitSchema = searcher.getSchema();
+                                assertNotNull(splitSchema, "Should be able to get schema");
+                                
+                                // The key test: our debug code should handle ANY schema safely
+                                // Previously this would panic with: FieldNotFound("title")
+                                // Now it should work regardless of whether "title" exists or not
+                                
+                                // Test succeeded if we got this far without a panic!
+                                // Previously the debug code would have crashed with:
+                                // thread '<unnamed>' panicked at src/split_searcher.rs:603:63:
+                                // called `Result::unwrap()` on an `Err` value: FieldNotFound("title")
+                                
+                                // Log what fields actually exist for verification
+                                List<String> actualFields = splitSchema.getFieldNames();
+                                System.out.println("✅ Panic regression test passed! Schema fields: " + actualFields);
+                                
+                                // Test search functionality on available fields
+                                // This exercises the search path that would have triggered the panic
+                                if (!actualFields.isEmpty()) {
+                                    String firstField = actualFields.get(0);
+                                    Query testQuery = Query.termQuery(splitSchema, firstField, "test");
+                                    SearchResult result = searcher.search(testQuery, 5);
+                                    assertNotNull(result, "Search should work without panic on any field");
+                                    System.out.println("   Tested search on field '" + firstField + "' - no panic!");
+                                }
+                                
+                                // Verify cache operations work
+                                SplitSearcher.CacheStats stats = searcher.getCacheStats();
+                                assertNotNull(stats, "Cache stats should be accessible");
+                                assertTrue(stats.getHitCount() >= 0, "Cache hit count should be non-negative");
+                                assertTrue(stats.getMissCount() >= 0, "Cache miss count should be non-negative");
+                                
+                                System.out.println("✅ Regression test passed - no panic with schema lacking 'title' field");
+                                System.out.println("   Schema fields: " + splitSchema.getFieldNames());
+                                System.out.println("   Cache stats: hits=" + stats.getHitCount() + ", misses=" + stats.getMissCount());
+                            }
+                        }
+                    } finally {
+                        Files.deleteIfExists(splitPath);
+                    }
+                }
+            }
+        } finally {
+            // Cleanup temporary directory
+            if (Files.exists(tempDir)) {
+                Files.walk(tempDir)
+                    .sorted((a, b) -> -a.compareTo(b))
+                    .forEach(path -> {
+                        try {
+                            Files.delete(path);
+                        } catch (Exception e) {
+                            // Best effort cleanup
+                        }
+                    });
+            }
+        }
+    }
 }
