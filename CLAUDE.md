@@ -245,6 +245,12 @@ Tantivy4Java now provides complete SplitSearcher functionality for searching Qui
 - **Cache behavior validation** - Memory usage, eviction logic, performance ✅
 - **Error handling coverage** - Invalid paths, connection failures, validation ✅
 
+**Debug Logging Control**
+- **Environment-controlled debug output** for development and troubleshooting ✅
+- **Clean production output** by default with optional verbose logging ✅
+- **Comprehensive debug information** including search queries, schema metadata, and cache operations ✅
+- **Simple activation**: Set `TANTIVY4JAVA_DEBUG=1` for detailed native layer logging ✅
+
 #### **✅ COMPLETE QUICKWIT SPLIT CONVERSION IMPLEMENTATION**
 
 **Seamless Tantivy to Quickwit Split Conversion with Native Integration**

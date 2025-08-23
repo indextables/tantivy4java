@@ -1,6 +1,15 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+// Debug logging macro - controlled by TANTIVY4JAVA_DEBUG environment variable
+macro_rules! debug_log {
+    ($($arg:tt)*) => {
+        if std::env::var("TANTIVY4JAVA_DEBUG").unwrap_or_default() == "1" {
+            eprintln!("DEBUG: {}", format!($($arg)*));
+        }
+    };
+}
 use jni::objects::{JClass, JObject, JString};
 use jni::sys::{jlong, jboolean, jobject, jint, jfloat};
 use jni::JNIEnv;
@@ -72,7 +81,7 @@ impl SplitSearcher {
         // Source S3 config from the provided API config objects
         use quickwit_config::S3StorageConfig;
         let s3_config = if let Some(aws_config) = &config.aws_config {
-            eprintln!("DEBUG: Creating S3Config with region: {}, access_key: {}, endpoint: {:?}, force_path_style: {}", 
+            debug_log!("Creating S3Config with region: {}, access_key: {}, endpoint: {:?}, force_path_style: {}", 
                      aws_config.region, aws_config.access_key, aws_config.endpoint, aws_config.force_path_style);
             S3StorageConfig {
                 region: Some(aws_config.region.clone()),
@@ -83,7 +92,7 @@ impl SplitSearcher {
                 ..Default::default()
             }
         } else {
-            eprintln!("DEBUG: No AWS config provided, using default S3StorageConfig");
+            debug_log!("No AWS config provided, using default S3StorageConfig");
             S3StorageConfig::default()
         };
         let storage_resolver = create_storage_resolver_with_config(s3_config);
@@ -97,7 +106,7 @@ impl SplitSearcher {
             if let Some(last_slash) = uri_str.rfind('/') {
                 let parent_uri_str = &uri_str[..last_slash]; // Get s3://bucket/splits
                 let file_name = &uri_str[last_slash + 1..];  // Get filename
-                eprintln!("DEBUG: Split S3 URI into parent: {} and file: {}", parent_uri_str, file_name);
+                debug_log!("Split S3 URI into parent: {} and file: {}", parent_uri_str, file_name);
                 (Uri::from_str(parent_uri_str)?, Some(file_name.to_string()))
             } else {
                 (split_uri.clone(), None)
@@ -110,15 +119,25 @@ impl SplitSearcher {
             storage_resolver.resolve(&storage_uri).await
         }).map_err(|e| anyhow::anyhow!("Failed to resolve storage for '{}': {}", config.split_path, e))?;
         
-        // Create byte range cache
+        // Create byte range cache with size limit (use cache_size_bytes from config)
         let byte_range_cache = ByteRangeCache::with_infinite_capacity(
             &quickwit_storage::STORAGE_METRICS.shortlived_cache
+        );
+        
+        // Create a QuickwitCache with proper size limits for fast fields and other components
+        // The QuickwitCache::new() already sets up .fast file caching, we can add more routes
+        let quickwit_cache = quickwit_storage::QuickwitCache::new(config.cache_size_bytes);
+        
+        // Wrap storage with the eviction-capable cache
+        let cached_storage = quickwit_storage::wrap_storage_with_cache(
+            Arc::new(quickwit_cache), 
+            storage.clone()
         );
         
         // Use the new Quickwit-style opening directly (no temporary instance needed)
         let (index, hot_directory) = runtime.block_on(async {
             Self::quickwit_open_index_with_caches_static(
-                storage.clone(), &config.split_path, &byte_range_cache, file_name.as_deref()
+                cached_storage.clone(), &config.split_path, &byte_range_cache, file_name.as_deref()
             ).await
         }).map_err(|e| anyhow::anyhow!("Failed to open split index '{}': {}", config.split_path, e))?;
         
@@ -130,7 +149,7 @@ impl SplitSearcher {
         Ok(SplitSearcher {
             runtime,
             split_path: config.split_path,
-            storage,
+            storage: cached_storage,
             cache: byte_range_cache.clone(),
             byte_range_cache,
             index,
@@ -210,7 +229,7 @@ impl SplitSearcher {
             },
             Protocol::S3 => {
                 // For S3 splits, use the provided storage to read the split file
-                eprintln!("DEBUG: Attempting to read S3 split file: {}", split_path);
+                debug_log!("Attempting to read S3 split file: {}", split_path);
                 
                 // Use the extracted filename for S3 storage access
                 let file_path = if let Some(filename) = file_name {
@@ -218,13 +237,13 @@ impl SplitSearcher {
                 } else {
                     return Err(anyhow::anyhow!("No filename provided for S3 split: {}", split_path));
                 };
-                eprintln!("DEBUG: Using S3 filename: {:?}", file_path);
+                debug_log!("Using S3 filename: {:?}", file_path);
                 let split_data = index_storage.get_all(file_path).await
                     .map_err(|e| {
-                        eprintln!("DEBUG: S3 storage error: {:?}", e);
+                        debug_log!("S3 storage error: {:?}", e);
                         anyhow::anyhow!("Failed to read S3 split file '{}': {}", split_path, e)
                     })?;
-                eprintln!("DEBUG: Successfully read {} bytes from S3", split_data.len());
+                debug_log!("Successfully read {} bytes from S3", split_data.len());
                 
                 let split_owned_bytes = split_data;
                 
@@ -387,7 +406,7 @@ impl SplitSearcher {
     pub fn preload_components(&self, components: &[String]) -> anyhow::Result<()> {
         if self.hot_directory.is_some() {
             // For now, just acknowledge the components to preload
-            eprintln!("Preloading components: {:?}", components);
+            debug_log!("Preloading components: {:?}", components);
             Ok(())
         } else {
             anyhow::bail!("Hot cache not loaded. Call load_hot_cache() first.")
@@ -395,12 +414,42 @@ impl SplitSearcher {
     }
 
     pub fn get_cache_stats(&self) -> CacheStats {
+        // Access real Quickwit cache metrics instead of mock values
+        let storage_metrics = &quickwit_storage::STORAGE_METRICS;
+        
+        // Aggregate stats from all relevant cache components
+        let fast_field_metrics = &storage_metrics.fast_field_cache;
+        let shortlived_metrics = &storage_metrics.shortlived_cache;
+        let searcher_split_metrics = &storage_metrics.searcher_split_cache;
+        
+        // Get fast field cache stats - IntCounter and IntGauge should have .get() method
+        let ff_hits = fast_field_metrics.hits_num_items.get();
+        let ff_misses = fast_field_metrics.misses_num_items.get(); 
+        let ff_evictions = fast_field_metrics.evict_num_items.get();
+        let ff_bytes = fast_field_metrics.in_cache_num_bytes.get() as u64;
+        let ff_items = fast_field_metrics.in_cache_count.get() as u64;
+        
+        // Get shortlived cache stats  
+        let sl_hits = shortlived_metrics.hits_num_items.get();
+        let sl_misses = shortlived_metrics.misses_num_items.get();
+        let sl_evictions = shortlived_metrics.evict_num_items.get();
+        let sl_bytes = shortlived_metrics.in_cache_num_bytes.get() as u64;
+        let sl_items = shortlived_metrics.in_cache_count.get() as u64;
+        
+        // Get searcher split cache stats
+        let ss_hits = searcher_split_metrics.hits_num_items.get();
+        let ss_misses = searcher_split_metrics.misses_num_items.get();
+        let ss_evictions = searcher_split_metrics.evict_num_items.get();
+        let ss_bytes = searcher_split_metrics.in_cache_num_bytes.get() as u64;
+        let ss_items = searcher_split_metrics.in_cache_count.get() as u64;
+        
+        // Aggregate all cache components
         CacheStats {
-            hit_count: self.cache_hits.load(std::sync::atomic::Ordering::Relaxed),
-            miss_count: self.cache_misses.load(std::sync::atomic::Ordering::Relaxed),
-            eviction_count: self.cache_evictions.load(std::sync::atomic::Ordering::Relaxed),
-            cache_size_bytes: 1024 * 1024, // Mock 1MB cache size
-            cache_num_items: self.cache_hits.load(std::sync::atomic::Ordering::Relaxed) + 1,
+            hit_count: ff_hits + sl_hits + ss_hits,
+            miss_count: ff_misses + sl_misses + ss_misses,
+            eviction_count: ff_evictions + sl_evictions + ss_evictions,
+            cache_size_bytes: ff_bytes + sl_bytes + ss_bytes,
+            cache_num_items: ff_items + sl_items + ss_items,
         }
     }
 
@@ -430,7 +479,7 @@ impl SplitSearcher {
 
     /// Quickwit leaf search implementation - uses Quickwit's search infrastructure exclusively
     pub fn search(&self, query_ptr: jlong, limit: i32) -> anyhow::Result<SearchResult> {
-        eprintln!("DEBUG: SplitSearcher.search using Quickwit leaf search infrastructure");
+        debug_log!("SplitSearcher.search using Quickwit leaf search infrastructure");
         
         // Get the actual Tantivy query object from the registry
         let query_result = crate::utils::with_object(query_ptr as u64, |query: &Box<dyn tantivy::query::Query>| {
@@ -438,14 +487,14 @@ impl SplitSearcher {
         });
         
         let query = query_result.ok_or_else(|| anyhow::anyhow!("Invalid query pointer"))?;
-        eprintln!("DEBUG: Retrieved query from registry successfully");
+        debug_log!("Retrieved query from registry successfully");
         
         // Use Quickwit's async leaf search architecture
         let (leaf_search_response, scores) = self.runtime.block_on(async {
             self.quickwit_leaf_search(query, limit as usize).await
         })?;
         
-        eprintln!("DEBUG: Quickwit leaf search completed with {} hits", leaf_search_response.partial_hits.len());
+        debug_log!("Quickwit leaf search completed with {} hits", leaf_search_response.partial_hits.len());
         
         // Convert Quickwit LeafSearchResponse to our SearchResult format
         let total_hits = leaf_search_response.num_hits;
@@ -509,7 +558,7 @@ impl SplitSearcher {
 
     /// Quickwit-style leaf search implementation that follows Quickwit directory patterns 
     async fn quickwit_leaf_search(&self, query: Box<dyn tantivy::query::Query>, limit: usize) -> anyhow::Result<(quickwit_proto::search::LeafSearchResponse, Vec<f32>)> {
-        eprintln!("DEBUG: Starting proper Quickwit-style search implementation");
+        debug_log!("Starting proper Quickwit-style search implementation");
         
         // SOLUTION: Use Quickwit's approach - the HotDirectory provides sync access
         // to the pre-loaded data while maintaining async storage capabilities
@@ -522,30 +571,30 @@ impl SplitSearcher {
         let searcher = self.reader.searcher();
         let collector = TopDocs::with_limit(limit);
         
-        eprintln!("DEBUG: Performing search using HotDirectory-backed index");
+        debug_log!("Performing search using HotDirectory-backed index");
         
         // Debug: Check index state
         let num_docs = searcher.num_docs();
-        eprintln!("DEBUG: Index contains {} total documents", num_docs);
+        debug_log!("Index contains {} total documents", num_docs);
         
         // Debug: Get schema info
         let index_schema = searcher.index().schema();
-        eprintln!("DEBUG: Index schema field count: {}", index_schema.fields().count());
+        debug_log!("Index schema field count: {}", index_schema.fields().count());
         
         // Debug: Print schema field mapping
         for field in index_schema.fields() {
-            eprintln!("DEBUG: Schema field ID {:?} -> name '{}', type: {:?}", 
+            debug_log!("Schema field ID {:?} -> name '{}', type: {:?}", 
                 field.0, index_schema.get_field_name(field.0), 
                 index_schema.get_field_entry(field.0).field_type());
         }
         
         // Debug: Print query info  
-        eprintln!("DEBUG: Executing query: {:?}", query);
+        debug_log!("Executing query: {:?}", query);
         
         // Debug: Extract term from query to see what we're actually searching for
         if let Ok(query_str) = format!("{:?}", query).parse::<String>() {
             if query_str.contains("TermQuery") {
-                eprintln!("DEBUG: This is a term query - checking what term is being searched");
+                debug_log!("This is a term query - checking what term is being searched");
             }
         }
         
@@ -553,36 +602,36 @@ impl SplitSearcher {
         if let Some(segment_reader) = searcher.segment_readers().first() {
             let title_field = index_schema.get_field("title").unwrap();
             if let Ok(inverted_index) = segment_reader.inverted_index(title_field) {
-                eprintln!("DEBUG: Term dictionary accessible for title field");
+                debug_log!("Term dictionary accessible for title field");
                 
                 // Try to check if specific terms exist
                 let terms = inverted_index.terms();
-                eprintln!("DEBUG: Terms dict has {} terms", terms.num_terms());
+                debug_log!("Terms dict has {} terms", terms.num_terms());
                 
                 // Check if "document" or "Document" terms exist  
                 match terms.term_ord(b"document") {
-                    Ok(Some(ord)) => eprintln!("DEBUG: Found 'document' term at ordinal: {}", ord),
-                    Ok(None) => eprintln!("DEBUG: 'document' term not found in dictionary"),
-                    Err(e) => eprintln!("DEBUG: Error checking 'document' term: {}", e),
+                    Ok(Some(ord)) => debug_log!("Found 'document' term at ordinal: {}", ord),
+                    Ok(None) => debug_log!("'document' term not found in dictionary"),
+                    Err(e) => debug_log!("Error checking 'document' term: {}", e),
                 }
                 
                 match terms.term_ord(b"Document") {
-                    Ok(Some(ord)) => eprintln!("DEBUG: Found 'Document' term at ordinal: {}", ord),
-                    Ok(None) => eprintln!("DEBUG: 'Document' term not found in dictionary"),
-                    Err(e) => eprintln!("DEBUG: Error checking 'Document' term: {}", e),
+                    Ok(Some(ord)) => debug_log!("Found 'Document' term at ordinal: {}", ord),
+                    Ok(None) => debug_log!("'Document' term not found in dictionary"),
+                    Err(e) => debug_log!("Error checking 'Document' term: {}", e),
                 }
             } else {
-                eprintln!("DEBUG: Cannot access inverted index for title field");
+                debug_log!("Cannot access inverted index for title field");
             }
         }
         
         // Debug: Check first document content to verify data
         if num_docs > 0 {
             if let Ok(first_doc) = searcher.doc::<tantivy::TantivyDocument>(tantivy::DocAddress::new(0, 0)) {
-                eprintln!("DEBUG: First document fields:");
+                debug_log!("First document fields:");
                 for (field, field_values) in first_doc.field_values() {
                     let field_name = index_schema.get_field_name(field);
-                    eprintln!("  {}: {:?}", field_name, field_values);
+                    debug_log!("  {}: {:?}", field_name, field_values);
                 }
             }
         }
@@ -592,7 +641,7 @@ impl SplitSearcher {
         let search_results = searcher.search(&*query, &collector)
             .map_err(|e| anyhow::anyhow!("Search execution failed: {}", e))?;
         
-        eprintln!("DEBUG: Search completed with {} results", search_results.len());
+        debug_log!("Search completed with {} results", search_results.len());
         
         // Convert to Quickwit's LeafSearchResponse format (following their pattern)
         let split_id = format!("split-{}", self.split_path.split('/').last().unwrap_or("unknown"));
@@ -775,7 +824,7 @@ fn get_string_field(env: &mut JNIEnv, obj: &JObject, method_name: &str) -> anyho
 fn extract_aws_config_from_java_map(env: &mut JNIEnv, split_config: &JObject) -> anyhow::Result<Option<AwsConfig>> {
     // Check if split_config is null/empty
     if split_config.is_null() {
-        eprintln!("DEBUG: split_config is null");
+        debug_log!("split_config is null");
         return Ok(None);
     }
     
@@ -785,7 +834,7 @@ fn extract_aws_config_from_java_map(env: &mut JNIEnv, split_config: &JObject) ->
     let aws_config_obj = aws_config_obj.l()?;
     
     if aws_config_obj.is_null() {
-        eprintln!("DEBUG: aws_config key not found in split_config");
+        debug_log!("aws_config key not found in split_config");
         return Ok(None);
     }
     
@@ -833,7 +882,7 @@ fn extract_aws_config_from_java_map(env: &mut JNIEnv, split_config: &JObject) ->
             force_path_style: true, // Default for S3Mock
         }))
     } else {
-        eprintln!("DEBUG: Missing access_key or secret_key in aws_config");
+        debug_log!("Missing access_key or secret_key in aws_config");
         Ok(None)
     }
 }
@@ -871,7 +920,7 @@ fn create_split_searcher_with_shared_cache(
     
     // Extract AWS configuration from split_config if present
     let aws_config = extract_aws_config_from_java_map(env, &split_config)?;
-    eprintln!("DEBUG: Extracted AWS config from Java: {:?}", aws_config);
+    debug_log!("Extracted AWS config from Java: {:?}", aws_config);
     
     // Register split with cache manager
     if cache_manager_ptr != 0 {
@@ -1041,11 +1090,11 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_searchNative(
     // Use the existing search method which properly handles query_ptr and limit
     match searcher.search(query_ptr, limit) {
         Ok(result) => {
-            eprintln!("DEBUG: search succeeded, creating result object");
+            debug_log!("search succeeded, creating result object");
             create_search_result_object(&mut env, result)
         },
         Err(e) => {
-            eprintln!("DEBUG: search failed with error: {}", e);
+            debug_log!("search failed with error: {}", e);
             std::ptr::null_mut()
         },
     }

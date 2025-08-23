@@ -680,10 +680,39 @@ try (SchemaBuilder builder = new SchemaBuilder();
 ### Comprehensive Python Parity Tests
 
 ```bash
+# Run tests with clean output
 mvn test
+
+# Run tests with debug logging for troubleshooting
+TANTIVY4JAVA_DEBUG=1 mvn test
 ```
 
 **Test Results**: **120+ tests total, 100% passing (PERFECT SUCCESS RATE, ZERO CRASHES)**
+
+### Debug Logging
+
+Tantivy4Java includes environment-controlled debug logging for development and troubleshooting:
+
+- **Clean output by default** - Tests and applications run with minimal logging noise
+- **Comprehensive debug mode** - Set `TANTIVY4JAVA_DEBUG=1` to enable detailed native layer logging
+- **Debug information includes**:
+  - Search query execution details and performance
+  - Index schema metadata and document content analysis  
+  - Cache operations and statistics
+  - S3 storage operations and split file validation
+  - Memory usage and resource management
+
+**Usage examples:**
+```bash
+# Clean production test run
+mvn test
+
+# Debug test run with detailed native logging
+TANTIVY4JAVA_DEBUG=1 mvn test -Dtest=SplitSearcherTest
+
+# Debug application execution
+TANTIVY4JAVA_DEBUG=1 java -cp target/classes:target/dependency/* MySearchApp
+```
 
 ### Test Coverage Includes:
 

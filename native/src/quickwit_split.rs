@@ -1,6 +1,15 @@
 use jni::objects::{JClass, JObject, JString, JValue};
 use jni::sys::jobject;
 use jni::JNIEnv;
+
+// Debug logging macro - controlled by TANTIVY4JAVA_DEBUG environment variable
+macro_rules! debug_log {
+    ($($arg:tt)*) => {
+        if std::env::var("TANTIVY4JAVA_DEBUG").unwrap_or_default() == "1" {
+            eprintln!("DEBUG: {}", format!($($arg)*));
+        }
+    };
+}
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::ops::RangeInclusive;
@@ -221,7 +230,7 @@ fn convert_tantivy_to_split(
     // because MmapDirectory's path field is private and there's no public accessor.
     // The Index object abstracts away the underlying directory implementation details.
     
-    eprintln!("DEBUG: Cannot extract directory path from Index object - path is not publicly accessible");
+    debug_log!("Cannot extract directory path from Index object - path is not publicly accessible");
     
     return Err(anyhow::anyhow!(
         "Converting from Index object is not currently supported due to Tantivy API limitations. \
@@ -286,7 +295,7 @@ fn create_quickwit_split(
     use quickwit_storage::SplitPayloadBuilder;
     use std::path::PathBuf;
     
-    eprintln!("DEBUG: create_quickwit_split called with output_path: {:?}", output_path);
+    debug_log!("create_quickwit_split called with output_path: {:?}", output_path);
     
     // Collect all Tantivy index files
     let mut split_files = Vec::new();
@@ -301,13 +310,13 @@ fn create_quickwit_split(
             }
             
             if path.is_file() {
-                eprintln!("DEBUG: Including file in split: {:?}", filename);
+                debug_log!("Including file in split: {:?}", filename);
                 split_files.push(path);
             }
         }
     }
     
-    eprintln!("DEBUG: Total files collected for split: {}", split_files.len());
+    debug_log!("Total files collected for split: {}", split_files.len());
     
     // Sort files for consistent ordering
     split_files.sort();
@@ -328,7 +337,7 @@ fn create_quickwit_split(
             all_field_metadata.extend(field_metadata);
         }
         
-        eprintln!("DEBUG: Extracted {} field metadata entries from index", all_field_metadata.len());
+        debug_log!("Extracted {} field metadata entries from index", all_field_metadata.len());
         
         // Use Quickwit's serialization functions to create proper field metadata
         use quickwit_proto::search::{ListFields, ListFieldsEntryResponse, serialize_split_fields};
@@ -347,7 +356,7 @@ fn create_quickwit_split(
                     _ => quickwit_proto::search::ListFieldType::Str as i32, // Default fallback
                 };
                 
-                eprintln!("DEBUG: Field '{}' - type: {:?}, indexed: {}, fast: {}", 
+                debug_log!("Field '{}' - type: {:?}, indexed: {}, fast: {}", 
                     field_metadata.field_name, field_metadata.typ, field_metadata.indexed, field_metadata.fast);
                     
                 ListFieldsEntryResponse {
@@ -486,7 +495,7 @@ pub extern "system" fn Java_com_tantivy4java_QuickwitSplit_nativeReadSplitMetada
             num_merge_ops: 0,
         };
         
-        eprintln!("DEBUG: Successfully read Quickwit split with {} files", file_count);
+        debug_log!("Successfully read Quickwit split with {} files", file_count);
         
         let metadata_obj = create_java_split_metadata(env, &split_metadata)?;
         Ok(metadata_obj.into_raw())
@@ -536,7 +545,7 @@ pub extern "system" fn Java_com_tantivy4java_QuickwitSplit_nativeListSplitFiles(
             file_count += 1;
         }
         
-        eprintln!("DEBUG: Listed {} files from Quickwit split", file_count);
+        debug_log!("Listed {} files from Quickwit split", file_count);
         
         Ok(file_list.into_raw())
     }).unwrap_or(std::ptr::null_mut())
@@ -603,7 +612,7 @@ pub extern "system" fn Java_com_tantivy4java_QuickwitSplit_nativeExtractSplit(
             std::fs::write(&output_file_path, &file_data)?;
             extracted_count += 1;
             
-            eprintln!("DEBUG: Extracted file {} ({} bytes)", file_path.display(), file_data.len());
+            debug_log!("Extracted file {} ({} bytes)", file_path.display(), file_data.len());
         }
         
         // Create a minimal metadata object for the return value
@@ -623,7 +632,7 @@ pub extern "system" fn Java_com_tantivy4java_QuickwitSplit_nativeExtractSplit(
             num_merge_ops: 0,
         };
         
-        eprintln!("DEBUG: Successfully extracted {} files from Quickwit split to {}", extracted_count, output_path.display());
+        debug_log!("Successfully extracted {} files from Quickwit split to {}", extracted_count, output_path.display());
         
         let metadata_obj = create_java_split_metadata(env, &split_metadata)?;
         Ok(metadata_obj.into_raw())
