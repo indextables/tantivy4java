@@ -96,8 +96,15 @@ public class SplitSearcherDocumentRetrievalTest {
         try (SplitSearcher searcher = cacheManager.createSplitSearcher(splitUrl)) {
             assertNotNull(searcher, "Split searcher should be created successfully");
             
+            // Demonstrate schema introspection
+            Schema schema = searcher.getSchema();
+            System.out.println("📊 Schema introspection results:");
+            System.out.println("   Field count: " + schema.getFieldCount());
+            System.out.println("   Field names: " + schema.getFieldNames());
+            System.out.println("   Has title field: " + schema.hasField("title"));
+            
             // Search for documents
-            Query titleQuery = Query.termQuery(searcher.getSchema(), "title", "Advanced");
+            Query titleQuery = Query.termQuery(schema, "title", "Advanced");
             SearchResult result = searcher.search(titleQuery, 10);
             
             assertNotNull(result, "Search should return results");
@@ -112,16 +119,40 @@ public class SplitSearcherDocumentRetrievalTest {
                 Document doc = searcher.doc(hit.getDocAddress());
                 assertNotNull(doc, "Document should be retrieved successfully");
                 
-                // Test actual field value access
+                // Test comprehensive field value access
                 Object titleValue = doc.getFirst("title");
                 assertNotNull(titleValue, "Document should have title field");
                 assertTrue(titleValue instanceof String, "Title should be a string");
+                assertTrue(titleValue.toString().startsWith("Advanced Document"), "Title should match expected pattern");
                 System.out.println("✅ Document retrieved successfully with title: " + titleValue);
                 
-                // Test additional field access
+                // Test content field access
                 Object contentValue = doc.getFirst("content");
                 assertNotNull(contentValue, "Document should have content field");
+                assertTrue(contentValue instanceof String, "Content should be a string");
+                assertTrue(contentValue.toString().contains("comprehensive test content"), "Content should match expected pattern");
                 System.out.println("   Content preview: " + contentValue.toString().substring(0, Math.min(50, contentValue.toString().length())) + "...");
+                
+                // Test category field access  
+                Object categoryValue = doc.getFirst("category");
+                assertNotNull(categoryValue, "Document should have category field");
+                assertTrue(categoryValue instanceof String, "Category should be a string");
+                assertTrue(categoryValue.toString().matches("technical|tutorial|education"), "Category should be one of expected values");
+                System.out.println("   Category: " + categoryValue);
+                
+                // Test integer field access
+                Object scoreValue = doc.getFirst("score");
+                assertNotNull(scoreValue, "Document should have score field");
+                assertTrue(scoreValue instanceof Integer || scoreValue instanceof Long, "Score should be numeric");
+                int scoreInt = ((Number) scoreValue).intValue();
+                assertTrue(scoreInt >= 8 && scoreInt <= 10, "Score should be in expected range (8-10)");
+                System.out.println("   Score: " + scoreInt);
+                
+                // Test boolean field access
+                Object publishedValue = doc.getFirst("published");
+                assertNotNull(publishedValue, "Document should have published field");
+                assertTrue(publishedValue instanceof Boolean, "Published should be boolean");
+                System.out.println("   Published: " + publishedValue);
                 
                 System.out.println("   Document address: " + hit.getDocAddress());
                 
@@ -174,10 +205,23 @@ public class SplitSearcherDocumentRetrievalTest {
             Document doc = searcher.doc(hit.getDocAddress());
             assertNotNull(doc, "Document should be retrieved for " + queryType);
             
-            // Test field access for the retrieved document
+            // Test comprehensive field access for the retrieved document
             Object titleValue = doc.getFirst("title");
-            assertNotNull(titleValue, "Retrieved document should have accessible fields");
-            System.out.println("   ✅ Retrieved document with score: " + hit.getScore() + ", title: " + titleValue);
+            assertNotNull(titleValue, "Retrieved document should have title field");
+            assertTrue(titleValue instanceof String, "Title should be a string");
+            
+            Object scoreValue = doc.getFirst("score");
+            assertNotNull(scoreValue, "Retrieved document should have score field");
+            assertTrue(scoreValue instanceof Integer || scoreValue instanceof Long, "Score should be numeric");
+            
+            Object publishedValue = doc.getFirst("published");
+            assertNotNull(publishedValue, "Retrieved document should have published field");
+            assertTrue(publishedValue instanceof Boolean, "Published should be boolean");
+            
+            System.out.println("   ✅ Retrieved document with score: " + hit.getScore() + 
+                             ", title: " + titleValue + 
+                             ", numeric_score: " + scoreValue + 
+                             ", published: " + publishedValue);
             doc.close();
         }
         
@@ -245,6 +289,96 @@ public class SplitSearcherDocumentRetrievalTest {
             
             doc1.close();
             doc2.close();
+            result.close();
+        }
+    }
+    
+    @Test
+    @DisplayName("Test comprehensive field data validation")
+    void testComprehensiveFieldDataValidation() {
+        try (SplitSearcher searcher = cacheManager.createSplitSearcher(splitUrl)) {
+            Schema schema = searcher.getSchema();
+            
+            // Search for a specific document we know the pattern of
+            Query titleQuery = Query.termQuery(schema, "title", "Document");
+            SearchResult result = searcher.search(titleQuery, 5);
+            
+            assertNotNull(result, "Search should return results");
+            List<SearchResult.Hit> hits = result.getHits();
+            assertTrue(hits.size() > 0, "Should find matching documents");
+            
+            for (SearchResult.Hit hit : hits) {
+                Document doc = searcher.doc(hit.getDocAddress());
+                assertNotNull(doc, "Document should be retrieved successfully");
+                
+                // Comprehensive field validation
+                System.out.println("🔍 Validating all field types for document:");
+                
+                // 1. Text field validation - title
+                Object titleValue = doc.getFirst("title");
+                assertNotNull(titleValue, "Title field must be present");
+                assertTrue(titleValue instanceof String, "Title must be String type");
+                String title = titleValue.toString();
+                assertTrue(title.startsWith("Advanced Document"), "Title should match expected format");
+                System.out.println("   ✅ Title field: " + title + " (String)");
+                
+                // 2. Text field validation - content  
+                Object contentValue = doc.getFirst("content");
+                assertNotNull(contentValue, "Content field must be present");
+                assertTrue(contentValue instanceof String, "Content must be String type");
+                String content = contentValue.toString();
+                assertTrue(content.contains("comprehensive test content"), "Content should contain expected text");
+                assertTrue(content.contains("advanced, technical, tutorial"), "Content should contain search terms");
+                System.out.println("   ✅ Content field: " + content.substring(0, Math.min(60, content.length())) + "... (String)");
+                
+                // 3. Text field validation - category
+                Object categoryValue = doc.getFirst("category");
+                assertNotNull(categoryValue, "Category field must be present");
+                assertTrue(categoryValue instanceof String, "Category must be String type");
+                String category = categoryValue.toString();
+                assertTrue(category.matches("technical|tutorial|education"), "Category must be one of expected values");
+                System.out.println("   ✅ Category field: " + category + " (String)");
+                
+                // 4. Integer field validation - score
+                Object scoreValue = doc.getFirst("score");
+                assertNotNull(scoreValue, "Score field must be present");
+                assertTrue(scoreValue instanceof Integer || scoreValue instanceof Long, "Score must be numeric type");
+                int score = ((Number) scoreValue).intValue();
+                assertTrue(score >= 8 && score <= 10, "Score should be in range 8-10 based on test data pattern");
+                System.out.println("   ✅ Score field: " + score + " (Integer)");
+                
+                // 5. Boolean field validation - published
+                Object publishedValue = doc.getFirst("published");
+                assertNotNull(publishedValue, "Published field must be present");
+                assertTrue(publishedValue instanceof Boolean, "Published must be Boolean type");
+                Boolean published = (Boolean) publishedValue;
+                System.out.println("   ✅ Published field: " + published + " (Boolean)");
+                
+                // 6. Validate field relationships (based on our test data pattern)
+                // Extract document number from title to validate cross-field consistency
+                if (title.matches("Advanced Document \\d+")) {
+                    String numStr = title.replaceAll("Advanced Document ", "");
+                    int docNum = Integer.parseInt(numStr);
+                    
+                    // Validate category matches pattern: i % 3 == 0 ? "technical" : (i % 3 == 1 ? "tutorial" : "education")
+                    String expectedCategory = docNum % 3 == 0 ? "technical" : (docNum % 3 == 1 ? "tutorial" : "education");
+                    assertEquals(expectedCategory, category, "Category should match document number pattern");
+                    
+                    // Validate score matches pattern: 8 + (i % 3)  
+                    int expectedScore = 8 + (docNum % 3);
+                    assertEquals(expectedScore, score, "Score should match document number pattern");
+                    
+                    // Validate published matches pattern: i % 2 == 0
+                    boolean expectedPublished = (docNum % 2 == 0);
+                    assertEquals(expectedPublished, published, "Published should match document number pattern");
+                    
+                    System.out.println("   ✅ Cross-field validation passed for document " + docNum);
+                }
+                
+                System.out.println("   🎯 All field types and values validated successfully!");
+                doc.close();
+            }
+            
             result.close();
         }
     }

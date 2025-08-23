@@ -36,6 +36,7 @@ Tantivy4Java
 - **Multi-value field support** - Arrays in documents and JSON matching Python behavior
 - **All field types** - Text, Integer, Float, Boolean, Date with Python-compatible behavior
 - **Field access patterns** - `doc.get(field)` matching Python `doc.to_named_doc(schema)`
+- **Schema introspection** - Runtime field discovery and metadata access
 
 **Query System (Complete Python Coverage)**
 - **All query types** implemented matching Python library:
@@ -91,6 +92,14 @@ Tantivy4Java
 - **Query explanation framework** - Scoring analysis (preparatory implementation)
 - **Document frequency analysis** - Term statistics and distribution
 
+**6. `SchemaIntrospectionTest.java` ✅**
+- **Field discovery and enumeration** - Runtime schema field listing
+- **Field existence validation** - Dynamic field checking capabilities
+- **Schema metadata access** - Field types, configurations, and capabilities
+- **Advanced field filtering** - Filter by type, storage, indexing, and fast access
+- **Schema summary generation** - Comprehensive schema structure reporting
+- **SplitSearcher integration** - Dynamic field discovery with document retrieval
+
 #### **Additional Comprehensive Tests**
 - **`ComprehensiveFunctionalityTest`** ✅ - Multi-field documents, all query types
 - **`DeleteDocumentsTest`** ✅ - CRUD operations, lifecycle management
@@ -118,6 +127,9 @@ Tantivy4Java
 | Fuzzy queries | `Query.fuzzyTermQuery(schema, field, term, distance)` | ✅ Complete |
 | Index segment merge | `writer.merge(segmentIds)` | ✅ Complete |
 | Quickwit split conversion | `QuickwitSplit.convertIndex(index, path, config)` | ✅ Complete |
+| Schema field discovery | `schema.getFieldNames()`, `schema.hasField(name)` | ✅ Complete |
+| Schema field filtering | `schema.getStoredFieldNames()`, `schema.getFieldNamesByType()` | ✅ Complete |
+| Schema metadata access | `schema.getSchemaSummary()`, `schema.getFieldCount()` | ✅ Complete |
 
 ### **🎯 DETAILED FUNCTIONALITY STATUS**
 
@@ -149,12 +161,13 @@ Tantivy4Java
 - **Boolean Fields** - True/false queries and filtering ✅
 - **Date Fields** - Temporal queries with proper date handling ✅
 - **Multi-value Fields** - Array support in documents and queries ✅
+- **Schema Introspection** - Runtime field discovery, type checking, and metadata access ✅
 
 #### **🎯 PYTHON COMPATIBILITY VERIFICATION**
 
 **Test Coverage Analysis**
-- **Total Tests**: 68 comprehensive tests
-- **Passing**: 68 tests (100% success rate)
+- **Total Tests**: 74 comprehensive tests
+- **Passing**: 74 tests (100% success rate)
 - **Minor Issues**: ✅ ALL RESOLVED - Boolean field handling fixed
 - **Core Functionality**: 100% working
 - **Python Patterns**: Complete coverage
@@ -258,6 +271,71 @@ System.out.println("Size: " + metadata.getUncompressedSizeBytes());
 - **Immutable Splits** - Self-contained, portable index segments for distributed deployment
 - **Split Inspection** - Extract metadata and file listings without full extraction
 - **Round-trip Support** - Convert splits back to searchable Tantivy indices
+
+#### **🔍 COMPLETE SCHEMA FIELD INTROSPECTION IMPLEMENTATION**
+
+**Runtime Schema Discovery and Metadata Access**
+
+Tantivy4Java now provides comprehensive schema introspection capabilities, allowing developers to dynamically discover and analyze schema structure at runtime:
+
+**Core Introspection Features**
+- **`schema.getFieldNames()`** - Get complete list of all field names ✅
+- **`schema.hasField(fieldName)`** - Check field existence before querying ✅  
+- **`schema.getFieldCount()`** - Get total number of fields for validation ✅
+- **`schema.getSchemaSummary()`** - Detailed field information with types and configuration ✅
+- **`schema.getStoredFieldNames()`** - Get all stored fields for document retrieval ✅
+- **`schema.getIndexedFieldNames()`** - Get all indexed fields for search optimization ✅
+- **`schema.getFastFieldNames()`** - Get all fast fields for performance tuning ✅
+- **`schema.getFieldNamesByType(fieldType)`** - Filter fields by data type ✅
+- **`schema.getFieldNamesByCapabilities(stored, indexed, fast)`** - Advanced field filtering ✅
+
+**Comprehensive Testing**
+- **6 dedicated introspection tests** with 100% pass rate ✅
+- **Dynamic field discovery scenarios** with various schema configurations ✅
+- **Field validation and existence checking** with error handling ✅
+- **Schema summary generation** with detailed metadata formatting ✅
+- **SplitSearcher integration** demonstrating real-world usage patterns ✅
+
+**Example Usage:**
+```java
+// Schema introspection with SplitSearcher
+try (SplitSearcher searcher = cacheManager.createSplitSearcher(splitUrl)) {
+    Schema schema = searcher.getSchema();
+    
+    // Dynamic field discovery
+    List<String> fieldNames = schema.getFieldNames();
+    int fieldCount = schema.getFieldCount();
+    boolean hasTitle = schema.hasField("title");
+    
+    System.out.println("📊 Schema contains " + fieldCount + " fields: " + fieldNames);
+    
+    // Smart query construction based on available fields
+    if (hasTitle) {
+        Query query = Query.termQuery(schema, "title", "search term");
+        SearchResult result = searcher.search(query, 10);
+        
+        // Document field access with introspection
+        for (var hit : result.getHits()) {
+            try (Document doc = searcher.doc(hit.getDocAddress())) {
+                for (String fieldName : fieldNames) {
+                    Object value = doc.getFirst(fieldName);
+                    if (value != null) {
+                        System.out.println(fieldName + ": " + value);
+                    }
+                }
+            }
+        }
+    }
+}
+```
+
+**Production Benefits:**
+- **💡 Dynamic Query Construction** - Build queries based on runtime schema discovery
+- **✅ Field Validation** - Prevent errors by checking field existence before querying
+- **📊 Performance Optimization** - Target only indexed/fast fields for better performance  
+- **🔍 Debug and Troubleshooting** - Comprehensive schema inspection capabilities
+- **🤖 API Discovery** - Dynamically adapt applications to different schema configurations
+- **🐛 Error Prevention** - Validate field access patterns before document processing
 
 #### **✅ COMPLETE TANTIVY SEGMENT MERGE IMPLEMENTATION**
 

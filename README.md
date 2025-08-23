@@ -19,6 +19,7 @@ Tantivy4Java delivers **100% functional compatibility** with the Python tantivy 
 - **🎯 Advanced search features** - Scoring, boosting, complex boolean logic
 - **💾 Index persistence** - Create, open, reload, exists functionality
 - **⚡ Index optimization** - Segment merging for performance tuning
+- **🔍 Schema introspection** - Runtime field discovery and metadata access
 
 ## Overview
 
@@ -35,6 +36,7 @@ Tantivy4Java brings the power of the Rust-based Tantivy search engine to Java th
 - **✅ Index persistence** - Open existing indices, check existence, retrieve schemas
 - **✅ Document retrieval** - Complete field extraction with proper type conversion
 - **✅ Index optimization** - Segment merging with metadata access for performance tuning
+- **✅ Schema introspection** - Complete field discovery, type checking, and metadata access
 - **✅ Resource management** - Memory-safe cleanup with try-with-resources
 - **✅ Zero-copy operations** - Direct memory sharing for maximum performance
 - **✅ Java 11+ compatibility** - Modern Java features and Maven integration
@@ -413,6 +415,119 @@ QuickwitSplit.SplitConfig config = new QuickwitSplit.SplitConfig(
 - **🔍 Split Inspection** - Read metadata without full extraction
 - **🛠️ Index Extraction** - Convert splits back to searchable indices
 
+### 🔍 **NEW: Complete Schema Field Introspection**
+
+Tantivy4Java now includes **comprehensive schema introspection capabilities** for runtime field discovery, type checking, and metadata access:
+
+```java
+import com.tantivy4java.*;
+
+// Create a schema with various field types
+try (SchemaBuilder builder = new SchemaBuilder()) {
+    builder.addTextField("title", true, false, "default", "position")
+           .addTextField("content", true, false, "default", "position")
+           .addIntegerField("view_count", true, true, true)
+           .addFloatField("rating", true, true, true)
+           .addBooleanField("is_published", true, true, true)
+           .addDateField("created_at", true, true, false);
+           
+    try (Schema schema = builder.build()) {
+        // Field discovery and enumeration
+        List<String> fieldNames = schema.getFieldNames();
+        int fieldCount = schema.getFieldCount();
+        
+        System.out.println("Schema contains " + fieldCount + " fields:");
+        System.out.println("Field names: " + fieldNames);
+        
+        // Field existence checking
+        boolean hasTitle = schema.hasField("title");
+        boolean hasNonExistent = schema.hasField("nonexistent");
+        
+        System.out.println("Has title field: " + hasTitle);        // true
+        System.out.println("Has missing field: " + hasNonExistent); // false
+        
+        // Get field names by capabilities
+        List<String> storedFields = schema.getStoredFieldNames();
+        List<String> indexedFields = schema.getIndexedFieldNames();
+        List<String> fastFields = schema.getFastFieldNames();
+        
+        System.out.println("Stored fields: " + storedFields);
+        System.out.println("Indexed fields: " + indexedFields);
+        System.out.println("Fast fields: " + fastFields);
+        
+        // Get field names by type
+        List<String> textFields = schema.getFieldNamesByType(FieldType.TEXT);
+        List<String> numericFields = schema.getFieldNamesByType(FieldType.INTEGER);
+        
+        System.out.println("Text fields: " + textFields);
+        System.out.println("Integer fields: " + numericFields);
+        
+        // Advanced field filtering
+        List<String> storedTextFields = schema.getFieldNamesByCapabilities(true, null, null);
+        List<String> fastNumericFields = schema.getFieldNamesByCapabilities(null, null, true);
+        
+        // Comprehensive schema summary
+        String summary = schema.getSchemaSummary();
+        System.out.println("\nDetailed Schema Summary:");
+        System.out.println(summary);
+    }
+}
+```
+
+#### Schema Introspection with SplitSearcher Integration
+
+```java
+// Schema introspection works seamlessly with SplitSearcher
+try (SplitSearcher searcher = cacheManager.createSplitSearcher(splitUrl)) {
+    Schema schema = searcher.getSchema();
+    
+    // Dynamic field discovery
+    List<String> availableFields = schema.getFieldNames();
+    System.out.println("📊 Available search fields: " + availableFields);
+    
+    // Smart query construction based on available fields
+    if (schema.hasField("title")) {
+        Query titleQuery = Query.termQuery(schema, "title", "search term");
+        SearchResult results = searcher.search(titleQuery, 10);
+        
+        // Document field access with introspection
+        for (var hit : results.getHits()) {
+            try (Document doc = searcher.doc(hit.getDocAddress())) {
+                // Access fields discovered through introspection
+                for (String fieldName : availableFields) {
+                    if (schema.hasField(fieldName)) {
+                        Object fieldValue = doc.getFirst(fieldName);
+                        if (fieldValue != null) {
+                            System.out.println(fieldName + ": " + fieldValue);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+```
+
+#### Schema Introspection Features
+
+- **🔍 Field Discovery** - Get complete list of all fields in a schema
+- **✓ Field Validation** - Check if specific fields exist before querying
+- **📊 Field Counting** - Get total number of fields for validation
+- **📝 Schema Summary** - Detailed field information with types and configuration
+- **🏷️ Field Filtering** - Get fields by type (TEXT, INTEGER, BOOLEAN, etc.)
+- **⚙️ Capability Filtering** - Find fields by capabilities (stored, indexed, fast)
+- **📚 Metadata Access** - Runtime access to field configuration and options
+- **🔗 Split Integration** - Works seamlessly with SplitSearcher for dynamic discovery
+
+#### Production Benefits
+
+- **💡 Dynamic Queries** - Build queries based on runtime schema discovery
+- **✅ Field Validation** - Prevent query errors by checking field existence
+- **📊 Performance Optimization** - Target only indexed/fast fields for better performance
+- **🔍 Debug Support** - Comprehensive schema inspection for troubleshooting
+- **🤖 API Discovery** - Dynamically adapt to different schema configurations
+- **🐛 Error Prevention** - Validate field access before document processing
+
 ### Advanced Performance Optimization
 
 Tantivy4Java also provides complete access to Tantivy's segment merging functionality for index optimization:
@@ -502,6 +617,8 @@ mvn test
 - **`ExplanationAndFrequencyTest`** - Query explanation, document frequency
 - **`IndexMergeTest`** - Segment merge API validation and error handling
 - **`RealSegmentMergeTest`** - Real-world merge scenarios with actual segment IDs
+- **`SchemaIntrospectionTest`** - Complete field discovery and metadata access (6 tests)
+- **`SplitSearcherDocumentRetrievalTest`** - Document retrieval with schema introspection integration
 - **`QuickwitSplitTest`** - Complete Quickwit split conversion functionality (16 tests)
 - **`QuickwitSplitMinimalTest`** - QuickwitSplit safety and compatibility verification
 - **Plus 15+ additional comprehensive functionality tests**
@@ -645,6 +762,7 @@ try (SchemaBuilder builder = new SchemaBuilder()) {
 - **Advanced features** - ✅ Phrase, fuzzy, range, boost queries
 - **JSON document support** - ✅ Document.from_dict equivalent
 - **Index operations** - ✅ Create, open, reload, exists
+- **Schema introspection** - ✅ Complete field discovery and metadata access
 - **Index optimization** - ✅ Segment merging with metadata access
 
 #### **Production-Ready Components**
@@ -655,6 +773,7 @@ try (SchemaBuilder builder = new SchemaBuilder()) {
 - ✅ **Index optimization** - Segment merging for performance tuning and storage efficiency
 - ✅ **Memory management** - Resource-safe cleanup patterns
 - ✅ **Index persistence** - Disk-based indices with full lifecycle management
+- ✅ **Schema introspection** - Runtime field discovery, type checking, and metadata access
 
 #### **Python Test Pattern Validation**
 - ✅ **1,600+ lines** of Python tests analyzed and ported

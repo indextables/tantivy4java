@@ -18,7 +18,7 @@
  */
 
 use jni::objects::{JClass, JString};
-use jni::sys::{jboolean, jlong};
+use jni::sys::{jboolean, jlong, jint, jobject};
 use jni::JNIEnv;
 use tantivy::schema::{SchemaBuilder, TextOptions, NumericOptions, DateOptions, IpAddrOptions};
 use tantivy::schema::{IndexRecordOption, TextFieldIndexing};
@@ -468,4 +468,128 @@ pub extern "system" fn Java_com_tantivy4java_Schema_nativeClose(
     ptr: jlong,
 ) {
     remove_object(ptr as u64);
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_tantivy4java_Schema_nativeGetFieldNames(
+    mut env: JNIEnv,
+    _class: JClass,
+    ptr: jlong,
+) -> jobject {
+    use crate::utils::with_object;
+    use jni::objects::JObject;
+    use jni::sys::jobject;
+    
+    if ptr == 0 {
+        return std::ptr::null_mut();
+    }
+    
+    let result = with_object::<tantivy::schema::Schema, Result<jobject, String>>(ptr as u64, |schema| {
+        // Create ArrayList to hold field names
+        let array_list_class = env.find_class("java/util/ArrayList").map_err(|e| e.to_string())?;
+        let array_list = env.new_object(&array_list_class, "()V", &[]).map_err(|e| e.to_string())?;
+        
+        // Get all fields and add their names to the list
+        for (field, _field_entry) in schema.fields() {
+            let field_name = schema.get_field_name(field);
+            let java_string = env.new_string(field_name).map_err(|e| e.to_string())?;
+            
+            env.call_method(
+                &array_list,
+                "add",
+                "(Ljava/lang/Object;)Z",
+                &[(&java_string).into()],
+            ).map_err(|e| e.to_string())?;
+        }
+        
+        Ok(array_list.into_raw())
+    });
+    
+    match result {
+        Some(Ok(list)) => list,
+        Some(Err(_)) | None => {
+            handle_error(&mut env, "Failed to get field names");
+            std::ptr::null_mut()
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_tantivy4java_Schema_nativeHasField(
+    mut env: JNIEnv,
+    _class: JClass,
+    ptr: jlong,
+    field_name: JString,
+) -> jboolean {
+    use crate::utils::with_object;
+    
+    if ptr == 0 {
+        return 0;
+    }
+    
+    let field_name_str: String = match env.get_string(&field_name) {
+        Ok(s) => s.into(),
+        Err(_) => return 0,
+    };
+    
+    let result = with_object::<tantivy::schema::Schema, bool>(ptr as u64, |schema| {
+        schema.get_field(&field_name_str).is_ok()
+    });
+    
+    result.unwrap_or(false) as jboolean
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_tantivy4java_Schema_nativeGetFieldCount(
+    _env: JNIEnv,
+    _class: JClass,
+    ptr: jlong,
+) -> jint {
+    use crate::utils::with_object;
+    use jni::sys::jint;
+    
+    if ptr == 0 {
+        return 0;
+    }
+    
+    let result = with_object::<tantivy::schema::Schema, usize>(ptr as u64, |schema| {
+        schema.fields().count()
+    });
+    
+    result.unwrap_or(0) as jint
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_tantivy4java_Schema_nativeGetSchemaSummary(
+    mut env: JNIEnv,
+    _class: JClass,
+    ptr: jlong,
+) -> jobject {
+    use crate::utils::with_object;
+    use jni::sys::jobject;
+    
+    if ptr == 0 {
+        return std::ptr::null_mut();
+    }
+    
+    let result = with_object::<tantivy::schema::Schema, Result<jobject, String>>(ptr as u64, |schema| {
+        let mut summary = String::new();
+        summary.push_str(&format!("Schema with {} fields:\n", schema.fields().count()));
+        
+        for (field, field_entry) in schema.fields() {
+            let field_name = schema.get_field_name(field);
+            summary.push_str(&format!("  - {}: {:?}\n", field_name, field_entry.field_type()));
+        }
+        
+        let java_string = env.new_string(summary).map_err(|e| e.to_string())?;
+        Ok(java_string.into_raw())
+    });
+    
+    match result {
+        Some(Ok(summary)) => summary,
+        Some(Err(_)) | None => {
+            handle_error(&mut env, "Failed to get schema summary");
+            std::ptr::null_mut()
+        }
+    }
 }

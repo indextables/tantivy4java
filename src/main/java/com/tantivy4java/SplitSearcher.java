@@ -8,6 +8,28 @@ import java.util.concurrent.CompletableFuture;
 /**
  * SplitSearcher provides efficient search capabilities over Quickwit split files
  * with hot cache optimization and incremental loading of index components.
+ * 
+ * <h3>Shared Cache Architecture</h3>
+ * SplitSearcher instances MUST be created through {@link SplitCacheManager#createSplitSearcher(String)}
+ * to ensure proper shared cache management. All SplitSearcher instances created through the same
+ * SplitCacheManager share global caches for:
+ * <ul>
+ *   <li>LeafSearchCache - Query result caching per split_id + query</li>
+ *   <li>ByteRangeCache - Storage byte range caching per file_path + range</li>
+ *   <li>ComponentCache - Index component caching (fast fields, postings, etc.)</li>
+ * </ul>
+ * 
+ * <h3>Proper Usage Pattern</h3>
+ * <pre>{@code
+ * // Create shared cache manager (reuse across application)
+ * SplitCacheManager.CacheConfig config = new SplitCacheManager.CacheConfig("main-cache")
+ *     .withMaxCacheSize(200_000_000); // 200MB shared across all splits
+ * SplitCacheManager cacheManager = SplitCacheManager.getInstance(config);
+ * 
+ * // Create searchers that share the cache
+ * SplitSearcher searcher1 = cacheManager.createSplitSearcher("s3://bucket/split1.split");
+ * SplitSearcher searcher2 = cacheManager.createSplitSearcher("s3://bucket/split2.split");
+ * }</pre>
  */
 public class SplitSearcher implements AutoCloseable {
     
@@ -20,22 +42,6 @@ public class SplitSearcher implements AutoCloseable {
     // Configuration now comes from SplitCacheManager
     private final SplitCacheManager cacheManager;
     
-    /**
-     * @deprecated SplitSearchConfig is no longer used. Configuration comes from SplitCacheManager.
-     * This class is kept only for backward compatibility and will be removed in future versions.
-     */
-    @Deprecated
-    public static class SplitSearchConfig {
-        private final String splitPath;
-        
-        @Deprecated
-        public SplitSearchConfig(String splitPath) {
-            this.splitPath = splitPath;
-        }
-        
-        @Deprecated
-        public String getSplitPath() { return splitPath; }
-    }
     
     /**
      * Index components that can be preloaded for optimal performance
@@ -140,18 +146,24 @@ public class SplitSearcher implements AutoCloseable {
     }
     
     /**
-     * Create a new SplitSearcher from a split file using shared cache.
+     * @deprecated REMOVED - Use SplitCacheManager.createSplitSearcher() instead.
      * 
-     * @deprecated Use SplitCacheManager.createSplitSearcher() instead for proper shared cache management.
-     * This method creates a default cache manager, but shared cache managers should be reused.
+     * Proper usage pattern:
+     * <pre>{@code
+     * SplitCacheManager.CacheConfig config = new SplitCacheManager.CacheConfig("my-cache")
+     *     .withMaxCacheSize(200_000_000);
+     * SplitCacheManager cacheManager = SplitCacheManager.getInstance(config);
+     * SplitSearcher searcher = cacheManager.createSplitSearcher(splitPath);
+     * }</pre>
+     * 
+     * This ensures proper shared cache management across all splits.
      */
     @Deprecated
-    public static SplitSearcher create(String splitPath) {
-        // Create a default cache manager - not recommended for production
-        SplitCacheManager.CacheConfig config = new SplitCacheManager.CacheConfig("default-cache")
-            .withMaxCacheSize(100_000_000); // 100MB default
-        SplitCacheManager defaultManager = SplitCacheManager.getInstance(config);
-        return defaultManager.createSplitSearcher(splitPath);
+    private static SplitSearcher create(String splitPath) {
+        throw new UnsupportedOperationException(
+            "SplitSearcher.create() is deprecated. Use SplitCacheManager.createSplitSearcher() instead. " +
+            "Create a SplitCacheManager with proper configuration and use it to create searchers."
+        );
     }
     
     /**

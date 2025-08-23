@@ -7,13 +7,39 @@ import java.util.concurrent.atomic.AtomicLong;
 /**
  * Global cache manager for Quickwit splits following Quickwit's multi-level caching strategy.
  * 
- * Implements Quickwit's proven caching architecture:
- * - LeafSearchCache: Global search result cache (per split_id + query)
- * - ByteRangeCache: Global storage byte range cache (per file_path + range)
- * - ComponentCache: Global component cache (fast fields, postings, etc.)
+ * <h3>Architecture Overview</h3>
+ * Implements Quickwit's proven caching architecture with GLOBAL shared caches:
+ * <ul>
+ *   <li><b>LeafSearchCache:</b> Global search result cache (per split_id + query)</li>
+ *   <li><b>ByteRangeCache:</b> Global storage byte range cache (per file_path + range)</li>
+ *   <li><b>ComponentCache:</b> Global component cache (fast fields, postings, etc.)</li>
+ * </ul>
  * 
- * This matches Quickwit's design where caches are GLOBAL and shared across all splits,
- * not per-split as in our original flawed design.
+ * <h3>Cache Sharing Model</h3>
+ * This matches Quickwit's design where caches are GLOBAL and shared across all splits.
+ * Each SplitCacheManager instance represents a named cache configuration that can be
+ * shared by multiple SplitSearcher instances. Cache instances are singleton per name.
+ * 
+ * <h3>Usage Pattern</h3>
+ * <pre>{@code
+ * // Single cache manager per application or logical grouping
+ * SplitCacheManager.CacheConfig config = new SplitCacheManager.CacheConfig("production-cache")
+ *     .withMaxCacheSize(500_000_000)  // 500MB shared across all splits
+ *     .withMaxConcurrentLoads(8)      // Parallel component loading
+ *     .withAwsCredentials(key, secret, region);
+ * 
+ * SplitCacheManager cacheManager = SplitCacheManager.getInstance(config);
+ * 
+ * // Multiple searchers sharing the same cache
+ * List<SplitSearcher> searchers = cacheManager.createMultipleSplitSearchers(splitPaths);
+ * 
+ * // Global search across all managed splits
+ * SearchResult results = cacheManager.searchAcrossAllSplits(query, 100);
+ * }</pre>
+ * 
+ * <h3>Configuration Validation</h3>
+ * The manager validates that cache instances with the same name have consistent
+ * configurations to prevent conflicting cache settings.
  */
 public class SplitCacheManager implements AutoCloseable {
     
@@ -166,7 +192,27 @@ public class SplitCacheManager implements AutoCloseable {
      */
     public static SplitCacheManager getInstance(CacheConfig config) {
         return instances.computeIfAbsent(config.getCacheName(), 
-            name -> new SplitCacheManager(config));
+            name -> {
+                validateCacheConfig(config);
+                return new SplitCacheManager(config);
+            });
+    }
+    
+    /**
+     * Validate cache configuration for consistency
+     */
+    private static void validateCacheConfig(CacheConfig config) {
+        // Check if a cache with this name already exists with different configuration
+        SplitCacheManager existing = instances.get(config.getCacheName());
+        if (existing != null) {
+            // If it exists, the configurations should be compatible
+            if (existing.maxCacheSize != config.getMaxCacheSize()) {
+                throw new IllegalArgumentException(
+                    "Cache '" + config.getCacheName() + "' already exists with different max size: " +
+                    "existing=" + existing.maxCacheSize + ", requested=" + config.getMaxCacheSize()
+                );
+            }
+        }
     }
     
     /**
