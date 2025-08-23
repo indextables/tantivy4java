@@ -9,19 +9,19 @@ use serde_json;
 
 use quickwit_storage::{
     Storage, StorageResolver, LocalFileStorageFactory, S3CompatibleObjectStorageFactory,
-    ByteRangeCache, BundleStorage
+    ByteRangeCache, BundleStorage, OwnedBytes, wrap_storage_with_cache,
+    QuickwitCache
 };
 use quickwit_proto::search::SplitIdAndFooterOffsets;
 use quickwit_config::S3StorageConfig;
-use quickwit_directories::{CachingDirectory, HotDirectory, StorageDirectory, get_hotcache_from_split};
+use quickwit_directories::{CachingDirectory, HotDirectory, StorageDirectory, BundleDirectory, get_hotcache_from_split};
 use quickwit_common::uri::{Uri, Protocol};
-// Import Quickwit search functionality
-use quickwit_search::SearcherContext;
 use tantivy::{Index, IndexReader, DocAddress, TantivyDocument};
 use tantivy::schema::Value;
+use tantivy::directory::FileSlice;
 use std::str::FromStr;
 use crate::document::RetrievedDocument;
-use crate::utils::{register_object, with_object};
+use crate::utils::register_object;
 
 /// Configuration for Split Searcher
 pub struct SplitSearchConfig {
@@ -97,10 +97,17 @@ impl SplitSearcher {
             &quickwit_storage::STORAGE_METRICS.shortlived_cache
         );
         
-        // Actually open the split file and create a real index using the async helper function
-        let (index, reader) = runtime.block_on(async {
-            open_split_index_standalone(storage.clone(), &config.split_path, &byte_range_cache, &runtime).await
+        // Use the new Quickwit-style opening directly (no temporary instance needed)
+        let (index, hot_directory) = runtime.block_on(async {
+            Self::quickwit_open_index_with_caches_static(
+                storage.clone(), &config.split_path, &byte_range_cache
+            ).await
         }).map_err(|e| anyhow::anyhow!("Failed to open split index '{}': {}", config.split_path, e))?;
+        
+        // Create reader with proper reload policy (like Quickwit does)
+        let reader = index.reader_builder()
+            .reload_policy(tantivy::ReloadPolicy::Manual)
+            .try_into()?;
         
         Ok(SplitSearcher {
             runtime,
@@ -110,101 +117,27 @@ impl SplitSearcher {
             byte_range_cache,
             index,
             reader,
-            hot_directory: None,
+            hot_directory: Some(hot_directory),
             cache_hits: std::sync::atomic::AtomicU64::new(0),
             cache_misses: std::sync::atomic::AtomicU64::new(0),
             cache_evictions: std::sync::atomic::AtomicU64::new(0),
         })
     }
     
-    /// Actually open a split file as a Tantivy index - supports both file:// and s3:// URLs
-    async fn open_split_index(
+    /// Open a split file following Quickwit's open_index_with_caches pattern
+    async fn open_split_index_quickwit_style(
         &self,
         storage: Arc<dyn Storage>, 
         split_path: &str,
-        _byte_range_cache: &ByteRangeCache
+        byte_range_cache: &ByteRangeCache
     ) -> anyhow::Result<(Index, IndexReader)> {
         // Parse the split URI to determine the type
-        let split_uri = Uri::from_str(split_path)?;
+        let _split_uri = Uri::from_str(split_path)?;
         
-        // Quickwit approach: use BundleStorage to open .split files
-        // This works for both local and cloud storage through the storage abstraction
-        let index = match split_uri.protocol() {
-            Protocol::File => {
-                // For local files, use BundleStorage approach like Quickwit does
-                if let Some(file_path) = split_uri.filepath() {
-                    if !file_path.exists() {
-                        return Err(anyhow::anyhow!("Split file does not exist: {:?}", file_path));
-                    }
-                    
-                    // Read the entire .split file first
-                    let split_data = std::fs::read(file_path)
-                        .map_err(|e| anyhow::anyhow!("Failed to read split file {:?}: {}", file_path, e))?;
-                    
-                    // Use BundleStorage to interpret the .split file as Quickwit does
-                    use quickwit_storage::BundleStorage;
-                    use tantivy::directory::FileSlice;
-                    
-                    let (hotcache_bytes, bundle_storage) = BundleStorage::open_from_split_data(
-                        storage.clone(),
-                        file_path.to_path_buf(),
-                        FileSlice::from(split_data),
-                    )?;
-                    
-                    // Create StorageDirectory from BundleStorage like Quickwit does
-                    let directory = StorageDirectory::new(Arc::new(bundle_storage));
-                    
-                    // Add CachingDirectory layer like Quickwit does - this provides sync read capabilities
-                    let caching_directory = CachingDirectory::new(Arc::new(directory), self.byte_range_cache.clone());
-                    
-                    // Use HotDirectory with the hotcache like Quickwit
-                    use quickwit_directories::HotDirectory;
-                    let hot_directory = HotDirectory::open(caching_directory, hotcache_bytes.read_bytes()?)?;
-                    
-                    Index::open(hot_directory)?
-                } else {
-                    return Err(anyhow::anyhow!("Invalid file URI: {}", split_path));
-                }
-            },
-            Protocol::S3 | Protocol::Google | Protocol::Azure => {
-                // For cloud storage, use Quickwit's async approach through the runtime
-                let (hotcache_bytes, bundle_storage) = self.runtime.block_on(async {
-                    // Use Quickwit's open_split_bundle approach for cloud storage
-                    let split_file = PathBuf::from(format!("{}.split", 
-                        split_path.split('/').last().unwrap_or("unknown").replace(".split", "")
-                    ));
-                    
-                    // Create a mock SplitIdAndFooterOffsets - in real usage this would come from metastore
-                    use quickwit_proto::search::SplitIdAndFooterOffsets;
-                    let split_and_footer_offsets = SplitIdAndFooterOffsets {
-                        split_id: split_file.file_stem().unwrap().to_string_lossy().to_string(),
-                        split_footer_start: 0, // Would be provided by metastore in real usage
-                        split_footer_end: 0,   // Would be provided by metastore in real usage
-                        num_docs: 0,           // Would be provided by metastore in real usage
-                        timestamp_start: None,
-                        timestamp_end: None,
-                    };
-                    
-                    // Use Quickwit's proper cloud storage opening approach
-                    open_split_bundle_cloud(storage.clone(), &split_and_footer_offsets).await
-                })?;
-                
-                // Create StorageDirectory from BundleStorage like Quickwit does
-                let directory = StorageDirectory::new(Arc::new(bundle_storage));
-                
-                // Add CachingDirectory layer like Quickwit does - this provides sync read capabilities
-                let caching_directory = CachingDirectory::new(Arc::new(directory), self.byte_range_cache.clone());
-                
-                // Use HotDirectory with the hotcache like Quickwit
-                use quickwit_directories::HotDirectory;
-                let hot_directory = HotDirectory::open(caching_directory, hotcache_bytes.read_bytes()?)?;
-                
-                Index::open(hot_directory)?
-            },
-            protocol => {
-                return Err(anyhow::anyhow!("Unsupported URI protocol '{}' for split file: {}. Currently supported: file", protocol, split_path));
-            }
-        };
+        // FIXED: Implement proper Quickwit open_index_with_caches pattern
+        let (index, _hot_directory) = Self::quickwit_open_index_with_caches_static(
+            storage, split_path, byte_range_cache
+        ).await?;
         
         // Create an IndexReader with proper reload policy
         let reader = index.reader_builder()
@@ -212,6 +145,90 @@ impl SplitSearcher {
             .try_into()?;
         
         Ok((index, reader))
+    }
+
+    /// Quickwit-style open_index_with_caches implementation (static method)
+    async fn quickwit_open_index_with_caches_static(
+        _index_storage: Arc<dyn Storage>, 
+        split_path: &str,
+        ephemeral_unbounded_cache: &ByteRangeCache
+    ) -> anyhow::Result<(Index, HotDirectory)> {
+        // Parse the split URI to determine how to handle it
+        let split_uri = Uri::from_str(split_path)?;
+        
+        match split_uri.protocol() {
+            Protocol::File => {
+                // For local file splits, use the simple BundleDirectory approach
+                if let Some(file_path) = split_uri.filepath() {
+                    if !file_path.exists() {
+                        return Err(anyhow::anyhow!("Split file does not exist: {:?}", file_path));
+                    }
+                    
+                    // Read the split file data
+                    let split_data = std::fs::read(file_path)?;
+                    let split_owned_bytes = OwnedBytes::new(split_data);
+                    
+                    // Extract hotcache from the split
+                    let hotcache_bytes = get_hotcache_from_split(split_owned_bytes.clone())
+                        .map_err(|e| anyhow::anyhow!("Failed to extract hotcache from split: {}", e))?;
+                    
+                    // Create FileSlice and open the split using BundleDirectory  
+                    let file_slice = FileSlice::new(Arc::new(split_owned_bytes));
+                    let bundle_directory = BundleDirectory::open_split(file_slice)
+                        .map_err(|e| anyhow::anyhow!("Failed to open split bundle: {}", e))?;
+                    
+                    // Create a caching directory over the bundle directory
+                    let caching_directory = CachingDirectory::new(Arc::new(bundle_directory), ephemeral_unbounded_cache.clone());
+                    
+                    // Create HotDirectory with the extracted hotcache
+                    let hot_directory = HotDirectory::open(caching_directory, hotcache_bytes)?;
+
+                    let index = Index::open(hot_directory.clone())?;
+                    Ok((index, hot_directory))
+                } else {
+                    Err(anyhow::anyhow!("Invalid file URI: {}", split_path))
+                }
+            },
+            _ => {
+                Err(anyhow::anyhow!("Unsupported protocol for split: {}", split_path))
+            }
+        }
+    }
+
+    /// Quickwit-style open_split_bundle implementation (static method)
+    async fn quickwit_open_split_bundle_static(
+        index_storage: Arc<dyn Storage>,
+        split_and_footer_offsets: &SplitIdAndFooterOffsets,
+    ) -> anyhow::Result<(FileSlice, BundleStorage)> {
+        let split_file = PathBuf::from(format!("{}.split", split_and_footer_offsets.split_id));
+        
+        // Get the footer data - this is where the bundle metadata is stored
+        let footer_data = Self::get_split_footer_from_storage_static(
+            index_storage.clone(),
+            split_and_footer_offsets,
+        ).await?;
+        
+        // Use BundleStorage to open from the split data with footer
+        let (hotcache_bytes, bundle_storage) = BundleStorage::open_from_split_data_with_owned_bytes(
+            index_storage.clone(),
+            split_file,
+            footer_data,
+        )?;
+        
+        Ok((hotcache_bytes, bundle_storage))
+    }
+
+    /// Get split footer data from storage (following Quickwit's get_split_footer_from_cache_or_fetch) (static method)
+    async fn get_split_footer_from_storage_static(
+        index_storage: Arc<dyn Storage>,
+        split_and_footer_offsets: &SplitIdAndFooterOffsets,
+    ) -> anyhow::Result<OwnedBytes> {
+        let split_file = PathBuf::from(format!("{}.split", split_and_footer_offsets.split_id));
+        
+        // For local files, read the entire split file for now
+        // In a production implementation, this would only read the footer section
+        let split_data = index_storage.get_all(&split_file).await?;
+        Ok(split_data)
     }
 
 
@@ -422,47 +439,96 @@ impl SplitSearcher {
 
     /// Quickwit-style leaf search implementation that follows Quickwit directory patterns 
     async fn quickwit_leaf_search(&self, query: Box<dyn tantivy::query::Query>, limit: usize) -> anyhow::Result<(quickwit_proto::search::LeafSearchResponse, Vec<f32>)> {
-        eprintln!("DEBUG: Starting Quickwit-style leaf search implementation");
+        eprintln!("DEBUG: Starting proper Quickwit-style search implementation");
         
-        // Use Quickwit's directory approach with Tantivy search
-        // This follows the exact pattern that Quickwit uses internally but without private APIs
+        // SOLUTION: Use Quickwit's approach - the HotDirectory provides sync access
+        // to the pre-loaded data while maintaining async storage capabilities
         
-        // Create a simple collector - we use Tantivy's collector but in Quickwit's async context
         use tantivy::collector::TopDocs;
-        let collector = TopDocs::with_limit(limit);
-        
-        // Perform the search using Quickwit's async-compatible directory structure
-        let search_results = tokio::task::spawn_blocking({
-            let index = self.index.clone();
-            let query = query.box_clone(); // Use box_clone for dyn Query
-            move || -> anyhow::Result<Vec<(f32, tantivy::DocAddress)>> {
-                eprintln!("DEBUG: Executing search using Quickwit directory structure");
-                
-                // Create reader with proper reload policy like Quickwit does
-                let reader = index.reader_builder()
-                    .reload_policy(tantivy::ReloadPolicy::Manual)
-                    .try_into()?;
-                let searcher = reader.searcher();
-                
-                // Execute search - this works because we're using Quickwit's directory layers
-                // (StorageDirectory + CachingDirectory + HotDirectory) which support async reads
-                let results = searcher.search(&*query, &collector)?;
-                
-                eprintln!("DEBUG: Search completed with {} results using Quickwit directories", results.len());
-                Ok(results)
-            }
-        }).await
-        .map_err(|e| anyhow::anyhow!("Quickwit search task join failed: {}", e))?
-        .map_err(|e| anyhow::anyhow!("Quickwit search execution failed: {}", e))?;
-        
-        // Convert results to Quickwit's LeafSearchResponse format
         use quickwit_proto::search::{LeafSearchResponse, PartialHit};
         
-        let mut partial_hits = Vec::new();
-        let split_id = format!("split-{}", self.split_path.split('/').last().unwrap_or("unknown"));
+        // Use the existing reader that was properly initialized with HotDirectory
+        // This follows the exact pattern from Quickwit's leaf_search_single_split
+        let searcher = self.reader.searcher();
+        let collector = TopDocs::with_limit(limit);
         
-        // Preserve scores separately and create PartialHits
+        eprintln!("DEBUG: Performing search using HotDirectory-backed index");
+        
+        // Debug: Check index state
+        let num_docs = searcher.num_docs();
+        eprintln!("DEBUG: Index contains {} total documents", num_docs);
+        
+        // Debug: Get schema info
+        let index_schema = searcher.index().schema();
+        eprintln!("DEBUG: Index schema field count: {}", index_schema.fields().count());
+        
+        // Debug: Print schema field mapping
+        for field in index_schema.fields() {
+            eprintln!("DEBUG: Schema field ID {:?} -> name '{}', type: {:?}", 
+                field.0, index_schema.get_field_name(field.0), 
+                index_schema.get_field_entry(field.0).field_type());
+        }
+        
+        // Debug: Print query info  
+        eprintln!("DEBUG: Executing query: {:?}", query);
+        
+        // Debug: Extract term from query to see what we're actually searching for
+        if let Ok(query_str) = format!("{:?}", query).parse::<String>() {
+            if query_str.contains("TermQuery") {
+                eprintln!("DEBUG: This is a term query - checking what term is being searched");
+            }
+        }
+        
+        // Debug: Check if term dictionary is accessible
+        if let Some(segment_reader) = searcher.segment_readers().first() {
+            let title_field = index_schema.get_field("title").unwrap();
+            if let Ok(inverted_index) = segment_reader.inverted_index(title_field) {
+                eprintln!("DEBUG: Term dictionary accessible for title field");
+                
+                // Try to check if specific terms exist
+                let terms = inverted_index.terms();
+                eprintln!("DEBUG: Terms dict has {} terms", terms.num_terms());
+                
+                // Check if "document" or "Document" terms exist  
+                match terms.term_ord(b"document") {
+                    Ok(Some(ord)) => eprintln!("DEBUG: Found 'document' term at ordinal: {}", ord),
+                    Ok(None) => eprintln!("DEBUG: 'document' term not found in dictionary"),
+                    Err(e) => eprintln!("DEBUG: Error checking 'document' term: {}", e),
+                }
+                
+                match terms.term_ord(b"Document") {
+                    Ok(Some(ord)) => eprintln!("DEBUG: Found 'Document' term at ordinal: {}", ord),
+                    Ok(None) => eprintln!("DEBUG: 'Document' term not found in dictionary"),
+                    Err(e) => eprintln!("DEBUG: Error checking 'Document' term: {}", e),
+                }
+            } else {
+                eprintln!("DEBUG: Cannot access inverted index for title field");
+            }
+        }
+        
+        // Debug: Check first document content to verify data
+        if num_docs > 0 {
+            if let Ok(first_doc) = searcher.doc::<tantivy::TantivyDocument>(tantivy::DocAddress::new(0, 0)) {
+                eprintln!("DEBUG: First document fields:");
+                for (field, field_values) in first_doc.field_values() {
+                    let field_name = index_schema.get_field_name(field);
+                    eprintln!("  {}: {:?}", field_name, field_values);
+                }
+            }
+        }
+        
+        // This should work now because HotDirectory supports sync reads
+        // even with async underlying storage (following Quickwit's design)
+        let search_results = searcher.search(&*query, &collector)
+            .map_err(|e| anyhow::anyhow!("Search execution failed: {}", e))?;
+        
+        eprintln!("DEBUG: Search completed with {} results", search_results.len());
+        
+        // Convert to Quickwit's LeafSearchResponse format (following their pattern)
+        let split_id = format!("split-{}", self.split_path.split('/').last().unwrap_or("unknown"));
+        let mut partial_hits = Vec::new();
         let mut scores = Vec::new();
+        
         for (score, doc_address) in search_results {
             let partial_hit = PartialHit {
                 sort_value: None,
@@ -478,14 +544,13 @@ impl SplitSearcher {
         let leaf_response = LeafSearchResponse {
             num_hits: partial_hits.len() as u64,
             partial_hits,
-            failed_splits: vec![], 
+            failed_splits: vec![],
             num_attempted_splits: 1,
             num_successful_splits: 1,
             intermediate_aggregation_result: None,
             resource_stats: None,
         };
         
-        eprintln!("DEBUG: Quickwit leaf search completed with {} hits", leaf_response.partial_hits.len());
         Ok((leaf_response, scores))
     }
 

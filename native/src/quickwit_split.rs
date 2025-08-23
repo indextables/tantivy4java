@@ -278,7 +278,7 @@ fn convert_index_from_path_impl(index_path: &str, output_path: &str, config: &Sp
 }
 
 fn create_quickwit_split(
-    _tantivy_index: &tantivy::Index, 
+    tantivy_index: &tantivy::Index, 
     index_dir: &PathBuf, 
     output_path: &PathBuf, 
     _split_metadata: &QuickwitSplitMetadata
@@ -301,16 +301,70 @@ fn create_quickwit_split(
             }
             
             if path.is_file() {
+                eprintln!("DEBUG: Including file in split: {:?}", filename);
                 split_files.push(path);
             }
         }
     }
     
+    eprintln!("DEBUG: Total files collected for split: {}", split_files.len());
+    
     // Sort files for consistent ordering
     split_files.sort();
     
-    // Create split fields metadata (required by Quickwit)
-    let split_fields = b"{}"; // Minimal empty JSON for split fields
+    // Create proper split fields metadata from the Tantivy index schema
+    let split_fields = {
+        // Extract field metadata from the Tantivy index
+        let searcher = tantivy_index.reader()
+            .map_err(|e| anyhow::anyhow!("Failed to create reader for field metadata extraction: {}", e))?
+            .searcher();
+        
+        let segment_ids: Vec<_> = searcher.segment_readers().iter().map(|sr| sr.segment_id()).collect();
+        let mut all_field_metadata = Vec::new();
+        
+        // Collect field metadata from all segments
+        for segment_reader in searcher.segment_readers() {
+            let field_metadata = segment_reader.fields_metadata();
+            all_field_metadata.extend(field_metadata);
+        }
+        
+        eprintln!("DEBUG: Extracted {} field metadata entries from index", all_field_metadata.len());
+        
+        // Use Quickwit's serialization functions to create proper field metadata
+        use quickwit_proto::search::{ListFields, ListFieldsEntryResponse, serialize_split_fields};
+        
+        let fields: Vec<ListFieldsEntryResponse> = all_field_metadata.into_iter().flat_map(|metadata_vec| {
+            metadata_vec.into_iter().map(|field_metadata| {
+                let field_type = match field_metadata.typ {
+                    tantivy::schema::Type::Str => quickwit_proto::search::ListFieldType::Str as i32,
+                    tantivy::schema::Type::U64 => quickwit_proto::search::ListFieldType::U64 as i32,
+                    tantivy::schema::Type::I64 => quickwit_proto::search::ListFieldType::I64 as i32,
+                    tantivy::schema::Type::F64 => quickwit_proto::search::ListFieldType::F64 as i32,
+                    tantivy::schema::Type::Bool => quickwit_proto::search::ListFieldType::Bool as i32,
+                    tantivy::schema::Type::Date => quickwit_proto::search::ListFieldType::Date as i32,
+                    tantivy::schema::Type::Facet => quickwit_proto::search::ListFieldType::Facet as i32,
+                    tantivy::schema::Type::Bytes => quickwit_proto::search::ListFieldType::Bytes as i32,
+                    _ => quickwit_proto::search::ListFieldType::Str as i32, // Default fallback
+                };
+                
+                eprintln!("DEBUG: Field '{}' - type: {:?}, indexed: {}, fast: {}", 
+                    field_metadata.field_name, field_metadata.typ, field_metadata.indexed, field_metadata.fast);
+                    
+                ListFieldsEntryResponse {
+                    field_name: field_metadata.field_name.clone(),
+                    field_type,
+                    searchable: field_metadata.indexed,
+                    aggregatable: field_metadata.fast,
+                    index_ids: Vec::new(),
+                    non_searchable_index_ids: Vec::new(), 
+                    non_aggregatable_index_ids: Vec::new(),
+                }
+            })
+        }).collect();
+        
+        let list_fields = ListFields { fields };
+        serialize_split_fields(list_fields)
+    };
     
     // Create proper hotcache using Quickwit's write_hotcache function
     let hotcache = {
@@ -335,7 +389,7 @@ fn create_quickwit_split(
         // Create the split payload using Quickwit's actual implementation
         let split_payload = SplitPayloadBuilder::get_split_payload(
             &split_files,
-            split_fields,
+            &split_fields,
             &hotcache
         )?;
         

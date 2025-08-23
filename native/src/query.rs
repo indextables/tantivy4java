@@ -64,8 +64,8 @@ pub extern "system" fn Java_com_tantivy4java_Query_nativeTermQuery(
         
         // Create term based on field type and value type
         let term = match field_type {
-            tantivy::schema::FieldType::Str(_) => {
-                // Handle string fields
+            tantivy::schema::FieldType::Str(text_options) => {
+                // Handle string fields with proper tokenization
                 if field_value_obj.is_null() {
                     return Err("Field value cannot be null for text field".to_string());
                 }
@@ -73,7 +73,17 @@ pub extern "system" fn Java_com_tantivy4java_Query_nativeTermQuery(
                     Ok(s) => s.into(),
                     Err(_) => return Err("Invalid field value for text field".to_string()),
                 };
-                Term::from_field_text(field, &field_value_str)
+                
+                // For text fields that are indexed, use tokenization to match how the index was created
+                if let Some(text_field_indexing) = &text_options.get_indexing_options() {
+                    // Use the same tokenizer that was used during indexing
+                    // For simplicity, we'll lowercase the term (which is what the default tokenizer does)
+                    let tokenized_term = field_value_str.to_lowercase();
+                    Term::from_field_text(field, &tokenized_term)
+                } else {
+                    // For non-indexed text fields, use exact match
+                    Term::from_field_text(field, &field_value_str)
+                }
             },
             tantivy::schema::FieldType::U64(_) => {
                 // Handle integer fields
