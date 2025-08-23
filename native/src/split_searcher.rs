@@ -309,9 +309,22 @@ impl SplitSearcher {
                         false
                     }
                 },
-                Protocol::S3 | Protocol::Google | Protocol::Azure => {
-                    // Cloud storage is not yet supported due to async/sync compatibility issues
-                    // Return false to indicate these are not valid for now
+                Protocol::S3 => {
+                    // For S3, extract the filename and validate by attempting to access the split file
+                    let uri_str = split_uri.as_str();
+                    if let Some(last_slash) = uri_str.rfind('/') {
+                        let file_name = &uri_str[last_slash + 1..];  // Get filename
+                        let file_path = std::path::Path::new(file_name);
+                        match self.storage.get_all(file_path).await {
+                            Ok(_) => true,  // File exists and is accessible
+                            Err(_) => false, // File doesn't exist or can't be accessed
+                        }
+                    } else {
+                        false // Invalid S3 URI format
+                    }
+                },
+                Protocol::Google | Protocol::Azure => {
+                    // Other cloud storage protocols are not yet supported  
                     false
                 },
                 _ => {
