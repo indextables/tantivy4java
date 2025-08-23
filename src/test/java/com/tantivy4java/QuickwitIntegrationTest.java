@@ -16,14 +16,16 @@ public class QuickwitIntegrationTest {
             String version = Tantivy.getVersion();
             System.out.println("✅ Tantivy version: " + version);
             
-            // Test split searcher creation (basic functionality)
+            // Test split searcher creation with shared cache (basic functionality)
             try {
-                SplitSearcher.SplitSearchConfig config = new SplitSearcher.SplitSearchConfig("/tmp/test.split")
-                    .withCacheSize(1024 * 1024);  // 1MB cache
+                // Create shared cache manager
+                SplitCacheManager.CacheConfig config = new SplitCacheManager.CacheConfig("quickwit-integration-test")
+                    .withMaxCacheSize(1024 * 1024);  // 1MB cache
+                SplitCacheManager cacheManager = SplitCacheManager.getInstance(config);
                 
                 // This will try to create the searcher - if it fails, that's expected for a non-existent file
                 // but at least we can test the JNI binding works
-                SplitSearcher searcher = SplitSearcher.create(config);
+                SplitSearcher searcher = cacheManager.createSplitSearcher("/tmp/test.split");
                 System.out.println("❌ Split searcher created (unexpected - no split file exists)");
                 searcher.close();
             } catch (Exception e) {

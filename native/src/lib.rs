@@ -30,6 +30,7 @@ mod doc_address;
 mod utils;
 mod quickwit_split;
 mod split_searcher;  // Now using proper Quickwit integration
+mod split_cache_manager;  // Global cache manager following Quickwit patterns
 // mod split_searcher_simple;  // Disabled to avoid conflicts
 mod common;
 

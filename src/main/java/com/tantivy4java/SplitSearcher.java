@@ -17,69 +17,24 @@ public class SplitSearcher implements AutoCloseable {
 
     private long nativePtr;
     private final String splitPath;
-    private final SplitSearchConfig config;
+    // Configuration now comes from SplitCacheManager
+    private final SplitCacheManager cacheManager;
     
     /**
-     * Configuration options for split searching with hot cache optimization
+     * @deprecated SplitSearchConfig is no longer used. Configuration comes from SplitCacheManager.
+     * This class is kept only for backward compatibility and will be removed in future versions.
      */
+    @Deprecated
     public static class SplitSearchConfig {
         private final String splitPath;
-        private long cacheSize = 50_000_000; // 50MB default
-        private Set<IndexComponent> preloadComponents = EnumSet.noneOf(IndexComponent.class);
-        private Duration maxWaitTime = Duration.ofSeconds(30);
-        private int maxConcurrentLoads = 4;
-        private boolean enableQueryCache = true;
-        private Map<String, String> awsConfig = new HashMap<>();
         
+        @Deprecated
         public SplitSearchConfig(String splitPath) {
             this.splitPath = splitPath;
         }
         
-        public SplitSearchConfig withCacheSize(long cacheSize) {
-            this.cacheSize = cacheSize;
-            return this;
-        }
-        
-        public SplitSearchConfig preload(IndexComponent... components) {
-            this.preloadComponents.addAll(Arrays.asList(components));
-            return this;
-        }
-        
-        public SplitSearchConfig withMaxWaitTime(Duration duration) {
-            this.maxWaitTime = duration;
-            return this;
-        }
-        
-        public SplitSearchConfig withMaxConcurrentLoads(int max) {
-            this.maxConcurrentLoads = max;
-            return this;
-        }
-        
-        public SplitSearchConfig enableQueryCache(boolean enable) {
-            this.enableQueryCache = enable;
-            return this;
-        }
-        
-        public SplitSearchConfig withAwsCredentials(String accessKey, String secretKey, String region) {
-            this.awsConfig.put("access_key", accessKey);
-            this.awsConfig.put("secret_key", secretKey);
-            this.awsConfig.put("region", region);
-            return this;
-        }
-        
-        public SplitSearchConfig withAwsEndpoint(String endpoint) {
-            this.awsConfig.put("endpoint", endpoint);
-            return this;
-        }
-        
-        // Getters
+        @Deprecated
         public String getSplitPath() { return splitPath; }
-        public long getCacheSize() { return cacheSize; }
-        public Set<IndexComponent> getPreloadComponents() { return preloadComponents; }
-        public Duration getMaxWaitTime() { return maxWaitTime; }
-        public int getMaxConcurrentLoads() { return maxConcurrentLoads; }
-        public boolean isQueryCacheEnabled() { return enableQueryCache; }
-        public Map<String, String> getAwsConfig() { return awsConfig; }
     }
     
     /**
@@ -175,72 +130,28 @@ public class SplitSearcher implements AutoCloseable {
         public double getAverageLoadTime() { return loadCount > 0 ? (double) loadTime / loadCount : 0; }
     }
     
-    private SplitSearcher(String splitPath, SplitSearchConfig config, long nativePtr) {
+    /**
+     * Constructor for SplitSearcher (now always uses shared cache)
+     */
+    SplitSearcher(String splitPath, SplitCacheManager cacheManager, Map<String, Object> splitConfig) {
         this.splitPath = splitPath;
-        this.config = config;
-        this.nativePtr = nativePtr;
+        this.cacheManager = cacheManager;
+        this.nativePtr = createNativeWithSharedCache(splitPath, cacheManager.getNativePtr(), splitConfig);
     }
     
     /**
-     * Create a new SplitSearcher from a split file
+     * Create a new SplitSearcher from a split file using shared cache.
+     * 
+     * @deprecated Use SplitCacheManager.createSplitSearcher() instead for proper shared cache management.
+     * This method creates a default cache manager, but shared cache managers should be reused.
      */
-    public static SplitSearcher create(SplitSearchConfig config) {
-        long nativePtr = createNative(config);
-        return new SplitSearcher(config.getSplitPath(), config, nativePtr);
-    }
-    
-    /**
-     * Builder pattern for creating SplitSearcher instances
-     */
-    public static Builder builder(String splitPath) {
-        return new Builder(splitPath);
-    }
-    
-    public static class Builder {
-        private final SplitSearchConfig config;
-        
-        private Builder(String splitPath) {
-            this.config = new SplitSearchConfig(splitPath);
-        }
-        
-        public Builder withCacheSize(long cacheSize) {
-            config.withCacheSize(cacheSize);
-            return this;
-        }
-        
-        public Builder preload(IndexComponent... components) {
-            config.preload(components);
-            return this;
-        }
-        
-        public Builder withMaxWaitTime(Duration duration) {
-            config.withMaxWaitTime(duration);
-            return this;
-        }
-        
-        public Builder withMaxConcurrentLoads(int max) {
-            config.withMaxConcurrentLoads(max);
-            return this;
-        }
-        
-        public Builder enableQueryCache(boolean enable) {
-            config.enableQueryCache(enable);
-            return this;
-        }
-        
-        public Builder withAwsCredentials(String accessKey, String secretKey, String region) {
-            config.withAwsCredentials(accessKey, secretKey, region);
-            return this;
-        }
-        
-        public Builder withAwsEndpoint(String endpoint) {
-            config.withAwsEndpoint(endpoint);
-            return this;
-        }
-        
-        public SplitSearcher build() {
-            return SplitSearcher.create(config);
-        }
+    @Deprecated
+    public static SplitSearcher create(String splitPath) {
+        // Create a default cache manager - not recommended for production
+        SplitCacheManager.CacheConfig config = new SplitCacheManager.CacheConfig("default-cache")
+            .withMaxCacheSize(100_000_000); // 100MB default
+        SplitCacheManager defaultManager = SplitCacheManager.getInstance(config);
+        return defaultManager.createSplitSearcher(splitPath);
     }
     
     /**
@@ -345,10 +256,13 @@ public class SplitSearcher implements AutoCloseable {
             closeNative(nativePtr);
             nativePtr = 0;
         }
+        
+        // Always notify cache manager (all instances now use shared cache)
+        cacheManager.removeSplitSearcher(splitPath);
     }
     
     // Native methods
-    private static native long createNative(SplitSearchConfig config);
+    private static native long createNativeWithSharedCache(String splitPath, long cacheManagerPtr, Map<String, Object> splitConfig);
     private static native long getSchemaFromNative(long nativePtr);
     private static native SearchResult searchNative(long nativePtr, long queryPtr, int limit);
     private static native void preloadComponentsNative(long nativePtr, IndexComponent[] components);

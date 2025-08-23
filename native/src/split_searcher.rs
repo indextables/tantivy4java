@@ -306,47 +306,7 @@ pub struct SearchHit {
 }
 
 // JNI function implementations
-#[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_SplitSearcher_createNative(
-    mut env: JNIEnv,
-    _class: JClass,
-    config_obj: JObject,
-) -> jlong {
-    match create_split_searcher(&mut env, config_obj) {
-        Ok(ptr) => ptr,
-        Err(e) => {
-            let _ = env.throw_new("java/lang/RuntimeException", &format!("Failed to create SplitSearcher: {}", e));
-            0
-        }
-    }
-}
-
-fn create_split_searcher(env: &mut JNIEnv, config_obj: JObject) -> anyhow::Result<jlong> {
-    // Extract split path
-    let split_path_obj = env.call_method(&config_obj, "getSplitPath", "()Ljava/lang/String;", &[])?
-        .l()?;
-    let split_path: String = env.get_string((&split_path_obj).into())?.into();
-    
-    // Extract cache size
-    let cache_size = env.call_method(&config_obj, "getCacheSize", "()J", &[])?
-        .j()? as usize;
-    
-    // Extract cache size (already extracted above) - no hot cache capacity in this API
-    
-    // For now, skip AWS config extraction - not implemented in this version  
-    let aws_config: Option<AwsConfig> = None;
-
-    let config = SplitSearchConfig {
-        split_path,
-        cache_size_bytes: cache_size,
-        hot_cache_capacity: 100, // Default value
-        aws_config,
-    };
-
-    let searcher = SplitSearcher::new(config)?;
-    let ptr = Box::into_raw(Box::new(searcher)) as jlong;
-    Ok(ptr)
-}
+// Legacy createNative method removed - all SplitSearcher instances now use shared cache
 
 fn extract_aws_config(env: &mut JNIEnv, aws_obj: JObject) -> anyhow::Result<AwsConfig> {
     let access_key = get_string_field(env, &aws_obj, "getAccessKey")?;
@@ -383,6 +343,55 @@ fn get_string_field(env: &mut JNIEnv, obj: &JObject, method_name: &str) -> anyho
     let java_string = JString::from(string_obj);
     let rust_string = env.get_string(&java_string)?.into();
     Ok(rust_string)
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_tantivy4java_SplitSearcher_createNativeWithSharedCache(
+    mut env: JNIEnv,
+    _class: JClass,
+    split_path: JString,
+    cache_manager_ptr: jlong,
+    _split_config: JObject,
+) -> jlong {
+    if cache_manager_ptr == 0 {
+        let _ = env.throw_new("java/lang/RuntimeException", "Invalid cache manager pointer");
+        return 0;
+    }
+    
+    match create_split_searcher_with_shared_cache(&mut env, split_path, cache_manager_ptr) {
+        Ok(ptr) => ptr,
+        Err(e) => {
+            let _ = env.throw_new("java/lang/RuntimeException", &format!("Failed to create SplitSearcher with shared cache: {}", e));
+            0
+        }
+    }
+}
+
+fn create_split_searcher_with_shared_cache(
+    env: &mut JNIEnv, 
+    split_path: JString, 
+    cache_manager_ptr: jlong
+) -> anyhow::Result<jlong> {
+    // Extract split path
+    let split_path: String = env.get_string(&split_path)?.into();
+    
+    // Register split with cache manager
+    if cache_manager_ptr != 0 {
+        let cache_manager = unsafe { &*(cache_manager_ptr as *const crate::split_cache_manager::GlobalSplitCacheManager) };
+        cache_manager.add_split(split_path.clone());
+    }
+    
+    // Create configuration using shared cache
+    let config = SplitSearchConfig {
+        split_path,
+        cache_size_bytes: 50_000_000, // Default 50MB
+        hot_cache_capacity: 10_000,   // Default capacity
+        aws_config: None,             // Will inherit from cache manager
+    };
+    
+    let searcher = SplitSearcher::new(config)?;
+    let boxed = Box::new(searcher);
+    Ok(Box::into_raw(boxed) as jlong)
 }
 
 #[no_mangle]

@@ -15,14 +15,17 @@ public class EnhancedSplitSearchTest {
             String version = Tantivy.getVersion();
             System.out.println("✅ Tantivy version: " + version);
             
-            // Test basic split searcher creation
-            System.out.println("\n📋 Testing Split Searcher Creation:");
-            SplitSearcher.SplitSearchConfig config = new SplitSearcher.SplitSearchConfig("/tmp/test.split")
-                .withCacheSize(10 * 1024 * 1024);  // 10MB cache
+            // Test basic split searcher creation with shared cache
+            System.out.println("\n📋 Testing Split Searcher Creation with Shared Cache:");
+            
+            // Create shared cache manager
+            SplitCacheManager.CacheConfig config = new SplitCacheManager.CacheConfig("enhanced-test-cache")
+                .withMaxCacheSize(10 * 1024 * 1024);  // 10MB cache
+            SplitCacheManager cacheManager = SplitCacheManager.getInstance(config);
             
             SplitSearcher searcher = null;
             try {
-                searcher = SplitSearcher.create(config);
+                searcher = cacheManager.createSplitSearcher("/tmp/test.split");
                 System.out.println("✅ Split searcher created successfully");
                 
                 // Test validation (expected to fail for non-existent file)
@@ -114,6 +117,10 @@ public class EnhancedSplitSearchTest {
                 if (searcher != null) {
                     searcher.close();
                     System.out.println("✅ Split searcher closed successfully");
+                }
+                if (cacheManager != null) {
+                    cacheManager.close();
+                    System.out.println("✅ Cache manager closed successfully");
                 }
             }
             

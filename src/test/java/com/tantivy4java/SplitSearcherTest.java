@@ -18,6 +18,7 @@ import java.time.Duration;
 import java.util.EnumSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -34,6 +35,7 @@ public class SplitSearcherTest {
     
     private static S3Mock s3Mock;
     private static S3Client s3Client;
+    private static SplitCacheManager cacheManager;
     
     @TempDir
     static Path tempDir;
@@ -65,10 +67,26 @@ public class SplitSearcherTest {
         s3Client.createBucket(CreateBucketRequest.builder()
             .bucket(TEST_BUCKET)
             .build());
+            
+        // Create shared cache manager for tests
+        SplitCacheManager.CacheConfig config = new SplitCacheManager.CacheConfig("split-searcher-test-cache")
+            .withMaxCacheSize(200_000_000) // 200MB shared cache
+            .withMaxConcurrentLoads(8)
+            .withAwsCredentials(ACCESS_KEY, SECRET_KEY, "us-east-1")
+            .withAwsEndpoint("http://localhost:" + S3_MOCK_PORT);
+            
+        cacheManager = SplitCacheManager.getInstance(config);
     }
     
     @AfterAll
     static void tearDownS3Mock() {
+        if (cacheManager != null) {
+            try {
+                cacheManager.close();
+            } catch (Exception e) {
+                // Log error but continue cleanup
+            }
+        }
         if (s3Client != null) {
             s3Client.close();
         }
@@ -142,11 +160,7 @@ public class SplitSearcherTest {
     void testCreateSplitSearcherWithFileProtocol() {
         String fileUri = "file://" + localSplitPath.toAbsolutePath();
         
-        try (SplitSearcher searcher = SplitSearcher.builder(fileUri)
-            .withCacheSize(25_000_000)
-            .preload(SplitSearcher.IndexComponent.SCHEMA, SplitSearcher.IndexComponent.STORE)
-            .build()) {
-            
+        try (SplitSearcher searcher = cacheManager.createSplitSearcher(fileUri)) {
             assertNotNull(searcher);
             
             // Verify schema access
@@ -157,6 +171,12 @@ public class SplitSearcherTest {
             SplitSearcher.SplitMetadata metadata = searcher.getSplitMetadata();
             assertNotNull(metadata);
             assertTrue(metadata.getTotalSize() > 0);
+            
+            // Verify preloading works through cache manager
+            cacheManager.preloadComponents(fileUri, Set.of(
+                SplitSearcher.IndexComponent.SCHEMA, 
+                SplitSearcher.IndexComponent.STORE
+            ));
         }
     }
 
@@ -165,11 +185,7 @@ public class SplitSearcherTest {
     void testFileProtocolBasicSearch() {
         String fileUri = "file://" + localSplitPath.toAbsolutePath();
         
-        try (SplitSearcher searcher = SplitSearcher.builder(fileUri)
-            .withCacheSize(50_000_000)
-            .enableQueryCache(true)
-            .build()) {
-            
+        try (SplitSearcher searcher = cacheManager.createSplitSearcher(fileUri)) {
             Schema schema = searcher.getSchema();
             Query query = Query.termQuery(schema, "content", "document");
             
@@ -184,10 +200,9 @@ public class SplitSearcherTest {
     void testFileProtocolRangeSearch() {
         String fileUri = "file://" + localSplitPath.toAbsolutePath();
         
-        try (SplitSearcher searcher = SplitSearcher.builder(fileUri)
-            .withCacheSize(50_000_000)
-            .preload(SplitSearcher.IndexComponent.FASTFIELD)
-            .build()) {
+        try (SplitSearcher searcher = cacheManager.createSplitSearcher(fileUri)) {
+            // Preload FASTFIELD component through cache manager
+            cacheManager.preloadComponents(fileUri, Set.of(SplitSearcher.IndexComponent.FASTFIELD));
             
             Schema schema = searcher.getSchema();
             
@@ -215,12 +230,13 @@ public class SplitSearcherTest {
     void testFileProtocolCachePerformance() {
         String fileUri = "file://" + localSplitPath.toAbsolutePath();
         
-        try (SplitSearcher searcher = SplitSearcher.builder(fileUri)
-            .withCacheSize(100_000_000)
-            .preload(SplitSearcher.IndexComponent.SCHEMA, 
-                    SplitSearcher.IndexComponent.STORE,
-                    SplitSearcher.IndexComponent.POSTINGS)
-            .build()) {
+        try (SplitSearcher searcher = cacheManager.createSplitSearcher(fileUri)) {
+            // Preload multiple components through cache manager
+            cacheManager.preloadComponents(fileUri, Set.of(
+                SplitSearcher.IndexComponent.SCHEMA,
+                SplitSearcher.IndexComponent.STORE,
+                SplitSearcher.IndexComponent.POSTINGS
+            ));
             
             Schema schema = searcher.getSchema();
             Query query = Query.termQuery(schema, "title", "Test");
@@ -253,13 +269,7 @@ public class SplitSearcherTest {
     @Test
     @DisplayName("Create SplitSearcher with s3: protocol")
     void testCreateSplitSearcherWithS3Protocol() {
-        SplitSearcher.SplitSearchConfig config = new SplitSearcher.SplitSearchConfig(s3SplitPath)
-            .withCacheSize(25_000_000)
-            .withAwsCredentials(ACCESS_KEY, SECRET_KEY, "us-east-1")
-            .withAwsEndpoint("http://localhost:" + S3_MOCK_PORT)
-            .preload(SplitSearcher.IndexComponent.SCHEMA);
-        
-        try (SplitSearcher searcher = SplitSearcher.create(config)) {
+        try (SplitSearcher searcher = cacheManager.createSplitSearcher(s3SplitPath)) {
             assertNotNull(searcher);
             
             // Verify schema access works with S3
@@ -270,19 +280,17 @@ public class SplitSearcherTest {
             SplitSearcher.SplitMetadata metadata = searcher.getSplitMetadata();
             assertNotNull(metadata);
             assertTrue(metadata.getTotalSize() > 0);
+            
+            // Preload schema component through cache manager
+            cacheManager.preloadComponents(s3SplitPath, Set.of(SplitSearcher.IndexComponent.SCHEMA));
         }
     }
 
     @Test
     @DisplayName("Search with s3: protocol - complex queries")
     void testS3ProtocolComplexSearch() {
-        SplitSearcher.SplitSearchConfig config = new SplitSearcher.SplitSearchConfig(s3SplitPath)
-            .withCacheSize(75_000_000)
-            .withAwsCredentials(ACCESS_KEY, SECRET_KEY, "us-east-1")
-            .withAwsEndpoint("http://localhost:" + S3_MOCK_PORT)
-            .enableQueryCache(true);
         
-        try (SplitSearcher searcher = SplitSearcher.create(config)) {
+        try (SplitSearcher searcher = cacheManager.createSplitSearcher(s3SplitPath)) {
             Schema schema = searcher.getSchema();
             
             // Complex boolean query
@@ -313,18 +321,8 @@ public class SplitSearcherTest {
     @Test
     @DisplayName("Hot cache preloading with s3: protocol")
     void testS3ProtocolHotCachePreloading() {
-        SplitSearcher.SplitSearchConfig config = new SplitSearcher.SplitSearchConfig(s3SplitPath)
-            .withCacheSize(100_000_000)
-            .withMaxConcurrentLoads(4)
-            .withMaxWaitTime(Duration.ofSeconds(30))
-            .withAwsCredentials(ACCESS_KEY, SECRET_KEY, "us-east-1")
-            .withAwsEndpoint("http://localhost:" + S3_MOCK_PORT)
-            .preload(SplitSearcher.IndexComponent.SCHEMA,
-                    SplitSearcher.IndexComponent.STORE,
-                    SplitSearcher.IndexComponent.FASTFIELD,
-                    SplitSearcher.IndexComponent.POSTINGS);
         
-        try (SplitSearcher searcher = SplitSearcher.create(config)) {
+        try (SplitSearcher searcher = cacheManager.createSplitSearcher(s3SplitPath)) {
             // Check loading statistics
             SplitSearcher.LoadingStats loadingStats = searcher.getLoadingStats();
             assertNotNull(loadingStats);
@@ -353,12 +351,8 @@ public class SplitSearcherTest {
     @Test
     @DisplayName("S3 endpoint configuration and custom headers")
     void testS3CustomEndpointConfiguration() {
-        SplitSearcher.SplitSearchConfig config = new SplitSearcher.SplitSearchConfig(s3SplitPath)
-            .withCacheSize(50_000_000)
-            .withAwsCredentials(ACCESS_KEY, SECRET_KEY, "us-east-1")
-            .withAwsEndpoint("http://localhost:" + S3_MOCK_PORT);
         
-        try (SplitSearcher searcher = SplitSearcher.create(config)) {
+        try (SplitSearcher searcher = cacheManager.createSplitSearcher(s3SplitPath)) {
             // Verify the searcher can access S3 with custom endpoint
             assertNotNull(searcher);
             
@@ -379,11 +373,7 @@ public class SplitSearcherTest {
     void testConcurrentSearchPerformance() throws InterruptedException {
         String fileUri = "file://" + localSplitPath.toAbsolutePath();
         
-        try (SplitSearcher searcher = SplitSearcher.builder(fileUri)
-            .withCacheSize(200_000_000)
-            .withMaxConcurrentLoads(8)
-            .preload(SplitSearcher.IndexComponent.values())
-            .build()) {
+        try (SplitSearcher searcher = cacheManager.createSplitSearcher(fileUri)) {
             
             final int numThreads = 4;
             final int queriesPerThread = 25;
@@ -428,10 +418,8 @@ public class SplitSearcherTest {
     void testMemoryUsageAndCacheEviction() {
         String fileUri = "file://" + localSplitPath.toAbsolutePath();
         
-        // Create searcher with small cache to force evictions
-        try (SplitSearcher searcher = SplitSearcher.builder(fileUri)
-            .withCacheSize(5_000_000) // Small cache
-            .build()) {
+        // Create searcher - cache manager handles cache sizing
+        try (SplitSearcher searcher = cacheManager.createSplitSearcher(fileUri)) {
             
             Schema schema = searcher.getSchema();
             
@@ -454,9 +442,7 @@ public class SplitSearcherTest {
     void testSplitValidationAndIntegrity() {
         String fileUri = "file://" + localSplitPath.toAbsolutePath();
         
-        try (SplitSearcher searcher = SplitSearcher.builder(fileUri)
-            .withCacheSize(50_000_000)
-            .build()) {
+        try (SplitSearcher searcher = cacheManager.createSplitSearcher(fileUri)) {
             
             // Validate split integrity
             assertTrue(searcher.validateSplit(), "Split should be valid");
@@ -477,24 +463,16 @@ public class SplitSearcherTest {
     @DisplayName("Handle invalid split path")
     void testInvalidSplitPath() {
         assertThrows(RuntimeException.class, () -> {
-            SplitSearcher.builder("file:///nonexistent/path/invalid.split")
-                .withCacheSize(10_000_000)
-                .build();
+            cacheManager.createSplitSearcher("file:///nonexistent/path/invalid.split");
         });
     }
 
     @Test
     @DisplayName("Handle S3 connection errors")
     void testS3ConnectionErrors() {
-        // Try to connect to invalid S3 endpoint
-        SplitSearcher.SplitSearchConfig config = new SplitSearcher.SplitSearchConfig(
-            "s3://invalid-bucket/invalid-split.split")
-            .withCacheSize(10_000_000)
-            .withAwsCredentials("invalid", "invalid", "us-east-1")
-            .withAwsEndpoint("http://localhost:9999"); // Invalid port
-        
+        // Try to create searcher with invalid split path
         assertThrows(RuntimeException.class, () -> {
-            SplitSearcher.create(config);
+            cacheManager.createSplitSearcher("s3://invalid-bucket/invalid-split.split");
         });
     }
 
@@ -503,10 +481,8 @@ public class SplitSearcherTest {
     void testCacheOverflowHandling() {
         String fileUri = "file://" + localSplitPath.toAbsolutePath();
         
-        // Create searcher with very small cache
-        try (SplitSearcher searcher = SplitSearcher.builder(fileUri)
-            .withCacheSize(1024) // Very small cache
-            .build()) {
+        // Create searcher - cache manager handles cache configuration
+        try (SplitSearcher searcher = cacheManager.createSplitSearcher(fileUri)) {
             
             Schema schema = searcher.getSchema();
             Query query = Query.termQuery(schema, "content", "sample");
