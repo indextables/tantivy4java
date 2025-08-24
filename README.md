@@ -226,10 +226,38 @@ Tantivy4Java now includes **complete SplitSearcher functionality** for searching
 - **ByteRangeCache** - Global storage byte range cache (per file_path + range)  
 - **ComponentCache** - Global component cache (fast fields, postings, etc.)
 
-✅ **Configuration Validation** - Prevents conflicting cache configurations:
-- Cache instances with same name must have consistent settings
-- Automatic validation prevents memory configuration conflicts
-- Clear error messages for configuration mismatches
+✅ **Enhanced Configuration Management** - Comprehensive cache key system prevents configuration conflicts:
+- **Configuration-Based Cache Keys** - Cache instances differentiated by complete configuration (size, credentials, endpoints)
+- **Automatic Instance Sharing** - Identical configurations share cache instances for efficiency
+- **Configuration Isolation** - Different configurations get separate cache instances for safety
+- **Multi-Cloud Support** - Different cloud configurations maintain separate cache instances
+- **Session Token Integration** - Session tokens included in cache key for proper credential isolation
+
+✅ **Configuration Examples**:
+```java
+// These configurations will share the same cache instance (identical)
+SplitCacheManager.CacheConfig config1 = new SplitCacheManager.CacheConfig("test-cache")
+    .withMaxCacheSize(100_000_000)
+    .withAwsCredentials("key1", "secret1", "us-east-1");
+
+SplitCacheManager.CacheConfig config2 = new SplitCacheManager.CacheConfig("test-cache")
+    .withMaxCacheSize(100_000_000)
+    .withAwsCredentials("key1", "secret1", "us-east-1");
+
+// These will get separate cache instances (different configurations)
+SplitCacheManager.CacheConfig config3 = new SplitCacheManager.CacheConfig("test-cache")
+    .withMaxCacheSize(200_000_000) // Different size
+    .withAwsCredentials("key1", "secret1", "us-east-1");
+
+SplitCacheManager.CacheConfig config4 = new SplitCacheManager.CacheConfig("test-cache")
+    .withMaxCacheSize(100_000_000)
+    .withAwsCredentials("key1", "secret1", "us-east-1", "session-token"); // Different credentials
+
+SplitCacheManager manager1 = SplitCacheManager.getInstance(config1);
+SplitCacheManager manager2 = SplitCacheManager.getInstance(config2); // Same instance as manager1
+SplitCacheManager manager3 = SplitCacheManager.getInstance(config3); // Different instance
+SplitCacheManager manager4 = SplitCacheManager.getInstance(config4); // Different instance
+```
 
 ✅ **Deprecated Methods Removed** - Eliminated per-split cache patterns:
 - Removed `SplitSearchConfig` class entirely
@@ -341,22 +369,37 @@ try (SplitSearcher searcher = cacheManager.createSplitSearcher(splitUrl)) {
 
 #### Multi-Cloud Storage Support
 
-**AWS S3 Storage:**
+**AWS S3 Storage with Native Session Token Support:**
 ```java
+// Standard AWS credentials
 SplitCacheManager.CacheConfig awsConfig = new SplitCacheManager.CacheConfig("aws-cache")
     .withMaxCacheSize(500_000_000) // 500MB shared cache
     .withAwsCredentials("access-key", "secret-key", "us-east-1")
     .withAwsEndpoint("https://s3.amazonaws.com"); // or MinIO/S3Mock endpoint
 
-SplitCacheManager cacheManager = SplitCacheManager.getInstance(awsConfig);
+// AWS temporary credentials with session token (native Quickwit support)
+SplitCacheManager.CacheConfig awsSessionConfig = new SplitCacheManager.CacheConfig("aws-session-cache")
+    .withMaxCacheSize(500_000_000)
+    .withAwsCredentials("access-key", "secret-key", "us-east-1", "session-token") // Native session token
+    .withAwsEndpoint("https://s3.amazonaws.com");
+
+SplitCacheManager cacheManager = SplitCacheManager.getInstance(awsSessionConfig);
 
 try (SplitSearcher searcher = cacheManager.createSplitSearcher("s3://my-bucket/splits/data.split")) {
-    // AWS S3 split operations
+    // AWS S3 split operations with session token support
     boolean isValid = searcher.validateSplit();
     SplitSearcher.SplitMetadata metadata = searcher.getSplitMetadata();
     System.out.println("AWS Split: " + metadata.getSplitId());
 }
 ```
+
+#### **🔐 AWS Session Token Features**
+- **✅ Native Support** - Built-in Quickwit session token integration (no environment variables)
+- **✅ STS Integration** - Full support for temporary credentials and assumed roles
+- **✅ IAM Roles** - Seamless integration with IAM role-based access
+- **✅ Federated Access** - Support for federated identity providers
+- **✅ MFA Support** - Multi-factor authentication compatible credentials
+- **✅ Production Ready** - Robust credential lifecycle management
 
 **Azure Blob Storage:**
 ```java
@@ -700,7 +743,10 @@ Tantivy4Java includes environment-controlled debug logging for development and t
   - Index schema metadata and document content analysis  
   - Cache operations and statistics
   - S3 storage operations and split file validation
+  - AWS session token handling (credentials redacted for security)
+  - Native Quickwit integration details
   - Memory usage and resource management
+  - Configuration-based cache key generation and sharing
 
 **Usage examples:**
 ```bash

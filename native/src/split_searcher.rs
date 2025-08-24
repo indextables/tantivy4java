@@ -87,33 +87,15 @@ impl SplitSearcher {
                      if aws_config.session_token.is_some() { "***PROVIDED***" } else { "None" },
                      aws_config.endpoint, aws_config.force_path_style);
             
-            // WORKAROUND: Since Quickwit's S3StorageConfig doesn't support session tokens,
-            // we set environment variables that AWS SDK will automatically pick up
-            // This ensures session token support for STS/temporary credentials
-            if let Some(session_token) = &aws_config.session_token {
-                std::env::set_var("AWS_ACCESS_KEY_ID", &aws_config.access_key);
-                std::env::set_var("AWS_SECRET_ACCESS_KEY", &aws_config.secret_key);
-                std::env::set_var("AWS_SESSION_TOKEN", session_token);
-                std::env::set_var("AWS_DEFAULT_REGION", &aws_config.region);
-                debug_log!("Set AWS environment variables including session token for automatic credential chain");
-                
-                // Use minimal S3StorageConfig and let AWS SDK credential chain handle the session token
-                S3StorageConfig {
-                    region: Some(aws_config.region.clone()),
-                    endpoint: aws_config.endpoint.clone(),
-                    force_path_style_access: aws_config.force_path_style,
-                    ..Default::default()
-                }
-            } else {
-                // No session token - use explicit credentials as before
-                S3StorageConfig {
-                    region: Some(aws_config.region.clone()),
-                    access_key_id: Some(aws_config.access_key.clone()),
-                    secret_access_key: Some(aws_config.secret_key.clone()),
-                    endpoint: aws_config.endpoint.clone(),
-                    force_path_style_access: aws_config.force_path_style,
-                    ..Default::default()
-                }
+            // Use native Quickwit session token support (no environment variable workaround needed)
+            S3StorageConfig {
+                region: Some(aws_config.region.clone()),
+                access_key_id: Some(aws_config.access_key.clone()),
+                secret_access_key: Some(aws_config.secret_key.clone()),
+                session_token: aws_config.session_token.clone(), // Native session token support
+                endpoint: aws_config.endpoint.clone(),
+                force_path_style_access: aws_config.force_path_style,
+                ..Default::default()
             }
         } else {
             debug_log!("No AWS config provided, using default S3StorageConfig");
