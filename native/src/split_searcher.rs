@@ -45,6 +45,7 @@ pub struct SplitSearchConfig {
 pub struct AwsConfig {
     pub access_key: String,
     pub secret_key: String,
+    pub session_token: Option<String>,
     pub region: String,
     pub endpoint: Option<String>,
     pub force_path_style: bool,
@@ -81,15 +82,38 @@ impl SplitSearcher {
         // Source S3 config from the provided API config objects
         use quickwit_config::S3StorageConfig;
         let s3_config = if let Some(aws_config) = &config.aws_config {
-            debug_log!("Creating S3Config with region: {}, access_key: {}, endpoint: {:?}, force_path_style: {}", 
-                     aws_config.region, aws_config.access_key, aws_config.endpoint, aws_config.force_path_style);
-            S3StorageConfig {
-                region: Some(aws_config.region.clone()),
-                access_key_id: Some(aws_config.access_key.clone()),
-                secret_access_key: Some(aws_config.secret_key.clone()),
-                endpoint: aws_config.endpoint.clone(),
-                force_path_style_access: aws_config.force_path_style,
-                ..Default::default()
+            debug_log!("Creating S3Config with region: {}, access_key: {}, session_token: {}, endpoint: {:?}, force_path_style: {}", 
+                     aws_config.region, aws_config.access_key, 
+                     if aws_config.session_token.is_some() { "***PROVIDED***" } else { "None" },
+                     aws_config.endpoint, aws_config.force_path_style);
+            
+            // WORKAROUND: Since Quickwit's S3StorageConfig doesn't support session tokens,
+            // we set environment variables that AWS SDK will automatically pick up
+            // This ensures session token support for STS/temporary credentials
+            if let Some(session_token) = &aws_config.session_token {
+                std::env::set_var("AWS_ACCESS_KEY_ID", &aws_config.access_key);
+                std::env::set_var("AWS_SECRET_ACCESS_KEY", &aws_config.secret_key);
+                std::env::set_var("AWS_SESSION_TOKEN", session_token);
+                std::env::set_var("AWS_DEFAULT_REGION", &aws_config.region);
+                debug_log!("Set AWS environment variables including session token for automatic credential chain");
+                
+                // Use minimal S3StorageConfig and let AWS SDK credential chain handle the session token
+                S3StorageConfig {
+                    region: Some(aws_config.region.clone()),
+                    endpoint: aws_config.endpoint.clone(),
+                    force_path_style_access: aws_config.force_path_style,
+                    ..Default::default()
+                }
+            } else {
+                // No session token - use explicit credentials as before
+                S3StorageConfig {
+                    region: Some(aws_config.region.clone()),
+                    access_key_id: Some(aws_config.access_key.clone()),
+                    secret_access_key: Some(aws_config.secret_key.clone()),
+                    endpoint: aws_config.endpoint.clone(),
+                    force_path_style_access: aws_config.force_path_style,
+                    ..Default::default()
+                }
             }
         } else {
             debug_log!("No AWS config provided, using default S3StorageConfig");
@@ -803,6 +827,19 @@ fn extract_aws_config(env: &mut JNIEnv, aws_obj: JObject) -> anyhow::Result<AwsC
     let secret_key = get_string_field(env, &aws_obj, "getSecretKey")?; 
     let region = get_string_field(env, &aws_obj, "getRegion")?;
     
+    // Extract session token (optional - for STS/temporary credentials)
+    let session_token = match env.call_method(&aws_obj, "getSessionToken", "()Ljava/lang/String;", &[]) {
+        Ok(session_result) => {
+            let session_obj = session_result.l()?;
+            if env.is_same_object(&session_obj, JObject::null())? {
+                None
+            } else {
+                Some(env.get_string((&session_obj).into())?.into())
+            }
+        },
+        Err(_) => None, // Method doesn't exist or returned null
+    };
+    
     let endpoint = match env.call_method(&aws_obj, "getEndpoint", "()Ljava/lang/String;", &[]) {
         Ok(endpoint_result) => {
             let endpoint_obj = endpoint_result.l()?;
@@ -821,6 +858,7 @@ fn extract_aws_config(env: &mut JNIEnv, aws_obj: JObject) -> anyhow::Result<AwsC
     Ok(AwsConfig {
         access_key,
         secret_key,
+        session_token,
         region,
         endpoint,
         force_path_style,
@@ -842,6 +880,7 @@ fn extract_aws_config_from_java_map(env: &mut JNIEnv, split_config: &JObject) ->
         return Ok(None);
     }
     
+    
     // Get the "aws_config" key from the HashMap
     let key = env.new_string("aws_config")?;
     let aws_config_obj = env.call_method(split_config, "get", "(Ljava/lang/Object;)Ljava/lang/Object;", &[(&key).into()])?;
@@ -855,11 +894,13 @@ fn extract_aws_config_from_java_map(env: &mut JNIEnv, split_config: &JObject) ->
     // Extract AWS credentials from the nested Map
     let access_key_jstr = env.new_string("access_key")?;
     let secret_key_jstr = env.new_string("secret_key")?;
+    let session_token_jstr = env.new_string("session_token")?;
     let region_jstr = env.new_string("region")?;
     let endpoint_jstr = env.new_string("endpoint")?;
     
     let access_key = env.call_method(&aws_config_obj, "get", "(Ljava/lang/Object;)Ljava/lang/Object;", &[(&access_key_jstr).into()])?;
     let secret_key = env.call_method(&aws_config_obj, "get", "(Ljava/lang/Object;)Ljava/lang/Object;", &[(&secret_key_jstr).into()])?;
+    let session_token = env.call_method(&aws_config_obj, "get", "(Ljava/lang/Object;)Ljava/lang/Object;", &[(&session_token_jstr).into()])?;
     let region = env.call_method(&aws_config_obj, "get", "(Ljava/lang/Object;)Ljava/lang/Object;", &[(&region_jstr).into()])?;
     let endpoint = env.call_method(&aws_config_obj, "get", "(Ljava/lang/Object;)Ljava/lang/Object;", &[(&endpoint_jstr).into()])?;
     
@@ -870,6 +911,12 @@ fn extract_aws_config_from_java_map(env: &mut JNIEnv, split_config: &JObject) ->
     } else { None };
     
     let secret_key = if let Ok(obj) = secret_key.l() {
+        if !obj.is_null() {
+            Some(env.get_string(&obj.into())?.to_string_lossy().into_owned())
+        } else { None }
+    } else { None };
+    
+    let session_token = if let Ok(obj) = session_token.l() {
         if !obj.is_null() {
             Some(env.get_string(&obj.into())?.to_string_lossy().into_owned())
         } else { None }
@@ -891,6 +938,7 @@ fn extract_aws_config_from_java_map(env: &mut JNIEnv, split_config: &JObject) ->
         Ok(Some(AwsConfig {
             access_key: access_key.unwrap(),
             secret_key: secret_key.unwrap(),
+            session_token,
             region,
             endpoint,
             force_path_style: true, // Default for S3Mock

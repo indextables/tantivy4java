@@ -29,13 +29,13 @@ once_cell = "1.19.0"
 bytesize = "1.3"
 
 # Quickwit dependencies with proper versions and features
-quickwit-storage = { git = "https://github.com/quickwit-oss/quickwit" }
-quickwit-metastore = { git = "https://github.com/quickwit-oss/quickwit" }
-quickwit-proto = { git = "https://github.com/quickwit-oss/quickwit" }
-quickwit-directories = { git = "https://github.com/quickwit-oss/quickwit" }
-quickwit-common = { git = "https://github.com/quickwit-oss/quickwit" }
-quickwit-config = { git = "https://github.com/quickwit-oss/quickwit" }
-quickwit-search = { git = "https://github.com/quickwit-oss/quickwit" }
+quickwit-storage = { git = "https://github.com/schenksj/quickwit" }
+quickwit-metastore = { git = "https://github.com/schenksj/quickwit" }
+quickwit-proto = { git = "https://github.com/schenksj/quickwit" }
+quickwit-directories = { git = "https://github.com/schenksj/quickwit" }
+quickwit-common = { git = "https://github.com/schenksj/quickwit" }
+quickwit-config = { git = "https://github.com/schenksj/quickwit" }
+quickwit-search = { git = "https://github.com/schenksj/quickwit" }
 
 # Additional dependencies
 anyhow = "1.0"

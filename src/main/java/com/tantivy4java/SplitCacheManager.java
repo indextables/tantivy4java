@@ -26,7 +26,12 @@ import java.util.concurrent.atomic.AtomicLong;
  * SplitCacheManager.CacheConfig config = new SplitCacheManager.CacheConfig("production-cache")
  *     .withMaxCacheSize(500_000_000)  // 500MB shared across all splits
  *     .withMaxConcurrentLoads(8)      // Parallel component loading
- *     .withAwsCredentials(key, secret, region);
+ *     .withAwsCredentials(key, secret, region);  // Basic credentials
+ * 
+ * // Or with session token for temporary credentials:
+ * SplitCacheManager.CacheConfig configWithToken = new SplitCacheManager.CacheConfig("production-cache")
+ *     .withMaxCacheSize(500_000_000)
+ *     .withAwsCredentials(key, secret, region, sessionToken);  // With session token
  * 
  * SplitCacheManager cacheManager = SplitCacheManager.getInstance(config);
  * 
@@ -50,6 +55,7 @@ public class SplitCacheManager implements AutoCloseable {
     private static final Map<String, SplitCacheManager> instances = new ConcurrentHashMap<>();
     
     private final String cacheName;
+    private final String cacheKey; // Full cache key used for storage/retrieval
     private final long maxCacheSize;
     private final Map<String, SplitSearcher> managedSearchers;
     private final AtomicLong totalCacheSize;
@@ -91,6 +97,24 @@ public class SplitCacheManager implements AutoCloseable {
             this.awsConfig.put("access_key", accessKey);
             this.awsConfig.put("secret_key", secretKey);
             this.awsConfig.put("region", region);
+            return this;
+        }
+        
+        /**
+         * Configure AWS credentials with session token for temporary credentials.
+         * This is useful for IAM roles, federated access, or STS-generated temporary credentials.
+         * 
+         * @param accessKey AWS access key ID
+         * @param secretKey AWS secret access key
+         * @param region AWS region
+         * @param sessionToken AWS session token for temporary credentials
+         * @return this CacheConfig for method chaining
+         */
+        public CacheConfig withAwsCredentials(String accessKey, String secretKey, String region, String sessionToken) {
+            this.awsConfig.put("access_key", accessKey);
+            this.awsConfig.put("secret_key", secretKey);
+            this.awsConfig.put("region", region);
+            this.awsConfig.put("session_token", sessionToken);
             return this;
         }
         
@@ -141,6 +165,52 @@ public class SplitCacheManager implements AutoCloseable {
         public Map<String, String> getAwsConfig() { return awsConfig; }
         public Map<String, String> getAzureConfig() { return azureConfig; }
         public Map<String, String> getGcpConfig() { return gcpConfig; }
+        
+        /**
+         * Generate a comprehensive cache key based on all configuration parameters.
+         * This ensures that different configurations don't accidentally share cache instances.
+         * 
+         * @return A unique cache key representing all configuration parameters
+         */
+        public String getCacheKey() {
+            StringBuilder keyBuilder = new StringBuilder();
+            keyBuilder.append("name=").append(cacheName);
+            keyBuilder.append(",maxSize=").append(maxCacheSize);
+            keyBuilder.append(",maxLoads=").append(maxConcurrentLoads);
+            keyBuilder.append(",queryCache=").append(enableQueryCache);
+            
+            // Add AWS config to key (sorted for consistency)
+            if (!awsConfig.isEmpty()) {
+                keyBuilder.append(",aws={");
+                awsConfig.entrySet().stream()
+                    .sorted(Map.Entry.comparingByKey())
+                    .forEach(entry -> keyBuilder.append(entry.getKey()).append("=").append(entry.getValue()).append(","));
+                keyBuilder.setLength(keyBuilder.length() - 1); // Remove last comma
+                keyBuilder.append("}");
+            }
+            
+            // Add Azure config to key (sorted for consistency)
+            if (!azureConfig.isEmpty()) {
+                keyBuilder.append(",azure={");
+                azureConfig.entrySet().stream()
+                    .sorted(Map.Entry.comparingByKey())
+                    .forEach(entry -> keyBuilder.append(entry.getKey()).append("=").append(entry.getValue()).append(","));
+                keyBuilder.setLength(keyBuilder.length() - 1); // Remove last comma
+                keyBuilder.append("}");
+            }
+            
+            // Add GCP config to key (sorted for consistency)
+            if (!gcpConfig.isEmpty()) {
+                keyBuilder.append(",gcp={");
+                gcpConfig.entrySet().stream()
+                    .sorted(Map.Entry.comparingByKey())
+                    .forEach(entry -> keyBuilder.append(entry.getKey()).append("=").append(entry.getValue()).append(","));
+                keyBuilder.setLength(keyBuilder.length() - 1); // Remove last comma
+                keyBuilder.append("}");
+            }
+            
+            return keyBuilder.toString();
+        }
     }
     
     /**
@@ -182,6 +252,7 @@ public class SplitCacheManager implements AutoCloseable {
     
     private SplitCacheManager(CacheConfig config) {
         this.cacheName = config.getCacheName();
+        this.cacheKey = config.getCacheKey();
         this.maxCacheSize = config.getMaxCacheSize();
         this.managedSearchers = new ConcurrentHashMap<>();
         this.totalCacheSize = new AtomicLong(0);
@@ -193,28 +264,33 @@ public class SplitCacheManager implements AutoCloseable {
      * Get or create a shared cache manager instance
      */
     public static SplitCacheManager getInstance(CacheConfig config) {
-        return instances.computeIfAbsent(config.getCacheName(), 
-            name -> {
+        return instances.computeIfAbsent(config.getCacheKey(), 
+            cacheKey -> {
                 validateCacheConfig(config);
                 return new SplitCacheManager(config);
             });
     }
     
     /**
-     * Validate cache configuration for consistency
+     * Validate cache configuration for consistency.
+     * With the comprehensive cache key approach, configurations are automatically 
+     * unique and consistent - identical configs share instances, different configs get separate instances.
      */
     private static void validateCacheConfig(CacheConfig config) {
-        // Check if a cache with this name already exists with different configuration
-        SplitCacheManager existing = instances.get(config.getCacheName());
-        if (existing != null) {
-            // If it exists, the configurations should be compatible
-            if (existing.maxCacheSize != config.getMaxCacheSize()) {
-                throw new IllegalArgumentException(
-                    "Cache '" + config.getCacheName() + "' already exists with different max size: " +
-                    "existing=" + existing.maxCacheSize + ", requested=" + config.getMaxCacheSize()
-                );
-            }
+        // Basic validation - ensure required fields are present
+        if (config.getCacheName() == null || config.getCacheName().trim().isEmpty()) {
+            throw new IllegalArgumentException("Cache name cannot be null or empty");
         }
+        if (config.getMaxCacheSize() <= 0) {
+            throw new IllegalArgumentException("Max cache size must be positive, got: " + config.getMaxCacheSize());
+        }
+        if (config.getMaxConcurrentLoads() <= 0) {
+            throw new IllegalArgumentException("Max concurrent loads must be positive, got: " + config.getMaxConcurrentLoads());
+        }
+        
+        // Note: Configuration conflict validation is no longer needed since we use comprehensive 
+        // cache keys. Identical configurations will share instances automatically, while different
+        // configurations will get separate cache instances as intended.
     }
     
     /**
@@ -334,8 +410,8 @@ public class SplitCacheManager implements AutoCloseable {
             closeNativeCacheManager(nativePtr);
         }
         
-        // Remove from instances
-        instances.remove(cacheName);
+        // Remove from instances using the cache key
+        instances.remove(cacheKey);
     }
     
     // Native method declarations
@@ -350,6 +426,7 @@ public class SplitCacheManager implements AutoCloseable {
     
     // Package-private getters for SplitSearcher
     String getCacheName() { return cacheName; }
+    String getCacheKey() { return cacheKey; }
     long getMaxCacheSize() { return maxCacheSize; }
     long getNativePtr() { return nativePtr; }
 }

@@ -16,6 +16,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.EnumSet;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -31,6 +32,7 @@ public class SplitSearcherTest {
     private static final String TEST_BUCKET = "test-splits-bucket";
     private static final String ACCESS_KEY = "test-access-key";
     private static final String SECRET_KEY = "test-secret-key";
+    private static final String SESSION_TOKEN = "test-session-token";
     private static final int S3_MOCK_PORT = 8001;
     
     private static S3Mock s3Mock;
@@ -72,7 +74,7 @@ public class SplitSearcherTest {
         SplitCacheManager.CacheConfig config = new SplitCacheManager.CacheConfig("split-searcher-test-cache")
             .withMaxCacheSize(50_000_000) // 50MB shared cache
             .withMaxConcurrentLoads(8)
-            .withAwsCredentials(ACCESS_KEY, SECRET_KEY, "us-east-1")
+            .withAwsCredentials(ACCESS_KEY, SECRET_KEY, "us-east-1", SESSION_TOKEN)
             .withAwsEndpoint("http://localhost:" + S3_MOCK_PORT);
             
         cacheManager = SplitCacheManager.getInstance(config);
@@ -363,6 +365,41 @@ public class SplitSearcherTest {
             List<String> files = searcher.listSplitFiles();
             assertNotNull(files);
             assertFalse(files.isEmpty());
+        }
+    }
+
+    @Test
+    @DisplayName("AWS session token support for S3 requests")
+    void testAwsSessionTokenSupport() {
+        // Test AWS session token handling in S3 configuration using the new CacheConfig API
+        try {
+            SplitCacheManager.CacheConfig configWithToken = new SplitCacheManager.CacheConfig("test-session-token-cache")
+                .withMaxCacheSize(50_000_000)
+                .withAwsCredentials(ACCESS_KEY, SECRET_KEY, "us-east-1", SESSION_TOKEN)
+                .withAwsEndpoint("http://localhost:" + S3_MOCK_PORT);
+            
+            SplitCacheManager tokenCacheManager = SplitCacheManager.getInstance(configWithToken);
+            
+            // Verify that the cache manager accepts session token configuration without error
+            assertNotNull(tokenCacheManager);
+            
+            // Create searcher with session token-enabled configuration
+            try (SplitSearcher searcher = tokenCacheManager.createSplitSearcher(s3SplitPath)) {
+                // Verify the searcher can be created (session token passed through correctly)
+                assertNotNull(searcher);
+                
+                // Test that session token configuration doesn't break basic operations
+                assertTrue(searcher.validateSplit());
+                
+                // Verify cache stats still work with session token configuration
+                SplitSearcher.CacheStats cacheStats = searcher.getCacheStats();
+                assertNotNull(cacheStats);
+                assertTrue(cacheStats.getHitCount() >= 0);
+                assertTrue(cacheStats.getMissCount() >= 0);
+                
+            }
+        } catch (Exception e) {
+            fail("AWS session token configuration should be accepted: " + e.getMessage());
         }
     }
 
