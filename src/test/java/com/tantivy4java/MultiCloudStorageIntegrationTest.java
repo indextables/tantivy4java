@@ -104,7 +104,8 @@ public class MultiCloudStorageIntegrationTest {
                 .withMaxCacheSize(500_000_000) // 500MB shared cache for all clouds
                 .withMaxConcurrentLoads(16)
                 // AWS Configuration
-                .withAwsCredentials(S3_ACCESS_KEY, S3_SECRET_KEY, "us-east-1")
+                .withAwsCredentials(S3_ACCESS_KEY, S3_SECRET_KEY)
+                .withAwsRegion("us-east-1")
                 .withAwsEndpoint("http://127.0.0.1:" + S3_MOCK_PORT)
                 // Azure Configuration
                 .withAzureCredentials(AZURE_ACCOUNT_NAME, AZURE_ACCOUNT_KEY)
@@ -142,7 +143,8 @@ public class MultiCloudStorageIntegrationTest {
         SplitCacheManager.CacheConfig config = new SplitCacheManager.CacheConfig("multi-cloud-validation")
                 .withMaxCacheSize(300_000_000)
                 // AWS Configuration
-                .withAwsCredentials("aws-test-key", "aws-test-secret", "us-west-2")
+                .withAwsCredentials("aws-test-key", "aws-test-secret")
+                .withAwsRegion("us-west-2")
                 .withAwsEndpoint("http://127.0.0.1:8002")
                 // Azure Configuration
                 .withAzureCredentials("azureaccount", "azurekey")
@@ -222,7 +224,8 @@ public class MultiCloudStorageIntegrationTest {
         // Test creating multiple cache managers with different configurations
         SplitCacheManager.CacheConfig tempConfig = new SplitCacheManager.CacheConfig("multi-cloud-temp")
                 .withMaxCacheSize(100_000_000)
-                .withAwsCredentials("temp-key", "temp-secret", "eu-west-1")
+                .withAwsCredentials("temp-key", "temp-secret")
+                .withAwsRegion("eu-west-1")
                 .withAzureCredentials("tempazure", "tempkey")
                 .withGcpCredentials("temp-project", "temp-service-key");
         

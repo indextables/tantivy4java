@@ -30,6 +30,12 @@ Tantivy4Java
 - **✅ Multi-Cloud Support** - Different cloud credentials maintain separate cache instances
 - **✅ Session Token Integration** - Session tokens properly isolated in cache keys
 
+**Improved Credential Configuration:**
+- **✅ Separate Region Management** - Region configured independently from credentials for flexibility
+- **✅ Clear Parameter Patterns** - 2 parameters (access+secret) vs 3 parameters (access+secret+token)
+- **✅ Multi-Region Support** - Change regions without reconfiguring credentials
+- **✅ Simplified API** - Clean separation of concerns between credentials and region settings
+
 **Latest Technical Achievements:**
 - **16/16 SplitSearcher tests passing** with native session token support
 - **Configuration conflict prevention** through comprehensive cache key system
@@ -259,7 +265,7 @@ Tantivy4Java now provides complete SplitSearcher functionality for searching Qui
 - **AWS S3/MinIO support** - Full cloud storage backend compatibility ✅
 - **Custom endpoint configuration** - Support for mock servers and private clouds ✅
 - **Connection validation** - Robust error handling for network issues ✅
-- **Credential management** - AWS access key and region configuration ✅
+- **Credential management** - AWS access key, secret key, and session token configuration with separate region management ✅
 
 **Comprehensive Testing**
 - **14 dedicated SplitSearcher tests** with **100% pass rate** ✅
@@ -374,9 +380,18 @@ Following user feedback about cache configuration inconsistencies, comprehensive
 
 **Example Proper Usage:**
 ```java
-// Create shared cache manager (reuse across application)
+// Create shared cache manager with AWS credentials (2 parameters: access + secret)
 SplitCacheManager.CacheConfig config = new SplitCacheManager.CacheConfig("main-cache")
-    .withMaxCacheSize(200_000_000); // 200MB shared across all splits
+    .withMaxCacheSize(200_000_000)  // 200MB shared across all splits
+    .withAwsCredentials("access-key", "secret-key")  // 2 parameters for basic credentials
+    .withAwsRegion("us-east-1");  // Region configured separately
+
+// Or with session token (3 parameters: access + secret + token)
+SplitCacheManager.CacheConfig sessionConfig = new SplitCacheManager.CacheConfig("session-cache")
+    .withMaxCacheSize(200_000_000)
+    .withAwsCredentials("access-key", "secret-key", "session-token")  // 3 parameters for temporary credentials
+    .withAwsRegion("us-east-1");
+
 SplitCacheManager cacheManager = SplitCacheManager.getInstance(config);
 
 // Create searchers that share the cache
@@ -389,6 +404,15 @@ SplitSearcher searcher2 = cacheManager.createSplitSearcher("s3://bucket/split2.s
 - **Eliminates anti-patterns** - Removes deprecated per-split cache configuration methods
 - **Matches Quickwit design** - Follows proven Quickwit multi-level caching architecture
 - **Clear migration path** - Explicit guidance for updating existing code
+
+#### **🔐 AWS Credential Configuration Patterns**
+
+**Flexible Configuration with Separate Region Management:**
+
+- **📋 2 Parameters**: `withAwsCredentials(accessKey, secretKey)` - For long-term credentials or IAM instance profiles
+- **🔐 3 Parameters**: `withAwsCredentials(accessKey, secretKey, sessionToken)` - For temporary credentials from STS, IAM roles, or federated access
+- **🌍 Separate Region**: `withAwsRegion(region)` - Configure region independently from credentials
+- **♻️ Flexible Reuse**: Change regions without reconfiguring credentials, ideal for multi-region deployments
 
 **Example Usage:**
 ```java

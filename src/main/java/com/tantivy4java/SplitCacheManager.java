@@ -26,12 +26,14 @@ import java.util.concurrent.atomic.AtomicLong;
  * SplitCacheManager.CacheConfig config = new SplitCacheManager.CacheConfig("production-cache")
  *     .withMaxCacheSize(500_000_000)  // 500MB shared across all splits
  *     .withMaxConcurrentLoads(8)      // Parallel component loading
- *     .withAwsCredentials(key, secret, region);  // Basic credentials
+ *     .withAwsCredentials(key, secret) // AWS credentials
+ *     .withAwsRegion(region);          // AWS region configured separately
  * 
  * // Or with session token for temporary credentials:
  * SplitCacheManager.CacheConfig configWithToken = new SplitCacheManager.CacheConfig("production-cache")
  *     .withMaxCacheSize(500_000_000)
- *     .withAwsCredentials(key, secret, region, sessionToken);  // With session token
+ *     .withAwsCredentials(key, secret, sessionToken) // Credentials with session token
+ *     .withAwsRegion(region);                        // Region configured separately
  * 
  * SplitCacheManager cacheManager = SplitCacheManager.getInstance(config);
  * 
@@ -93,30 +95,47 @@ public class SplitCacheManager implements AutoCloseable {
             return this;
         }
         
-        public CacheConfig withAwsCredentials(String accessKey, String secretKey, String region) {
+        /**
+         * Configure AWS credentials (2 parameters: access key and secret key).
+         * For long-term credentials or IAM instance profiles.
+         * 
+         * @param accessKey AWS access key ID
+         * @param secretKey AWS secret access key
+         * @return this CacheConfig for method chaining
+         */
+        public CacheConfig withAwsCredentials(String accessKey, String secretKey) {
             this.awsConfig.put("access_key", accessKey);
             this.awsConfig.put("secret_key", secretKey);
-            this.awsConfig.put("region", region);
             return this;
         }
         
         /**
-         * Configure AWS credentials with session token for temporary credentials.
-         * This is useful for IAM roles, federated access, or STS-generated temporary credentials.
+         * Configure AWS credentials (3 parameters: access key, secret key, and session token).
+         * For temporary credentials from IAM roles, federated access, or STS-generated credentials.
          * 
          * @param accessKey AWS access key ID
          * @param secretKey AWS secret access key
-         * @param region AWS region
          * @param sessionToken AWS session token for temporary credentials
          * @return this CacheConfig for method chaining
          */
-        public CacheConfig withAwsCredentials(String accessKey, String secretKey, String region, String sessionToken) {
+        public CacheConfig withAwsCredentials(String accessKey, String secretKey, String sessionToken) {
             this.awsConfig.put("access_key", accessKey);
             this.awsConfig.put("secret_key", secretKey);
-            this.awsConfig.put("region", region);
             this.awsConfig.put("session_token", sessionToken);
             return this;
         }
+        
+        /**
+         * Configure AWS region separately from credentials.
+         * 
+         * @param region AWS region (e.g., "us-east-1", "eu-west-1")
+         * @return this CacheConfig for method chaining
+         */
+        public CacheConfig withAwsRegion(String region) {
+            this.awsConfig.put("region", region);
+            return this;
+        }
+        
         
         public CacheConfig withAwsEndpoint(String endpoint) {
             this.awsConfig.put("endpoint", endpoint);

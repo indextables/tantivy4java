@@ -74,7 +74,8 @@ public class SplitSearcherTest {
         SplitCacheManager.CacheConfig config = new SplitCacheManager.CacheConfig("split-searcher-test-cache")
             .withMaxCacheSize(50_000_000) // 50MB shared cache
             .withMaxConcurrentLoads(8)
-            .withAwsCredentials(ACCESS_KEY, SECRET_KEY, "us-east-1", SESSION_TOKEN)
+            .withAwsCredentials(ACCESS_KEY, SECRET_KEY, SESSION_TOKEN)
+            .withAwsRegion("us-east-1")
             .withAwsEndpoint("http://localhost:" + S3_MOCK_PORT);
             
         cacheManager = SplitCacheManager.getInstance(config);
@@ -375,7 +376,8 @@ public class SplitSearcherTest {
         try {
             SplitCacheManager.CacheConfig configWithToken = new SplitCacheManager.CacheConfig("test-session-token-cache")
                 .withMaxCacheSize(50_000_000)
-                .withAwsCredentials(ACCESS_KEY, SECRET_KEY, "us-east-1", SESSION_TOKEN)
+                .withAwsCredentials(ACCESS_KEY, SECRET_KEY, SESSION_TOKEN)
+            .withAwsRegion("us-east-1")
                 .withAwsEndpoint("http://localhost:" + S3_MOCK_PORT);
             
             SplitCacheManager tokenCacheManager = SplitCacheManager.getInstance(configWithToken);

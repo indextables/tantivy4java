@@ -238,20 +238,24 @@ Tantivy4Java now includes **complete SplitSearcher functionality** for searching
 // These configurations will share the same cache instance (identical)
 SplitCacheManager.CacheConfig config1 = new SplitCacheManager.CacheConfig("test-cache")
     .withMaxCacheSize(100_000_000)
-    .withAwsCredentials("key1", "secret1", "us-east-1");
+    .withAwsCredentials("key1", "secret1")
+    .withAwsRegion("us-east-1");
 
 SplitCacheManager.CacheConfig config2 = new SplitCacheManager.CacheConfig("test-cache")
     .withMaxCacheSize(100_000_000)
-    .withAwsCredentials("key1", "secret1", "us-east-1");
+    .withAwsCredentials("key1", "secret1")
+    .withAwsRegion("us-east-1");
 
 // These will get separate cache instances (different configurations)
 SplitCacheManager.CacheConfig config3 = new SplitCacheManager.CacheConfig("test-cache")
     .withMaxCacheSize(200_000_000) // Different size
-    .withAwsCredentials("key1", "secret1", "us-east-1");
+    .withAwsCredentials("key1", "secret1")
+    .withAwsRegion("us-east-1");
 
 SplitCacheManager.CacheConfig config4 = new SplitCacheManager.CacheConfig("test-cache")
     .withMaxCacheSize(100_000_000)
-    .withAwsCredentials("key1", "secret1", "us-east-1", "session-token"); // Different credentials
+    .withAwsCredentials("key1", "secret1", "session-token") // Different credentials
+    .withAwsRegion("us-east-1");
 
 SplitCacheManager manager1 = SplitCacheManager.getInstance(config1);
 SplitCacheManager manager2 = SplitCacheManager.getInstance(config2); // Same instance as manager1
@@ -367,6 +371,33 @@ try (SplitSearcher searcher = cacheManager.createSplitSearcher(splitUrl)) {
 - ✅ **Cross-field Consistency** - Related field values maintain relationships
 - ✅ **Performance** - Efficient field access with caching optimization
 
+#### AWS Credential Configuration
+
+**Flexible Credential Management with Separate Region Configuration:**
+
+Tantivy4Java provides flexible AWS credential configuration with separate region management:
+
+```java
+// 2 parameters: Basic long-term credentials
+SplitCacheManager.CacheConfig basicConfig = new SplitCacheManager.CacheConfig("basic-cache")
+    .withAwsCredentials("access-key", "secret-key")  // 2 parameters: access + secret
+    .withAwsRegion("us-east-1");                     // Region configured separately
+
+// 3 parameters: Temporary credentials with session token
+SplitCacheManager.CacheConfig sessionConfig = new SplitCacheManager.CacheConfig("session-cache")
+    .withAwsCredentials("access-key", "secret-key", "session-token")  // 3 parameters: access + secret + token
+    .withAwsRegion("us-east-1");                                      // Region configured separately
+
+// Region can be changed independently without repeating credentials
+basicConfig.withAwsRegion("eu-west-1");  // Switch region while keeping same credentials
+```
+
+**Configuration Pattern Benefits:**
+- **📋 2 Parameters**: `withAwsCredentials(accessKey, secretKey)` - For long-term credentials or IAM instance profiles
+- **🔐 3 Parameters**: `withAwsCredentials(accessKey, secretKey, sessionToken)` - For temporary credentials from STS, IAM roles, or federated access
+- **🌍 Separate Region**: `withAwsRegion(region)` - Configure region independently for better flexibility
+- **♻️ Reusable**: Change regions without reconfiguring credentials, ideal for multi-region deployments
+
 #### Multi-Cloud Storage Support
 
 **AWS S3 Storage with Native Session Token Support:**
@@ -374,13 +405,15 @@ try (SplitSearcher searcher = cacheManager.createSplitSearcher(splitUrl)) {
 // Standard AWS credentials
 SplitCacheManager.CacheConfig awsConfig = new SplitCacheManager.CacheConfig("aws-cache")
     .withMaxCacheSize(500_000_000) // 500MB shared cache
-    .withAwsCredentials("access-key", "secret-key", "us-east-1")
+    .withAwsCredentials("access-key", "secret-key")
+    .withAwsRegion("us-east-1")
     .withAwsEndpoint("https://s3.amazonaws.com"); // or MinIO/S3Mock endpoint
 
 // AWS temporary credentials with session token (native Quickwit support)
 SplitCacheManager.CacheConfig awsSessionConfig = new SplitCacheManager.CacheConfig("aws-session-cache")
     .withMaxCacheSize(500_000_000)
-    .withAwsCredentials("access-key", "secret-key", "us-east-1", "session-token") // Native session token
+    .withAwsCredentials("access-key", "secret-key", "session-token") // Native session token
+    .withAwsRegion("us-east-1")
     .withAwsEndpoint("https://s3.amazonaws.com");
 
 SplitCacheManager cacheManager = SplitCacheManager.getInstance(awsSessionConfig);
@@ -440,7 +473,8 @@ SplitCacheManager.CacheConfig multiCloudConfig = new SplitCacheManager.CacheConf
     .withMaxCacheSize(1_000_000_000) // 1GB shared cache across all clouds
     .withMaxConcurrentLoads(16)
     // AWS Configuration
-    .withAwsCredentials("aws-key", "aws-secret", "us-east-1")
+    .withAwsCredentials("aws-key", "aws-secret")
+    .withAwsRegion("us-east-1")
     .withAwsEndpoint("https://s3.amazonaws.com")
     // Azure Configuration  
     .withAzureCredentials("azure-account", "azure-key")
