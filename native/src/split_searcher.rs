@@ -1186,136 +1186,165 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_getSchemaFromNative(
     _class: JClass,
     ptr: jlong,
 ) -> jlong {
+    use crate::utils::convert_throwable;
+    
     if ptr == 0 {
+        let _ = env.throw_new("java/lang/RuntimeException", "Invalid SplitSearcher pointer");
         return 0;
     }
     
-    // Create schema matching the test's expected fields
-    let schema_builder_class = match env.find_class("com/tantivy4java/SchemaBuilder") {
-        Ok(class) => class,
-        Err(_) => return 0,
-    };
+    let searcher = unsafe { &*(ptr as *mut SplitSearcher) };
     
-    let schema_builder = match env.new_object(schema_builder_class, "()V", &[]) {
-        Ok(builder) => builder,
-        Err(_) => return 0,
-    };
+    // Get the actual schema from the split file's Tantivy index
+    let schema = searcher.index.schema();
     
-    // Add all fields that the test expects (based on setUp method)
-    let fields = vec![
-        ("title", "text"),
-        ("content", "text"),
-        ("category_id", "integer"),
-        ("rating", "float"),
-        ("created_at", "date"),
-    ];
+    // Convert the Tantivy schema to a Java Schema object
+    match convert_tantivy_schema_to_java(&mut env, &schema) {
+        Ok(java_schema_ptr) => java_schema_ptr,
+        Err(error_msg) => {
+            let full_error = format!("Failed to retrieve schema from split file: {}", error_msg);
+            let _ = env.throw_new("java/lang/RuntimeException", &full_error);
+            0
+        }
+    }
+}
+
+/// Convert a Tantivy Schema to a Java Schema object
+fn convert_tantivy_schema_to_java(env: &mut JNIEnv, schema: &tantivy::schema::Schema) -> Result<jlong, String> {
+    // Create Java SchemaBuilder
+    let schema_builder_class = env.find_class("com/tantivy4java/SchemaBuilder")
+        .map_err(|_| "Failed to find SchemaBuilder class")?;
     
-    for (field_name_str, field_type) in fields {
-        match field_type {
-            "text" => {
-                let field_name = match env.new_string(field_name_str) {
-                    Ok(name) => name,
-                    Err(_) => return 0,
-                };
-                let tokenizer = match env.new_string("default") {
-                    Ok(tok) => tok,
-                    Err(_) => return 0,
-                };
-                let index_option = match env.new_string("position") {
-                    Ok(opt) => opt,
-                    Err(_) => return 0,
-                };
+    let schema_builder = env.new_object(schema_builder_class, "()V", &[])
+        .map_err(|_| "Failed to create SchemaBuilder instance")?;
+    
+    // Iterate through actual fields in the Tantivy schema
+    for (field, field_entry) in schema.fields() {
+        let field_name = schema.get_field_name(field);
+        let java_field_name = env.new_string(field_name)
+            .map_err(|_| format!("Failed to create Java string for field name: {}", field_name))?;
+        
+        match field_entry.field_type() {
+            tantivy::schema::FieldType::Str(_) => {
+                let tokenizer = env.new_string("default")
+                    .map_err(|_| "Failed to create tokenizer string")?;
+                let index_option = env.new_string("position")
+                    .map_err(|_| "Failed to create index option string")?;
                 
-                if let Err(_) = env.call_method(
+                env.call_method(
                     &schema_builder,
                     "addTextField",
                     "(Ljava/lang/String;ZZLjava/lang/String;Ljava/lang/String;)Lcom/tantivy4java/SchemaBuilder;",
                     &[
-                        (&field_name).into(),
-                        true.into(),
-                        false.into(),
+                        (&java_field_name).into(),
+                        field_entry.is_stored().into(),
+                        field_entry.is_fast().into(),
                         (&tokenizer).into(),
                         (&index_option).into(),
                     ],
-                ) {
-                    return 0;
-                }
+                ).map_err(|e| format!("Failed to add text field '{}': {:?}", field_name, e))?;
             }
-            "integer" => {
-                let field_name = match env.new_string(field_name_str) {
-                    Ok(name) => name,
-                    Err(_) => return 0,
-                };
-                
-                if let Err(_) = env.call_method(
+            tantivy::schema::FieldType::U64(_) => {
+                env.call_method(
                     &schema_builder,
                     "addIntegerField",
                     "(Ljava/lang/String;ZZZ)Lcom/tantivy4java/SchemaBuilder;",
                     &[
-                        (&field_name).into(),
-                        true.into(),
-                        true.into(),
-                        true.into(),
+                        (&java_field_name).into(),
+                        field_entry.is_stored().into(),
+                        field_entry.is_indexed().into(),
+                        field_entry.is_fast().into(),
                     ],
-                ) {
-                    return 0;
-                }
+                ).map_err(|e| format!("Failed to add integer field '{}': {:?}", field_name, e))?;
             }
-            "float" => {
-                let field_name = match env.new_string(field_name_str) {
-                    Ok(name) => name,
-                    Err(_) => return 0,
-                };
-                
-                if let Err(_) = env.call_method(
+            tantivy::schema::FieldType::I64(_) => {
+                env.call_method(
+                    &schema_builder,
+                    "addIntegerField",
+                    "(Ljava/lang/String;ZZZ)Lcom/tantivy4java/SchemaBuilder;",
+                    &[
+                        (&java_field_name).into(),
+                        field_entry.is_stored().into(),
+                        field_entry.is_indexed().into(),
+                        field_entry.is_fast().into(),
+                    ],
+                ).map_err(|e| format!("Failed to add integer field '{}': {:?}", field_name, e))?;
+            }
+            tantivy::schema::FieldType::F64(_) => {
+                env.call_method(
                     &schema_builder,
                     "addFloatField",
                     "(Ljava/lang/String;ZZZ)Lcom/tantivy4java/SchemaBuilder;",
                     &[
-                        (&field_name).into(),
-                        true.into(),
-                        true.into(),
-                        true.into(),
+                        (&java_field_name).into(),
+                        field_entry.is_stored().into(),
+                        field_entry.is_indexed().into(),
+                        field_entry.is_fast().into(),
                     ],
-                ) {
-                    return 0;
-                }
+                ).map_err(|e| format!("Failed to add float field '{}': {:?}", field_name, e))?;
             }
-            "date" => {
-                let field_name = match env.new_string(field_name_str) {
-                    Ok(name) => name,
-                    Err(_) => return 0,
-                };
-                
-                if let Err(_) = env.call_method(
+            tantivy::schema::FieldType::Bool(_) => {
+                env.call_method(
+                    &schema_builder,
+                    "addBooleanField",
+                    "(Ljava/lang/String;ZZZ)Lcom/tantivy4java/SchemaBuilder;",
+                    &[
+                        (&java_field_name).into(),
+                        field_entry.is_stored().into(),
+                        field_entry.is_indexed().into(),
+                        field_entry.is_fast().into(),
+                    ],
+                ).map_err(|e| format!("Failed to add boolean field '{}': {:?}", field_name, e))?;
+            }
+            tantivy::schema::FieldType::Date(_) => {
+                env.call_method(
                     &schema_builder,
                     "addDateField",
                     "(Ljava/lang/String;ZZZ)Lcom/tantivy4java/SchemaBuilder;",
                     &[
-                        (&field_name).into(),
-                        true.into(),
-                        true.into(),
-                        true.into(),
+                        (&java_field_name).into(),
+                        field_entry.is_stored().into(),
+                        field_entry.is_indexed().into(),
+                        field_entry.is_fast().into(),
                     ],
-                ) {
-                    return 0;
-                }
+                ).map_err(|e| format!("Failed to add date field '{}': {:?}", field_name, e))?;
             }
-            _ => continue,
+            tantivy::schema::FieldType::IpAddr(_) => {
+                env.call_method(
+                    &schema_builder,
+                    "addIpAddressField",
+                    "(Ljava/lang/String;ZZZ)Lcom/tantivy4java/SchemaBuilder;",
+                    &[
+                        (&java_field_name).into(),
+                        field_entry.is_stored().into(),
+                        field_entry.is_indexed().into(),
+                        field_entry.is_fast().into(),
+                    ],
+                ).map_err(|e| format!("Failed to add IP address field '{}': {:?}", field_name, e))?;
+            }
+            _ => {
+                // For unsupported field types, skip with a warning
+                debug_log!("Skipping unsupported field type for field '{}': {:?}", field_name, field_entry.field_type());
+                continue;
+            }
         }
     }
     
     // Build the schema
-    let schema = match env.call_method(&schema_builder, "build", "()Lcom/tantivy4java/Schema;", &[]) {
-        Ok(schema_obj) => schema_obj,
-        Err(_) => return 0,
-    };
+    let schema_result = env.call_method(&schema_builder, "build", "()Lcom/tantivy4java/Schema;", &[])
+        .map_err(|e| format!("Failed to build schema: {:?}", e))?;
     
     // Get the native pointer from the schema
-    match env.call_method(&schema.l().unwrap(), "getNativePtr", "()J", &[]) {
-        Ok(ptr_value) => ptr_value.j().unwrap_or(0),
-        Err(_) => 0,
-    }
+    let schema_obj = schema_result.l()
+        .map_err(|_| "Failed to get schema object from build result")?;
+    
+    let ptr_result = env.call_method(&schema_obj, "getNativePtr", "()J", &[])
+        .map_err(|e| format!("Failed to get native pointer from schema: {:?}", e))?;
+    
+    let native_ptr = ptr_result.j()
+        .map_err(|_| "Failed to extract long value from native pointer")?;
+    
+    Ok(native_ptr)
 }
 
 #[no_mangle]
@@ -1325,6 +1354,7 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_getSchemaJsonNative(
     ptr: jlong,
 ) -> jobject {
     if ptr == 0 {
+        let _ = env.throw_new("java/lang/RuntimeException", "Invalid SplitSearcher pointer");
         return std::ptr::null_mut();
     }
     
@@ -1334,10 +1364,18 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_getSchemaJsonNative(
         Ok(schema_json) => {
             match env.new_string(&schema_json) {
                 Ok(java_string) => java_string.as_raw(),
-                Err(_) => std::ptr::null_mut(),
+                Err(e) => {
+                    let error_msg = format!("Failed to create Java string from schema JSON: {:?}", e);
+                    let _ = env.throw_new("java/lang/RuntimeException", &error_msg);
+                    std::ptr::null_mut()
+                }
             }
         },
-        Err(_) => std::ptr::null_mut(),
+        Err(e) => {
+            let error_msg = format!("Failed to get schema from split file: {}", e);
+            let _ = env.throw_new("java/lang/RuntimeException", &error_msg);
+            std::ptr::null_mut()
+        },
     }
 }
 

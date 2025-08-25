@@ -312,13 +312,14 @@ pub extern "system" fn Java_com_tantivy4java_SplitCacheManager_evictComponentsNa
 
 #[no_mangle]
 pub extern "system" fn Java_com_tantivy4java_SplitCacheManager_searchAcrossAllSplitsNative(
-    _env: JNIEnv,
+    mut env: JNIEnv,
     _class: JClass,
     ptr: jlong,
     _query_ptr: jlong,
     _total_limit: jint,
 ) -> jobject {
     if ptr == 0 {
+        let _ = env.throw_new("java/lang/RuntimeException", "Invalid SplitCacheManager pointer");
         return std::ptr::null_mut();
     }
     
@@ -326,19 +327,21 @@ pub extern "system" fn Java_com_tantivy4java_SplitCacheManager_searchAcrossAllSp
     let managers = CACHE_MANAGERS.lock().unwrap();
     let manager = match managers.values().find(|m| Arc::as_ptr(m) as jlong == ptr) {
         Some(manager_arc) => manager_arc,
-        None => return std::ptr::null_mut(),
+        None => {
+            let _ = env.throw_new("java/lang/RuntimeException", "SplitCacheManager not found in registry");
+            return std::ptr::null_mut();
+        }
     };
     
-    // Simulate cache hit
-    manager.total_hits.fetch_add(1, Ordering::Relaxed);
-    
-    // Return mock search result (would implement real multi-split search in production)
-    std::ptr::null_mut() // Placeholder - would return real SearchResult
+    // Multi-split search is not yet implemented
+    let error_msg = "Multi-split search across all splits is not yet implemented. Use individual SplitSearcher instances for searching specific splits.";
+    let _ = env.throw_new("java/lang/UnsupportedOperationException", error_msg);
+    std::ptr::null_mut()
 }
 
 #[no_mangle]
 pub extern "system" fn Java_com_tantivy4java_SplitCacheManager_searchAcrossSplitsNative(
-    _env: JNIEnv,
+    mut env: JNIEnv,
     _class: JClass,
     ptr: jlong,
     _split_paths: JObject,
@@ -346,6 +349,7 @@ pub extern "system" fn Java_com_tantivy4java_SplitCacheManager_searchAcrossSplit
     _total_limit: jint,
 ) -> jobject {
     if ptr == 0 {
+        let _ = env.throw_new("java/lang/RuntimeException", "Invalid SplitCacheManager pointer");
         return std::ptr::null_mut();
     }
     
@@ -353,12 +357,14 @@ pub extern "system" fn Java_com_tantivy4java_SplitCacheManager_searchAcrossSplit
     let managers = CACHE_MANAGERS.lock().unwrap();
     let manager = match managers.values().find(|m| Arc::as_ptr(m) as jlong == ptr) {
         Some(manager_arc) => manager_arc,
-        None => return std::ptr::null_mut(),
+        None => {
+            let _ = env.throw_new("java/lang/RuntimeException", "SplitCacheManager not found in registry");
+            return std::ptr::null_mut();
+        }
     };
     
-    // Simulate cache activity
-    manager.total_hits.fetch_add(1, Ordering::Relaxed);
-    
-    // Return mock search result (would implement real selective multi-split search in production)
-    std::ptr::null_mut() // Placeholder - would return real SearchResult
+    // Multi-split search is not yet implemented
+    let error_msg = "Multi-split search across specified splits is not yet implemented. Use individual SplitSearcher instances for searching specific splits.";
+    let _ = env.throw_new("java/lang/UnsupportedOperationException", error_msg);
+    std::ptr::null_mut()
 }

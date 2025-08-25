@@ -404,7 +404,15 @@ pub extern "system" fn Java_com_tantivy4java_Query_nativePhraseQuery(
                     return Err("Phrase query requires at least one term".to_string());
                 }
                 
-                // Create the PhraseQuery with slop
+                // Fix: Tantivy requires phrase queries to have more than one term
+                // If there's only one term, create a TermQuery instead
+                if phrase_terms.len() == 1 {
+                    let (_, term) = phrase_terms.into_iter().next().unwrap();
+                    let term_query = TermQuery::new(term, tantivy::schema::IndexRecordOption::Basic);
+                    return Ok(Box::new(term_query) as Box<dyn TantivyQuery>);
+                }
+                
+                // Create the PhraseQuery with slop (only for multi-term phrases)
                 let phrase_query = if slop > 0 {
                     PhraseQuery::new_with_offset_and_slop(phrase_terms, slop as u32)
                 } else {
