@@ -558,6 +558,68 @@ pub extern "system" fn Java_com_tantivy4java_Schema_nativeGetFieldCount(
 }
 
 #[no_mangle]
+pub extern "system" fn Java_com_tantivy4java_Schema_nativeGetFieldNamesByType(
+    mut env: JNIEnv,
+    _class: JClass,
+    ptr: jlong,
+    field_type: jint,
+) -> jobject {
+    use crate::utils::with_object;
+    use tantivy::schema::FieldType as TantivyFieldType;
+    
+    if ptr == 0 {
+        return std::ptr::null_mut();
+    }
+    
+    let result = with_object::<tantivy::schema::Schema, Result<jobject, String>>(ptr as u64, |schema| {
+        // Create ArrayList to hold field names
+        let array_list_class = env.find_class("java/util/ArrayList").map_err(|e| e.to_string())?;
+        let array_list = env.new_object(&array_list_class, "()V", &[]).map_err(|e| e.to_string())?;
+        
+        // Map Java FieldType enum values to Tantivy FieldType
+        // Java enum values: TEXT(1), UNSIGNED(2), INTEGER(3), FLOAT(4), BOOLEAN(5), DATE(6), FACET(7), BYTES(8), JSON(9), IP_ADDR(10)
+        for (field, field_entry) in schema.fields() {
+            let tantivy_field_type = field_entry.field_type();
+            let matches_type = match field_type {
+                1 => matches!(tantivy_field_type, TantivyFieldType::Str(_)), // TEXT
+                2 => matches!(tantivy_field_type, TantivyFieldType::U64(_)), // UNSIGNED
+                3 => matches!(tantivy_field_type, TantivyFieldType::I64(_)), // INTEGER
+                4 => matches!(tantivy_field_type, TantivyFieldType::F64(_)), // FLOAT
+                5 => matches!(tantivy_field_type, TantivyFieldType::Bool(_)), // BOOLEAN
+                6 => matches!(tantivy_field_type, TantivyFieldType::Date(_)), // DATE
+                7 => matches!(tantivy_field_type, TantivyFieldType::Facet(_)), // FACET
+                8 => matches!(tantivy_field_type, TantivyFieldType::Bytes(_)), // BYTES
+                9 => matches!(tantivy_field_type, TantivyFieldType::JsonObject(_)), // JSON
+                10 => matches!(tantivy_field_type, TantivyFieldType::IpAddr(_)), // IP_ADDR
+                _ => false,
+            };
+            
+            if matches_type {
+                let field_name = schema.get_field_name(field);
+                let java_string = env.new_string(field_name).map_err(|e| e.to_string())?;
+                
+                env.call_method(
+                    &array_list,
+                    "add",
+                    "(Ljava/lang/Object;)Z",
+                    &[(&java_string).into()],
+                ).map_err(|e| e.to_string())?;
+            }
+        }
+        
+        Ok(array_list.into_raw())
+    });
+    
+    match result {
+        Some(Ok(list)) => list,
+        Some(Err(_)) | None => {
+            handle_error(&mut env, "Failed to get field names by type");
+            std::ptr::null_mut()
+        }
+    }
+}
+
+#[no_mangle]
 pub extern "system" fn Java_com_tantivy4java_Schema_nativeGetSchemaSummary(
     mut env: JNIEnv,
     _class: JClass,

@@ -66,6 +66,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "69f7f8c3906b62b754cd5326047894316021dcfe5a194c8ea52bdd94934a3457"
 
 [[package]]
+name = "async-compression"
+version = "0.4.28"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6448dfb3960f0b038e88c781ead1e7eb7929dfc3a71a1336ec9086c00f6d1e75"
+dependencies = [
+ "compression-codecs",
+ "compression-core",
+ "flate2",
+ "futures-core",
+ "memchr",
+ "pin-project-lite",
+ "tokio",
+]
+
+[[package]]
 name = "async-speed-limit"
 version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -897,6 +912,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "compression-codecs"
+version = "0.4.28"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "46cc6539bf1c592cff488b9f253b30bc0ec50d15407c2cf45e27bd8f308d5905"
+dependencies = [
+ "compression-core",
+ "flate2",
+ "futures-core",
+ "memchr",
+ "pin-project-lite",
+]
+
+[[package]]
+name = "compression-core"
+version = "0.4.28"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2957e823c15bde7ecf1e8b64e537aa03a6be5fda0e2334e99887669e75b12e01"
+
+[[package]]
 name = "const-oid"
 version = "0.9.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1277,6 +1311,17 @@ checksum = "778e2ac28f6c47af28e4907f13ffd1e1ddbd400980a9abd7c8df189bf578a5ad"
 dependencies = [
  "libc",
  "windows-sys 0.60.2",
+]
+
+[[package]]
+name = "fail"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fe5e43d0f78a42ad591453aedb1d7ae631ce7ee445c7643691055a9ed8d3b01c"
+dependencies = [
+ "log",
+ "once_cell",
+ "rand 0.8.5",
 ]
 
 [[package]]
@@ -3172,6 +3217,51 @@ dependencies = [
 ]
 
 [[package]]
+name = "quickwit-indexing"
+version = "0.8.0"
+source = "git+https://github.com/schenksj/quickwit#96111d59b4dae960cd918c1ae87925a8df35dba9"
+dependencies = [
+ "anyhow",
+ "arc-swap",
+ "async-compression",
+ "async-trait",
+ "bytes",
+ "bytesize",
+ "fail",
+ "flume",
+ "fnv",
+ "futures",
+ "itertools 0.14.0",
+ "once_cell",
+ "oneshot",
+ "percent-encoding",
+ "quickwit-actors",
+ "quickwit-aws",
+ "quickwit-cluster",
+ "quickwit-common",
+ "quickwit-config",
+ "quickwit-directories",
+ "quickwit-doc-mapper",
+ "quickwit-ingest",
+ "quickwit-metastore",
+ "quickwit-opentelemetry",
+ "quickwit-proto",
+ "quickwit-query",
+ "quickwit-storage",
+ "regex",
+ "serde",
+ "serde_json",
+ "tantivy",
+ "tempfile",
+ "thiserror 2.0.16",
+ "time",
+ "tokio",
+ "tracing",
+ "ulid",
+ "utoipa",
+]
+
+[[package]]
 name = "quickwit-ingest"
 version = "0.8.0"
 source = "git+https://github.com/schenksj/quickwit#96111d59b4dae960cd918c1ae87925a8df35dba9"
@@ -4358,6 +4448,7 @@ dependencies = [
  "quickwit-common",
  "quickwit-config",
  "quickwit-directories",
+ "quickwit-indexing",
  "quickwit-metastore",
  "quickwit-proto",
  "quickwit-search",

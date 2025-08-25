@@ -36,6 +36,7 @@ quickwit-directories = { git = "https://github.com/schenksj/quickwit" }
 quickwit-common = { git = "https://github.com/schenksj/quickwit" }
 quickwit-config = { git = "https://github.com/schenksj/quickwit" }
 quickwit-search = { git = "https://github.com/schenksj/quickwit" }
+quickwit-indexing = { git = "https://github.com/schenksj/quickwit" }
 
 # Additional dependencies
 anyhow = "1.0"

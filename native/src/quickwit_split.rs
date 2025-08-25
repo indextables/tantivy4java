@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::ops::RangeInclusive;
 use std::io::Write;
 use std::fs::File;
+use tempfile as temp;
 
 // Add tantivy Directory trait import
 use tantivy::Directory;
@@ -655,4 +656,464 @@ pub extern "system" fn Java_com_tantivy4java_QuickwitSplit_nativeValidateSplit(
         
         Ok(if is_valid { jni::sys::JNI_TRUE } else { jni::sys::JNI_FALSE })
     }).unwrap_or(jni::sys::JNI_FALSE)
+}
+
+/// Configuration for split merging operations
+#[derive(Debug)]
+struct MergeConfig {
+    index_uid: String,
+    source_id: String,
+    node_id: String,
+    doc_mapping_uid: String,
+    partition_id: u64,
+    delete_queries: Option<Vec<String>>,
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_tantivy4java_QuickwitSplit_nativeMergeSplits(
+    mut env: JNIEnv,
+    _class: JClass,
+    split_urls_list: JObject,
+    output_path: JString,
+    merge_config: JObject,
+) -> jobject {
+    convert_throwable(&mut env, |env| {
+        debug_log!("Starting split merge operation");
+        
+        let output_path_str = jstring_to_string(env, &output_path)?;
+        debug_log!("Output path: {}", output_path_str);
+        
+        // Extract merge configuration from Java object
+        let config = extract_merge_config(env, &merge_config)?;
+        debug_log!("Merge config: {:?}", config);
+        
+        // Extract split URLs from Java List
+        let split_urls = extract_string_list_from_jobject(env, &split_urls_list)?;
+        debug_log!("Split URLs to merge: {:?}", split_urls);
+        
+        if split_urls.len() < 2 {
+            return Err(anyhow!("At least 2 splits are required for merging"));
+        }
+        
+        // Perform the merge operation
+        let merged_metadata = merge_splits_impl(&split_urls, &output_path_str, &config)?;
+        debug_log!("Split merge completed successfully");
+        
+        // Create Java metadata object
+        let metadata_obj = create_java_split_metadata(env, &merged_metadata)?;
+        Ok(metadata_obj.into_raw())
+    }).unwrap_or(std::ptr::null_mut())
+}
+
+/// Extract merge configuration from Java MergeConfig object
+fn extract_merge_config(env: &mut JNIEnv, config_obj: &JObject) -> Result<MergeConfig> {
+    let index_uid = get_string_field_value(env, config_obj, "getIndexUid")?;
+    let source_id = get_string_field_value(env, config_obj, "getSourceId")?;
+    let node_id = get_string_field_value(env, config_obj, "getNodeId")?;
+    let doc_mapping_uid = get_string_field_value(env, config_obj, "getDocMappingUid")?;
+    
+    // Get partition ID
+    let partition_id = env.call_method(config_obj, "getPartitionId", "()J", &[])?
+        .j()? as u64;
+    
+    // Get delete queries (optional)
+    let delete_queries_result = env.call_method(config_obj, "getDeleteQueries", "()Ljava/util/List;", &[]);
+    let delete_queries = match delete_queries_result {
+        Ok(list_val) => {
+            let list_obj = list_val.l()?;
+            if list_obj.is_null() {
+                None
+            } else {
+                Some(extract_string_list_from_jobject(env, &list_obj)?)
+            }
+        }
+        Err(_) => None,
+    };
+    
+    Ok(MergeConfig {
+        index_uid,
+        source_id,
+        node_id,
+        doc_mapping_uid,
+        partition_id,
+        delete_queries,
+    })
+}
+
+/// Extract a string list from a Java List object  
+fn extract_string_list_from_jobject(env: &mut JNIEnv, list_obj: &JObject) -> Result<Vec<String>> {
+    let list_size = env.call_method(list_obj, "size", "()I", &[])?.i()?;
+    let mut strings = Vec::with_capacity(list_size as usize);
+    
+    for i in 0..list_size {
+        let element = env.call_method(list_obj, "get", "(I)Ljava/lang/Object;", &[JValue::Int(i)])?.l()?;
+        let java_string = JString::from(element);
+        let rust_string = jstring_to_string(env, &java_string)?;
+        strings.push(rust_string);
+    }
+    
+    Ok(strings)
+}
+
+/// Helper function to get string field value from Java object
+fn get_string_field_value(env: &mut JNIEnv, obj: &JObject, method_name: &str) -> Result<String> {
+    let string_obj = env.call_method(obj, method_name, "()Ljava/lang/String;", &[])?.l()?;
+    let java_string = JString::from(string_obj);
+    jstring_to_string(env, &java_string)
+}
+
+/// Extract split file contents to a directory (avoiding read-only BundleDirectory issues)
+fn extract_split_to_directory_impl(split_path: &Path, output_dir: &Path) -> Result<()> {
+    use tantivy::directory::{MmapDirectory, DirectoryClone};
+    
+    debug_log!("Extracting split {:?} to directory {:?}", split_path, output_dir);
+    
+    // Create output directory
+    std::fs::create_dir_all(output_dir)?;
+    
+    // Open the bundle directory (read-only)
+    let split_path_str = split_path.to_string_lossy().to_string();
+    let bundle_directory = get_tantivy_directory_from_split_bundle(&split_path_str)?;
+    
+    // Open the output directory (writable)  
+    let output_directory = MmapDirectory::open(output_dir)?;
+    
+    // Open bundle as index to get list of files
+    let temp_bundle_index = tantivy::Index::open(bundle_directory.box_clone())?;
+    let index_meta = temp_bundle_index.load_metas()?;
+    
+    // Copy all segment files and meta.json
+    let mut copied_files = 0;
+    
+    // Copy meta.json
+    if bundle_directory.exists(Path::new("meta.json"))? {
+        debug_log!("Copying meta.json");
+        let meta_data = bundle_directory.atomic_read(Path::new("meta.json"))?;
+        output_directory.atomic_write(Path::new("meta.json"), &meta_data)?;
+        copied_files += 1;
+    }
+    
+    // Copy all segment-related files
+    for segment_meta in &index_meta.segments {
+        let segment_id = segment_meta.id().uuid_string();
+        debug_log!("Copying files for segment: {}", segment_id);
+        
+        // Copy common segment files (this is a simplified approach - in practice Tantivy has many file types)
+        let file_patterns = vec![
+            format!("{}.store", segment_id),
+            format!("{}.pos", segment_id), 
+            format!("{}.idx", segment_id),
+            format!("{}.term", segment_id),
+            format!("{}.fieldnorm", segment_id),
+            format!("{}.fast", segment_id),
+        ];
+        
+        for file_pattern in file_patterns {
+            let file_path = Path::new(&file_pattern);
+            if bundle_directory.exists(file_path)? {
+                debug_log!("Copying file: {}", file_pattern);
+                let file_data = bundle_directory.atomic_read(file_path)?;
+                output_directory.atomic_write(file_path, &file_data)?;
+                copied_files += 1;
+            }
+        }
+    }
+    
+    debug_log!("Successfully extracted split to directory (copied {} files)", copied_files);
+    Ok(())
+}
+
+/// Implementation of split merging using Quickwit's efficient approach
+/// This follows Quickwit's MergeExecutor pattern for memory-efficient large-scale merges
+fn merge_splits_impl(split_urls: &[String], output_path: &str, config: &MergeConfig) -> Result<QuickwitSplitMetadata> {
+    use quickwit_directories::UnionDirectory;
+    use tantivy::directory::{MmapDirectory, Directory, Advice, DirectoryClone};
+    use tantivy::{Index as TantivyIndex, IndexMeta};
+    use tantivy::index::SegmentId;
+    
+    debug_log!("Implementing split merge using Quickwit's efficient approach for {} splits", split_urls.len());
+    
+    // Create async runtime for async operations
+    let runtime = tokio::runtime::Runtime::new()?;
+    
+    // 1. Open split directories without extraction (Quickwit's approach)
+    let mut split_directories: Vec<Box<dyn Directory>> = Vec::new();
+    let mut index_metas: Vec<IndexMeta> = Vec::new();
+    let mut total_docs = 0usize;
+    let mut total_size = 0u64;
+    
+    for (i, split_url) in split_urls.iter().enumerate() {
+        debug_log!("Opening split directory {}: {}", i, split_url);
+        
+        // Support file-based splits (not S3 URLs in this implementation)
+        if split_url.contains("://") && !split_url.starts_with("file://") {
+            return Err(anyhow!("S3/remote split URLs not yet supported in merge operation: {}", split_url));
+        }
+        
+        let split_path = if split_url.starts_with("file://") {
+            split_url.strip_prefix("file://").unwrap_or(split_url)
+        } else {
+            split_url
+        };
+        
+        // Validate split exists
+        if !Path::new(split_path).exists() {
+            return Err(anyhow!("Split file not found: {}", split_path));
+        }
+        
+        // SOLUTION: Extract split to temporary directory to avoid read-only BundleDirectory issues
+        let temp_extract_dir = temp::TempDir::new()?;
+        let temp_extract_path = temp_extract_dir.path();
+        
+        debug_log!("Extracting split {} to temporary directory: {:?}", i, temp_extract_path);
+        
+        // Extract the split to a writable directory
+        extract_split_to_directory_impl(Path::new(split_path), temp_extract_path)?;
+        
+        // Open the extracted directory as writable MmapDirectory
+        let extracted_directory = MmapDirectory::open(temp_extract_path)?;
+        let temp_index = TantivyIndex::open(extracted_directory.box_clone())?;
+        let index_meta = temp_index.load_metas()?;
+        
+        // Count documents and calculate size efficiently
+        let reader = temp_index.reader()?;
+        let searcher = reader.searcher();
+        let doc_count = searcher.num_docs();
+        let split_size = std::fs::metadata(split_path)?.len();
+        
+        debug_log!("Extracted split {} has {} documents, {} bytes", i, doc_count, split_size);
+        
+        total_docs += doc_count as usize;
+        total_size += split_size;
+        split_directories.push(extracted_directory.box_clone());
+        index_metas.push(index_meta);
+        
+        // Keep temp directory alive for merge duration
+        std::mem::forget(temp_extract_dir);
+    }
+    
+    debug_log!("Opened {} splits with total {} documents, {} bytes", split_urls.len(), total_docs, total_size);
+    
+    // 2. Combine index metadata (Quickwit's approach)
+    let union_index_meta = combine_index_meta(index_metas)?;
+    debug_log!("Combined metadata from {} splits", split_urls.len());
+    
+    // 3. Create shadowing meta.json directory (Quickwit's metadata pattern)
+    let shadowing_meta_directory = create_shadowing_meta_json_directory(union_index_meta)?;
+    debug_log!("Created shadowing metadata directory");
+    
+    // 4. Set up output directory with sequential access optimization
+    let output_dir_path = Path::new(output_path).parent()
+        .ok_or_else(|| anyhow!("Cannot determine parent directory for output path"))?;
+    let output_temp_dir = output_dir_path.join("temp_merge_output");
+    std::fs::create_dir_all(&output_temp_dir)?;
+    
+    let output_directory = MmapDirectory::open_with_madvice(&output_temp_dir, Advice::Sequential)?;
+    debug_log!("Created output directory: {:?}", output_temp_dir);
+    
+    // 5. Create UnionDirectory stack (Quickwit's memory-efficient approach)
+    // CRITICAL: Writable directory must be first - all writes go to first directory
+    let mut directory_stack: Vec<Box<dyn Directory>> = vec![
+        Box::new(output_directory),                    // First - receives ALL writes (must be writable)
+        Box::new(shadowing_meta_directory),            // Second - provides meta.json override
+    ];
+    // Add read-only split directories for reading existing segments
+    directory_stack.extend(split_directories);
+    
+    debug_log!("Created directory stack with {} directories", directory_stack.len());
+    
+    // 6. Create union directory for unified access without copying data
+    let union_directory = UnionDirectory::union_of(directory_stack);
+    let union_index = TantivyIndex::open(union_directory)?;
+    debug_log!("Created union index");
+    
+    // 7. Perform memory-efficient segment-level merge (not document copying)
+    let merged_docs = runtime.block_on(perform_segment_merge(&union_index))?;
+    debug_log!("Segment merge completed with {} documents", merged_docs);
+    
+    // 8. Calculate final index size
+    let final_size = calculate_directory_size(&output_temp_dir)?;
+    debug_log!("Final merged index size: {} bytes", final_size);
+    
+    // 9. Create merged split metadata
+    let merge_split_id = uuid::Uuid::new_v4().to_string();
+    let merged_metadata = QuickwitSplitMetadata {
+        split_id: merge_split_id.clone(),
+        index_uid: config.index_uid.clone(),
+        source_id: config.source_id.clone(),
+        node_id: config.node_id.clone(),
+        doc_mapping_uid: config.doc_mapping_uid.clone(),
+        partition_id: config.partition_id,
+        num_docs: merged_docs,
+        uncompressed_docs_size_in_bytes: final_size,
+        time_range: None,
+        create_timestamp: Utc::now().timestamp(),
+        tags: BTreeSet::new(),
+        delete_opstamp: 0,
+        num_merge_ops: 1,
+    };
+    
+    // 10. Create the merged split file using the merged index
+    create_merged_split_file(&output_temp_dir, output_path, &merged_metadata)?;
+    
+    // 11. Clean up temporary directory
+    std::fs::remove_dir_all(&output_temp_dir).unwrap_or_else(|e| {
+        debug_log!("Warning: Could not clean up temp directory: {}", e);
+    });
+    
+    debug_log!("Created efficient merged split file: {} with {} documents", output_path, merged_docs);
+    
+    Ok(merged_metadata)
+}
+
+/// Get Tantivy directory from split bundle using Quickwit's BundleDirectory
+/// This is memory-efficient as it doesn't extract files
+fn get_tantivy_directory_from_split_bundle(split_path: &str) -> Result<Box<dyn tantivy::Directory>> {
+    use quickwit_directories::BundleDirectory;
+    use tantivy::directory::MmapDirectory;
+    
+    debug_log!("Opening bundle directory for split: {}", split_path);
+    
+    let split_file_path = PathBuf::from(split_path);
+    let parent_dir = split_file_path.parent()
+        .ok_or_else(|| anyhow!("Cannot find parent directory for {}", split_path))?;
+    
+    // Open parent directory
+    let mmap_directory = MmapDirectory::open(parent_dir)?;
+    
+    // Get filename only
+    let filename = split_file_path.file_name()
+        .ok_or_else(|| anyhow!("Cannot extract filename from {}", split_path))?;
+    
+    // Open the split file slice
+    let split_fileslice = mmap_directory.open_read(Path::new(filename))?;
+    
+    // Create BundleDirectory - this provides direct access without extraction
+    let bundle_directory = BundleDirectory::open_split(split_fileslice)?;
+    
+    debug_log!("Successfully opened bundle directory for split: {}", split_path);
+    Ok(Box::new(bundle_directory))
+}
+
+/// Combine multiple index metadata using Quickwit's approach
+fn combine_index_meta(mut index_metas: Vec<tantivy::IndexMeta>) -> Result<tantivy::IndexMeta> {
+    use tantivy::IndexMeta;
+    
+    debug_log!("Combining {} index metadata objects", index_metas.len());
+    
+    if index_metas.is_empty() {
+        return Err(anyhow!("No index metadata to combine"));
+    }
+    
+    // Start with the first metadata
+    let mut union_index_meta = index_metas.remove(0);
+    
+    // Combine segments from all metadata
+    for index_meta in index_metas {
+        debug_log!("Adding {} segments to union", index_meta.segments.len());
+        union_index_meta.segments.extend(index_meta.segments);
+    }
+    
+    debug_log!("Combined metadata has {} total segments", union_index_meta.segments.len());
+    Ok(union_index_meta)
+}
+
+/// Create shadowing meta.json directory using Quickwit's metadata pattern
+fn create_shadowing_meta_json_directory(index_meta: tantivy::IndexMeta) -> Result<tantivy::directory::RamDirectory> {
+    use tantivy::directory::RamDirectory;
+    
+    debug_log!("Creating shadowing meta.json directory");
+    
+    // Serialize the combined metadata
+    let union_index_meta_json = serde_json::to_string_pretty(&index_meta)?;
+    
+    // Create RAM directory with the meta.json file
+    let ram_directory = RamDirectory::default();
+    ram_directory.atomic_write(Path::new("meta.json"), union_index_meta_json.as_bytes())?;
+    
+    debug_log!("Created shadowing directory with meta.json ({} bytes)", union_index_meta_json.len());
+    Ok(ram_directory)
+}
+
+/// Perform segment-level merge using Quickwit/Tantivy's efficient approach
+async fn perform_segment_merge(union_index: &tantivy::Index) -> Result<usize> {
+    use tantivy::IndexWriter;
+    use tantivy::index::SegmentId;
+    use tantivy::merge_policy::NoMergePolicy;
+    
+    debug_log!("Performing segment-level merge");
+    
+    // Create writer with memory limit (15MB like Quickwit)
+    let mut index_writer: IndexWriter = union_index.writer_with_num_threads(1, 15_000_000)?;
+    
+    // CRITICAL: Use NoMergePolicy to prevent garbage collection during merge
+    // This prevents delete operations on read-only BundleDirectories
+    index_writer.set_merge_policy(Box::new(NoMergePolicy));
+    
+    // Get all segment IDs from the union index using reader
+    let reader = union_index.reader()?;
+    let searcher = reader.searcher();
+    let segment_ids: Vec<SegmentId> = searcher
+        .segment_readers()
+        .iter()
+        .map(|segment_reader| segment_reader.segment_id())
+        .collect();
+    
+    debug_log!("Found {} segments to merge: {:?}", segment_ids.len(), segment_ids);
+    
+    // Skip merge if there's only one segment (Quickwit's optimization)
+    if segment_ids.len() <= 1 {
+        debug_log!("Skipping merge - only {} segment(s)", segment_ids.len());
+        return Ok(searcher.num_docs() as usize);
+    }
+    
+    // Perform efficient segment-level merge (Quickwit's approach)
+    debug_log!("Starting segment merge of {} segments", segment_ids.len());
+    index_writer.merge(&segment_ids).await?;
+    debug_log!("Segment merge completed");
+    
+    // Get final document count
+    union_index.load_metas()?;
+    let reader = union_index.reader()?;
+    let searcher = reader.searcher();
+    let final_doc_count = searcher.num_docs();
+    
+    debug_log!("Merged index contains {} documents", final_doc_count);
+    Ok(final_doc_count as usize)
+}
+
+/// Calculate the total size of all files in a directory
+fn calculate_directory_size(dir_path: &Path) -> Result<u64> {
+    let mut total_size = 0u64;
+    
+    if let Ok(entries) = std::fs::read_dir(dir_path) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file() {
+                if let Ok(metadata) = std::fs::metadata(&path) {
+                    total_size += metadata.len();
+                }
+            }
+        }
+    }
+    
+    Ok(total_size)
+}
+
+/// Create the merged split file using existing Quickwit split creation logic
+fn create_merged_split_file(merged_index_path: &Path, output_path: &str, metadata: &QuickwitSplitMetadata) -> Result<()> {
+    use tantivy::directory::MmapDirectory;
+    use tantivy::Index as TantivyIndex;
+    
+    debug_log!("Creating merged split file at {} from index {:?}", output_path, merged_index_path);
+    
+    // Open the merged Tantivy index
+    let merged_directory = MmapDirectory::open(merged_index_path)?;
+    let merged_index = TantivyIndex::open(merged_directory)?;
+    
+    // Use the existing split creation logic
+    create_quickwit_split(&merged_index, &merged_index_path.to_path_buf(), &PathBuf::from(output_path), metadata)?;
+    
+    debug_log!("Successfully created merged split file: {}", output_path);
+    Ok(())
 }

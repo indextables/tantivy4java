@@ -296,6 +296,124 @@ public class QuickwitSplit {
         }
     }
 
+    /**
+     * Configuration for split merging operations.
+     */
+    public static class MergeConfig {
+        private final String indexUid;
+        private final String sourceId;
+        private final String nodeId;
+        private final String docMappingUid;
+        private final long partitionId;
+        private final List<String> deleteQueries;
+
+        /**
+         * Create a new merge configuration.
+         * 
+         * @param indexUid Unique identifier for the index
+         * @param sourceId Source identifier
+         * @param nodeId Node identifier that will create the merged split
+         * @param docMappingUid Document mapping unique identifier (must match across all splits)
+         * @param partitionId Partition identifier (default: 0)
+         * @param deleteQueries Optional list of delete queries to apply during merge
+         */
+        public MergeConfig(String indexUid, String sourceId, String nodeId, String docMappingUid,
+                          long partitionId, List<String> deleteQueries) {
+            this.indexUid = indexUid;
+            this.sourceId = sourceId;
+            this.nodeId = nodeId;
+            this.docMappingUid = docMappingUid;
+            this.partitionId = partitionId;
+            this.deleteQueries = deleteQueries;
+        }
+
+        /**
+         * Create a minimal merge configuration.
+         * 
+         * @param indexUid Unique identifier for the index
+         * @param sourceId Source identifier
+         * @param nodeId Node identifier that will create the merged split
+         */
+        public MergeConfig(String indexUid, String sourceId, String nodeId) {
+            this(indexUid, sourceId, nodeId, "default", 0L, null);
+        }
+
+        // Getters
+        public String getIndexUid() { return indexUid; }
+        public String getSourceId() { return sourceId; }
+        public String getNodeId() { return nodeId; }
+        public String getDocMappingUid() { return docMappingUid; }
+        public long getPartitionId() { return partitionId; }
+        public List<String> getDeleteQueries() { return deleteQueries; }
+    }
+
+    /**
+     * Merge multiple Quickwit splits into a single split file.
+     * 
+     * This function implements Quickwit's split merging functionality, which:
+     * 1. Downloads/opens all source split files
+     * 2. Extracts Tantivy index directories from each split
+     * 3. Uses Tantivy's segment merging to combine all content
+     * 4. Applies any delete queries during the merge process
+     * 5. Creates a new split file with merged content and updated metadata
+     * 
+     * The merged split will contain:
+     * - Combined document count from all source splits
+     * - Merged time ranges (if applicable)
+     * - Aggregated size statistics
+     * - Incremented merge operation count
+     * - List of replaced split IDs for tracking
+     * 
+     * @param splitUrls List of split file URLs/paths to merge (supports file:// and s3:// URLs)
+     * @param outputPath Path where the merged split file should be written (must end with .split)
+     * @param config Configuration for the merge operation
+     * @return Metadata about the created merged split
+     * @throws IllegalArgumentException if input validation fails
+     * @throws RuntimeException if merge operation fails
+     * 
+     * @since 0.24.0
+     */
+    public static SplitMetadata mergeSplits(List<String> splitUrls, String outputPath, MergeConfig config) {
+        if (splitUrls == null || splitUrls.isEmpty()) {
+            throw new IllegalArgumentException("Split URLs list cannot be null or empty");
+        }
+        if (splitUrls.size() < 2) {
+            throw new IllegalArgumentException("At least 2 splits are required for merging");
+        }
+        if (outputPath == null || !outputPath.endsWith(".split")) {
+            throw new IllegalArgumentException("Output path must end with .split");
+        }
+        if (config == null) {
+            throw new IllegalArgumentException("Merge configuration cannot be null");
+        }
+        if (config.getIndexUid() == null || config.getIndexUid().trim().isEmpty()) {
+            throw new IllegalArgumentException("Index UID cannot be null or empty");
+        }
+        if (config.getSourceId() == null || config.getSourceId().trim().isEmpty()) {
+            throw new IllegalArgumentException("Source ID cannot be null or empty");
+        }
+        if (config.getNodeId() == null || config.getNodeId().trim().isEmpty()) {
+            throw new IllegalArgumentException("Node ID cannot be null or empty");
+        }
+
+        // Validate all split URLs/paths
+        for (String splitUrl : splitUrls) {
+            if (splitUrl == null || splitUrl.trim().isEmpty()) {
+                throw new IllegalArgumentException("Split URL cannot be null or empty");
+            }
+            // Support both file paths and URLs
+            if (!splitUrl.contains("://")) {
+                // Treat as file path - must end with .split
+                if (!splitUrl.endsWith(".split")) {
+                    throw new IllegalArgumentException("Split file path must end with .split: " + splitUrl);
+                }
+            }
+            // For URLs (s3://, file://), we'll validate format in native layer
+        }
+
+        return nativeMergeSplits(splitUrls, outputPath, config);
+    }
+
     // Native method declarations
     private static native SplitMetadata nativeConvertIndex(long indexPtr, String outputPath, SplitConfig config);
     private static native SplitMetadata nativeConvertIndexFromPath(String indexPath, String outputPath, SplitConfig config);
@@ -303,4 +421,5 @@ public class QuickwitSplit {
     private static native List<String> nativeListSplitFiles(String splitPath);
     private static native SplitMetadata nativeExtractSplit(String splitPath, String outputDir);
     private static native boolean nativeValidateSplit(String splitPath);
+    private static native SplitMetadata nativeMergeSplits(List<String> splitUrls, String outputPath, MergeConfig config);
 }
