@@ -14,7 +14,23 @@ Tantivy4Java
 
 ## ✅ **PRODUCTION READY WITH QUICKWIT SPLIT MERGE COMPLETE**
 
-### **🚀 LATEST BREAKTHROUGH: QUICKWIT SPLIT MERGE FUNCTIONALITY (January 2025)**
+### **🚀 LATEST BREAKTHROUGH: TEXT FIELD BEHAVIOR VERIFICATION & SPLIT MERGE (January 2025)**
+
+**✅ Text Field Behavior Verification and Native Method Fixes:**
+- **✅ Verified Correct Text Field Behavior** - Confirmed text fields are always indexed (matching tantivy-py design)
+- **✅ Fixed Missing Native Methods** - Implemented `nativeGetFieldNamesByCapabilities`, `nativeGetFieldInfo`, `nativeGetAllFieldInfo`
+- **✅ Resolved UnsatisfiedLinkError** - Complete JNI method implementation for schema introspection
+- **✅ Memory-Safe JNI Operations** - All pointer operations with proper validation and type safety
+- **✅ Updated Test Documentation** - Clear field naming and behavior documentation
+- **✅ Production-Ready Schema API** - Complete field capability filtering and metadata access
+
+**✅ Text Field vs Numeric Field Behavior (Matching tantivy-py):**
+- **✅ Text Fields Always Indexed** - No `indexed` parameter, always searchable by design
+- **✅ Numeric Fields Explicit Control** - `indexed=true/false` parameter for fine-grained control
+- **✅ API Compliance** - Exact match with tantivy-py Python library behavior
+- **✅ Comprehensive Testing** - All schema field type tests passing with correct expectations
+
+### **🚀 PREVIOUS BREAKTHROUGH: QUICKWIT SPLIT MERGE FUNCTIONALITY**
 
 **✅ Complete Quickwit-Style Split Merging Implementation:**
 - **✅ QuickwitSplit.mergeSplits() API** - Production-ready split merging with Quickwit's efficient approach
@@ -224,12 +240,27 @@ Tantivy4Java
 - **S3 Storage Backend** - Full AWS S3/MinIO support with error handling ✅
 
 **Field Type Support**
-- **Text Fields** - Full tokenization, indexing, position tracking ✅
-- **Numeric Fields** - Integer, Float with range queries and fast fields ✅
+- **Text Fields** - Full tokenization, **always indexed** (tantivy-py behavior), position tracking ✅
+- **Numeric Fields** - Integer, Float with **explicit indexed control** and range queries ✅
 - **Boolean Fields** - True/false queries and filtering ✅
 - **Date Fields** - Temporal queries with proper date handling ✅
 - **Multi-value Fields** - Array support in documents and queries ✅
 - **Schema Introspection** - Runtime field discovery, type checking, and metadata access ✅
+
+**API Design (Matching tantivy-py exactly):**
+```java
+// Text fields: addTextField(name, stored, fast, tokenizer, indexOption)
+// NO indexed parameter - always indexed by design
+builder.addTextField("title", true, false, "default", "position");    // stored + indexed
+builder.addTextField("content", false, true, "default", "position");  // fast + indexed
+builder.addTextField("tags", false, false, "default", "position");    // indexed only
+
+// Numeric fields: addIntegerField(name, stored, indexed, fast) 
+// HAS indexed parameter for explicit control
+builder.addIntegerField("count", true, true, false);   // stored + indexed, not fast
+builder.addIntegerField("score", true, false, true);   // stored + fast, NOT indexed
+builder.addIntegerField("meta", false, false, false);  // not stored, not indexed, not fast
+```
 
 #### **🎯 PYTHON COMPATIBILITY VERIFICATION**
 
@@ -249,6 +280,13 @@ Tantivy4Java
 - **Edge cases** - Python-compatible edge case handling ✅
 
 ### **✅ ALL ISSUES RESOLVED - PERFECT TEST COVERAGE**
+
+**✅ Recently Fixed Issues (January 2025)**
+1. **Schema introspection UnsatisfiedLinkError** - ✅ FIXED: Implemented missing `nativeGetFieldNamesByCapabilities`
+2. **Field metadata access** - ✅ FIXED: Added `nativeGetFieldInfo` and `nativeGetAllFieldInfo` methods  
+3. **JNI compilation errors** - ✅ FIXED: JsonObjectOptions compatibility and enum creation
+4. **Text field behavior documentation** - ✅ FIXED: Clarified always-indexed behavior matching tantivy-py
+5. **Test naming and clarity** - ✅ FIXED: Updated test field names to reflect actual behavior
 
 **✅ Previously Fixed Issues**
 1. **Boolean field handling** - ✅ FIXED: Native termQuery now handles all Java object types

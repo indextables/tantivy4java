@@ -51,6 +51,27 @@ Tantivy4Java brings the power of the Rust-based Tantivy search engine to Java th
 
 ### ✅ **Complete Python Tantivy Feature Set**
 
+#### **Text Field Behavior (Matching tantivy-py)**
+
+**IMPORTANT**: Tantivy4Java exactly matches tantivy-py text field behavior:
+- **✅ Text fields are ALWAYS indexed** - Cannot create non-indexed text fields (by design)
+- **✅ `stored` parameter controls field retrieval** - Whether document content can be accessed
+- **✅ `fast` parameter controls fast field access** - For sorting and aggregation
+- **✅ No `indexed` parameter for text fields** - Unlike numeric fields which have explicit `indexed` control
+
+```java
+// Text field parameters: addTextField(name, stored, fast, tokenizer, indexOption)
+builder.addTextField("title", true, false, "default", "position");    // stored + indexed (always)
+builder.addTextField("content", false, true, "default", "position");  // fast + indexed (always) 
+builder.addTextField("tags", false, false, "default", "position");    // indexed only (always)
+
+// Numeric fields have explicit indexed control
+builder.addIntegerField("count", true, true, false);  // stored + indexed, not fast
+builder.addIntegerField("metadata", true, false, true); // stored + fast, NOT indexed
+```
+
+This matches the tantivy-py design where text fields are meant for search and are always indexed.
+
 #### **Core Functionality (100% Compatible)**
 - **Schema Building** - All field types with Python-compatible configuration
 - **Document Management** - Creation, indexing, JSON support (Document.from_dict equivalent)
