@@ -26,6 +26,7 @@ use tantivy::DateTime;
 use std::ops::Bound;
 use time::Month;
 use crate::utils::{register_object, remove_object, with_object, handle_error};
+use crate::extract_helpers::{extract_long_value, extract_double_value};
 
 #[no_mangle]
 pub extern "system" fn Java_com_tantivy4java_Query_nativeTermQuery(
@@ -1478,52 +1479,8 @@ fn extract_occur_queries(env: &mut JNIEnv, list_obj: &JObject) -> Result<Vec<(Oc
     Ok(occur_queries)
 }
 
-// Helper function to extract long value from Java Object (Integer/Long)
-fn extract_long_value(env: &mut JNIEnv, obj: &JObject) -> Result<i64, String> {
-    if obj.is_null() {
-        return Err("Object is null".to_string());
-    }
-    
-    // Try Long first
-    if let Ok(result) = env.call_method(obj, "longValue", "()J", &[]) {
-        if let Ok(val) = result.j() {
-            return Ok(val);
-        }
-    }
-    
-    // Try Integer 
-    if let Ok(result) = env.call_method(obj, "intValue", "()I", &[]) {
-        if let Ok(val) = result.i() {
-            return Ok(val as i64);
-        }
-    }
-    
-    Err("Failed to extract long value from object".to_string())
-}
 
-// Helper function to extract double value from Java Object (Float/Double)
-fn extract_double_value(env: &mut JNIEnv, obj: &JObject) -> Result<f64, String> {
-    if obj.is_null() {
-        return Err("Object is null".to_string());
-    }
-    
-    // Try Double first
-    if let Ok(result) = env.call_method(obj, "doubleValue", "()D", &[]) {
-        if let Ok(val) = result.d() {
-            return Ok(val);
-        }
-    }
-    
-    // Try Float
-    if let Ok(result) = env.call_method(obj, "floatValue", "()F", &[]) {
-        if let Ok(val) = result.f() {
-            return Ok(val as f64);
-        }
-    }
-    
-    Err("Failed to extract double value from object".to_string())
-}
-
+// The extract_long_value and extract_double_value functions are now imported from extract_helpers module
 // Helper function to extract DateTime value from Java LocalDateTime
 fn extract_date_value(env: &mut JNIEnv, obj: &JObject) -> Result<DateTime, String> {
     if obj.is_null() {

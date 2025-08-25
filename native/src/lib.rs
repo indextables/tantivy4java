@@ -33,6 +33,7 @@ mod split_searcher;  // Now using proper Quickwit integration
 mod split_cache_manager;  // Global cache manager following Quickwit patterns
 // mod split_searcher_simple;  // Disabled to avoid conflicts
 mod common;
+mod extract_helpers;
 
 pub use schema::*;
 pub use document::*;
