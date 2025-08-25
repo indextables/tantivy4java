@@ -21,7 +21,7 @@ use jni::objects::{JClass, JString, JObject};
 use jni::sys::{jlong, jboolean, jint, jdouble, jlongArray, jobject};
 use jni::JNIEnv;
 use tantivy::query::{Query as TantivyQuery, TermQuery, AllQuery, BooleanQuery, Occur, RangeQuery, PhraseQuery, FuzzyTermQuery, RegexQuery, BoostQuery, ConstScoreQuery, TermSetQuery};
-use tantivy::schema::{Schema, Term, IndexRecordOption, FieldType as TantivyFieldType};
+use tantivy::schema::{Schema, Term, IndexRecordOption, FieldType as TantivyFieldType, Field};
 use tantivy::DateTime;
 use std::ops::Bound;
 use time::Month;
@@ -587,6 +587,537 @@ pub extern "system" fn Java_com_tantivy4java_Query_nativeRegexQuery(
             handle_error(&mut env, "Invalid Schema pointer");
             0
         }
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_tantivy4java_Query_nativeWildcardQuery(
+    mut env: JNIEnv,
+    _class: JClass,
+    schema_ptr: jlong,
+    field_name: JString,
+    pattern: JString,
+) -> jlong {
+    let field_name_str: String = match env.get_string(&field_name) {
+        Ok(s) => s.into(),
+        Err(_) => {
+            handle_error(&mut env, "Invalid field name");
+            return 0;
+        }
+    };
+    
+    let pattern_str: String = match env.get_string(&pattern) {
+        Ok(s) => s.into(),
+        Err(_) => {
+            handle_error(&mut env, "Invalid wildcard pattern");
+            return 0;
+        }
+    };
+    
+    let result = with_object::<Schema, Result<Box<dyn TantivyQuery>, String>>(schema_ptr as u64, |schema| {
+        // Get field by name
+        let field = match schema.get_field(&field_name_str) {
+            Ok(f) => f,
+            Err(_) => return Err(format!("Field '{}' not found in schema", field_name_str)),
+        };
+        
+        // Verify the field is a text field
+        let field_entry = schema.get_field_entry(field);
+        match field_entry.field_type() {
+            TantivyFieldType::Str(_) => {
+                // Check for complex multi-wildcard patterns first (e.g., "*y*me*key*y")
+                if !pattern_str.contains(' ') && contains_multi_wildcards(&pattern_str) {
+                    // Complex multi-wildcard pattern - use regex-based approach
+                    create_multi_wildcard_regex_query(field, &pattern_str)
+                } else if pattern_str.contains(' ') {
+                    // Tokenize the pattern and create boolean query
+                    create_tokenized_wildcard_query(schema, field, &pattern_str)
+                } else {
+                    // Single token - use simple regex query
+                    create_single_wildcard_query(field, &pattern_str)
+                }
+            },
+            _ => Err(format!("Field '{}' is not a text field - wildcard queries require text fields", field_name_str)),
+        }
+    });
+    
+    match result {
+        Some(Ok(query)) => {
+            register_object(query) as jlong
+        },
+        Some(Err(err)) => {
+            handle_error(&mut env, &err);
+            0
+        },
+        None => {
+            handle_error(&mut env, "Invalid Schema pointer");
+            0
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_tantivy4java_Query_nativeWildcardQueryLenient(
+    mut env: JNIEnv,
+    _class: JClass,
+    schema_ptr: jlong,
+    field_name: JString,
+    pattern: JString,
+    lenient: jboolean,
+) -> jlong {
+    let field_name_str: String = match env.get_string(&field_name) {
+        Ok(s) => s.into(),
+        Err(_) => {
+            handle_error(&mut env, "Invalid field name");
+            return 0;
+        }
+    };
+    
+    let pattern_str: String = match env.get_string(&pattern) {
+        Ok(s) => s.into(),
+        Err(_) => {
+            handle_error(&mut env, "Invalid wildcard pattern");
+            return 0;
+        }
+    };
+    
+    let is_lenient = lenient != 0;
+    
+    let result = with_object::<Schema, Result<Box<dyn TantivyQuery>, String>>(schema_ptr as u64, |schema| {
+        // Get field by name
+        let field = match schema.get_field(&field_name_str) {
+            Ok(f) => f,
+            Err(_) => {
+                if is_lenient {
+                    // Return a query that matches no documents
+                    let bool_query = BooleanQuery::new(vec![]);
+                    return Ok(Box::new(bool_query) as Box<dyn TantivyQuery>);
+                } else {
+                    return Err(format!("Field '{}' not found in schema", field_name_str));
+                }
+            }
+        };
+        
+        // Verify the field is a text field
+        let field_entry = schema.get_field_entry(field);
+        match field_entry.field_type() {
+            TantivyFieldType::Str(_) => {
+                // Check for complex multi-wildcard patterns first (e.g., "*y*me*key*y")
+                if !pattern_str.contains(' ') && contains_multi_wildcards(&pattern_str) {
+                    // Complex multi-wildcard pattern - use regex-based approach
+                    create_multi_wildcard_regex_query(field, &pattern_str)
+                } else if pattern_str.contains(' ') {
+                    // Tokenize the pattern and create boolean query
+                    create_tokenized_wildcard_query(schema, field, &pattern_str)
+                } else {
+                    // Single token - use simple regex query
+                    create_single_wildcard_query(field, &pattern_str)
+                }
+            },
+            _ => {
+                if is_lenient {
+                    // Return a query that matches no documents
+                    let bool_query = BooleanQuery::new(vec![]);
+                    Ok(Box::new(bool_query) as Box<dyn TantivyQuery>)
+                } else {
+                    Err(format!("Field '{}' is not a text field - wildcard queries require text fields", field_name_str))
+                }
+            }
+        }
+    });
+    
+    match result {
+        Some(Ok(query)) => {
+            register_object(query) as jlong
+        },
+        Some(Err(err)) => {
+            handle_error(&mut env, &err);
+            0
+        },
+        None => {
+            handle_error(&mut env, "Invalid Schema pointer");
+            0
+        }
+    }
+}
+
+/// Create a single wildcard query for a pattern without spaces
+/// Uses boolean OR to combine regex and term approaches for better case handling
+fn create_single_wildcard_query(field: Field, pattern: &str) -> Result<Box<dyn TantivyQuery>, String> {
+    let mut subqueries = Vec::new();
+    
+    // Approach 1: Use regex query with original case
+    let regex_pattern = wildcard_to_regex_preserve_case(pattern);
+    match RegexQuery::from_pattern(&regex_pattern, field) {
+        Ok(regex_query) => {
+            subqueries.push((Occur::Should, Box::new(regex_query) as Box<dyn TantivyQuery>));
+        },
+        Err(_) => {
+            // If regex fails, we'll rely on other approaches
+        }
+    }
+    
+    // Approach 2: Use regex query with lowercase pattern
+    let regex_pattern_lower = wildcard_to_regex(pattern);
+    if regex_pattern_lower != regex_pattern {
+        match RegexQuery::from_pattern(&regex_pattern_lower, field) {
+            Ok(regex_query_lower) => {
+                subqueries.push((Occur::Should, Box::new(regex_query_lower) as Box<dyn TantivyQuery>));
+            },
+            Err(_) => {
+                // If regex fails, continue with other approaches
+            }
+        }
+    }
+    
+    // For patterns without wildcards, we rely on the regex approaches above
+    // which will create exact regex matches that should work correctly
+    
+    // If we have multiple approaches, combine with OR; otherwise use the single approach
+    if subqueries.len() > 1 {
+        let boolean_query = BooleanQuery::new(subqueries);
+        Ok(Box::new(boolean_query) as Box<dyn TantivyQuery>)
+    } else if subqueries.len() == 1 {
+        Ok(subqueries.into_iter().next().unwrap().1)
+    } else {
+        Err(format!("Unable to create wildcard query for pattern '{}'", pattern))
+    }
+}
+
+/// Create regex pattern preserving original case
+fn wildcard_to_regex_preserve_case(pattern: &str) -> String {
+    let mut regex = String::new();
+    let mut chars = pattern.chars().peekable();
+    
+    while let Some(ch) = chars.next() {
+        match ch {
+            '*' => regex.push_str(".*"),
+            '?' => regex.push('.'),
+            '\\' => {
+                if let Some(&next_ch) = chars.peek() {
+                    chars.next();
+                    match next_ch {
+                        '*' | '?' | '\\' => regex.push(next_ch),
+                        _ => {
+                            regex.push('\\');
+                            regex.push(next_ch);
+                        }
+                    }
+                } else {
+                    regex.push('\\');
+                }
+            }
+            '.' | '^' | '$' | '+' | '|' | '(' | ')' | '[' | ']' | '{' | '}' => {
+                regex.push('\\');
+                regex.push(ch);
+            }
+            _ => regex.push(ch),
+        }
+    }
+    regex
+}
+
+/// Create a tokenized wildcard query for patterns containing spaces
+/// Tokenizes the pattern and creates a boolean AND query of individual wildcard/term queries
+fn create_tokenized_wildcard_query(schema: &Schema, field: Field, pattern: &str) -> Result<Box<dyn TantivyQuery>, String> {
+    // Simple tokenization by splitting on whitespace
+    let tokens: Vec<&str> = pattern.split_whitespace().collect();
+    
+    if tokens.is_empty() {
+        return Err("Empty wildcard pattern".to_string());
+    }
+    
+    if tokens.len() == 1 {
+        // Single token after splitting - fall back to simple query
+        return create_single_wildcard_query(field, tokens[0]);
+    }
+    
+    // Create individual queries for each token
+    let mut subqueries = Vec::new();
+    
+    for token in tokens {
+        if contains_wildcards(token) {
+            // Token contains wildcards - create wildcard query
+            match create_single_wildcard_query(field, token) {
+                Ok(query) => subqueries.push((Occur::Must, query)),
+                Err(e) => return Err(e),
+            }
+        } else {
+            // Token is literal - create term query
+            let term = Term::from_field_text(field, token);
+            let term_query = TermQuery::new(term, IndexRecordOption::WithFreqs);
+            subqueries.push((Occur::Must, Box::new(term_query) as Box<dyn TantivyQuery>));
+        }
+    }
+    
+    if subqueries.is_empty() {
+        return Err("No valid tokens in wildcard pattern".to_string());
+    }
+    
+    if subqueries.len() == 1 {
+        // Only one subquery - return it directly
+        Ok(subqueries.into_iter().next().unwrap().1)
+    } else {
+        // Multiple subqueries - create boolean AND query
+        let boolean_query = BooleanQuery::new(subqueries);
+        Ok(Box::new(boolean_query) as Box<dyn TantivyQuery>)
+    }
+}
+
+/// Check if a token contains wildcard characters
+fn contains_wildcards(token: &str) -> bool {
+    token.contains('*') || token.contains('?')
+}
+
+/// Check if pattern contains multiple wildcards that should be split into regex segments
+fn contains_multi_wildcards(pattern: &str) -> bool {
+    // Only consider patterns with multiple asterisks (*) as multi-wildcard
+    // Patterns like "?est*" or "*test?" should be handled as simple wildcards
+    // Only patterns like "*abc*def*" should be multi-wildcard
+    let mut asterisk_count = 0;
+    let mut chars = pattern.chars().peekable();
+    
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\\' => {
+                // Skip the next character (it's escaped)
+                chars.next();
+            }
+            '*' => {
+                asterisk_count += 1;
+                if asterisk_count >= 2 {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Parse complex multi-wildcard pattern into raw segments (no regex escaping)
+/// Example: "*y*me*key*y" -> ["y", "me", "key", "y"]
+fn parse_multi_wildcard_pattern(pattern: &str) -> Vec<String> {
+    let mut segments = Vec::new();
+    let mut current_segment = String::new();
+    let mut chars = pattern.chars().peekable();
+    
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\\' => {
+                // Handle escaped characters
+                if let Some(next_ch) = chars.next() {
+                    current_segment.push(next_ch);
+                }
+            }
+            '*' => {
+                // End current segment if it has content
+                if !current_segment.is_empty() {
+                    segments.push(current_segment.trim().to_string());
+                    current_segment.clear();
+                }
+            }
+            '?' => {
+                // For single-char wildcard, we'll treat it as a literal character in regex context
+                current_segment.push('.');
+            }
+            _ => {
+                current_segment.push(ch);
+            }
+        }
+    }
+    
+    // Add final segment if it exists
+    if !current_segment.is_empty() {
+        segments.push(current_segment.trim().to_string());
+    }
+    
+    // Return raw segments (no regex escaping here)
+    segments.into_iter()
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// Escape regex special characters for safe use in patterns
+fn escape_regex_chars(input: &str) -> String {
+    let mut result = String::new();
+    for ch in input.chars() {
+        match ch {
+            '\\' | '^' | '$' | '.' | '|' | '?' | '*' | '+' | '(' | ')' | '[' | ']' | '{' | '}' => {
+                result.push('\\');
+                result.push(ch);
+            }
+            _ => result.push(ch),
+        }
+    }
+    result
+}
+
+/// Create enhanced multi-wildcard query with comprehensive matching strategies
+/// Example: "*Wild*Joe*" becomes:
+/// ((regex(".*Wild.*") OR regex(".*Wild") OR regex("Wild.*") OR term("Wild")) 
+///  AND 
+///  (regex(".*Joe.*") OR regex(".*Joe") OR regex("Joe.*") OR term("Joe")))
+fn create_multi_wildcard_regex_query(field: Field, pattern: &str) -> Result<Box<dyn TantivyQuery>, String> {
+    let segments = parse_multi_wildcard_pattern(pattern);
+    
+    if segments.is_empty() {
+        // Pattern was all wildcards - match everything
+        let regex_pattern = ".*";
+        match RegexQuery::from_pattern(regex_pattern, field) {
+            Ok(regex_query) => Ok(Box::new(regex_query) as Box<dyn TantivyQuery>),
+            Err(e) => Err(format!("Failed to create regex query: {}", e)),
+        }
+    } else {
+        // Create boolean AND query where each segment has multiple matching strategies
+        let mut and_subqueries = Vec::new();
+        
+        for segment in segments {
+            // Create OR query for this segment with multiple matching strategies
+            let mut or_strategies = Vec::new();
+            
+            // Escape the segment for regex use
+            let escaped_segment = escape_regex_chars(&segment);
+            
+            // Strategy 1: Contains pattern (.*segment.*)
+            let contains_pattern = format!(".*{}.*", escaped_segment);
+            if let Ok(regex_query) = RegexQuery::from_pattern(&contains_pattern, field) {
+                or_strategies.push((Occur::Should, Box::new(regex_query) as Box<dyn TantivyQuery>));
+            }
+            // Case-insensitive version
+            let contains_pattern_ci = format!("(?i).*{}.*", escaped_segment);
+            if let Ok(regex_query) = RegexQuery::from_pattern(&contains_pattern_ci, field) {
+                or_strategies.push((Occur::Should, Box::new(regex_query) as Box<dyn TantivyQuery>));
+            }
+            
+            // Strategy 2: Prefix pattern (segment.*)
+            let prefix_pattern = format!("{}.*", escaped_segment);
+            if let Ok(regex_query) = RegexQuery::from_pattern(&prefix_pattern, field) {
+                or_strategies.push((Occur::Should, Box::new(regex_query) as Box<dyn TantivyQuery>));
+            }
+            // Case-insensitive version
+            let prefix_pattern_ci = format!("(?i){}.*", escaped_segment);
+            if let Ok(regex_query) = RegexQuery::from_pattern(&prefix_pattern_ci, field) {
+                or_strategies.push((Occur::Should, Box::new(regex_query) as Box<dyn TantivyQuery>));
+            }
+            
+            // Strategy 3: Suffix pattern (.*segment)
+            let suffix_pattern = format!(".*{}", escaped_segment);
+            if let Ok(regex_query) = RegexQuery::from_pattern(&suffix_pattern, field) {
+                or_strategies.push((Occur::Should, Box::new(regex_query) as Box<dyn TantivyQuery>));
+            }
+            // Case-insensitive version
+            let suffix_pattern_ci = format!("(?i).*{}", escaped_segment);
+            if let Ok(regex_query) = RegexQuery::from_pattern(&suffix_pattern_ci, field) {
+                or_strategies.push((Occur::Should, Box::new(regex_query) as Box<dyn TantivyQuery>));
+            }
+            
+            // Strategy 4: Exact term match (both original and lowercase)
+            let term_orig = Term::from_field_text(field, &segment);
+            let term_query_orig = TermQuery::new(term_orig, IndexRecordOption::WithFreqs);
+            or_strategies.push((Occur::Should, Box::new(term_query_orig) as Box<dyn TantivyQuery>));
+            
+            // Also try lowercase version for better matching
+            let segment_lower = segment.to_lowercase();
+            if segment_lower != segment {
+                let term_lower = Term::from_field_text(field, &segment_lower);
+                let term_query_lower = TermQuery::new(term_lower, IndexRecordOption::WithFreqs);
+                or_strategies.push((Occur::Should, Box::new(term_query_lower) as Box<dyn TantivyQuery>));
+            }
+            
+            // Combine all strategies for this segment with OR
+            if or_strategies.len() > 1 {
+                let segment_or_query = BooleanQuery::new(or_strategies);
+                and_subqueries.push((Occur::Must, Box::new(segment_or_query) as Box<dyn TantivyQuery>));
+            } else if or_strategies.len() == 1 {
+                and_subqueries.push((Occur::Must, or_strategies.into_iter().next().unwrap().1));
+            }
+        }
+        
+        // Combine all segments with AND
+        if and_subqueries.len() > 1 {
+            let boolean_query = BooleanQuery::new(and_subqueries);
+            Ok(Box::new(boolean_query) as Box<dyn TantivyQuery>)
+        } else if and_subqueries.len() == 1 {
+            Ok(and_subqueries.into_iter().next().unwrap().1)
+        } else {
+            Err("No valid query strategies could be created".to_string())
+        }
+    }
+}
+
+/// Convert wildcard pattern to regex pattern
+/// * -> .*
+/// ? -> .
+/// Escape other regex special characters
+/// Note: Don't use anchors as Tantivy's RegexQuery doesn't seem to like them
+fn wildcard_to_regex(pattern: &str) -> String {
+    let mut regex = String::new();
+    // Don't add anchors - let Tantivy handle word boundaries
+    
+    // Convert pattern to lowercase to match tokenizer behavior
+    let pattern_lower = pattern.to_lowercase();
+    let mut chars = pattern_lower.chars().peekable();
+    
+    while let Some(ch) = chars.next() {
+        match ch {
+            '*' => regex.push_str(".*"),
+            '?' => regex.push('.'),
+            '\\' => {
+                // Handle escape sequences
+                if let Some(&next_ch) = chars.peek() {
+                    chars.next(); // consume the escaped character
+                    match next_ch {
+                        '*' | '?' | '\\' => regex.push(next_ch),
+                        _ => {
+                            // For other characters, just include them literally
+                            regex.push('\\');
+                            regex.push(next_ch);
+                        }
+                    }
+                } else {
+                    // Trailing backslash - just include it
+                    regex.push('\\');
+                }
+            }
+            // Escape regex special characters
+            '.' | '^' | '$' | '+' | '|' | '(' | ')' | '[' | ']' | '{' | '}' => {
+                regex.push('\\');
+                regex.push(ch);
+            }
+            _ => regex.push(ch),
+        }
+    }
+    
+    // Don't add end anchor either
+    regex
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_wildcard_to_regex() {
+        // Basic patterns
+        assert_eq!(wildcard_to_regex("Hello*"), "Hello.*");
+        assert_eq!(wildcard_to_regex("*World"), ".*World");
+        assert_eq!(wildcard_to_regex("He?lo"), "He.lo");
+        
+        // Complex patterns
+        assert_eq!(wildcard_to_regex("Hello*World"), "Hello.*World");
+        assert_eq!(wildcard_to_regex("*test*"), ".*test.*");
+        
+        // Escape sequences
+        assert_eq!(wildcard_to_regex("test\\*"), "test*");
+        assert_eq!(wildcard_to_regex("test\\?"), "test?");
+        
+        // Special regex characters
+        assert_eq!(wildcard_to_regex("test.txt"), "test\\.txt");
+        assert_eq!(wildcard_to_regex("test(1)"), "test\\(1\\)");
+        
+        // Exact match (no wildcards)
+        assert_eq!(wildcard_to_regex("Hello"), "Hello");
     }
 }
 

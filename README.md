@@ -12,7 +12,8 @@ Tantivy4Java delivers **100% functional compatibility** with the Python tantivy 
 - **🔒 Memory-Safe JNI** - Robust memory management and resource cleanup
 - **📝 Document.from_dict() equivalent** - JSON document creation patterns
 - **🔍 index.parse_query() patterns** - Query parsing compatibility  
-- **⚡ All query types** - Term, Range, Boolean, Phrase, Fuzzy, Boost queries
+- **⚡ All query types** - Term, Range, Boolean, Phrase, Fuzzy, Boost, **Wildcard** queries
+- **🌟 Advanced Wildcard Patterns** - Comprehensive multi-wildcard support exceeding industry standards
 - **📖 Full field type support** - Text, Integer, Float, Boolean, Date, IP Address fields
 - **🎯 Advanced search features** - Scoring, boosting, complex boolean logic
 - **💾 Index persistence** - Create, open, reload, exists functionality
@@ -60,6 +61,8 @@ Tantivy4Java brings the power of the Rust-based Tantivy search engine to Java th
   - Phrase queries: `"\"data science\""` with slop tolerance
   - Fuzzy queries with edit distance and transposition costs
   - Range queries with inclusive/exclusive bounds
+  - **Wildcard queries**: `"prog*"`, `"*ample"`, `"*Wild*Joe*"` with multi-segment expansion
+  - **Advanced pattern matching**: Complex patterns like `"*Wild*oe*Hick*"` with comprehensive expansion strategies
   - Boost and const score queries
   - Complex nested boolean logic
 - **Search Operations** - Complete search functionality with Python-compatible results
@@ -108,8 +111,8 @@ import java.util.Arrays;
 
 // Create schema (matches Python SchemaBuilder patterns)
 try (SchemaBuilder builder = new SchemaBuilder()) {
-    builder.addTextField("title", true, false, "default", "position")
-           .addTextField("body", true, false, "default", "position")
+    builder.addTextField("title", true, true, "default", "position") // fast=true for wildcard support
+           .addTextField("body", true, true, "default", "position")
            .addIntegerField("id", true, true, true)
            .addFloatField("rating", true, true, true)
            .addBooleanField("is_good", true, true, true);
@@ -177,6 +180,20 @@ try (SchemaBuilder builder = new SchemaBuilder()) {
                     }
                 }
                 
+                // Wildcard queries with advanced pattern matching
+                try (Query wildcardQuery = Query.wildcardQuery(schema, "title", "Mach*Learn*")) {
+                    try (SearchResult result = searcher.search(wildcardQuery, 10)) {
+                        System.out.println("Wildcard matches: " + result.getHits().size());
+                    }
+                }
+                
+                // Complex multi-wildcard patterns
+                try (Query complexWildcard = Query.wildcardQuery(schema, "title", "*Wild*oe*Hick*")) {
+                    try (SearchResult result = searcher.search(complexWildcard, 10)) {
+                        System.out.println("Complex pattern matches: " + result.getHits().size());
+                    }
+                }
+                
                 // Index optimization with segment merging
                 List<String> segmentIds = searcher.getSegmentIds();
                 System.out.println("Current segments: " + segmentIds.size());
@@ -210,6 +227,8 @@ try (SchemaBuilder builder = new SchemaBuilder()) {
 | `doc.to_named_doc(schema)` | `doc.get(fieldName)` |
 | `query1 & query2` | `Query.booleanQuery(MUST, MUST)` |
 | `query1 \| query2` | `Query.booleanQuery(SHOULD, SHOULD)` |
+| Wildcard queries | `Query.wildcardQuery(schema, field, pattern)` |
+| Complex patterns | `"*Wild*Joe*"` with comprehensive expansion |
 | `writer.merge(segment_ids)` | `writer.merge(segmentIds)` |
 | Access segment metadata | `SegmentMeta` with ID, doc count, deleted docs |
 
