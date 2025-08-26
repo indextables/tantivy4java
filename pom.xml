@@ -341,6 +341,28 @@
                                         <argument>--target-dir</argument>
                                         <argument>${rust.target.dir}</argument>
                                     </arguments>
+                                    <workingDirectory>${project.basedir}/native</workingDirectory>
+                                </configuration>
+                            </execution>
+                        </executions>
+                    </plugin>
+                    <!-- Copy only darwin-aarch64 library -->
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-resources-plugin</artifactId>
+                        <executions>
+                            <execution>
+                                <id>copy-native-lib</id>
+                                <configuration>
+                                    <resources>
+                                        <resource>
+                                            <directory>${rust.target.dir}/aarch64-apple-darwin/release</directory>
+                                            <targetPath>darwin-aarch64</targetPath>
+                                            <includes>
+                                                <include>libtantivy4java.dylib</include>
+                                            </includes>
+                                        </resource>
+                                    </resources>
                                 </configuration>
                             </execution>
                         </executions>
@@ -370,6 +392,28 @@
                                         <argument>--target-dir</argument>
                                         <argument>${rust.target.dir}</argument>
                                     </arguments>
+                                    <workingDirectory>${project.basedir}/native</workingDirectory>
+                                </configuration>
+                            </execution>
+                        </executions>
+                    </plugin>
+                    <!-- Copy only linux-x86_64 library -->
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-resources-plugin</artifactId>
+                        <executions>
+                            <execution>
+                                <id>copy-native-lib</id>
+                                <configuration>
+                                    <resources>
+                                        <resource>
+                                            <directory>${rust.target.dir}/x86_64-unknown-linux-gnu/release</directory>
+                                            <targetPath>linux-x86_64</targetPath>
+                                            <includes>
+                                                <include>libtantivy4java.so</include>
+                                            </includes>
+                                        </resource>
+                                    </resources>
                                 </configuration>
                             </execution>
                         </executions>
@@ -399,6 +443,28 @@
                                         <argument>--target-dir</argument>
                                         <argument>${rust.target.dir}</argument>
                                     </arguments>
+                                    <workingDirectory>${project.basedir}/native</workingDirectory>
+                                </configuration>
+                            </execution>
+                        </executions>
+                    </plugin>
+                    <!-- Copy only linux-aarch64 library -->
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-resources-plugin</artifactId>
+                        <executions>
+                            <execution>
+                                <id>copy-native-lib</id>
+                                <configuration>
+                                    <resources>
+                                        <resource>
+                                            <directory>${rust.target.dir}/aarch64-unknown-linux-gnu/release</directory>
+                                            <targetPath>linux-aarch64</targetPath>
+                                            <includes>
+                                                <include>libtantivy4java.so</include>
+                                            </includes>
+                                        </resource>
+                                    </resources>
                                 </configuration>
                             </execution>
                         </executions>

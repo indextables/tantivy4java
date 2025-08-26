@@ -1130,10 +1130,86 @@ mvn test -Dtest="*PythonParity*"
 mvn compile
 ```
 
-### Cross-Platform Support
-- **Linux** - Full support with native library packaging
-- **macOS** - Complete compatibility (tested)
-- **Windows** - Cross-compilation support available
+### 🏗️ **Cross-Platform Build System**
+
+Tantivy4Java provides comprehensive cross-platform native library builds through Maven:
+
+#### **Build Options**
+
+**1. Default Build (Current Platform):**
+```bash
+mvn clean package
+```
+- Builds for your current platform only
+- Ideal for local development and testing
+
+**2. Cross-Platform Build (All Supported Platforms):**
+```bash  
+mvn clean package -Pcross-compile
+```
+- Builds native libraries for all supported platforms:
+  - **macOS ARM64** (Apple Silicon)
+  - **Linux x86_64** (AMD64)
+  - **Linux ARM64** (aarch64)
+- Creates single JAR with platform-specific libraries
+- Automatic platform detection at runtime
+
+**3. Single Platform Build:**
+```bash
+# Build specific platform only
+mvn clean package -Pdarwin-aarch64    # macOS ARM64
+mvn clean package -Plinux-x86_64      # Linux x86_64  
+mvn clean package -Plinux-aarch64     # Linux ARM64
+```
+
+**4. Multiple Platform Build:**
+```bash
+# Build subset of platforms
+mvn clean package -Pdarwin-aarch64,linux-x86_64
+```
+
+#### **JAR Structure**
+Cross-compiled JARs contain platform-specific libraries:
+```
+native/
+├── darwin-aarch64/libtantivy4java.dylib  (macOS ARM64)
+├── linux-x86_64/libtantivy4java.so      (Linux AMD64)  
+└── linux-aarch64/libtantivy4java.so     (Linux ARM64)
+```
+
+#### **Platform Support**
+- ✅ **macOS ARM64** (Apple Silicon) - Native & cross-compile
+- ✅ **Linux x86_64** (AMD64) - Cross-compile with proper sysroot  
+- ✅ **Linux ARM64** (aarch64) - Cross-compile with proper sysroot
+- 🚧 **Windows** - Planned future support
+
+#### **Cross-Compilation Setup**
+For cross-compilation support, run the setup script:
+```bash
+./install-cross-compile.sh
+```
+This installs:
+- Rust cross-compilation targets
+- Linux cross-compilation toolchains with sysroot
+- Proper Cargo configuration
+
+#### **Library Loading**
+The Java library loader automatically:
+- Detects runtime platform (OS + architecture)
+- Selects appropriate native library
+- Falls back gracefully if platform not available
+- Provides clear error messages for unsupported platforms
+
+#### **CI/CD Integration**
+Perfect for continuous integration:
+```bash
+# Full cross-platform build in CI
+mvn clean package -Pcross-compile -DskipTests
+
+# Platform-specific builds for different agents
+mvn clean package -Plinux-x86_64     # Linux agent
+mvn clean package -Pdarwin-aarch64   # macOS agent
+```
 
 ## Contributing
 
