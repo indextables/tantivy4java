@@ -263,9 +263,9 @@ dependencies = [
 
 [[package]]
 name = "aws-sdk-ssooidc"
-version = "1.82.0"
+version = "1.83.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "43326f724ba2cc957e6f3deac0ca1621a3e5d4146f5970c24c8a108dac33070f"
+checksum = "0b49e8fe57ff100a2f717abfa65bdd94e39702fa5ab3f60cddc6ac7784010c68"
 dependencies = [
  "aws-credential-types",
  "aws-runtime",
@@ -3006,7 +3006,7 @@ checksum = "106dd99e98437432fed6519dedecfade6a06a73bb7b2a1e019fdd2bee5778d94"
 [[package]]
 name = "quickwit-actors"
 version = "0.8.0"
-source = "git+https://github.com/schenksj/quickwit#96111d59b4dae960cd918c1ae87925a8df35dba9"
+source = "git+https://github.com/schenksj/quickwit#1fc14929c4788cd57440eebc59c9a34973e6e8f9"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3025,7 +3025,7 @@ dependencies = [
 [[package]]
 name = "quickwit-aws"
 version = "0.8.0"
-source = "git+https://github.com/schenksj/quickwit#96111d59b4dae960cd918c1ae87925a8df35dba9"
+source = "git+https://github.com/schenksj/quickwit#1fc14929c4788cd57440eebc59c9a34973e6e8f9"
 dependencies = [
  "aws-config",
  "aws-runtime",
@@ -3045,7 +3045,7 @@ dependencies = [
 [[package]]
 name = "quickwit-cluster"
 version = "0.8.0"
-source = "git+https://github.com/schenksj/quickwit#96111d59b4dae960cd918c1ae87925a8df35dba9"
+source = "git+https://github.com/schenksj/quickwit#1fc14929c4788cd57440eebc59c9a34973e6e8f9"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3072,7 +3072,7 @@ dependencies = [
 [[package]]
 name = "quickwit-codegen"
 version = "0.8.0"
-source = "git+https://github.com/schenksj/quickwit#96111d59b4dae960cd918c1ae87925a8df35dba9"
+source = "git+https://github.com/schenksj/quickwit#1fc14929c4788cd57440eebc59c9a34973e6e8f9"
 dependencies = [
  "anyhow",
  "heck 0.5.0",
@@ -3087,7 +3087,7 @@ dependencies = [
 [[package]]
 name = "quickwit-common"
 version = "0.8.0"
-source = "git+https://github.com/schenksj/quickwit#96111d59b4dae960cd918c1ae87925a8df35dba9"
+source = "git+https://github.com/schenksj/quickwit#1fc14929c4788cd57440eebc59c9a34973e6e8f9"
 dependencies = [
  "anyhow",
  "async-speed-limit",
@@ -3127,7 +3127,7 @@ dependencies = [
 [[package]]
 name = "quickwit-config"
 version = "0.8.0"
-source = "git+https://github.com/schenksj/quickwit#96111d59b4dae960cd918c1ae87925a8df35dba9"
+source = "git+https://github.com/schenksj/quickwit#1fc14929c4788cd57440eebc59c9a34973e6e8f9"
 dependencies = [
  "anyhow",
  "bytes",
@@ -3159,7 +3159,7 @@ dependencies = [
 [[package]]
 name = "quickwit-datetime"
 version = "0.8.0"
-source = "git+https://github.com/schenksj/quickwit#96111d59b4dae960cd918c1ae87925a8df35dba9"
+source = "git+https://github.com/schenksj/quickwit#1fc14929c4788cd57440eebc59c9a34973e6e8f9"
 dependencies = [
  "anyhow",
  "itertools 0.14.0",
@@ -3173,7 +3173,7 @@ dependencies = [
 [[package]]
 name = "quickwit-directories"
 version = "0.8.0"
-source = "git+https://github.com/schenksj/quickwit#96111d59b4dae960cd918c1ae87925a8df35dba9"
+source = "git+https://github.com/schenksj/quickwit#1fc14929c4788cd57440eebc59c9a34973e6e8f9"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3190,7 +3190,7 @@ dependencies = [
 [[package]]
 name = "quickwit-doc-mapper"
 version = "0.8.0"
-source = "git+https://github.com/schenksj/quickwit#96111d59b4dae960cd918c1ae87925a8df35dba9"
+source = "git+https://github.com/schenksj/quickwit#1fc14929c4788cd57440eebc59c9a34973e6e8f9"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -3219,7 +3219,7 @@ dependencies = [
 [[package]]
 name = "quickwit-indexing"
 version = "0.8.0"
-source = "git+https://github.com/schenksj/quickwit#96111d59b4dae960cd918c1ae87925a8df35dba9"
+source = "git+https://github.com/schenksj/quickwit#1fc14929c4788cd57440eebc59c9a34973e6e8f9"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -3264,7 +3264,7 @@ dependencies = [
 [[package]]
 name = "quickwit-ingest"
 version = "0.8.0"
-source = "git+https://github.com/schenksj/quickwit#96111d59b4dae960cd918c1ae87925a8df35dba9"
+source = "git+https://github.com/schenksj/quickwit#1fc14929c4788cd57440eebc59c9a34973e6e8f9"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3299,7 +3299,7 @@ dependencies = [
 [[package]]
 name = "quickwit-macros"
 version = "0.8.0"
-source = "git+https://github.com/schenksj/quickwit#96111d59b4dae960cd918c1ae87925a8df35dba9"
+source = "git+https://github.com/schenksj/quickwit#1fc14929c4788cd57440eebc59c9a34973e6e8f9"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -3309,7 +3309,7 @@ dependencies = [
 [[package]]
 name = "quickwit-metastore"
 version = "0.8.0"
-source = "git+https://github.com/schenksj/quickwit#96111d59b4dae960cd918c1ae87925a8df35dba9"
+source = "git+https://github.com/schenksj/quickwit#1fc14929c4788cd57440eebc59c9a34973e6e8f9"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3345,7 +3345,7 @@ dependencies = [
 [[package]]
 name = "quickwit-opentelemetry"
 version = "0.8.0"
-source = "git+https://github.com/schenksj/quickwit#96111d59b4dae960cd918c1ae87925a8df35dba9"
+source = "git+https://github.com/schenksj/quickwit#1fc14929c4788cd57440eebc59c9a34973e6e8f9"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3368,7 +3368,7 @@ dependencies = [
 [[package]]
 name = "quickwit-proto"
 version = "0.8.0"
-source = "git+https://github.com/schenksj/quickwit#96111d59b4dae960cd918c1ae87925a8df35dba9"
+source = "git+https://github.com/schenksj/quickwit#1fc14929c4788cd57440eebc59c9a34973e6e8f9"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3401,7 +3401,7 @@ dependencies = [
 [[package]]
 name = "quickwit-query"
 version = "0.8.0"
-source = "git+https://github.com/schenksj/quickwit#96111d59b4dae960cd918c1ae87925a8df35dba9"
+source = "git+https://github.com/schenksj/quickwit#1fc14929c4788cd57440eebc59c9a34973e6e8f9"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -3423,7 +3423,7 @@ dependencies = [
 [[package]]
 name = "quickwit-search"
 version = "0.8.0"
-source = "git+https://github.com/schenksj/quickwit#96111d59b4dae960cd918c1ae87925a8df35dba9"
+source = "git+https://github.com/schenksj/quickwit#1fc14929c4788cd57440eebc59c9a34973e6e8f9"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3467,7 +3467,7 @@ dependencies = [
 [[package]]
 name = "quickwit-storage"
 version = "0.8.0"
-source = "git+https://github.com/schenksj/quickwit#96111d59b4dae960cd918c1ae87925a8df35dba9"
+source = "git+https://github.com/schenksj/quickwit#1fc14929c4788cd57440eebc59c9a34973e6e8f9"
 dependencies = [
  "anyhow",
  "async-trait",

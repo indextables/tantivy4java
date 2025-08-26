@@ -28,7 +28,7 @@ futures = "0.3.31"
 once_cell = "1.19.0"
 bytesize = "1.3"
 
-# Quickwit dependencies with proper versions and features
+# Quickwit dependencies with proper versions and features - updated to latest upstream  
 quickwit-storage = { git = "https://github.com/schenksj/quickwit" }
 quickwit-metastore = { git = "https://github.com/schenksj/quickwit" }
 quickwit-proto = { git = "https://github.com/schenksj/quickwit" }
