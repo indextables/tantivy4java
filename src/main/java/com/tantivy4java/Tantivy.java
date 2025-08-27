@@ -43,30 +43,21 @@ public class Tantivy {
             return;
         }
 
-        String osName = System.getProperty("os.name").toLowerCase();
-        String osArch = System.getProperty("os.arch").toLowerCase();
-        
-        // Normalize architecture names
-        String normalizedArch;
-        if (osArch.equals("x86_64") || osArch.equals("amd64")) {
-            normalizedArch = "x86_64";
-        } else if (osArch.equals("aarch64") || osArch.equals("arm64")) {
-            normalizedArch = "aarch64";
-        } else {
-            normalizedArch = osArch;
-        }
+        // Detect actual runtime platform (works correctly in containers)
+        String osName = detectOS();
+        String osArch = detectArch();
         
         // Determine platform and library name
         String platform;
         String libraryName;
-        if (osName.contains("windows")) {
-            platform = "windows-" + normalizedArch;
+        if (osName.equals("windows")) {
+            platform = "windows-" + osArch;
             libraryName = "tantivy4java.dll";
-        } else if (osName.contains("mac") || osName.contains("darwin")) {
-            platform = "darwin-" + normalizedArch;
+        } else if (osName.equals("darwin")) {
+            platform = "darwin-" + osArch;
             libraryName = "libtantivy4java.dylib";
         } else {
-            platform = "linux-" + normalizedArch;
+            platform = "linux-" + osArch;
             libraryName = "libtantivy4java.so";
         }
 
@@ -98,6 +89,55 @@ public class Tantivy {
             throw new RuntimeException(
                 "Failed to load tantivy4java native library for platform: " + platform + 
                 ". Tried paths: " + String.join(", ", resourcePaths), e);
+        }
+    }
+    
+    /**
+     * Detect the actual OS, handling containers correctly.
+     */
+    private static String detectOS() {
+        String osName = System.getProperty("os.name").toLowerCase();
+        
+        // First check for Linux by looking for /proc/version
+        if (new java.io.File("/proc/version").exists()) {
+            return "linux";
+        }
+        
+        // Check for common container environment variables
+        if (System.getenv("KUBERNETES_SERVICE_HOST") != null ||
+            System.getenv("container") != null ||
+            new java.io.File("/.dockerenv").exists()) {
+            // In a container, check for Linux-specific files
+            if (new java.io.File("/etc/os-release").exists() ||
+                new java.io.File("/etc/alpine-release").exists()) {
+                return "linux";
+            }
+        }
+        
+        // Fall back to System property detection
+        if (osName.contains("windows")) {
+            return "windows";
+        } else if (osName.contains("mac") || osName.contains("darwin")) {
+            return "darwin";
+        } else {
+            return "linux";
+        }
+    }
+    
+    /**
+     * Detect the actual architecture, handling containers correctly.
+     */
+    private static String detectArch() {
+        String osArch = System.getProperty("os.arch").toLowerCase();
+        
+        // In containers, os.arch is generally reliable for architecture
+        // Normalize architecture names
+        if (osArch.equals("x86_64") || osArch.equals("amd64")) {
+            return "x86_64";
+        } else if (osArch.equals("aarch64") || osArch.equals("arm64")) {
+            return "aarch64";
+        } else {
+            return osArch;
         }
     }
 
