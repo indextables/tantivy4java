@@ -155,31 +155,77 @@
                 </executions>
             </plugin>
 
-            <!-- Copy native library to resources -->
+            <!-- Copy native library to resources - detects correct platform at runtime -->
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
-                <artifactId>maven-resources-plugin</artifactId>
-                <version>3.3.1</version>
+                <artifactId>maven-antrun-plugin</artifactId>
+                <version>3.1.0</version>
                 <executions>
                     <execution>
-                        <id>copy-native-lib</id>
+                        <id>detect-and-copy-native</id>
                         <phase>process-classes</phase>
                         <goals>
-                            <goal>copy-resources</goal>
+                            <goal>run</goal>
                         </goals>
                         <configuration>
-                            <outputDirectory>${project.build.outputDirectory}/native</outputDirectory>
-                            <resources>
-                                <!-- Copy native library built for current platform -->
-                                <resource>
-                                    <directory>${rust.target.dir}/release</directory>
-                                    <includes>
-                                        <include>libtantivy4java.so</include>
-                                        <include>libtantivy4java.dylib</include>
-                                        <include>tantivy4java.dll</include>
-                                    </includes>
-                                </resource>
-                            </resources>
+                            <target>
+                                <!-- Detect platform using uname for better container support -->
+                                <exec executable="sh" outputproperty="detected.os">
+                                    <arg value="-c"/>
+                                    <arg value="uname -s | tr '[:upper:]' '[:lower:]'"/>
+                                </exec>
+                                <exec executable="sh" outputproperty="detected.arch">
+                                    <arg value="-c"/>
+                                    <arg value="uname -m"/>
+                                </exec>
+                                
+                                <!-- Normalize OS name -->
+                                <condition property="os.platform" value="linux">
+                                    <contains string="${detected.os}" substring="linux"/>
+                                </condition>
+                                <condition property="os.platform" value="darwin">
+                                    <contains string="${detected.os}" substring="darwin"/>
+                                </condition>
+                                <condition property="os.platform" value="windows">
+                                    <contains string="${detected.os}" substring="mingw"/>
+                                </condition>
+                                <property name="os.platform" value="linux"/> <!-- Default to Linux -->
+                                
+                                <!-- Normalize architecture -->
+                                <condition property="os.arch" value="x86_64">
+                                    <or>
+                                        <equals arg1="${detected.arch}" arg2="x86_64"/>
+                                        <equals arg1="${detected.arch}" arg2="amd64"/>
+                                    </or>
+                                </condition>
+                                <condition property="os.arch" value="aarch64">
+                                    <or>
+                                        <equals arg1="${detected.arch}" arg2="aarch64"/>
+                                        <equals arg1="${detected.arch}" arg2="arm64"/>
+                                    </or>
+                                </condition>
+                                <property name="os.arch" value="${detected.arch}"/>
+                                
+                                <!-- Determine library name -->
+                                <condition property="lib.name" value="tantivy4java.dll">
+                                    <equals arg1="${os.platform}" arg2="windows"/>
+                                </condition>
+                                <condition property="lib.name" value="libtantivy4java.dylib">
+                                    <equals arg1="${os.platform}" arg2="darwin"/>
+                                </condition>
+                                <property name="lib.name" value="libtantivy4java.so"/> <!-- Default to .so -->
+                                
+                                <!-- Set full platform string -->
+                                <property name="platform.dir" value="${os.platform}-${os.arch}"/>
+                                
+                                <echo message="Detected platform: ${platform.dir}, library: ${lib.name}"/>
+                                
+                                <!-- Copy the library to the correct location -->
+                                <mkdir dir="${project.build.outputDirectory}/native/${platform.dir}"/>
+                                <copy file="${rust.target.dir}/release/${lib.name}" 
+                                      todir="${project.build.outputDirectory}/native/${platform.dir}"
+                                      failonerror="false"/>
+                            </target>
                         </configuration>
                     </execution>
                 </executions>
