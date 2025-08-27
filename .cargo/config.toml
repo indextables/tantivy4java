@@ -1,0 +1,6 @@
+# Native builds only - no cross-compilation
+# For Linux builds, use Docker containers
+
+# Enable static linking when building on Linux
+[target.'cfg(target_os = "linux")']
+rustflags = ["-C", "target-feature=+crt-static"]
