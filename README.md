@@ -80,37 +80,34 @@ mvn clean package
 
 This builds the native library for your current platform and packages it with the JAR.
 
-### Static Linux Builds (No External Dependencies)
+### Linux Container Builds
 
-For production deployments requiring no external dependencies, use Docker to create statically linked Linux builds with musl libc:
+For consistent Linux builds across different distributions, use Docker to create optimized Linux builds:
 
 ```bash
-# Using Ubuntu with rustup (recommended - avoids Alpine Rust limitations)
+# Using Ubuntu with rustup (recommended)
 docker run --rm --platform linux/amd64 \
   -v $(pwd):/workspace -w /workspace \
   ubuntu:22.04 sh -c '
     export DEBIAN_FRONTEND=noninteractive &&
     apt-get update &&
-    apt-get install -y build-essential curl openjdk-11-jdk maven pkg-config libssl-dev musl-tools musl-dev &&
+    apt-get install -y build-essential curl openjdk-11-jdk maven &&
     curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y &&
     export PATH="/root/.cargo/bin:${PATH}" &&
-    rustup target add x86_64-unknown-linux-musl &&
     export JAVA_HOME=/usr/lib/jvm/java-11-openjdk-amd64 &&
-    export RUSTFLAGS="-C target-feature=+crt-static -C target-cpu=x86-64" &&
-    export CC_x86_64_unknown_linux_musl=musl-gcc &&
     mvn clean package
   '
 
 # Or use the provided Dockerfile
-docker build --platform linux/amd64 -f Dockerfile.static-build -t tantivy4java-static .
+docker build --platform linux/amd64 -f Dockerfile.static-build -t tantivy4java-optimized .
 ```
 
-**Static Build Benefits:**
-- ✅ **Zero external dependencies** - No libc, libssl, or other shared libraries required
-- ✅ **Universal Linux compatibility** - Works on any Linux distribution (CentOS, Ubuntu, Alpine, etc.)
-- ✅ **Container optimized** - Compatible with scratch, distroless, and minimal images
-- ✅ **Serverless ready** - Perfect for AWS Lambda, Google Cloud Functions, and similar environments
-- ✅ **Security hardened** - Eliminates shared library attack vectors
+**Container Build Benefits:**
+- ✅ **Consistent builds** - Reproducible across different development environments
+- ✅ **Broad Linux compatibility** - Works on most modern Linux distributions  
+- ✅ **Container ready** - Optimized for Docker and container deployments
+- ✅ **CI/CD friendly** - Perfect for automated build pipelines
+- ✅ **Minimal dependencies** - Only requires standard system libraries (glibc)
 
 ### Running Tests
 ```bash

@@ -1,0 +1,21 @@
+# Multi-stage build for creating optimized Linux binaries
+# This builds tantivy4java optimized for x86_64 Linux
+
+FROM ubuntu:22.04 AS builder
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    curl \
+    openjdk-11-jdk \
+    maven \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Rust via rustup
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+# Set up environment for x86_64 optimized build
+ENV JAVA_HOME=/usr/lib/jvm/java-11-openjdk-amd64
+
+mvn install

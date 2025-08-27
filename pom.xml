@@ -202,9 +202,9 @@
 
     <!-- Build profiles -->
     <profiles>
-        <!-- Linux static build profile - automatically activates on Linux -->
+        <!-- Linux optimized build profile - automatically activates on Linux -->
         <profile>
-            <id>linux-static</id>
+            <id>linux-optimized</id>
             <activation>
                 <os>
                     <family>unix</family>
@@ -233,8 +233,8 @@
                                     </arguments>
                                     <workingDirectory>${project.basedir}/native</workingDirectory>
                                     <environmentVariables>
-                                        <!-- Force static linking when on Linux -->
-                                        <RUSTFLAGS>-C target-feature=+crt-static</RUSTFLAGS>
+                                        <!-- Optimize for x86_64 Linux -->
+                                        <RUSTFLAGS>-C target-cpu=x86-64</RUSTFLAGS>
                                     </environmentVariables>
                                 </configuration>
                             </execution>

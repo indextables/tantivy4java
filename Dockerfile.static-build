@@ -1,5 +1,5 @@
-# Multi-stage build for creating statically linked Linux binaries
-# This builds tantivy4java with no external dependencies for x86_64
+# Multi-stage build for creating optimized Linux binaries
+# This builds tantivy4java optimized for x86_64 Linux
 
 FROM --platform=linux/amd64 ubuntu:22.04 AS builder
 
@@ -9,36 +9,24 @@ RUN apt-get update && apt-get install -y \
     curl \
     openjdk-11-jdk \
     maven \
-    pkg-config \
-    libssl-dev \
-    musl-tools \
-    musl-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Rust via rustup for proper musl support
+# Install Rust via rustup
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 ENV PATH="/root/.cargo/bin:${PATH}"
 
-# Add musl target for static compilation
-RUN rustup target add x86_64-unknown-linux-musl
-
-# Set up environment for x86_64 static build
+# Set up environment for x86_64 optimized build
 ENV JAVA_HOME=/usr/lib/jvm/java-11-openjdk-amd64
-ENV RUSTFLAGS="-C target-feature=+crt-static -C target-cpu=x86-64"
-ENV CC_x86_64_unknown_linux_musl=musl-gcc
 
 # Copy source code
 WORKDIR /build
 COPY . .
 
-# Build with static linking for x86_64 musl
-RUN cd native && \
-    cargo build --release --target x86_64-unknown-linux-musl && \
-    cd .. && \
-    mvn clean compile
+# Build with Maven (will use linux-optimized profile automatically)
+RUN mvn clean package -DskipTests
 
-# Verify the binary has no external dependencies
-RUN ldd native/target/x86_64-unknown-linux-musl/release/libtantivy4java.so || echo "Static binary (no dependencies)"
+# Verify the binary was built correctly
+RUN ldd target/rust/release/libtantivy4java.so
 
 # Final stage - minimal Ubuntu image for x86_64
 FROM --platform=linux/amd64 ubuntu:22.04

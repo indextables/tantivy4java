@@ -9,11 +9,11 @@ mvn clean package
 
 This will build the native library for your current platform and package it with the JAR.
 
-## Static Linux Builds (No External Dependencies)
+## Linux Container Builds
 
-For Linux builds with no external dependencies (statically linked), use Docker to build inside a Linux container with musl libc.
+For consistent Linux builds that work across distributions, use Docker to build inside a Linux container.
 
-> **Note**: Static builds require a Linux environment because Alpine's Rust compiler has limitations with cdylib/proc-macro support for musl targets. The Ubuntu-based approach uses rustup for proper musl toolchain support.
+> **Important**: True static linking (no external dependencies) is not currently supported due to Rust limitations with `cdylib` crate types and `crt-static`. The builds below produce portable Linux binaries that depend on system libc but work on most Linux distributions.
 
 ### Method 1: Using Ubuntu Container (Recommended)
 
@@ -27,19 +27,11 @@ docker run --rm --platform linux/amd64 \
       build-essential \
       curl \
       openjdk-11-jdk \
-      maven \
-      pkg-config \
-      libssl-dev \
-      musl-tools \
-      musl-dev &&
+      maven &&
     
     curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y &&
     export PATH="/root/.cargo/bin:${PATH}" &&
-    rustup target add x86_64-unknown-linux-musl &&
-    
     export JAVA_HOME=/usr/lib/jvm/java-11-openjdk-amd64 &&
-    export RUSTFLAGS="-C target-feature=+crt-static -C target-cpu=x86-64" &&
-    export CC_x86_64_unknown_linux_musl=musl-gcc &&
     
     mvn clean package
   '
@@ -65,19 +57,19 @@ For testing and validation, you can use the provided test script:
 ./test-static-build.sh
 ```
 
-### Benefits of Static Builds
-- ✅ **No external dependencies** - Statically linked with musl libc
-- ✅ **Universal Linux compatibility** - Works on any Linux distribution
-- ✅ **Minimal container images** - Compatible with scratch and distroless images
-- ✅ **Serverless ready** - Perfect for AWS Lambda, Google Cloud Functions, etc.
-- ✅ **Security hardened** - Eliminates shared library vulnerabilities
-- ✅ **x86_64 optimized** - Compiled with target-cpu=x86-64 for performance
+### Benefits of Container Builds
+- ✅ **Consistent Linux binaries** - Reproducible builds across environments
+- ✅ **Broad Linux compatibility** - Works on most modern Linux distributions
+- ✅ **Container ready** - Suitable for Docker and container deployments
+- ✅ **CI/CD friendly** - Perfect for automated build pipelines
+- ✅ **x86_64 optimized** - Native compilation for optimal performance
+- ✅ **Clean dependencies** - Only requires system libc (available everywhere)
 
 ### Technical Implementation
-- **musl libc static linking** - Uses `RUSTFLAGS="-C target-feature=+crt-static"`
-- **Ubuntu + rustup toolchain** - Avoids Alpine's Rust compiler limitations
-- **Proper musl-gcc setup** - Cross-compilation support with musl-tools
-- **JNI compatibility** - Full Java Native Interface support in static builds
+- **Native compilation** - Builds for the container's native target
+- **Ubuntu + rustup toolchain** - Modern Rust toolchain with full feature support
+- **Standard glibc linking** - Compatible with virtually all Linux systems
+- **JNI compatibility** - Full Java Native Interface support
 
 ## Build Output
 
@@ -94,12 +86,12 @@ The JAR file will be created in `target/tantivy4java-*.jar` with the native libr
 
 ## Troubleshooting
 
-### Common Static Build Issues
+### Common Build Issues
 
-**"cannot produce cdylib" or "cannot produce proc-macro" errors:**
-- This occurs when using Alpine's packaged Rust compiler
-- **Solution**: Use the Ubuntu-based approach with rustup (Method 1 above)
-- Alpine's Rust 1.87.0 has known limitations with musl targets
+**"cannot produce cdylib" errors:**
+- This occurs when attempting true static linking with `crt-static`
+- **Root cause**: Rust's `crt-static` feature is incompatible with `cdylib` crate types
+- **Solution**: Use regular dynamic linking (Method 1 above) - still very portable
 
 **Docker disk space errors:**
 - Static builds download many dependencies (1-2GB)
@@ -114,13 +106,13 @@ The JAR file will be created in `target/tantivy4java-*.jar` with the native libr
 
 ### Verification
 
-To verify a static build has no external dependencies:
+To verify the build works correctly:
 ```bash
 # Check the built library
-ldd target/x86_64-unknown-linux-musl/release/libtantivy4java.so
-# Should output: "not a dynamic executable" or "statically linked"
+ldd target/rust/release/libtantivy4java.so
+# Should show minimal dependencies (typically just libc, libdl, libpthread)
 
-# Or in container:
-file target/x86_64-unknown-linux-musl/release/libtantivy4java.so
-# Should show: "statically linked"
+# Or check file type:
+file target/rust/release/libtantivy4java.so
+# Should show: "ELF 64-bit LSB shared object, x86-64"
 ```
