@@ -45,51 +45,31 @@ public class Tantivy {
 
         // Detect actual runtime platform (works correctly in containers)
         String osName = detectOS();
-        String osArch = detectArch();
-        
-        // Determine platform and library name
-        String platform;
+       
         String libraryName;
-        if (osName.equals("windows")) {
-            platform = "windows-" + osArch;
+        if (osName.contains("windows")) {
             libraryName = "tantivy4java.dll";
-        } else if (osName.equals("darwin")) {
-            platform = "darwin-" + osArch;
+        } else if (osName.contains("mac") || osName.contains("darwin")) {
             libraryName = "libtantivy4java.dylib";
         } else {
-            platform = "linux-" + osArch;
             libraryName = "libtantivy4java.so";
         }
 
-        // Try platform-specific path first, then fallback to generic path
-        String[] resourcePaths = {
-            "/native/" + platform + "/" + libraryName,
-            "/native/" + libraryName
-        };
-        
-        for (String resourcePath : resourcePaths) {
-            try {
-                InputStream is = Tantivy.class.getResourceAsStream(resourcePath);
-                if (is != null) {
-                    Path tempFile = Files.createTempFile("tantivy4java-" + platform, libraryName);
-                    Files.copy(is, tempFile, StandardCopyOption.REPLACE_EXISTING);
-                    System.load(tempFile.toAbsolutePath().toString());
-                    loaded = true;
-                    return;
-                }
-            } catch (Exception e) {
-                // Try next path or fall back to system library loading
+        try {
+            // Try to load from resources first
+            InputStream is = Tantivy.class.getResourceAsStream("/native/" + libraryName);
+            if (is != null) {
+                Path tempFile = Files.createTempFile("tantivy4java", libraryName);
+                Files.copy(is, tempFile, StandardCopyOption.REPLACE_EXISTING);
+                System.load(tempFile.toAbsolutePath().toString());
+                loaded = true;
+                return;
             }
+            throw new RuntimeException("Native library not found in resources: /native/" + libraryName);
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to load tantivy4java native library: " + libraryName, e);
         }
 
-        try {
-            System.loadLibrary("tantivy4java");
-            loaded = true;
-        } catch (UnsatisfiedLinkError e) {
-            throw new RuntimeException(
-                "Failed to load tantivy4java native library for platform: " + platform + 
-                ". Tried paths: " + String.join(", ", resourcePaths), e);
-        }
     }
     
     /**
@@ -124,23 +104,6 @@ public class Tantivy {
         }
     }
     
-    /**
-     * Detect the actual architecture, handling containers correctly.
-     */
-    private static String detectArch() {
-        String osArch = System.getProperty("os.arch").toLowerCase();
-        
-        // In containers, os.arch is generally reliable for architecture
-        // Normalize architecture names
-        if (osArch.equals("x86_64") || osArch.equals("amd64")) {
-            return "x86_64";
-        } else if (osArch.equals("aarch64") || osArch.equals("arm64")) {
-            return "aarch64";
-        } else {
-            return osArch;
-        }
-    }
-
     /**
      * Get the version of the Tantivy4Java library.
      * @return Version string
