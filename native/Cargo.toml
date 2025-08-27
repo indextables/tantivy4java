@@ -10,9 +10,6 @@ description = "JNI bindings for Tantivy search engine"
 name = "tantivy4java"
 crate-type = ["cdylib"]
 
-# Enable static linking when building on Linux
-[target.'cfg(target_os = "linux")']
-rustflags = ["-C", "target-feature=+crt-static"]
 
 [dependencies]
 # Use the exact same tantivy version as Quickwit to avoid conflicts  

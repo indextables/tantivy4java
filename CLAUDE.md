@@ -413,55 +413,49 @@ Tantivy4Java now provides comprehensive schema introspection capabilities, allow
 - **Schema summary generation** with detailed metadata formatting ✅
 - **SplitSearcher integration** demonstrating real-world usage patterns ✅
 
-#### **🏗️ COMPLETE CROSS-PLATFORM BUILD SYSTEM IMPLEMENTATION**
+#### **🏗️ SIMPLIFIED BUILD SYSTEM IMPLEMENTATION**
 
-**Maven-Driven Cross-Platform Native Library Builds**
+**Native Platform Builds with Docker-Based Linux Static Compilation**
 
-Tantivy4Java now provides complete cross-platform build support through Maven profiles without external scripts:
+Tantivy4Java now provides a simplified build approach focusing on native compilation:
 
-**✅ Cross-Platform Build Architecture:**
-- **Native Maven Integration** - All builds managed through Maven profiles without external scripts
-- **Platform-Specific Targets** - Individual and multi-platform build support
-- **Intelligent Resource Copying** - Platform-specific library organization in JARs
-- **Automatic Runtime Detection** - Java library loader selects appropriate native library
+**✅ Build Architecture:**
+- **Native Builds Only** - No complex cross-compilation setup
+- **Platform-Native Compilation** - Build on the target platform for best compatibility
+- **Docker for Linux Static Builds** - Use containers for fully static Linux binaries
+- **Automatic Static Linking on Linux** - RUSTFLAGS automatically applied when building on Linux
 
-**✅ Supported Platform Matrix:**
-- **macOS ARM64** (aarch64-apple-darwin) - Native and cross-compilation
-- **Linux x86_64** (x86_64-unknown-linux-gnu) - Cross-compilation with proper sysroot
-- **Linux ARM64** (aarch64-unknown-linux-gnu) - Cross-compilation with proper sysroot
+**✅ Supported Platforms:**
+- **macOS** (Intel and Apple Silicon) - Native builds
+- **Linux x86_64/ARM64** - Native or Docker-based static builds
+- **Windows x86_64** - Native builds
 
-**✅ Build Command Options:**
+**✅ Build Commands:**
 ```bash
-# Current platform only (default)
+# Current platform only (always native)
 mvn clean package
 
-# All supported platforms  
-mvn clean package -Pcross-compile
+# Static Linux build (no external dependencies)
+docker run --rm -v $(pwd):/workspace -w /workspace alpine:latest sh -c \
+  'apk add --no-cache build-base rust cargo openjdk11 maven musl-dev && \
+   export JAVA_HOME=/usr/lib/jvm/java-11-openjdk && \
+   export RUSTFLAGS="-C target-feature=+crt-static" && \
+   mvn clean package'
 
-# Individual platforms
-mvn clean package -Pdarwin-aarch64
-mvn clean package -Plinux-x86_64  
-mvn clean package -Plinux-aarch64
-
-# Multiple platforms
-mvn clean package -Pdarwin-aarch64,linux-x86_64
+# Or use the provided Dockerfile
+docker build -f Dockerfile.static-build -t tantivy4java-static .
 ```
 
-**✅ JAR Structure Optimization:**
-- **Cross-compile profile**: Creates platform-specific directories (no duplicates)
-- **Single-platform builds**: Each creates JAR with only that platform's library
-- **Automatic platform detection**: Java loader selects correct library at runtime
+**✅ Static Linux Benefits:**
+- **No External Dependencies** - Completely self-contained binaries
+- **Universal Compatibility** - Works on any Linux distribution
+- **Container-Friendly** - Perfect for minimal Docker images
+- **Simplified Deployment** - No library dependency management
 
-**✅ Cross-Compilation Toolchain:**
-- **Proper Sysroot Configuration** - Linux cross-compilers with system headers
-- **Messense Toolchain Integration** - Modern cross-compilation toolchain with complete sysroot
-- **Cargo Configuration** - Automatic linker and compiler setup
-- **Updated Setup Script** - `install-cross-compile.sh` installs complete toolchain
-
-**✅ CI/CD Optimization:**
-- **Parallel builds**: Each platform can be built independently
-- **Resource efficiency**: Build only needed platforms
-- **JAR structure**: Clean platform-specific organization
+**✅ Build Simplification:**
+- **Single JAR Structure** - One native library per platform at `/native/libtantivy4java.{so,dylib,dll}`
+- **No Complex Toolchains** - Native builds avoid cross-compilation complexity
+- **Reliable Builds** - Native compilation always works correctly
 
 ### **🏗️ VALIDATED SHARED CACHE ARCHITECTURE IMPLEMENTATION**
 

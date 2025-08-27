@@ -61,40 +61,56 @@ Tantivy4Java is a production-ready JNI wrapper for the Rust-based Tantivy search
 - **Custom Endpoints** - Support for mock servers and development environments
 - **Credential Management** - AWS access keys, secret keys, session tokens, and IAM roles
 
-### Cross-Platform Support
-- **macOS ARM64** (aarch64-apple-darwin)
-- **Linux x86_64** (x86_64-unknown-linux-gnu)
-- **Linux ARM64** (aarch64-unknown-linux-gnu)
-- **Maven Integration** - Complete build system with platform-specific profiles
+### Platform Support
+- **macOS** (Intel and Apple Silicon)
+- **Linux** (x86_64 and ARM64)
+- **Windows** (x86_64)
 
 ## Building the Project
 
 ### Prerequisites
 - Java 11 or higher
 - Maven 3.6+
-- Rust toolchain (for native compilation)
+- Rust toolchain (installed automatically if needed)
 
-### Quick Build (Current Platform)
+### Build for Current Platform
 ```bash
 mvn clean package
 ```
 
-### Cross-Platform Build
+This builds the native library for your current platform and packages it with the JAR.
+
+### Static Linux Builds (No External Dependencies)
+
+For production deployments requiring no external dependencies, use Docker to create statically linked Linux builds with musl libc:
+
 ```bash
-# Install cross-compilation toolchain
-./install-cross-compile.sh
+# Using Ubuntu with rustup (recommended - avoids Alpine Rust limitations)
+docker run --rm --platform linux/amd64 \
+  -v $(pwd):/workspace -w /workspace \
+  ubuntu:22.04 sh -c '
+    export DEBIAN_FRONTEND=noninteractive &&
+    apt-get update &&
+    apt-get install -y build-essential curl openjdk-11-jdk maven pkg-config libssl-dev musl-tools musl-dev &&
+    curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y &&
+    export PATH="/root/.cargo/bin:${PATH}" &&
+    rustup target add x86_64-unknown-linux-musl &&
+    export JAVA_HOME=/usr/lib/jvm/java-11-openjdk-amd64 &&
+    export RUSTFLAGS="-C target-feature=+crt-static -C target-cpu=x86-64" &&
+    export CC_x86_64_unknown_linux_musl=musl-gcc &&
+    mvn clean package
+  '
 
-# Build for all supported platforms
-mvn clean package -Pcross-compile
-
-# Build for specific platforms
-mvn clean package -Pdarwin-aarch64
-mvn clean package -Plinux-x86_64
-mvn clean package -Plinux-aarch64
-
-# Build for multiple platforms
-mvn clean package -Pdarwin-aarch64,linux-x86_64
+# Or use the provided Dockerfile
+docker build --platform linux/amd64 -f Dockerfile.static-build -t tantivy4java-static .
 ```
+
+**Static Build Benefits:**
+- ✅ **Zero external dependencies** - No libc, libssl, or other shared libraries required
+- ✅ **Universal Linux compatibility** - Works on any Linux distribution (CentOS, Ubuntu, Alpine, etc.)
+- ✅ **Container optimized** - Compatible with scratch, distroless, and minimal images
+- ✅ **Serverless ready** - Perfect for AWS Lambda, Google Cloud Functions, and similar environments
+- ✅ **Security hardened** - Eliminates shared library attack vectors
 
 ### Running Tests
 ```bash

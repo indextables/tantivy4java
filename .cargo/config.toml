@@ -1,6 +1,13 @@
 # Native builds only - no cross-compilation
 # For Linux builds, use Docker containers
 
-# Enable static linking when building on Linux
-[target.'cfg(target_os = "linux")']
+# Static linking configuration for musl targets
+[target.x86_64-unknown-linux-musl]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.aarch64-unknown-linux-musl]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+# Alpine Linux default target
+[target.x86_64-alpine-linux-musl]
 rustflags = ["-C", "target-feature=+crt-static"]

@@ -1,39 +1,50 @@
 # Multi-stage build for creating statically linked Linux binaries
-# This builds tantivy4java with no external dependencies
+# This builds tantivy4java with no external dependencies for x86_64
 
-FROM alpine:latest AS builder
+FROM --platform=linux/amd64 ubuntu:22.04 AS builder
 
 # Install build dependencies
-RUN apk add --no-cache \
-    build-base \
-    musl-dev \
-    rust \
-    cargo \
-    openjdk11 \
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    curl \
+    openjdk-11-jdk \
     maven \
-    pkgconfig \
-    openssl-dev \
-    openssl-libs-static
+    pkg-config \
+    libssl-dev \
+    musl-tools \
+    musl-dev \
+    && rm -rf /var/lib/apt/lists/*
 
-# Set up environment
-ENV JAVA_HOME=/usr/lib/jvm/java-11-openjdk
-ENV RUSTFLAGS="-C target-feature=+crt-static"
+# Install Rust via rustup for proper musl support
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+# Add musl target for static compilation
+RUN rustup target add x86_64-unknown-linux-musl
+
+# Set up environment for x86_64 static build
+ENV JAVA_HOME=/usr/lib/jvm/java-11-openjdk-amd64
+ENV RUSTFLAGS="-C target-feature=+crt-static -C target-cpu=x86-64"
+ENV CC_x86_64_unknown_linux_musl=musl-gcc
 
 # Copy source code
 WORKDIR /build
 COPY . .
 
-# Build with static linking
-RUN mvn clean package -Dquiet=true
+# Build with static linking for x86_64 musl
+RUN cd native && \
+    cargo build --release --target x86_64-unknown-linux-musl && \
+    cd .. && \
+    mvn clean compile
 
 # Verify the binary has no external dependencies
-RUN ldd target/classes/native/libtantivy4java.so || echo "Static binary (no dependencies)"
+RUN ldd native/target/x86_64-unknown-linux-musl/release/libtantivy4java.so || echo "Static binary (no dependencies)"
 
-# Final stage - minimal Alpine image
-FROM alpine:latest
+# Final stage - minimal Ubuntu image for x86_64
+FROM --platform=linux/amd64 ubuntu:22.04
 
 # Install only Java runtime
-RUN apk add --no-cache openjdk11-jre
+RUN apt-get update && apt-get install -y openjdk-11-jre-headless && rm -rf /var/lib/apt/lists/*
 
 # Copy the built JAR
 COPY --from=builder /build/target/tantivy4java-*.jar /app/tantivy4java.jar
