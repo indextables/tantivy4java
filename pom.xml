@@ -170,26 +170,13 @@
                         <configuration>
                             <outputDirectory>${project.build.outputDirectory}/native</outputDirectory>
                             <resources>
-                                <!-- Copy cross-compiled libraries only -->
+                                <!-- Copy native library built for current platform -->
                                 <resource>
-                                    <directory>${rust.target.dir}/aarch64-apple-darwin/release</directory>
-                                    <targetPath>darwin-aarch64</targetPath>
+                                    <directory>${rust.target.dir}/release</directory>
                                     <includes>
+                                        <include>libtantivy4java.so</include>
                                         <include>libtantivy4java.dylib</include>
-                                    </includes>
-                                </resource>
-                                <resource>
-                                    <directory>${rust.target.dir}/x86_64-unknown-linux-gnu/release</directory>
-                                    <targetPath>linux-x86_64</targetPath>
-                                    <includes>
-                                        <include>libtantivy4java.so</include>
-                                    </includes>
-                                </resource>
-                                <resource>
-                                    <directory>${rust.target.dir}/aarch64-unknown-linux-gnu/release</directory>
-                                    <targetPath>linux-aarch64</targetPath>
-                                    <includes>
-                                        <include>libtantivy4java.so</include>
+                                        <include>tantivy4java.dll</include>
                                     </includes>
                                 </resource>
                             </resources>
@@ -220,6 +207,42 @@
             <id>cross-compile</id>
             <build>
                 <plugins>
+                    <!-- Override resource copying for cross-compilation -->
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-resources-plugin</artifactId>
+                        <executions>
+                            <execution>
+                                <id>copy-native-lib</id>
+                                <configuration>
+                                    <resources>
+                                        <!-- Copy cross-compiled libraries to platform-specific directories -->
+                                        <resource>
+                                            <directory>${rust.target.dir}/aarch64-apple-darwin/release</directory>
+                                            <targetPath>darwin-aarch64</targetPath>
+                                            <includes>
+                                                <include>libtantivy4java.dylib</include>
+                                            </includes>
+                                        </resource>
+                                        <resource>
+                                            <directory>${rust.target.dir}/x86_64-unknown-linux-gnu/release</directory>
+                                            <targetPath>linux-x86_64</targetPath>
+                                            <includes>
+                                                <include>libtantivy4java.so</include>
+                                            </includes>
+                                        </resource>
+                                        <resource>
+                                            <directory>${rust.target.dir}/aarch64-unknown-linux-gnu/release</directory>
+                                            <targetPath>linux-aarch64</targetPath>
+                                            <includes>
+                                                <include>libtantivy4java.so</include>
+                                            </includes>
+                                        </resource>
+                                    </resources>
+                                </configuration>
+                            </execution>
+                        </executions>
+                    </plugin>
                     <!-- Install Rust targets -->
                     <plugin>
                         <groupId>org.codehaus.mojo</groupId>
@@ -473,41 +496,5 @@
             </build>
         </profile>
 
-        <!-- Default single-platform build (when not using cross-compile) -->
-        <profile>
-            <id>single-platform</id>
-            <activation>
-                <property>
-                    <name>!cross-compile</name>
-                </property>
-            </activation>
-            <build>
-                <plugins>
-                    <!-- Override resource copying for single platform -->
-                    <plugin>
-                        <groupId>org.apache.maven.plugins</groupId>
-                        <artifactId>maven-resources-plugin</artifactId>
-                        <executions>
-                            <execution>
-                                <id>copy-native-lib</id>
-                                <configuration>
-                                    <resources>
-                                        <!-- Copy current platform library to generic location -->
-                                        <resource>
-                                            <directory>${rust.target.dir}/release</directory>
-                                            <includes>
-                                                <include>libtantivy4java.so</include>
-                                                <include>libtantivy4java.dylib</include>
-                                                <include>tantivy4java.dll</include>
-                                            </includes>
-                                        </resource>
-                                    </resources>
-                                </configuration>
-                            </execution>
-                        </executions>
-                    </plugin>
-                </plugins>
-            </build>
-        </profile>
     </profiles>
 </project>
