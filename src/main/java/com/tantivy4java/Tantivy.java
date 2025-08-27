@@ -43,7 +43,7 @@ public class Tantivy {
             return;
         }
 
-        // Detect actual runtime platform (works correctly in containers)
+        // Detect actual runtime platform
         String osName = detectOS();
        
         String libraryName;
@@ -56,8 +56,9 @@ public class Tantivy {
         }
 
         try {
-            // Try to load from resources first
+            // Load from resources
             InputStream is = Tantivy.class.getResourceAsStream("/native/" + libraryName);
+            
             if (is != null) {
                 Path tempFile = Files.createTempFile("tantivy4java", libraryName);
                 Files.copy(is, tempFile, StandardCopyOption.REPLACE_EXISTING);
@@ -65,6 +66,7 @@ public class Tantivy {
                 loaded = true;
                 return;
             }
+            
             throw new RuntimeException("Native library not found in resources: /native/" + libraryName);
         } catch (Exception e) {
             throw new RuntimeException("Failed to load tantivy4java native library: " + libraryName, e);
@@ -103,6 +105,7 @@ public class Tantivy {
             return "linux";
         }
     }
+    
     
     /**
      * Get the version of the Tantivy4Java library.

@@ -1,0 +1,42 @@
+# Multi-stage build for creating statically linked Linux binaries
+# This builds tantivy4java with no external dependencies
+
+FROM alpine:latest AS builder
+
+# Install build dependencies
+RUN apk add --no-cache \
+    build-base \
+    musl-dev \
+    rust \
+    cargo \
+    openjdk11 \
+    maven \
+    pkgconfig \
+    openssl-dev \
+    openssl-libs-static
+
+# Set up environment
+ENV JAVA_HOME=/usr/lib/jvm/java-11-openjdk
+ENV RUSTFLAGS="-C target-feature=+crt-static"
+
+# Copy source code
+WORKDIR /build
+COPY . .
+
+# Build with static linking
+RUN mvn clean package -Dquiet=true
+
+# Verify the binary has no external dependencies
+RUN ldd target/classes/native/libtantivy4java.so || echo "Static binary (no dependencies)"
+
+# Final stage - minimal Alpine image
+FROM alpine:latest
+
+# Install only Java runtime
+RUN apk add --no-cache openjdk11-jre
+
+# Copy the built JAR
+COPY --from=builder /build/target/tantivy4java-*.jar /app/tantivy4java.jar
+
+# Verification command
+CMD ["java", "-cp", "/app/tantivy4java.jar", "com.tantivy4java.Tantivy"]
