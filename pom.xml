@@ -46,6 +46,69 @@
             <artifactId>jackson-databind</artifactId>
             <version>2.15.2</version>
         </dependency>
+        
+        <!-- AWS SDK for S3 testing -->
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>s3</artifactId>
+            <version>2.21.29</version>
+            <scope>test</scope>
+        </dependency>
+        
+        <!-- Azure Storage Blob -->
+        <dependency>
+            <groupId>com.azure</groupId>
+            <artifactId>azure-storage-blob</artifactId>
+            <version>12.23.0</version>
+            <scope>test</scope>
+        </dependency>
+        
+        <!-- GCP Cloud Storage -->
+        <dependency>
+            <groupId>com.google.cloud</groupId>
+            <artifactId>google-cloud-storage</artifactId>
+            <version>2.29.1</version>
+            <scope>test</scope>
+        </dependency>
+        
+        <!-- GCP NIO for LocalStorageHelper (pure Java, no Docker) -->
+        <dependency>
+            <groupId>com.google.cloud</groupId>
+            <artifactId>google-cloud-nio</artifactId>
+            <version>0.127.12</version>
+            <scope>test</scope>
+        </dependency>
+        
+        <!-- Mockito for mocking Azure and other services -->
+        <dependency>
+            <groupId>org.mockito</groupId>
+            <artifactId>mockito-core</artifactId>
+            <version>5.7.0</version>
+            <scope>test</scope>
+        </dependency>
+        
+        <dependency>
+            <groupId>org.mockito</groupId>
+            <artifactId>mockito-junit-jupiter</artifactId>
+            <version>5.7.0</version>
+            <scope>test</scope>
+        </dependency>
+        
+        <!-- Adobe S3Mock for S3 testing -->
+        <dependency>
+            <groupId>io.findify</groupId>
+            <artifactId>s3mock_2.13</artifactId>
+            <version>0.2.6</version>
+            <scope>test</scope>
+        </dependency>
+        
+        <!-- Scala library (required by S3Mock) -->
+        <dependency>
+            <groupId>org.scala-lang</groupId>
+            <artifactId>scala-library</artifactId>
+            <version>2.13.12</version>
+            <scope>test</scope>
+        </dependency>
     </dependencies>
 
     <build>
@@ -66,7 +129,7 @@
                 <version>3.1.2</version>
             </plugin>
 
-            <!-- Native library build plugin -->
+            <!-- Native library build plugin - builds for current platform by default -->
             <plugin>
                 <groupId>org.codehaus.mojo</groupId>
                 <artifactId>exec-maven-plugin</artifactId>
@@ -107,12 +170,26 @@
                         <configuration>
                             <outputDirectory>${project.build.outputDirectory}/native</outputDirectory>
                             <resources>
+                                <!-- Copy cross-compiled libraries only -->
                                 <resource>
-                                    <directory>${rust.target.dir}/release</directory>
+                                    <directory>${rust.target.dir}/aarch64-apple-darwin/release</directory>
+                                    <targetPath>darwin-aarch64</targetPath>
+                                    <includes>
+                                        <include>libtantivy4java.dylib</include>
+                                    </includes>
+                                </resource>
+                                <resource>
+                                    <directory>${rust.target.dir}/x86_64-unknown-linux-gnu/release</directory>
+                                    <targetPath>linux-x86_64</targetPath>
                                     <includes>
                                         <include>libtantivy4java.so</include>
-                                        <include>libtantivy4java.dylib</include>
-                                        <include>tantivy4java.dll</include>
+                                    </includes>
+                                </resource>
+                                <resource>
+                                    <directory>${rust.target.dir}/aarch64-unknown-linux-gnu/release</directory>
+                                    <targetPath>linux-aarch64</targetPath>
+                                    <includes>
+                                        <include>libtantivy4java.so</include>
                                     </includes>
                                 </resource>
                             </resources>
@@ -136,4 +213,301 @@
             </plugin>
         </plugins>
     </build>
+
+    <profiles>
+        <!-- Cross-compilation profile for all platforms -->
+        <profile>
+            <id>cross-compile</id>
+            <build>
+                <plugins>
+                    <!-- Install Rust targets -->
+                    <plugin>
+                        <groupId>org.codehaus.mojo</groupId>
+                        <artifactId>exec-maven-plugin</artifactId>
+                        <version>3.1.0</version>
+                        <executions>
+                            <!-- Install required Rust targets -->
+                            <execution>
+                                <id>install-targets</id>
+                                <phase>initialize</phase>
+                                <goals>
+                                    <goal>exec</goal>
+                                </goals>
+                                <configuration>
+                                    <executable>rustup</executable>
+                                    <arguments>
+                                        <argument>target</argument>
+                                        <argument>add</argument>
+                                        <argument>aarch64-apple-darwin</argument>
+                                        <argument>x86_64-unknown-linux-gnu</argument>
+                                        <argument>aarch64-unknown-linux-gnu</argument>
+                                    </arguments>
+                                </configuration>
+                            </execution>
+                            <!-- Build for macOS ARM64 -->
+                            <execution>
+                                <id>build-darwin-aarch64</id>
+                                <phase>compile</phase>
+                                <goals>
+                                    <goal>exec</goal>
+                                </goals>
+                                <configuration>
+                                    <executable>cargo</executable>
+                                    <arguments>
+                                        <argument>build</argument>
+                                        <argument>--release</argument>
+                                        <argument>--target</argument>
+                                        <argument>aarch64-apple-darwin</argument>
+                                        <argument>--target-dir</argument>
+                                        <argument>${rust.target.dir}</argument>
+                                    </arguments>
+                                    <workingDirectory>${project.basedir}/native</workingDirectory>
+                                </configuration>
+                            </execution>
+                            <!-- Build for Linux x86_64 -->
+                            <execution>
+                                <id>build-linux-x86_64</id>
+                                <phase>compile</phase>
+                                <goals>
+                                    <goal>exec</goal>
+                                </goals>
+                                <configuration>
+                                    <executable>cargo</executable>
+                                    <arguments>
+                                        <argument>build</argument>
+                                        <argument>--release</argument>
+                                        <argument>--target</argument>
+                                        <argument>x86_64-unknown-linux-gnu</argument>
+                                        <argument>--target-dir</argument>
+                                        <argument>${rust.target.dir}</argument>
+                                    </arguments>
+                                    <workingDirectory>${project.basedir}/native</workingDirectory>
+                                    <successCodes>
+                                        <successCode>0</successCode>
+                                        <successCode>101</successCode> <!-- Allow compilation to fail gracefully -->
+                                    </successCodes>
+                                </configuration>
+                            </execution>
+                            <!-- Build for Linux ARM64 -->
+                            <execution>
+                                <id>build-linux-aarch64</id>
+                                <phase>compile</phase>
+                                <goals>
+                                    <goal>exec</goal>
+                                </goals>
+                                <configuration>
+                                    <executable>cargo</executable>
+                                    <arguments>
+                                        <argument>build</argument>
+                                        <argument>--release</argument>
+                                        <argument>--target</argument>
+                                        <argument>aarch64-unknown-linux-gnu</argument>
+                                        <argument>--target-dir</argument>
+                                        <argument>${rust.target.dir}</argument>
+                                    </arguments>
+                                    <workingDirectory>${project.basedir}/native</workingDirectory>
+                                    <successCodes>
+                                        <successCode>0</successCode>
+                                        <successCode>101</successCode> <!-- Allow compilation to fail gracefully -->
+                                    </successCodes>
+                                </configuration>
+                            </execution>
+                        </executions>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+
+        <!-- Platform-specific profiles for single-platform builds -->
+
+        <profile>
+            <id>darwin-aarch64</id>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.codehaus.mojo</groupId>
+                        <artifactId>exec-maven-plugin</artifactId>
+                        <executions>
+                            <execution>
+                                <id>build-rust</id>
+                                <phase>compile</phase>
+                                <configuration>
+                                    <executable>cargo</executable>
+                                    <arguments>
+                                        <argument>build</argument>
+                                        <argument>--release</argument>
+                                        <argument>--target</argument>
+                                        <argument>aarch64-apple-darwin</argument>
+                                        <argument>--target-dir</argument>
+                                        <argument>${rust.target.dir}</argument>
+                                    </arguments>
+                                    <workingDirectory>${project.basedir}/native</workingDirectory>
+                                </configuration>
+                            </execution>
+                        </executions>
+                    </plugin>
+                    <!-- Copy only darwin-aarch64 library -->
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-resources-plugin</artifactId>
+                        <executions>
+                            <execution>
+                                <id>copy-native-lib</id>
+                                <configuration>
+                                    <resources>
+                                        <resource>
+                                            <directory>${rust.target.dir}/aarch64-apple-darwin/release</directory>
+                                            <targetPath>darwin-aarch64</targetPath>
+                                            <includes>
+                                                <include>libtantivy4java.dylib</include>
+                                            </includes>
+                                        </resource>
+                                    </resources>
+                                </configuration>
+                            </execution>
+                        </executions>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+
+        <profile>
+            <id>linux-x86_64</id>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.codehaus.mojo</groupId>
+                        <artifactId>exec-maven-plugin</artifactId>
+                        <executions>
+                            <execution>
+                                <id>build-rust</id>
+                                <phase>compile</phase>
+                                <configuration>
+                                    <executable>cargo</executable>
+                                    <arguments>
+                                        <argument>build</argument>
+                                        <argument>--release</argument>
+                                        <argument>--target</argument>
+                                        <argument>x86_64-unknown-linux-gnu</argument>
+                                        <argument>--target-dir</argument>
+                                        <argument>${rust.target.dir}</argument>
+                                    </arguments>
+                                    <workingDirectory>${project.basedir}/native</workingDirectory>
+                                </configuration>
+                            </execution>
+                        </executions>
+                    </plugin>
+                    <!-- Copy only linux-x86_64 library -->
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-resources-plugin</artifactId>
+                        <executions>
+                            <execution>
+                                <id>copy-native-lib</id>
+                                <configuration>
+                                    <resources>
+                                        <resource>
+                                            <directory>${rust.target.dir}/x86_64-unknown-linux-gnu/release</directory>
+                                            <targetPath>linux-x86_64</targetPath>
+                                            <includes>
+                                                <include>libtantivy4java.so</include>
+                                            </includes>
+                                        </resource>
+                                    </resources>
+                                </configuration>
+                            </execution>
+                        </executions>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+
+        <profile>
+            <id>linux-aarch64</id>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.codehaus.mojo</groupId>
+                        <artifactId>exec-maven-plugin</artifactId>
+                        <executions>
+                            <execution>
+                                <id>build-rust</id>
+                                <phase>compile</phase>
+                                <configuration>
+                                    <executable>cargo</executable>
+                                    <arguments>
+                                        <argument>build</argument>
+                                        <argument>--release</argument>
+                                        <argument>--target</argument>
+                                        <argument>aarch64-unknown-linux-gnu</argument>
+                                        <argument>--target-dir</argument>
+                                        <argument>${rust.target.dir}</argument>
+                                    </arguments>
+                                    <workingDirectory>${project.basedir}/native</workingDirectory>
+                                </configuration>
+                            </execution>
+                        </executions>
+                    </plugin>
+                    <!-- Copy only linux-aarch64 library -->
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-resources-plugin</artifactId>
+                        <executions>
+                            <execution>
+                                <id>copy-native-lib</id>
+                                <configuration>
+                                    <resources>
+                                        <resource>
+                                            <directory>${rust.target.dir}/aarch64-unknown-linux-gnu/release</directory>
+                                            <targetPath>linux-aarch64</targetPath>
+                                            <includes>
+                                                <include>libtantivy4java.so</include>
+                                            </includes>
+                                        </resource>
+                                    </resources>
+                                </configuration>
+                            </execution>
+                        </executions>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+
+        <!-- Default single-platform build (when not using cross-compile) -->
+        <profile>
+            <id>single-platform</id>
+            <activation>
+                <property>
+                    <name>!cross-compile</name>
+                </property>
+            </activation>
+            <build>
+                <plugins>
+                    <!-- Override resource copying for single platform -->
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-resources-plugin</artifactId>
+                        <executions>
+                            <execution>
+                                <id>copy-native-lib</id>
+                                <configuration>
+                                    <resources>
+                                        <!-- Copy current platform library to generic location -->
+                                        <resource>
+                                            <directory>${rust.target.dir}/release</directory>
+                                            <includes>
+                                                <include>libtantivy4java.so</include>
+                                                <include>libtantivy4java.dylib</include>
+                                                <include>tantivy4java.dll</include>
+                                            </includes>
+                                        </resource>
+                                    </resources>
+                                </configuration>
+                            </execution>
+                        </executions>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+    </profiles>
 </project>

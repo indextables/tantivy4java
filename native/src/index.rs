@@ -315,8 +315,8 @@ pub extern "system" fn Java_com_tantivy4java_Index_nativeParseQuery(
         // Create query parser
         let query_parser = QueryParser::for_index(index, default_fields);
         
-        // Parse the query
-        let parsed_query = query_parser.parse_query(&query_str)
+        // Parse the query using our fixed parser
+        let parsed_query = parse_query_with_phrase_fix(&query_parser, &query_str)
             .map_err(|e| format!("Query parsing error: {}", e))?;
         
         Ok(parsed_query)
@@ -397,6 +397,64 @@ pub extern "system" fn Java_com_tantivy4java_Index_nativeRegisterTokenizer(
     _text_analyzer_ptr: jlong,
 ) {
     handle_error(&mut env, "Index native methods not fully implemented yet");
+}
+
+/// Custom query parser that fixes single-term phrase query issues
+fn parse_query_with_phrase_fix(
+    query_parser: &QueryParser,
+    query_str: &str
+) -> Result<Box<dyn TantivyQuery>, tantivy::query::QueryParserError> {
+    // Preprocess the query string to fix quoted single terms
+    let fixed_query_str = fix_quoted_single_terms(query_str);
+    
+    // Parse the fixed query string
+    query_parser.parse_query(&fixed_query_str)
+}
+
+/// Fix quoted single terms in query string to prevent single-term phrase queries
+fn fix_quoted_single_terms(query_str: &str) -> String {
+    let mut result = String::new();
+    let mut chars = query_str.chars().peekable();
+    
+    while let Some(ch) = chars.next() {
+        if ch == '"' {
+            // Found opening quote, check if it's a single-term phrase
+            let mut quoted_content = String::new();
+            let mut found_closing_quote = false;
+            
+            // Collect content until closing quote
+            while let Some(inner_ch) = chars.next() {
+                if inner_ch == '"' {
+                    found_closing_quote = true;
+                    break;
+                } else {
+                    quoted_content.push(inner_ch);
+                }
+            }
+            
+            if found_closing_quote {
+                // Check if quoted content is a single term (no spaces)
+                if !quoted_content.contains(' ') && !quoted_content.is_empty() {
+                    // Single term - remove quotes to prevent phrase query
+                    result.push_str(&quoted_content);
+                } else {
+                    // Multi-term phrase - keep quotes for proper phrase query
+                    result.push('"');
+                    result.push_str(&quoted_content);
+                    result.push('"');
+                }
+            } else {
+                // Unclosed quote - keep original
+                result.push('"');
+                result.push_str(&quoted_content);
+            }
+        } else {
+            // Regular character
+            result.push(ch);
+        }
+    }
+    
+    result
 }
 
 #[no_mangle]

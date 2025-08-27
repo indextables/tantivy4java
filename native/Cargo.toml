@@ -11,16 +11,39 @@ name = "tantivy4java"
 crate-type = ["cdylib"]
 
 [dependencies]
-tantivy = "0.24.2"
+# Use the exact same tantivy version as Quickwit to avoid conflicts  
+tantivy = { git = "https://github.com/quickwit-oss/tantivy/", rev = "80f5f1e", default-features = false, features = [
+  "lz4-compression",
+  "mmap", 
+  "quickwit",
+  "zstd-compression",
+] }
 jni = "0.21.1"
 chrono = { version = "0.4.41", features = ["serde"] }
 time = { version = "0.3", features = ["macros"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0.142"
 base64 = "0.22"
-itertools = "0.14.0"
 futures = "0.3.31"
 once_cell = "1.19.0"
+bytesize = "1.3"
+
+# Quickwit dependencies with proper versions and features - updated to latest upstream  
+quickwit-storage = { git = "https://github.com/schenksj/quickwit" }
+quickwit-metastore = { git = "https://github.com/schenksj/quickwit" }
+quickwit-proto = { git = "https://github.com/schenksj/quickwit" }
+quickwit-directories = { git = "https://github.com/schenksj/quickwit" }
+quickwit-common = { git = "https://github.com/schenksj/quickwit" }
+quickwit-config = { git = "https://github.com/schenksj/quickwit" }
+quickwit-search = { git = "https://github.com/schenksj/quickwit" }
+quickwit-indexing = { git = "https://github.com/schenksj/quickwit" }
+
+# Additional dependencies
+anyhow = "1.0"
+uuid = { version = "1.0", features = ["v4", "serde"] }
+tokio = { version = "1.45", features = ["full"] }
+lazy_static = "1.4"
+tempfile = "3"
 
 [build-dependencies]
 jni = "0.21.1"
