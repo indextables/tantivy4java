@@ -193,6 +193,41 @@ public class Index implements AutoCloseable {
     }
 
     /**
+     * Parse a query string using Tantivy's QueryParser with automatic field detection.
+     * This method automatically detects all text fields in the index schema and uses them
+     * as default search fields for query parsing.
+     * 
+     * Supported query syntax:
+     * - Simple term: "hello"
+     * - Boolean operators: "hello AND world", "foo OR bar", "NOT spam"
+     * - Field-specific queries: "title:hello", "content:world"
+     * - Phrase queries: "\"hello world\""
+     * - Wildcard queries: "hel*", "?ello"
+     * - Range queries: "score:[1 TO 5]", "date:[2020-01-01 TO 2020-12-31]"
+     * - Fuzzy queries: "hello~", "hello~2"
+     * - Boosted queries: "hello^2"
+     * 
+     * @param queryString The query string to parse
+     * @return A Query object representing the parsed query
+     * @throws RuntimeException if the query string is invalid or cannot be parsed
+     */
+    public Query parseQuery(String queryString) {
+        if (closed) {
+            throw new IllegalStateException("Index has been closed");
+        }
+        if (queryString == null || queryString.trim().isEmpty()) {
+            throw new IllegalArgumentException("Query string cannot be null or empty");
+        }
+        
+        long queryPtr = nativeParseQuerySimple(nativePtr, queryString);
+        if (queryPtr == 0) {
+            throw new RuntimeException("Failed to parse query: " + queryString);
+        }
+        
+        return new Query(queryPtr);
+    }
+
+    /**
      * Parse a query string leniently, returning parsing errors.
      * @param query Query string
      * @param defaultFieldNames Default fields to search in
@@ -367,6 +402,7 @@ public class Index implements AutoCloseable {
     private static native long nativeGetSchema(long ptr);
     private static native void nativeReload(long ptr);
     private static native long nativeParseQuery(long ptr, String query, List<String> defaultFieldNames, Map<String, Double> fieldBoosts, Map<String, FuzzyConfig> fuzzyFields);
+    private static native long nativeParseQuerySimple(long ptr, String queryString);
     private static native long nativeParseQueryLenient(long ptr, String query, List<String> defaultFieldNames, Map<String, Double> fieldBoosts, Map<String, FuzzyConfig> fuzzyFields);
     private static native void nativeRegisterTokenizer(long ptr, String name, long textAnalyzerPtr);
     private static native void nativeClose(long ptr);

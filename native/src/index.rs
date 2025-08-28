@@ -313,10 +313,10 @@ pub extern "system" fn Java_com_tantivy4java_Index_nativeParseQuery(
         }
         
         // Create query parser
-        let query_parser = QueryParser::for_index(index, default_fields);
+        let query_parser = QueryParser::for_index(index, default_fields.clone());
         
-        // Parse the query using our fixed parser
-        let parsed_query = parse_query_with_phrase_fix(&query_parser, &query_str)
+        // Parse the query using our fixed parser with schema and field info
+        let parsed_query = parse_query_with_phrase_fix(&query_parser, &query_str, &schema, &default_fields)
             .map_err(|e| format!("Query parsing error: {}", e))?;
         
         Ok(parsed_query)
@@ -400,19 +400,22 @@ pub extern "system" fn Java_com_tantivy4java_Index_nativeRegisterTokenizer(
 }
 
 /// Custom query parser that fixes single-term phrase query issues
-fn parse_query_with_phrase_fix(
+pub fn parse_query_with_phrase_fix(
     query_parser: &QueryParser,
-    query_str: &str
+    query_str: &str,
+    schema: &tantivy::schema::Schema,
+    default_fields: &[tantivy::schema::Field]
 ) -> Result<Box<dyn TantivyQuery>, tantivy::query::QueryParserError> {
-    // Preprocess the query string to fix quoted single terms
-    let fixed_query_str = fix_quoted_single_terms(query_str);
+    // Preprocess the query string to fix quoted single terms using proper tokenization
+    let fixed_query_str = fix_quoted_single_terms(query_str, schema, default_fields);
     
     // Parse the fixed query string
     query_parser.parse_query(&fixed_query_str)
 }
 
 /// Fix quoted single terms in query string to prevent single-term phrase queries
-fn fix_quoted_single_terms(query_str: &str) -> String {
+/// Uses proper tokenization instead of hardcoded space checking
+pub fn fix_quoted_single_terms(query_str: &str, schema: &tantivy::schema::Schema, default_fields: &[tantivy::schema::Field]) -> String {
     let mut result = String::new();
     let mut chars = query_str.chars().peekable();
     
@@ -433,8 +436,18 @@ fn fix_quoted_single_terms(query_str: &str) -> String {
             }
             
             if found_closing_quote {
-                // Check if quoted content is a single term (no spaces)
-                if !quoted_content.contains(' ') && !quoted_content.is_empty() {
+                // Check if quoted content is a single term using proper tokenization
+                // Use the first text field as a representative field for tokenization
+                let is_single_term = if let Some(&field) = default_fields.iter()
+                    .find(|&&f| matches!(schema.get_field_entry(f).field_type(), tantivy::schema::FieldType::Str(_))) {
+                    // Use proper tokenization to check if it's a single token
+                    !is_multi_token_pattern_for_quoted_content(schema, field, &quoted_content)
+                } else {
+                    // Fallback to basic heuristic if no text field available
+                    !quoted_content.trim().contains(char::is_whitespace) && !quoted_content.is_empty()
+                };
+                
+                if is_single_term && !quoted_content.is_empty() {
                     // Single term - remove quotes to prevent phrase query
                     result.push_str(&quoted_content);
                 } else {
@@ -455,6 +468,50 @@ fn fix_quoted_single_terms(query_str: &str) -> String {
     }
     
     result
+}
+
+/// Check if quoted content would result in multiple tokens using proper tokenization
+/// This is specifically for quoted strings in query parsing
+pub fn is_multi_token_pattern_for_quoted_content(schema: &tantivy::schema::Schema, field: tantivy::schema::Field, content: &str) -> bool {
+    let field_entry = schema.get_field_entry(field);
+    
+    if let tantivy::schema::FieldType::Str(text_options) = field_entry.field_type() {
+        if let Some(indexing_options) = text_options.get_indexing_options() {
+            // Try to get the tokenizer - simulate tokenization behavior
+            let tokenizer_name = indexing_options.tokenizer();
+            
+            // For most tokenizers, we can simulate tokenization by splitting on common boundaries
+            let tokens: Vec<&str> = match tokenizer_name {
+                "default" | "simple" | "en_stem" => {
+                    // Default tokenizer splits on whitespace and punctuation
+                    content.split_whitespace()
+                        .flat_map(|word| word.split(|c: char| c.is_ascii_punctuation()))
+                        .filter(|token| !token.is_empty())
+                        .collect()
+                },
+                "keyword" => {
+                    // Keyword tokenizer treats entire input as single token
+                    vec![content]
+                },
+                "whitespace" => {
+                    // Whitespace tokenizer only splits on whitespace (preserves case)
+                    content.split_whitespace().collect()
+                },
+                _ => {
+                    // Unknown tokenizer - fall back to whitespace splitting
+                    content.split_whitespace().collect()
+                }
+            };
+            
+            tokens.len() > 1
+        } else {
+            // No indexing options - treat as single token
+            false
+        }
+    } else {
+        // Not a text field - treat as single token
+        false
+    }
 }
 
 #[no_mangle]

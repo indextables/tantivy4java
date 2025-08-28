@@ -137,7 +137,7 @@ public class PythonParityTest {
                             
                             // Test case-insensitive wildcard (should match all variations)
                             System.out.println("\n🔍 Testing case-insensitive wildcard 'hello*':");
-                            try (Query caseInsensitiveQuery = Query.wildcardQueryCaseInsensitive(schema, "title", "hello*")) {
+                            try (Query caseInsensitiveQuery = Query.wildcardQuery(schema, "title", "hello*")) {
                                 System.out.println("Case-insensitive query: " + caseInsensitiveQuery.toString());
                                 SearchResult insensitiveResult = searcher.search(caseInsensitiveQuery, 10);
                                 System.out.println("Case-insensitive matches: " + insensitiveResult.getHits().size());
@@ -156,13 +156,13 @@ public class PythonParityTest {
                             
                             // Test mixed case pattern
                             System.out.println("\n🔍 Testing case-insensitive wildcard 'HELLO*' (uppercase pattern):");
-                            try (Query upperCaseQuery = Query.wildcardQueryCaseInsensitive(schema, "title", "HELLO*")) {
+                            try (Query upperCaseQuery = Query.wildcardQuery(schema, "title", "HELLO*")) {
                                 System.out.println("Uppercase pattern query: " + upperCaseQuery.toString());
                                 SearchResult upperResult = searcher.search(upperCaseQuery, 10);
                                 System.out.println("Uppercase pattern matches: " + upperResult.getHits().size());
                                 
                                 // Should match same number as lowercase case-insensitive
-                                try (Query lowerCaseQuery = Query.wildcardQueryCaseInsensitive(schema, "title", "hello*")) {
+                                try (Query lowerCaseQuery = Query.wildcardQuery(schema, "title", "hello*")) {
                                     SearchResult lowerResult = searcher.search(lowerCaseQuery, 10);
                                     assertEquals(upperResult.getHits().size(), lowerResult.getHits().size(),
                                                "Case-insensitive queries should match same documents regardless of pattern case");
@@ -171,7 +171,7 @@ public class PythonParityTest {
                             
                             // Test content field with mixed case pattern
                             System.out.println("\n🔍 Testing case-insensitive content wildcard 'TEST*':");
-                            try (Query contentQuery = Query.wildcardQueryCaseInsensitive(schema, "content", "TEST*")) {
+                            try (Query contentQuery = Query.wildcardQuery(schema, "content", "TEST*")) {
                                 System.out.println("Content query: " + contentQuery.toString());
                                 SearchResult contentResult = searcher.search(contentQuery, 10);
                                 System.out.println("Content matches: " + contentResult.getHits().size());

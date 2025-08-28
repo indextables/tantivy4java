@@ -26,6 +26,7 @@ use quickwit_config::S3StorageConfig;
 use quickwit_directories::{CachingDirectory, HotDirectory, StorageDirectory, BundleDirectory, get_hotcache_from_split};
 use quickwit_common::uri::{Uri, Protocol};
 use tantivy::{Index, IndexReader, DocAddress, TantivyDocument};
+use tantivy::query::{Query as TantivyQuery, QueryParser};
 use tantivy::schema::Value;
 use tantivy::directory::FileSlice;
 use std::str::FromStr;
@@ -1204,6 +1205,61 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_getSchemaFromNative(
         Err(error_msg) => {
             let full_error = format!("Failed to retrieve schema from split file: {}", error_msg);
             let _ = env.throw_new("java/lang/RuntimeException", &full_error);
+            0
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_tantivy4java_SplitSearcher_parseQueryNative(
+    mut env: JNIEnv,
+    _class: JClass,
+    ptr: jlong,
+    query_string: JString,
+) -> jlong {
+    if ptr == 0 {
+        let _ = env.throw_new("java/lang/RuntimeException", "Invalid SplitSearcher pointer");
+        return 0;
+    }
+
+    let query_str: String = match env.get_string(&query_string) {
+        Ok(s) => s.into(),
+        Err(_) => {
+            let _ = env.throw_new("java/lang/RuntimeException", "Invalid query string");
+            return 0;
+        }
+    };
+
+    let searcher = unsafe { &*(ptr as *mut SplitSearcher) };
+    
+    // Get the schema and index from the split file
+    let schema = searcher.index.schema();
+    
+    // Get default fields (only indexed text fields - exclude numeric fields)
+    let default_fields: Vec<_> = schema.fields()
+        .filter(|(_, field_entry)| {
+            field_entry.is_indexed() && 
+            matches!(field_entry.field_type(), tantivy::schema::FieldType::Str(_))
+        })
+        .map(|(field, _)| field)
+        .collect();
+    
+    if default_fields.is_empty() {
+        let _ = env.throw_new("java/lang/RuntimeException", "No indexed fields available for query parsing");
+        return 0;
+    }
+    
+    // Create query parser
+    let query_parser = QueryParser::for_index(&searcher.index, default_fields.clone());
+    
+    // Parse the query using the same logic as Index.parseQuery()
+    match crate::index::parse_query_with_phrase_fix(&query_parser, &query_str, &schema, &default_fields) {
+        Ok(parsed_query) => {
+            register_object(parsed_query) as jlong
+        },
+        Err(e) => {
+            let error_msg = format!("Query parsing error: {}", e);
+            let _ = env.throw_new("java/lang/RuntimeException", &error_msg);
             0
         }
     }

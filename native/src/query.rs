@@ -20,7 +20,7 @@
 use jni::objects::{JClass, JString, JObject};
 use jni::sys::{jlong, jboolean, jint, jdouble, jlongArray, jobject};
 use jni::JNIEnv;
-use tantivy::query::{Query as TantivyQuery, TermQuery, AllQuery, BooleanQuery, Occur, RangeQuery, PhraseQuery, FuzzyTermQuery, RegexQuery, BoostQuery, ConstScoreQuery, TermSetQuery};
+use tantivy::query::{Query as TantivyQuery, TermQuery, AllQuery, BooleanQuery, Occur, RangeQuery, PhraseQuery, FuzzyTermQuery, RegexQuery, BoostQuery, ConstScoreQuery, TermSetQuery, QueryParser};
 use tantivy::schema::{Schema, Term, IndexRecordOption, FieldType as TantivyFieldType, Field};
 use tantivy::DateTime;
 use std::ops::Bound;
@@ -623,6 +623,7 @@ pub extern "system" fn Java_com_tantivy4java_Query_nativeWildcardQuery(
         }
     };
     
+    
     let result = with_object::<Schema, Result<Box<dyn TantivyQuery>, String>>(schema_ptr as u64, |schema| {
         // Get field by name
         let field = match schema.get_field(&field_name_str) {
@@ -630,20 +631,34 @@ pub extern "system" fn Java_com_tantivy4java_Query_nativeWildcardQuery(
             Err(_) => return Err(format!("Field '{}' not found in schema", field_name_str)),
         };
         
-        // Verify the field is a text field
+        // Verify the field is a text field and check tokenizer
         let field_entry = schema.get_field_entry(field);
         match field_entry.field_type() {
-            TantivyFieldType::Str(_) => {
-                // Check for complex multi-wildcard patterns first (e.g., "*y*me*key*y")
-                if !pattern_str.contains(' ') && contains_multi_wildcards(&pattern_str) {
-                    // Complex multi-wildcard pattern - use regex-based approach
-                    create_multi_wildcard_regex_query(field, &pattern_str)
-                } else if pattern_str.contains(' ') {
-                    // Tokenize the pattern and create boolean query
-                    create_tokenized_wildcard_query(schema, field, &pattern_str)
+            TantivyFieldType::Str(text_options) => {
+                // Check if field uses "default" tokenizer (which lowercases)
+                let uses_default_tokenizer = text_options.get_indexing_options()
+                    .map(|opts| opts.tokenizer().to_string() == "default")
+                    .unwrap_or(true); // Default to true if no indexing options
+                
+                // Lowercase pattern if using default tokenizer
+                let processed_pattern = if uses_default_tokenizer {
+                    pattern_str.to_lowercase()
                 } else {
-                    // Single token - use simple regex query
-                    create_single_wildcard_query(field, &pattern_str)
+                    pattern_str.clone()
+                };
+                
+                // Check if pattern results in multiple tokens when tokenized
+                if is_multi_token_pattern(schema, field, &processed_pattern) {
+                    // Multi-token pattern - create boolean query with individual wildcard terms
+                    // This creates a query like: (*ell* AND *orld*) which searches for documents 
+                    // that contain terms matching *ell* AND terms matching *orld*
+                    create_fixed_tokenized_wildcard_query(schema, field, &processed_pattern, uses_default_tokenizer)
+                } else if contains_multi_wildcards(&processed_pattern) {
+                    // Single token but complex multi-wildcard pattern - use regex-based approach
+                    create_multi_wildcard_regex_query(field, &processed_pattern)
+                } else {
+                    // Single token, simple pattern - use simple query
+                    create_single_wildcard_query_with_tokenizer(field, &processed_pattern, uses_default_tokenizer)
                 }
             },
             _ => Err(format!("Field '{}' is not a text field - wildcard queries require text fields", field_name_str)),
@@ -665,138 +680,6 @@ pub extern "system" fn Java_com_tantivy4java_Query_nativeWildcardQuery(
     }
 }
 
-#[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_Query_nativeWildcardQueryCaseInsensitive(
-    mut env: JNIEnv,
-    _class: JClass,
-    schema_ptr: jlong,
-    field_name: JString,
-    pattern: JString,
-) -> jlong {
-    let field_name_str: String = match env.get_string(&field_name) {
-        Ok(s) => s.into(),
-        Err(_) => {
-            handle_error(&mut env, "Invalid field name");
-            return 0;
-        }
-    };
-    
-    let pattern_str: String = match env.get_string(&pattern) {
-        Ok(s) => s.into(),
-        Err(_) => {
-            handle_error(&mut env, "Invalid wildcard pattern");
-            return 0;
-        }
-    };
-    
-    let result = with_object::<Schema, Result<Box<dyn TantivyQuery>, String>>(schema_ptr as u64, |schema| {
-        // Get field by name
-        let field = match schema.get_field(&field_name_str) {
-            Ok(f) => f,
-            Err(_) => return Err(format!("Field '{}' not found in schema", field_name_str)),
-        };
-        
-        // Verify the field is a text field
-        let field_entry = schema.get_field_entry(field);
-        match field_entry.field_type() {
-            TantivyFieldType::Str(_) => {
-                // Create case-insensitive wildcard query
-                create_case_insensitive_wildcard_query(field, &pattern_str)
-            },
-            _ => Err(format!("Field '{}' is not a text field - wildcard queries require text fields", field_name_str)),
-        }
-    });
-    
-    match result {
-        Some(Ok(query)) => {
-            register_object(query) as jlong
-        },
-        Some(Err(err)) => {
-            handle_error(&mut env, &err);
-            0
-        },
-        None => {
-            handle_error(&mut env, "Invalid Schema pointer");
-            0
-        }
-    }
-}
-
-#[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_Query_nativeWildcardQueryCaseInsensitiveLenient(
-    mut env: JNIEnv,
-    _class: JClass,
-    schema_ptr: jlong,
-    field_name: JString,
-    pattern: JString,
-    lenient: jboolean,
-) -> jlong {
-    let field_name_str: String = match env.get_string(&field_name) {
-        Ok(s) => s.into(),
-        Err(_) => {
-            handle_error(&mut env, "Invalid field name");
-            return 0;
-        }
-    };
-    
-    let pattern_str: String = match env.get_string(&pattern) {
-        Ok(s) => s.into(),
-        Err(_) => {
-            handle_error(&mut env, "Invalid wildcard pattern");
-            return 0;
-        }
-    };
-    
-    let is_lenient = lenient != 0;
-    
-    let result = with_object::<Schema, Result<Box<dyn TantivyQuery>, String>>(schema_ptr as u64, |schema| {
-        // Get field by name
-        let field = match schema.get_field(&field_name_str) {
-            Ok(f) => f,
-            Err(_) => {
-                if is_lenient {
-                    // Return a query that matches no documents
-                    let bool_query = BooleanQuery::new(vec![]);
-                    return Ok(Box::new(bool_query) as Box<dyn TantivyQuery>);
-                } else {
-                    return Err(format!("Field '{}' not found in schema", field_name_str));
-                }
-            }
-        };
-        
-        // Verify the field is a text field
-        let field_entry = schema.get_field_entry(field);
-        match field_entry.field_type() {
-            TantivyFieldType::Str(_) => {
-                // Create case-insensitive wildcard query
-                create_case_insensitive_wildcard_query(field, &pattern_str)
-            },
-            _ => {
-                if is_lenient {
-                    // Return a query that matches no documents
-                    let bool_query = BooleanQuery::new(vec![]);
-                    Ok(Box::new(bool_query) as Box<dyn TantivyQuery>)
-                } else {
-                    Err(format!("Field '{}' is not a text field - wildcard queries require text fields", field_name_str))
-                }
-            }
-        }
-    });
-    
-    match result {
-        Some(Ok(query)) => {
-            register_object(query) as jlong
-        },
-        Some(Err(err)) => {
-            handle_error(&mut env, &err);
-            0
-        },
-        None => {
-            handle_error(&mut env, "Invalid Schema pointer");
-            0
-        }
-    }
-}
 
 #[no_mangle]
 pub extern "system" fn Java_com_tantivy4java_Query_nativeWildcardQueryLenient(
@@ -823,6 +706,7 @@ pub extern "system" fn Java_com_tantivy4java_Query_nativeWildcardQueryLenient(
         }
     };
     
+    
     let is_lenient = lenient != 0;
     
     let result = with_object::<Schema, Result<Box<dyn TantivyQuery>, String>>(schema_ptr as u64, |schema| {
@@ -840,20 +724,34 @@ pub extern "system" fn Java_com_tantivy4java_Query_nativeWildcardQueryLenient(
             }
         };
         
-        // Verify the field is a text field
+        // Verify the field is a text field and check tokenizer
         let field_entry = schema.get_field_entry(field);
         match field_entry.field_type() {
-            TantivyFieldType::Str(_) => {
-                // Check for complex multi-wildcard patterns first (e.g., "*y*me*key*y")
-                if !pattern_str.contains(' ') && contains_multi_wildcards(&pattern_str) {
-                    // Complex multi-wildcard pattern - use regex-based approach
-                    create_multi_wildcard_regex_query(field, &pattern_str)
-                } else if pattern_str.contains(' ') {
-                    // Tokenize the pattern and create boolean query
-                    create_tokenized_wildcard_query(schema, field, &pattern_str)
+            TantivyFieldType::Str(text_options) => {
+                // Check if field uses "default" tokenizer (which lowercases)
+                let uses_default_tokenizer = text_options.get_indexing_options()
+                    .map(|opts| opts.tokenizer().to_string() == "default")
+                    .unwrap_or(true); // Default to true if no indexing options
+                
+                // Lowercase pattern if using default tokenizer
+                let processed_pattern = if uses_default_tokenizer {
+                    pattern_str.to_lowercase()
                 } else {
-                    // Single token - use simple regex query
-                    create_single_wildcard_query(field, &pattern_str)
+                    pattern_str.clone()
+                };
+                
+                // Check if pattern results in multiple tokens when tokenized
+                if is_multi_token_pattern(schema, field, &processed_pattern) {
+                    // Multi-token pattern - create boolean query with individual wildcard terms
+                    // This creates a query like: (*ell* AND *orld*) which searches for documents 
+                    // that contain terms matching *ell* AND terms matching *orld*
+                    create_fixed_tokenized_wildcard_query(schema, field, &processed_pattern, uses_default_tokenizer)
+                } else if contains_multi_wildcards(&processed_pattern) {
+                    // Single token but complex multi-wildcard pattern - use regex-based approach
+                    create_multi_wildcard_regex_query(field, &processed_pattern)
+                } else {
+                    // Single token, simple pattern - use simple query
+                    create_single_wildcard_query_with_tokenizer(field, &processed_pattern, uses_default_tokenizer)
                 }
             },
             _ => {
@@ -883,24 +781,34 @@ pub extern "system" fn Java_com_tantivy4java_Query_nativeWildcardQueryLenient(
     }
 }
 
-/// Create a single case-sensitive wildcard query for a pattern without spaces
-/// Uses only case-preserving regex to ensure exact case matching
-fn create_single_wildcard_query(field: Field, pattern: &str) -> Result<Box<dyn TantivyQuery>, String> {
+/// Create a single wildcard query with tokenizer-aware processing
+fn create_single_wildcard_query_with_tokenizer(field: Field, pattern: &str, uses_default_tokenizer: bool) -> Result<Box<dyn TantivyQuery>, String> {
     // If pattern contains no wildcards, use exact term query for better performance and accuracy
     if !contains_wildcards(pattern) {
-        // For default tokenizer, terms are lowercased during indexing
-        let term = Term::from_field_text(field, &pattern.to_lowercase());
+        let term = if uses_default_tokenizer {
+            // Default tokenizer lowercases during indexing, so pattern is already lowercased
+            Term::from_field_text(field, pattern)
+        } else {
+            // Other tokenizers preserve case
+            Term::from_field_text(field, pattern)
+        };
         let term_query = TermQuery::new(term, IndexRecordOption::Basic);
         return Ok(Box::new(term_query) as Box<dyn TantivyQuery>);
     }
     
-    // For patterns with wildcards, use lowercase regex pattern since default tokenizer lowercases text
-    let lowercase_pattern = pattern.to_lowercase();
-    let regex_pattern = wildcard_to_regex_preserve_case(&lowercase_pattern);
+    // For patterns with wildcards, use regex query
+    // Pattern is already processed (lowercased if needed) by caller
+    let regex_pattern = wildcard_to_regex_preserve_case(pattern);
     match RegexQuery::from_pattern(&regex_pattern, field) {
         Ok(regex_query) => Ok(Box::new(regex_query) as Box<dyn TantivyQuery>),
-        Err(e) => Err(format!("Failed to create case-sensitive wildcard query for pattern '{}': {}", pattern, e)),
+        Err(e) => Err(format!("Failed to create wildcard query for pattern '{}': {}", pattern, e)),
     }
+}
+
+/// Legacy function - kept for backward compatibility but should use tokenizer-aware version
+fn create_single_wildcard_query(field: Field, pattern: &str) -> Result<Box<dyn TantivyQuery>, String> {
+    // Default to using default tokenizer behavior (lowercase)
+    create_single_wildcard_query_with_tokenizer(field, &pattern.to_lowercase(), true)
 }
 
 /// Create regex pattern preserving original case
@@ -936,34 +844,41 @@ fn wildcard_to_regex_preserve_case(pattern: &str) -> String {
     regex
 }
 
-/// Create a tokenized wildcard query for patterns containing spaces
+/// Create a tokenized wildcard query using proper tokenizer instead of whitespace splitting
 /// Tokenizes the pattern and creates a boolean AND query of individual wildcard/term queries
-fn create_tokenized_wildcard_query(schema: &Schema, field: Field, pattern: &str) -> Result<Box<dyn TantivyQuery>, String> {
-    // Simple tokenization by splitting on whitespace
-    let tokens: Vec<&str> = pattern.split_whitespace().collect();
+fn create_tokenized_wildcard_query_with_tokenizer(schema: &Schema, field: Field, pattern: &str, uses_default_tokenizer: bool) -> Result<Box<dyn TantivyQuery>, String> {
+    // Get the field entry to access tokenizer information
+    let field_entry = schema.get_field_entry(field);
+    
+    // Use proper tokenization based on the field's tokenizer
+    let tokens = tokenize_pattern_for_field(schema, field, pattern);
+    
+    // Debug output
     
     if tokens.is_empty() {
-        return Err("Empty wildcard pattern".to_string());
+        return Err("Empty wildcard pattern after tokenization".to_string());
     }
     
     if tokens.len() == 1 {
-        // Single token after splitting - fall back to simple query
-        return create_single_wildcard_query(field, tokens[0]);
+        // Single token after tokenization - fall back to simple query
+        return create_single_wildcard_query_with_tokenizer(field, &tokens[0], uses_default_tokenizer);
     }
     
     // Create individual queries for each token
     let mut subqueries = Vec::new();
     
     for token in tokens {
-        if contains_wildcards(token) {
+        if contains_wildcards(&token) {
             // Token contains wildcards - create wildcard query
-            match create_single_wildcard_query(field, token) {
-                Ok(query) => subqueries.push((Occur::Must, query)),
+            match create_single_wildcard_query_with_tokenizer(field, &token, uses_default_tokenizer) {
+                Ok(query) => {
+                    subqueries.push((Occur::Must, query));
+                },
                 Err(e) => return Err(e),
             }
         } else {
-            // Token is literal - create term query
-            let term = Term::from_field_text(field, token);
+            // Token is literal - create term query (already processed by tokenizer)
+            let term = Term::from_field_text(field, &token);
             let term_query = TermQuery::new(term, IndexRecordOption::WithFreqs);
             subqueries.push((Occur::Must, Box::new(term_query) as Box<dyn TantivyQuery>));
         }
@@ -981,6 +896,60 @@ fn create_tokenized_wildcard_query(schema: &Schema, field: Field, pattern: &str)
         let boolean_query = BooleanQuery::new(subqueries);
         Ok(Box::new(boolean_query) as Box<dyn TantivyQuery>)
     }
+}
+
+/// Tokenize a pattern using the field's actual tokenizer to determine token boundaries
+fn tokenize_pattern_for_field(schema: &Schema, field: Field, pattern: &str) -> Vec<String> {
+    let field_entry = schema.get_field_entry(field);
+    
+    if let TantivyFieldType::Str(text_options) = field_entry.field_type() {
+        if let Some(indexing_options) = text_options.get_indexing_options() {
+            // Try to get the tokenizer - for now we'll simulate since direct access is complex
+            let tokenizer_name = indexing_options.tokenizer();
+            
+            // For most tokenizers, we can simulate tokenization by splitting on common boundaries
+            match tokenizer_name {
+                "default" | "simple" | "en_stem" => {
+                    // For wildcard patterns, split only on whitespace to preserve wildcards
+                    // Don't split on punctuation because * and ? are wildcard characters
+                    pattern.split_whitespace()
+                        .filter(|token| !token.is_empty())
+                        .map(|s| s.to_string())
+                        .collect()
+                },
+                "keyword" => {
+                    // Keyword tokenizer treats entire input as single token
+                    vec![pattern.to_string()]
+                },
+                "whitespace" => {
+                    // Whitespace tokenizer only splits on whitespace (preserves case)
+                    pattern.split_whitespace().map(|s| s.to_string()).collect()
+                },
+                _ => {
+                    // Unknown tokenizer - fall back to whitespace splitting
+                    pattern.split_whitespace().map(|s| s.to_string()).collect()
+                }
+            }
+        } else {
+            // No indexing options - treat as single token
+            vec![pattern.to_string()]
+        }
+    } else {
+        // Not a text field - treat as single token
+        vec![pattern.to_string()]
+    }
+}
+
+/// Check if a pattern would result in multiple tokens when processed by the field's tokenizer
+fn is_multi_token_pattern(schema: &Schema, field: Field, pattern: &str) -> bool {
+    let tokens = tokenize_pattern_for_field(schema, field, pattern);
+    tokens.len() > 1
+}
+
+/// Legacy function - kept for backward compatibility but should use tokenizer-aware version
+fn create_tokenized_wildcard_query(schema: &Schema, field: Field, pattern: &str) -> Result<Box<dyn TantivyQuery>, String> {
+    // Default to using default tokenizer behavior
+    create_tokenized_wildcard_query_with_tokenizer(schema, field, &pattern.to_lowercase(), true)
 }
 
 /// Check if a token contains wildcard characters
@@ -1156,12 +1125,9 @@ fn create_multi_wildcard_regex_query(field: Field, pattern: &str) -> Result<Box<
 /// This creates a query that will match text regardless of case
 fn create_case_insensitive_wildcard_query(field: Field, pattern: &str) -> Result<Box<dyn TantivyQuery>, String> {
     // Check for complex multi-wildcard patterns first (e.g., "*Wild*Joe*")
-    if !pattern.contains(' ') && contains_multi_wildcards(pattern) {
+    if contains_multi_wildcards(pattern) {
         // Complex multi-wildcard pattern - use case-insensitive regex-based approach
         create_case_insensitive_multi_wildcard_query(field, pattern)
-    } else if pattern.contains(' ') {
-        // Tokenize the pattern and create boolean query with case-insensitive handling
-        create_case_insensitive_tokenized_wildcard_query(field, pattern)
     } else {
         // Single token - use case-insensitive regex query
         create_case_insensitive_single_wildcard_query(field, pattern)
@@ -1333,6 +1299,83 @@ fn create_case_insensitive_multi_wildcard_query(field: Field, pattern: &str) -> 
 /// ? -> .
 /// Escape other regex special characters
 /// Note: Don't use anchors as Tantivy's RegexQuery doesn't seem to like them
+/// Convert a multi-token wildcard pattern to a regex that matches across token boundaries
+/// Example: "*ell* *orld*" -> ".*ell.*\\s+.*orld.*"
+fn multi_token_wildcard_to_regex(pattern: &str) -> String {
+    // Split on whitespace to get individual token patterns  
+    let tokens: Vec<&str> = pattern.split_whitespace().collect();
+    
+    if tokens.is_empty() {
+        return ".*".to_string();
+    }
+    
+    if tokens.len() == 1 {
+        // Single token - use regular wildcard to regex conversion
+        return wildcard_to_regex_preserve_case(tokens[0]);
+    }
+    
+    // Multiple tokens - create regex that matches all tokens with flexible whitespace
+    let mut regex_parts = Vec::new();
+    
+    for (i, token) in tokens.iter().enumerate() {
+        // Convert each token's wildcards to regex
+        let token_regex = wildcard_to_regex_preserve_case(token);
+        regex_parts.push(token_regex);
+        
+        // Add flexible whitespace pattern between tokens (except after the last one)
+        if i < tokens.len() - 1 {
+            regex_parts.push(r"\s+".to_string());
+        }
+    }
+    
+    regex_parts.join("")
+}
+
+/// Create a tokenized wildcard query that preserves wildcards correctly
+/// This fixes the issue where wildcards were being stripped in the original implementation
+fn create_fixed_tokenized_wildcard_query(schema: &Schema, field: Field, pattern: &str, uses_default_tokenizer: bool) -> Result<Box<dyn TantivyQuery>, String> {
+    // Split pattern on whitespace to get individual wildcard tokens
+    let tokens: Vec<&str> = pattern.split_whitespace()
+        .filter(|token| !token.is_empty())
+        .collect();
+    
+    if tokens.is_empty() {
+        return Err("Empty wildcard pattern after tokenization".to_string());
+    }
+    
+    if tokens.len() == 1 {
+        // Single token after splitting - use single wildcard query
+        return create_single_wildcard_query_with_tokenizer(field, tokens[0], uses_default_tokenizer);
+    }
+    
+    // Create individual wildcard queries for each token
+    let mut subqueries = Vec::new();
+    
+    for token in tokens {
+        // Each token should be treated as a wildcard pattern
+        // Don't check if it contains wildcards - preserve the original token as-is
+        match create_single_wildcard_query_with_tokenizer(field, token, uses_default_tokenizer) {
+            Ok(query) => {
+                subqueries.push((Occur::Must, query));
+            },
+            Err(e) => return Err(format!("Failed to create wildcard query for token '{}': {}", token, e)),
+        }
+    }
+    
+    if subqueries.is_empty() {
+        return Err("No valid wildcard tokens in pattern".to_string());
+    }
+    
+    if subqueries.len() == 1 {
+        // Only one subquery - return it directly
+        Ok(subqueries.into_iter().next().unwrap().1)
+    } else {
+        // Multiple subqueries - create boolean AND query
+        let boolean_query = BooleanQuery::new(subqueries);
+        Ok(Box::new(boolean_query) as Box<dyn TantivyQuery>)
+    }
+}
+
 fn wildcard_to_regex(pattern: &str) -> String {
     let mut regex = String::new();
     // Don't add anchors - let Tantivy handle word boundaries
@@ -2206,4 +2249,85 @@ pub extern "system" fn Java_com_tantivy4java_Range_nativeClose(
 ) {
     // Remove the stub range tuple object
     remove_object(ptr as u64);
+}
+
+// QueryParser JNI methods
+#[no_mangle]
+pub extern "system" fn Java_com_tantivy4java_Index_nativeParseQuerySimple(
+    mut env: JNIEnv,
+    _class: JClass,
+    index_ptr: jlong,
+    query_string: JString,
+) -> jlong {
+    let query_str: String = match env.get_string(&query_string) {
+        Ok(s) => s.into(),
+        Err(e) => {
+            handle_error(&mut env, &format!("Invalid query string: {}", e));
+            return 0;
+        }
+    };
+    
+    // Validate query string is not empty
+    if query_str.trim().is_empty() {
+        handle_error(&mut env, "Query string cannot be empty");
+        return 0;
+    }
+    
+    // Get the index from registry without using with_object to avoid potential deadlock
+    let registry = match crate::utils::OBJECT_REGISTRY.lock() {
+        Ok(registry) => registry,
+        Err(_) => {
+            handle_error(&mut env, "Failed to lock object registry");
+            return 0;
+        }
+    };
+    
+    let index = match registry.get(&(index_ptr as u64)) {
+        Some(boxed) => match boxed.downcast_ref::<tantivy::Index>() {
+            Some(index) => index,
+            None => {
+                handle_error(&mut env, "Invalid index object type");
+                return 0;
+            }
+        },
+        None => {
+            handle_error(&mut env, "Invalid index pointer");
+            return 0;
+        }
+    };
+    
+    // Get schema and find text fields
+    let schema = index.schema();
+    let mut default_fields = Vec::new();
+    
+    for (field, field_entry) in schema.fields() {
+        if let tantivy::schema::FieldType::Str(_) = field_entry.field_type() {
+            default_fields.push(field);
+        }
+    }
+    
+    if default_fields.is_empty() {
+        drop(registry); // Release lock before error handling
+        handle_error(&mut env, "No text fields found in schema for query parsing");
+        return 0;
+    }
+    
+    // Create query parser and parse query
+    let query_parser = QueryParser::for_index(index, default_fields);
+    let parsed_query = match query_parser.parse_query(&query_str) {
+        Ok(query) => query,
+        Err(e) => {
+            drop(registry); // Release lock before error handling
+            handle_error(&mut env, &format!("Failed to parse query '{}': {}", query_str, e));
+            return 0;
+        }
+    };
+    
+    // Release the registry lock before registering new object
+    drop(registry);
+    
+    // Register the query and return pointer
+    let query_box: Box<dyn TantivyQuery> = parsed_query;
+    let ptr = crate::utils::register_object(query_box);
+    ptr as jlong
 }
