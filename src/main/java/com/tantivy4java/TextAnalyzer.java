@@ -38,6 +38,37 @@ public class TextAnalyzer implements AutoCloseable {
     }
 
     /**
+     * Create a TextAnalyzer with the specified tokenizer.
+     * @param tokenizerName Name of the tokenizer ("default", "keyword", "whitespace", "raw", etc.)
+     * @return New TextAnalyzer instance
+     */
+    public static TextAnalyzer create(String tokenizerName) {
+        long ptr = nativeCreateAnalyzer(tokenizerName);
+        return new TextAnalyzer(ptr);
+    }
+
+    /**
+     * Tokenize text using Tantivy's default tokenizer.
+     * This is a static convenience method that doesn't require creating an analyzer instance.
+     * @param text Text to tokenize
+     * @return List of tokens
+     */
+    public static List<String> tokenize(String text) {
+        return tokenize(text, "default");
+    }
+
+    /**
+     * Tokenize text using the specified Tantivy tokenizer.
+     * This is a static convenience method that doesn't require creating an analyzer instance.
+     * @param text Text to tokenize
+     * @param tokenizerName Name of the tokenizer ("default", "keyword", "whitespace", "raw", etc.)
+     * @return List of tokens
+     */
+    public static List<String> tokenize(String text, String tokenizerName) {
+        return nativeTokenize(text, tokenizerName);
+    }
+
+    /**
      * Analyze text and return the resulting tokens.
      * @param text Text to analyze
      * @return List of tokens
@@ -70,6 +101,8 @@ public class TextAnalyzer implements AutoCloseable {
     }
 
     // Native method declarations
+    private static native long nativeCreateAnalyzer(String tokenizerName);
+    private static native List<String> nativeTokenize(String text, String tokenizerName);
     private static native List<String> nativeAnalyze(long ptr, String text);
     private static native void nativeClose(long ptr);
 }

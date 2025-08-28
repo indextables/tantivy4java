@@ -23,8 +23,11 @@ Tantivy4Java is a production-ready JNI wrapper for the Rust-based Tantivy search
 - **Boolean Logic** - MUST/SHOULD/MUST_NOT with nested combinations
 - **Range Queries** - All field types with inclusive/exclusive bounds
 - **Wildcard Queries** - Advanced pattern matching with multi-segment expansion
+  - **Case-sensitive wildcards** - Default wildcard behavior
+  - **Case-insensitive wildcards** - With `wildcardQueryCaseInsensitive()` method
 - **Boost Queries** - Score multiplication and relevance tuning
 - **Const Score Queries** - Uniform scoring
+- **Query Debugging** - Built-in `toString()` method for query inspection and debugging
 
 ### Field Type Support
 - **Text Fields** - Full tokenization, always indexed, position tracking
@@ -33,6 +36,13 @@ Tantivy4Java is a production-ready JNI wrapper for the Rust-based Tantivy search
 - **Date Fields** - Temporal queries with proper date handling
 - **Multi-value Fields** - Array support in documents and queries
 - **Schema Introspection** - Runtime field discovery, type checking, and metadata access
+
+### Text Analysis and Processing
+- **TextAnalyzer API** - Complete tokenization and text processing
+- **Multiple Tokenizers** - Support for default, simple, whitespace, keyword, and raw tokenizers
+- **Static Tokenization** - `TextAnalyzer.tokenize()` for quick text processing
+- **Instance-based Analysis** - Reusable analyzer instances with `TextAnalyzer.create()`
+- **Custom Tokenizer Configuration** - Configurable tokenization strategies
 
 ### Index Optimization
 - **Segment Merging** - Programmatic index optimization with metadata access
@@ -177,6 +187,13 @@ Query phraseQuery = Query.phraseQuery(schema, "content",
 // Wildcard query with advanced pattern matching
 Query wildcardQuery = Query.wildcardQuery(schema, "content", "*search*engine*");
 
+// Case-insensitive wildcard query
+Query caseInsensitiveWildcard = Query.wildcardQueryCaseInsensitive(schema, "content", "*SEARCH*ENGINE*");
+
+// Query debugging - inspect query structure
+System.out.println("Query structure: " + wildcardQuery.toString());
+System.out.println("Case-insensitive: " + caseInsensitiveWildcard.toString());
+
 // Execute search
 SearchResult result = searcher.search(booleanQuery, 10);
 for (Hit hit : result.getHits()) {
@@ -226,6 +243,48 @@ List<String> integerFields = schema.getFieldNamesByType("i64");
 
 // Advanced field filtering
 List<String> searchableStoredFields = schema.getFieldNamesByCapabilities(true, true, false);
+```
+
+### Text Analysis and Tokenization
+
+```java
+// Static tokenization with default tokenizer
+String text = "Hello World! This is a test document.";
+List<String> tokens = TextAnalyzer.tokenize(text);
+System.out.println("Default tokens: " + tokens);
+// Output: [hello, world, this, is, a, test, document]
+
+// Static tokenization with specific tokenizer
+List<String> simpleTokens = TextAnalyzer.tokenize(text, "simple");
+List<String> whitespaceTokens = TextAnalyzer.tokenize(text, "whitespace"); 
+List<String> keywordTokens = TextAnalyzer.tokenize(text, "keyword");
+List<String> rawTokens = TextAnalyzer.tokenize(text, "raw");
+
+System.out.println("Simple tokens: " + simpleTokens);
+System.out.println("Whitespace tokens: " + whitespaceTokens);
+System.out.println("Keyword tokens: " + keywordTokens);  // [Hello World! This is a test document.]
+System.out.println("Raw tokens: " + rawTokens);
+
+// Instance-based analysis for reuse
+try (TextAnalyzer analyzer = TextAnalyzer.create("default")) {
+    List<String> tokens1 = analyzer.analyze("First document text");
+    List<String> tokens2 = analyzer.analyze("Second document text");
+    
+    System.out.println("Analyzed text 1: " + tokens1);
+    System.out.println("Analyzed text 2: " + tokens2);
+}
+
+// Advanced text processing
+String complexText = "Don't split contractions! But do split sentences. What about URLs: https://example.com?";
+List<String> processedTokens = TextAnalyzer.tokenize(complexText, "default");
+System.out.println("Complex text tokens: " + processedTokens);
+
+// Available tokenizer types and their behavior:
+// - "default": Simple tokenizer + lowercase + stop word removal  
+// - "simple": Simple tokenizer with lowercase (splits on non-alphanumeric)
+// - "whitespace": Whitespace tokenizer with lowercase (splits only on whitespace)
+// - "keyword": Treats entire input as single token (no splitting)
+// - "raw": Raw tokenizer (no processing, minimal splitting)
 ```
 
 ## Working with Quickwit Splits
@@ -410,10 +469,11 @@ SplitCacheManager.CacheConfig customConfig = new SplitCacheManager.CacheConfig("
 - `IndexWriter` - Document indexing operations
 - `IndexReader` - Index reading operations  
 - `Searcher` - Search execution
-- `Schema` - Index schema definition
+- `Schema` - Index schema definition and introspection
 - `SchemaBuilder` - Schema construction
-- `Query` - Query construction utilities
+- `Query` - Query construction utilities with debugging support
 - `Document` - Document representation
+- `TextAnalyzer` - Text tokenization and analysis
 
 ### Quickwit Classes
 - `SplitSearcher` - Split file search operations

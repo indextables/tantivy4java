@@ -883,46 +883,23 @@ pub extern "system" fn Java_com_tantivy4java_Query_nativeWildcardQueryLenient(
     }
 }
 
-/// Create a single wildcard query for a pattern without spaces
-/// Uses boolean OR to combine regex and term approaches for better case handling
+/// Create a single case-sensitive wildcard query for a pattern without spaces
+/// Uses only case-preserving regex to ensure exact case matching
 fn create_single_wildcard_query(field: Field, pattern: &str) -> Result<Box<dyn TantivyQuery>, String> {
-    let mut subqueries = Vec::new();
+    // If pattern contains no wildcards, use exact term query for better performance and accuracy
+    if !contains_wildcards(pattern) {
+        // For default tokenizer, terms are lowercased during indexing
+        let term = Term::from_field_text(field, &pattern.to_lowercase());
+        let term_query = TermQuery::new(term, IndexRecordOption::Basic);
+        return Ok(Box::new(term_query) as Box<dyn TantivyQuery>);
+    }
     
-    // Approach 1: Use regex query with original case
-    let regex_pattern = wildcard_to_regex_preserve_case(pattern);
+    // For patterns with wildcards, use lowercase regex pattern since default tokenizer lowercases text
+    let lowercase_pattern = pattern.to_lowercase();
+    let regex_pattern = wildcard_to_regex_preserve_case(&lowercase_pattern);
     match RegexQuery::from_pattern(&regex_pattern, field) {
-        Ok(regex_query) => {
-            subqueries.push((Occur::Should, Box::new(regex_query) as Box<dyn TantivyQuery>));
-        },
-        Err(_) => {
-            // If regex fails, we'll rely on other approaches
-        }
-    }
-    
-    // Approach 2: Use regex query with lowercase pattern
-    let regex_pattern_lower = wildcard_to_regex(pattern);
-    if regex_pattern_lower != regex_pattern {
-        match RegexQuery::from_pattern(&regex_pattern_lower, field) {
-            Ok(regex_query_lower) => {
-                subqueries.push((Occur::Should, Box::new(regex_query_lower) as Box<dyn TantivyQuery>));
-            },
-            Err(_) => {
-                // If regex fails, continue with other approaches
-            }
-        }
-    }
-    
-    // For patterns without wildcards, we rely on the regex approaches above
-    // which will create exact regex matches that should work correctly
-    
-    // If we have multiple approaches, combine with OR; otherwise use the single approach
-    if subqueries.len() > 1 {
-        let boolean_query = BooleanQuery::new(subqueries);
-        Ok(Box::new(boolean_query) as Box<dyn TantivyQuery>)
-    } else if subqueries.len() == 1 {
-        Ok(subqueries.into_iter().next().unwrap().1)
-    } else {
-        Err(format!("Unable to create wildcard query for pattern '{}'", pattern))
+        Ok(regex_query) => Ok(Box::new(regex_query) as Box<dyn TantivyQuery>),
+        Err(e) => Err(format!("Failed to create case-sensitive wildcard query for pattern '{}': {}", pattern, e)),
     }
 }
 
@@ -1007,34 +984,43 @@ fn create_tokenized_wildcard_query(schema: &Schema, field: Field, pattern: &str)
 }
 
 /// Check if a token contains wildcard characters
-fn contains_wildcards(token: &str) -> bool {
-    token.contains('*') || token.contains('?')
-}
-
-/// Check if pattern contains multiple wildcards that should be split into regex segments
-fn contains_multi_wildcards(pattern: &str) -> bool {
-    // Only consider patterns with multiple asterisks (*) as multi-wildcard
-    // Patterns like "?est*" or "*test?" should be handled as simple wildcards
-    // Only patterns like "*abc*def*" should be multi-wildcard
-    let mut asterisk_count = 0;
+/// Process escape sequences in a wildcard pattern and return the literal text
+fn process_escapes(pattern: &str) -> String {
+    let mut result = String::new();
     let mut chars = pattern.chars().peekable();
     
     while let Some(ch) = chars.next() {
         match ch {
             '\\' => {
-                // Skip the next character (it's escaped)
-                chars.next();
-            }
-            '*' => {
-                asterisk_count += 1;
-                if asterisk_count >= 2 {
-                    return true;
+                if let Some(&next_ch) = chars.peek() {
+                    chars.next();
+                    // All escaped characters become literals
+                    result.push(next_ch);
+                } else {
+                    result.push('\\');
                 }
             }
-            _ => {}
+            _ => result.push(ch),
         }
     }
-    false
+    result
+}
+
+fn contains_wildcards(pattern: &str) -> bool {
+    let processed = process_escapes(pattern);
+    processed.contains('*') || processed.contains('?')
+}
+
+/// Check if pattern contains multiple wildcards that should be split into regex segments
+fn contains_multi_wildcards(pattern: &str) -> bool {
+    // Count the number of asterisks - multiple wildcards indicate complex patterns
+    // Examples:
+    // - "*hello*world*" -> 3 asterisks (multi-wildcard)
+    // - "*hello*" -> 2 asterisks (multi-wildcard)  
+    // - "hello*world" -> 1 asterisk (simple wildcard)
+    // - "*" -> 1 asterisk (simple wildcard)
+    
+    pattern.chars().filter(|&c| c == '*').count() > 1
 }
 
 /// Parse complex multi-wildcard pattern into raw segments (no regex escaping)
@@ -1118,17 +1104,13 @@ fn create_multi_wildcard_regex_query(field: Field, pattern: &str) -> Result<Box<
             // Create OR query for this segment with multiple matching strategies
             let mut or_strategies = Vec::new();
             
-            // Escape the segment for regex use
-            let escaped_segment = escape_regex_chars(&segment);
+            // For case-sensitive multi-wildcard, lowercase the segment since default tokenizer lowercases
+            let segment_lower = segment.to_lowercase();
+            let escaped_segment = escape_regex_chars(&segment_lower);
             
             // Strategy 1: Contains pattern (.*segment.*)
             let contains_pattern = format!(".*{}.*", escaped_segment);
             if let Ok(regex_query) = RegexQuery::from_pattern(&contains_pattern, field) {
-                or_strategies.push((Occur::Should, Box::new(regex_query) as Box<dyn TantivyQuery>));
-            }
-            // Case-insensitive version
-            let contains_pattern_ci = format!("(?i).*{}.*", escaped_segment);
-            if let Ok(regex_query) = RegexQuery::from_pattern(&contains_pattern_ci, field) {
                 or_strategies.push((Occur::Should, Box::new(regex_query) as Box<dyn TantivyQuery>));
             }
             
@@ -1137,35 +1119,17 @@ fn create_multi_wildcard_regex_query(field: Field, pattern: &str) -> Result<Box<
             if let Ok(regex_query) = RegexQuery::from_pattern(&prefix_pattern, field) {
                 or_strategies.push((Occur::Should, Box::new(regex_query) as Box<dyn TantivyQuery>));
             }
-            // Case-insensitive version
-            let prefix_pattern_ci = format!("(?i){}.*", escaped_segment);
-            if let Ok(regex_query) = RegexQuery::from_pattern(&prefix_pattern_ci, field) {
-                or_strategies.push((Occur::Should, Box::new(regex_query) as Box<dyn TantivyQuery>));
-            }
             
             // Strategy 3: Suffix pattern (.*segment)
             let suffix_pattern = format!(".*{}", escaped_segment);
             if let Ok(regex_query) = RegexQuery::from_pattern(&suffix_pattern, field) {
                 or_strategies.push((Occur::Should, Box::new(regex_query) as Box<dyn TantivyQuery>));
             }
-            // Case-insensitive version
-            let suffix_pattern_ci = format!("(?i).*{}", escaped_segment);
-            if let Ok(regex_query) = RegexQuery::from_pattern(&suffix_pattern_ci, field) {
-                or_strategies.push((Occur::Should, Box::new(regex_query) as Box<dyn TantivyQuery>));
-            }
             
-            // Strategy 4: Exact term match (both original and lowercase)
-            let term_orig = Term::from_field_text(field, &segment);
+            // Strategy 4: Exact term match with lowercase
+            let term_orig = Term::from_field_text(field, &segment_lower);
             let term_query_orig = TermQuery::new(term_orig, IndexRecordOption::WithFreqs);
             or_strategies.push((Occur::Should, Box::new(term_query_orig) as Box<dyn TantivyQuery>));
-            
-            // Also try lowercase version for better matching
-            let segment_lower = segment.to_lowercase();
-            if segment_lower != segment {
-                let term_lower = Term::from_field_text(field, &segment_lower);
-                let term_query_lower = TermQuery::new(term_lower, IndexRecordOption::WithFreqs);
-                or_strategies.push((Occur::Should, Box::new(term_query_lower) as Box<dyn TantivyQuery>));
-            }
             
             // Combine all strategies for this segment with OR
             if or_strategies.len() > 1 {
@@ -1206,7 +1170,40 @@ fn create_case_insensitive_wildcard_query(field: Field, pattern: &str) -> Result
 
 /// Create a single case-insensitive wildcard query
 fn create_case_insensitive_single_wildcard_query(field: Field, pattern: &str) -> Result<Box<dyn TantivyQuery>, String> {
-    // Create case-insensitive regex pattern
+    // If pattern contains no wildcards, create case-insensitive term matching
+    if !contains_wildcards(pattern) {
+        // Use case-insensitive regex for exact match
+        let regex_pattern = format!("(?i)^{}$", escape_regex_chars(pattern));
+        match RegexQuery::from_pattern(&regex_pattern, field) {
+            Ok(regex_query) => return Ok(Box::new(regex_query) as Box<dyn TantivyQuery>),
+            Err(_) => {
+                // Fallback: try both original and lowercase term queries
+                let mut or_strategies = Vec::new();
+                
+                // Original case term
+                let term_orig = Term::from_field_text(field, pattern);
+                let term_query_orig = TermQuery::new(term_orig, IndexRecordOption::WithFreqs);
+                or_strategies.push((Occur::Should, Box::new(term_query_orig) as Box<dyn TantivyQuery>));
+                
+                // Lowercase term
+                let pattern_lower = pattern.to_lowercase();
+                if pattern_lower != pattern {
+                    let term_lower = Term::from_field_text(field, &pattern_lower);
+                    let term_query_lower = TermQuery::new(term_lower, IndexRecordOption::WithFreqs);
+                    or_strategies.push((Occur::Should, Box::new(term_query_lower) as Box<dyn TantivyQuery>));
+                }
+                
+                if or_strategies.len() > 1 {
+                    let boolean_query = BooleanQuery::new(or_strategies);
+                    return Ok(Box::new(boolean_query) as Box<dyn TantivyQuery>);
+                } else if or_strategies.len() == 1 {
+                    return Ok(or_strategies.into_iter().next().unwrap().1);
+                }
+            }
+        }
+    }
+    
+    // For patterns with wildcards, create case-insensitive regex pattern
     let regex_pattern = format!("(?i){}", wildcard_to_regex_preserve_case(pattern));
     
     match RegexQuery::from_pattern(&regex_pattern, field) {
@@ -1683,6 +1680,21 @@ pub extern "system" fn Java_com_tantivy4java_Query_nativeExplain(
     0
 }
 
+/// Format a query with concise, readable output avoiding verbose automaton dumps
+fn format_query_concise(query: &Box<dyn TantivyQuery>) -> String {
+    let debug_string = format!("{:?}", query);
+    
+    // If the output contains newlines (like regex automaton dumps), just take the first line
+    if debug_string.contains('\n') {
+        if let Some(first_line) = debug_string.lines().next() {
+            return first_line.to_string();
+        }
+    }
+    
+    // For normal, single-line queries, return the debug output as-is
+    debug_string
+}
+
 #[no_mangle]
 pub extern "system" fn Java_com_tantivy4java_Query_nativeToString(
     mut env: JNIEnv,
@@ -1690,7 +1702,7 @@ pub extern "system" fn Java_com_tantivy4java_Query_nativeToString(
     query_ptr: jlong,
 ) -> jobject {
     let result = with_object::<Box<dyn TantivyQuery>, Option<String>>(query_ptr as u64, |query| {
-        Some(format!("{:?}", query))
+        Some(format_query_concise(query))
     });
     
     match result {
