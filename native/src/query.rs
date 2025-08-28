@@ -666,6 +666,139 @@ pub extern "system" fn Java_com_tantivy4java_Query_nativeWildcardQuery(
 }
 
 #[no_mangle]
+pub extern "system" fn Java_com_tantivy4java_Query_nativeWildcardQueryCaseInsensitive(
+    mut env: JNIEnv,
+    _class: JClass,
+    schema_ptr: jlong,
+    field_name: JString,
+    pattern: JString,
+) -> jlong {
+    let field_name_str: String = match env.get_string(&field_name) {
+        Ok(s) => s.into(),
+        Err(_) => {
+            handle_error(&mut env, "Invalid field name");
+            return 0;
+        }
+    };
+    
+    let pattern_str: String = match env.get_string(&pattern) {
+        Ok(s) => s.into(),
+        Err(_) => {
+            handle_error(&mut env, "Invalid wildcard pattern");
+            return 0;
+        }
+    };
+    
+    let result = with_object::<Schema, Result<Box<dyn TantivyQuery>, String>>(schema_ptr as u64, |schema| {
+        // Get field by name
+        let field = match schema.get_field(&field_name_str) {
+            Ok(f) => f,
+            Err(_) => return Err(format!("Field '{}' not found in schema", field_name_str)),
+        };
+        
+        // Verify the field is a text field
+        let field_entry = schema.get_field_entry(field);
+        match field_entry.field_type() {
+            TantivyFieldType::Str(_) => {
+                // Create case-insensitive wildcard query
+                create_case_insensitive_wildcard_query(field, &pattern_str)
+            },
+            _ => Err(format!("Field '{}' is not a text field - wildcard queries require text fields", field_name_str)),
+        }
+    });
+    
+    match result {
+        Some(Ok(query)) => {
+            register_object(query) as jlong
+        },
+        Some(Err(err)) => {
+            handle_error(&mut env, &err);
+            0
+        },
+        None => {
+            handle_error(&mut env, "Invalid Schema pointer");
+            0
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_tantivy4java_Query_nativeWildcardQueryCaseInsensitiveLenient(
+    mut env: JNIEnv,
+    _class: JClass,
+    schema_ptr: jlong,
+    field_name: JString,
+    pattern: JString,
+    lenient: jboolean,
+) -> jlong {
+    let field_name_str: String = match env.get_string(&field_name) {
+        Ok(s) => s.into(),
+        Err(_) => {
+            handle_error(&mut env, "Invalid field name");
+            return 0;
+        }
+    };
+    
+    let pattern_str: String = match env.get_string(&pattern) {
+        Ok(s) => s.into(),
+        Err(_) => {
+            handle_error(&mut env, "Invalid wildcard pattern");
+            return 0;
+        }
+    };
+    
+    let is_lenient = lenient != 0;
+    
+    let result = with_object::<Schema, Result<Box<dyn TantivyQuery>, String>>(schema_ptr as u64, |schema| {
+        // Get field by name
+        let field = match schema.get_field(&field_name_str) {
+            Ok(f) => f,
+            Err(_) => {
+                if is_lenient {
+                    // Return a query that matches no documents
+                    let bool_query = BooleanQuery::new(vec![]);
+                    return Ok(Box::new(bool_query) as Box<dyn TantivyQuery>);
+                } else {
+                    return Err(format!("Field '{}' not found in schema", field_name_str));
+                }
+            }
+        };
+        
+        // Verify the field is a text field
+        let field_entry = schema.get_field_entry(field);
+        match field_entry.field_type() {
+            TantivyFieldType::Str(_) => {
+                // Create case-insensitive wildcard query
+                create_case_insensitive_wildcard_query(field, &pattern_str)
+            },
+            _ => {
+                if is_lenient {
+                    // Return a query that matches no documents
+                    let bool_query = BooleanQuery::new(vec![]);
+                    Ok(Box::new(bool_query) as Box<dyn TantivyQuery>)
+                } else {
+                    Err(format!("Field '{}' is not a text field - wildcard queries require text fields", field_name_str))
+                }
+            }
+        }
+    });
+    
+    match result {
+        Some(Ok(query)) => {
+            register_object(query) as jlong
+        },
+        Some(Err(err)) => {
+            handle_error(&mut env, &err);
+            0
+        },
+        None => {
+            handle_error(&mut env, "Invalid Schema pointer");
+            0
+        }
+    }
+}
+
+#[no_mangle]
 pub extern "system" fn Java_com_tantivy4java_Query_nativeWildcardQueryLenient(
     mut env: JNIEnv,
     _class: JClass,
@@ -1051,6 +1184,149 @@ fn create_multi_wildcard_regex_query(field: Field, pattern: &str) -> Result<Box<
             Ok(and_subqueries.into_iter().next().unwrap().1)
         } else {
             Err("No valid query strategies could be created".to_string())
+        }
+    }
+}
+
+/// Create a case-insensitive wildcard query using regex patterns
+/// This creates a query that will match text regardless of case
+fn create_case_insensitive_wildcard_query(field: Field, pattern: &str) -> Result<Box<dyn TantivyQuery>, String> {
+    // Check for complex multi-wildcard patterns first (e.g., "*Wild*Joe*")
+    if !pattern.contains(' ') && contains_multi_wildcards(pattern) {
+        // Complex multi-wildcard pattern - use case-insensitive regex-based approach
+        create_case_insensitive_multi_wildcard_query(field, pattern)
+    } else if pattern.contains(' ') {
+        // Tokenize the pattern and create boolean query with case-insensitive handling
+        create_case_insensitive_tokenized_wildcard_query(field, pattern)
+    } else {
+        // Single token - use case-insensitive regex query
+        create_case_insensitive_single_wildcard_query(field, pattern)
+    }
+}
+
+/// Create a single case-insensitive wildcard query
+fn create_case_insensitive_single_wildcard_query(field: Field, pattern: &str) -> Result<Box<dyn TantivyQuery>, String> {
+    // Create case-insensitive regex pattern
+    let regex_pattern = format!("(?i){}", wildcard_to_regex_preserve_case(pattern));
+    
+    match RegexQuery::from_pattern(&regex_pattern, field) {
+        Ok(regex_query) => Ok(Box::new(regex_query) as Box<dyn TantivyQuery>),
+        Err(e) => Err(format!("Failed to create case-insensitive wildcard query for pattern '{}': {}", pattern, e)),
+    }
+}
+
+/// Create case-insensitive tokenized wildcard query for patterns containing spaces
+fn create_case_insensitive_tokenized_wildcard_query(field: Field, pattern: &str) -> Result<Box<dyn TantivyQuery>, String> {
+    // Simple tokenization by splitting on whitespace
+    let tokens: Vec<&str> = pattern.split_whitespace().collect();
+    
+    if tokens.is_empty() {
+        return Err("Empty wildcard pattern".to_string());
+    }
+    
+    if tokens.len() == 1 {
+        // Single token after splitting - fall back to simple query
+        return create_case_insensitive_single_wildcard_query(field, tokens[0]);
+    }
+    
+    // Create individual case-insensitive queries for each token
+    let mut subqueries = Vec::new();
+    
+    for token in tokens {
+        if contains_wildcards(token) {
+            // Token contains wildcards - create case-insensitive wildcard query
+            match create_case_insensitive_single_wildcard_query(field, token) {
+                Ok(query) => subqueries.push((Occur::Must, query)),
+                Err(e) => return Err(e),
+            }
+        } else {
+            // Token is literal - create case-insensitive regex for exact match
+            let regex_pattern = format!("(?i){}", escape_regex_chars(token));
+            match RegexQuery::from_pattern(&regex_pattern, field) {
+                Ok(regex_query) => subqueries.push((Occur::Must, Box::new(regex_query) as Box<dyn TantivyQuery>)),
+                Err(_) => {
+                    // Fallback to term query with lowercase
+                    let term = Term::from_field_text(field, &token.to_lowercase());
+                    let term_query = TermQuery::new(term, IndexRecordOption::WithFreqs);
+                    subqueries.push((Occur::Must, Box::new(term_query) as Box<dyn TantivyQuery>));
+                }
+            }
+        }
+    }
+    
+    if subqueries.is_empty() {
+        return Err("No valid tokens in case-insensitive wildcard pattern".to_string());
+    }
+    
+    if subqueries.len() == 1 {
+        // Only one subquery - return it directly
+        Ok(subqueries.into_iter().next().unwrap().1)
+    } else {
+        // Multiple subqueries - create boolean AND query
+        let boolean_query = BooleanQuery::new(subqueries);
+        Ok(Box::new(boolean_query) as Box<dyn TantivyQuery>)
+    }
+}
+
+/// Create case-insensitive multi-wildcard query
+fn create_case_insensitive_multi_wildcard_query(field: Field, pattern: &str) -> Result<Box<dyn TantivyQuery>, String> {
+    let segments = parse_multi_wildcard_pattern(pattern);
+    
+    if segments.is_empty() {
+        // Pattern was all wildcards - match everything case-insensitively
+        let regex_pattern = "(?i).*";
+        match RegexQuery::from_pattern(regex_pattern, field) {
+            Ok(regex_query) => Ok(Box::new(regex_query) as Box<dyn TantivyQuery>),
+            Err(e) => Err(format!("Failed to create case-insensitive regex query: {}", e)),
+        }
+    } else {
+        // Create boolean AND query where each segment is case-insensitive
+        let mut and_subqueries = Vec::new();
+        
+        for segment in segments {
+            // Create case-insensitive contains pattern for each segment
+            let escaped_segment = escape_regex_chars(&segment);
+            let case_insensitive_pattern = format!("(?i).*{}.*", escaped_segment);
+            
+            match RegexQuery::from_pattern(&case_insensitive_pattern, field) {
+                Ok(regex_query) => {
+                    and_subqueries.push((Occur::Must, Box::new(regex_query) as Box<dyn TantivyQuery>));
+                },
+                Err(_) => {
+                    // Fallback: try term queries with both original and lowercase
+                    let mut or_strategies = Vec::new();
+                    
+                    // Original case term
+                    let term_orig = Term::from_field_text(field, &segment);
+                    let term_query_orig = TermQuery::new(term_orig, IndexRecordOption::WithFreqs);
+                    or_strategies.push((Occur::Should, Box::new(term_query_orig) as Box<dyn TantivyQuery>));
+                    
+                    // Lowercase term
+                    let segment_lower = segment.to_lowercase();
+                    if segment_lower != segment {
+                        let term_lower = Term::from_field_text(field, &segment_lower);
+                        let term_query_lower = TermQuery::new(term_lower, IndexRecordOption::WithFreqs);
+                        or_strategies.push((Occur::Should, Box::new(term_query_lower) as Box<dyn TantivyQuery>));
+                    }
+                    
+                    if or_strategies.len() > 1 {
+                        let segment_or_query = BooleanQuery::new(or_strategies);
+                        and_subqueries.push((Occur::Must, Box::new(segment_or_query) as Box<dyn TantivyQuery>));
+                    } else if or_strategies.len() == 1 {
+                        and_subqueries.push((Occur::Must, or_strategies.into_iter().next().unwrap().1));
+                    }
+                }
+            }
+        }
+        
+        // Combine all segments with AND
+        if and_subqueries.len() > 1 {
+            let boolean_query = BooleanQuery::new(and_subqueries);
+            Ok(Box::new(boolean_query) as Box<dyn TantivyQuery>)
+        } else if and_subqueries.len() == 1 {
+            Ok(and_subqueries.into_iter().next().unwrap().1)
+        } else {
+            Err("No valid case-insensitive query strategies could be created".to_string())
         }
     }
 }

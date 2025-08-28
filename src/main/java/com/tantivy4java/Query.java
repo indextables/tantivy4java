@@ -217,6 +217,35 @@ public class Query implements AutoCloseable {
     }
 
     /**
+     * Create a case-insensitive wildcard query for pattern matching.
+     * Supports * (any sequence) and ? (single character) wildcards.
+     * Pattern matching is performed case-insensitively.
+     * @param schema Schema for field validation
+     * @param fieldName Field to search in
+     * @param pattern Wildcard pattern (e.g., "Test*", "?ELLO", "Wo*D")
+     * @return New Query instance
+     */
+    public static Query wildcardQueryCaseInsensitive(Schema schema, String fieldName, String pattern) {
+        long ptr = nativeWildcardQueryCaseInsensitive(schema.getNativePtr(), fieldName, pattern);
+        return new Query(ptr);
+    }
+
+    /**
+     * Create a case-insensitive wildcard query for pattern matching with lenient option.
+     * Supports * (any sequence) and ? (single character) wildcards.
+     * Pattern matching is performed case-insensitively.
+     * @param schema Schema for field validation
+     * @param fieldName Field to search in
+     * @param pattern Wildcard pattern (e.g., "Test*", "?ELLO", "Wo*D")
+     * @param lenient Whether to ignore missing fields (returns no matches instead of error)
+     * @return New Query instance
+     */
+    public static Query wildcardQueryCaseInsensitive(Schema schema, String fieldName, String pattern, boolean lenient) {
+        long ptr = nativeWildcardQueryCaseInsensitiveLenient(schema.getNativePtr(), fieldName, pattern, lenient);
+        return new Query(ptr);
+    }
+
+    /**
      * Create a more-like-this query.
      * @param docAddress Document address to use as reference
      * @param minDocFrequency Minimum document frequency
@@ -363,6 +392,8 @@ public class Query implements AutoCloseable {
     private static native long nativeRegexQuery(long schemaPtr, String fieldName, String regexPattern);
     private static native long nativeWildcardQuery(long schemaPtr, String fieldName, String pattern);
     private static native long nativeWildcardQueryLenient(long schemaPtr, String fieldName, String pattern, boolean lenient);
+    private static native long nativeWildcardQueryCaseInsensitive(long schemaPtr, String fieldName, String pattern);
+    private static native long nativeWildcardQueryCaseInsensitiveLenient(long schemaPtr, String fieldName, String pattern, boolean lenient);
     private static native long nativeMoreLikeThisQuery(long docAddressPtr, Integer minDocFrequency, Integer maxDocFrequency, Integer minTermFrequency, Integer maxQueryTerms, Integer minWordLength, Integer maxWordLength, Double boostFactor, List<String> stopWords);
     private static native long nativeConstScoreQuery(long queryPtr, double score);
     private static native long nativeRangeQuery(long schemaPtr, String fieldName, int fieldType, Object lowerBound, Object upperBound, boolean includeLower, boolean includeUpper);

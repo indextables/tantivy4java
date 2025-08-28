@@ -79,6 +79,127 @@ public class PythonParityTest {
     }
 
     @Test
+    @DisplayName("Case-insensitive wildcard query functionality")
+    public void testCaseInsensitiveWildcardQuery(@TempDir Path tempDir) {
+        System.out.println("🚀 === CASE-INSENSITIVE WILDCARD QUERY TEST ===");
+        System.out.println("Testing case-insensitive wildcard pattern matching");
+        
+        String indexPath = tempDir.resolve("wildcard_index").toString();
+        
+        try {
+            // Create schema and index
+            try (SchemaBuilder builder = new SchemaBuilder()) {
+                builder.addTextField("title", true, false, "default", "position")
+                       .addTextField("content", true, false, "default", "position");
+                
+                try (Schema schema = builder.build()) {
+                    try (Index index = new Index(schema, indexPath, false)) {
+                        try (IndexWriter writer = index.writer(50, 1)) {
+                            
+                            // Add test documents with mixed case
+                            try (Document doc1 = new Document()) {
+                                doc1.addText("title", "Hello World");
+                                doc1.addText("content", "This is a Test Document");
+                                writer.addDocument(doc1);
+                            }
+                            
+                            try (Document doc2 = new Document()) {
+                                doc2.addText("title", "HELLO UNIVERSE");
+                                doc2.addText("content", "Another TEST Example");
+                                writer.addDocument(doc2);
+                            }
+                            
+                            try (Document doc3 = new Document()) {
+                                doc3.addText("title", "hello galaxy");
+                                doc3.addText("content", "test document here");
+                                writer.addDocument(doc3);
+                            }
+                            
+                            writer.commit();
+                        }
+                        
+                        try (Searcher searcher = index.searcher()) {
+                            // Test case-sensitive wildcard (should be restrictive)
+                            System.out.println("\n🔍 Testing case-sensitive wildcard 'hello*':");
+                            SearchResult sensitiveResult;
+                            try (Query caseSensitiveQuery = Query.wildcardQuery(schema, "title", "hello*")) {
+                                System.out.println("Case-sensitive query: " + caseSensitiveQuery.toString());
+                                sensitiveResult = searcher.search(caseSensitiveQuery, 10);
+                                System.out.println("Case-sensitive matches: " + sensitiveResult.getHits().size());
+                                
+                                for (var hit : sensitiveResult.getHits()) {
+                                    try (Document doc = searcher.doc(hit.getDocAddress())) {
+                                        String title = (String) doc.getFirst("title");
+                                        System.out.println("  Found: '" + title + "'");
+                                    }
+                                }
+                            }
+                            
+                            // Test case-insensitive wildcard (should match all variations)
+                            System.out.println("\n🔍 Testing case-insensitive wildcard 'hello*':");
+                            try (Query caseInsensitiveQuery = Query.wildcardQueryCaseInsensitive(schema, "title", "hello*")) {
+                                System.out.println("Case-insensitive query: " + caseInsensitiveQuery.toString());
+                                SearchResult insensitiveResult = searcher.search(caseInsensitiveQuery, 10);
+                                System.out.println("Case-insensitive matches: " + insensitiveResult.getHits().size());
+                                
+                                for (var hit : insensitiveResult.getHits()) {
+                                    try (Document doc = searcher.doc(hit.getDocAddress())) {
+                                        String title = (String) doc.getFirst("title");
+                                        System.out.println("  Found: '" + title + "'");
+                                    }
+                                }
+                                
+                                // Case-insensitive should match more documents
+                                assertTrue(insensitiveResult.getHits().size() >= sensitiveResult.getHits().size(),
+                                         "Case-insensitive query should match at least as many documents as case-sensitive");
+                            }
+                            
+                            // Test mixed case pattern
+                            System.out.println("\n🔍 Testing case-insensitive wildcard 'HELLO*' (uppercase pattern):");
+                            try (Query upperCaseQuery = Query.wildcardQueryCaseInsensitive(schema, "title", "HELLO*")) {
+                                System.out.println("Uppercase pattern query: " + upperCaseQuery.toString());
+                                SearchResult upperResult = searcher.search(upperCaseQuery, 10);
+                                System.out.println("Uppercase pattern matches: " + upperResult.getHits().size());
+                                
+                                // Should match same number as lowercase case-insensitive
+                                try (Query lowerCaseQuery = Query.wildcardQueryCaseInsensitive(schema, "title", "hello*")) {
+                                    SearchResult lowerResult = searcher.search(lowerCaseQuery, 10);
+                                    assertEquals(upperResult.getHits().size(), lowerResult.getHits().size(),
+                                               "Case-insensitive queries should match same documents regardless of pattern case");
+                                }
+                            }
+                            
+                            // Test content field with mixed case pattern
+                            System.out.println("\n🔍 Testing case-insensitive content wildcard 'TEST*':");
+                            try (Query contentQuery = Query.wildcardQueryCaseInsensitive(schema, "content", "TEST*")) {
+                                System.out.println("Content query: " + contentQuery.toString());
+                                SearchResult contentResult = searcher.search(contentQuery, 10);
+                                System.out.println("Content matches: " + contentResult.getHits().size());
+                                
+                                assertTrue(contentResult.getHits().size() > 0,
+                                         "Case-insensitive content query should find matches");
+                                
+                                for (var hit : contentResult.getHits()) {
+                                    try (Document doc = searcher.doc(hit.getDocAddress())) {
+                                        String content = (String) doc.getFirst("content");
+                                        String title = (String) doc.getFirst("title");
+                                        System.out.println("  Found: title='" + title + "', content='" + content + "'");
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    
+                    System.out.println("✅ Case-insensitive wildcard query tests passed");
+                }
+            }
+        } catch (Exception e) {
+            fail("Case-insensitive wildcard query test failed: " + e.getMessage());
+            e.printStackTrace();
+        }
+    }
+
+    @Test
     @DisplayName("Document creation and field access matching Python behavior")
     public void testDocumentCreationAndAccess(@TempDir Path tempDir) {
         System.out.println("🚀 === PYTHON PARITY: DOCUMENT CREATION TEST ===");
