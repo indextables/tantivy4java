@@ -1,0 +1,41 @@
+# Multi-stage build for creating optimized Linux binaries
+# This builds tantivy4java optimized for x86_64 Linux
+
+FROM --platform=linux/amd64 ubuntu:22.04 AS builder
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    curl \
+    openjdk-11-jdk \
+    maven \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Rust via rustup
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+# Set up environment for x86_64 optimized build
+ENV JAVA_HOME=/usr/lib/jvm/java-11-openjdk-amd64
+
+# Copy source code
+WORKDIR /build
+COPY . .
+
+# Build with Maven (will use linux-optimized profile automatically)
+RUN mvn clean package -DskipTests
+
+# Verify the binary was built correctly
+RUN ldd target/rust/release/libtantivy4java.so
+
+# Final stage - minimal Ubuntu image for x86_64
+FROM --platform=linux/amd64 ubuntu:22.04
+
+# Install only Java runtime
+RUN apt-get update && apt-get install -y openjdk-11-jre-headless && rm -rf /var/lib/apt/lists/*
+
+# Copy the built JAR
+COPY --from=builder /build/target/tantivy4java-*.jar /app/tantivy4java.jar
+
+# Verification command
+CMD ["java", "-cp", "/app/tantivy4java.jar", "com.tantivy4java.Tantivy"]

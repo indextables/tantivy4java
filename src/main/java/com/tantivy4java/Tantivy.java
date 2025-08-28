@@ -43,64 +43,70 @@ public class Tantivy {
             return;
         }
 
-        String osName = System.getProperty("os.name").toLowerCase();
-        String osArch = System.getProperty("os.arch").toLowerCase();
-        
-        // Normalize architecture names
-        String normalizedArch;
-        if (osArch.equals("x86_64") || osArch.equals("amd64")) {
-            normalizedArch = "x86_64";
-        } else if (osArch.equals("aarch64") || osArch.equals("arm64")) {
-            normalizedArch = "aarch64";
-        } else {
-            normalizedArch = osArch;
-        }
-        
-        // Determine platform and library name
-        String platform;
+        // Detect actual runtime platform
+        String osName = detectOS();
+       
         String libraryName;
         if (osName.contains("windows")) {
-            platform = "windows-" + normalizedArch;
             libraryName = "tantivy4java.dll";
         } else if (osName.contains("mac") || osName.contains("darwin")) {
-            platform = "darwin-" + normalizedArch;
             libraryName = "libtantivy4java.dylib";
         } else {
-            platform = "linux-" + normalizedArch;
             libraryName = "libtantivy4java.so";
         }
 
-        // Try platform-specific path first, then fallback to generic path
-        String[] resourcePaths = {
-            "/native/" + platform + "/" + libraryName,
-            "/native/" + libraryName
-        };
+        try {
+            // Load from resources
+            InputStream is = Tantivy.class.getResourceAsStream("/native/" + libraryName);
+            
+            if (is != null) {
+                Path tempFile = Files.createTempFile("tantivy4java", libraryName);
+                Files.copy(is, tempFile, StandardCopyOption.REPLACE_EXISTING);
+                System.load(tempFile.toAbsolutePath().toString());
+                loaded = true;
+                return;
+            }
+            
+            throw new RuntimeException("Native library not found in resources: /native/" + libraryName);
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to load tantivy4java native library: " + libraryName, e);
+        }
+
+    }
+    
+    /**
+     * Detect the actual OS, handling containers correctly.
+     */
+    private static String detectOS() {
+        String osName = System.getProperty("os.name").toLowerCase();
         
-        for (String resourcePath : resourcePaths) {
-            try {
-                InputStream is = Tantivy.class.getResourceAsStream(resourcePath);
-                if (is != null) {
-                    Path tempFile = Files.createTempFile("tantivy4java-" + platform, libraryName);
-                    Files.copy(is, tempFile, StandardCopyOption.REPLACE_EXISTING);
-                    System.load(tempFile.toAbsolutePath().toString());
-                    loaded = true;
-                    return;
-                }
-            } catch (Exception e) {
-                // Try next path or fall back to system library loading
+        // First check for Linux by looking for /proc/version
+        if (new java.io.File("/proc/version").exists()) {
+            return "linux";
+        }
+        
+        // Check for common container environment variables
+        if (System.getenv("KUBERNETES_SERVICE_HOST") != null ||
+            System.getenv("container") != null ||
+            new java.io.File("/.dockerenv").exists()) {
+            // In a container, check for Linux-specific files
+            if (new java.io.File("/etc/os-release").exists() ||
+                new java.io.File("/etc/alpine-release").exists()) {
+                return "linux";
             }
         }
-
-        try {
-            System.loadLibrary("tantivy4java");
-            loaded = true;
-        } catch (UnsatisfiedLinkError e) {
-            throw new RuntimeException(
-                "Failed to load tantivy4java native library for platform: " + platform + 
-                ". Tried paths: " + String.join(", ", resourcePaths), e);
+        
+        // Fall back to System property detection
+        if (osName.contains("windows")) {
+            return "windows";
+        } else if (osName.contains("mac") || osName.contains("darwin")) {
+            return "darwin";
+        } else {
+            return "linux";
         }
     }
-
+    
+    
     /**
      * Get the version of the Tantivy4Java library.
      * @return Version string

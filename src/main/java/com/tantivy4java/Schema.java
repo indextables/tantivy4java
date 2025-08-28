@@ -169,6 +169,7 @@ public class Schema implements AutoCloseable {
         }
         return nativeGetSchemaSummary(nativePtr);
     }
+    
 
     @Override
     public void close() {

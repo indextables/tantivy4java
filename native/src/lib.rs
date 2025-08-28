@@ -28,6 +28,7 @@ mod index;
 mod searcher;
 mod doc_address;
 mod utils;
+mod text_analyzer;
 mod quickwit_split;
 mod split_searcher;  // Now using proper Quickwit integration
 mod split_cache_manager;  // Global cache manager following Quickwit patterns
@@ -42,6 +43,7 @@ pub use index::*;
 pub use searcher::*;
 pub use doc_address::*;
 pub use utils::*;
+pub use text_analyzer::*;
 pub use quickwit_split::*;
 pub use split_searcher::*;  // Now enabled with proper Quickwit integration
 // pub use split_searcher_simple::*;  // Disabled to avoid conflicts

@@ -10,6 +10,7 @@ description = "JNI bindings for Tantivy search engine"
 name = "tantivy4java"
 crate-type = ["cdylib"]
 
+
 [dependencies]
 # Use the exact same tantivy version as Quickwit to avoid conflicts  
 tantivy = { git = "https://github.com/quickwit-oss/tantivy/", rev = "80f5f1e", default-features = false, features = [

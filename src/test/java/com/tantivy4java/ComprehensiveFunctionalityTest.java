@@ -158,9 +158,10 @@ public class ComprehensiveFunctionalityTest {
                             assertEquals(4, totalDocs, "Should have 4 documents");
                             System.out.println("✅ Index stats: " + totalDocs + " documents in " + numSegments + " segments");
                             
-                            // Test 1: Simple text search
+                            // Test 1: Simple text search  
                             System.out.println("\n🔎 Search Test 1: Simple text search");
                             try (Query query1 = reopenedIndex.parseQuery("machine learning", Arrays.asList("title", "body"))) {
+                                System.out.println("  📋 Parsed Query Structure: " + query1.toString());
                                 try (SearchResult result1 = searcher.search(query1, 10)) {
                                     var hits1 = result1.getHits();
                                     assertTrue(hits1.size() >= 1, "Should find machine learning documents");
@@ -179,6 +180,7 @@ public class ComprehensiveFunctionalityTest {
                             // Test 2: Category-specific search  
                             System.out.println("\n🔎 Search Test 2: Category filtering");
                             try (Query query2 = reopenedIndex.parseQuery("category:technology", Arrays.asList("category"))) {
+                                System.out.println("  📋 Parsed Query Structure: " + query2.toString());
                                 try (SearchResult result2 = searcher.search(query2, 10)) {
                                     var hits2 = result2.getHits();
                                     assertEquals(2, hits2.size(), "Should find 2 technology documents");
@@ -197,6 +199,7 @@ public class ComprehensiveFunctionalityTest {
                             // Test 3: Boolean query with complex logic
                             System.out.println("\n🔎 Search Test 3: Complex boolean search");
                             try (Query query3 = reopenedIndex.parseQuery("quantum AND (computing OR algorithms)", Arrays.asList("title", "body"))) {
+                                System.out.println("  📋 Parsed Query Structure: " + query3.toString());
                                 try (SearchResult result3 = searcher.search(query3, 10)) {
                                     var hits3 = result3.getHits();
                                     assertTrue(hits3.size() >= 1, "Should find quantum computing documents");
@@ -256,6 +259,7 @@ public class ComprehensiveFunctionalityTest {
                         // Delete by category using query
                         try (IndexWriter writer = reopenedIndex.writer(50, 1)) {
                             try (Query deleteQuery = reopenedIndex.parseQuery("category:health", Arrays.asList("category"))) {
+                                System.out.println("🗑️ Delete Query Structure: " + deleteQuery.toString());
                                 long deletedCount = writer.deleteDocumentsByQuery(deleteQuery);
                                 writer.commit();
                                 System.out.println("✅ Deleted health category documents (opstamp: " + deletedCount + ")");

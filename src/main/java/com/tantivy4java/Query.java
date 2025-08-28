@@ -216,6 +216,7 @@ public class Query implements AutoCloseable {
         return new Query(ptr);
     }
 
+
     /**
      * Create a more-like-this query.
      * @param docAddress Document address to use as reference
@@ -327,6 +328,14 @@ public class Query implements AutoCloseable {
         }
     }
 
+    @Override
+    public String toString() {
+        if (closed) {
+            return "Query{CLOSED}";
+        }
+        return nativeToString(nativePtr);
+    }
+
     /**
      * Helper class for boolean query construction.
      */
@@ -359,5 +368,6 @@ public class Query implements AutoCloseable {
     private static native long nativeConstScoreQuery(long queryPtr, double score);
     private static native long nativeRangeQuery(long schemaPtr, String fieldName, int fieldType, Object lowerBound, Object upperBound, boolean includeLower, boolean includeUpper);
     private static native long nativeExplain(long queryPtr, long searcherPtr, long docAddressPtr);
+    private static native String nativeToString(long queryPtr);
     private static native void nativeClose(long ptr);
 }

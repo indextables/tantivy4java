@@ -765,25 +765,7 @@ pub extern "system" fn Java_com_tantivy4java_Explanation_nativeClose(
     remove_object(ptr as u64);
 }
 
-#[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_TextAnalyzer_nativeAnalyze(
-    mut env: JNIEnv,
-    _class: JClass,
-    _ptr: jlong,
-    _text: JString,
-) -> jobject {
-    handle_error(&mut env, "TextAnalyzer native methods not fully implemented yet");
-    std::ptr::null_mut()
-}
-
-#[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_TextAnalyzer_nativeClose(
-    _env: JNIEnv,
-    _class: JClass,
-    ptr: jlong,
-) {
-    remove_object(ptr as u64);
-}
+// TextAnalyzer methods are now implemented in text_analyzer.rs
 
 // Facet native methods
 #[no_mangle]

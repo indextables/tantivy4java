@@ -174,6 +174,22 @@ public class SplitSearcher implements AutoCloseable {
     }
     
     /**
+     * Parse a query string using this split's schema and tokenization settings.
+     * This method provides the same query parsing functionality as Index.parseQuery()
+     * but uses the schema from the split file.
+     * 
+     * @param queryString The query string to parse (e.g., "title:python AND content:machine")
+     * @return Parsed Query object ready for search operations
+     * @throws RuntimeException If the query string is malformed or contains invalid field references
+     * 
+     * @see Index#parseQuery(String)
+     */
+    public Query parseQuery(String queryString) {
+        long queryPtr = parseQueryNative(nativePtr, queryString);
+        return new Query(queryPtr);
+    }
+    
+    /**
      * Search the split with hot cache optimization
      */
     public SearchResult search(Query query, int limit) {
@@ -285,6 +301,7 @@ public class SplitSearcher implements AutoCloseable {
     // Native methods
     private static native long createNativeWithSharedCache(String splitPath, long cacheManagerPtr, Map<String, Object> splitConfig);
     private static native long getSchemaFromNative(long nativePtr);
+    private static native long parseQueryNative(long nativePtr, String queryString);
     private static native SearchResult searchNative(long nativePtr, long queryPtr, int limit);
     private static native Document docNative(long nativePtr, int segment, int docId);
     private static native void preloadComponentsNative(long nativePtr, IndexComponent[] components);
