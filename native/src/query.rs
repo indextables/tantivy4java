@@ -1408,6 +1408,33 @@ pub extern "system" fn Java_com_tantivy4java_Query_nativeExplain(
 }
 
 #[no_mangle]
+pub extern "system" fn Java_com_tantivy4java_Query_nativeToString(
+    mut env: JNIEnv,
+    _class: JClass,
+    query_ptr: jlong,
+) -> jobject {
+    let result = with_object::<Box<dyn TantivyQuery>, Option<String>>(query_ptr as u64, |query| {
+        Some(format!("{:?}", query))
+    });
+    
+    match result {
+        Some(Some(debug_string)) => {
+            match env.new_string(&debug_string) {
+                Ok(java_string) => java_string.into_raw(),
+                Err(_) => {
+                    handle_error(&mut env, "Failed to create Java string for query debug");
+                    std::ptr::null_mut()
+                }
+            }
+        },
+        _ => {
+            handle_error(&mut env, "Invalid Query pointer for toString");
+            std::ptr::null_mut()
+        }
+    }
+}
+
+#[no_mangle]
 pub extern "system" fn Java_com_tantivy4java_Query_nativeClose(
     _env: JNIEnv,
     _class: JClass,

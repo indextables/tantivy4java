@@ -18,4 +18,4 @@ ENV PATH="/root/.cargo/bin:${PATH}"
 # Set up environment for x86_64 optimized build
 ENV JAVA_HOME=/usr/lib/jvm/java-11-openjdk-amd64
 
-mvn install
+RUN apt-get update && apt-get install -y protobuf-compiler

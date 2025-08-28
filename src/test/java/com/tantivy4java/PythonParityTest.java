@@ -17,6 +17,68 @@ import java.util.ArrayList;
 public class PythonParityTest {
     
     @Test
+    @DisplayName("Query toString method provides expressive debug output")
+    public void testQueryToStringMethod(@TempDir Path tempDir) {
+        System.out.println("🚀 === QUERY toString() DEBUG TEST ===");
+        System.out.println("Testing Query.toString() provides useful debug information");
+        
+        String indexPath = tempDir.resolve("tostring_index").toString();
+        
+        try {
+            // Create a simple schema
+            try (SchemaBuilder builder = new SchemaBuilder()) {
+                builder.addTextField("title", true, false, "default", "position")
+                       .addIntegerField("score", true, true, false);
+                
+                try (Schema schema = builder.build()) {
+                    System.out.println("✅ Created schema for toString tests");
+                    
+                    // Test different query types and their toString output
+                    try (Query termQuery = Query.termQuery(schema, "title", "hello")) {
+                        String termStr = termQuery.toString();
+                        System.out.println("Term Query toString: " + termStr);
+                        assertNotNull(termStr, "Term query toString should not be null");
+                        assertTrue(termStr.length() > 0, "Term query toString should not be empty");
+                        assertTrue(termStr.contains("Term") || termStr.contains("hello"), 
+                                 "Term query toString should contain meaningful content: " + termStr);
+                    }
+                    
+                    try (Query allQuery = Query.allQuery()) {
+                        String allStr = allQuery.toString();
+                        System.out.println("All Query toString: " + allStr);
+                        assertNotNull(allStr, "All query toString should not be null");
+                        assertTrue(allStr.length() > 0, "All query toString should not be empty");
+                    }
+                    
+                    // Test nested/complex queries
+                    try (Query termQuery = Query.termQuery(schema, "title", "test");
+                         Query boostQuery = Query.boostQuery(termQuery, 2.0)) {
+                        String boostStr = boostQuery.toString();
+                        System.out.println("Boost Query toString: " + boostStr);
+                        assertNotNull(boostStr, "Boost query toString should not be null");
+                        assertTrue(boostStr.contains("Boost") || boostStr.contains("2"), 
+                                 "Boost query toString should mention boost or factor: " + boostStr);
+                    }
+                    
+                    try (Query termQuery = Query.termQuery(schema, "title", "constant");
+                         Query constQuery = Query.constScoreQuery(termQuery, 1.5)) {
+                        String constStr = constQuery.toString();
+                        System.out.println("Const Score Query toString: " + constStr);
+                        assertNotNull(constStr, "Const query toString should not be null");
+                        assertTrue(constStr.contains("Const") || constStr.contains("1.5"), 
+                                 "Const query toString should mention const score: " + constStr);
+                    }
+                    
+                    System.out.println("✅ All Query toString tests passed - expressive debug output working");
+                }
+            }
+        } catch (Exception e) {
+            fail("Query toString test failed: " + e.getMessage());
+            e.printStackTrace();
+        }
+    }
+
+    @Test
     @DisplayName("Document creation and field access matching Python behavior")
     public void testDocumentCreationAndAccess(@TempDir Path tempDir) {
         System.out.println("🚀 === PYTHON PARITY: DOCUMENT CREATION TEST ===");
