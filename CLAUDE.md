@@ -66,14 +66,19 @@ Tantivy4Java
 - **✅ API Compliance** - Exact match with tantivy-py Python library behavior
 - **✅ Comprehensive Testing** - All schema field type tests passing with correct expectations
 
-### **🚀 PREVIOUS BREAKTHROUGH: QUICKWIT SPLIT MERGE FUNCTIONALITY**
+### **🚀 NEW BREAKTHROUGH: COMPLETE S3 REMOTE SPLIT MERGE SUPPORT (September 2025)**
 
-**✅ Complete Quickwit-Style Split Merging Implementation:**
-- **✅ QuickwitSplit.mergeSplits() API** - Production-ready split merging with Quickwit's efficient approach
+**✅ Complete S3/Remote Split Merging Implementation:**
+- **✅ QuickwitSplit.mergeSplits() API** - Production-ready split merging with full S3 URL support
+- **✅ Multi-Protocol Support** - Local files, file:// URLs, and s3:// URLs seamlessly supported
+- **✅ AWS Credential Integration** - Full support for access keys, secret keys, session tokens
+- **✅ S3-Compatible Storage** - MinIO, custom endpoints, and path-style access support
 - **✅ Memory-Optimized Architecture** - Uses Quickwit's MergeExecutor pattern for large-scale indices
 - **✅ UnionDirectory Integration** - Memory-efficient unified access without data copying
 - **✅ Segment-Level Merging** - Direct Tantivy segment operations instead of document-by-document copying
 - **✅ Temporary Extraction Strategy** - Safely handles read-only BundleDirectory constraints
+
+### **🚀 PREVIOUS BREAKTHROUGH: QUICKWIT SPLIT MERGE FUNCTIONALITY**
 
 **✅ Production-Optimized for Very Large Indices:**
 - **✅ Controlled Memory Usage** - 15MB heap limits like Quickwit's implementation
@@ -118,7 +123,10 @@ Tantivy4Java
 ### **✅ QUICKWIT SPLIT FUNCTIONALITY: MERGE COMPLETE, ADDITIONAL FEATURES IN PROGRESS**
 
 **✅ Completed Quickwit Split Features:**
-- **✅ QuickwitSplit.mergeSplits()** - **COMPLETE**: Production-ready Quickwit-style split merging
+- **✅ QuickwitSplit.mergeSplits()** - **COMPLETE**: Production-ready Quickwit-style split merging with full S3 support
+- **✅ Remote S3 Split Merging** - Download and merge splits from S3/MinIO with AWS credential authentication
+- **✅ Multi-Protocol Support** - Seamlessly handles local files, file:// URLs, and s3:// URLs in single operation
+- **✅ AWS Integration** - Complete credential support including temporary credentials and custom endpoints
 - **✅ Memory-efficient merging** - Uses Quickwit's proven MergeExecutor pattern for large indices
 - **✅ Comprehensive testing** - Split merge functionality fully tested and validated
 - **✅ Format compliance** - Proper Quickwit split merging with metadata handling
@@ -127,6 +135,69 @@ Tantivy4Java
 - **🚧 Real split creation** - Completing `convertIndex()` method to eliminate fake split generation
 - **🚧 Split extraction** - Implementing `extractSplit()` for split-to-index conversion
 - **🚧 Split inspection** - Adding `readSplitMetadata()` and `listSplitFiles()` methods
+
+#### **🌟 S3 Remote Split Merge Examples**
+
+**Basic S3 Split Merge:**
+```java
+// Create AWS configuration
+QuickwitSplit.AwsConfig awsConfig = new QuickwitSplit.AwsConfig(
+    "AKIA...", "secret-key", "us-east-1");
+
+// Create merge configuration with AWS credentials
+QuickwitSplit.MergeConfig config = new QuickwitSplit.MergeConfig(
+    "my-index", "my-source", "my-node", awsConfig);
+
+// Define S3 split URLs to merge
+List<String> s3Splits = Arrays.asList(
+    "s3://my-bucket/splits/split-001.split",
+    "s3://my-bucket/splits/split-002.split",
+    "s3://my-bucket/splits/split-003.split"
+);
+
+// Merge remote S3 splits
+QuickwitSplit.SplitMetadata result = QuickwitSplit.mergeSplits(
+    s3Splits, "/tmp/merged-split.split", config);
+
+System.out.println("Merged " + result.getNumDocs() + " documents");
+```
+
+**Advanced S3 Configuration (Session Token + Custom Endpoint):**
+```java
+// Temporary credentials with session token
+QuickwitSplit.AwsConfig sessionConfig = new QuickwitSplit.AwsConfig(
+    "temp-access-key",     // Temporary access key
+    "temp-secret-key",     // Temporary secret key  
+    "session-token",       // STS session token
+    "us-west-2",          // AWS region
+    "https://s3.custom.endpoint.com", // Custom S3 endpoint
+    true                   // Force path style (for MinIO)
+);
+
+QuickwitSplit.MergeConfig config = new QuickwitSplit.MergeConfig(
+    "distributed-index", "data-source", "worker-node", sessionConfig);
+```
+
+**Mixed Protocol Support:**
+```java
+// Merge splits from multiple sources in single operation
+List<String> mixedSplits = Arrays.asList(
+    "/local/path/split-001.split",           // Local file
+    "file:///shared/storage/split-002.split", // File URL  
+    "s3://bucket-a/split-003.split",         // S3 URL
+    "s3://bucket-b/remote/split-004.split"   // Different S3 bucket
+);
+
+QuickwitSplit.SplitMetadata result = QuickwitSplit.mergeSplits(
+    mixedSplits, "s3://output-bucket/merged.split", config);
+```
+
+**✅ Production Benefits:**
+- **🌐 Global Distribution** - Merge splits across regions and cloud providers
+- **🔐 Secure Access** - AWS IAM integration with temporary credentials support
+- **⚡ High Performance** - Native Quickwit merge algorithms with S3 streaming
+- **🛡️ Error Resilience** - Comprehensive error handling for network issues
+- **🔧 DevOps Friendly** - Works with CI/CD pipelines and container deployments
 
 ### **🎯 COMPREHENSIVE PYTHON PARITY IMPLEMENTATION**
 
