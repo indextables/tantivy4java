@@ -47,34 +47,6 @@ import java.util.concurrent.atomic.AtomicLong;
  * <h3>Configuration Validation</h3>
  * The manager validates that cache instances with the same name have consistent
  * configurations to prevent conflicting cache settings.
- * 
- * <h3>AWS Credential Session Token Management</h3>
- * The cache manager automatically handles AWS credential rotation scenarios:
- * <ul>
- *   <li><b>Session Token Invalidation:</b> When creating a cache with the same AWS access_key 
- *       and secret_key but different session_token, existing caches are automatically closed 
- *       and invalidated</li>
- *   <li><b>Credential Tracking:</b> Caches are tracked by AWS credentials to enable automatic 
- *       cleanup during credential rotation</li>
- *   <li><b>Manual Invalidation:</b> {@link #invalidateAwsCredentialCaches(String, String)} 
- *       allows programmatic invalidation of caches using specific AWS credentials</li>
- * </ul>
- * 
- * <p><b>Example AWS credential rotation handling:</b></p>
- * <pre>{@code
- * // Initial cache with session token
- * SplitCacheManager.CacheConfig config1 = new SplitCacheManager.CacheConfig("aws-cache")
- *     .withAwsCredentials("access-key", "secret-key", "session-token-1");
- * SplitCacheManager cache1 = SplitCacheManager.getInstance(config1);
- * 
- * // New cache with rotated session token - automatically invalidates cache1
- * SplitCacheManager.CacheConfig config2 = new SplitCacheManager.CacheConfig("aws-cache")
- *     .withAwsCredentials("access-key", "secret-key", "session-token-2");
- * SplitCacheManager cache2 = SplitCacheManager.getInstance(config2); // cache1 is closed
- * 
- * // Manual invalidation of all caches using specific credentials
- * int invalidated = SplitCacheManager.invalidateAwsCredentialCaches("access-key", "secret-key");
- * }</pre>
  */
 public class SplitCacheManager implements AutoCloseable {
     
@@ -83,9 +55,6 @@ public class SplitCacheManager implements AutoCloseable {
     }
     
     private static final Map<String, SplitCacheManager> instances = new ConcurrentHashMap<>();
-    
-    // Track caches by AWS credential key (access_key + secret_key) for session token invalidation
-    private static final Map<String, List<String>> awsCredentialToCacheKeys = new ConcurrentHashMap<>();
     
     private final String cacheName;
     private final String cacheKey; // Full cache key used for storage/retrieval
@@ -311,95 +280,14 @@ public class SplitCacheManager implements AutoCloseable {
     }
     
     /**
-     * Get or create a shared cache manager instance with AWS credential session token invalidation.
-     * If AWS credentials (access_key + secret_key) already exist with a different session token,
-     * the existing cache will be closed and replaced.
+     * Get or create a shared cache manager instance
      */
     public static SplitCacheManager getInstance(CacheConfig config) {
-        // Handle AWS credential session token invalidation
-        String awsCredentialKey = getAwsCredentialKey(config);
-        if (awsCredentialKey != null) {
-            invalidateExistingAwsCredentialCaches(config, awsCredentialKey);
-        }
-        
         return instances.computeIfAbsent(config.getCacheKey(), 
             cacheKey -> {
                 validateCacheConfig(config);
-                SplitCacheManager manager = new SplitCacheManager(config);
-                
-                // Track this cache by AWS credentials if present
-                if (awsCredentialKey != null) {
-                    awsCredentialToCacheKeys.computeIfAbsent(awsCredentialKey, k -> new ArrayList<>())
-                        .add(cacheKey);
-                }
-                
-                return manager;
+                return new SplitCacheManager(config);
             });
-    }
-    
-    /**
-     * Generate AWS credential key for tracking (access_key + secret_key, excluding session_token)
-     */
-    private static String getAwsCredentialKey(CacheConfig config) {
-        Map<String, String> awsConfig = config.getAwsConfig();
-        if (awsConfig.isEmpty()) {
-            return null;
-        }
-        
-        String accessKey = awsConfig.get("access_key");
-        String secretKey = awsConfig.get("secret_key");
-        
-        if (accessKey == null || secretKey == null) {
-            return null;
-        }
-        
-        return "aws:" + accessKey + ":" + secretKey;
-    }
-    
-    /**
-     * Invalidate existing caches with the same AWS credentials but different session tokens
-     */
-    private static void invalidateExistingAwsCredentialCaches(CacheConfig newConfig, String awsCredentialKey) {
-        List<String> existingCacheKeys = awsCredentialToCacheKeys.get(awsCredentialKey);
-        if (existingCacheKeys == null || existingCacheKeys.isEmpty()) {
-            return;
-        }
-        
-        String newSessionToken = newConfig.getAwsConfig().get("session_token");
-        List<String> keysToRemove = new ArrayList<>();
-        
-        // Create a copy of the list to avoid ConcurrentModificationException
-        List<String> cacheKeysCopy = new ArrayList<>(existingCacheKeys);
-        
-        for (String existingCacheKey : cacheKeysCopy) {
-            SplitCacheManager existingManager = instances.get(existingCacheKey);
-            if (existingManager == null) {
-                keysToRemove.add(existingCacheKey);
-                continue;
-            }
-            
-            String existingSessionToken = existingManager.awsConfig.get("session_token");
-            
-            // If session tokens are different (including null vs non-null), invalidate the existing cache
-            if (!Objects.equals(newSessionToken, existingSessionToken)) {
-                System.out.println("🔄 AWS session token changed - invalidating existing cache: " + existingCacheKey);
-                
-                try {
-                    existingManager.close();
-                } catch (Exception e) {
-                    System.err.println("Error closing cache during AWS credential invalidation: " + e.getMessage());
-                }
-                
-                instances.remove(existingCacheKey);
-                keysToRemove.add(existingCacheKey);
-            }
-        }
-        
-        // Clean up removed cache keys (safe since we're working with the original list)
-        existingCacheKeys.removeAll(keysToRemove);
-        if (existingCacheKeys.isEmpty()) {
-            awsCredentialToCacheKeys.remove(awsCredentialKey);
-        }
     }
     
     /**
@@ -536,9 +424,6 @@ public class SplitCacheManager implements AutoCloseable {
         }
         managedSearchers.clear();
         
-        // Clean up AWS credential tracking
-        cleanupAwsCredentialTracking();
-        
         // Close native cache manager
         if (nativePtr != 0) {
             closeNativeCacheManager(nativePtr);
@@ -546,72 +431,6 @@ public class SplitCacheManager implements AutoCloseable {
         
         // Remove from instances using the cache key
         instances.remove(cacheKey);
-    }
-    
-    /**
-     * Manually invalidate all caches using specific AWS credentials.
-     * Useful for programmatic credential rotation scenarios.
-     * 
-     * @param accessKey AWS access key ID
-     * @param secretKey AWS secret access key
-     * @return Number of caches that were invalidated
-     */
-    public static int invalidateAwsCredentialCaches(String accessKey, String secretKey) {
-        if (accessKey == null || secretKey == null) {
-            return 0;
-        }
-        
-        String awsCredentialKey = "aws:" + accessKey + ":" + secretKey;
-        List<String> cacheKeys = awsCredentialToCacheKeys.get(awsCredentialKey);
-        
-        if (cacheKeys == null || cacheKeys.isEmpty()) {
-            return 0;
-        }
-        
-        int invalidatedCount = 0;
-        List<String> keysToRemove = new ArrayList<>(cacheKeys);
-        
-        for (String cacheKey : keysToRemove) {
-            SplitCacheManager manager = instances.get(cacheKey);
-            if (manager != null) {
-                System.out.println("🔄 Manually invalidating AWS credential cache: " + cacheKey);
-                
-                try {
-                    manager.close();
-                    invalidatedCount++;
-                } catch (Exception e) {
-                    System.err.println("Error closing cache during manual AWS credential invalidation: " + e.getMessage());
-                }
-            }
-        }
-        
-        return invalidatedCount;
-    }
-    
-    /**
-     * Clean up AWS credential tracking when cache is closed
-     */
-    private void cleanupAwsCredentialTracking() {
-        if (awsConfig.isEmpty()) {
-            return;
-        }
-        
-        String accessKey = awsConfig.get("access_key");
-        String secretKey = awsConfig.get("secret_key");
-        
-        if (accessKey == null || secretKey == null) {
-            return;
-        }
-        
-        String awsCredentialKey = "aws:" + accessKey + ":" + secretKey;
-        List<String> cacheKeys = awsCredentialToCacheKeys.get(awsCredentialKey);
-        
-        if (cacheKeys != null) {
-            cacheKeys.remove(this.cacheKey);
-            if (cacheKeys.isEmpty()) {
-                awsCredentialToCacheKeys.remove(awsCredentialKey);
-            }
-        }
     }
     
     // Native method declarations
