@@ -40,7 +40,7 @@ public class AdvancedPythonParityTest {
                     System.out.println("\n📝 Phase 2: Adding test documents for phrase queries");
                     
                     try (Index index = new Index(schema, indexPath, false)) {
-                        try (IndexWriter writer = index.writer(50, 1)) {
+                        try (IndexWriter writer = index.writer(Index.Memory.DEFAULT_HEAP_SIZE, 1)) {
                             
                             // Add documents matching Python test patterns
                             try (Document doc1 = new Document()) {
@@ -208,7 +208,7 @@ public class AdvancedPythonParityTest {
                     System.out.println("\n📝 Phase 2: Adding documents with intentional typos for fuzzy testing");
                     
                     try (Index index = new Index(schema, indexPath, false)) {
-                        try (IndexWriter writer = index.writer(50, 1)) {
+                        try (IndexWriter writer = index.writer(Index.Memory.DEFAULT_HEAP_SIZE, 1)) {
                             
                             // Add documents matching Python fuzzy test patterns
                             try (Document doc1 = new Document()) {
@@ -402,7 +402,7 @@ public class AdvancedPythonParityTest {
                     System.out.println("\n📝 Phase 2: Adding documents for scoring analysis");
                     
                     try (Index index = new Index(schema, indexPath, false)) {
-                        try (IndexWriter writer = index.writer(50, 1)) {
+                        try (IndexWriter writer = index.writer(Index.Memory.DEFAULT_HEAP_SIZE, 1)) {
                             
                             // Add documents for scoring tests
                             try (Document doc1 = new Document()) {

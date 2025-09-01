@@ -40,7 +40,7 @@ public class ExplanationAndFrequencyTest {
                     System.out.println("\n📝 Phase 2: Adding documents for explanation analysis");
                     
                     try (Index index = new Index(schema, indexPath, false)) {
-                        try (IndexWriter writer = index.writer(50, 1)) {
+                        try (IndexWriter writer = index.writer(Index.Memory.DEFAULT_HEAP_SIZE, 1)) {
                             
                             // Add documents with varying term frequencies
                             try (Document doc1 = new Document()) {
@@ -234,7 +234,7 @@ public class ExplanationAndFrequencyTest {
                     System.out.println("\n📝 Phase 2: Adding documents with known term frequencies");
                     
                     try (Index index = new Index(schema, indexPath, false)) {
-                        try (IndexWriter writer = index.writer(50, 1)) {
+                        try (IndexWriter writer = index.writer(Index.Memory.DEFAULT_HEAP_SIZE, 1)) {
                             
                             // Document 1: Contains 'sea' multiple times
                             try (Document doc1 = new Document()) {

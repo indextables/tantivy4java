@@ -60,7 +60,7 @@ public class TestSplitMerge {
             
             Schema schema = builder.build();
             Index index = new Index(schema, indexPath.toString(), false);
-            IndexWriter writer = index.writer(50, 1);
+            IndexWriter writer = index.writer(Index.Memory.DEFAULT_HEAP_SIZE, 1);
             
             // Add test document
             try (Document doc = new Document()) {

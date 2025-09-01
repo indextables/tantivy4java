@@ -60,7 +60,7 @@ public class SimplifiedMultiSplitCacheTest {
             // Create local index with different data
             Path indexPath = tempDir.resolve("test-index-" + i);
             try (Index index = new Index(testSchema, indexPath.toString(), false)) {
-                try (IndexWriter writer = index.writer(50, 1)) {
+                try (IndexWriter writer = index.writer(Index.Memory.DEFAULT_HEAP_SIZE, 1)) {
                     // Add different documents to each split
                     for (int j = 0; j < 5; j++) {
                         String json = String.format(

@@ -39,7 +39,7 @@ public class EscapeAndSpecialFieldsTest {
                     System.out.println("\n📝 Phase 2: Adding documents with special characters");
                     
                     try (Index index = new Index(schema, indexPath, false)) {
-                        try (IndexWriter writer = index.writer(50, 1)) {
+                        try (IndexWriter writer = index.writer(Index.Memory.DEFAULT_HEAP_SIZE, 1)) {
                             
                             // Add documents with quotes and special characters
                             try (Document doc1 = new Document()) {
@@ -215,7 +215,7 @@ public class EscapeAndSpecialFieldsTest {
                     System.out.println("\n📝 Phase 2: Adding documents with boolean fields");
                     
                     try (Index index = new Index(schema, indexPath, false)) {
-                        try (IndexWriter writer = index.writer(50, 1)) {
+                        try (IndexWriter writer = index.writer(Index.Memory.DEFAULT_HEAP_SIZE, 1)) {
                             
                             // Test 1: Document with boolean true (Python pattern)
                             System.out.println("\n🔎 Test 1: Document with boolean=true");

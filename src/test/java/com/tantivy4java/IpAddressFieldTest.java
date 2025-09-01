@@ -27,7 +27,7 @@ public class IpAddressFieldTest {
             try (Schema schema = builder.build()) {
                 try (Index index = new Index(schema, "", true)) {
                     // Index documents with IP address fields
-                    try (IndexWriter writer = index.writer(50, 1)) {
+                    try (IndexWriter writer = index.writer(Index.Memory.DEFAULT_HEAP_SIZE, 1)) {
                         
                         // Document 1: IPv4 address
                         try (Document doc1 = new Document()) {
@@ -158,7 +158,7 @@ public class IpAddressFieldTest {
             
             try (Schema schema = builder.build()) {
                 try (Index index = new Index(schema, "", true)) {
-                    try (IndexWriter writer = index.writer(50, 1)) {
+                    try (IndexWriter writer = index.writer(Index.Memory.DEFAULT_HEAP_SIZE, 1)) {
                         
                         // Test various valid IP address formats
                         String[] validIps = {

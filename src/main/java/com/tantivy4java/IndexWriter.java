@@ -62,6 +62,57 @@ public class IndexWriter implements AutoCloseable {
     }
 
     /**
+     * Add multiple documents from a serialized batch buffer.
+     * This method provides high-performance bulk indexing by minimizing JNI calls
+     * and using zero-copy semantics where possible.
+     * 
+     * The buffer must be formatted according to the Tantivy4Java batch protocol.
+     * Use BatchDocumentBuilder to create properly formatted buffers.
+     * 
+     * @param buffer Direct ByteBuffer containing serialized document batch
+     * @return Array of operation stamps, one for each document added
+     * @throws IllegalArgumentException if buffer is null or not direct
+     * @throws RuntimeException if buffer format is invalid or processing fails
+     */
+    public long[] addDocumentsByBuffer(java.nio.ByteBuffer buffer) {
+        if (closed) {
+            throw new IllegalStateException("IndexWriter has been closed");
+        }
+        if (buffer == null) {
+            throw new IllegalArgumentException("Buffer cannot be null");
+        }
+        if (!buffer.isDirect()) {
+            throw new IllegalArgumentException("Buffer must be a direct ByteBuffer for zero-copy operations");
+        }
+        if (!buffer.hasRemaining()) {
+            throw new IllegalArgumentException("Buffer is empty");
+        }
+        
+        return nativeAddDocumentsByBuffer(nativePtr, buffer);
+    }
+
+    /**
+     * Add multiple documents from a BatchDocumentBuilder.
+     * This is a convenience method that builds the buffer and adds the documents
+     * in a single operation.
+     * 
+     * @param builder BatchDocumentBuilder containing documents to add
+     * @return Array of operation stamps, one for each document added
+     * @throws IllegalArgumentException if builder is null or empty
+     */
+    public long[] addDocumentsBatch(BatchDocumentBuilder builder) {
+        if (builder == null) {
+            throw new IllegalArgumentException("Builder cannot be null");
+        }
+        if (builder.isEmpty()) {
+            throw new IllegalArgumentException("Builder contains no documents");
+        }
+        
+        java.nio.ByteBuffer buffer = builder.build();
+        return addDocumentsByBuffer(buffer);
+    }
+
+    /**
      * Commit all pending changes to the index.
      * @return Operation stamp of the commit
      */
@@ -201,6 +252,7 @@ public class IndexWriter implements AutoCloseable {
     // Native method declarations
     private static native long nativeAddDocument(long ptr, long docPtr);
     private static native long nativeAddJson(long ptr, String json);
+    private static native long[] nativeAddDocumentsByBuffer(long ptr, java.nio.ByteBuffer buffer);
     private static native long nativeCommit(long ptr);
     private static native long nativeRollback(long ptr);
     private static native void nativeGarbageCollectFiles(long ptr);

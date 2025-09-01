@@ -82,7 +82,7 @@ public class QuickwitSplitFromPathTest {
         
         // Create index
         Index index = new Index(schema, indexPath);
-        IndexWriter writer = index.writer(100, 1);
+        IndexWriter writer = index.writer(Index.Memory.DEFAULT_HEAP_SIZE, 1);
         
         // Add 200 test documents in a loop
         for (int i = 1; i <= 200; i++) {

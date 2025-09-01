@@ -60,7 +60,7 @@ public class ComprehensiveFunctionalityTest {
                     try (Index index = new Index(schema, indexPath, false)) {
                         
                         // Add diverse test documents
-                        try (IndexWriter writer = index.writer(100, 2)) {
+                        try (IndexWriter writer = index.writer(Index.Memory.DEFAULT_HEAP_SIZE, 2)) {
                             
                             // Document 1: Tech article
                             try (Document doc1 = new Document()) {
@@ -242,7 +242,7 @@ public class ComprehensiveFunctionalityTest {
                         System.out.println("\n🗑️ Phase 6: Document management (CRUD operations)");
                         
                         // Delete unpublished documents
-                        try (IndexWriter writer = reopenedIndex.writer(50, 1)) {
+                        try (IndexWriter writer = reopenedIndex.writer(Index.Memory.DEFAULT_HEAP_SIZE, 1)) {
                             long deletedCount = writer.deleteDocumentsByTerm("published", false);
                             writer.commit();
                             System.out.println("✅ Deleted unpublished documents (opstamp: " + deletedCount + ")");
@@ -257,7 +257,7 @@ public class ComprehensiveFunctionalityTest {
                         }
                         
                         // Delete by category using query
-                        try (IndexWriter writer = reopenedIndex.writer(50, 1)) {
+                        try (IndexWriter writer = reopenedIndex.writer(Index.Memory.DEFAULT_HEAP_SIZE, 1)) {
                             try (Query deleteQuery = reopenedIndex.parseQuery("category:health", Arrays.asList("category"))) {
                                 System.out.println("🗑️ Delete Query Structure: " + deleteQuery.toString());
                                 long deletedCount = writer.deleteDocumentsByQuery(deleteQuery);

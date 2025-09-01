@@ -27,6 +27,26 @@ import java.util.Map;
  * An index contains documents and provides search capabilities.
  */
 public class Index implements AutoCloseable {
+    
+    /**
+     * Memory allocation constants for IndexWriter creation.
+     * These values ensure compatibility with Tantivy's minimum memory requirements.
+     */
+    public static final class Memory {
+        /** Minimum heap size required by Tantivy (15MB) */
+        public static final int MIN_HEAP_SIZE = 15_000_000;
+        
+        /** Default heap size for normal usage (50MB) */
+        public static final int DEFAULT_HEAP_SIZE = 50_000_000;
+        
+        /** Large heap size for bulk operations (128MB) */
+        public static final int LARGE_HEAP_SIZE = 128_000_000;
+        
+        /** Extra large heap size for very large indices (256MB) */
+        public static final int XL_HEAP_SIZE = 256_000_000;
+        
+        private Memory() {} // Utility class
+    }
     static {
         Tantivy.initialize();
     }
@@ -99,6 +119,13 @@ public class Index implements AutoCloseable {
         if (closed) {
             throw new IllegalStateException("Index has been closed");
         }
+        if (heapSize < Memory.MIN_HEAP_SIZE) {
+            throw new IllegalArgumentException(
+                "Heap size must be at least " + Memory.MIN_HEAP_SIZE + " bytes (15MB). " +
+                "Consider using Index.Memory.DEFAULT_HEAP_SIZE (" + Memory.DEFAULT_HEAP_SIZE + ") " +
+                "or other predefined constants."
+            );
+        }
         long ptr = nativeWriter(nativePtr, heapSize, numThreads);
         return new IndexWriter(ptr);
     }
@@ -108,7 +135,7 @@ public class Index implements AutoCloseable {
      * @return New IndexWriter instance
      */
     public IndexWriter writer() {
-        return writer(128_000_000, 0);
+        return writer(Memory.LARGE_HEAP_SIZE, 0);
     }
 
     /**

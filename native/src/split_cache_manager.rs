@@ -142,7 +142,7 @@ pub struct GlobalCacheStats {
 
 // Global registry for cache managers
 lazy_static::lazy_static! {
-    static ref CACHE_MANAGERS: Mutex<HashMap<String, Arc<GlobalSplitCacheManager>>> = 
+    pub static ref CACHE_MANAGERS: Mutex<HashMap<String, Arc<GlobalSplitCacheManager>>> = 
         Mutex::new(HashMap::new());
 }
 

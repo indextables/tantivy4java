@@ -40,7 +40,7 @@ public class NewFunctionalityTest {
                     System.out.println("\n📝 Phase 2: Testing IndexWriter new methods");
                     
                     try (Index index = new Index(schema, indexPath, false)) {
-                        try (IndexWriter writer = index.writer(50, 1)) {
+                        try (IndexWriter writer = index.writer(Index.Memory.DEFAULT_HEAP_SIZE, 1)) {
                             
                             // Test 1: Regular document addition
                             System.out.println("\n🔎 Test 1: Adding regular documents");
@@ -154,7 +154,7 @@ public class NewFunctionalityTest {
                     System.out.println("\n📝 Phase 2: Adding test documents for term set queries");
                     
                     try (Index index = new Index(schema, indexPath, false)) {
-                        try (IndexWriter writer = index.writer(50, 1)) {
+                        try (IndexWriter writer = index.writer(Index.Memory.DEFAULT_HEAP_SIZE, 1)) {
                             
                             // Add test documents
                             try (Document doc1 = new Document()) {

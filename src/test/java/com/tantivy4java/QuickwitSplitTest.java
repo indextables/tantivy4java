@@ -56,7 +56,7 @@ class QuickwitSplitTest {
         index = new Index(schema, tempIndexDir.toString());
         System.out.println("✅ Created index");
         
-        try (IndexWriter writer = index.writer(50, 1)) {
+        try (IndexWriter writer = index.writer(Index.Memory.DEFAULT_HEAP_SIZE, 1)) {
             // Add minimal test documents to avoid complex setup issues
             Document doc1 = new Document();
             doc1.addText("title", "First Document");
@@ -501,7 +501,7 @@ class QuickwitSplitTest {
         
         Index largeIndex = new Index(schema, largeIndexDir.toString());
         
-        try (IndexWriter writer = largeIndex.writer(100, 2)) {
+        try (IndexWriter writer = largeIndex.writer(Index.Memory.DEFAULT_HEAP_SIZE, 2)) {
             // Add more documents with simplified approach
             for (int i = 0; i < 120; i++) {
                 Document doc = new Document();

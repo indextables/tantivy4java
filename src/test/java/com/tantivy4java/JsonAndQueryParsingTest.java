@@ -40,7 +40,7 @@ public class JsonAndQueryParsingTest {
                     System.out.println("\n📝 Phase 2: Testing JSON document creation patterns");
                     
                     try (Index index = new Index(schema, indexPath, false)) {
-                        try (IndexWriter writer = index.writer(50, 1)) {
+                        try (IndexWriter writer = index.writer(Index.Memory.DEFAULT_HEAP_SIZE, 1)) {
                             
                             // Test 1: Equivalent to Python Document.from_dict()
                             System.out.println("\n🔎 Test 1: Document.from_dict equivalent with multiple fields");
@@ -176,7 +176,7 @@ public class JsonAndQueryParsingTest {
                     System.out.println("\n📝 Phase 2: Adding test documents for query parsing");
                     
                     try (Index index = new Index(schema, indexPath, false)) {
-                        try (IndexWriter writer = index.writer(50, 1)) {
+                        try (IndexWriter writer = index.writer(Index.Memory.DEFAULT_HEAP_SIZE, 1)) {
                             
                             // Add documents for parsing tests
                             String jsonDoc1 = "{ \"id\": 1, \"title\": \"The Old Man and the Sea\", \"body\": \"He was an old man who fished alone in a skiff in the Gulf Stream.\" }";

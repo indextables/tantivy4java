@@ -27,7 +27,7 @@ public class IndexWriterDeleteTest {
                 try (Index index = new Index(schema, "", true)) {
                     
                     // Add some documents first
-                    try (IndexWriter writer = index.writer(50, 1)) {
+                    try (IndexWriter writer = index.writer(Index.Memory.DEFAULT_HEAP_SIZE, 1)) {
                         for (int i = 1; i <= 5; i++) {
                             try (Document doc = new Document()) {
                                 doc.addText("title", "Test Document " + i);
@@ -48,7 +48,7 @@ public class IndexWriterDeleteTest {
                     }
                     
                     // Delete all documents
-                    try (IndexWriter writer = index.writer(50, 1)) {
+                    try (IndexWriter writer = index.writer(Index.Memory.DEFAULT_HEAP_SIZE, 1)) {
                         writer.deleteAllDocuments();
                         writer.commit();
                         System.out.println("✓ Deleted all documents");
@@ -86,7 +86,7 @@ public class IndexWriterDeleteTest {
                 try (Index index = new Index(schema, "", true)) {
                     
                     // Add documents with different values
-                    try (IndexWriter writer = index.writer(50, 1)) {
+                    try (IndexWriter writer = index.writer(Index.Memory.DEFAULT_HEAP_SIZE, 1)) {
                         // Active documents
                         for (int i = 1; i <= 3; i++) {
                             try (Document doc = new Document()) {
@@ -119,7 +119,7 @@ public class IndexWriterDeleteTest {
                     }
                     
                     // Delete documents by boolean term (delete inactive documents)
-                    try (IndexWriter writer = index.writer(50, 1)) {
+                    try (IndexWriter writer = index.writer(Index.Memory.DEFAULT_HEAP_SIZE, 1)) {
                         long opstamp = writer.deleteDocumentsByTerm("active", false);
                         writer.commit();
                         System.out.println("✓ Delete operation completed with opstamp: " + opstamp);
@@ -155,7 +155,7 @@ public class IndexWriterDeleteTest {
                     }
                     
                     // Delete documents by integer term (delete id = 2)
-                    try (IndexWriter writer = index.writer(50, 1)) {
+                    try (IndexWriter writer = index.writer(Index.Memory.DEFAULT_HEAP_SIZE, 1)) {
                         long opstamp = writer.deleteDocumentsByTerm("id", 2L);
                         writer.commit();
                         System.out.println("✓ Delete operation completed with opstamp: " + opstamp);
@@ -194,7 +194,7 @@ public class IndexWriterDeleteTest {
                 try (Index index = new Index(schema, "", true)) {
                     
                     // Add documents in different categories
-                    try (IndexWriter writer = index.writer(50, 1)) {
+                    try (IndexWriter writer = index.writer(Index.Memory.DEFAULT_HEAP_SIZE, 1)) {
                         // Tech category
                         for (int i = 1; i <= 3; i++) {
                             try (Document doc = new Document()) {
@@ -237,7 +237,7 @@ public class IndexWriterDeleteTest {
                     }
                     
                     // Delete documents by query (delete all technology articles)
-                    try (IndexWriter writer = index.writer(50, 1)) {
+                    try (IndexWriter writer = index.writer(Index.Memory.DEFAULT_HEAP_SIZE, 1)) {
                         try (Query deleteQuery = index.parseQuery("technology", Arrays.asList("category"))) {
                             long opstamp = writer.deleteDocumentsByQuery(deleteQuery);
                             writer.commit();
@@ -309,7 +309,7 @@ public class IndexWriterDeleteTest {
                 try (Index index = new Index(schema, "", true)) {
                     
                     // Add documents with various field types
-                    try (IndexWriter writer = index.writer(50, 1)) {
+                    try (IndexWriter writer = index.writer(Index.Memory.DEFAULT_HEAP_SIZE, 1)) {
                         try (Document doc1 = new Document()) {
                             doc1.addText("title", "First Document");
                             doc1.addInteger("id", 1);
@@ -347,7 +347,7 @@ public class IndexWriterDeleteTest {
                     index.reload();
                     
                     // Test delete by float field
-                    try (IndexWriter writer = index.writer(50, 1)) {
+                    try (IndexWriter writer = index.writer(Index.Memory.DEFAULT_HEAP_SIZE, 1)) {
                         long opstamp = writer.deleteDocumentsByTerm("rating", 4.5);
                         writer.commit();
                         System.out.println("✓ Delete operation completed with opstamp: " + opstamp);

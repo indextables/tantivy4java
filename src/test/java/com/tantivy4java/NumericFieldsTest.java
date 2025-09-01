@@ -33,7 +33,7 @@ public class NumericFieldsTest {
                     System.out.println("✓ Index created successfully");
                     
                     // Create IndexWriter and add documents with numeric data
-                    try (IndexWriter writer = index.writer(50, 1)) {
+                    try (IndexWriter writer = index.writer(Index.Memory.DEFAULT_HEAP_SIZE, 1)) {
                         System.out.println("✓ IndexWriter created successfully");
                         
                         // Document 1: high rating, good

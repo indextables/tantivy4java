@@ -18,7 +18,7 @@ public class TestSearcherDoc {
             try (Schema schema = builder.build()) {
                 try (Index index = new Index(schema, "", true)) {
                     // Index test documents
-                    try (IndexWriter writer = index.writer(50, 1)) {
+                    try (IndexWriter writer = index.writer(Index.Memory.DEFAULT_HEAP_SIZE, 1)) {
                         
                         try (Document doc1 = new Document()) {
                             doc1.addText("title", "Machine Learning Guide");

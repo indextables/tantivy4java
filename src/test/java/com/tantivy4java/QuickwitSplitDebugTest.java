@@ -34,7 +34,7 @@ public class QuickwitSplitDebugTest {
                 
         index = new Index(schema, tempIndexDir.toString());
         
-        try (IndexWriter writer = index.writer(50, 1)) {
+        try (IndexWriter writer = index.writer(Index.Memory.DEFAULT_HEAP_SIZE, 1)) {
             Document doc = new Document();
             doc.addText("title", "Debug Document");
             writer.addDocument(doc);

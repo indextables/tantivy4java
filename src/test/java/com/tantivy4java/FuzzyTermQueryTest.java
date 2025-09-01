@@ -38,7 +38,7 @@ public class FuzzyTermQueryTest {
                     System.out.println("\n📝 Phase 2: Creating index and adding test documents with various spellings");
                     
                     try (Index index = new Index(schema, indexPath, false)) {
-                        try (IndexWriter writer = index.writer(100, 2)) {
+                        try (IndexWriter writer = index.writer(Index.Memory.DEFAULT_HEAP_SIZE, 2)) {
                             
                             // Add test documents with various spellings and typos
                             try (Document doc1 = new Document()) {

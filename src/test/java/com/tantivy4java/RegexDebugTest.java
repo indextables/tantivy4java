@@ -52,7 +52,7 @@ public class RegexDebugTest {
         
         // EXACT index setup from AdvancedQueryTest  
         index = new Index(schema, tempDir.toString(), false);
-        writer = index.writer(100, 2);
+        writer = index.writer(Index.Memory.DEFAULT_HEAP_SIZE, 2);
         
         // Add test document with EXACT data from AdvancedQueryTest
         try (Document doc = new Document()) {

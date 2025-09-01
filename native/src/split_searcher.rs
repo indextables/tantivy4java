@@ -10,8 +10,8 @@ macro_rules! debug_log {
         }
     };
 }
-use jni::objects::{JClass, JObject, JString};
-use jni::sys::{jlong, jboolean, jobject, jint, jfloat};
+use jni::objects::{JClass, JObject, JString, JIntArray};
+use jni::sys::{jlong, jboolean, jobject, jint, jfloat, jintArray};
 use jni::JNIEnv;
 use tokio::runtime::Runtime;
 use serde_json;
@@ -28,6 +28,8 @@ use quickwit_common::uri::{Uri, Protocol};
 use tantivy::{Index, IndexReader, DocAddress, TantivyDocument};
 use tantivy::query::{Query as TantivyQuery, QueryParser};
 use tantivy::schema::Value;
+
+// Use local SearchResult type since we define it in this module
 use tantivy::directory::FileSlice;
 use std::str::FromStr;
 use crate::document::RetrievedDocument;
@@ -496,9 +498,16 @@ impl SplitSearcher {
         let query = query_result.ok_or_else(|| anyhow::anyhow!("Invalid query pointer"))?;
         debug_log!("Retrieved query from registry successfully");
         
+        // Delegate to search_with_query
+        self.search_with_query(&query, limit)
+    }
+    
+    pub fn search_with_query(&self, query: &Box<dyn tantivy::query::Query>, limit: i32) -> anyhow::Result<SearchResult> {
+        debug_log!("SplitSearcher.search_with_query using Quickwit leaf search infrastructure");
+        
         // Use Quickwit's async leaf search architecture
         let (leaf_search_response, scores) = self.runtime.block_on(async {
-            self.quickwit_leaf_search(query, limit as usize).await
+            self.quickwit_leaf_search(query.box_clone(), limit as usize).await
         })?;
         
         debug_log!("Quickwit leaf search completed with {} hits", leaf_search_response.partial_hits.len());
@@ -967,10 +976,15 @@ fn create_split_searcher_with_shared_cache(
     let aws_config = extract_aws_config_from_java_map(env, &split_config)?;
     debug_log!("Extracted AWS config from Java: {:?}", aws_config);
     
-    // Register split with cache manager
+    // Register split with cache manager (safely) - Release lock before register_object
     if cache_manager_ptr != 0 {
-        let cache_manager = unsafe { &*(cache_manager_ptr as *const crate::split_cache_manager::GlobalSplitCacheManager) };
-        cache_manager.add_split(split_path.clone());
+        // Use safe cache manager access through registry
+        {
+            let managers = crate::split_cache_manager::CACHE_MANAGERS.lock().unwrap();
+            if let Some(cache_manager) = managers.values().find(|m| Arc::as_ptr(m) as jlong == cache_manager_ptr) {
+                cache_manager.add_split(split_path.clone());
+            }
+        } // Lock is released here
     }
     
     // Create configuration using shared cache
@@ -982,8 +996,7 @@ fn create_split_searcher_with_shared_cache(
     };
     
     let searcher = SplitSearcher::new(config)?;
-    let boxed = Box::new(searcher);
-    Ok(Box::into_raw(boxed) as jlong)
+    Ok(register_object(searcher) as jlong)
 }
 
 #[no_mangle]
@@ -993,9 +1006,7 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_closeNative(
     ptr: jlong,
 ) {
     if ptr != 0 {
-        unsafe {
-            let _ = Box::from_raw(ptr as *mut SplitSearcher);
-        }
+        crate::utils::remove_object(ptr as u64);
     }
 }
 
@@ -1009,13 +1020,13 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_validateSplitNative(
         return false as jboolean;
     }
     
-    // Add basic pointer validation before unsafe dereference
-    if (ptr as *mut SplitSearcher).is_null() {
-        return false as jboolean;
+    // Use safe object access pattern
+    match crate::utils::with_object::<SplitSearcher, bool>(ptr as u64, |searcher| {
+        searcher.validate_split()
+    }) {
+        Some(result) => result as jboolean,
+        None => false as jboolean,
     }
-    
-    let searcher = unsafe { &*(ptr as *mut SplitSearcher) };
-    searcher.validate_split() as jboolean
 }
 
 #[no_mangle]
@@ -1028,11 +1039,11 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_listSplitFilesNative(
         return std::ptr::null_mut();
     }
     
-    let searcher = unsafe { &*(ptr as *mut SplitSearcher) };
-    
-    match searcher.list_split_files() {
-        Ok(files) => create_string_list(&mut env, files),
-        Err(_) => std::ptr::null_mut(),
+    match crate::utils::with_object::<SplitSearcher, Result<Vec<String>, anyhow::Error>>(ptr as u64, |searcher| {
+        searcher.list_split_files()
+    }) {
+        Some(Ok(files)) => create_string_list(&mut env, files),
+        _ => std::ptr::null_mut(),
     }
 }
 
@@ -1046,8 +1057,12 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_loadHotCacheNative(
         return false as jboolean;
     }
     
-    let searcher = unsafe { &mut *(ptr as *mut SplitSearcher) };
-    searcher.load_hot_cache().is_ok() as jboolean
+    match crate::utils::with_object_mut::<SplitSearcher, Result<(), anyhow::Error>>(ptr as u64, |searcher| {
+        searcher.load_hot_cache()
+    }) {
+        Some(Ok(_)) => true as jboolean,
+        _ => false as jboolean,
+    }
 }
 
 #[no_mangle]
@@ -1061,10 +1076,10 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_preloadComponentsNati
         return;
     }
     
-    let searcher = unsafe { &*(ptr as *mut SplitSearcher) };
-    
     if let Ok(components) = extract_string_list(&mut env, components_list) {
-        let _ = searcher.preload_components(&components);
+        let _ = crate::utils::with_object::<SplitSearcher, Result<(), anyhow::Error>>(ptr as u64, |searcher| {
+            searcher.preload_components(&components)
+        });
     }
 }
 
@@ -1078,10 +1093,12 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_getCacheStatsNative(
         return std::ptr::null_mut();
     }
     
-    let searcher = unsafe { &*(ptr as *mut SplitSearcher) };
-    let stats = searcher.get_cache_stats();
-    
-    create_cache_stats_object(&mut env, stats)
+    match crate::utils::with_object::<SplitSearcher, CacheStats>(ptr as u64, |searcher| {
+        searcher.get_cache_stats()
+    }) {
+        Some(stats) => create_cache_stats_object(&mut env, stats),
+        None => std::ptr::null_mut(),
+    }
 }
 
 #[no_mangle]
@@ -1094,10 +1111,12 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_getComponentCacheStat
         return std::ptr::null_mut();
     }
     
-    let searcher = unsafe { &*(ptr as *mut SplitSearcher) };
-    let status_map = searcher.get_component_cache_status();
-    
-    create_component_status_map(&mut env, status_map)
+    match crate::utils::with_object::<SplitSearcher, std::collections::HashMap<String, ComponentCacheStatus>>(ptr as u64, |searcher| {
+        searcher.get_component_cache_status()
+    }) {
+        Some(status_map) => create_component_status_map(&mut env, status_map),
+        None => std::ptr::null_mut(),
+    }
 }
 
 #[no_mangle]
@@ -1111,10 +1130,10 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_evictComponentsNative
         return;
     }
     
-    let searcher = unsafe { &mut *(ptr as *mut SplitSearcher) };
-    
     if let Ok(components) = extract_string_list(&mut env, components_list) {
-        let _ = searcher.evict_components(&components);
+        let _ = crate::utils::with_object_mut::<SplitSearcher, Result<(), anyhow::Error>>(ptr as u64, |searcher| {
+            searcher.evict_components(&components)
+        });
     }
 }
 
@@ -1130,16 +1149,32 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_searchNative(
         return std::ptr::null_mut();
     }
     
-    let searcher = unsafe { &*(ptr as *mut SplitSearcher) };
+    // Get the query object first to avoid recursive lock in search()
+    let query_result = crate::utils::with_object(query_ptr as u64, |query: &Box<dyn tantivy::query::Query>| {
+        query.box_clone()
+    });
     
-    // Use the existing search method which properly handles query_ptr and limit
-    match searcher.search(query_ptr, limit) {
-        Ok(result) => {
+    let query = match query_result {
+        Some(q) => q,
+        None => return std::ptr::null_mut(),
+    };
+    
+    // Use safe object access for search with the pre-retrieved query
+    let search_result = crate::utils::with_object::<SplitSearcher, Result<SearchResult, anyhow::Error>>(ptr as u64, |searcher| {
+        searcher.search_with_query(&query, limit)
+    });
+    
+    match search_result {
+        Some(Ok(result)) => {
             debug_log!("search succeeded, creating result object");
             create_search_result_object(&mut env, result)
         },
-        Err(e) => {
+        Some(Err(e)) => {
             debug_log!("search failed with error: {}", e);
+            std::ptr::null_mut()
+        },
+        None => {
+            debug_log!("search failed: null searcher");
             std::ptr::null_mut()
         },
     }
@@ -1157,23 +1192,24 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_docNative(
         return std::ptr::null_mut();
     }
     
-    let searcher = unsafe { &*(ptr as *mut SplitSearcher) };
+    let retrieved_doc = match crate::utils::with_object::<SplitSearcher, Result<crate::document::RetrievedDocument, anyhow::Error>>(ptr as u64, |searcher| {
+        searcher.get_document(segment, doc_id)
+    }) {
+        Some(Ok(retrieved_doc)) => retrieved_doc,
+        Some(Err(_)) => return std::ptr::null_mut(),
+        None => return std::ptr::null_mut(),
+    };
+
+    // Register object OUTSIDE the with_object closure to avoid recursive lock
+    use crate::document::DocumentWrapper;
     
-    match searcher.get_document(segment, doc_id) {
-        Ok(retrieved_doc) => {
-            // Use the RetrievedDocument directly with populated field values
-            use crate::document::DocumentWrapper;
-            
-            let document_wrapper = DocumentWrapper::Retrieved(retrieved_doc);
-            let native_ptr = register_object(document_wrapper) as jlong;
-            
-            match env.find_class("com/tantivy4java/Document") {
-                Ok(class) => {
-                    match env.new_object(class, "(J)V", &[native_ptr.into()]) {
-                        Ok(obj) => obj.into_raw(),
-                        Err(_) => std::ptr::null_mut(),
-                    }
-                },
+    let document_wrapper = DocumentWrapper::Retrieved(retrieved_doc);
+    let native_ptr = register_object(document_wrapper) as jlong;
+        
+    match env.find_class("com/tantivy4java/Document") {
+        Ok(class) => {
+            match env.new_object(class, "(J)V", &[native_ptr.into()]) {
+                Ok(obj) => obj.into_raw(),
                 Err(_) => std::ptr::null_mut(),
             }
         },
@@ -1194,10 +1230,16 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_getSchemaFromNative(
         return 0;
     }
     
-    let searcher = unsafe { &*(ptr as *mut SplitSearcher) };
-    
-    // Get the actual schema from the split file's Tantivy index
-    let schema = searcher.index.schema();
+    // Get schema safely
+    let schema = match crate::utils::with_object::<SplitSearcher, tantivy::schema::Schema>(ptr as u64, |searcher| {
+        searcher.index.schema()
+    }) {
+        Some(s) => s,
+        None => {
+            let _ = env.throw_new("java/lang/RuntimeException", "Invalid Schema pointer");
+            return 0;
+        }
+    };
     
     // Convert the Tantivy schema to a Java Schema object
     match convert_tantivy_schema_to_java(&mut env, &schema) {
@@ -1230,10 +1272,13 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_parseQueryNative(
         }
     };
 
-    let searcher = unsafe { &*(ptr as *mut SplitSearcher) };
-    
-    // Get the schema and index from the split file
-    let schema = searcher.index.schema();
+    // Get schema and index safely 
+    let (schema, index) = match crate::utils::with_object::<SplitSearcher, (tantivy::schema::Schema, tantivy::Index)>(ptr as u64, |searcher| {
+        (searcher.index.schema(), searcher.index.clone())
+    }) {
+        Some(result) => result,
+        None => return 0,
+    };
     
     // Get default fields (only indexed text fields - exclude numeric fields)
     let default_fields: Vec<_> = schema.fields()
@@ -1250,7 +1295,7 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_parseQueryNative(
     }
     
     // Create query parser
-    let query_parser = QueryParser::for_index(&searcher.index, default_fields.clone());
+    let query_parser = QueryParser::for_index(&index, default_fields.clone());
     
     // Parse the query using the same logic as Index.parseQuery()
     match crate::index::parse_query_with_phrase_fix(&query_parser, &query_str, &schema, &default_fields) {
@@ -1414,10 +1459,10 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_getSchemaJsonNative(
         return std::ptr::null_mut();
     }
     
-    let searcher = unsafe { &*(ptr as *mut SplitSearcher) };
-    
-    match searcher.get_schema() {
-        Ok(schema_json) => {
+    match crate::utils::with_object::<SplitSearcher, Result<String, anyhow::Error>>(ptr as u64, |searcher| {
+        searcher.get_schema()
+    }) {
+        Some(Ok(schema_json)) => {
             match env.new_string(&schema_json) {
                 Ok(java_string) => java_string.as_raw(),
                 Err(e) => {
@@ -1427,9 +1472,13 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_getSchemaJsonNative(
                 }
             }
         },
-        Err(e) => {
+        Some(Err(e)) => {
             let error_msg = format!("Failed to get schema from split file: {}", e);
             let _ = env.throw_new("java/lang/RuntimeException", &error_msg);
+            std::ptr::null_mut()
+        },
+        None => {
+            let _ = env.throw_new("java/lang/RuntimeException", "Invalid searcher pointer for schema");
             std::ptr::null_mut()
         },
     }
@@ -1445,7 +1494,7 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_getSplitMetadataNativ
         return std::ptr::null_mut();
     }
     
-    let _searcher = unsafe { &*(ptr as *mut SplitSearcher) };
+    // Safe access not needed for placeholder implementation
     
     // Create a placeholder SplitMetadata object
     // In a real implementation, this would extract metadata from the actual split file
@@ -1528,7 +1577,7 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_getLoadingStatsNative
         return std::ptr::null_mut();
     }
     
-    let _searcher = unsafe { &*(ptr as *mut SplitSearcher) };
+    // Safe access not needed for placeholder implementation
     
     // Create a placeholder LoadingStats object
     match env.find_class("com/tantivy4java/SplitSearcher$LoadingStats") {
@@ -1570,8 +1619,14 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_getLoadingStatsNative
 
 fn extract_string_list(env: &mut JNIEnv, list_obj: jobject) -> anyhow::Result<Vec<String>> {
     let mut result = Vec::new();
-    let list = unsafe { JObject::from_raw(list_obj) };
     
+    if list_obj.is_null() {
+        return Ok(result);
+    }
+    
+    // REQUIRED unsafe: JNI requires raw jobject -> JObject conversion for type safety
+    // This is a JNI interface requirement, not for performance
+    let list = unsafe { JObject::from_raw(list_obj) };
     let size = env.call_method(&list, "size", "()I", &[])?.i()?;
     
     for i in 0..size {
@@ -1884,4 +1939,413 @@ async fn open_split_index_standalone(
         .try_into()?;
         
     Ok((index, reader))
+}
+
+// Bulk Document Retrieval Implementation (Simplified Stubs)
+// ========================================
+
+// Simple stub implementations for bulk document retrieval
+
+#[no_mangle]
+pub extern "system" fn Java_com_tantivy4java_SplitSearcher_docsBulkNative(
+    mut env: JNIEnv,
+    _class: JClass,
+    ptr: jlong,
+    segments: jintArray,
+    doc_ids: jintArray,
+) -> jobject {
+    if ptr == 0 {
+        let _ = env.throw_new("java/lang/RuntimeException", "Invalid SplitSearcher pointer");
+        return std::ptr::null_mut();
+    }
+    let segments_array = unsafe { JIntArray::from_raw(segments) };
+    let doc_ids_array = unsafe { JIntArray::from_raw(doc_ids) };
+    
+    let segments_len = match env.get_array_length(&segments_array) {
+        Ok(len) => len as usize,
+        Err(_) => {
+            let _ = env.throw_new("java/lang/RuntimeException", "Failed to get segment array length");
+            return std::ptr::null_mut();
+        }
+    };
+    
+    let doc_ids_len = match env.get_array_length(&doc_ids_array) {
+        Ok(len) => len as usize,
+        Err(_) => {
+            let _ = env.throw_new("java/lang/RuntimeException", "Failed to get doc ID array length");
+            return std::ptr::null_mut();
+        }
+    };
+    
+    if segments_len != doc_ids_len {
+        let _ = env.throw_new("java/lang/RuntimeException", "Segment and doc ID arrays must have same length");
+        return std::ptr::null_mut();
+    }
+    
+    // Get array elements
+    let mut segments_vec = vec![0i32; segments_len];
+    let mut doc_ids_vec = vec![0i32; doc_ids_len];
+    
+    match env.get_int_array_region(&segments_array, 0, &mut segments_vec) {
+        Ok(_) => {},
+        Err(_) => {
+            let _ = env.throw_new("java/lang/RuntimeException", "Failed to read segment array");
+            return std::ptr::null_mut();
+        }
+    };
+    
+    match env.get_int_array_region(&doc_ids_array, 0, &mut doc_ids_vec) {
+        Ok(_) => {},
+        Err(_) => {
+            let _ = env.throw_new("java/lang/RuntimeException", "Failed to read doc ID array");
+            return std::ptr::null_mut();
+        }
+    };
+
+    // Use safe object access - perform operations inside the closure to avoid lifetime issues
+    let result = crate::utils::with_object::<SplitSearcher, Result<Vec<u8>, String>>(ptr as u64, |searcher| {
+
+        // Create a simple binary buffer with document data
+        // Format: [doc_count: 4 bytes] [doc1_data] [doc2_data] ...
+        let mut buffer = Vec::new();
+        
+        // Write document count in big-endian (Java default)
+        buffer.extend_from_slice(&(segments_vec.len() as i32).to_be_bytes());
+        
+        // Get the tantivy searcher for document retrieval
+        let tantivy_searcher = searcher.reader.searcher();
+        let schema = searcher.index.schema();
+        
+        // For each document, retrieve and serialize basic data
+        for (segment_id, doc_id) in segments_vec.iter().zip(doc_ids_vec.iter()) {
+            // Create DocAddress
+            let doc_address = DocAddress {
+                segment_ord: *segment_id as u32,
+                doc_id: *doc_id as u32,
+            };
+            
+            // Get document using existing single doc retrieval
+            match tantivy_searcher.doc::<tantivy::TantivyDocument>(doc_address) {
+                Ok(doc) => {
+                    // Simple serialization: just write field count and basic field data
+                    let fields: Vec<_> = schema.fields().collect();
+                    
+                    // Write field count in big-endian
+                    buffer.extend_from_slice(&(fields.len() as i32).to_be_bytes());
+                    
+                    // For each field, write basic data
+                    for (field, field_entry) in fields {
+                        let field_name = field_entry.name();
+                        let field_values = doc.get_all(field);
+                        
+                        // Write field name length and name in big-endian
+                        let name_bytes = field_name.as_bytes();
+                        buffer.extend_from_slice(&(name_bytes.len() as i32).to_be_bytes());
+                        buffer.extend_from_slice(name_bytes);
+                        
+                        // Write value count in big-endian
+                        let field_values_vec: Vec<_> = field_values.collect();
+                        buffer.extend_from_slice(&(field_values_vec.len() as i32).to_be_bytes());
+                        
+                        // Write values with proper type handling - using string conversion for now
+                        for value in field_values_vec {
+                            let value_str = if let Some(s) = value.as_str() {
+                                s.to_string()
+                            } else if let Some(n) = value.as_u64() {
+                                n.to_string()
+                            } else if let Some(n) = value.as_i64() {
+                                n.to_string()
+                            } else if let Some(f) = value.as_f64() {
+                                f.to_string()
+                            } else if let Some(b) = value.as_bool() {
+                                b.to_string()
+                            } else if let Some(d) = value.as_datetime() {
+                                format!("{:?}", d)
+                            } else {
+                                // Fallback - use debug format
+                                format!("{:?}", value)
+                            };
+                            let value_bytes = value_str.as_bytes();
+                            buffer.extend_from_slice(&(value_bytes.len() as i32).to_be_bytes());
+                            buffer.extend_from_slice(value_bytes);
+                        }
+                    }
+                },
+                Err(_) => {
+                    // Skip invalid documents, just write 0 fields in big-endian
+                    buffer.extend_from_slice(&0i32.to_be_bytes());
+                }
+            }
+        }
+
+        Ok(buffer)
+    });
+    
+    let buffer = match result {
+        Some(Ok(buffer)) => buffer,
+        Some(Err(err)) => {
+            let _ = env.throw_new("java/lang/RuntimeException", &err);
+            return std::ptr::null_mut();
+        },
+        None => {
+            let _ = env.throw_new("java/lang/RuntimeException", "Invalid SplitSearcher pointer");
+            return std::ptr::null_mut();
+        }
+    };
+
+    // Create safe ByteBuffer - use simple approach to avoid complex JNI operations
+    // First, create a byte array from the buffer data
+    match env.byte_array_from_slice(&buffer) {
+        Ok(byte_array) => {
+            // Return the byte array directly - the Java side can wrap it in ByteBuffer.wrap()
+            // This is safer than complex JNI calls that can cause crashes
+            byte_array.as_raw()
+        },
+        Err(_) => {
+            let _ = env.throw_new("java/lang/RuntimeException", "Failed to create byte array");
+            std::ptr::null_mut()
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_tantivy4java_SplitSearcher_parseBulkDocsNative(
+    mut env: JNIEnv,
+    _class: JClass,
+    buffer: jni::objects::JByteBuffer,
+) -> jobject {
+    if buffer.is_null() {
+        // Return empty ArrayList for null input
+        match env.find_class("java/util/ArrayList") {
+            Ok(arraylist_class) => {
+                match env.new_object(&arraylist_class, "()V", &[]) {
+                    Ok(arraylist) => return arraylist.as_raw(),
+                    Err(_) => return std::ptr::null_mut()
+                }
+            },
+            Err(_) => return std::ptr::null_mut()
+        }
+    }
+
+    // Get buffer data - handle both direct and wrapped ByteBuffers
+    // Copy data to avoid lifetime issues
+    let buffer_data_vec = match env.get_direct_buffer_address(&buffer) {
+        Ok(ptr) => {
+            // This is a direct buffer
+            let capacity = match env.get_direct_buffer_capacity(&buffer) {
+                Ok(cap) => cap,
+                Err(_) => {
+                    let _ = env.throw_new("java/lang/RuntimeException", "Failed to get direct buffer capacity");
+                    return std::ptr::null_mut();
+                }
+            };
+            if capacity == 0 {
+                // Return empty ArrayList for empty buffer
+                match env.find_class("java/util/ArrayList") {
+                    Ok(arraylist_class) => {
+                        match env.new_object(&arraylist_class, "()V", &[]) {
+                            Ok(arraylist) => return arraylist.as_raw(),
+                            Err(_) => return std::ptr::null_mut()
+                        }
+                    },
+                    Err(_) => return std::ptr::null_mut()
+                }
+            }
+            // Copy direct buffer data
+            let src_slice = unsafe { std::slice::from_raw_parts(ptr, capacity) };
+            src_slice.to_vec()
+        },
+        Err(_) => {
+            // Not a direct buffer, try to get backing array
+            match env.call_method(&buffer, "array", "()[B", &[]) {
+                Ok(array_result) => {
+                    match array_result.l() {
+                        Ok(array_obj) => {
+                            // Convert JObject to JByteArray
+                            let byte_array = jni::objects::JByteArray::from(array_obj);
+                            
+                            // Get array length
+                            let length = match env.get_array_length(&byte_array) {
+                                Ok(len) => len as usize,
+                                Err(_) => {
+                                    let _ = env.throw_new("java/lang/RuntimeException", "Failed to get array length");
+                                    return std::ptr::null_mut();
+                                }
+                            };
+
+                            if length == 0 {
+                                // Return empty ArrayList for empty buffer
+                                match env.find_class("java/util/ArrayList") {
+                                    Ok(arraylist_class) => {
+                                        match env.new_object(&arraylist_class, "()V", &[]) {
+                                            Ok(arraylist) => return arraylist.as_raw(),
+                                            Err(_) => return std::ptr::null_mut()
+                                        }
+                                    },
+                                    Err(_) => return std::ptr::null_mut()
+                                }
+                            }
+
+                            // Get array elements by copying
+                            let mut buffer = vec![0i8; length];
+                            match env.get_byte_array_region(&byte_array, 0, &mut buffer) {
+                                Ok(_) => {
+                                    // Convert i8 to u8 safely
+                                    buffer.into_iter().map(|b| b as u8).collect()
+                                },
+                                Err(_) => {
+                                    let _ = env.throw_new("java/lang/RuntimeException", "Failed to get array elements");
+                                    return std::ptr::null_mut();
+                                }
+                            }
+                        },
+                        Err(_) => {
+                            let _ = env.throw_new("java/lang/RuntimeException", "Failed to get buffer array");
+                            return std::ptr::null_mut();
+                        }
+                    }
+                },
+                Err(_) => {
+                    let _ = env.throw_new("java/lang/RuntimeException", "Failed to call array() method on ByteBuffer");
+                    return std::ptr::null_mut();
+                }
+            }
+        }
+    };
+
+    let buffer_data = &buffer_data_vec[..];
+
+    // Parse the binary format: [doc_count: 4 bytes] [doc1_data] [doc2_data] ...
+    if buffer_data.len() < 4 {
+        let _ = env.throw_new("java/lang/RuntimeException", "Buffer too small to contain document count");
+        return std::ptr::null_mut();
+    }
+
+    // Read document count (big-endian)
+    let doc_count = i32::from_be_bytes([
+        buffer_data[0], buffer_data[1], buffer_data[2], buffer_data[3]
+    ]);
+
+    // Create ArrayList for documents
+    let arraylist_class = match env.find_class("java/util/ArrayList") {
+        Ok(class) => class,
+        Err(_) => {
+            let _ = env.throw_new("java/lang/RuntimeException", "Failed to find ArrayList class");
+            return std::ptr::null_mut();
+        }
+    };
+
+    let arraylist = match env.new_object(&arraylist_class, "()V", &[]) {
+        Ok(list) => list,
+        Err(_) => {
+            let _ = env.throw_new("java/lang/RuntimeException", "Failed to create ArrayList");
+            return std::ptr::null_mut();
+        }
+    };
+
+    // Parse each document
+    let mut offset = 4;
+    for _doc_idx in 0..doc_count {
+        if offset + 4 > buffer_data.len() {
+            break; // Not enough data for field count
+        }
+
+        // Read field count (big-endian)
+        let field_count = i32::from_be_bytes([
+            buffer_data[offset], buffer_data[offset + 1],
+            buffer_data[offset + 2], buffer_data[offset + 3]
+        ]);
+        offset += 4;
+
+        // Create Document object
+        let document_class = match env.find_class("com/tantivy4java/Document") {
+            Ok(class) => class,
+            Err(_) => continue,
+        };
+
+        let document = match env.new_object(&document_class, "()V", &[]) {
+            Ok(doc) => doc,
+            Err(_) => continue,
+        };
+
+        // Parse each field
+        for _field_idx in 0..field_count {
+            if offset + 4 > buffer_data.len() {
+                break; // Not enough data for field name length
+            }
+
+            // Read field name length (big-endian)
+            let name_len = i32::from_be_bytes([
+                buffer_data[offset], buffer_data[offset + 1],
+                buffer_data[offset + 2], buffer_data[offset + 3]
+            ]) as usize;
+            offset += 4;
+
+            if offset + name_len > buffer_data.len() {
+                break; // Not enough data for field name
+            }
+
+            // Read field name
+            let field_name = match std::str::from_utf8(&buffer_data[offset..offset + name_len]) {
+                Ok(name) => name,
+                Err(_) => continue,
+            };
+            offset += name_len;
+
+            if offset + 4 > buffer_data.len() {
+                break; // Not enough data for value count
+            }
+
+            // Read value count (big-endian)
+            let value_count = i32::from_be_bytes([
+                buffer_data[offset], buffer_data[offset + 1],
+                buffer_data[offset + 2], buffer_data[offset + 3]
+            ]) as usize;
+            offset += 4;
+
+            // Read values
+            for _value_idx in 0..value_count {
+                if offset + 4 > buffer_data.len() {
+                    break; // Not enough data for value length
+                }
+
+                // Read value length (big-endian)
+                let value_len = i32::from_be_bytes([
+                    buffer_data[offset], buffer_data[offset + 1],
+                    buffer_data[offset + 2], buffer_data[offset + 3]
+                ]) as usize;
+                offset += 4;
+
+                if offset + value_len > buffer_data.len() {
+                    break; // Not enough data for value
+                }
+
+                // Read value as string
+                if let Ok(value_str) = std::str::from_utf8(&buffer_data[offset..offset + value_len]) {
+                    // Add field to document using addText method
+                    if let Ok(field_name_jstring) = env.new_string(field_name) {
+                        if let Ok(value_jstring) = env.new_string(value_str) {
+                            let _ = env.call_method(
+                                &document,
+                                "addText",
+                                "(Ljava/lang/String;Ljava/lang/String;)V",
+                                &[(&field_name_jstring).into(), (&value_jstring).into()],
+                            );
+                        }
+                    }
+                }
+                offset += value_len;
+            }
+        }
+
+        // Add document to list
+        let _ = env.call_method(
+            &arraylist,
+            "add",
+            "(Ljava/lang/Object;)Z",
+            &[(&document).into()],
+        );
+    }
+
+    arraylist.as_raw()
 }

@@ -37,7 +37,7 @@ public class IndexMergeTest {
                 try (Index index = new Index(schema, indexPath, false)) {
                     
                     // Add documents in multiple commits to create multiple segments
-                    try (IndexWriter writer = index.writer(50, 1)) {
+                    try (IndexWriter writer = index.writer(Index.Memory.DEFAULT_HEAP_SIZE, 1)) {
                         
                         // First batch - commit to create first segment
                         for (int i = 1; i <= 10; i++) {
@@ -97,7 +97,7 @@ public class IndexMergeTest {
                         "00000000-0000-0000-0000-000000000002"
                     );
                     
-                    try (IndexWriter writer = index.writer(50, 1)) {
+                    try (IndexWriter writer = index.writer(Index.Memory.DEFAULT_HEAP_SIZE, 1)) {
                         // Test merge with invalid segment IDs (should handle gracefully)
                         try {
                             SegmentMeta result = writer.merge(testSegmentIds);
@@ -143,7 +143,7 @@ public class IndexMergeTest {
             
             try (Schema schema = builder.build()) {
                 try (Index index = new Index(schema, "", true)) {
-                    try (IndexWriter writer = index.writer(50, 1)) {
+                    try (IndexWriter writer = index.writer(Index.Memory.DEFAULT_HEAP_SIZE, 1)) {
                         
                         // Test null parameter
                         assertThrows(IllegalArgumentException.class, () -> {
@@ -176,7 +176,7 @@ public class IndexMergeTest {
             
             try (Schema schema = builder.build()) {
                 try (Index index = new Index(schema, "", true)) {
-                    try (IndexWriter writer = index.writer(50, 1)) {
+                    try (IndexWriter writer = index.writer(Index.Memory.DEFAULT_HEAP_SIZE, 1)) {
                         // Add a document to create some index content
                         try (Document doc = new Document()) {
                             doc.addText("title", "Test Document");
@@ -220,7 +220,7 @@ public class IndexMergeTest {
             
             try (Schema schema = builder.build()) {
                 try (Index index = new Index(schema, "", true)) {
-                    IndexWriter writer = index.writer(50, 1);
+                    IndexWriter writer = index.writer(Index.Memory.DEFAULT_HEAP_SIZE, 1);
                     writer.close();
                     
                     // Test that closed writer throws proper exception

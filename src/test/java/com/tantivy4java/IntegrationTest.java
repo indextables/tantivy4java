@@ -49,7 +49,7 @@ public class IntegrationTest {
                     System.out.println("\n📝 Phase 2: Creating index with diverse test documents");
                     
                     try (Index index = new Index(schema, indexPath, false)) {
-                        try (IndexWriter writer = index.writer(150, 4)) {
+                        try (IndexWriter writer = index.writer(Index.Memory.LARGE_HEAP_SIZE, 4)) {
                             
                             // Document 1: High-tech AI article
                             try (Document doc1 = new Document()) {

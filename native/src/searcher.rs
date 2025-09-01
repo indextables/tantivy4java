@@ -17,16 +17,16 @@
  * under the License.
  */
 
-use jni::objects::{JClass, JString, JObject};
+use jni::objects::{JClass, JString, JObject, JByteBuffer};
 use jni::sys::{jlong, jboolean, jint, jobject};
 use jni::JNIEnv;
-use tantivy::{IndexWriter as TantivyIndexWriter, Searcher as TantivySearcher, DocAddress as TantivyDocAddress};
+use tantivy::{IndexWriter as TantivyIndexWriter, Searcher as TantivySearcher, DocAddress as TantivyDocAddress, DateTime, Term};
+use tantivy::schema::{TantivyDocument, Field, Schema, Facet};
 use tantivy::query::Query as TantivyQuery;
-use tantivy::Term;
-use tantivy::schema::Schema;
 use tantivy::index::SegmentId;
 use std::net::IpAddr;
 use crate::utils::{register_object, remove_object, with_object, with_object_mut, handle_error};
+use serde_json;
 use crate::document::{RetrievedDocument, DocumentWrapper};
 
 // Helper function to extract segment IDs from Java List<String>
@@ -357,6 +357,42 @@ pub extern "system" fn Java_com_tantivy4java_IndexWriter_nativeAddJson(
         None => {
             handle_error(&mut env, "Invalid IndexWriter pointer");
             0
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_tantivy4java_IndexWriter_nativeAddDocumentsByBuffer(
+    mut env: JNIEnv,
+    _class: JClass,
+    ptr: jlong,
+    buffer: JByteBuffer,
+) -> jni::sys::jlongArray {
+    // Parse the buffer according to the batch protocol
+    let result = parse_batch_buffer(&mut env, ptr, buffer);
+    
+    match result {
+        Ok(opstamps) => {
+            // Convert Vec<u64> to Java long array
+            let jlong_array = match env.new_long_array(opstamps.len() as i32) {
+                Ok(arr) => arr,
+                Err(_) => {
+                    handle_error(&mut env, "Failed to create result array");
+                    return std::ptr::null_mut();
+                }
+            };
+            
+            let jlong_opstamps: Vec<i64> = opstamps.into_iter().map(|op| op as i64).collect();
+            if env.set_long_array_region(&jlong_array, 0, &jlong_opstamps).is_err() {
+                handle_error(&mut env, "Failed to populate result array");
+                return std::ptr::null_mut();
+            }
+            
+            jlong_array.as_raw()
+        },
+        Err(err) => {
+            handle_error(&mut env, &err);
+            std::ptr::null_mut()
         }
     }
 }
@@ -1004,4 +1040,408 @@ pub extern "system" fn Java_com_tantivy4java_SegmentMeta_nativeClose(
     ptr: jlong,
 ) {
     remove_object(ptr as u64);
+}
+
+/// Parse batch document buffer according to the Tantivy4Java batch protocol
+fn parse_batch_buffer(env: &mut JNIEnv, writer_ptr: jlong, buffer: JByteBuffer) -> Result<Vec<u64>, String> {
+    // Get the direct ByteBuffer from Java
+    let byte_buffer = match env.get_direct_buffer_address(&buffer) {
+        Ok(address) => address,
+        Err(e) => return Err(format!("Failed to get buffer address: {}", e)),
+    };
+    
+    let buffer_size = match env.get_direct_buffer_capacity(&buffer) {
+        Ok(capacity) => capacity,
+        Err(e) => return Err(format!("Failed to get buffer capacity: {}", e)),
+    };
+    
+    // Create a slice from the direct buffer
+    let buffer_slice = unsafe {
+        std::slice::from_raw_parts(byte_buffer as *const u8, buffer_size)
+    };
+    
+    // Parse the buffer according to the batch protocol
+    parse_batch_documents(env, writer_ptr, buffer_slice)
+}
+
+/// Parse the batch document format and add documents to the writer
+fn parse_batch_documents(_env: &mut JNIEnv, writer_ptr: jlong, buffer: &[u8]) -> Result<Vec<u64>, String> {
+    if buffer.len() < 16 {
+        return Err("Buffer too small for batch format".to_string());
+    }
+    
+    // Read footer to get document count and offset table position
+    let footer_start = buffer.len() - 12;
+    let offset_table_pos = u32::from_ne_bytes([
+        buffer[footer_start],
+        buffer[footer_start + 1],
+        buffer[footer_start + 2],
+        buffer[footer_start + 3]
+    ]) as usize;
+    
+    let doc_count = u32::from_ne_bytes([
+        buffer[footer_start + 4],
+        buffer[footer_start + 5],
+        buffer[footer_start + 6],
+        buffer[footer_start + 7]
+    ]) as usize;
+    
+    let footer_magic = u32::from_ne_bytes([
+        buffer[footer_start + 8],
+        buffer[footer_start + 9],
+        buffer[footer_start + 10],
+        buffer[footer_start + 11]
+    ]);
+    
+    // Validate magic numbers
+    const MAGIC_NUMBER: u32 = 0x54414E54; // "TANT"
+    let header_magic = u32::from_ne_bytes([buffer[0], buffer[1], buffer[2], buffer[3]]);
+    
+    if header_magic != MAGIC_NUMBER || footer_magic != MAGIC_NUMBER {
+        return Err(format!("Invalid magic number: header={:x}, footer={:x}", header_magic, footer_magic));
+    }
+    
+    // Read document offsets
+    let mut offsets = Vec::with_capacity(doc_count);
+    for i in 0..doc_count {
+        let offset_pos = offset_table_pos + (i * 4);
+        if offset_pos + 4 > buffer.len() {
+            return Err("Invalid offset table".to_string());
+        }
+        
+        let offset = u32::from_ne_bytes([
+            buffer[offset_pos],
+            buffer[offset_pos + 1], 
+            buffer[offset_pos + 2],
+            buffer[offset_pos + 3]
+        ]) as usize;
+        
+        offsets.push(offset);
+    }
+    
+    // Process each document
+    let opstamps = with_object_mut::<TantivyIndexWriter, Result<Vec<u64>, String>>(writer_ptr as u64, |writer| {
+        let schema = writer.index().schema();
+        let mut opstamps = Vec::with_capacity(doc_count);
+        
+        for (doc_index, &doc_offset) in offsets.iter().enumerate() {
+            match parse_single_document(&schema, buffer, doc_offset) {
+                Ok(document) => {
+                    match writer.add_document(document) {
+                        Ok(opstamp) => opstamps.push(opstamp),
+                        Err(e) => return Err(format!("Failed to add document {}: {}", doc_index, e)),
+                    }
+                },
+                Err(e) => return Err(format!("Failed to parse document {}: {}", doc_index, e)),
+            }
+        }
+        
+        Ok(opstamps)
+    })
+    .ok_or_else(|| "Invalid IndexWriter pointer".to_string())??;
+    
+    Ok(opstamps)
+}
+
+/// Parse a single document from the buffer
+fn parse_single_document(schema: &Schema, buffer: &[u8], offset: usize) -> Result<TantivyDocument, String> {
+    if offset + 2 > buffer.len() {
+        return Err("Document offset out of bounds".to_string());
+    }
+    
+    let mut pos = offset;
+    let field_count = u16::from_ne_bytes([buffer[pos], buffer[pos + 1]]) as usize;
+    pos += 2;
+    
+    let mut document = TantivyDocument::default();
+    
+    for _ in 0..field_count {
+        let (field_name, field_values, new_pos) = parse_field(buffer, pos)?;
+        pos = new_pos;
+        
+        // Look up field in schema
+        let field = match schema.get_field(&field_name) {
+            Ok(f) => f,
+            Err(_) => return Err(format!("Field '{}' not found in schema", field_name)),
+        };
+        
+        // Add values to document with schema-aware type conversion
+        for value in field_values {
+            match value {
+                FieldValue::Text(text) => document.add_text(field, &text),
+                FieldValue::Integer(int_val) => {
+                    // Check schema field type and convert safely
+                    add_integer_value_safely(&mut document, schema, field, int_val);
+                },
+                FieldValue::Unsigned(uint_val) => {
+                    // Check schema field type and convert safely  
+                    add_unsigned_value_safely(&mut document, schema, field, uint_val);
+                },
+                FieldValue::Float(float_val) => document.add_f64(field, float_val),
+                FieldValue::Boolean(bool_val) => document.add_bool(field, bool_val),
+                FieldValue::Date(date_millis) => {
+                    let date_time = DateTime::from_timestamp_millis(date_millis);
+                    document.add_date(field, date_time);
+                },
+                FieldValue::Bytes(bytes) => document.add_bytes(field, &bytes),
+                FieldValue::Json(json_str) => {
+                    // For JSON fields, we'll store the raw JSON string
+                    // This matches how the existing IndexWriter.addJson works
+                    document.add_text(field, &json_str);
+                },
+                FieldValue::IpAddr(ip_str) => {
+                    // Parse IP address - convert to IPv6 format for Tantivy
+                    match ip_str.parse::<std::net::IpAddr>() {
+                        Ok(ip) => {
+                            let ipv6 = match ip {
+                                IpAddr::V4(ipv4) => ipv4.to_ipv6_mapped(),
+                                IpAddr::V6(ipv6) => ipv6,
+                            };
+                            document.add_ip_addr(field, ipv6);
+                        },
+                        Err(e) => return Err(format!("Invalid IP address in field '{}': {}", field_name, e)),
+                    }
+                },
+                FieldValue::Facet(facet_path) => {
+                    // Parse facet path
+                    let facet = Facet::from(&facet_path);
+                    document.add_facet(field, facet);
+                },
+            }
+        }
+    }
+    
+    Ok(document)
+}
+
+/// Field value types for batch parsing
+#[derive(Debug)]
+enum FieldValue {
+    Text(String),
+    Integer(i64),
+    Unsigned(u64),
+    Float(f64),
+    Boolean(bool),
+    Date(i64),
+    Bytes(Vec<u8>),
+    Json(String),
+    IpAddr(String),
+    Facet(String),
+}
+
+/// Parse a field from the buffer
+fn parse_field(buffer: &[u8], mut pos: usize) -> Result<(String, Vec<FieldValue>, usize), String> {
+    if pos + 2 > buffer.len() {
+        return Err("Field name length out of bounds".to_string());
+    }
+    
+    // Read field name
+    let name_len = u16::from_ne_bytes([buffer[pos], buffer[pos + 1]]) as usize;
+    pos += 2;
+    
+    if pos + name_len + 1 + 2 > buffer.len() {
+        return Err("Field name out of bounds".to_string());
+    }
+    
+    let field_name = String::from_utf8(buffer[pos..pos + name_len].to_vec())
+        .map_err(|e| format!("Invalid field name UTF-8: {}", e))?;
+    pos += name_len;
+    
+    // Read field type
+    let field_type = buffer[pos];
+    pos += 1;
+    
+    // Read value count
+    let value_count = u16::from_ne_bytes([buffer[pos], buffer[pos + 1]]) as usize;
+    pos += 2;
+    
+    // Read values
+    let mut values = Vec::with_capacity(value_count);
+    for _ in 0..value_count {
+        let (value, new_pos) = parse_field_value(buffer, pos, field_type)?;
+        values.push(value);
+        pos = new_pos;
+    }
+    
+    Ok((field_name, values, pos))
+}
+
+/// Parse a field value based on type
+fn parse_field_value(buffer: &[u8], mut pos: usize, field_type: u8) -> Result<(FieldValue, usize), String> {
+    match field_type {
+        0 | 6 | 7 => { // TEXT, JSON, IP_ADDR
+            if pos + 4 > buffer.len() {
+                return Err("String length out of bounds".to_string());
+            }
+            
+            let str_len = u32::from_ne_bytes([buffer[pos], buffer[pos + 1], buffer[pos + 2], buffer[pos + 3]]) as usize;
+            pos += 4;
+            
+            if pos + str_len > buffer.len() {
+                return Err("String data out of bounds".to_string());
+            }
+            
+            let string_val = String::from_utf8(buffer[pos..pos + str_len].to_vec())
+                .map_err(|e| format!("Invalid UTF-8: {}", e))?;
+            pos += str_len;
+            
+            let value = match field_type {
+                0 => FieldValue::Text(string_val),
+                6 => FieldValue::Json(string_val), 
+                7 => FieldValue::IpAddr(string_val),
+                _ => unreachable!(),
+            };
+            Ok((value, pos))
+        },
+        1 => { // INTEGER
+            if pos + 8 > buffer.len() {
+                return Err("Integer value out of bounds".to_string());
+            }
+            
+            let int_val = i64::from_ne_bytes([
+                buffer[pos], buffer[pos + 1], buffer[pos + 2], buffer[pos + 3],
+                buffer[pos + 4], buffer[pos + 5], buffer[pos + 6], buffer[pos + 7]
+            ]);
+            pos += 8;
+            
+            Ok((FieldValue::Integer(int_val), pos))
+        },
+        8 => { // UNSIGNED
+            if pos + 8 > buffer.len() {
+                return Err("Unsigned integer value out of bounds".to_string());
+            }
+            
+            let uint_val = u64::from_ne_bytes([
+                buffer[pos], buffer[pos + 1], buffer[pos + 2], buffer[pos + 3],
+                buffer[pos + 4], buffer[pos + 5], buffer[pos + 6], buffer[pos + 7]
+            ]);
+            pos += 8;
+            
+            Ok((FieldValue::Unsigned(uint_val), pos))
+        },
+        2 => { // FLOAT
+            if pos + 8 > buffer.len() {
+                return Err("Float value out of bounds".to_string());
+            }
+            
+            let float_val = f64::from_ne_bytes([
+                buffer[pos], buffer[pos + 1], buffer[pos + 2], buffer[pos + 3],
+                buffer[pos + 4], buffer[pos + 5], buffer[pos + 6], buffer[pos + 7]
+            ]);
+            pos += 8;
+            
+            Ok((FieldValue::Float(float_val), pos))
+        },
+        3 => { // BOOLEAN
+            if pos + 1 > buffer.len() {
+                return Err("Boolean value out of bounds".to_string());
+            }
+            
+            let bool_val = buffer[pos] != 0;
+            pos += 1;
+            
+            Ok((FieldValue::Boolean(bool_val), pos))
+        },
+        4 => { // DATE
+            if pos + 8 > buffer.len() {
+                return Err("Date value out of bounds".to_string());
+            }
+            
+            let date_millis = i64::from_ne_bytes([
+                buffer[pos], buffer[pos + 1], buffer[pos + 2], buffer[pos + 3],
+                buffer[pos + 4], buffer[pos + 5], buffer[pos + 6], buffer[pos + 7]
+            ]);
+            pos += 8;
+            
+            Ok((FieldValue::Date(date_millis), pos))
+        },
+        5 => { // BYTES
+            if pos + 4 > buffer.len() {
+                return Err("Bytes length out of bounds".to_string());
+            }
+            
+            let bytes_len = u32::from_ne_bytes([buffer[pos], buffer[pos + 1], buffer[pos + 2], buffer[pos + 3]]) as usize;
+            pos += 4;
+            
+            if pos + bytes_len > buffer.len() {
+                return Err("Bytes data out of bounds".to_string());
+            }
+            
+            let bytes = buffer[pos..pos + bytes_len].to_vec();
+            pos += bytes_len;
+            
+            Ok((FieldValue::Bytes(bytes), pos))
+        },
+        9 => { // FACET
+            if pos + 4 > buffer.len() {
+                return Err("Facet length out of bounds".to_string());
+            }
+            
+            let facet_len = u32::from_ne_bytes([buffer[pos], buffer[pos + 1], buffer[pos + 2], buffer[pos + 3]]) as usize;
+            pos += 4;
+            
+            if pos + facet_len > buffer.len() {
+                return Err("Facet data out of bounds".to_string());
+            }
+            
+            let facet_path = String::from_utf8(buffer[pos..pos + facet_len].to_vec())
+                .map_err(|e| format!("Invalid facet UTF-8: {}", e))?;
+            pos += facet_len;
+            
+            Ok((FieldValue::Facet(facet_path), pos))
+        },
+        _ => Err(format!("Unknown field type: {}", field_type)),
+    }
+}
+
+/// Safely add an integer value to document, converting based on schema field type
+fn add_integer_value_safely(document: &mut TantivyDocument, schema: &Schema, field: Field, int_val: i64) {
+    let field_entry = schema.get_field_entry(field);
+    let field_type = field_entry.field_type();
+    
+    match field_type {
+        tantivy::schema::FieldType::U64(_) => {
+            // Schema expects unsigned, but we have signed - convert safely
+            if int_val < 0 {
+                // Negative value can't be converted to unsigned - use 0 as fallback
+                document.add_u64(field, 0);
+            } else {
+                document.add_u64(field, int_val as u64);
+            }
+        },
+        tantivy::schema::FieldType::I64(_) => {
+            // Schema expects signed - direct assignment
+            document.add_i64(field, int_val);
+        },
+        _ => {
+            // For other field types, try to add as signed integer (fallback)
+            document.add_i64(field, int_val);
+        }
+    }
+}
+
+/// Safely add an unsigned value to document, converting based on schema field type  
+fn add_unsigned_value_safely(document: &mut TantivyDocument, schema: &Schema, field: Field, uint_val: u64) {
+    let field_entry = schema.get_field_entry(field);
+    let field_type = field_entry.field_type();
+    
+    match field_type {
+        tantivy::schema::FieldType::I64(_) => {
+            // Schema expects signed, but we have unsigned - convert safely
+            if uint_val > i64::MAX as u64 {
+                // Value too large for signed - use MAX as fallback
+                document.add_i64(field, i64::MAX);
+            } else {
+                document.add_i64(field, uint_val as i64);
+            }
+        },
+        tantivy::schema::FieldType::U64(_) => {
+            // Schema expects unsigned - direct assignment
+            document.add_u64(field, uint_val);
+        },
+        _ => {
+            // For other field types, try to add as unsigned (fallback)
+            document.add_u64(field, uint_val);
+        }
+    }
 }

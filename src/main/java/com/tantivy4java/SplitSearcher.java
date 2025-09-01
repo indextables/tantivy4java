@@ -206,6 +206,54 @@ public class SplitSearcher implements AutoCloseable {
     }
     
     /**
+     * Retrieve multiple documents efficiently using zero-copy semantics.
+     * This method serializes all requested documents into a single ByteBuffer
+     * for optimal performance when retrieving many documents.
+     * 
+     * The returned ByteBuffer uses the same binary protocol as batch document
+     * indexing but in reverse - for efficient bulk document retrieval.
+     * 
+     * @param docAddresses List of document addresses to retrieve
+     * @return ByteBuffer containing serialized documents, or null if addresses is empty
+     * @throws RuntimeException if retrieval fails
+     */
+    public java.nio.ByteBuffer docsBulk(List<DocAddress> docAddresses) {
+        if (docAddresses == null || docAddresses.isEmpty()) {
+            return null;
+        }
+        
+        // Convert to arrays for JNI transfer
+        int[] segments = new int[docAddresses.size()];
+        int[] docIds = new int[docAddresses.size()];
+        
+        for (int i = 0; i < docAddresses.size(); i++) {
+            DocAddress addr = docAddresses.get(i);
+            segments[i] = addr.getSegmentOrd();
+            docIds[i] = addr.getDoc();
+        }
+        
+        byte[] result = docsBulkNative(nativePtr, segments, docIds);
+        return result != null ? java.nio.ByteBuffer.wrap(result) : null;
+    }
+    
+    /**
+     * Parse documents from a bulk retrieval ByteBuffer.
+     * This method provides a convenient way to extract individual Document objects
+     * from the zero-copy ByteBuffer returned by docsBulk().
+     * 
+     * @param buffer ByteBuffer from docsBulk() call
+     * @return List of Document objects in the same order as the original request
+     * @throws RuntimeException if parsing fails
+     */
+    public List<Document> parseBulkDocs(java.nio.ByteBuffer buffer) {
+        if (buffer == null) {
+            return new ArrayList<>();
+        }
+        
+        return parseBulkDocsNative(buffer);
+    }
+    
+    /**
      * Asynchronously preload specified components into cache
      */
     public CompletableFuture<Void> preloadComponents(IndexComponent... components) {
@@ -304,6 +352,8 @@ public class SplitSearcher implements AutoCloseable {
     private static native long parseQueryNative(long nativePtr, String queryString);
     private static native SearchResult searchNative(long nativePtr, long queryPtr, int limit);
     private static native Document docNative(long nativePtr, int segment, int docId);
+    private static native byte[] docsBulkNative(long nativePtr, int[] segments, int[] docIds);
+    private static native List<Document> parseBulkDocsNative(java.nio.ByteBuffer buffer);
     private static native void preloadComponentsNative(long nativePtr, IndexComponent[] components);
     private static native CacheStats getCacheStatsNative(long nativePtr);
     private static native LoadingStats getLoadingStatsNative(long nativePtr);
