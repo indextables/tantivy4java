@@ -94,7 +94,7 @@ public class PythonParityTest {
                 
                 try (Schema schema = builder.build()) {
                     try (Index index = new Index(schema, indexPath, false)) {
-                        try (IndexWriter writer = index.writer(50, 1)) {
+                        try (IndexWriter writer = index.writer(Index.Memory.DEFAULT_HEAP_SIZE, 1)) {
                             
                             // Add test documents with mixed case
                             try (Document doc1 = new Document()) {
@@ -225,7 +225,7 @@ public class PythonParityTest {
                     System.out.println("\n📝 Phase 2: Testing document creation and field access");
                     
                     try (Index index = new Index(schema, indexPath, false)) {
-                        try (IndexWriter writer = index.writer(50, 1)) {
+                        try (IndexWriter writer = index.writer(Index.Memory.DEFAULT_HEAP_SIZE, 1)) {
                             
                             // Test 1: Document creation like Python Document(name="Bill", reference=[1, 2])
                             System.out.println("\n🔎 Test 1: Multi-value field document creation");
@@ -411,7 +411,7 @@ public class PythonParityTest {
                     System.out.println("\n📝 Phase 2: Adding test documents for boolean queries");
                     
                     try (Index index = new Index(schema, indexPath, false)) {
-                        try (IndexWriter writer = index.writer(50, 1)) {
+                        try (IndexWriter writer = index.writer(Index.Memory.DEFAULT_HEAP_SIZE, 1)) {
                             
                             // Add documents matching Python test data
                             try (Document doc1 = new Document()) {
@@ -585,7 +585,7 @@ public class PythonParityTest {
                     System.out.println("\n📝 Phase 2: Adding test data for range queries");
                     
                     try (Index index = new Index(schema, indexPath, false)) {
-                        try (IndexWriter writer = index.writer(50, 1)) {
+                        try (IndexWriter writer = index.writer(Index.Memory.DEFAULT_HEAP_SIZE, 1)) {
                             
                             // Add test documents with ranges matching Python tests
                             try (Document doc1 = new Document()) {

@@ -68,7 +68,7 @@ public class QuickwitSplitMinimalTest {
             Index index = new Index(schema, indexPath.toString());
             System.out.println("✅ Index created successfully");
             
-            try (IndexWriter writer = index.writer(50, 1)) {
+            try (IndexWriter writer = index.writer(Index.Memory.DEFAULT_HEAP_SIZE, 1)) {
                 Document doc = new Document();
                 doc.addText("title", "Test Document");
                 writer.addDocument(doc);

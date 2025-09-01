@@ -152,10 +152,10 @@ pub extern "system" fn Java_com_tantivy4java_Index_nativeWriter(
     num_threads: jint,
 ) -> jlong {
     let result = with_object::<TantivyIndex, Result<TantivyIndexWriter, String>>(ptr as u64, |index| {
-        let heap_size_mb = if heap_size > 0 { heap_size as usize } else { 50 };
+        let heap_size_bytes = if heap_size > 0 { heap_size as usize } else { 50_000_000 }; // 50MB default
         let num_threads_val = if num_threads > 0 { num_threads as usize } else { 1 };
         
-        index.writer_with_num_threads(num_threads_val, heap_size_mb * 1_000_000)
+        index.writer_with_num_threads(num_threads_val, heap_size_bytes)
             .map_err(|e| e.to_string())
     });
     

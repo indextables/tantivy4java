@@ -28,7 +28,7 @@ public class BooleanFieldTest {
             try (Schema schema = builder.build()) {
                 try (Index index = new Index(schema, "", true)) {
                     // Index documents with boolean fields
-                    try (IndexWriter writer = index.writer(50, 1)) {
+                    try (IndexWriter writer = index.writer(Index.Memory.DEFAULT_HEAP_SIZE, 1)) {
                         
                         // Document 1: Active and featured
                         try (Document doc1 = new Document()) {
@@ -170,7 +170,7 @@ public class BooleanFieldTest {
             
             try (Schema schema = builder.build()) {
                 try (Index index = new Index(schema, "", true)) {
-                    try (IndexWriter writer = index.writer(50, 1)) {
+                    try (IndexWriter writer = index.writer(Index.Memory.DEFAULT_HEAP_SIZE, 1)) {
                         
                         // Test with mixed boolean values
                         boolean[] testValues = {true, false, true, false, true};

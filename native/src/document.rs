@@ -779,3 +779,14 @@ fn convert_tantivy_datetime_to_java(env: &mut JNIEnv, dt: &DateTime) -> Result<j
     
     Ok(localdatetime_obj.l().map_err(|e| e.to_string())?.into_raw())
 }
+
+/// Create a Java Document object from a RetrievedDocument for bulk operations
+pub fn create_java_document_from_retrieved(env: &mut JNIEnv, retrieved_doc: RetrievedDocument) -> anyhow::Result<jlong> {
+    // Create a new DocumentWrapper with the retrieved document
+    let document_wrapper = DocumentWrapper::Retrieved(retrieved_doc);
+    
+    // Register the document and return the pointer
+    let doc_ptr = register_object(document_wrapper);
+    
+    Ok(doc_ptr as jlong)
+}

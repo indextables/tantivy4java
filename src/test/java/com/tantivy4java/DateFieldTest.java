@@ -28,7 +28,7 @@ public class DateFieldTest {
             try (Schema schema = builder.build()) {
                 try (Index index = new Index(schema, "", true)) {
                     // Index documents with date fields
-                    try (IndexWriter writer = index.writer(50, 1)) {
+                    try (IndexWriter writer = index.writer(Index.Memory.DEFAULT_HEAP_SIZE, 1)) {
                         
                         // Document 1: 2020-01-01
                         try (Document doc1 = new Document()) {
@@ -149,7 +149,7 @@ public class DateFieldTest {
             
             try (Schema schema = builder.build()) {
                 try (Index index = new Index(schema, "", true)) {
-                    try (IndexWriter writer = index.writer(50, 1)) {
+                    try (IndexWriter writer = index.writer(Index.Memory.DEFAULT_HEAP_SIZE, 1)) {
                         
                         // Test various date values
                         try (Document doc1 = new Document()) {

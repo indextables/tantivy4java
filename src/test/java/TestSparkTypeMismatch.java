@@ -36,7 +36,7 @@ public class TestSparkTypeMismatch {
             Schema schema = builder.build();
             
             Index index = new Index(schema, indexPath.toString(), false);
-            IndexWriter writer = index.writer(50, 1);
+            IndexWriter writer = index.writer(Index.Memory.DEFAULT_HEAP_SIZE, 1);
             
             // Add document with mixed types
             try (Document doc = new Document()) {
@@ -100,7 +100,7 @@ public class TestSparkTypeMismatch {
             Schema schema = builder.build();
             
             Index index = new Index(schema, indexPath.toString(), false);
-            IndexWriter writer = index.writer(50, 1);
+            IndexWriter writer = index.writer(Index.Memory.DEFAULT_HEAP_SIZE, 1);
             
             try (Document doc = new Document()) {
                 doc.addInteger("employee_id", 12345L);
@@ -165,7 +165,7 @@ public class TestSparkTypeMismatch {
             Schema schema = builder.build();
             
             Index index = new Index(schema, indexPath.toString(), false);
-            IndexWriter writer = index.writer(50, 1);
+            IndexWriter writer = index.writer(Index.Memory.DEFAULT_HEAP_SIZE, 1);
             
             try (Document doc = new Document()) {
                 doc.addInteger("id", 1L);

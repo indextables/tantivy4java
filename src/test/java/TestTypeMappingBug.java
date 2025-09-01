@@ -42,7 +42,7 @@ public class TestTypeMappingBug {
             
             // Create index and add document
             Index index = new Index(schema, indexPath.toString(), false);
-            IndexWriter writer = index.writer(50, 1);
+            IndexWriter writer = index.writer(Index.Memory.DEFAULT_HEAP_SIZE, 1);
             
             try (Document doc = new Document()) {
                 doc.addInteger("id", 12345L);
@@ -102,7 +102,7 @@ public class TestTypeMappingBug {
             printDetailedSchemaInfo(schema);
             
             Index index = new Index(schema, indexPath.toString(), false);
-            IndexWriter writer = index.writer(50, 1);
+            IndexWriter writer = index.writer(Index.Memory.DEFAULT_HEAP_SIZE, 1);
             
             try (Document doc = new Document()) {
                 doc.addInteger("id", 1L);
@@ -171,7 +171,7 @@ public class TestTypeMappingBug {
             }
             
             Index index = new Index(schema, indexPath.toString(), false);
-            IndexWriter writer = index.writer(50, 1);
+            IndexWriter writer = index.writer(Index.Memory.DEFAULT_HEAP_SIZE, 1);
             
             try (Document doc = new Document()) {
                 doc.addInteger("field_a_int", 1L);

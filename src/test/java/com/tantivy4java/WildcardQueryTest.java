@@ -55,7 +55,7 @@ public class WildcardQueryTest {
         
         // Create index and add test documents
         index = new Index(schema, tempDir.toString(), false);
-        writer = index.writer(50, 1);
+        writer = index.writer(Index.Memory.DEFAULT_HEAP_SIZE, 1);
         
         // Add test documents with various patterns
         addTestDocument("doc1", "Hello World", "This is a sample document about programming", "Alice", "programming");
@@ -266,7 +266,7 @@ public class WildcardQueryTest {
     @Test
     public void testEscapeSequences() {
         // Create a document with special characters for testing
-        writer = index.writer(50, 1);
+        writer = index.writer(Index.Memory.DEFAULT_HEAP_SIZE, 1);
         addTestDocument("doc11", "Price: $100*", "Special price with asterisk", "Admin", "pricing");
         addTestDocument("doc12", "Question?", "Document with question mark", "User", "question");
         writer.commit();
@@ -299,7 +299,7 @@ public class WildcardQueryTest {
         }
         
         // Test with parentheses and brackets
-        writer = index.writer(50, 1);
+        writer = index.writer(Index.Memory.DEFAULT_HEAP_SIZE, 1);
         addTestDocument("doc13", "Code (Example)", "Programming code example", "Developer", "coding");
         addTestDocument("doc14", "Array[0]", "Array access example", "Coder", "programming");
         writer.commit();
@@ -615,7 +615,7 @@ public class WildcardQueryTest {
     @Test
     public void testMultiTokenWildcardWithEscaping() {
         // First add a document with special characters for testing
-        writer = index.writer(50, 1);
+        writer = index.writer(Index.Memory.DEFAULT_HEAP_SIZE, 1);
         addTestDocument("doc20", "Test * Pattern", "Document with asterisk in title", "Tester", "special");
         writer.commit();
         writer.close();

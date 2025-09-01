@@ -11,6 +11,9 @@ Tantivy4Java is a production-ready JNI wrapper for the Rust-based Tantivy search
 ### Core Search Engine
 - **Schema Building** - Complete support for all field types (text, integer, float, boolean, date, IP address)
 - **Document Management** - Creation, indexing, JSON support, multi-value fields
+- **High-Performance Batch Operations**
+  - **Batch Indexing**: Zero-copy bulk document indexing with 3x performance improvements
+  - **Bulk Document Retrieval**: **🚧 IN DEVELOPMENT** - Zero-copy bulk document retrieval for high-performance data access
 - **Index Operations** - Create, reload, commit, open, exists, schema access
 - **Query System** - All query types with complex boolean logic
 - **Search Pipeline** - Complete search with scoring and result handling
@@ -157,6 +160,51 @@ writer.addDocument(Map.of(
 
 writer.commit();
 ```
+
+### High-Performance Batch Indexing
+
+For maximum performance when indexing large numbers of documents, use the batch indexing system with automatic flushing:
+
+```java
+import com.tantivy4java.*;
+
+// Create schema and index (same as above)
+SchemaBuilder schemaBuilder = new SchemaBuilder();
+schemaBuilder.addTextField("title", true, false, "default", "position");
+schemaBuilder.addTextField("content", true, false, "default", "position");
+schemaBuilder.addIntegerField("rating", true, true, false);
+Schema schema = schemaBuilder.build();
+
+Index index = Index.createInRam(schema);
+IndexWriter writer = index.writer(50_000_000);
+
+// Automatic batch processing with try-with-resources (recommended)
+try (BatchDocumentBuilder builder = new BatchDocumentBuilder(writer)) {
+    // Add many documents efficiently
+    for (int i = 0; i < 100_000; i++) {
+        BatchDocument doc = new BatchDocument();
+        doc.addText("title", "Article " + i);
+        doc.addText("content", "Content for article number " + i + " with search terms.");
+        doc.addInteger("rating", (i % 5) + 1);
+        
+        builder.addDocument(doc);
+        
+        // Optional: Manual flush when batch gets large
+        if (builder.getDocumentCount() >= 1000) {
+            builder.flush(); // Flush current batch and continue
+        }
+    }
+    // Documents automatically flushed when builder is closed
+}
+
+writer.commit();
+```
+
+**Performance Benefits:**
+- **3x faster** than single document indexing for large batches
+- **Zero-copy operations** with direct ByteBuffer transfers  
+- **Automatic resource management** with try-with-resources support
+- **Memory efficient** with configurable batch sizes
 
 ### Searching with Complex Queries
 
@@ -474,6 +522,10 @@ SplitCacheManager.CacheConfig customConfig = new SplitCacheManager.CacheConfig("
 - `Query` - Query construction utilities with debugging support
 - `Document` - Document representation
 - `TextAnalyzer` - Text tokenization and analysis
+
+### Batch Processing Classes
+- `BatchDocument` - High-performance document representation for batch operations
+- `BatchDocumentBuilder` - AutoCloseable builder for efficient bulk indexing with automatic flushing
 
 ### Quickwit Classes
 - `SplitSearcher` - Split file search operations

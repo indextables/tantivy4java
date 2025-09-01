@@ -60,7 +60,7 @@ public class SplitSearcherDocumentRetrievalTest {
 
         Path indexPath = tempDir.resolve("test-index");
         Index testIndex = new Index(schema, indexPath.toString());
-        IndexWriter writer = testIndex.writer(50, 1);
+        IndexWriter writer = testIndex.writer(Index.Memory.DEFAULT_HEAP_SIZE, 1);
 
         // Add test documents for document retrieval testing
         for (int i = 0; i < 20; i++) {

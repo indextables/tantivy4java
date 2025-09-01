@@ -41,7 +41,7 @@ public class SnippetTest {
                     System.out.println("\n📝 Phase 2: Creating index and adding documents with rich text content");
                     
                     try (Index index = new Index(schema, indexPath, false)) {
-                        try (IndexWriter writer = index.writer(100, 2)) {
+                        try (IndexWriter writer = index.writer(Index.Memory.DEFAULT_HEAP_SIZE, 2)) {
                             
                             // Add documents with rich content for snippet testing
                             try (Document doc1 = new Document()) {

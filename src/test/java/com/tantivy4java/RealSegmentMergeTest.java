@@ -36,7 +36,7 @@ public class RealSegmentMergeTest {
                 try (Index index = new Index(schema, indexPath, false)) {
                     
                     // Phase 1: Create multiple segments by doing separate commits
-                    try (IndexWriter writer = index.writer(50, 1)) {
+                    try (IndexWriter writer = index.writer(Index.Memory.DEFAULT_HEAP_SIZE, 1)) {
                         
                         // First segment
                         for (int i = 1; i <= 5; i++) {
@@ -100,7 +100,7 @@ public class RealSegmentMergeTest {
                     }
                     
                     // Phase 3: Test merge with real segment IDs
-                    try (IndexWriter writer = index.writer(50, 1)) {
+                    try (IndexWriter writer = index.writer(Index.Memory.DEFAULT_HEAP_SIZE, 1)) {
                         // Select segments to merge (take first 2 segments)
                         List<String> segmentsToMerge = new ArrayList<>();
                         for (int i = 0; i < Math.min(2, segmentIds.size()); i++) {
@@ -193,7 +193,7 @@ public class RealSegmentMergeTest {
                 try (Index index = new Index(schema, indexPath, false)) {
                     
                     // Create multiple segments
-                    try (IndexWriter writer = index.writer(50, 1)) {
+                    try (IndexWriter writer = index.writer(Index.Memory.DEFAULT_HEAP_SIZE, 1)) {
                         // First batch
                         try (Document doc = new Document()) {
                             doc.addText("content", "First segment document");
@@ -254,7 +254,7 @@ public class RealSegmentMergeTest {
                 try (Index index = new Index(schema, indexPath, false)) {
                     
                     // Create 4 segments
-                    try (IndexWriter writer = index.writer(50, 1)) {
+                    try (IndexWriter writer = index.writer(Index.Memory.DEFAULT_HEAP_SIZE, 1)) {
                         for (int segment = 1; segment <= 4; segment++) {
                             try (Document doc = new Document()) {
                                 doc.addText("content", "Segment " + segment + " content");
@@ -277,7 +277,7 @@ public class RealSegmentMergeTest {
                             List<String> segmentsToMerge = allSegmentIds.subList(0, 2);
                             System.out.println("Attempting to merge first 2 segments");
                             
-                            try (IndexWriter writer = index.writer(50, 1)) {
+                            try (IndexWriter writer = index.writer(Index.Memory.DEFAULT_HEAP_SIZE, 1)) {
                                 try {
                                     SegmentMeta result = writer.merge(segmentsToMerge);
                                     try (SegmentMeta mergedSegment = result) {
