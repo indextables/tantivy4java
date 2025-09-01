@@ -118,11 +118,11 @@ public class S3MergeMockTest {
             assertNotNull(metadata, "Split conversion should succeed");
             assertTrue(Files.exists(splitPath), "Split file should exist");
             
-            // Upload split to S3Mock
+            // Upload split to S3Mock (no subdirectory - S3Mock limitation)
             s3Client.putObject(
                 PutObjectRequest.builder()
                     .bucket(TEST_BUCKET)
-                    .key("splits/split-" + i + ".split")
+                    .key("split-" + i + ".split")
                     .build(),
                 splitPath
             );
@@ -149,10 +149,10 @@ public class S3MergeMockTest {
         QuickwitSplit.MergeConfig mergeConfig = new QuickwitSplit.MergeConfig(
             "merged-test-index", "merged-source", "merged-node", awsConfig);
         
-        // S3 URLs to merge (from S3Mock)
+        // S3 URLs to merge (from S3Mock - no subdirectory)
         List<String> s3Splits = Arrays.asList(
-            "s3://" + TEST_BUCKET + "/splits/split-1.split",
-            "s3://" + TEST_BUCKET + "/splits/split-2.split"
+            "s3://" + TEST_BUCKET + "/split-1.split",
+            "s3://" + TEST_BUCKET + "/split-2.split"
         );
         
         // Output path for merged split
@@ -172,6 +172,59 @@ public class S3MergeMockTest {
         System.out.println("   Split ID: " + result.getSplitId());
         System.out.println("   Documents: " + result.getNumDocs());
         System.out.println("   Output size: " + Files.size(outputPath) + " bytes");
+        
+        // Validate merged split content by querying it
+        try {
+            SplitCacheManager.CacheConfig cacheConfig = new SplitCacheManager.CacheConfig("merge-validation")
+                .withMaxCacheSize(50_000_000);
+            
+            SplitCacheManager cacheManager = SplitCacheManager.getInstance(cacheConfig);
+            
+            // Open the merged split file for searching
+            try (SplitSearcher searcher = cacheManager.createSplitSearcher("file://" + outputPath.toAbsolutePath())) {
+                
+                Schema schema = searcher.getSchema();
+                assertNotNull(schema, "Merged split should have accessible schema");
+                
+                // Search for documents that should exist from split-1 and split-2
+                // Based on createTestIndex(), each split has documents with "Test Document X for Index Y" titles
+                Query titleQuery = Query.termQuery(schema, "title", "Test");
+                SearchResult titleResult = searcher.search(titleQuery, 20);
+                
+                Query contentQuery = Query.termQuery(schema, "content", "content");
+                SearchResult contentResult = searcher.search(contentQuery, 20);
+                
+                // Verify we found documents from both source splits
+                assertTrue(titleResult.getHits().size() > 0, "Should find documents with 'Test' in title");
+                assertTrue(contentResult.getHits().size() > 0, "Should find documents with 'content' in content field");
+                
+                // Should have documents from both split-1 (Index 1) and split-2 (Index 2)
+                // Each source split has 5 docs, so merged should have 10 total
+                assertEquals(10, result.getNumDocs(), "Should have exactly 10 documents from 2 source splits");
+                
+                // Verify we can retrieve actual document data
+                if (titleResult.getHits().size() > 0) {
+                    try (Document doc = searcher.doc(titleResult.getHits().get(0).getDocAddress())) {
+                        String titleValue = (String) doc.getFirst("title");
+                        assertNotNull(titleValue, "Document should have title field");
+                        assertTrue(titleValue.contains("Test Document"), "Title should contain expected text");
+                        
+                        String contentValue = (String) doc.getFirst("content");
+                        assertNotNull(contentValue, "Document should have content field");
+                        assertTrue(contentValue.contains("test content"), "Content should contain expected text");
+                    }
+                }
+                
+                System.out.println("✅ Merged split content validation:");
+                System.out.println("   Found " + titleResult.getHits().size() + " documents with 'Test' in title");
+                System.out.println("   Found " + contentResult.getHits().size() + " documents with 'content' in content");
+                System.out.println("   Merged split is searchable and contains expected data");
+                
+            }
+            
+        } catch (Exception e) {
+            fail("Failed to validate merged split content: " + e.getMessage());
+        }
     }
 
     @Test
@@ -191,11 +244,11 @@ public class S3MergeMockTest {
         QuickwitSplit.MergeConfig mergeConfig = new QuickwitSplit.MergeConfig(
             "session-merged-index", "session-source", "session-node", sessionConfig);
         
-        // Merge all three splits
+        // Merge all three splits (no subdirectory)
         List<String> allSplits = Arrays.asList(
-            "s3://" + TEST_BUCKET + "/splits/split-1.split",
-            "s3://" + TEST_BUCKET + "/splits/split-2.split",
-            "s3://" + TEST_BUCKET + "/splits/split-3.split"
+            "s3://" + TEST_BUCKET + "/split-1.split",
+            "s3://" + TEST_BUCKET + "/split-2.split",
+            "s3://" + TEST_BUCKET + "/split-3.split"
         );
         
         Path outputPath = tempDir.resolve("merged-session.split");
@@ -236,10 +289,10 @@ public class S3MergeMockTest {
         QuickwitSplit.MergeConfig mergeConfig = new QuickwitSplit.MergeConfig(
             "mixed-merge-index", "mixed-source", "mixed-node", awsConfig);
         
-        // Mix local file and S3 URL
+        // Mix local file and S3 URL (no subdirectory)
         List<String> mixedSplits = Arrays.asList(
             localSplitPath.toString(),                           // Local file
-            "s3://" + TEST_BUCKET + "/splits/split-1.split"      // S3 URL
+            "s3://" + TEST_BUCKET + "/split-1.split"             // S3 URL
         );
         
         Path outputPath = tempDir.resolve("merged-mixed.split");
@@ -269,8 +322,8 @@ public class S3MergeMockTest {
         
         // Use nonexistent bucket - this should fail
         List<String> s3Splits = Arrays.asList(
-            "s3://nonexistent-bucket-12345/splits/split-1.split",
-            "s3://nonexistent-bucket-12345/splits/split-2.split"
+            "s3://nonexistent-bucket-12345/split-1.split",
+            "s3://nonexistent-bucket-12345/split-2.split"
         );
         
         Path outputPath = tempDir.resolve("should-not-exist.split");
@@ -292,6 +345,114 @@ public class S3MergeMockTest {
 
     @Test
     @org.junit.jupiter.api.Order(6)
+    @DisplayName("Test complete S3 round-trip: merge to S3 and validate")
+    public void testCompleteS3MergeRoundTrip() throws IOException {
+        // AWS config for S3Mock
+        QuickwitSplit.AwsConfig awsConfig = new QuickwitSplit.AwsConfig(
+            ACCESS_KEY, SECRET_KEY, "us-east-1");
+        awsConfig = new QuickwitSplit.AwsConfig(
+            ACCESS_KEY, SECRET_KEY, null, "us-east-1",
+            "http://localhost:" + S3_MOCK_PORT, true);
+        
+        QuickwitSplit.MergeConfig mergeConfig = new QuickwitSplit.MergeConfig(
+            "s3-round-trip-index", "s3-source", "s3-node", awsConfig);
+        
+        // Step 1: Count documents in source splits (no subdirectory)
+        List<String> sourceSplits = Arrays.asList(
+            "s3://" + TEST_BUCKET + "/split-1.split",
+            "s3://" + TEST_BUCKET + "/split-2.split",
+            "s3://" + TEST_BUCKET + "/split-3.split"
+        );
+        
+        // Get expected document count by merging locally first
+        Path localMerged = tempDir.resolve("expected-docs.split");
+        QuickwitSplit.SplitMetadata expectedMeta = QuickwitSplit.mergeSplits(
+            sourceSplits, localMerged.toString(), mergeConfig);
+        long expectedDocCount = expectedMeta.getNumDocs();
+        
+        System.out.println("Expected document count from source splits: " + expectedDocCount);
+        
+        // Step 2: Merge to S3 (the key test - output to S3, not local)
+        String s3OutputUrl = "s3://" + TEST_BUCKET + "/complete-test-merge.split";
+        
+        QuickwitSplit.SplitMetadata s3MergeResult = QuickwitSplit.mergeSplits(
+            sourceSplits, s3OutputUrl, mergeConfig);
+        
+        assertNotNull(s3MergeResult, "S3 merge should return metadata");
+        assertEquals(expectedDocCount, s3MergeResult.getNumDocs(), 
+            "S3 merge should preserve document count");
+        
+        System.out.println("✅ S3 merge to S3 successful:");
+        System.out.println("   Split ID: " + s3MergeResult.getSplitId());
+        System.out.println("   Documents: " + s3MergeResult.getNumDocs());
+        System.out.println("   S3 Output: " + s3OutputUrl);
+        
+        // Step 3: Validate the merged split exists on S3 by downloading it
+        Path downloadedSplit = tempDir.resolve("downloaded-merged.split");
+        
+        try {
+            var getResponse = s3Client.getObject(
+                builder -> builder.bucket(TEST_BUCKET).key("complete-test-merge.split"),
+                downloadedSplit
+            );
+            
+            assertTrue(Files.exists(downloadedSplit), "Downloaded split should exist");
+            assertTrue(Files.size(downloadedSplit) > 0, "Downloaded split should not be empty");
+            
+            System.out.println("✅ Merged split downloaded from S3:");
+            System.out.println("   Size: " + Files.size(downloadedSplit) + " bytes");
+            
+        } catch (Exception e) {
+            fail("Failed to download merged split from S3: " + e.getMessage());
+        }
+        
+        // Step 4: Validate the downloaded split is readable and contains correct data
+        // Create a SplitSearcher to verify the merged split can be read
+        try {
+            SplitCacheManager.CacheConfig cacheConfig = new SplitCacheManager.CacheConfig("s3-validation")
+                .withMaxCacheSize(50_000_000)
+                .withAwsCredentials(ACCESS_KEY, SECRET_KEY)
+                .withAwsRegion("us-east-1")
+                .withAwsEndpoint("http://localhost:" + S3_MOCK_PORT);
+            
+            SplitCacheManager cacheManager = SplitCacheManager.getInstance(cacheConfig);
+            
+            // Read the split directly from S3 using SplitSearcher
+            try (SplitSearcher searcher = cacheManager.createSplitSearcher(s3OutputUrl)) {
+                
+                // Validate split is searchable
+                Schema schema = searcher.getSchema();
+                assertNotNull(schema, "Schema should be accessible");
+                
+                // Count documents by searching for a known term
+                Query contentQuery = Query.termQuery(schema, "content", "document");  // Search for a common term
+                SearchResult result = searcher.search(contentQuery, 1000);
+                
+                // If that doesn't work, try searching for any content in title field
+                if (result.getHits().size() == 0) {
+                    Query titleQuery = Query.termQuery(schema, "title", "Test");
+                    result = searcher.search(titleQuery, 1000);
+                }
+                
+                // We should be able to find some documents
+                assertTrue(result.getHits().size() > 0, 
+                    "Merged split should contain searchable documents, searched for 'document' and 'Test'");
+                
+                System.out.println("✅ Merged split validation successful:");
+                System.out.println("   Schema fields: " + schema.getFieldNames().size());
+                System.out.println("   Searchable documents found: " + result.getHits().size());
+                
+            }
+            
+        } catch (Exception e) {
+            fail("Failed to validate merged split searchability: " + e.getMessage());
+        }
+        
+        System.out.println("✅ Complete S3 round-trip test successful!");
+    }
+
+    @Test
+    @org.junit.jupiter.api.Order(7)
     @DisplayName("Test S3 parameter extraction with complex config")
     public void testComplexS3ParameterExtraction() throws IOException {
         // Create complex AWS configuration
@@ -328,8 +489,8 @@ public class S3MergeMockTest {
         
         // The merge will fail due to invalid credentials, but that proves parameter extraction worked
         List<String> s3Splits = Arrays.asList(
-            "s3://" + TEST_BUCKET + "/splits/split-1.split",
-            "s3://" + TEST_BUCKET + "/splits/split-2.split"
+            "s3://" + TEST_BUCKET + "/split-1.split",
+            "s3://" + TEST_BUCKET + "/split-2.split"
         );
         
         Path outputPath = tempDir.resolve("complex-test.split");

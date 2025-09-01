@@ -1060,13 +1060,13 @@ fn merge_splits_impl(split_urls: &[String], output_path: &str, config: &MergeCon
     
     // 4. Set up output directory with sequential access optimization
     // Handle S3 URLs by creating a local temporary directory
-    let (output_temp_dir, is_s3_output) = if output_path.contains("://") && !output_path.starts_with("file://") {
+    let (output_temp_dir, is_s3_output, _temp_dir_guard) = if output_path.contains("://") && !output_path.starts_with("file://") {
         // For S3/remote URLs, create a local temporary directory
         let temp_dir = temp::TempDir::new()?;
         let temp_path = temp_dir.path().join("temp_merge_output");
         std::fs::create_dir_all(&temp_path)?;
         debug_log!("Created local temporary directory for S3 output: {:?}", temp_path);
-        (temp_path, true)
+        (temp_path, true, Some(temp_dir))
     } else {
         // For local files, create temp directory next to output file
         let output_dir_path = Path::new(output_path).parent()
@@ -1074,7 +1074,7 @@ fn merge_splits_impl(split_urls: &[String], output_path: &str, config: &MergeCon
         let temp_dir = output_dir_path.join("temp_merge_output");
         std::fs::create_dir_all(&temp_dir)?;
         debug_log!("Created local temporary directory: {:?}", temp_dir);
-        (temp_dir, false)
+        (temp_dir, false, None)
     };
     
     let output_directory = MmapDirectory::open_with_madvice(&output_temp_dir, Advice::Sequential)?;
