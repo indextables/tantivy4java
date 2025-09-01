@@ -1059,10 +1059,23 @@ fn merge_splits_impl(split_urls: &[String], output_path: &str, config: &MergeCon
     debug_log!("Created shadowing metadata directory");
     
     // 4. Set up output directory with sequential access optimization
-    let output_dir_path = Path::new(output_path).parent()
-        .ok_or_else(|| anyhow!("Cannot determine parent directory for output path"))?;
-    let output_temp_dir = output_dir_path.join("temp_merge_output");
-    std::fs::create_dir_all(&output_temp_dir)?;
+    // Handle S3 URLs by creating a local temporary directory
+    let (output_temp_dir, is_s3_output) = if output_path.contains("://") && !output_path.starts_with("file://") {
+        // For S3/remote URLs, create a local temporary directory
+        let temp_dir = temp::TempDir::new()?;
+        let temp_path = temp_dir.path().join("temp_merge_output");
+        std::fs::create_dir_all(&temp_path)?;
+        debug_log!("Created local temporary directory for S3 output: {:?}", temp_path);
+        (temp_path, true)
+    } else {
+        // For local files, create temp directory next to output file
+        let output_dir_path = Path::new(output_path).parent()
+            .ok_or_else(|| anyhow!("Cannot determine parent directory for output path"))?;
+        let temp_dir = output_dir_path.join("temp_merge_output");
+        std::fs::create_dir_all(&temp_dir)?;
+        debug_log!("Created local temporary directory: {:?}", temp_dir);
+        (temp_dir, false)
+    };
     
     let output_directory = MmapDirectory::open_with_madvice(&output_temp_dir, Advice::Sequential)?;
     debug_log!("Created output directory: {:?}", output_temp_dir);
@@ -1110,7 +1123,22 @@ fn merge_splits_impl(split_urls: &[String], output_path: &str, config: &MergeCon
     };
     
     // 10. Create the merged split file using the merged index
-    create_merged_split_file(&output_temp_dir, output_path, &merged_metadata)?;
+    if is_s3_output {
+        // For S3 output, create split locally then upload
+        let local_split_filename = format!("{}.split", merged_metadata.split_id);
+        let local_split_path = output_temp_dir.join(&local_split_filename);
+        
+        debug_log!("Creating local split file: {:?}", local_split_path);
+        create_merged_split_file(&output_temp_dir, local_split_path.to_str().unwrap(), &merged_metadata)?;
+        
+        // Upload to S3
+        debug_log!("Uploading split file to S3: {}", output_path);
+        upload_split_to_s3(&local_split_path, output_path, config)?;
+        debug_log!("Successfully uploaded split file to S3: {}", output_path);
+    } else {
+        // For local output, create split directly
+        create_merged_split_file(&output_temp_dir, output_path, &merged_metadata)?;
+    }
     
     // 11. Clean up temporary directory
     std::fs::remove_dir_all(&output_temp_dir).unwrap_or_else(|e| {
@@ -1254,6 +1282,76 @@ fn calculate_directory_size(dir_path: &Path) -> Result<u64> {
     }
     
     Ok(total_size)
+}
+
+/// Upload a local split file to S3 using the storage resolver with AWS credentials
+async fn upload_split_to_s3_impl(local_split_path: &Path, s3_url: &str, config: &MergeConfig) -> Result<()> {
+    use quickwit_storage::{Storage, StorageResolver, LocalFileStorageFactory, S3CompatibleObjectStorageFactory};
+    use std::str::FromStr;
+    
+    debug_log!("Starting S3 upload from {:?} to {}", local_split_path, s3_url);
+    
+    // Parse the S3 URI
+    let s3_uri = Uri::from_str(s3_url)?;
+    
+    // Create storage resolver with AWS config from MergeConfig
+    let s3_config = if let Some(ref aws_config) = config.aws_config {
+        S3StorageConfig {
+            region: Some(aws_config.region.clone()),
+            access_key_id: Some(aws_config.access_key.clone()),
+            secret_access_key: Some(aws_config.secret_key.clone()),
+            session_token: aws_config.session_token.clone(),
+            endpoint: aws_config.endpoint.clone(),
+            force_path_style_access: aws_config.force_path_style,
+            ..Default::default()
+        }
+    } else {
+        S3StorageConfig::default()
+    };
+    let storage_resolver = StorageResolver::builder()
+        .register(LocalFileStorageFactory::default())
+        .register(S3CompatibleObjectStorageFactory::new(s3_config))
+        .build()
+        .map_err(|e| anyhow!("Failed to create storage resolver for upload: {}", e))?;
+    
+    // For S3 URIs, we need to resolve the parent directory, not the file itself
+    let (storage_uri, file_name) = if s3_uri.protocol() == Protocol::S3 {
+        let uri_str = s3_uri.as_str();
+        if let Some(last_slash) = uri_str.rfind('/') {
+            let parent_uri_str = &uri_str[..last_slash]; // Get s3://bucket/splits
+            let file_name = &uri_str[last_slash + 1..];  // Get filename
+            debug_log!("Split S3 URI for upload into parent: {} and file: {}", parent_uri_str, file_name);
+            (Uri::from_str(parent_uri_str)?, file_name.to_string())
+        } else {
+            return Err(anyhow!("Invalid S3 URL format: {}", s3_url));
+        }
+    } else {
+        return Err(anyhow!("Only S3 URLs are supported for upload, got: {}", s3_url));
+    };
+    
+    // Resolve storage for the URI
+    let storage = storage_resolver.resolve(&storage_uri).await
+        .map_err(|e| anyhow!("Failed to resolve storage for '{}': {}", s3_url, e))?;
+    
+    // Read the local split file
+    let split_data = std::fs::read(local_split_path)
+        .map_err(|e| anyhow!("Failed to read local split file {:?}: {}", local_split_path, e))?;
+    
+    let split_size = split_data.len();
+    debug_log!("Read {} bytes from local split file", split_size);
+    
+    // Upload the split file to S3
+    storage.put(Path::new(&file_name), Box::new(split_data)).await
+        .map_err(|e| anyhow!("Failed to upload split to S3: {}", e))?;
+    
+    debug_log!("Successfully uploaded {} bytes to S3: {}", split_size, s3_url);
+    Ok(())
+}
+
+/// Synchronous wrapper for S3 upload
+fn upload_split_to_s3(local_split_path: &Path, s3_url: &str, config: &MergeConfig) -> Result<()> {
+    let runtime = tokio::runtime::Runtime::new()?;
+    runtime.block_on(upload_split_to_s3_impl(local_split_path, s3_url, config))
 }
 
 /// Create the merged split file using existing Quickwit split creation logic

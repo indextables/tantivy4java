@@ -166,12 +166,70 @@ The performance improvement comes from:
 3. **Bulk processing** - Rust processes entire batches efficiently in native code
 4. **Sequential I/O** - Optimized disk access patterns for large-scale indexing
 
+## Resource Management
+
+The batch document system provides comprehensive resource management with automatic cleanup:
+
+### AutoCloseable Interface
+
+`BatchDocumentBuilder` implements `AutoCloseable` for safe resource management:
+
+```java
+// Automatic flushing with try-with-resources (recommended)
+try (BatchDocumentBuilder builder = new BatchDocumentBuilder(writer)) {
+    BatchDocument doc = new BatchDocument();
+    doc.addText("title", "Auto-flushed Document");
+    builder.addDocument(doc);
+    // Documents are automatically flushed when builder is closed
+}
+```
+
+### Manual Resource Management
+
+For cases requiring explicit control:
+
+```java
+BatchDocumentBuilder builder = new BatchDocumentBuilder();
+builder.associateWith(writer);
+
+// Add documents
+builder.addDocument(doc1);
+builder.addDocument(doc2);
+
+// Manual flush
+long[] opstamps = builder.flush();
+
+// Safe cleanup
+builder.close();
+```
+
+### Key Features
+
+- **Automatic flushing** - Pending documents are flushed when `close()` is called
+- **IndexWriter association** - Associate builders with writers for auto-flushing
+- **Closed state protection** - Prevents adding documents to closed builders
+- **Idempotent operations** - Safe to call `close()` multiple times
+- **Error handling** - Comprehensive exception handling during flush operations
+
+### API Methods
+
+- **`BatchDocumentBuilder(IndexWriter writer)`** - Constructor with associated writer
+- **`associateWith(IndexWriter writer)`** - Associate writer after construction
+- **`flush()`** - Manually flush pending documents to associated writer
+- **`close()`** - Auto-flush and close builder (implements AutoCloseable)
+- **`isClosed()`** - Check if builder has been closed
+- **`hasAssociatedWriter()`** - Check if writer is associated
+
 ## Version History
 
 - **v1.0**: Initial implementation with footer-based format
   - Magic number: 0x54414E54
   - Document count in footer for streaming write capability
   - Support for all Tantivy field types
+- **v1.1**: Added resource management with AutoCloseable interface
+  - Automatic flushing on close
+  - IndexWriter association
+  - Comprehensive error handling
 
 ## Error Handling
 
@@ -181,6 +239,8 @@ The performance improvement comes from:
 - **Value Count Overflow**: More than 65535 values for a single field
 - **Buffer Underflow**: Unexpected end of buffer during parsing
 - **Invalid Type Code**: Unknown field type code encountered
+- **Closed Builder Exception**: Attempting to add documents to a closed builder
+- **Flush Errors**: IndexWriter errors during automatic or manual flushing
 
 ## Implementation Notes
 
@@ -189,3 +249,5 @@ The performance improvement comes from:
 - Multi-value fields store each value independently
 - Date values are normalized to UTC epoch milliseconds
 - Boolean values use single-byte encoding (0/1)
+- Resource management follows Java AutoCloseable patterns
+- Thread safety is maintained through proper synchronization
