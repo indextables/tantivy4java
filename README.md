@@ -64,7 +64,9 @@ Tantivy4Java is a production-ready JNI wrapper for the Rust-based Tantivy search
 
 #### Split Operations
 - **Split Creation** - Convert Tantivy indices to Quickwit split format
-- **Split Merging** - Efficient Quickwit-style split merging for large-scale indices
+- **Split Merging** - Efficient Quickwit-style split merging for large-scale indices with full S3 support
+- **Remote S3 Split Merging** - Merge splits directly from S3/MinIO with AWS credential authentication
+- **Mixed Protocol Support** - Merge local files, file URLs, and S3 URLs in single operation
 - **Split Validation** - Verify split file integrity and accessibility
 - **Metadata Access** - Complete split information and statistics
 
@@ -365,6 +367,7 @@ System.out.println("Split is valid: " + isValid);
 
 ### Merging Multiple Splits
 
+#### Local Split Merging
 ```java
 // Merge multiple splits using Quickwit's efficient approach
 List<String> splitPaths = List.of(
@@ -373,7 +376,7 @@ List<String> splitPaths = List.of(
     "/path/to/split3.split"
 );
 
-QuickwitSplit.SplitConfig mergeConfig = new QuickwitSplit.SplitConfig(
+QuickwitSplit.MergeConfig mergeConfig = new QuickwitSplit.MergeConfig(
     "merged-index-uid",
     "merged-source",
     "merge-node"
@@ -388,6 +391,62 @@ QuickwitSplit.SplitMetadata mergedSplit = QuickwitSplit.mergeSplits(
 System.out.println("Merged " + splitPaths.size() + " splits");
 System.out.println("Total documents: " + mergedSplit.getNumDocs());
 System.out.println("Merged split size: " + mergedSplit.getUncompressedSizeBytes());
+```
+
+#### S3 Remote Split Merging
+```java
+// Create AWS configuration for S3 access
+QuickwitSplit.AwsConfig awsConfig = new QuickwitSplit.AwsConfig(
+    "AKIA...",        // Access key
+    "secret-key",     // Secret key
+    "us-east-1"       // Region
+);
+
+// Create merge configuration with AWS credentials
+QuickwitSplit.MergeConfig config = new QuickwitSplit.MergeConfig(
+    "distributed-index", "data-source", "worker-node", awsConfig);
+
+// Define S3 split URLs to merge
+List<String> s3Splits = Arrays.asList(
+    "s3://my-bucket/splits/split-001.split",
+    "s3://my-bucket/splits/split-002.split",
+    "s3://my-bucket/splits/split-003.split"
+);
+
+// Merge remote S3 splits
+QuickwitSplit.SplitMetadata result = QuickwitSplit.mergeSplits(
+    s3Splits, "/tmp/merged-split.split", config);
+
+System.out.println("✅ Successfully merged " + s3Splits.size() + " S3 splits");
+System.out.println("   Merged split ID: " + result.getSplitId());
+System.out.println("   Total documents: " + result.getNumDocs());
+```
+
+#### Advanced S3 Configuration (Session Tokens + Custom Endpoints)
+```java
+// For temporary credentials or custom S3-compatible storage
+QuickwitSplit.AwsConfig sessionConfig = new QuickwitSplit.AwsConfig(
+    "temp-access-key",     // Temporary access key
+    "temp-secret-key",     // Temporary secret key
+    "session-token",       // STS session token
+    "us-west-2",          // AWS region
+    "https://minio.example.com", // Custom endpoint (MinIO)
+    true                   // Force path style
+);
+
+QuickwitSplit.MergeConfig config = new QuickwitSplit.MergeConfig(
+    "index-uid", "source-id", "node-id", sessionConfig);
+
+// Mix local and remote splits in single operation
+List<String> mixedSplits = Arrays.asList(
+    "/local/path/split-001.split",           // Local file
+    "file:///shared/storage/split-002.split", // File URL
+    "s3://bucket-a/split-003.split",         // S3 URL
+    "s3://bucket-b/remote/split-004.split"   // Different bucket
+);
+
+QuickwitSplit.SplitMetadata result = QuickwitSplit.mergeSplits(
+    mixedSplits, "/tmp/merged.split", config);
 ```
 
 ### Searching Split Files
@@ -531,6 +590,8 @@ SplitCacheManager.CacheConfig customConfig = new SplitCacheManager.CacheConfig("
 - `SplitSearcher` - Split file search operations
 - `SplitCacheManager` - Shared cache management
 - `QuickwitSplit` - Split conversion and merging utilities
+- `QuickwitSplit.AwsConfig` - AWS credential configuration for S3 access
+- `QuickwitSplit.MergeConfig` - Split merge configuration with AWS support
 - `SplitMetadata` - Split information access
 
 ## Requirements

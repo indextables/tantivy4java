@@ -297,7 +297,130 @@ public class QuickwitSplit {
     }
 
     /**
-     * Configuration for split merging operations.
+     * AWS configuration for S3-compatible storage access.
+     * 
+     * <p>This class provides configuration for accessing S3 splits using AWS credentials.
+     * It supports both basic AWS access (access key + secret key) and temporary credentials
+     * (with session tokens from STS), as well as custom S3-compatible endpoints like MinIO.
+     * 
+     * <h3>Usage Examples:</h3>
+     * 
+     * <h4>Basic AWS Credentials:</h4>
+     * <pre>{@code
+     * AwsConfig config = new AwsConfig("AKIA...", "secret-key", "us-east-1");
+     * }</pre>
+     * 
+     * <h4>Temporary Credentials (STS):</h4>
+     * <pre>{@code
+     * AwsConfig config = new AwsConfig(
+     *     "temp-access-key", 
+     *     "temp-secret-key", 
+     *     "session-token",    // From STS
+     *     "us-west-2", 
+     *     null,              // Use default endpoint
+     *     false              // Virtual-hosted style
+     * );
+     * }</pre>
+     * 
+     * <h4>MinIO or Custom S3 Endpoint:</h4>
+     * <pre>{@code
+     * AwsConfig config = new AwsConfig(
+     *     "minioaccess", 
+     *     "miniosecret", 
+     *     null,                           // No session token
+     *     "us-east-1", 
+     *     "https://minio.example.com",    // Custom endpoint
+     *     true                            // Force path-style URLs
+     * );
+     * }</pre>
+     * 
+     * @see MergeConfig#MergeConfig(String, String, String, AwsConfig) for integration
+     * @since 0.24.0
+     */
+    public static class AwsConfig {
+        private final String accessKey;
+        private final String secretKey;
+        private final String sessionToken;
+        private final String region;
+        private final String endpoint;
+        private final boolean forcePathStyle;
+        
+        /**
+         * Create AWS configuration for S3 access.
+         *
+         * @param accessKey AWS access key ID
+         * @param secretKey AWS secret access key
+         * @param region AWS region
+         */
+        public AwsConfig(String accessKey, String secretKey, String region) {
+            this(accessKey, secretKey, null, region, null, false);
+        }
+        
+        /**
+         * Create AWS configuration with all options.
+         *
+         * @param accessKey AWS access key ID
+         * @param secretKey AWS secret access key
+         * @param sessionToken AWS session token (optional, for temporary credentials)
+         * @param region AWS region
+         * @param endpoint Custom S3 endpoint (optional, for S3-compatible storage)
+         * @param forcePathStyle Force path-style URLs (for MinIO compatibility)
+         */
+        public AwsConfig(String accessKey, String secretKey, String sessionToken, String region, String endpoint, boolean forcePathStyle) {
+            this.accessKey = accessKey;
+            this.secretKey = secretKey;
+            this.sessionToken = sessionToken;
+            this.region = region;
+            this.endpoint = endpoint;
+            this.forcePathStyle = forcePathStyle;
+        }
+        
+        public String getAccessKey() { return accessKey; }
+        public String getSecretKey() { return secretKey; }
+        public String getSessionToken() { return sessionToken; }
+        public String getRegion() { return region; }
+        public String getEndpoint() { return endpoint; }
+        public boolean isForcePathStyle() { return forcePathStyle; }
+    }
+
+    /**
+     * Configuration for split merging operations with optional S3/AWS support.
+     * 
+     * <p>This class configures split merge operations, including metadata for the resulting
+     * merged split and optional AWS credentials for accessing remote S3 splits.
+     * 
+     * <h3>Usage Examples:</h3>
+     * 
+     * <h4>Local Split Merging:</h4>
+     * <pre>{@code
+     * MergeConfig config = new MergeConfig("my-index", "my-source", "my-node");
+     * }</pre>
+     * 
+     * <h4>S3 Remote Split Merging:</h4>
+     * <pre>{@code
+     * AwsConfig awsConfig = new AwsConfig("access-key", "secret-key", "us-east-1");
+     * MergeConfig config = new MergeConfig("my-index", "my-source", "my-node", awsConfig);
+     * }</pre>
+     * 
+     * <h4>Advanced Configuration:</h4>
+     * <pre>{@code
+     * AwsConfig awsConfig = new AwsConfig("access", "secret", "us-east-1");
+     * List<String> deleteQueries = Arrays.asList("deleted:true");
+     * 
+     * MergeConfig config = new MergeConfig(
+     *     "distributed-index",    // Index UID
+     *     "data-source",         // Source ID  
+     *     "worker-node",         // Node ID
+     *     "mapping-v1",          // Document mapping UID
+     *     42L,                   // Partition ID
+     *     deleteQueries,         // Delete queries to apply
+     *     awsConfig              // AWS credentials for S3
+     * );
+     * }</pre>
+     * 
+     * @see AwsConfig for S3 credential configuration
+     * @see #mergeSplits(List, String, MergeConfig) for usage
+     * @since 0.24.0
      */
     public static class MergeConfig {
         private final String indexUid;
@@ -306,6 +429,7 @@ public class QuickwitSplit {
         private final String docMappingUid;
         private final long partitionId;
         private final List<String> deleteQueries;
+        private final AwsConfig awsConfig;
 
         /**
          * Create a new merge configuration.
@@ -316,15 +440,32 @@ public class QuickwitSplit {
          * @param docMappingUid Document mapping unique identifier (must match across all splits)
          * @param partitionId Partition identifier (default: 0)
          * @param deleteQueries Optional list of delete queries to apply during merge
+         * @param awsConfig AWS configuration for S3 access (optional)
          */
         public MergeConfig(String indexUid, String sourceId, String nodeId, String docMappingUid,
-                          long partitionId, List<String> deleteQueries) {
+                          long partitionId, List<String> deleteQueries, AwsConfig awsConfig) {
             this.indexUid = indexUid;
             this.sourceId = sourceId;
             this.nodeId = nodeId;
             this.docMappingUid = docMappingUid;
             this.partitionId = partitionId;
             this.deleteQueries = deleteQueries;
+            this.awsConfig = awsConfig;
+        }
+        
+        /**
+         * Create a new merge configuration without AWS config.
+         * 
+         * @param indexUid Unique identifier for the index
+         * @param sourceId Source identifier
+         * @param nodeId Node identifier that will create the merged split
+         * @param docMappingUid Document mapping unique identifier (must match across all splits)
+         * @param partitionId Partition identifier (default: 0)
+         * @param deleteQueries Optional list of delete queries to apply during merge
+         */
+        public MergeConfig(String indexUid, String sourceId, String nodeId, String docMappingUid,
+                          long partitionId, List<String> deleteQueries) {
+            this(indexUid, sourceId, nodeId, docMappingUid, partitionId, deleteQueries, null);
         }
 
         /**
@@ -335,7 +476,19 @@ public class QuickwitSplit {
          * @param nodeId Node identifier that will create the merged split
          */
         public MergeConfig(String indexUid, String sourceId, String nodeId) {
-            this(indexUid, sourceId, nodeId, "default", 0L, null);
+            this(indexUid, sourceId, nodeId, "default", 0L, null, null);
+        }
+        
+        /**
+         * Create a merge configuration with AWS config for S3 splits.
+         * 
+         * @param indexUid Unique identifier for the index
+         * @param sourceId Source identifier
+         * @param nodeId Node identifier that will create the merged split
+         * @param awsConfig AWS configuration for S3 access
+         */
+        public MergeConfig(String indexUid, String sourceId, String nodeId, AwsConfig awsConfig) {
+            this(indexUid, sourceId, nodeId, "default", 0L, null, awsConfig);
         }
 
         // Getters
@@ -345,17 +498,53 @@ public class QuickwitSplit {
         public String getDocMappingUid() { return docMappingUid; }
         public long getPartitionId() { return partitionId; }
         public List<String> getDeleteQueries() { return deleteQueries; }
+        public AwsConfig getAwsConfig() { return awsConfig; }
     }
 
     /**
-     * Merge multiple Quickwit splits into a single split file.
+     * Merge multiple Quickwit splits into a single split file with full S3 remote support.
      * 
-     * This function implements Quickwit's split merging functionality, which:
-     * 1. Downloads/opens all source split files
+     * This function implements Quickwit's split merging functionality with comprehensive 
+     * support for local files, file URLs, and S3 remote splits. The process:
+     * 1. Downloads/opens all source split files (from local disk or S3)
      * 2. Extracts Tantivy index directories from each split
      * 3. Uses Tantivy's segment merging to combine all content
      * 4. Applies any delete queries during the merge process
      * 5. Creates a new split file with merged content and updated metadata
+     * 
+     * <h3>Supported URL Types:</h3>
+     * <ul>
+     * <li><strong>Local paths:</strong> {@code /path/to/split.split}</li>
+     * <li><strong>File URLs:</strong> {@code file:///path/to/split.split}</li>
+     * <li><strong>S3 URLs:</strong> {@code s3://bucket/path/split.split} (requires AWS config)</li>
+     * </ul>
+     * 
+     * <h3>S3 Remote Split Support:</h3>
+     * When merging S3 splits, provide AWS credentials via {@link MergeConfig#getAwsConfig()}:
+     * <pre>{@code
+     * // Create AWS configuration
+     * AwsConfig awsConfig = new AwsConfig("access-key", "secret-key", "us-east-1");
+     * 
+     * // Create merge config with AWS credentials  
+     * MergeConfig config = new MergeConfig("index", "source", "node", awsConfig);
+     * 
+     * // Merge S3 splits
+     * List<String> s3Splits = Arrays.asList(
+     *     "s3://bucket/split1.split", 
+     *     "s3://bucket/split2.split"
+     * );
+     * SplitMetadata result = mergeSplits(s3Splits, "/tmp/merged.split", config);
+     * }</pre>
+     * 
+     * <h3>Mixed Protocol Support:</h3>
+     * You can merge splits from multiple sources in a single operation:
+     * <pre>{@code
+     * List<String> mixedSplits = Arrays.asList(
+     *     "/local/split1.split",                    // Local file
+     *     "file:///shared/split2.split",           // File URL
+     *     "s3://bucket/split3.split"               // S3 URL
+     * );
+     * }</pre>
      * 
      * The merged split will contain:
      * - Combined document count from all source splits
@@ -364,13 +553,15 @@ public class QuickwitSplit {
      * - Incremented merge operation count
      * - List of replaced split IDs for tracking
      * 
-     * @param splitUrls List of split file URLs/paths to merge (supports file:// and s3:// URLs)
+     * @param splitUrls List of split file URLs/paths to merge (local, file://, or s3://)
      * @param outputPath Path where the merged split file should be written (must end with .split)
-     * @param config Configuration for the merge operation
+     * @param config Configuration for the merge operation (include AwsConfig for S3 splits)
      * @return Metadata about the created merged split
-     * @throws IllegalArgumentException if input validation fails
-     * @throws RuntimeException if merge operation fails
+     * @throws IllegalArgumentException if input validation fails or AWS credentials missing for S3 URLs
+     * @throws RuntimeException if merge operation fails (network, S3 access, or merge errors)
      * 
+     * @see AwsConfig for S3 credential configuration
+     * @see MergeConfig#MergeConfig(String, String, String, AwsConfig) for AWS integration
      * @since 0.24.0
      */
     public static SplitMetadata mergeSplits(List<String> splitUrls, String outputPath, MergeConfig config) {

@@ -28,9 +28,12 @@ use serde_json;
 use base64::{Engine, engine::general_purpose};
 
 // Quickwit imports
-use quickwit_storage::{SplitPayloadBuilder, PutPayload, BundleStorage, RamStorage, Storage};
+use quickwit_storage::{SplitPayloadBuilder, PutPayload, BundleStorage, RamStorage, Storage, StorageResolver, LocalFileStorageFactory, S3CompatibleObjectStorageFactory};
 use quickwit_directories::write_hotcache;
+use quickwit_config::S3StorageConfig;
+use quickwit_common::uri::{Uri, Protocol};
 use tantivy::directory::{OwnedBytes, FileSlice};
+use std::str::FromStr;
 
 use crate::utils::{convert_throwable, jstring_to_string, string_to_jstring, with_object};
 
@@ -667,6 +670,18 @@ struct MergeConfig {
     doc_mapping_uid: String,
     partition_id: u64,
     delete_queries: Option<Vec<String>>,
+    aws_config: Option<AwsConfig>,
+}
+
+/// AWS configuration for S3-compatible storage (copy from split_searcher.rs)
+#[derive(Clone, Debug)]
+struct AwsConfig {
+    access_key: String,
+    secret_key: String,
+    session_token: Option<String>,
+    region: String,
+    endpoint: Option<String>,
+    force_path_style: bool,
 }
 
 #[no_mangle]
@@ -705,6 +720,54 @@ pub extern "system" fn Java_com_tantivy4java_QuickwitSplit_nativeMergeSplits(
     }).unwrap_or(std::ptr::null_mut())
 }
 
+/// Extract AWS configuration from Java AwsConfig object
+fn extract_aws_config(env: &mut JNIEnv, aws_obj: JObject) -> anyhow::Result<AwsConfig> {
+    let access_key = get_string_field_value(env, &aws_obj, "getAccessKey")?;
+    let secret_key = get_string_field_value(env, &aws_obj, "getSecretKey")?;
+    let region = get_string_field_value(env, &aws_obj, "getRegion")?;
+    
+    // Extract session token (optional - for STS/temporary credentials)
+    let session_token = match env.call_method(&aws_obj, "getSessionToken", "()Ljava/lang/String;", &[]) {
+        Ok(session_result) => {
+            let session_obj = session_result.l()?;
+            if env.is_same_object(&session_obj, JObject::null())? {
+                None
+            } else {
+                Some(jstring_to_string(env, &session_obj.into())?)
+            }
+        },
+        Err(_) => None,
+    };
+
+    // Extract endpoint (optional - for S3-compatible storage)
+    let endpoint = match env.call_method(&aws_obj, "getEndpoint", "()Ljava/lang/String;", &[]) {
+        Ok(endpoint_result) => {
+            let endpoint_obj = endpoint_result.l()?;
+            if env.is_same_object(&endpoint_obj, JObject::null())? {
+                None
+            } else {
+                Some(jstring_to_string(env, &endpoint_obj.into())?)
+            }
+        },
+        Err(_) => None,
+    };
+    
+    // Extract force path style flag
+    let force_path_style = match env.call_method(&aws_obj, "isForcePathStyle", "()Z", &[]) {
+        Ok(result) => result.z()?,
+        Err(_) => false,
+    };
+
+    Ok(AwsConfig {
+        access_key,
+        secret_key,
+        session_token,
+        region,
+        endpoint,
+        force_path_style,
+    })
+}
+
 /// Extract merge configuration from Java MergeConfig object
 fn extract_merge_config(env: &mut JNIEnv, config_obj: &JObject) -> Result<MergeConfig> {
     let index_uid = get_string_field_value(env, config_obj, "getIndexUid")?;
@@ -730,6 +793,19 @@ fn extract_merge_config(env: &mut JNIEnv, config_obj: &JObject) -> Result<MergeC
         Err(_) => None,
     };
     
+    // Extract AWS configuration if present
+    let aws_config = match env.call_method(config_obj, "getAwsConfig", "()Lcom/tantivy4java/QuickwitSplit$AwsConfig;", &[]) {
+        Ok(aws_result) => {
+            let aws_obj = aws_result.l()?;
+            if env.is_same_object(&aws_obj, JObject::null())? {
+                None
+            } else {
+                Some(extract_aws_config(env, aws_obj)?)
+            }
+        },
+        Err(_) => None,
+    };
+    
     Ok(MergeConfig {
         index_uid,
         source_id,
@@ -737,6 +813,7 @@ fn extract_merge_config(env: &mut JNIEnv, config_obj: &JObject) -> Result<MergeC
         doc_mapping_uid,
         partition_id,
         delete_queries,
+        aws_config,
     })
 }
 
@@ -845,30 +922,94 @@ fn merge_splits_impl(split_urls: &[String], output_path: &str, config: &MergeCon
     for (i, split_url) in split_urls.iter().enumerate() {
         debug_log!("Opening split directory {}: {}", i, split_url);
         
-        // Support file-based splits (not S3 URLs in this implementation)
-        if split_url.contains("://") && !split_url.starts_with("file://") {
-            return Err(anyhow!("S3/remote split URLs not yet supported in merge operation: {}", split_url));
-        }
-        
-        let split_path = if split_url.starts_with("file://") {
-            split_url.strip_prefix("file://").unwrap_or(split_url)
-        } else {
-            split_url
-        };
-        
-        // Validate split exists
-        if !Path::new(split_path).exists() {
-            return Err(anyhow!("Split file not found: {}", split_path));
-        }
-        
-        // SOLUTION: Extract split to temporary directory to avoid read-only BundleDirectory issues
+        // Support both file-based and S3/remote splits
         let temp_extract_dir = temp::TempDir::new()?;
         let temp_extract_path = temp_extract_dir.path();
         
         debug_log!("Extracting split {} to temporary directory: {:?}", i, temp_extract_path);
         
-        // Extract the split to a writable directory
-        extract_split_to_directory_impl(Path::new(split_path), temp_extract_path)?;
+        if split_url.contains("://") && !split_url.starts_with("file://") {
+            // Handle S3/remote URLs
+            debug_log!("Processing S3/remote split URL: {}", split_url);
+            
+            // Parse the split URI
+            let split_uri = Uri::from_str(split_url)?;
+            
+            // Create storage resolver with AWS config from MergeConfig
+            let s3_config = if let Some(ref aws_config) = config.aws_config {
+                S3StorageConfig {
+                    region: Some(aws_config.region.clone()),
+                    access_key_id: Some(aws_config.access_key.clone()),
+                    secret_access_key: Some(aws_config.secret_key.clone()),
+                    session_token: aws_config.session_token.clone(),
+                    endpoint: aws_config.endpoint.clone(),
+                    force_path_style_access: aws_config.force_path_style,
+                    ..Default::default()
+                }
+            } else {
+                S3StorageConfig::default()
+            };
+            let storage_resolver = StorageResolver::builder()
+                .register(LocalFileStorageFactory::default())
+                .register(S3CompatibleObjectStorageFactory::new(s3_config))
+                .build()
+                .map_err(|e| anyhow!("Failed to create storage resolver: {}", e))?;
+            
+            // For S3 URIs, we need to resolve the parent directory, not the file itself
+            let (storage_uri, file_name) = if split_uri.protocol() == Protocol::S3 {
+                let uri_str = split_uri.as_str();
+                if let Some(last_slash) = uri_str.rfind('/') {
+                    let parent_uri_str = &uri_str[..last_slash]; // Get s3://bucket/splits
+                    let file_name = &uri_str[last_slash + 1..];  // Get filename
+                    debug_log!("Split S3 URI into parent: {} and file: {}", parent_uri_str, file_name);
+                    (Uri::from_str(parent_uri_str)?, Some(file_name.to_string()))
+                } else {
+                    (split_uri.clone(), None)
+                }
+            } else {
+                (split_uri.clone(), None)
+            };
+            
+            // Resolve storage for the URI
+            let storage = runtime.block_on(async {
+                storage_resolver.resolve(&storage_uri).await
+            }).map_err(|e| anyhow!("Failed to resolve storage for '{}': {}", split_url, e))?;
+            
+            // Download the split file to temporary location
+            let split_filename = file_name.unwrap_or_else(|| {
+                split_url.split('/').last().unwrap_or("split.split").to_string()
+            });
+            let temp_split_path = temp_extract_path.join(&split_filename);
+            
+            debug_log!("Downloading split {} to {:?}", split_url, temp_split_path);
+            
+            // Download the split file
+            let split_data = runtime.block_on(async {
+                storage.get_all(Path::new(&split_filename)).await
+            }).map_err(|e| anyhow!("Failed to download split from {}: {}", split_url, e))?;
+            
+            std::fs::write(&temp_split_path, &split_data)?;
+            debug_log!("Downloaded {} bytes to {:?}", split_data.len(), temp_split_path);
+            
+            // Extract the downloaded split to the temp directory
+            extract_split_to_directory_impl(&temp_split_path, temp_extract_path)?;
+            
+        } else {
+            // Handle local file URLs
+            let split_path = if split_url.starts_with("file://") {
+                split_url.strip_prefix("file://").unwrap_or(split_url)
+            } else {
+                split_url
+            };
+            
+            // Validate split exists
+            if !Path::new(split_path).exists() {
+                return Err(anyhow!("Split file not found: {}", split_path));
+            }
+            
+            // Extract the split to a writable directory
+            extract_split_to_directory_impl(Path::new(split_path), temp_extract_path)?;
+        }
         
         // Open the extracted directory as writable MmapDirectory
         let extracted_directory = MmapDirectory::open(temp_extract_path)?;
@@ -879,7 +1020,22 @@ fn merge_splits_impl(split_urls: &[String], output_path: &str, config: &MergeCon
         let reader = temp_index.reader()?;
         let searcher = reader.searcher();
         let doc_count = searcher.num_docs();
-        let split_size = std::fs::metadata(split_path)?.len();
+        
+        // Calculate split size based on source type
+        let split_size = if split_url.contains("://") && !split_url.starts_with("file://") {
+            // For S3/remote splits, get size from the temporary downloaded file
+            let split_filename = split_url.split('/').last().unwrap_or("split.split");
+            let temp_split_path = temp_extract_path.join(split_filename);
+            std::fs::metadata(&temp_split_path)?.len()
+        } else {
+            // For local splits, get size from original file
+            let split_path = if split_url.starts_with("file://") {
+                split_url.strip_prefix("file://").unwrap_or(split_url)
+            } else {
+                split_url
+            };
+            std::fs::metadata(split_path)?.len()
+        };
         
         debug_log!("Extracted split {} has {} documents, {} bytes", i, doc_count, split_size);
         
