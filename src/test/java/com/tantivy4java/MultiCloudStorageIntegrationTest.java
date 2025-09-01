@@ -29,7 +29,7 @@ public class MultiCloudStorageIntegrationTest {
     private static final String S3_BUCKET = "s3-test-bucket";
     private static final String S3_ACCESS_KEY = "test-access-key";
     private static final String S3_SECRET_KEY = "test-secret-key";
-    private static final int S3_MOCK_PORT = 8001;
+    private static final int S3_MOCK_PORT = 8003; // Unique port to avoid conflicts with SplitSearcherTest (8001) and S3MergeMockTest (8002)
     
     // Azure Configuration
     private static final String AZURE_CONTAINER = "azure-test-container";
