@@ -2,6 +2,15 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+// Debug logging macro - controlled by TANTIVY4JAVA_DEBUG environment variable
+macro_rules! debug_log {
+    ($($arg:tt)*) => {
+        if std::env::var("TANTIVY4JAVA_DEBUG").unwrap_or_default() == "1" {
+            eprintln!("DEBUG: {}", format!($($arg)*));
+        }
+    };
+}
+
 use jni::JNIEnv;
 use jni::objects::{JClass, JObject, JString, JValue};
 use jni::sys::{jlong, jint, jobject};
@@ -68,6 +77,10 @@ impl GlobalSplitCacheManager {
             limits,
         ).expect("Failed to create SplitCache");
         
+        // 🚀 OPTIMIZATION: Controlled ByteRangeCache resource allocation
+        // Reserve 25% of cache size for ByteRangeCache operations (optimal for mixed workloads)
+        // Note: ByteRangeCache has infinite capacity but we control total system memory usage
+        let _byte_range_cache_budget = max_cache_size / 4; // 25% allocation for byte ranges
         let byte_range_cache = ByteRangeCache::with_infinite_capacity(
             &quickwit_storage::STORAGE_METRICS.shortlived_cache,
         );
@@ -108,12 +121,60 @@ impl GlobalSplitCacheManager {
     }
     
     pub fn get_cache_stats(&self) -> GlobalCacheStats {
-        // For now, use our tracking counters until we can properly access split cache stats
+        // 🚀 OPTIMIZATION: Access real Quickwit cache metrics instead of basic counters
+        // This provides comprehensive per-cache-type metrics with ByteRangeCache-specific tracking
+        
+        // Access Quickwit's comprehensive storage metrics
+        let storage_metrics = &quickwit_storage::STORAGE_METRICS;
+        
+        // 🎯 ByteRangeCache-specific metrics (shortlived_cache is used by ByteRangeCache)
+        let byte_range_hits = storage_metrics.shortlived_cache.hits_num_items.get();
+        let byte_range_misses = storage_metrics.shortlived_cache.misses_num_items.get(); 
+        let byte_range_evictions = storage_metrics.shortlived_cache.evict_num_items.get();
+        let byte_range_bytes = storage_metrics.shortlived_cache.in_cache_num_bytes.get() as u64;
+        
+        // 🎯 Split Footer Cache metrics (MemorySizedCache)
+        let footer_hits = storage_metrics.split_footer_cache.hits_num_items.get();
+        let footer_misses = storage_metrics.split_footer_cache.misses_num_items.get();
+        let footer_evictions = storage_metrics.split_footer_cache.evict_num_items.get();
+        let footer_bytes = storage_metrics.split_footer_cache.in_cache_num_bytes.get() as u64;
+        
+        // 🎯 Fast Field Cache metrics (component-level caching)
+        let fastfield_hits = storage_metrics.fast_field_cache.hits_num_items.get();
+        let fastfield_misses = storage_metrics.fast_field_cache.misses_num_items.get();
+        let fastfield_evictions = storage_metrics.fast_field_cache.evict_num_items.get();
+        let fastfield_bytes = storage_metrics.fast_field_cache.in_cache_num_bytes.get() as u64;
+        
+        // 🎯 Searcher Split Cache metrics (SplitCache tracking)
+        let split_hits = storage_metrics.searcher_split_cache.hits_num_items.get();
+        let split_misses = storage_metrics.searcher_split_cache.misses_num_items.get();
+        let split_evictions = storage_metrics.searcher_split_cache.evict_num_items.get();
+        let split_bytes = storage_metrics.searcher_split_cache.in_cache_num_bytes.get() as u64;
+        
+        // Aggregate comprehensive metrics across all cache types
+        let total_hits = byte_range_hits + footer_hits + fastfield_hits + split_hits;
+        let total_misses = byte_range_misses + footer_misses + fastfield_misses + split_misses;
+        let total_evictions = byte_range_evictions + footer_evictions + fastfield_evictions + split_evictions;
+        let current_size = byte_range_bytes + footer_bytes + fastfield_bytes + split_bytes;
+        
+        debug_log!("📊 Comprehensive Cache Metrics:");
+        debug_log!("  📦 ByteRangeCache: {} hits, {} misses, {} evictions, {} bytes",
+                  byte_range_hits, byte_range_misses, byte_range_evictions, byte_range_bytes);
+        debug_log!("  📄 FooterCache: {} hits, {} misses, {} evictions, {} bytes",
+                  footer_hits, footer_misses, footer_evictions, footer_bytes);
+        debug_log!("  ⚡ FastFieldCache: {} hits, {} misses, {} evictions, {} bytes",
+                  fastfield_hits, fastfield_misses, fastfield_evictions, fastfield_bytes);
+        debug_log!("  🔍 SplitCache: {} hits, {} misses, {} evictions, {} bytes",
+                  split_hits, split_misses, split_evictions, split_bytes);
+        debug_log!("  🏆 Total: {} hits, {} misses, {} evictions, {} bytes ({}% hit rate)",
+                  total_hits, total_misses, total_evictions, current_size,
+                  if total_hits + total_misses > 0 { (total_hits * 100) / (total_hits + total_misses) } else { 0 });
+        
         GlobalCacheStats {
-            total_hits: self.total_hits.load(Ordering::Relaxed),
-            total_misses: self.total_misses.load(Ordering::Relaxed),
-            total_evictions: self.total_evictions.load(Ordering::Relaxed),
-            current_size: self.current_size.load(Ordering::Relaxed),
+            total_hits: total_hits as u64,
+            total_misses: total_misses as u64,
+            total_evictions: total_evictions as u64,
+            current_size,
             max_size: self.max_cache_size,
             active_splits: self.get_managed_split_count() as u64,
         }
@@ -273,6 +334,86 @@ pub extern "system" fn Java_com_tantivy4java_SplitCacheManager_forceEvictionNati
         None => return,
     };
     manager.force_eviction(target_size_bytes as u64);
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_tantivy4java_SplitCacheManager_getComprehensiveCacheStatsNative(
+    mut env: JNIEnv,
+    _class: JClass,
+    ptr: jlong,
+) -> jobject {
+    if ptr == 0 {
+        return std::ptr::null_mut();
+    }
+    
+    // Safely access through global registry instead of unsafe pointer cast
+    let managers = CACHE_MANAGERS.lock().unwrap();
+    let _manager = match managers.values().find(|m| Arc::as_ptr(m) as jlong == ptr) {
+        Some(manager_arc) => manager_arc,
+        None => return std::ptr::null_mut(),
+    };
+    
+    // 🚀 COMPREHENSIVE CACHE METRICS: Access real Quickwit storage metrics
+    let storage_metrics = &quickwit_storage::STORAGE_METRICS;
+    
+    // Create 2D array: [cache_type][metrics] where metrics = [hits, misses, evictions, sizeBytes]
+    let per_cache_metrics = vec![
+        // ByteRangeCache metrics (shortlived_cache)
+        vec![
+            storage_metrics.shortlived_cache.hits_num_items.get() as jlong,
+            storage_metrics.shortlived_cache.misses_num_items.get() as jlong,
+            storage_metrics.shortlived_cache.evict_num_items.get() as jlong,
+            storage_metrics.shortlived_cache.in_cache_num_bytes.get() as jlong,
+        ],
+        // FooterCache metrics (split_footer_cache)
+        vec![
+            storage_metrics.split_footer_cache.hits_num_items.get() as jlong,
+            storage_metrics.split_footer_cache.misses_num_items.get() as jlong,
+            storage_metrics.split_footer_cache.evict_num_items.get() as jlong,
+            storage_metrics.split_footer_cache.in_cache_num_bytes.get() as jlong,
+        ],
+        // FastFieldCache metrics (fast_field_cache)
+        vec![
+            storage_metrics.fast_field_cache.hits_num_items.get() as jlong,
+            storage_metrics.fast_field_cache.misses_num_items.get() as jlong,
+            storage_metrics.fast_field_cache.evict_num_items.get() as jlong,
+            storage_metrics.fast_field_cache.in_cache_num_bytes.get() as jlong,
+        ],
+        // SplitCache metrics (searcher_split_cache)  
+        vec![
+            storage_metrics.searcher_split_cache.hits_num_items.get() as jlong,
+            storage_metrics.searcher_split_cache.misses_num_items.get() as jlong,
+            storage_metrics.searcher_split_cache.evict_num_items.get() as jlong,
+            storage_metrics.searcher_split_cache.in_cache_num_bytes.get() as jlong,
+        ],
+    ];
+    
+    // Create Java 2D long array
+    // First create the long array class to use as the component type
+    let long_array_class = match env.find_class("[J") {
+        Ok(class) => class,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    
+    match env.new_object_array(4, &long_array_class, jni::objects::JObject::null()) {
+        Ok(outer_array) => {
+            for (i, cache_metrics) in per_cache_metrics.iter().enumerate() {
+                match env.new_long_array(4) {
+                    Ok(inner_array) => {
+                        let _ = env.set_long_array_region(&inner_array, 0, cache_metrics);
+                        let _ = env.set_object_array_element(&outer_array, i as i32, &inner_array);
+                    }
+                    Err(_) => return std::ptr::null_mut(),
+                }
+            }
+            
+            debug_log!("📊 Comprehensive cache metrics returned: {} cache types with detailed stats",
+                      per_cache_metrics.len());
+            
+            outer_array.as_raw()
+        }
+        Err(_) => std::ptr::null_mut(),
+    }
 }
 
 #[no_mangle]

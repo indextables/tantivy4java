@@ -267,6 +267,107 @@ public class SplitCacheManager implements AutoCloseable {
         public double getUtilization() {
             return maxSize > 0 ? (double) currentSize / maxSize : 0.0;
         }
+        
+        @Override
+        public String toString() {
+            return String.format(
+                "GlobalCacheStats{hits=%d, misses=%d, evictions=%d, hitRate=%.2f%%, " +
+                "currentSize=%d, maxSize=%d, utilization=%.2f%%, activeSplits=%d}",
+                totalHits, totalMisses, totalEvictions, getHitRate() * 100,
+                currentSize, maxSize, getUtilization() * 100, activeSplits
+            );
+        }
+    }
+    
+    /**
+     * 🚀 COMPREHENSIVE CACHE METRICS - Detailed per-cache-type statistics
+     * 
+     * Provides granular visibility into each cache type's performance:
+     * - ByteRangeCache: Storage byte range caching (shortlived_cache in Quickwit)
+     * - FooterCache: Split metadata/footer caching (split_footer_cache)  
+     * - FastFieldCache: Component-level fast field caching (fast_field_cache)
+     * - SplitCache: Split file caching (searcher_split_cache)
+     */
+    public static class ComprehensiveCacheStats {
+        private final CacheTypeStats byteRangeCache;
+        private final CacheTypeStats footerCache; 
+        private final CacheTypeStats fastFieldCache;
+        private final CacheTypeStats splitCache;
+        private final GlobalCacheStats aggregated;
+        
+        public ComprehensiveCacheStats(CacheTypeStats byteRangeCache, CacheTypeStats footerCache,
+                                     CacheTypeStats fastFieldCache, CacheTypeStats splitCache) {
+            this.byteRangeCache = byteRangeCache;
+            this.footerCache = footerCache;
+            this.fastFieldCache = fastFieldCache;
+            this.splitCache = splitCache;
+            
+            // Calculate aggregated stats
+            long totalHits = byteRangeCache.hits + footerCache.hits + fastFieldCache.hits + splitCache.hits;
+            long totalMisses = byteRangeCache.misses + footerCache.misses + fastFieldCache.misses + splitCache.misses;
+            long totalEvictions = byteRangeCache.evictions + footerCache.evictions + fastFieldCache.evictions + splitCache.evictions;
+            long totalSize = byteRangeCache.sizeBytes + footerCache.sizeBytes + fastFieldCache.sizeBytes + splitCache.sizeBytes;
+            
+            this.aggregated = new GlobalCacheStats(totalHits, totalMisses, totalEvictions, totalSize, 0, 0);
+        }
+        
+        public CacheTypeStats getByteRangeCache() { return byteRangeCache; }
+        public CacheTypeStats getFooterCache() { return footerCache; }
+        public CacheTypeStats getFastFieldCache() { return fastFieldCache; }
+        public CacheTypeStats getSplitCache() { return splitCache; }
+        public GlobalCacheStats getAggregated() { return aggregated; }
+        
+        @Override
+        public String toString() {
+            return String.format(
+                "ComprehensiveCacheStats{\n" +
+                "  📦 ByteRangeCache: %s\n" +
+                "  📄 FooterCache: %s\n" +
+                "  ⚡ FastFieldCache: %s\n" +  
+                "  🔍 SplitCache: %s\n" +
+                "  🏆 Aggregated: %s\n" +
+                "}",
+                byteRangeCache, footerCache, fastFieldCache, splitCache, aggregated
+            );
+        }
+    }
+    
+    /**
+     * Cache statistics for a specific cache type
+     */
+    public static class CacheTypeStats {
+        private final String cacheType;
+        private final long hits;
+        private final long misses; 
+        private final long evictions;
+        private final long sizeBytes;
+        
+        public CacheTypeStats(String cacheType, long hits, long misses, long evictions, long sizeBytes) {
+            this.cacheType = cacheType;
+            this.hits = hits;
+            this.misses = misses;
+            this.evictions = evictions;
+            this.sizeBytes = sizeBytes;
+        }
+        
+        public String getCacheType() { return cacheType; }
+        public long getHits() { return hits; }
+        public long getMisses() { return misses; }
+        public long getEvictions() { return evictions; }
+        public long getSizeBytes() { return sizeBytes; }
+        
+        public double getHitRate() {
+            long total = hits + misses;
+            return total > 0 ? (double) hits / total : 0.0;
+        }
+        
+        @Override
+        public String toString() {
+            return String.format(
+                "%s{hits=%d, misses=%d, evictions=%d, hitRate=%.2f%%, sizeBytes=%d}",
+                cacheType, hits, misses, evictions, getHitRate() * 100, sizeBytes
+            );
+        }
     }
     
     private SplitCacheManager(CacheConfig config) {
@@ -423,6 +524,48 @@ public class SplitCacheManager implements AutoCloseable {
     }
     
     /**
+     * 🚀 NEW: Get comprehensive cache statistics with per-cache-type breakdown
+     * 
+     * Provides detailed metrics for each cache type:
+     * - ByteRangeCache: Storage byte range caching performance
+     * - FooterCache: Split metadata caching efficiency  
+     * - FastFieldCache: Component loading cache utilization
+     * - SplitCache: Split file caching metrics
+     * 
+     * Essential for production performance monitoring and optimization tuning.
+     * 
+     * @return Comprehensive cache statistics with per-type breakdown
+     */
+    public ComprehensiveCacheStats getComprehensiveCacheStats() {
+        // Get detailed per-cache metrics from native layer
+        long[][] perCacheMetrics = getComprehensiveCacheStatsNative(nativePtr);
+        
+        if (perCacheMetrics == null || perCacheMetrics.length != 4) {
+            // Fallback to basic stats if native method unavailable
+            GlobalCacheStats basicStats = getGlobalCacheStats();
+            CacheTypeStats fallback = new CacheTypeStats("fallback", 
+                basicStats.getTotalHits(), basicStats.getTotalMisses(), 
+                basicStats.getTotalEvictions(), basicStats.getCurrentSize());
+            return new ComprehensiveCacheStats(fallback, fallback, fallback, fallback);
+        }
+        
+        // Parse native metrics: each array contains [hits, misses, evictions, sizeBytes]
+        CacheTypeStats byteRangeCache = new CacheTypeStats("ByteRangeCache",
+            perCacheMetrics[0][0], perCacheMetrics[0][1], perCacheMetrics[0][2], perCacheMetrics[0][3]);
+        
+        CacheTypeStats footerCache = new CacheTypeStats("FooterCache", 
+            perCacheMetrics[1][0], perCacheMetrics[1][1], perCacheMetrics[1][2], perCacheMetrics[1][3]);
+        
+        CacheTypeStats fastFieldCache = new CacheTypeStats("FastFieldCache",
+            perCacheMetrics[2][0], perCacheMetrics[2][1], perCacheMetrics[2][2], perCacheMetrics[2][3]);
+        
+        CacheTypeStats splitCache = new CacheTypeStats("SplitCache",
+            perCacheMetrics[3][0], perCacheMetrics[3][1], perCacheMetrics[3][2], perCacheMetrics[3][3]);
+        
+        return new ComprehensiveCacheStats(byteRangeCache, footerCache, fastFieldCache, splitCache);
+    }
+    
+    /**
      * Preload components for a specific split
      */
     public void preloadComponents(String splitPath, Set<SplitSearcher.IndexComponent> components) {
@@ -468,6 +611,7 @@ public class SplitCacheManager implements AutoCloseable {
     private static native long createNativeCacheManager(CacheConfig config);
     private static native void closeNativeCacheManager(long ptr);
     private static native GlobalCacheStats getGlobalCacheStatsNative(long ptr);
+    private static native long[][] getComprehensiveCacheStatsNative(long ptr);
     private static native void preloadComponentsNative(long ptr, String splitPath, Set<SplitSearcher.IndexComponent> components);
     private static native void evictComponentsNative(long ptr, String splitPath, Set<SplitSearcher.IndexComponent> components);
     private static native void forceEvictionNative(long ptr, long targetSizeBytes);
