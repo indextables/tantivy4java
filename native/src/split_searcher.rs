@@ -401,6 +401,7 @@ impl SplitSearcher {
                     &file_path,
                     &split_id,
                     split_footer_cache,
+                    footer_offsets,
                 ).await?;
                 
                 debug_log!("Successfully fetched split footer ({} bytes) for split: {}", footer_data.len(), split_id);
@@ -439,6 +440,7 @@ impl SplitSearcher {
         split_file: &std::path::Path,
         split_id: &str,
         footer_cache: &MemorySizedCache<String>,
+        footer_offsets: Option<&FooterOffsetConfig>,
     ) -> anyhow::Result<OwnedBytes> {
         // Check cache first
         if let Some(cached_footer) = footer_cache.get(split_id) {
@@ -447,6 +449,32 @@ impl SplitSearcher {
         }
         
         debug_log!("Split footer cache MISS for split: {}, fetching from S3", split_id);
+        
+        // 🚀 OPTIMIZATION: Use pre-computed footer offsets for single byte-range request
+        if let Some(offsets) = footer_offsets {
+            if offsets.enable_lazy_loading {
+                debug_log!("🚀 OPTIMIZED: Using pre-computed footer offsets for single byte-range request");
+                debug_log!("   Fetching footer range: {} - {} ({} bytes)", 
+                          offsets.footer_start_offset, offsets.footer_end_offset,
+                          offsets.footer_end_offset - offsets.footer_start_offset);
+                
+                // Single optimized byte-range request using metastore-provided offsets
+                let footer_data = index_storage.get_slice(
+                    split_file, 
+                    offsets.footer_start_offset as usize..offsets.footer_end_offset as usize
+                ).await?;
+                
+                debug_log!("✅ OPTIMIZED: Successfully fetched footer ({} bytes) with single request", footer_data.len());
+                
+                // Cache the optimized result
+                footer_cache.put(split_id.to_string(), footer_data.clone());
+                return Ok(footer_data);
+            } else {
+                debug_log!("📁 Footer offsets available but lazy loading disabled, using traditional method");
+            }
+        } else {
+            debug_log!("📁 No footer offsets available, using traditional multi-request method");
+        }
         
         // Get file size first
         let file_len = index_storage.file_num_bytes(split_file).await? as usize;
