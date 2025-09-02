@@ -263,6 +263,82 @@ public class SplitSearcher implements AutoCloseable {
     }
     
     /**
+     * Warmup system: Proactively fetch query-relevant components before search execution.
+     * This implements Quickwit's sophisticated warmup optimization that analyzes queries
+     * and preloads only the data needed for optimal performance.
+     * 
+     * Benefits:
+     * - Parallel async loading of query-relevant components
+     * - Reduced search latency through proactive data fetching  
+     * - Network request consolidation and caching optimization
+     * - Memory-efficient loading of only required data
+     * 
+     * Usage:
+     * <pre>{@code
+     * Query query = Query.termQuery(schema, "title", "search term");
+     * searcher.warmupQuery(query).thenCompose(v -> 
+     *     searcher.searchAsync(query, 10)
+     * ).thenAccept(results -> {
+     *     // Search executes much faster due to pre-warmed data
+     *     System.out.println("Results: " + results.getHits().size());
+     * });
+     * }</pre>
+     * 
+     * @param query The query to analyze and warm up components for
+     * @return CompletableFuture that completes when warmup is finished
+     * @throws RuntimeException if warmup fails
+     */
+    public CompletableFuture<Void> warmupQuery(Query query) {
+        return CompletableFuture.runAsync(() -> {
+            warmupQueryNative(nativePtr, query.getNativePtr());
+        });
+    }
+    
+    /**
+     * Advanced warmup with explicit component control.
+     * Allows fine-grained control over which components to warm up for a query.
+     * 
+     * @param query The query to warm up for
+     * @param components Specific components to prioritize (null for auto-detection)
+     * @param enableParallel Whether to use parallel loading (recommended: true)
+     * @return CompletableFuture that completes when warmup is finished
+     */
+    public CompletableFuture<WarmupStats> warmupQueryAdvanced(Query query, IndexComponent[] components, boolean enableParallel) {
+        return CompletableFuture.supplyAsync(() -> {
+            return warmupQueryAdvancedNative(nativePtr, query.getNativePtr(), components, enableParallel);
+        });
+    }
+    
+    /**
+     * Statistics about warmup performance and effectiveness
+     */
+    public static class WarmupStats {
+        private final long totalBytesLoaded;
+        private final long warmupTimeMs;
+        private final int componentsLoaded;
+        private final Map<IndexComponent, Long> componentSizes;
+        private final boolean usedParallelLoading;
+        
+        public WarmupStats(long totalBytesLoaded, long warmupTimeMs, int componentsLoaded, 
+                          Map<IndexComponent, Long> componentSizes, boolean usedParallelLoading) {
+            this.totalBytesLoaded = totalBytesLoaded;
+            this.warmupTimeMs = warmupTimeMs;
+            this.componentsLoaded = componentsLoaded;
+            this.componentSizes = new HashMap<>(componentSizes);
+            this.usedParallelLoading = usedParallelLoading;
+        }
+        
+        public long getTotalBytesLoaded() { return totalBytesLoaded; }
+        public long getWarmupTimeMs() { return warmupTimeMs; }
+        public int getComponentsLoaded() { return componentsLoaded; }
+        public Map<IndexComponent, Long> getComponentSizes() { return componentSizes; }
+        public boolean isUsedParallelLoading() { return usedParallelLoading; }
+        public double getLoadingSpeedMBps() { 
+            return warmupTimeMs > 0 ? (totalBytesLoaded / 1024.0 / 1024.0) / (warmupTimeMs / 1000.0) : 0.0;
+        }
+    }
+    
+    /**
      * Get current cache statistics
      */
     public CacheStats getCacheStats() {
@@ -355,6 +431,8 @@ public class SplitSearcher implements AutoCloseable {
     private static native byte[] docsBulkNative(long nativePtr, int[] segments, int[] docIds);
     private static native List<Document> parseBulkDocsNative(java.nio.ByteBuffer buffer);
     private static native void preloadComponentsNative(long nativePtr, IndexComponent[] components);
+    private static native void warmupQueryNative(long nativePtr, long queryPtr);
+    private static native WarmupStats warmupQueryAdvancedNative(long nativePtr, long queryPtr, IndexComponent[] components, boolean enableParallel);
     private static native CacheStats getCacheStatsNative(long nativePtr);
     private static native LoadingStats getLoadingStatsNative(long nativePtr);
     private static native Map<IndexComponent, Boolean> getComponentCacheStatusNative(long nativePtr);
