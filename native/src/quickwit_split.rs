@@ -67,6 +67,12 @@ struct QuickwitSplitMetadata {
     tags: BTreeSet<String>,
     delete_opstamp: u64,
     num_merge_ops: usize,
+    
+    // Footer offset information for lazy loading optimization
+    footer_start_offset: Option<u64>,    // Where metadata begins (excludes hotcache)
+    footer_end_offset: Option<u64>,      // End of file
+    hotcache_start_offset: Option<u64>,  // Where hotcache begins
+    hotcache_length: Option<u64>,        // Size of hotcache
 }
 
 impl SplitConfig {
@@ -139,6 +145,12 @@ fn create_split_metadata(config: &SplitConfig, num_docs: usize, uncompressed_doc
         tags: config.tags.clone(),
         delete_opstamp: 0,
         num_merge_ops: 0,
+        
+        // Footer offset fields initialized as None, will be set after split creation
+        footer_start_offset: None,
+        footer_end_offset: None,
+        hotcache_start_offset: None,
+        hotcache_length: None,
     }
 }
 
@@ -166,9 +178,10 @@ fn create_java_split_metadata<'a>(env: &mut JNIEnv<'a>, split_metadata: &Quickwi
     
     let split_id_jstring = string_to_jstring(env, &split_metadata.split_id)?;
     
+    // Use the new constructor that includes footer offset parameters
     let metadata_obj = env.new_object(
         &split_metadata_class,
-        "(Ljava/lang/String;JJLjava/time/Instant;Ljava/time/Instant;Ljava/util/Set;JI)V",
+        "(Ljava/lang/String;JJLjava/time/Instant;Ljava/time/Instant;Ljava/util/Set;JIJJJJ)V",
         &[
             JValue::Object(&split_id_jstring.into()),
             JValue::Long(split_metadata.num_docs as i64),
@@ -178,6 +191,11 @@ fn create_java_split_metadata<'a>(env: &mut JNIEnv<'a>, split_metadata: &Quickwi
             JValue::Object(&tags_set),
             JValue::Long(split_metadata.delete_opstamp as i64),
             JValue::Int(split_metadata.num_merge_ops as i32),
+            // Footer offset parameters (use -1 to indicate missing values)
+            JValue::Long(split_metadata.footer_start_offset.map(|v| v as i64).unwrap_or(-1)),
+            JValue::Long(split_metadata.footer_end_offset.map(|v| v as i64).unwrap_or(-1)),
+            JValue::Long(split_metadata.hotcache_start_offset.map(|v| v as i64).unwrap_or(-1)),
+            JValue::Long(split_metadata.hotcache_length.map(|v| v as i64).unwrap_or(-1)),
         ]
     )?;
     
@@ -284,10 +302,25 @@ fn convert_index_from_path_impl(index_path: &str, output_path: &str, config: &Sp
     split_metadata.num_docs = doc_count as usize;
     split_metadata.uncompressed_docs_size_in_bytes = total_size;
     
-    // Use Quickwit's split creation functionality
-    create_quickwit_split(&tantivy_index, &index_dir, &PathBuf::from(output_path), &split_metadata)?;
+    // Use Quickwit's split creation functionality and get footer offsets
+    let footer_offsets = create_quickwit_split(&tantivy_index, &index_dir, &PathBuf::from(output_path), &split_metadata)?;
+    
+    // Update split metadata with footer offsets for lazy loading optimization
+    split_metadata.footer_start_offset = Some(footer_offsets.footer_start_offset);
+    split_metadata.footer_end_offset = Some(footer_offsets.footer_end_offset);
+    split_metadata.hotcache_start_offset = Some(footer_offsets.hotcache_start_offset);
+    split_metadata.hotcache_length = Some(footer_offsets.hotcache_length);
     
     Ok(split_metadata)
+}
+
+// Footer offset information for lazy loading optimization
+#[derive(Debug, Clone)]
+struct FooterOffsets {
+    footer_start_offset: u64,    // Where metadata begins (excludes hotcache)
+    footer_end_offset: u64,      // End of file
+    hotcache_start_offset: u64,  // Where hotcache begins
+    hotcache_length: u64,        // Size of hotcache
 }
 
 fn create_quickwit_split(
@@ -295,7 +328,7 @@ fn create_quickwit_split(
     index_dir: &PathBuf, 
     output_path: &PathBuf, 
     _split_metadata: &QuickwitSplitMetadata
-) -> Result<(), anyhow::Error> {
+) -> Result<FooterOffsets, anyhow::Error> {
     use quickwit_storage::SplitPayloadBuilder;
     use std::path::PathBuf;
     
@@ -412,10 +445,36 @@ fn create_quickwit_split(
         output_file.write_all(&payload_bytes)?;
         output_file.flush()?;
         
-        Ok::<(), anyhow::Error>(())
-    })?;
-    
-    Ok(())
+        // Calculate footer offsets based on the Quickwit split format:
+        // [Files][Metadata JSON][Metadata Length: 4 bytes LE][Hotcache][Hotcache Length: 4 bytes LE]
+        
+        let total_file_size = payload_bytes.len() as u64;
+        let metadata_length = split_fields.len() as u64;
+        let hotcache_length = hotcache.len() as u64;
+        
+        // Footer structure (from end backwards):
+        // - Last 4 bytes: hotcache length
+        // - Before that: hotcache data
+        // - Before that: 4 bytes metadata length  
+        // - Before that: metadata JSON
+        
+        let footer_end_offset = total_file_size;
+        let hotcache_start_offset = total_file_size - 4 - hotcache_length;
+        let footer_start_offset = total_file_size - 4 - hotcache_length - 4 - metadata_length;
+        
+        let footer_offsets = FooterOffsets {
+            footer_start_offset,
+            footer_end_offset,
+            hotcache_start_offset,
+            hotcache_length,
+        };
+        
+        debug_log!("Split footer offsets: metadata={}..{} ({} bytes), hotcache={}..{} ({} bytes)", 
+            footer_start_offset, hotcache_start_offset, metadata_length,
+            hotcache_start_offset, footer_end_offset - 4, hotcache_length);
+        
+        Ok::<FooterOffsets, anyhow::Error>(footer_offsets)
+    })
 }
 
 #[no_mangle]
@@ -497,6 +556,12 @@ pub extern "system" fn Java_com_tantivy4java_QuickwitSplit_nativeReadSplitMetada
             tags: BTreeSet::new(),
             delete_opstamp: 0,
             num_merge_ops: 0,
+            
+            // Footer offset fields not available for existing split files
+            footer_start_offset: None,
+            footer_end_offset: None,
+            hotcache_start_offset: None,
+            hotcache_length: None,
         };
         
         debug_log!("Successfully read Quickwit split with {} files", file_count);
@@ -634,6 +699,12 @@ pub extern "system" fn Java_com_tantivy4java_QuickwitSplit_nativeExtractSplit(
             tags: BTreeSet::new(),
             delete_opstamp: 0,
             num_merge_ops: 0,
+            
+            // Footer offset fields not available for extraction
+            footer_start_offset: None,
+            footer_end_offset: None,
+            hotcache_start_offset: None,
+            hotcache_length: None,
         };
         
         debug_log!("Successfully extracted {} files from Quickwit split to {}", extracted_count, output_path.display());
@@ -713,6 +784,11 @@ pub extern "system" fn Java_com_tantivy4java_QuickwitSplit_nativeMergeSplits(
         // Perform the merge operation
         let merged_metadata = merge_splits_impl(&split_urls, &output_path_str, &config)?;
         debug_log!("Split merge completed successfully");
+        
+        // Debug: Check if merged metadata has footer offsets
+        debug_log!("🔍 MERGE RESULT: Merged metadata footer offsets: start={:?}, end={:?}, hotcache_start={:?}, hotcache_length={:?}",
+                  merged_metadata.footer_start_offset, merged_metadata.footer_end_offset,
+                  merged_metadata.hotcache_start_offset, merged_metadata.hotcache_length);
         
         // Create Java metadata object
         let metadata_obj = create_java_split_metadata(env, &merged_metadata)?;
@@ -1120,25 +1196,62 @@ fn merge_splits_impl(split_urls: &[String], output_path: &str, config: &MergeCon
         tags: BTreeSet::new(),
         delete_opstamp: 0,
         num_merge_ops: 1,
+        
+        // Footer offset fields will be set when creating the final split
+        footer_start_offset: None,
+        footer_end_offset: None,
+        hotcache_start_offset: None,
+        hotcache_length: None,
     };
     
-    // 10. Create the merged split file using the merged index
-    if is_s3_output {
+    // 10. Create the merged split file using the merged index and capture footer offsets
+    let footer_offsets = if is_s3_output {
         // For S3 output, create split locally then upload
         let local_split_filename = format!("{}.split", merged_metadata.split_id);
         let local_split_path = output_temp_dir.join(&local_split_filename);
         
         debug_log!("Creating local split file: {:?}", local_split_path);
-        create_merged_split_file(&output_temp_dir, local_split_path.to_str().unwrap(), &merged_metadata)?;
+        let offsets = create_merged_split_file(&output_temp_dir, local_split_path.to_str().unwrap(), &merged_metadata)?;
         
         // Upload to S3
         debug_log!("Uploading split file to S3: {}", output_path);
         upload_split_to_s3(&local_split_path, output_path, config)?;
         debug_log!("Successfully uploaded split file to S3: {}", output_path);
+        offsets
     } else {
         // For local output, create split directly
-        create_merged_split_file(&output_temp_dir, output_path, &merged_metadata)?;
-    }
+        create_merged_split_file(&output_temp_dir, output_path, &merged_metadata)?
+    };
+    
+    // 11. Update merged metadata with footer offsets for optimization
+    let final_merged_metadata = QuickwitSplitMetadata {
+        split_id: merged_metadata.split_id,
+        index_uid: merged_metadata.index_uid,
+        source_id: merged_metadata.source_id,
+        node_id: merged_metadata.node_id,
+        doc_mapping_uid: merged_metadata.doc_mapping_uid,
+        partition_id: merged_metadata.partition_id,
+        num_docs: merged_metadata.num_docs,
+        uncompressed_docs_size_in_bytes: merged_metadata.uncompressed_docs_size_in_bytes,
+        time_range: merged_metadata.time_range,
+        create_timestamp: merged_metadata.create_timestamp,
+        tags: merged_metadata.tags,
+        delete_opstamp: merged_metadata.delete_opstamp,
+        num_merge_ops: merged_metadata.num_merge_ops,
+        
+        // Set footer offsets from the merge operation
+        footer_start_offset: Some(footer_offsets.footer_start_offset),
+        footer_end_offset: Some(footer_offsets.footer_end_offset),
+        hotcache_start_offset: Some(footer_offsets.hotcache_start_offset),
+        hotcache_length: Some(footer_offsets.hotcache_length),
+    };
+    
+    debug_log!("✅ MERGE OPTIMIZATION: Added footer offsets to merged split metadata");
+    debug_log!("   Footer: {} - {} ({} bytes)", 
+               footer_offsets.footer_start_offset, footer_offsets.footer_end_offset,
+               footer_offsets.footer_end_offset - footer_offsets.footer_start_offset);
+    debug_log!("   Hotcache: {} bytes at offset {}", 
+               footer_offsets.hotcache_length, footer_offsets.hotcache_start_offset);
     
     // 11. Clean up temporary directory
     std::fs::remove_dir_all(&output_temp_dir).unwrap_or_else(|e| {
@@ -1147,7 +1260,7 @@ fn merge_splits_impl(split_urls: &[String], output_path: &str, config: &MergeCon
     
     debug_log!("Created efficient merged split file: {} with {} documents", output_path, merged_docs);
     
-    Ok(merged_metadata)
+    Ok(final_merged_metadata)
 }
 
 /// Get Tantivy directory from split bundle using Quickwit's BundleDirectory
@@ -1355,7 +1468,8 @@ fn upload_split_to_s3(local_split_path: &Path, s3_url: &str, config: &MergeConfi
 }
 
 /// Create the merged split file using existing Quickwit split creation logic
-fn create_merged_split_file(merged_index_path: &Path, output_path: &str, metadata: &QuickwitSplitMetadata) -> Result<()> {
+/// Returns the footer offsets for the merged split
+fn create_merged_split_file(merged_index_path: &Path, output_path: &str, metadata: &QuickwitSplitMetadata) -> Result<FooterOffsets> {
     use tantivy::directory::MmapDirectory;
     use tantivy::Index as TantivyIndex;
     
@@ -1365,9 +1479,9 @@ fn create_merged_split_file(merged_index_path: &Path, output_path: &str, metadat
     let merged_directory = MmapDirectory::open(merged_index_path)?;
     let merged_index = TantivyIndex::open(merged_directory)?;
     
-    // Use the existing split creation logic
-    create_quickwit_split(&merged_index, &merged_index_path.to_path_buf(), &PathBuf::from(output_path), metadata)?;
+    // Use the existing split creation logic and capture footer offsets
+    let footer_offsets = create_quickwit_split(&merged_index, &merged_index_path.to_path_buf(), &PathBuf::from(output_path), metadata)?;
     
-    debug_log!("Successfully created merged split file: {}", output_path);
-    Ok(())
+    debug_log!("Successfully created merged split file: {} with footer offsets: {:?}", output_path, footer_offsets);
+    Ok(footer_offsets)
 }

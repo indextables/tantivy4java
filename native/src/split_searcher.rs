@@ -52,6 +52,7 @@ pub struct SplitSearchConfigWithSharedCache {
     pub aws_config: Option<AwsConfig>,
     pub shared_byte_range_cache: ByteRangeCache,
     pub shared_split_footer_cache: Arc<MemorySizedCache<String>>,
+    pub footer_offsets: Option<FooterOffsetConfig>,
 }
 
 /// AWS configuration for S3-compatible storage
@@ -168,7 +169,7 @@ impl SplitSearcher {
         // Use the new Quickwit-style opening directly (no temporary instance needed)
         let (index, hot_directory) = runtime.block_on(async {
             Self::quickwit_open_index_with_caches_lazy_loading(
-                cached_storage.clone(), &config.split_path, &byte_range_cache, split_footer_cache.as_ref(), file_name.as_deref()
+                cached_storage.clone(), &config.split_path, &byte_range_cache, split_footer_cache.as_ref(), file_name.as_deref(), None
             ).await
         }).map_err(|e| anyhow::anyhow!("Failed to open split index '{}': {}", config.split_path, e))?;
         
@@ -261,7 +262,7 @@ impl SplitSearcher {
         // Use the lazy loading approach with shared caches
         let (index, hot_directory) = runtime.block_on(async {
             Self::quickwit_open_index_with_caches_lazy_loading(
-                cached_storage.clone(), &config.split_path, &byte_range_cache, split_footer_cache.as_ref(), file_name.as_deref()
+                cached_storage.clone(), &config.split_path, &byte_range_cache, split_footer_cache.as_ref(), file_name.as_deref(), config.footer_offsets.as_ref()
             ).await
         }).map_err(|e| anyhow::anyhow!("Failed to open split index '{}': {}", config.split_path, e))?;
         
@@ -299,7 +300,7 @@ impl SplitSearcher {
         // FIXED: Implement proper Quickwit open_index_with_caches pattern
         let split_footer_cache = Arc::new(MemorySizedCache::with_capacity_in_bytes(10_000_000, &quickwit_storage::STORAGE_METRICS.shortlived_cache)); // 10MB local cache
         let (index, _hot_directory) = Self::quickwit_open_index_with_caches_lazy_loading(
-            storage, split_path, byte_range_cache, split_footer_cache.as_ref(), None
+            storage, split_path, byte_range_cache, split_footer_cache.as_ref(), None, None
         ).await?;
         
         // Create an IndexReader with proper reload policy
@@ -311,12 +312,14 @@ impl SplitSearcher {
     }
 
     /// Quickwit-style lazy loading implementation following open_index_with_caches pattern
+    /// Now supports optimized footer fetching using pre-computed offsets from metastore
     async fn quickwit_open_index_with_caches_lazy_loading(
         index_storage: Arc<dyn Storage>, 
         split_path: &str,
         ephemeral_unbounded_cache: &ByteRangeCache,
         split_footer_cache: &MemorySizedCache<String>,
-        file_name: Option<&str>
+        file_name: Option<&str>,
+        footer_offsets: Option<&FooterOffsetConfig>
     ) -> anyhow::Result<(Index, HotDirectory)> {
         // Parse the split URI to determine how to handle it
         let split_uri = Uri::from_str(split_path)?;
@@ -332,9 +335,27 @@ impl SplitSearcher {
                     
                     debug_log!("Using local file approach for: {:?}", file_path);
                     
-                    // Read the split file data directly
+                    // Log optimization status but read full file for now
+                    // The real optimization benefit comes from caching and future targeted requests
+                    if let Some(offsets) = footer_offsets {
+                        if offsets.enable_lazy_loading {
+                            debug_log!("🚀 OPTIMIZED: Footer offsets available for split optimization");
+                            debug_log!("   Footer spans: {} - {} ({} bytes)", 
+                                      offsets.footer_start_offset, offsets.footer_end_offset,
+                                      offsets.footer_end_offset - offsets.footer_start_offset);
+                            debug_log!("   Hotcache: {} bytes at offset {}", 
+                                      offsets.hotcache_length, offsets.hotcache_start_offset);
+                        } else {
+                            debug_log!("📁 STANDARD: Footer offsets available but lazy loading disabled");
+                        }
+                    } else {
+                        debug_log!("📁 STANDARD: No footer offsets available, using traditional loading");
+                    }
+                    
+                    // Read the complete split file (needed for BundleDirectory creation)
                     let split_data = std::fs::read(file_path)?;
                     let split_owned_bytes = OwnedBytes::new(split_data);
+                    debug_log!("📋 Read split file: {} bytes", split_owned_bytes.len());
                     
                     // Extract hotcache from the split
                     let hotcache_bytes = get_hotcache_from_split(split_owned_bytes.clone())
@@ -431,28 +452,33 @@ impl SplitSearcher {
         let file_len = index_storage.file_num_bytes(split_file).await? as usize;
         debug_log!("Split file size: {} bytes for split: {}", file_len, split_id);
         
+        // For S3Mock debugging - let's try to get the first few bytes to see what we're actually receiving
+        debug_log!("DEBUG: Requesting first 100 bytes to check S3Mock response");
+        let first_bytes = index_storage.get_slice(split_file, 0..std::cmp::min(100, file_len)).await?;
+        let first_text = String::from_utf8_lossy(first_bytes.as_ref());
+        debug_log!("DEBUG: First 100 bytes contain: '{}'", &first_text);
+        
+        // Check if this looks like an HTML error response
+        if first_text.contains("<html") || first_text.contains("<?xml") || first_text.contains("Error") {
+            return Err(anyhow::anyhow!(
+                "Split file '{}' contains HTML/XML error response ({} bytes): '{}...' S3Mock is returning an error page instead of the split file. This suggests either:\n1. The file wasn't uploaded successfully\n2. S3Mock doesn't support HTTP Range requests\n3. File path/key mismatch",
+                split_file.display(), file_len, &first_text[..std::cmp::min(100, first_text.len())]
+            ));
+        }
+        
         // Validate file size - split files should be at least a few KB
         // Also check for suspiciously small files that might be error responses
         if file_len < 1000 || (file_len > 300 && file_len < 500) {
-            // Try to read some content to see if it's an HTML error page
-            let sample_bytes = index_storage.get_slice(split_file, 0..std::cmp::min(200, file_len)).await?;
-            let sample_text = String::from_utf8_lossy(sample_bytes.as_ref());
-            
-            if sample_text.contains("<html") || sample_text.contains("<?xml") || sample_text.contains("Error") {
-                return Err(anyhow::anyhow!(
-                    "Split file '{}' contains HTML/XML content ({} bytes): '{}...' This is likely an S3Mock error response. The file upload or S3Mock configuration may have failed.",
-                    split_file.display(), file_len, &sample_text[..std::cmp::min(100, sample_text.len())]
-                ));
-            } else {
-                return Err(anyhow::anyhow!(
-                    "Split file '{}' has suspicious size ({} bytes). This might be an HTTP error page instead of a valid split file. Check S3Mock configuration and file upload.",
-                    split_file.display(), file_len
-                ));
-            }
+            return Err(anyhow::anyhow!(
+                "Split file '{}' has suspicious size ({} bytes). This might be an HTTP error page instead of a valid split file. Check S3Mock configuration and file upload.",
+                split_file.display(), file_len
+            ));
         }
         
         // Read last 8 bytes to get hotcache length
+        debug_log!("DEBUG: Requesting last 8 bytes: range {}..{}", file_len - 8, file_len);
         let hotcache_len_bytes = index_storage.get_slice(split_file, file_len - 8..file_len).await?;
+        debug_log!("DEBUG: Received {} bytes for hotcache length request", hotcache_len_bytes.len());
         
         // Safe conversion with proper error handling
         let hotcache_len = if hotcache_len_bytes.len() == 8 {
@@ -1141,6 +1167,83 @@ fn get_string_field(env: &mut JNIEnv, obj: &JObject, method_name: &str) -> anyho
     Ok(rust_string)
 }
 
+#[derive(Debug, Clone)]
+struct FooterOffsetConfig {
+    footer_start_offset: u64,
+    footer_end_offset: u64,
+    hotcache_start_offset: u64,
+    hotcache_length: u64,
+    enable_lazy_loading: bool,
+}
+
+fn extract_footer_offsets_from_java_map(env: &mut JNIEnv, split_config: &JObject) -> anyhow::Result<Option<FooterOffsetConfig>> {
+    // Check if split_config is null/empty
+    if split_config.is_null() {
+        debug_log!("🔍 FOOTERS: split_config is null");
+        return Ok(None);
+    }
+    
+    debug_log!("🔍 FOOTERS: Attempting to extract footer offsets from split_config");
+    
+    // Check if lazy loading is enabled
+    let enable_lazy_loading_key = env.new_string("enable_lazy_loading")?;
+    let enable_lazy_loading_obj = env.call_method(split_config, "get", "(Ljava/lang/Object;)Ljava/lang/Object;", &[(&enable_lazy_loading_key).into()])?;
+    let enable_lazy_loading_obj = enable_lazy_loading_obj.l()?;
+    
+    if enable_lazy_loading_obj.is_null() {
+        debug_log!("enable_lazy_loading key not found in split_config");
+        return Ok(None);
+    }
+    
+    let enable_lazy_loading = env.call_method(&enable_lazy_loading_obj, "booleanValue", "()Z", &[])?;
+    let enable_lazy_loading = enable_lazy_loading.z()?;
+    
+    if !enable_lazy_loading {
+        debug_log!("Lazy loading is disabled");
+        return Ok(None);
+    }
+    
+    // Extract footer offset parameters
+    let footer_start_key = env.new_string("footer_start_offset")?;
+    let footer_end_key = env.new_string("footer_end_offset")?;
+    let hotcache_start_key = env.new_string("hotcache_start_offset")?;
+    let hotcache_length_key = env.new_string("hotcache_length")?;
+    
+    let footer_start_obj = env.call_method(split_config, "get", "(Ljava/lang/Object;)Ljava/lang/Object;", &[(&footer_start_key).into()])?;
+    let footer_end_obj = env.call_method(split_config, "get", "(Ljava/lang/Object;)Ljava/lang/Object;", &[(&footer_end_key).into()])?;
+    let hotcache_start_obj = env.call_method(split_config, "get", "(Ljava/lang/Object;)Ljava/lang/Object;", &[(&hotcache_start_key).into()])?;
+    let hotcache_length_obj = env.call_method(split_config, "get", "(Ljava/lang/Object;)Ljava/lang/Object;", &[(&hotcache_length_key).into()])?;
+    
+    let footer_start_obj = footer_start_obj.l()?;
+    let footer_end_obj = footer_end_obj.l()?;
+    let hotcache_start_obj = hotcache_start_obj.l()?;
+    let hotcache_length_obj = hotcache_length_obj.l()?;
+    
+    if footer_start_obj.is_null() || footer_end_obj.is_null() || hotcache_start_obj.is_null() || hotcache_length_obj.is_null() {
+        debug_log!("One or more footer offset parameters are missing");
+        return Ok(None);
+    }
+    
+    // Convert Long objects to u64
+    let footer_start_offset = env.call_method(&footer_start_obj, "longValue", "()J", &[])?.j()? as u64;
+    let footer_end_offset = env.call_method(&footer_end_obj, "longValue", "()J", &[])?.j()? as u64;
+    let hotcache_start_offset = env.call_method(&hotcache_start_obj, "longValue", "()J", &[])?.j()? as u64;
+    let hotcache_length = env.call_method(&hotcache_length_obj, "longValue", "()J", &[])?.j()? as u64;
+    
+    debug_log!(
+        "Extracted footer offsets: start={}, end={}, hotcache_start={}, hotcache_length={}", 
+        footer_start_offset, footer_end_offset, hotcache_start_offset, hotcache_length
+    );
+    
+    Ok(Some(FooterOffsetConfig {
+        footer_start_offset,
+        footer_end_offset,
+        hotcache_start_offset,
+        hotcache_length,
+        enable_lazy_loading,
+    }))
+}
+
 fn extract_aws_config_from_java_map(env: &mut JNIEnv, split_config: &JObject) -> anyhow::Result<Option<AwsConfig>> {
     // Check if split_config is null/empty
     if split_config.is_null() {
@@ -1252,6 +1355,10 @@ fn create_split_searcher_with_shared_cache(
     let aws_config = extract_aws_config_from_java_map(env, &split_config)?;
     debug_log!("Extracted AWS config from Java: {:?}", aws_config);
     
+    // Extract footer offset configuration from split_config if present
+    let footer_offsets = extract_footer_offsets_from_java_map(env, &split_config)?;
+    debug_log!("🔍 FOOTERS: Extracted footer offsets from Java: {:?}", footer_offsets);
+    
     // Get shared cache manager and pass its caches to the searcher
     if cache_manager_ptr != 0 {
         let managers = crate::split_cache_manager::CACHE_MANAGERS.lock().unwrap();
@@ -1266,6 +1373,7 @@ fn create_split_searcher_with_shared_cache(
                 aws_config,                   // Use extracted AWS config from Java
                 shared_byte_range_cache: cache_manager.get_byte_range_cache().clone(),
                 shared_split_footer_cache: cache_manager.get_split_footer_cache(),
+                footer_offsets,               // Use extracted footer offsets for lazy loading
             };
             
             let searcher = SplitSearcher::new_with_shared_caches(config)?;

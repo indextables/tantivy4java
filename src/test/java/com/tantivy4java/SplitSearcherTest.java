@@ -145,6 +145,7 @@ public class SplitSearcherTest {
         s3Client.putObject(PutObjectRequest.builder()
             .bucket(TEST_BUCKET)
             .key(s3Key)
+            .contentType("application/octet-stream")  // Force binary content type
             .build(),
             localSplitPath);
     }

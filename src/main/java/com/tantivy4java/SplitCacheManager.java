@@ -334,6 +334,37 @@ public class SplitCacheManager implements AutoCloseable {
     }
     
     /**
+     * Create an optimized split searcher using pre-computed footer offsets from a metastore.
+     * This enables lazy loading by fetching only the metadata portion of the split file,
+     * significantly reducing initialization network traffic and improving performance.
+     * 
+     * @param splitPath The path or URL to the split file
+     * @param metadata Split metadata containing footer offsets for optimization
+     * @return A SplitSearcher configured for optimized lazy loading
+     */
+    public SplitSearcher createSplitSearcher(String splitPath, QuickwitSplit.SplitMetadata metadata) {
+        Map<String, Object> splitConfig = new HashMap<>();
+        
+        // Add AWS configuration from the cache manager
+        if (!this.awsConfig.isEmpty()) {
+            splitConfig.put("aws_config", this.awsConfig);
+        }
+        
+        // Add footer offsets for lazy loading optimization
+        if (metadata.hasFooterOffsets()) {
+            splitConfig.put("footer_start_offset", metadata.getFooterStartOffset());
+            splitConfig.put("footer_end_offset", metadata.getFooterEndOffset());
+            splitConfig.put("hotcache_start_offset", metadata.getHotcacheStartOffset());
+            splitConfig.put("hotcache_length", metadata.getHotcacheLength());
+            splitConfig.put("enable_lazy_loading", true);
+        } else {
+            splitConfig.put("enable_lazy_loading", false);
+        }
+        
+        return createSplitSearcher(splitPath, splitConfig);
+    }
+    
+    /**
      * Create multiple split searchers sharing the same cache (batch creation)
      */
     public List<SplitSearcher> createMultipleSplitSearchers(List<String> splitPaths) {

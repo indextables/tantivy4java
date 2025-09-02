@@ -112,10 +112,18 @@ public class QuickwitSplit {
         private final Set<String> tags;
         private final long deleteOpstamp;
         private final int numMergeOps;
+        
+        // Footer offset information for lazy loading optimization
+        private final long footerStartOffset;    // Where metadata begins (excludes hotcache)
+        private final long footerEndOffset;      // End of file
+        private final long hotcacheStartOffset;  // Where hotcache begins  
+        private final long hotcacheLength;       // Size of hotcache
 
         public SplitMetadata(String splitId, long numDocs, long uncompressedSizeBytes,
                            Instant timeRangeStart, Instant timeRangeEnd, Set<String> tags,
-                           long deleteOpstamp, int numMergeOps) {
+                           long deleteOpstamp, int numMergeOps,
+                           long footerStartOffset, long footerEndOffset, 
+                           long hotcacheStartOffset, long hotcacheLength) {
             this.splitId = splitId;
             this.numDocs = numDocs;
             this.uncompressedSizeBytes = uncompressedSizeBytes;
@@ -124,6 +132,18 @@ public class QuickwitSplit {
             this.tags = tags;
             this.deleteOpstamp = deleteOpstamp;
             this.numMergeOps = numMergeOps;
+            this.footerStartOffset = footerStartOffset;
+            this.footerEndOffset = footerEndOffset;
+            this.hotcacheStartOffset = hotcacheStartOffset;
+            this.hotcacheLength = hotcacheLength;
+        }
+        
+        // Backward compatibility constructor (for existing code)
+        public SplitMetadata(String splitId, long numDocs, long uncompressedSizeBytes,
+                           Instant timeRangeStart, Instant timeRangeEnd, Set<String> tags,
+                           long deleteOpstamp, int numMergeOps) {
+            this(splitId, numDocs, uncompressedSizeBytes, timeRangeStart, timeRangeEnd, 
+                 tags, deleteOpstamp, numMergeOps, -1L, -1L, -1L, -1L);
         }
 
         // Getters
@@ -135,6 +155,21 @@ public class QuickwitSplit {
         public Set<String> getTags() { return tags; }
         public long getDeleteOpstamp() { return deleteOpstamp; }
         public int getNumMergeOps() { return numMergeOps; }
+        
+        // Footer offset getters for lazy loading optimization
+        public long getFooterStartOffset() { return footerStartOffset; }
+        public long getFooterEndOffset() { return footerEndOffset; }
+        public long getHotcacheStartOffset() { return hotcacheStartOffset; }
+        public long getHotcacheLength() { return hotcacheLength; }
+        
+        // Convenience methods
+        public boolean hasFooterOffsets() { 
+            return footerStartOffset >= 0 && footerEndOffset >= 0; 
+        }
+        
+        public long getMetadataSize() {
+            return hasFooterOffsets() ? (footerEndOffset - footerStartOffset) : -1;
+        }
 
         @Override
         public String toString() {
