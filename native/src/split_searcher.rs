@@ -18,9 +18,10 @@ use serde_json;
 
 use quickwit_storage::{
     Storage, StorageResolver, LocalFileStorageFactory, S3CompatibleObjectStorageFactory,
-    ByteRangeCache, BundleStorage, OwnedBytes, wrap_storage_with_cache,
+    ByteRangeCache, BundleStorage, OwnedBytes, MemorySizedCache, wrap_storage_with_cache,
     QuickwitCache
 };
+use anyhow::Context;
 use quickwit_proto::search::SplitIdAndFooterOffsets;
 use quickwit_config::S3StorageConfig;
 use quickwit_directories::{CachingDirectory, HotDirectory, StorageDirectory, BundleDirectory, get_hotcache_from_split};
@@ -43,6 +44,16 @@ pub struct SplitSearchConfig {
     pub aws_config: Option<AwsConfig>,
 }
 
+/// Configuration for Split Searcher with shared caches from cache manager
+pub struct SplitSearchConfigWithSharedCache {
+    pub split_path: String,
+    pub cache_size_bytes: usize,
+    pub hot_cache_capacity: usize,
+    pub aws_config: Option<AwsConfig>,
+    pub shared_byte_range_cache: ByteRangeCache,
+    pub shared_split_footer_cache: Arc<MemorySizedCache<String>>,
+}
+
 /// AWS configuration for S3-compatible storage
 #[derive(Clone, Debug)]
 pub struct AwsConfig {
@@ -60,6 +71,7 @@ pub struct SplitSearcher {
     split_path: String,
     storage: Arc<dyn Storage>,
     byte_range_cache: ByteRangeCache,
+    split_footer_cache: Arc<MemorySizedCache<String>>,
     // Real Quickwit components
     index: Index,
     reader: IndexReader,
@@ -121,17 +133,27 @@ impl SplitSearcher {
                 (split_uri.clone(), None)
             }
         } else {
+            // For local files, we bypass the Quickwit storage resolver
             (split_uri.clone(), None)
         };
         
-        let storage = runtime.block_on(async {
-            storage_resolver.resolve(&storage_uri).await
-        }).map_err(|e| anyhow::anyhow!("Failed to resolve storage for '{}': {}", config.split_path, e))?;
+        let storage = if split_uri.protocol() == quickwit_common::uri::Protocol::S3 {
+            runtime.block_on(async {
+                storage_resolver.resolve(&storage_uri).await
+            }).map_err(|e| anyhow::anyhow!("Failed to resolve storage for '{}': {}", config.split_path, e))?
+        } else {
+            // For local files, storage won't be used, but we need something for type compatibility
+            use quickwit_storage::RamStorage;
+            Arc::new(RamStorage::default()) as Arc<dyn Storage>
+        };
         
         // Create byte range cache with size limit (use cache_size_bytes from config)
         let byte_range_cache = ByteRangeCache::with_infinite_capacity(
             &quickwit_storage::STORAGE_METRICS.shortlived_cache
         );
+        
+        // Create split footer cache for lazy loading (following Quickwit's pattern)
+        let split_footer_cache = Arc::new(MemorySizedCache::with_capacity_in_bytes(50_000_000, &quickwit_storage::STORAGE_METRICS.shortlived_cache)); // 50MB for split footers
         
         // Create a QuickwitCache with proper size limits for fast fields and other components
         // The QuickwitCache::new() already sets up .fast file caching, we can add more routes
@@ -145,8 +167,8 @@ impl SplitSearcher {
         
         // Use the new Quickwit-style opening directly (no temporary instance needed)
         let (index, hot_directory) = runtime.block_on(async {
-            Self::quickwit_open_index_with_caches_static(
-                cached_storage.clone(), &config.split_path, &byte_range_cache, file_name.as_deref()
+            Self::quickwit_open_index_with_caches_lazy_loading(
+                cached_storage.clone(), &config.split_path, &byte_range_cache, split_footer_cache.as_ref(), file_name.as_deref()
             ).await
         }).map_err(|e| anyhow::anyhow!("Failed to open split index '{}': {}", config.split_path, e))?;
         
@@ -161,6 +183,100 @@ impl SplitSearcher {
             storage: cached_storage,
             cache: byte_range_cache.clone(),
             byte_range_cache,
+            split_footer_cache,
+            index,
+            reader,
+            hot_directory: Some(hot_directory),
+            cache_hits: std::sync::atomic::AtomicU64::new(0),
+            cache_misses: std::sync::atomic::AtomicU64::new(0),
+            cache_evictions: std::sync::atomic::AtomicU64::new(0),
+        })
+    }
+    
+    /// Constructor for SplitSearcher with shared caches (from cache manager)
+    /// Uses existing Quickwit crates exactly as intended
+    pub fn new_with_shared_caches(config: SplitSearchConfigWithSharedCache) -> anyhow::Result<Self> {
+        // Create a dedicated runtime for this SplitSearcher
+        let runtime = Runtime::new()
+            .map_err(|e| anyhow::anyhow!("Failed to create Tokio runtime: {}", e))?;
+        
+        // Parse the split URI
+        let split_uri = Uri::from_str(&config.split_path)?;
+        
+        // Create storage resolver and get storage for the split
+        use quickwit_config::S3StorageConfig;
+        let s3_config = if let Some(aws_config) = &config.aws_config {
+            S3StorageConfig {
+                region: Some(aws_config.region.clone()),
+                access_key_id: Some(aws_config.access_key.clone()),
+                secret_access_key: Some(aws_config.secret_key.clone()),
+                session_token: aws_config.session_token.clone(),
+                endpoint: aws_config.endpoint.clone(),
+                force_path_style_access: aws_config.force_path_style,
+                ..Default::default()
+            }
+        } else {
+            S3StorageConfig::default()
+        };
+        let storage_resolver = create_storage_resolver_with_config(s3_config);
+        
+        let _guard = runtime.enter();
+        
+        // For S3 URIs, we need to resolve the parent directory, not the file itself
+        let (storage_uri, file_name) = if split_uri.protocol() == quickwit_common::uri::Protocol::S3 {
+            let uri_str = split_uri.as_str();
+            if let Some(last_slash) = uri_str.rfind('/') {
+                let parent_uri_str = &uri_str[..last_slash];
+                let file_name = &uri_str[last_slash + 1..];
+                (Uri::from_str(parent_uri_str)?, Some(file_name.to_string()))
+            } else {
+                (split_uri.clone(), None)
+            }
+        } else {
+            // For local files, we don't need storage resolution
+            (split_uri.clone(), None)
+        };
+        
+        let storage = if split_uri.protocol() == quickwit_common::uri::Protocol::S3 {
+            runtime.block_on(async {
+                storage_resolver.resolve(&storage_uri).await
+            }).map_err(|e| anyhow::anyhow!("Failed to resolve storage for '{}': {}", config.split_path, e))?
+        } else {
+            // For local files, storage won't be used, but we need something for type compatibility
+            use quickwit_storage::RamStorage;
+            Arc::new(RamStorage::default()) as Arc<dyn Storage>
+        };
+        
+        // Create QuickwitCache and wrap storage (reusing existing Quickwit components)
+        let quickwit_cache = quickwit_storage::QuickwitCache::new(config.cache_size_bytes);
+        let cached_storage = quickwit_storage::wrap_storage_with_cache(
+            Arc::new(quickwit_cache), 
+            storage.clone()
+        );
+        
+        // Use shared caches from cache manager
+        let byte_range_cache = config.shared_byte_range_cache;
+        let split_footer_cache = config.shared_split_footer_cache;
+        
+        // Use the lazy loading approach with shared caches
+        let (index, hot_directory) = runtime.block_on(async {
+            Self::quickwit_open_index_with_caches_lazy_loading(
+                cached_storage.clone(), &config.split_path, &byte_range_cache, split_footer_cache.as_ref(), file_name.as_deref()
+            ).await
+        }).map_err(|e| anyhow::anyhow!("Failed to open split index '{}': {}", config.split_path, e))?;
+        
+        // Create reader with proper reload policy (like Quickwit does)
+        let reader = index.reader_builder()
+            .reload_policy(tantivy::ReloadPolicy::Manual)
+            .try_into()?;
+        
+        Ok(SplitSearcher {
+            runtime,
+            split_path: config.split_path,
+            storage: cached_storage,
+            cache: byte_range_cache.clone(),
+            byte_range_cache,
+            split_footer_cache,
             index,
             reader,
             hot_directory: Some(hot_directory),
@@ -181,8 +297,9 @@ impl SplitSearcher {
         let _split_uri = Uri::from_str(split_path)?;
         
         // FIXED: Implement proper Quickwit open_index_with_caches pattern
-        let (index, _hot_directory) = Self::quickwit_open_index_with_caches_static(
-            storage, split_path, byte_range_cache, None
+        let split_footer_cache = Arc::new(MemorySizedCache::with_capacity_in_bytes(10_000_000, &quickwit_storage::STORAGE_METRICS.shortlived_cache)); // 10MB local cache
+        let (index, _hot_directory) = Self::quickwit_open_index_with_caches_lazy_loading(
+            storage, split_path, byte_range_cache, split_footer_cache.as_ref(), None
         ).await?;
         
         // Create an IndexReader with proper reload policy
@@ -193,11 +310,12 @@ impl SplitSearcher {
         Ok((index, reader))
     }
 
-    /// Quickwit-style open_index_with_caches implementation (static method)
-    async fn quickwit_open_index_with_caches_static(
+    /// Quickwit-style lazy loading implementation following open_index_with_caches pattern
+    async fn quickwit_open_index_with_caches_lazy_loading(
         index_storage: Arc<dyn Storage>, 
         split_path: &str,
         ephemeral_unbounded_cache: &ByteRangeCache,
+        split_footer_cache: &MemorySizedCache<String>,
         file_name: Option<&str>
     ) -> anyhow::Result<(Index, HotDirectory)> {
         // Parse the split URI to determine how to handle it
@@ -205,13 +323,16 @@ impl SplitSearcher {
         
         match split_uri.protocol() {
             Protocol::File => {
-                // For local file splits, use the simple BundleDirectory approach
+                // For local files, we need to handle them specially due to Quickwit's path restrictions
+                // Fall back to the traditional BundleDirectory approach for local files
                 if let Some(file_path) = split_uri.filepath() {
                     if !file_path.exists() {
                         return Err(anyhow::anyhow!("Split file does not exist: {:?}", file_path));
                     }
                     
-                    // Read the split file data
+                    debug_log!("Using local file approach for: {:?}", file_path);
+                    
+                    // Read the split file data directly
                     let split_data = std::fs::read(file_path)?;
                     let split_owned_bytes = OwnedBytes::new(split_data);
                     
@@ -237,41 +358,50 @@ impl SplitSearcher {
                 }
             },
             Protocol::S3 => {
-                // For S3 splits, use the provided storage to read the split file
-                debug_log!("Attempting to read S3 split file: {}", split_path);
+                // For S3 splits, use proper Quickwit lazy loading pattern
+                debug_log!("Opening S3 split with lazy loading: {}", split_path);
                 
-                // Use the extracted filename for S3 storage access
                 let file_path = if let Some(filename) = file_name {
-                    std::path::Path::new(filename)
+                    std::path::PathBuf::from(filename)
                 } else {
                     return Err(anyhow::anyhow!("No filename provided for S3 split: {}", split_path));
                 };
-                debug_log!("Using S3 filename: {:?}", file_path);
-                let split_data = index_storage.get_all(file_path).await
-                    .map_err(|e| {
-                        debug_log!("S3 storage error: {:?}", e);
-                        anyhow::anyhow!("Failed to read S3 split file '{}': {}", split_path, e)
-                    })?;
-                debug_log!("Successfully read {} bytes from S3", split_data.len());
                 
-                let split_owned_bytes = split_data;
+                let split_id = file_path.file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("unknown")
+                    .to_string();
                 
-                // Extract hotcache from the split
-                let hotcache_bytes = get_hotcache_from_split(split_owned_bytes.clone())
-                    .map_err(|e| anyhow::anyhow!("Failed to extract hotcache from S3 split: {}", e))?;
+                debug_log!("Split ID: {}, file path: {:?}", split_id, file_path);
                 
-                // Create FileSlice and open the split using BundleDirectory  
-                let file_slice = FileSlice::new(Arc::new(split_owned_bytes));
-                let bundle_directory = BundleDirectory::open_split(file_slice)
-                    .map_err(|e| anyhow::anyhow!("Failed to open S3 split bundle: {}", e))?;
+                // Get or create split footer from cache (ONLY the footer, not the whole file!)
+                let footer_data = Self::get_split_footer_from_cache_or_fetch_s3(
+                    index_storage.clone(),
+                    &file_path,
+                    &split_id,
+                    split_footer_cache,
+                ).await?;
                 
-                // Create a caching directory over the bundle directory
-                let caching_directory = CachingDirectory::new(Arc::new(bundle_directory), ephemeral_unbounded_cache.clone());
+                debug_log!("Successfully fetched split footer ({} bytes) for split: {}", footer_data.len(), split_id);
                 
-                // Create HotDirectory with the extracted hotcache
-                let hot_directory = HotDirectory::open(caching_directory, hotcache_bytes)?;
+                // Use BundleStorage::open_from_split_data for proper lazy loading
+                let (hotcache_bytes, bundle_storage) = BundleStorage::open_from_split_data(
+                    index_storage.clone(), // This storage will handle lazy S3 byte-range requests
+                    file_path,
+                    FileSlice::new(Arc::new(footer_data)),
+                )?;
+                
+                debug_log!("Successfully created BundleStorage for lazy S3 access");
+                
+                // Create StorageDirectory for lazy byte-range requests  
+                let directory = StorageDirectory::new(Arc::new(bundle_storage));
+                
+                // Add caching layer
+                let caching_directory = CachingDirectory::new(Arc::new(directory), ephemeral_unbounded_cache.clone());
+                let hot_directory = HotDirectory::open(caching_directory, hotcache_bytes.read_bytes()?)?;
 
                 let index = Index::open(hot_directory.clone())?;
+                debug_log!("Successfully opened index with lazy S3 loading for split: {}", split_id);
                 Ok((index, hot_directory))
             },
             _ => {
@@ -280,40 +410,186 @@ impl SplitSearcher {
         }
     }
 
-    /// Quickwit-style open_split_bundle implementation (static method)
-    async fn quickwit_open_split_bundle_static(
-        index_storage: Arc<dyn Storage>,
-        split_and_footer_offsets: &SplitIdAndFooterOffsets,
-    ) -> anyhow::Result<(FileSlice, BundleStorage)> {
-        let split_file = PathBuf::from(format!("{}.split", split_and_footer_offsets.split_id));
-        
-        // Get the footer data - this is where the bundle metadata is stored
-        let footer_data = Self::get_split_footer_from_storage_static(
-            index_storage.clone(),
-            split_and_footer_offsets,
-        ).await?;
-        
-        // Use BundleStorage to open from the split data with footer
-        let (hotcache_bytes, bundle_storage) = BundleStorage::open_from_split_data_with_owned_bytes(
-            index_storage.clone(),
-            split_file,
-            footer_data,
-        )?;
-        
-        Ok((hotcache_bytes, bundle_storage))
-    }
 
-    /// Get split footer data from storage (following Quickwit's get_split_footer_from_cache_or_fetch) (static method)
-    async fn get_split_footer_from_storage_static(
+    /// Get split footer from cache or fetch from S3 (ONLY footer, not entire file)
+    /// Following Quickwit's get_split_footer_from_cache_or_fetch pattern
+    async fn get_split_footer_from_cache_or_fetch_s3(
         index_storage: Arc<dyn Storage>,
-        split_and_footer_offsets: &SplitIdAndFooterOffsets,
+        split_file: &std::path::Path,
+        split_id: &str,
+        footer_cache: &MemorySizedCache<String>,
     ) -> anyhow::Result<OwnedBytes> {
-        let split_file = PathBuf::from(format!("{}.split", split_and_footer_offsets.split_id));
+        // Check cache first
+        if let Some(cached_footer) = footer_cache.get(split_id) {
+            debug_log!("Split footer cache HIT for split: {}", split_id);
+            return Ok(cached_footer);
+        }
         
-        // For local files, read the entire split file for now
-        // In a production implementation, this would only read the footer section
-        let split_data = index_storage.get_all(&split_file).await?;
-        Ok(split_data)
+        debug_log!("Split footer cache MISS for split: {}, fetching from S3", split_id);
+        
+        // Get file size first
+        let file_len = index_storage.file_num_bytes(split_file).await? as usize;
+        debug_log!("Split file size: {} bytes for split: {}", file_len, split_id);
+        
+        // Validate file size - split files should be at least a few KB
+        // Also check for suspiciously small files that might be error responses
+        if file_len < 1000 || (file_len > 300 && file_len < 500) {
+            // Try to read some content to see if it's an HTML error page
+            let sample_bytes = index_storage.get_slice(split_file, 0..std::cmp::min(200, file_len)).await?;
+            let sample_text = String::from_utf8_lossy(sample_bytes.as_ref());
+            
+            if sample_text.contains("<html") || sample_text.contains("<?xml") || sample_text.contains("Error") {
+                return Err(anyhow::anyhow!(
+                    "Split file '{}' contains HTML/XML content ({} bytes): '{}...' This is likely an S3Mock error response. The file upload or S3Mock configuration may have failed.",
+                    split_file.display(), file_len, &sample_text[..std::cmp::min(100, sample_text.len())]
+                ));
+            } else {
+                return Err(anyhow::anyhow!(
+                    "Split file '{}' has suspicious size ({} bytes). This might be an HTTP error page instead of a valid split file. Check S3Mock configuration and file upload.",
+                    split_file.display(), file_len
+                ));
+            }
+        }
+        
+        // Read last 8 bytes to get hotcache length
+        let hotcache_len_bytes = index_storage.get_slice(split_file, file_len - 8..file_len).await?;
+        
+        // Safe conversion with proper error handling
+        let hotcache_len = if hotcache_len_bytes.len() == 8 {
+            let bytes: [u8; 8] = hotcache_len_bytes.as_ref().try_into()
+                .map_err(|e| anyhow::anyhow!("Failed to convert hotcache length bytes: {} (got {} bytes)", e, hotcache_len_bytes.len()))?;
+            u64::from_le_bytes(bytes) as usize
+        } else {
+            // Show first few bytes to help diagnose if it's HTML/text
+            let preview = if hotcache_len_bytes.len() > 0 {
+                let preview_len = std::cmp::min(50, hotcache_len_bytes.len());
+                match std::str::from_utf8(&hotcache_len_bytes.as_ref()[0..preview_len]) {
+                    Ok(text) => format!(" Content preview: '{}'", text),
+                    Err(_) => format!(" Binary data: {:?}", &hotcache_len_bytes.as_ref()[0..preview_len]),
+                }
+            } else {
+                String::new()
+            };
+            
+            return Err(anyhow::anyhow!(
+                "Invalid hotcache length data: expected 8 bytes, got {} bytes. File may be corrupted or not a valid split file.{}", 
+                hotcache_len_bytes.len(), preview
+            ));
+        };
+        
+        debug_log!("Hotcache length: {} bytes for split: {}", hotcache_len, split_id);
+        
+        // Read metadata length (8 bytes before hotcache)
+        let metadata_len_start = file_len - 8 - hotcache_len - 8;
+        let metadata_len_bytes = index_storage
+            .get_slice(split_file, metadata_len_start..metadata_len_start + 8)
+            .await?;
+        
+        // Safe conversion with proper error handling
+        let metadata_len = if metadata_len_bytes.len() == 8 {
+            let bytes: [u8; 8] = metadata_len_bytes.as_ref().try_into()
+                .map_err(|e| anyhow::anyhow!("Failed to convert metadata length bytes: {} (got {} bytes)", e, metadata_len_bytes.len()))?;
+            u64::from_le_bytes(bytes) as usize
+        } else {
+            return Err(anyhow::anyhow!(
+                "Invalid metadata length data: expected 8 bytes, got {} bytes at offset {}. File may be corrupted or not a valid split file.", 
+                metadata_len_bytes.len(), metadata_len_start
+            ));
+        };
+        
+        // Read the complete footer: [metadata][metadata_len][hotcache][hotcache_len]
+        let footer_start = metadata_len_start - metadata_len;
+        let footer_data = index_storage
+            .get_slice(split_file, footer_start..file_len)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to fetch footer from {} for split `{}` (range: {}..{})",
+                    index_storage.uri(),
+                    split_id,
+                    footer_start,
+                    file_len
+                )
+            })?;
+        
+        debug_log!("Successfully fetched split footer ({} bytes) from S3 for split: {}", footer_data.len(), split_id);
+        
+        // Cache the footer for future use
+        footer_cache.put(split_id.to_owned(), footer_data.clone());
+        
+        Ok(footer_data)
+    }
+    
+    /// Get split footer from cache or fetch from local file (ONLY footer, not entire file)
+    async fn get_split_footer_from_cache_or_fetch_local(
+        index_storage: Arc<dyn Storage>,
+        split_file: &std::path::Path,
+        split_id: &str,
+        footer_cache: &MemorySizedCache<String>,
+    ) -> anyhow::Result<OwnedBytes> {
+        // Check cache first
+        if let Some(cached_footer) = footer_cache.get(split_id) {
+            debug_log!("Split footer cache HIT for local split: {}", split_id);
+            return Ok(cached_footer);
+        }
+        
+        debug_log!("Split footer cache MISS for local split: {}, reading footer from file", split_id);
+        
+        // For local files, we can use the same approach as S3
+        let file_len = index_storage.file_num_bytes(split_file).await? as usize;
+        
+        // Validate file size - split files should be at least a few KB
+        // Also check for suspiciously small files
+        if file_len < 1000 || (file_len > 300 && file_len < 500) {
+            return Err(anyhow::anyhow!(
+                "Local split file '{}' has suspicious size ({} bytes). This might not be a valid split file.",
+                split_file.display(), file_len
+            ));
+        }
+        
+        // Read last 8 bytes to get hotcache length
+        let hotcache_len_bytes = index_storage.get_slice(split_file, file_len - 8..file_len).await?;
+        
+        // Safe conversion with proper error handling
+        let hotcache_len = if hotcache_len_bytes.len() == 8 {
+            let bytes: [u8; 8] = hotcache_len_bytes.as_ref().try_into()
+                .map_err(|e| anyhow::anyhow!("Failed to convert local hotcache length bytes: {} (got {} bytes)", e, hotcache_len_bytes.len()))?;
+            u64::from_le_bytes(bytes) as usize
+        } else {
+            return Err(anyhow::anyhow!(
+                "Invalid local hotcache length data: expected 8 bytes, got {} bytes. Local split file may be corrupted.", 
+                hotcache_len_bytes.len()
+            ));
+        };
+        
+        // Read metadata length (8 bytes before hotcache)
+        let metadata_len_start = file_len - 8 - hotcache_len - 8;
+        let metadata_len_bytes = index_storage
+            .get_slice(split_file, metadata_len_start..metadata_len_start + 8)
+            .await?;
+        
+        // Safe conversion with proper error handling
+        let metadata_len = if metadata_len_bytes.len() == 8 {
+            let bytes: [u8; 8] = metadata_len_bytes.as_ref().try_into()
+                .map_err(|e| anyhow::anyhow!("Failed to convert local metadata length bytes: {} (got {} bytes)", e, metadata_len_bytes.len()))?;
+            u64::from_le_bytes(bytes) as usize
+        } else {
+            return Err(anyhow::anyhow!(
+                "Invalid local metadata length data: expected 8 bytes, got {} bytes at offset {}. Local split file may be corrupted.", 
+                metadata_len_bytes.len(), metadata_len_start
+            ));
+        };
+        
+        // Read the complete footer
+        let footer_start = metadata_len_start - metadata_len;
+        let footer_data = index_storage.get_slice(split_file, footer_start..file_len).await?;
+        
+        debug_log!("Successfully read split footer ({} bytes) from local file for split: {}", footer_data.len(), split_id);
+        
+        // Cache the footer
+        footer_cache.put(split_id.to_owned(), footer_data.clone());
+        
+        Ok(footer_data)
     }
 
 
@@ -976,18 +1252,28 @@ fn create_split_searcher_with_shared_cache(
     let aws_config = extract_aws_config_from_java_map(env, &split_config)?;
     debug_log!("Extracted AWS config from Java: {:?}", aws_config);
     
-    // Register split with cache manager (safely) - Release lock before register_object
+    // Get shared cache manager and pass its caches to the searcher
     if cache_manager_ptr != 0 {
-        // Use safe cache manager access through registry
-        {
-            let managers = crate::split_cache_manager::CACHE_MANAGERS.lock().unwrap();
-            if let Some(cache_manager) = managers.values().find(|m| Arc::as_ptr(m) as jlong == cache_manager_ptr) {
-                cache_manager.add_split(split_path.clone());
-            }
-        } // Lock is released here
+        let managers = crate::split_cache_manager::CACHE_MANAGERS.lock().unwrap();
+        if let Some(cache_manager) = managers.values().find(|m| Arc::as_ptr(m) as jlong == cache_manager_ptr) {
+            cache_manager.add_split(split_path.clone());
+            
+            // Create configuration using shared caches from cache manager
+            let config = SplitSearchConfigWithSharedCache {
+                split_path,
+                cache_size_bytes: 50_000_000, // Default 50MB
+                hot_cache_capacity: 10_000,   // Default capacity
+                aws_config,                   // Use extracted AWS config from Java
+                shared_byte_range_cache: cache_manager.get_byte_range_cache().clone(),
+                shared_split_footer_cache: cache_manager.get_split_footer_cache(),
+            };
+            
+            let searcher = SplitSearcher::new_with_shared_caches(config)?;
+            return Ok(register_object(searcher) as jlong);
+        }
     }
     
-    // Create configuration using shared cache
+    // Fallback to individual searcher if cache manager not found
     let config = SplitSearchConfig {
         split_path,
         cache_size_bytes: 50_000_000, // Default 50MB
@@ -1223,7 +1509,6 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_getSchemaFromNative(
     _class: JClass,
     ptr: jlong,
 ) -> jlong {
-    use crate::utils::convert_throwable;
     
     if ptr == 0 {
         let _ = env.throw_new("java/lang/RuntimeException", "Invalid SplitSearcher pointer");
@@ -1826,120 +2111,7 @@ pub fn create_storage_resolver_with_config(s3_config: S3StorageConfig) -> Storag
         .expect("Failed to create storage resolver")
 }
 
-/// Cloud storage version of Quickwit's open_split_bundle function
-/// This follows the same pattern as quickwit-search/src/leaf.rs
-async fn open_split_bundle_cloud(
-    storage: Arc<dyn Storage>,
-    split_and_footer_offsets: &SplitIdAndFooterOffsets,
-) -> anyhow::Result<(tantivy::directory::FileSlice, BundleStorage)> {
-    let split_file = PathBuf::from(format!("{}.split", split_and_footer_offsets.split_id));
-    
-    // For proper implementation, we would need to get footer data from the split file
-    // For now, create minimal bundle storage directly
-    // In real Quickwit, this would fetch footer metadata first
-    let split_data = storage.get_all(&split_file).await
-        .map_err(|e| anyhow::anyhow!("Failed to fetch split file {}: {}", split_file.display(), e))?;
-    
-    // Open BundleStorage from the split data using Quickwit's API
-    let (hotcache_bytes, bundle_storage) = BundleStorage::open_from_split_data_with_owned_bytes(
-        storage,
-        split_file,
-        split_data,
-    )?;
-    
-    Ok((hotcache_bytes, bundle_storage))
-}
 
-/// Open a split using Quickwit's real approach with proper caching layers
-async fn open_split_index_standalone(
-    storage: Arc<dyn Storage>,
-    split_path: &str,
-    byte_range_cache: &ByteRangeCache,
-    _runtime: &Runtime,
-) -> anyhow::Result<(Index, IndexReader)> {
-    // Parse the split URI to determine the type
-    let split_uri = Uri::from_str(split_path)?;
-    
-    let index = match split_uri.protocol() {
-        Protocol::File => {
-            // For local files, use real Quickwit BundleStorage approach with proper caching
-            if let Some(file_path) = split_uri.filepath() {
-                if !file_path.exists() {
-                    return Err(anyhow::anyhow!("Split file does not exist: {:?}", file_path));
-                }
-                
-                // Read the split file data
-                let split_data = std::fs::read(file_path)
-                    .map_err(|e| anyhow::anyhow!("Failed to read split file {:?}: {}", file_path, e))?;
-                
-                // Use real Quickwit BundleStorage opening
-                let (hotcache_bytes, bundle_storage) = BundleStorage::open_from_split_data_with_owned_bytes(
-                    storage.clone(),
-                    file_path.to_path_buf(),
-                    quickwit_storage::OwnedBytes::new(split_data),
-                )?;
-                
-                // Create StorageDirectory with BundleStorage (this is critical for correct search behavior)
-                let directory = StorageDirectory::new(Arc::new(bundle_storage));
-                
-                // Add the important caching layer that Quickwit uses
-                use quickwit_directories::CachingDirectory;
-                let caching_directory = CachingDirectory::new(Arc::new(directory), byte_range_cache.clone());
-                
-                // Use HotDirectory with proper hotcache like Quickwit does
-                use quickwit_directories::HotDirectory;
-                let hot_directory = HotDirectory::open(caching_directory, hotcache_bytes.read_bytes()?)?;
-                
-                Index::open(hot_directory)?
-            } else {
-                return Err(anyhow::anyhow!("Invalid file URI: {}", split_path));
-            }
-        },
-        Protocol::S3 | Protocol::Google | Protocol::Azure => {
-            // For cloud storage, use the real Quickwit async approach with caching
-            let (hotcache_bytes, bundle_storage) = {
-                // Get the split file name from the path
-                let split_file = PathBuf::from(format!("{}.split", 
-                    split_path.split('/').last().unwrap_or("unknown").replace(".split", "")
-                ));
-                
-                // Create minimal SplitIdAndFooterOffsets (would come from metastore in real usage)
-                let split_and_footer_offsets = SplitIdAndFooterOffsets {
-                    split_id: split_file.file_stem().unwrap().to_string_lossy().to_string(),
-                    split_footer_start: 0, // Would be provided by metastore
-                    split_footer_end: 0,   // Would be provided by metastore
-                    num_docs: 0,           // Would be provided by metastore
-                    timestamp_start: None,
-                    timestamp_end: None,
-                };
-                
-                // Open using cloud storage approach
-                open_split_bundle_cloud(storage.clone(), &split_and_footer_offsets).await?
-            };
-            
-            // Apply the same caching layers that Quickwit uses for cloud storage
-            let directory = StorageDirectory::new(Arc::new(bundle_storage));
-            use quickwit_directories::CachingDirectory;
-            let caching_directory = CachingDirectory::new(Arc::new(directory), byte_range_cache.clone());
-            
-            // Use HotDirectory with hotcache
-            use quickwit_directories::HotDirectory;
-            let hot_directory = HotDirectory::open(caching_directory, hotcache_bytes.read_bytes()?)?;
-            
-            Index::open(hot_directory)?
-        },
-        protocol => {
-            return Err(anyhow::anyhow!("Unsupported URI protocol '{}' for split file: {}. Supported: file, s3, gs, azure", protocol, split_path));
-        }
-    };
-    
-    // Create IndexReader with proper reload policy like Quickwit
-    let reader = index.reader_builder()
-        .reload_policy(tantivy::ReloadPolicy::OnCommitWithDelay)
-        .try_into()?;
-        
-    Ok((index, reader))
-}
 
 // Bulk Document Retrieval Implementation (Simplified Stubs)
 // ========================================

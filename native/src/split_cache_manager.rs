@@ -6,7 +6,7 @@ use jni::JNIEnv;
 use jni::objects::{JClass, JObject, JString, JValue};
 use jni::sys::{jlong, jint, jobject};
 
-use quickwit_storage::{ByteRangeCache, SplitCache};
+use quickwit_storage::{ByteRangeCache, SplitCache, MemorySizedCache};
 use tokio::runtime::Runtime;
 // Note: LeafSearchCache might be in a different location in Quickwit codebase
 // For now, we'll implement a simpler cache structure that follows Quickwit patterns
@@ -23,6 +23,7 @@ pub struct GlobalSplitCacheManager {
     // Using the available Quickwit cache types
     split_cache: Arc<SplitCache>,
     byte_range_cache: ByteRangeCache,
+    split_footer_cache: Arc<MemorySizedCache<String>>, // Cache for split footers (shared per schema+AWS config)
     
     // Statistics
     total_hits: AtomicU64,
@@ -71,12 +72,16 @@ impl GlobalSplitCacheManager {
             &quickwit_storage::STORAGE_METRICS.shortlived_cache,
         );
         
+        // Create split footer cache (shared across all splits with same schema+AWS config)
+        let split_footer_cache = Arc::new(MemorySizedCache::with_capacity_in_bytes(50_000_000, &quickwit_storage::STORAGE_METRICS.shortlived_cache)); // 50MB for footers
+        
         Self {
             cache_name,
             max_cache_size,
             runtime,
             split_cache,
             byte_range_cache,
+            split_footer_cache,
             total_hits: AtomicU64::new(0),
             total_misses: AtomicU64::new(0),
             total_evictions: AtomicU64::new(0),
@@ -121,6 +126,10 @@ impl GlobalSplitCacheManager {
     
     pub fn get_byte_range_cache(&self) -> &ByteRangeCache {
         &self.byte_range_cache
+    }
+    
+    pub fn get_split_footer_cache(&self) -> Arc<MemorySizedCache<String>> {
+        self.split_footer_cache.clone()
     }
     
     pub fn force_eviction(&self, _target_size_bytes: u64) {
