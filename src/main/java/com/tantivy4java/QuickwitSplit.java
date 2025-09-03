@@ -118,12 +118,15 @@ public class QuickwitSplit {
         private final long footerEndOffset;      // End of file
         private final long hotcacheStartOffset;  // Where hotcache begins  
         private final long hotcacheLength;       // Size of hotcache
+        
+        // Doc mapping JSON for SplitSearcher integration
+        private final String docMappingJson;     // JSON representation of the doc mapping
 
         public SplitMetadata(String splitId, long numDocs, long uncompressedSizeBytes,
                            Instant timeRangeStart, Instant timeRangeEnd, Set<String> tags,
                            long deleteOpstamp, int numMergeOps,
                            long footerStartOffset, long footerEndOffset, 
-                           long hotcacheStartOffset, long hotcacheLength) {
+                           long hotcacheStartOffset, long hotcacheLength, String docMappingJson) {
             this.splitId = splitId;
             this.numDocs = numDocs;
             this.uncompressedSizeBytes = uncompressedSizeBytes;
@@ -136,6 +139,7 @@ public class QuickwitSplit {
             this.footerEndOffset = footerEndOffset;
             this.hotcacheStartOffset = hotcacheStartOffset;
             this.hotcacheLength = hotcacheLength;
+            this.docMappingJson = docMappingJson;
         }
         
         // Backward compatibility constructor (for existing code)
@@ -143,14 +147,14 @@ public class QuickwitSplit {
                            Instant timeRangeStart, Instant timeRangeEnd, Set<String> tags,
                            long deleteOpstamp, int numMergeOps) {
             this(splitId, numDocs, uncompressedSizeBytes, timeRangeStart, timeRangeEnd, 
-                 tags, deleteOpstamp, numMergeOps, -1L, -1L, -1L, -1L);
+                 tags, deleteOpstamp, numMergeOps, -1L, -1L, -1L, -1L, null);
         }
         
         // Constructor with only footer offset information (as requested)
         public SplitMetadata(long footerStartOffset, long footerEndOffset, 
                            long hotcacheStartOffset, long hotcacheLength) {
             this("", 0L, 0L, null, null, new java.util.HashSet<>(), 0L, 0,
-                 footerStartOffset, footerEndOffset, hotcacheStartOffset, hotcacheLength);
+                 footerStartOffset, footerEndOffset, hotcacheStartOffset, hotcacheLength, null);
         }
 
         // Getters
@@ -169,9 +173,16 @@ public class QuickwitSplit {
         public long getHotcacheStartOffset() { return hotcacheStartOffset; }
         public long getHotcacheLength() { return hotcacheLength; }
         
+        // Doc mapping getter
+        public String getDocMappingJson() { return docMappingJson; }
+        
         // Convenience methods
         public boolean hasFooterOffsets() { 
             return footerStartOffset >= 0 && footerEndOffset >= 0; 
+        }
+        
+        public boolean hasDocMapping() {
+            return docMappingJson != null && !docMappingJson.trim().isEmpty();
         }
         
         public long getMetadataSize() {

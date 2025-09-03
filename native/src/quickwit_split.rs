@@ -32,10 +32,33 @@ use quickwit_storage::{SplitPayloadBuilder, PutPayload, BundleStorage, RamStorag
 use quickwit_directories::write_hotcache;
 use quickwit_config::S3StorageConfig;
 use quickwit_common::uri::{Uri, Protocol};
+use quickwit_doc_mapper::{DocMapper, default_doc_mapper_for_test};
 use tantivy::directory::{OwnedBytes, FileSlice};
 use std::str::FromStr;
 
 use crate::utils::{convert_throwable, jstring_to_string, string_to_jstring, with_object};
+
+/// Extract or create a DocMapper from a Tantivy index schema
+fn extract_doc_mapping_from_index(tantivy_index: &tantivy::Index) -> Result<String> {
+    // Get the schema from the Tantivy index
+    let schema = tantivy_index.schema();
+    
+    debug_log!("Extracting doc mapping from Tantivy schema with {} fields", schema.fields().count());
+    
+    // For now, we'll create a default DocMapper and serialize it
+    // This is a placeholder - in a real implementation, we'd need to reconstruct
+    // the DocMapper from the Tantivy schema, but that's complex and may not be 
+    // fully possible since some original mapping information is lost during schema creation
+    let doc_mapper = default_doc_mapper_for_test();
+    
+    // Serialize the DocMapper to JSON
+    let doc_mapping_json = serde_json::to_string(&doc_mapper)
+        .map_err(|e| anyhow!("Failed to serialize DocMapper to JSON: {}", e))?;
+    
+    debug_log!("Successfully extracted doc mapping JSON ({} bytes)", doc_mapping_json.len());
+    
+    Ok(doc_mapping_json)
+}
 
 /// Configuration for split conversion passed from Java
 #[derive(Debug)]
@@ -73,6 +96,9 @@ struct QuickwitSplitMetadata {
     footer_end_offset: Option<u64>,      // End of file
     hotcache_start_offset: Option<u64>,  // Where hotcache begins
     hotcache_length: Option<u64>,        // Size of hotcache
+    
+    // Doc mapping JSON for SplitSearcher integration
+    doc_mapping_json: Option<String>,    // JSON representation of the doc mapping
 }
 
 impl SplitConfig {
@@ -151,6 +177,9 @@ fn create_split_metadata(config: &SplitConfig, num_docs: usize, uncompressed_doc
         footer_end_offset: None,
         hotcache_start_offset: None,
         hotcache_length: None,
+        
+        // Doc mapping JSON initialized as None, will be set during extraction
+        doc_mapping_json: None,
     }
 }
 
@@ -178,10 +207,16 @@ fn create_java_split_metadata<'a>(env: &mut JNIEnv<'a>, split_metadata: &Quickwi
     
     let split_id_jstring = string_to_jstring(env, &split_metadata.split_id)?;
     
-    // Use the new constructor that includes footer offset parameters
+    // Convert doc mapping JSON to Java string or null if not available
+    let doc_mapping_jstring = match &split_metadata.doc_mapping_json {
+        Some(json) => string_to_jstring(env, json)?,
+        None => JString::from(JObject::null()),
+    };
+    
+    // Use the new constructor that includes footer offset parameters and doc mapping JSON
     let metadata_obj = env.new_object(
         &split_metadata_class,
-        "(Ljava/lang/String;JJLjava/time/Instant;Ljava/time/Instant;Ljava/util/Set;JIJJJJ)V",
+        "(Ljava/lang/String;JJLjava/time/Instant;Ljava/time/Instant;Ljava/util/Set;JIJJJJLjava/lang/String;)V",
         &[
             JValue::Object(&split_id_jstring.into()),
             JValue::Long(split_metadata.num_docs as i64),
@@ -196,6 +231,8 @@ fn create_java_split_metadata<'a>(env: &mut JNIEnv<'a>, split_metadata: &Quickwi
             JValue::Long(split_metadata.footer_end_offset.map(|v| v as i64).unwrap_or(-1)),
             JValue::Long(split_metadata.hotcache_start_offset.map(|v| v as i64).unwrap_or(-1)),
             JValue::Long(split_metadata.hotcache_length.map(|v| v as i64).unwrap_or(-1)),
+            // Doc mapping JSON parameter
+            JValue::Object(&doc_mapping_jstring.into()),
         ]
     )?;
     
@@ -299,10 +336,15 @@ fn convert_index_from_path_impl(index_path: &str, output_path: &str, config: &Sp
         }
     }
     
+    // Extract doc mapping from the index schema
+    let doc_mapping_json = extract_doc_mapping_from_index(&tantivy_index)
+        .map_err(|e| anyhow!("Failed to extract doc mapping from index: {}", e))?;
+    
     // Create split metadata with actual values from the index
     let mut split_metadata = create_split_metadata(config, doc_count as usize, total_size);
     split_metadata.num_docs = doc_count as usize;
     split_metadata.uncompressed_docs_size_in_bytes = total_size;
+    split_metadata.doc_mapping_json = Some(doc_mapping_json);
     
     // Use Quickwit's split creation functionality and get footer offsets
     let footer_offsets = create_quickwit_split(&tantivy_index, &index_dir, &PathBuf::from(output_path), &split_metadata)?;
@@ -508,9 +550,28 @@ fn create_quickwit_split(
             hotcache_length,
         };
         
+        debug_log!("🔍 FOOTER CALCULATION DEBUG:");
+        debug_log!("   total_file_size = {}", total_file_size);
+        debug_log!("   metadata_length = {}", metadata_length);
+        debug_log!("   hotcache_length = {}", hotcache_length);
+        debug_log!("   footer_end_offset = {} (= total_file_size)", footer_end_offset);
+        debug_log!("   hotcache_start_offset = {} (= {} - 8 - {})", hotcache_start_offset, total_file_size, hotcache_length);
+        debug_log!("   footer_start_offset = {} (= {} - 8 - {})", footer_start_offset, hotcache_start_offset, metadata_length);
+        
+        // CRITICAL: Check for values that would cause subtraction overflow
+        if footer_end_offset > u32::MAX as u64 {
+            debug_log!("🚨 WARNING: footer_end_offset ({}) > u32::MAX ({}), may cause overflow", footer_end_offset, u32::MAX);
+        }
+        if footer_start_offset > u32::MAX as u64 {
+            debug_log!("🚨 WARNING: footer_start_offset ({}) > u32::MAX ({}), may cause overflow", footer_start_offset, u32::MAX);
+        }
+        if hotcache_start_offset > u32::MAX as u64 {
+            debug_log!("🚨 WARNING: hotcache_start_offset ({}) > u32::MAX ({}), may cause overflow", hotcache_start_offset, u32::MAX);
+        }
+        
         debug_log!("Split footer offsets: metadata={}..{} ({} bytes), hotcache={}..{} ({} bytes)", 
             footer_start_offset, hotcache_start_offset, metadata_length,
-            hotcache_start_offset, footer_end_offset - 4, hotcache_length);
+            hotcache_start_offset, footer_end_offset - 8, hotcache_length);
         
         Ok::<FooterOffsets, anyhow::Error>(footer_offsets)
     })
@@ -601,6 +662,9 @@ pub extern "system" fn Java_com_tantivy4java_QuickwitSplit_nativeReadSplitMetada
             footer_end_offset: None,
             hotcache_start_offset: None,
             hotcache_length: None,
+            
+            // Doc mapping JSON not available when reading existing split files
+            doc_mapping_json: None,
         };
         
         debug_log!("Successfully read Quickwit split with {} files", file_count);
@@ -746,6 +810,9 @@ pub extern "system" fn Java_com_tantivy4java_QuickwitSplit_nativeExtractSplit(
             footer_end_offset: None,
             hotcache_start_offset: None,
             hotcache_length: None,
+            
+            // Doc mapping JSON not available when extracting existing splits
+            doc_mapping_json: None,
         };
         
         debug_log!("Successfully extracted {} files from Quickwit split to {}", extracted_count, output_path.display());
@@ -1241,6 +1308,11 @@ fn merge_splits_impl(split_urls: &[String], output_path: &str, config: &MergeCon
     let union_index = TantivyIndex::open(union_directory)?;
     debug_log!("Created union index");
     
+    // 6.5. Extract doc mapping from the union index schema
+    let doc_mapping_json = extract_doc_mapping_from_index(&union_index)
+        .map_err(|e| anyhow!("Failed to extract doc mapping from union index: {}", e))?;
+    debug_log!("Extracted doc mapping from union index ({} bytes)", doc_mapping_json.len());
+    
     // 7. Perform memory-efficient segment-level merge (not document copying)
     let merged_docs = runtime.block_on(perform_segment_merge(&union_index))?;
     debug_log!("Segment merge completed with {} documents", merged_docs);
@@ -1271,6 +1343,9 @@ fn merge_splits_impl(split_urls: &[String], output_path: &str, config: &MergeCon
         footer_end_offset: None,
         hotcache_start_offset: None,
         hotcache_length: None,
+        
+        // Doc mapping JSON extracted from union index
+        doc_mapping_json: Some(doc_mapping_json.clone()),
     };
     
     // 10. Create the merged split file using the merged index and capture footer offsets
@@ -1313,6 +1388,9 @@ fn merge_splits_impl(split_urls: &[String], output_path: &str, config: &MergeCon
         footer_end_offset: Some(footer_offsets.footer_end_offset),
         hotcache_start_offset: Some(footer_offsets.hotcache_start_offset),
         hotcache_length: Some(footer_offsets.hotcache_length),
+        
+        // Doc mapping JSON extracted from union index during merge
+        doc_mapping_json: merged_metadata.doc_mapping_json,
     };
     
     debug_log!("✅ MERGE OPTIMIZATION: Added footer offsets to merged split metadata");

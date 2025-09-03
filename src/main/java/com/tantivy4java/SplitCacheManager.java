@@ -467,6 +467,14 @@ public class SplitCacheManager implements AutoCloseable {
         splitConfig.put("hotcache_length", metadata.getHotcacheLength());
         splitConfig.put("enable_lazy_loading", true);
         
+        // Add doc mapping JSON if available
+        if (metadata.hasDocMapping()) {
+            splitConfig.put("doc_mapping", metadata.getDocMappingJson());
+            System.out.println("✅ Added doc mapping to split config for: " + splitPath);
+        } else {
+            System.out.println("⚠️  No doc mapping available in metadata for: " + splitPath);
+        }
+        
         // Create searcher with optimized configuration
         SplitSearcher searcher = new SplitSearcher(splitPath, this, splitConfig);
         managedSearchers.put(splitPath, searcher);

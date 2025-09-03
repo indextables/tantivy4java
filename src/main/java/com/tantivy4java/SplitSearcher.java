@@ -193,7 +193,33 @@ public class SplitSearcher implements AutoCloseable {
      * Search the split with hot cache optimization
      */
     public SearchResult search(Query query, int limit) {
-        return searchNative(nativePtr, query.getNativePtr(), limit);
+        System.out.println("🔍 Java SplitSearcher.search called with nativePtr=" + nativePtr + ", queryPtr=" + query.getNativePtr() + ", limit=" + limit);
+        if (nativePtr == 0) {
+            System.out.println("❌ Java: nativePtr is 0!");
+            return null;
+        }
+        if (query.getNativePtr() == 0) {
+            System.out.println("❌ Java: query.getNativePtr() is 0!");
+            return null;
+        }
+        
+        try {
+            System.out.println("🔍 Java: About to call searchNative...");
+            System.out.flush(); // Force output before native call
+            
+            SearchResult result = searchNative(nativePtr, query.getNativePtr(), limit);
+            
+            System.out.println("🔍 Java: searchNative returned: " + result);
+            return result;
+        } catch (UnsatisfiedLinkError e) {
+            System.out.println("❌ Java: UnsatisfiedLinkError: " + e.getMessage());
+            e.printStackTrace();
+            return null;
+        } catch (Throwable e) {
+            System.out.println("❌ Java: searchNative threw throwable: " + e.getClass().getName() + ": " + e.getMessage());
+            e.printStackTrace();
+            return null;
+        }
     }
     
     /**

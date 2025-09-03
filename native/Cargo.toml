@@ -29,15 +29,17 @@ futures = "0.3.31"
 once_cell = "1.19.0"
 bytesize = "1.3"
 
-# Quickwit dependencies with proper versions and features - updated to latest upstream  
-quickwit-storage = { git = "https://github.com/schenksj/quickwit" }
-quickwit-metastore = { git = "https://github.com/schenksj/quickwit" }
-quickwit-proto = { git = "https://github.com/schenksj/quickwit" }
-quickwit-directories = { git = "https://github.com/schenksj/quickwit" }
-quickwit-common = { git = "https://github.com/schenksj/quickwit" }
-quickwit-config = { git = "https://github.com/schenksj/quickwit" }
-quickwit-search = { git = "https://github.com/schenksj/quickwit" }
-quickwit-indexing = { git = "https://github.com/schenksj/quickwit" }
+# Quickwit dependencies with proper versions and features - updated to latest upstream with public modules
+quickwit-storage = { git = "https://github.com/schenksj/quickwit", rev = "da45fd1c25c330dfdcf3ee16e810c1a2a82a2d43" }
+quickwit-metastore = { git = "https://github.com/schenksj/quickwit", rev = "da45fd1c25c330dfdcf3ee16e810c1a2a82a2d43" }
+quickwit-proto = { git = "https://github.com/schenksj/quickwit", rev = "da45fd1c25c330dfdcf3ee16e810c1a2a82a2d43" }
+quickwit-directories = { git = "https://github.com/schenksj/quickwit", rev = "da45fd1c25c330dfdcf3ee16e810c1a2a82a2d43" }
+quickwit-common = { git = "https://github.com/schenksj/quickwit", rev = "da45fd1c25c330dfdcf3ee16e810c1a2a82a2d43" }
+quickwit-config = { git = "https://github.com/schenksj/quickwit", rev = "da45fd1c25c330dfdcf3ee16e810c1a2a82a2d43" }
+quickwit-search = { git = "https://github.com/schenksj/quickwit", rev = "da45fd1c25c330dfdcf3ee16e810c1a2a82a2d43" }
+quickwit-indexing = { git = "https://github.com/schenksj/quickwit", rev = "da45fd1c25c330dfdcf3ee16e810c1a2a82a2d43" }
+quickwit-doc-mapper = { git = "https://github.com/schenksj/quickwit", rev = "da45fd1c25c330dfdcf3ee16e810c1a2a82a2d43" }
+quickwit-query = { git = "https://github.com/schenksj/quickwit", rev = "da45fd1c25c330dfdcf3ee16e810c1a2a82a2d43" }
 
 # Additional dependencies
 anyhow = "1.0"
