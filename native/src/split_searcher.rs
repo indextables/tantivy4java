@@ -49,6 +49,7 @@ pub struct SplitSearchConfig {
     pub cache_size_bytes: usize,
     pub hot_cache_capacity: usize,
     pub aws_config: Option<AwsConfig>,
+    pub footer_offsets: Option<FooterOffsetConfig>,
     pub doc_mapper: Option<Arc<DocMapper>>,
 }
 
@@ -91,6 +92,8 @@ pub struct SplitSearcher {
     // Required for leaf_search_single_split
     doc_mapper: Arc<DocMapper>,
     storage_resolver: StorageResolver,
+    // Footer offsets for proper split boundary handling
+    footer_offsets: Option<FooterOffsetConfig>,
     // Cache statistics tracking
     cache_hits: std::sync::atomic::AtomicU64,
     cache_misses: std::sync::atomic::AtomicU64,
@@ -208,6 +211,7 @@ impl SplitSearcher {
             hot_directory: Some(hot_directory),
             doc_mapper,
             storage_resolver,
+            footer_offsets: config.footer_offsets,
             cache_hits: std::sync::atomic::AtomicU64::new(0),
             cache_misses: std::sync::atomic::AtomicU64::new(0),
             cache_evictions: std::sync::atomic::AtomicU64::new(0),
@@ -368,6 +372,7 @@ impl SplitSearcher {
             hot_directory: Some(hot_directory),
             doc_mapper,
             storage_resolver,
+            footer_offsets: config.footer_offsets,
             cache_hits: std::sync::atomic::AtomicU64::new(0),
             cache_misses: std::sync::atomic::AtomicU64::new(0),
             cache_evictions: std::sync::atomic::AtomicU64::new(0),
@@ -651,9 +656,17 @@ impl SplitSearcher {
                 let hotcache_data = hotcache_bytes.read_bytes()?;
                 debug_log!("Extracted hotcache data: {} bytes for HotDirectory", hotcache_data.len());
                 
-                let hot_directory = HotDirectory::open(caching_directory, hotcache_data)?;
+                // Additional validation before creating HotDirectory
+                if hotcache_data.is_empty() {
+                    return Err(anyhow::anyhow!("Hotcache data is empty for split: {}", split_id));
+                }
+                
+                let hot_directory = HotDirectory::open(caching_directory, hotcache_data)
+                    .with_context(|| format!("Failed to create HotDirectory for split: {}. Footer or hotcache data may be corrupted.", split_id))?;
 
-                let index = Index::open(hot_directory.clone())?;
+                // Try to open the index with additional error context
+                let index = Index::open(hot_directory.clone())
+                    .with_context(|| format!("Failed to open index for split: {}. This may indicate corrupted split footer or inconsistent file offsets.", split_id))?;
                 debug_log!("Successfully opened index with lazy S3 loading for split: {}", split_id);
                 Ok((index, hot_directory))
             },
@@ -1105,14 +1118,48 @@ impl SplitSearcher {
             ..Default::default()
         };
         
-        // Create SplitIdAndFooterOffsets
-        let split_id_and_offsets = SplitIdAndFooterOffsets {
-            split_id: self.split_path.clone(),
-            split_footer_start: 0,
-            split_footer_end: u64::MAX,
-            timestamp_start: None,
-            timestamp_end: None,
-            num_docs: 1000, // Default estimate
+        // Create SplitIdAndFooterOffsets using metadata from Java instead of I/O operations
+        let split_id_and_offsets = if let Some(ref footer_config) = self.footer_offsets {
+            // Use metadata from Java for document count, fall back to 0 if not provided
+            let num_docs = footer_config.num_docs.unwrap_or_else(|| {
+                debug_log!("⚠️  num_docs not provided in Java metadata, using 0 (let Quickwit determine)");
+                0
+            });
+            
+            debug_log!("🎯 Using metadata from Java: start={}, end={}, num_docs={}", 
+                      footer_config.footer_start_offset, footer_config.footer_end_offset, num_docs);
+            SplitIdAndFooterOffsets {
+                split_id: self.split_path.clone(),
+                split_footer_start: footer_config.footer_start_offset,
+                split_footer_end: footer_config.footer_end_offset,
+                timestamp_start: None,
+                timestamp_end: None,
+                num_docs, // Use document count from Java metadata or 0
+            }
+        } else {
+            // Fallback: get actual file size for safe defaults instead of u64::MAX
+            debug_log!("⚠️  No footer offsets available, calculating file size for safe defaults");
+            let file_size = if let Ok(uri) = quickwit_common::uri::Uri::from_str(&self.split_path) {
+                self.runtime.block_on(async {
+                    match self.storage.file_num_bytes(std::path::Path::new(uri.as_str())).await {
+                        Ok(size) => size as u64,
+                        Err(_) => 1_000_000_u64, // 1MB fallback if we can't determine file size
+                    }
+                })
+            } else {
+                // Fallback for non-URI paths - use 1MB default
+                1_000_000_u64 // 1MB fallback for invalid URIs or when file size cannot be determined
+            };
+            
+            debug_log!("📁 Using safe fallback footer offsets: file_size={}, num_docs=0 (let Quickwit determine)", file_size);
+            SplitIdAndFooterOffsets {
+                split_id: self.split_path.clone(),
+                split_footer_start: 0,
+                split_footer_end: file_size.saturating_sub(1), // Safe: file_size - 1, won't overflow
+                timestamp_start: None,
+                timestamp_end: None,
+                num_docs: 0, // Let Quickwit determine the document count when not available
+            }
         };
         
         // Create aggregation limits guard
@@ -1583,6 +1630,7 @@ struct FooterOffsetConfig {
     hotcache_start_offset: u64,
     hotcache_length: u64,
     enable_lazy_loading: bool,
+    num_docs: Option<u64>, // Document count from Java metadata
 }
 
 impl FooterOffsetConfig {
@@ -1688,19 +1736,22 @@ fn extract_footer_offsets_from_java_map(env: &mut JNIEnv, split_config: &JObject
     let footer_end_key = env.new_string("footer_end_offset")?;
     let hotcache_start_key = env.new_string("hotcache_start_offset")?;
     let hotcache_length_key = env.new_string("hotcache_length")?;
+    let num_docs_key = env.new_string("num_docs")?;
     
     let footer_start_obj = env.call_method(split_config, "get", "(Ljava/lang/Object;)Ljava/lang/Object;", &[(&footer_start_key).into()])?;
     let footer_end_obj = env.call_method(split_config, "get", "(Ljava/lang/Object;)Ljava/lang/Object;", &[(&footer_end_key).into()])?;
     let hotcache_start_obj = env.call_method(split_config, "get", "(Ljava/lang/Object;)Ljava/lang/Object;", &[(&hotcache_start_key).into()])?;
     let hotcache_length_obj = env.call_method(split_config, "get", "(Ljava/lang/Object;)Ljava/lang/Object;", &[(&hotcache_length_key).into()])?;
+    let num_docs_obj = env.call_method(split_config, "get", "(Ljava/lang/Object;)Ljava/lang/Object;", &[(&num_docs_key).into()])?;
     
     let footer_start_obj = footer_start_obj.l()?;
     let footer_end_obj = footer_end_obj.l()?;
     let hotcache_start_obj = hotcache_start_obj.l()?;
     let hotcache_length_obj = hotcache_length_obj.l()?;
+    let num_docs_obj = num_docs_obj.l()?;
     
     if footer_start_obj.is_null() || footer_end_obj.is_null() || hotcache_start_obj.is_null() || hotcache_length_obj.is_null() {
-        debug_log!("One or more footer offset parameters are missing");
+        debug_log!("One or more required footer offset parameters are missing");
         return Ok(None);
     }
     
@@ -1710,18 +1761,43 @@ fn extract_footer_offsets_from_java_map(env: &mut JNIEnv, split_config: &JObject
     let hotcache_start_offset = env.call_method(&hotcache_start_obj, "longValue", "()J", &[])?.j()? as u64;
     let hotcache_length = env.call_method(&hotcache_length_obj, "longValue", "()J", &[])?.j()? as u64;
     
-    debug_log!(
-        "Extracted footer offsets: start={}, end={}, hotcache_start={}, hotcache_length={}", 
-        footer_start_offset, footer_end_offset, hotcache_start_offset, hotcache_length
-    );
+    // Extract num_docs (optional - may be null)
+    let num_docs = if !num_docs_obj.is_null() {
+        let docs_value = env.call_method(&num_docs_obj, "longValue", "()J", &[])?.j()? as u64;
+        Some(docs_value)
+    } else {
+        debug_log!("num_docs parameter not provided in Java metadata");
+        None
+    };
     
-    Ok(Some(FooterOffsetConfig {
+    if let Some(docs) = num_docs {
+        debug_log!(
+            "Extracted footer offsets: start={}, end={}, hotcache_start={}, hotcache_length={}, num_docs={}", 
+            footer_start_offset, footer_end_offset, hotcache_start_offset, hotcache_length, docs
+        );
+    } else {
+        debug_log!(
+            "Extracted footer offsets: start={}, end={}, hotcache_start={}, hotcache_length={}, num_docs=None", 
+            footer_start_offset, footer_end_offset, hotcache_start_offset, hotcache_length
+        );
+    }
+    
+    let config = FooterOffsetConfig {
         footer_start_offset,
         footer_end_offset,
         hotcache_start_offset,
         hotcache_length,
         enable_lazy_loading,
-    }))
+        num_docs,
+    };
+    
+    // Validate the extracted offsets
+    if let Err(e) = config.validate() {
+        debug_log!("🔍 FOOTERS: Validation failed: {}", e);
+        return Ok(None); // Return None if validation fails to avoid panics
+    }
+    
+    Ok(Some(config))
 }
 
 fn extract_doc_mapping_from_java_map(env: &mut JNIEnv, split_config: &JObject) -> anyhow::Result<Option<Arc<DocMapper>>> {
@@ -1846,15 +1922,34 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_createNativeWithShare
     cache_manager_ptr: jlong,
     split_config: JObject,
 ) -> jlong {
-    if cache_manager_ptr == 0 {
-        let _ = env.throw_new("java/lang/RuntimeException", "Invalid cache manager pointer");
-        return 0;
-    }
+    // Wrap in catch_unwind to make panics unwindable in JNI context
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if cache_manager_ptr == 0 {
+            let _ = env.throw_new("java/lang/RuntimeException", "Invalid cache manager pointer");
+            return 0;
+        }
+        
+        match create_split_searcher_with_shared_cache(&mut env, split_path, cache_manager_ptr, split_config) {
+            Ok(ptr) => ptr,
+            Err(e) => {
+                let _ = env.throw_new("java/lang/RuntimeException", &format!("Failed to create SplitSearcher with shared cache: {}", e));
+                0
+            }
+        }
+    }));
     
-    match create_split_searcher_with_shared_cache(&mut env, split_path, cache_manager_ptr, split_config) {
+    match result {
         Ok(ptr) => ptr,
-        Err(e) => {
-            let _ = env.throw_new("java/lang/RuntimeException", &format!("Failed to create SplitSearcher with shared cache: {}", e));
+        Err(panic_err) => {
+            // Handle the panic gracefully with full stack trace
+            let panic_msg = if let Some(s) = panic_err.downcast_ref::<&str>() {
+                format!("Panic in createNativeWithSharedCache: {}\n\nStack trace:\n{}", s, std::backtrace::Backtrace::force_capture())
+            } else if let Some(s) = panic_err.downcast_ref::<String>() {
+                format!("Panic in createNativeWithSharedCache: {}\n\nStack trace:\n{}", s, std::backtrace::Backtrace::force_capture())
+            } else {
+                format!("Unknown panic in createNativeWithSharedCache\n\nStack trace:\n{}", std::backtrace::Backtrace::force_capture())
+            };
+            let _ = env.throw_new("java/lang/RuntimeException", &panic_msg);
             0
         }
     }
@@ -1917,6 +2012,7 @@ fn create_split_searcher_with_shared_cache(
         cache_size_bytes: 50_000_000, // Default 50MB
         hot_cache_capacity: 10_000,   // Default capacity
         aws_config,                   // Use extracted AWS config from Java
+        footer_offsets,               // Use extracted footer offsets from Java
         doc_mapper,                   // Use extracted DocMapper from Java
     };
     
