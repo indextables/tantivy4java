@@ -48,3 +48,25 @@ tempfile = "3"
 
 [build-dependencies]
 jni = "0.21.1"
+
+# Debug symbols configuration for maximum debug information
+[profile.dev]
+debug = 2            # Maximum debug info (line tables, local variables, etc)
+debug-assertions = true
+overflow-checks = true
+opt-level = 0        # No optimization
+panic = "unwind"     # Enable stack unwinding for better backtraces
+rpath = false        # Standard setting
+lto = false          # No link-time optimization for debug builds
+codegen-units = 256  # Parallel compilation for faster debug builds
+incremental = true   # Enable incremental compilation
+
+[profile.release]
+debug = 2            # Maximum debug symbols in release builds too
+debug-assertions = false
+overflow-checks = false
+opt-level = 3        # Full optimization for release
+panic = "unwind"     # Enable stack unwinding for production debugging
+lto = false          # Disable link-time optimization to preserve debug info
+codegen-units = 1    # Better debugging but slower compilation
+incremental = false  # No incremental compilation for release

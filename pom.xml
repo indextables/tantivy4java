@@ -120,6 +120,9 @@
                 <configuration>
                     <source>11</source>
                     <target>11</target>
+                    <!-- Enable debug symbols for Java compilation -->
+                    <debug>true</debug>
+                    <debuglevel>lines,vars,source</debuglevel>
                 </configuration>
             </plugin>
 
@@ -244,8 +247,51 @@
                                     </arguments>
                                     <workingDirectory>${project.basedir}/native</workingDirectory>
                                     <environmentVariables>
-                                        <!-- Optimize for x86_64 Linux -->
-                                        <RUSTFLAGS>-C target-cpu=x86-64</RUSTFLAGS>
+                                        <!-- Optimize for x86_64 Linux with debug symbols -->
+                                        <RUSTFLAGS>-C target-cpu=x86-64 -C debuginfo=2</RUSTFLAGS>
+                                        <RUST_BACKTRACE>1</RUST_BACKTRACE>
+                                    </environmentVariables>
+                                </configuration>
+                            </execution>
+                        </executions>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+        
+        <!-- Debug build profile - activate with -Pdebug -->
+        <profile>
+            <id>debug</id>
+            <properties>
+                <rust.target.dir>target</rust.target.dir>
+            </properties>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.codehaus.mojo</groupId>
+                        <artifactId>exec-maven-plugin</artifactId>
+                        <executions>
+                            <execution>
+                                <id>build-rust-debug</id>
+                                <phase>compile</phase>
+                                <goals>
+                                    <goal>exec</goal>
+                                </goals>
+                                <configuration>
+                                    <executable>cargo</executable>
+                                    <arguments>
+                                        <argument>build</argument>
+                                        <!-- Use debug build instead of release -->
+                                        <argument>--target-dir</argument>
+                                        <argument>${rust.target.dir}</argument>
+                                    </arguments>
+                                    <workingDirectory>${project.basedir}/native</workingDirectory>
+                                    <environmentVariables>
+                                        <!-- Enable maximum debug information for panic tracking -->
+                                        <RUST_BACKTRACE>full</RUST_BACKTRACE>
+                                        <TANTIVY4JAVA_DEBUG>1</TANTIVY4JAVA_DEBUG>
+                                        <!-- Maximum debug info, no optimization, debug assertions -->
+                                        <RUSTFLAGS>-C debuginfo=2 -C opt-level=0 -C debug-assertions=on -C overflow-checks=on -C panic=unwind</RUSTFLAGS>
                                     </environmentVariables>
                                 </configuration>
                             </execution>

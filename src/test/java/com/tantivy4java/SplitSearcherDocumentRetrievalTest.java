@@ -25,6 +25,7 @@ public class SplitSearcherDocumentRetrievalTest {
     private Path indexPath;
     private Path splitPath;
     private String splitUrl;
+    private static QuickwitSplit.SplitMetadata metadata;
 
     @BeforeAll
     static void setUpCacheManager() {
@@ -86,14 +87,14 @@ public class SplitSearcherDocumentRetrievalTest {
             "document-test-node"
         );
         
-        QuickwitSplit.convertIndexFromPath(indexPath.toString(), splitPath.toString(), config);
+        metadata = QuickwitSplit.convertIndexFromPath(indexPath.toString(), splitPath.toString(), config);
         splitUrl = "file://" + splitPath.toAbsolutePath().toString();
     }
 
     @Test
     @DisplayName("Test document retrieval from search results")
     void testDocumentRetrievalFromSearchResults() {
-        try (SplitSearcher searcher = cacheManager.createSplitSearcher(splitUrl)) {
+        try (SplitSearcher searcher = cacheManager.createSplitSearcher(splitUrl, metadata)) {
             assertNotNull(searcher, "Split searcher should be created successfully");
             
             // Demonstrate schema introspection
@@ -167,7 +168,7 @@ public class SplitSearcherDocumentRetrievalTest {
     @Test
     @DisplayName("Test document retrieval with different query types")
     void testDocumentRetrievalWithDifferentQueries() {
-        try (SplitSearcher searcher = cacheManager.createSplitSearcher(splitUrl)) {
+        try (SplitSearcher searcher = cacheManager.createSplitSearcher(splitUrl, metadata)) {
             Schema schema = searcher.getSchema();
             
             // Test 1: Term query
@@ -231,7 +232,7 @@ public class SplitSearcherDocumentRetrievalTest {
     @Test
     @DisplayName("Test document retrieval with invalid document addresses")
     void testDocumentRetrievalWithInvalidAddresses() {
-        try (SplitSearcher searcher = cacheManager.createSplitSearcher(splitUrl)) {
+        try (SplitSearcher searcher = cacheManager.createSplitSearcher(splitUrl, metadata)) {
             // Test with non-existent document address
             DocAddress invalidAddress = new DocAddress(999, 999);
             
@@ -256,7 +257,7 @@ public class SplitSearcherDocumentRetrievalTest {
     @Test
     @DisplayName("Test document retrieval performance and caching")
     void testDocumentRetrievalPerformanceAndCaching() {
-        try (SplitSearcher searcher = cacheManager.createSplitSearcher(splitUrl)) {
+        try (SplitSearcher searcher = cacheManager.createSplitSearcher(splitUrl, metadata)) {
             Schema schema = searcher.getSchema();
             Query query = Query.termQuery(schema, "title", "Document");
             SearchResult result = searcher.search(query, 3);
@@ -296,7 +297,7 @@ public class SplitSearcherDocumentRetrievalTest {
     @Test
     @DisplayName("Test comprehensive field data validation")
     void testComprehensiveFieldDataValidation() {
-        try (SplitSearcher searcher = cacheManager.createSplitSearcher(splitUrl)) {
+        try (SplitSearcher searcher = cacheManager.createSplitSearcher(splitUrl, metadata)) {
             Schema schema = searcher.getSchema();
             
             // Search for a specific document we know the pattern of
@@ -386,7 +387,7 @@ public class SplitSearcherDocumentRetrievalTest {
     @Test
     @DisplayName("Test document lifecycle management")
     void testDocumentLifecycleManagement() {
-        try (SplitSearcher searcher = cacheManager.createSplitSearcher(splitUrl)) {
+        try (SplitSearcher searcher = cacheManager.createSplitSearcher(splitUrl, metadata)) {
             Schema schema = searcher.getSchema();
             Query query = Query.termQuery(schema, "content", "test");
             SearchResult result = searcher.search(query, 2);

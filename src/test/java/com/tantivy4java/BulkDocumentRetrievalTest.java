@@ -30,6 +30,7 @@ public class BulkDocumentRetrievalTest {
     private Path splitPath;
     private String splitUrl;
     private Schema schema;
+    private QuickwitSplit.SplitMetadata metadata;
     private final int TOTAL_DOCUMENTS = 50;
 
     @BeforeAll
@@ -101,14 +102,14 @@ public class BulkDocumentRetrievalTest {
             "bulk-retrieval-node"
         );
         
-        QuickwitSplit.convertIndexFromPath(indexPath.toString(), splitPath.toString(), config);
+        metadata = QuickwitSplit.convertIndexFromPath(indexPath.toString(), splitPath.toString(), config);
         splitUrl = "file://" + splitPath.toAbsolutePath().toString();
     }
 
     @Test
     @DisplayName("Test basic bulk document retrieval vs individual retrieval")
     void testBasicBulkRetrievalVsIndividual() {
-        try (SplitSearcher searcher = cacheManager.createSplitSearcher(splitUrl)) {
+        try (SplitSearcher searcher = cacheManager.createSplitSearcher(splitUrl, metadata)) {
             assertNotNull(searcher, "Split searcher should be created successfully");
             
             // Get a sample of documents to retrieve
@@ -164,7 +165,7 @@ public class BulkDocumentRetrievalTest {
     @Test
     @DisplayName("Test working bulk retrieval functionality")
     void testBulkRetrievalFunctionality() {
-        try (SplitSearcher searcher = cacheManager.createSplitSearcher(splitUrl)) {
+        try (SplitSearcher searcher = cacheManager.createSplitSearcher(splitUrl, metadata)) {
             // Get some documents to test with
             Query query = Query.rangeQuery(schema, "score", FieldType.INTEGER, 85, 95, true, true);
             SearchResult results = searcher.search(query, 15);
@@ -206,7 +207,7 @@ public class BulkDocumentRetrievalTest {
     @Test
     @DisplayName("Test individual document retrieval performance baseline")
     void testIndividualRetrievalPerformanceBenchmark() {
-        try (SplitSearcher searcher = cacheManager.createSplitSearcher(splitUrl)) {
+        try (SplitSearcher searcher = cacheManager.createSplitSearcher(splitUrl, metadata)) {
             // Get documents to test performance with
             Query query = Query.termQuery(schema, "content", "content"); 
             SearchResult results = searcher.search(query, TOTAL_DOCUMENTS);
@@ -272,7 +273,7 @@ public class BulkDocumentRetrievalTest {
     @Test
     @DisplayName("Test API contract for bulk retrieval methods")
     void testBulkRetrievalAPIContract() {
-        try (SplitSearcher searcher = cacheManager.createSplitSearcher(splitUrl)) {
+        try (SplitSearcher searcher = cacheManager.createSplitSearcher(splitUrl, metadata)) {
             Query query = Query.termQuery(schema, "content", "content");
             SearchResult results = searcher.search(query, 10);
             

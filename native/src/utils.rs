@@ -20,25 +20,23 @@
 use jni::JNIEnv;
 use std::collections::HashMap;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use once_cell::sync::Lazy;
 
 /// Global registry for native objects
 pub static OBJECT_REGISTRY: Lazy<Mutex<HashMap<u64, Box<dyn std::any::Any + Send + Sync>>>> = 
     Lazy::new(|| Mutex::new(HashMap::new()));
 
-static mut NEXT_ID: u64 = 1;
+/// Thread-safe atomic counter for generating unique IDs
+static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Register a native object and return its handle
 pub fn register_object<T: 'static + Send + Sync>(obj: T) -> u64 {
-    unsafe {
-        let mut registry = OBJECT_REGISTRY.lock().unwrap();
+    let mut registry = OBJECT_REGISTRY.lock().unwrap();
 
-        let id = NEXT_ID;
-        NEXT_ID += 1;
-
-        registry.insert(id, Box::new(obj));
-        id
-    }
+    let id = NEXT_ID.fetch_add(1, Ordering::SeqCst);
+    registry.insert(id, Box::new(obj));
+    id
 }
 
 /// Execute a function with a reference to a registered object

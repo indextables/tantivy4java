@@ -285,9 +285,29 @@ pub extern "system" fn Java_com_tantivy4java_Document_nativeGet(
                             env.new_object(&boolean_class, "(Z)V", &[(*b).into()]).map_err(|e| e.to_string())?
                         },
                         OwnedValue::Date(dt) => {
-                            // Convert DateTime to Java LocalDateTime
-                            let java_localdatetime = convert_tantivy_datetime_to_java(&mut env, dt)?;
-                            unsafe { JObject::from_raw(java_localdatetime) }
+                            // Convert DateTime to Java LocalDateTime directly
+                            let timestamp_millis = dt.into_timestamp_millis();
+                            let chrono_dt = chrono::DateTime::from_timestamp_millis(timestamp_millis)
+                                .ok_or_else(|| "Invalid timestamp".to_string())?;
+                            let naive_dt = chrono_dt.naive_utc();
+                            
+                            // Extract components
+                            let year = naive_dt.year();
+                            let month = naive_dt.month() as i32;
+                            let day = naive_dt.day() as i32;
+                            let hour = naive_dt.hour() as i32;
+                            let minute = naive_dt.minute() as i32;
+                            let second = naive_dt.second() as i32;
+                            
+                            // Create Java LocalDateTime object directly without unsafe operations
+                            let localdatetime_class = env.find_class("java/time/LocalDateTime").map_err(|e| e.to_string())?;
+                            let localdatetime_result = env.call_static_method(
+                                &localdatetime_class,
+                                "of",
+                                "(IIIIII)Ljava/time/LocalDateTime;",
+                                &[year.into(), month.into(), day.into(), hour.into(), minute.into(), second.into()]
+                            ).map_err(|e| e.to_string())?;
+                            localdatetime_result.l().map_err(|e| e.to_string())?
                         },
                         OwnedValue::IpAddr(ipv6) => {
                             // Convert IPv6 address back to original format if it was IPv4-mapped
@@ -751,34 +771,6 @@ pub fn convert_java_localdatetime_to_tantivy(env: &mut JNIEnv, date_obj: &JObjec
     Ok(DateTime::from_timestamp_millis(timestamp_millis))
 }
 
-// Helper function to convert Tantivy DateTime to Java LocalDateTime
-fn convert_tantivy_datetime_to_java(env: &mut JNIEnv, dt: &DateTime) -> Result<jobject, String> {
-    let timestamp_millis = dt.into_timestamp_millis();
-    
-    // Create a chrono datetime from the timestamp
-    let chrono_dt = chrono::DateTime::from_timestamp_millis(timestamp_millis)
-        .ok_or("Invalid timestamp")?;
-    let naive_dt = chrono_dt.naive_utc();
-    
-    // Extract components
-    let year = naive_dt.year();
-    let month = naive_dt.month() as i32;
-    let day = naive_dt.day() as i32;
-    let hour = naive_dt.hour() as i32;
-    let minute = naive_dt.minute() as i32;
-    let second = naive_dt.second() as i32;
-    
-    // Create Java LocalDateTime object using the static of() method
-    let localdatetime_class = env.find_class("java/time/LocalDateTime").map_err(|e| e.to_string())?;
-    let localdatetime_obj = env.call_static_method(
-        &localdatetime_class,
-        "of",
-        "(IIIIII)Ljava/time/LocalDateTime;",
-        &[year.into(), month.into(), day.into(), hour.into(), minute.into(), second.into()]
-    ).map_err(|e| e.to_string())?;
-    
-    Ok(localdatetime_obj.l().map_err(|e| e.to_string())?.into_raw())
-}
 
 /// Create a Java Document object from a RetrievedDocument for bulk operations
 pub fn create_java_document_from_retrieved(env: &mut JNIEnv, retrieved_doc: RetrievedDocument) -> anyhow::Result<jlong> {

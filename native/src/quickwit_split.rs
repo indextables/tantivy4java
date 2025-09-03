@@ -244,8 +244,10 @@ fn convert_tantivy_to_split(
     split_content.extend_from_slice(b"INDEX_INFO_END\n");
     
     // Use Quickwit's SplitPayloadBuilder to create a real split bundle
-    // Create a runtime for async operations
-    let runtime = tokio::runtime::Runtime::new()
+    // Use a current-thread runtime to avoid conflicts with other runtimes
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
         .map_err(|e| anyhow::anyhow!("Failed to create tokio runtime: {}", e))?;
     
     // Unfortunately, we cannot reliably extract the directory path from a Tantivy Index object
@@ -428,11 +430,14 @@ fn create_quickwit_split(
     };
     
     // Use Quickwit's real SplitPayloadBuilder to create proper split format
-    let runtime = tokio::runtime::Runtime::new()
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
         .map_err(|e| anyhow::anyhow!("Failed to create tokio runtime: {}", e))?;
     
     runtime.block_on(async {
         // Create the split payload using Quickwit's actual implementation
+        // This should create the correct format: [Files][FilesMetadata][FilesMetadata length 8 byte LE][Hotcache][Hotcache length 8 byte LE]
         let split_payload = SplitPayloadBuilder::get_split_payload(
             &split_files,
             &split_fields,
@@ -441,26 +446,60 @@ fn create_quickwit_split(
         
         // Write the payload to the output file
         let payload_bytes = split_payload.read_all().await?;
-        let mut output_file = File::create(output_path)?;
-        output_file.write_all(&payload_bytes)?;
-        output_file.flush()?;
+        std::fs::write(output_path, &payload_bytes)?;
         
-        // Calculate footer offsets based on the Quickwit split format:
-        // [Files][Metadata JSON][Metadata Length: 4 bytes LE][Hotcache][Hotcache Length: 4 bytes LE]
+        debug_log!("Successfully wrote split file: {:?} ({} bytes)", output_path, payload_bytes.len());
         
+        // Debug: Check the actual bytes at the end of the file to see what format was created
+        let file_len = payload_bytes.len();
+        if file_len >= 16 {
+            let last_16_bytes = &payload_bytes[file_len-16..file_len];
+            debug_log!("Last 16 bytes of split file: {:?}", last_16_bytes);
+            
+            // Try to read the last 8 bytes as u64 LE (should be hotcache length)
+            let last_8_bytes = &payload_bytes[file_len-8..file_len];
+            if last_8_bytes.len() == 8 {
+                if let Ok(last_8_array) = <[u8; 8]>::try_from(last_8_bytes) {
+                    let hotcache_len = u64::from_le_bytes(last_8_array);
+                debug_log!("Last 8 bytes as u64 LE (should be hotcache length): {}", hotcache_len);
+                
+                    // Try to read the 8 bytes before that as u64 LE (should be metadata length)
+                    if file_len >= hotcache_len as usize + 16 {
+                        let metadata_len_start = file_len - 8 - hotcache_len as usize - 8;
+                        if metadata_len_start < file_len && metadata_len_start + 8 <= file_len {
+                            let metadata_len_bytes = &payload_bytes[metadata_len_start..metadata_len_start + 8];
+                            if let Ok(metadata_len_array) = <[u8; 8]>::try_from(metadata_len_bytes) {
+                                let metadata_len = u64::from_le_bytes(metadata_len_array);
+                                debug_log!("Metadata length from split: {}", metadata_len);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Calculate footer offsets based on what SplitPayloadBuilder actually created
+        // The SplitPayloadBuilder should have created the correct Quickwit format
         let total_file_size = payload_bytes.len() as u64;
-        let metadata_length = split_fields.len() as u64;
         let hotcache_length = hotcache.len() as u64;
+        let metadata_length = split_fields.len() as u64;
         
-        // Footer structure (from end backwards):
-        // - Last 4 bytes: hotcache length
+        // Footer structure in Quickwit format (from end backwards):
+        // - Last 8 bytes: hotcache length (u64 LE) 
         // - Before that: hotcache data
-        // - Before that: 4 bytes metadata length  
-        // - Before that: metadata JSON
-        
+        // - Before that: 8 bytes metadata length (u64 LE)
+        // - Before that: metadata data
         let footer_end_offset = total_file_size;
-        let hotcache_start_offset = total_file_size - 4 - hotcache_length;
-        let footer_start_offset = total_file_size - 4 - hotcache_length - 4 - metadata_length;
+        let hotcache_start_offset = total_file_size - 8 - hotcache_length;  
+        let footer_start_offset = hotcache_start_offset - 8 - metadata_length;
+        
+        // Validate that our calculated offsets make sense
+        if footer_start_offset >= footer_end_offset {
+            return Err(anyhow::anyhow!(
+                "Invalid footer calculation: start({}) >= end({}) - file_size={}, metadata_len={}, hotcache_len={}", 
+                footer_start_offset, footer_end_offset, total_file_size, metadata_length, hotcache_length
+            ));
+        }
         
         let footer_offsets = FooterOffsets {
             footer_start_offset,
@@ -646,7 +685,9 @@ pub extern "system" fn Java_com_tantivy4java_QuickwitSplit_nativeExtractSplit(
         let owned_bytes = OwnedBytes::new(split_data);
         
         // Parse the split using Quickwit's BundleStorage  
-        let runtime = tokio::runtime::Runtime::new()
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
             .map_err(|e| anyhow::anyhow!("Failed to create tokio runtime: {}", e))?;
         
         let ram_storage = std::sync::Arc::new(RamStorage::default());
@@ -747,8 +788,8 @@ struct MergeConfig {
 /// AWS configuration for S3-compatible storage (copy from split_searcher.rs)
 #[derive(Clone, Debug)]
 struct AwsConfig {
-    access_key: String,
-    secret_key: String,
+    access_key: Option<String>,  // Made optional to support default credential chain
+    secret_key: Option<String>,  // Made optional to support default credential chain
     session_token: Option<String>,
     region: String,
     endpoint: Option<String>,
@@ -798,8 +839,8 @@ pub extern "system" fn Java_com_tantivy4java_QuickwitSplit_nativeMergeSplits(
 
 /// Extract AWS configuration from Java AwsConfig object
 fn extract_aws_config(env: &mut JNIEnv, aws_obj: JObject) -> anyhow::Result<AwsConfig> {
-    let access_key = get_string_field_value(env, &aws_obj, "getAccessKey")?;
-    let secret_key = get_string_field_value(env, &aws_obj, "getSecretKey")?;
+    let access_key = get_nullable_string_field_value(env, &aws_obj, "getAccessKey")?;
+    let secret_key = get_nullable_string_field_value(env, &aws_obj, "getSecretKey")?;
     let region = get_string_field_value(env, &aws_obj, "getRegion")?;
     
     // Extract session token (optional - for STS/temporary credentials)
@@ -915,18 +956,34 @@ fn get_string_field_value(env: &mut JNIEnv, obj: &JObject, method_name: &str) ->
     jstring_to_string(env, &java_string)
 }
 
+/// Get a string field value that can be null (for nullable credentials)
+fn get_nullable_string_field_value(env: &mut JNIEnv, obj: &JObject, method_name: &str) -> Result<Option<String>> {
+    let string_obj = env.call_method(obj, method_name, "()Ljava/lang/String;", &[])?.l()?;
+    if env.is_same_object(&string_obj, JObject::null())? {
+        Ok(None)
+    } else {
+        let java_string = JString::from(string_obj);
+        let string_value = jstring_to_string(env, &java_string)?;
+        Ok(Some(string_value))
+    }
+}
+
 /// Extract split file contents to a directory (avoiding read-only BundleDirectory issues)
+/// CRITICAL: This function is used by merge operations and must NOT use lazy loading
+/// to prevent range assertion failures in the native layer
 fn extract_split_to_directory_impl(split_path: &Path, output_dir: &Path) -> Result<()> {
     use tantivy::directory::{MmapDirectory, DirectoryClone};
     
-    debug_log!("Extracting split {:?} to directory {:?}", split_path, output_dir);
+    debug_log!("🔧 MERGE EXTRACTION: Extracting split {:?} to directory {:?}", split_path, output_dir);
+    debug_log!("🚨 MERGE SAFETY: Using full file access (NO lazy loading) to prevent native crashes");
     
     // Create output directory
     std::fs::create_dir_all(output_dir)?;
     
-    // Open the bundle directory (read-only)
+    // Open the bundle directory (read-only) - MERGE OPERATIONS MUST USE FULL ACCESS
     let split_path_str = split_path.to_string_lossy().to_string();
-    let bundle_directory = get_tantivy_directory_from_split_bundle(&split_path_str)?;
+    debug_log!("🔧 MERGE EXTRACTION: Opening bundle directory with full file access (no lazy loading)");
+    let bundle_directory = get_tantivy_directory_from_split_bundle_full_access(&split_path_str)?;
     
     // Open the output directory (writable)  
     let output_directory = MmapDirectory::open(output_dir)?;
@@ -978,22 +1035,30 @@ fn extract_split_to_directory_impl(split_path: &Path, output_dir: &Path) -> Resu
 
 /// Implementation of split merging using Quickwit's efficient approach
 /// This follows Quickwit's MergeExecutor pattern for memory-efficient large-scale merges
+/// CRITICAL: For merge operations, we disable lazy loading and force full file downloads
+/// to avoid the range assertion failures that occur when accessing corrupted/invalid metadata
 fn merge_splits_impl(split_urls: &[String], output_path: &str, config: &MergeConfig) -> Result<QuickwitSplitMetadata> {
     use quickwit_directories::UnionDirectory;
     use tantivy::directory::{MmapDirectory, Directory, Advice, DirectoryClone};
     use tantivy::{Index as TantivyIndex, IndexMeta};
     use tantivy::index::SegmentId;
     
-    debug_log!("Implementing split merge using Quickwit's efficient approach for {} splits", split_urls.len());
+    debug_log!("🔧 MERGE OPERATION: Implementing split merge using Quickwit's efficient approach for {} splits", split_urls.len());
+    debug_log!("🚨 MERGE SAFETY: Lazy loading DISABLED for merge operations to prevent range assertion failures");
     
-    // Create async runtime for async operations
-    let runtime = tokio::runtime::Runtime::new()?;
+    // Create async runtime for async operations with proper cleanup
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
     
-    // 1. Open split directories without extraction (Quickwit's approach)
-    let mut split_directories: Vec<Box<dyn Directory>> = Vec::new();
-    let mut index_metas: Vec<IndexMeta> = Vec::new();
-    let mut total_docs = 0usize;
-    let mut total_size = 0u64;
+    // Use a closure to ensure proper runtime cleanup even on errors  
+    let result: Result<QuickwitSplitMetadata> = (|| -> Result<QuickwitSplitMetadata> {
+        // 1. Open split directories without extraction (Quickwit's approach)
+        let mut split_directories: Vec<Box<dyn Directory>> = Vec::new();
+        let mut index_metas: Vec<IndexMeta> = Vec::new();
+        let mut total_docs = 0usize;
+        let mut total_size = 0u64;
+        let mut temp_dirs: Vec<temp::TempDir> = Vec::new(); // Keep track of temp dirs for proper cleanup
     
     for (i, split_url) in split_urls.iter().enumerate() {
         debug_log!("Opening split directory {}: {}", i, split_url);
@@ -1015,8 +1080,8 @@ fn merge_splits_impl(split_urls: &[String], output_path: &str, config: &MergeCon
             let s3_config = if let Some(ref aws_config) = config.aws_config {
                 S3StorageConfig {
                     region: Some(aws_config.region.clone()),
-                    access_key_id: Some(aws_config.access_key.clone()),
-                    secret_access_key: Some(aws_config.secret_key.clone()),
+                    access_key_id: aws_config.access_key.clone(),
+                    secret_access_key: aws_config.secret_key.clone(),
                     session_token: aws_config.session_token.clone(),
                     endpoint: aws_config.endpoint.clone(),
                     force_path_style_access: aws_config.force_path_style,
@@ -1068,6 +1133,8 @@ fn merge_splits_impl(split_urls: &[String], output_path: &str, config: &MergeCon
             debug_log!("Downloaded {} bytes to {:?}", split_data.len(), temp_split_path);
             
             // Extract the downloaded split to the temp directory
+            // CRITICAL: For merge operations, use full extraction instead of lazy loading
+            debug_log!("🔧 MERGE EXTRACTION: Forcing full split extraction (no lazy loading) for merge safety");
             extract_split_to_directory_impl(&temp_split_path, temp_extract_path)?;
             
         } else {
@@ -1084,6 +1151,8 @@ fn merge_splits_impl(split_urls: &[String], output_path: &str, config: &MergeCon
             }
             
             // Extract the split to a writable directory
+            // CRITICAL: For merge operations, use full extraction instead of lazy loading
+            debug_log!("🔧 MERGE EXTRACTION: Forcing full split extraction (no lazy loading) for merge safety");
             extract_split_to_directory_impl(Path::new(split_path), temp_extract_path)?;
         }
         
@@ -1120,8 +1189,8 @@ fn merge_splits_impl(split_urls: &[String], output_path: &str, config: &MergeCon
         split_directories.push(extracted_directory.box_clone());
         index_metas.push(index_meta);
         
-        // Keep temp directory alive for merge duration
-        std::mem::forget(temp_extract_dir);
+        // Keep temp directory alive for merge duration - store in vector for proper cleanup
+        temp_dirs.push(temp_extract_dir);
     }
     
     debug_log!("Opened {} splits with total {} documents, {} bytes", split_urls.len(), total_docs, total_size);
@@ -1253,14 +1322,28 @@ fn merge_splits_impl(split_urls: &[String], output_path: &str, config: &MergeCon
     debug_log!("   Hotcache: {} bytes at offset {}", 
                footer_offsets.hotcache_length, footer_offsets.hotcache_start_offset);
     
-    // 11. Clean up temporary directory
+    // 11. Clean up temporary directories - both the output temp dir and split temp dirs
     std::fs::remove_dir_all(&output_temp_dir).unwrap_or_else(|e| {
-        debug_log!("Warning: Could not clean up temp directory: {}", e);
+        debug_log!("Warning: Could not clean up output temp directory: {}", e);
     });
     
-    debug_log!("Created efficient merged split file: {} with {} documents", output_path, merged_docs);
+        // Clean up split extraction temporary directories explicitly
+        for (i, _temp_dir) in temp_dirs.into_iter().enumerate() {
+            debug_log!("Cleaning up split temp directory {}", i);
+            // temp_dir will be automatically cleaned up when dropped
+        }
+        
+        debug_log!("Created efficient merged split file: {} with {} documents", output_path, merged_docs);
+        
+        Ok(final_merged_metadata)
+    })(); // End closure
     
-    Ok(final_merged_metadata)
+    // Ensure proper runtime cleanup regardless of success or failure
+    runtime.shutdown_background();
+    debug_log!("Tokio runtime shutdown completed");
+    
+    // Return the result
+    result
 }
 
 /// Get Tantivy directory from split bundle using Quickwit's BundleDirectory
@@ -1289,6 +1372,41 @@ fn get_tantivy_directory_from_split_bundle(split_path: &str) -> Result<Box<dyn t
     let bundle_directory = BundleDirectory::open_split(split_fileslice)?;
     
     debug_log!("Successfully opened bundle directory for split: {}", split_path);
+    Ok(Box::new(bundle_directory))
+}
+
+/// Get Tantivy directory from split bundle with FULL ACCESS (no lazy loading)
+/// CRITICAL: This version is used for merge operations to prevent range assertion failures
+/// It forces full file download instead of using lazy loading with potentially corrupted offsets
+fn get_tantivy_directory_from_split_bundle_full_access(split_path: &str) -> Result<Box<dyn tantivy::Directory>> {
+    use quickwit_storage::{BundleStorage, RamStorage, Storage, PutPayload};
+    use tantivy::directory::{OwnedBytes, MmapDirectory};
+    use quickwit_directories::BundleDirectory;
+    
+    debug_log!("🔧 MERGE SAFETY: Opening bundle directory with FULL ACCESS (no lazy loading): {}", split_path);
+    
+    let split_file_path = PathBuf::from(split_path);
+    
+    // Read the entire split file into memory (FULL ACCESS - no lazy loading)
+    debug_log!("🔧 MERGE SAFETY: Reading entire split file into memory to avoid range issues");
+    let split_data = std::fs::read(&split_file_path)
+        .map_err(|e| anyhow!("Failed to read split file {:?}: {}", split_file_path, e))?;
+    
+    let file_size = split_data.len();
+    debug_log!("🔧 MERGE SAFETY: Read {} bytes from split file (full file access)", file_size);
+    
+    // Create OwnedBytes from the full file data
+    let owned_bytes = OwnedBytes::new(split_data);
+    
+    // Create FileSlice from the complete file data (no range restrictions)
+    let file_slice = tantivy::directory::FileSlice::new(std::sync::Arc::new(owned_bytes));
+    
+    // Create BundleDirectory from the full file slice
+    // This should work correctly because we have the complete file data
+    let bundle_directory = BundleDirectory::open_split(file_slice)
+        .map_err(|e| anyhow!("Failed to open split bundle with full access: {}", e))?;
+    
+    debug_log!("✅ MERGE SAFETY: Successfully opened bundle directory with full file access (no lazy loading)");
     Ok(Box::new(bundle_directory))
 }
 
@@ -1411,8 +1529,8 @@ async fn upload_split_to_s3_impl(local_split_path: &Path, s3_url: &str, config: 
     let s3_config = if let Some(ref aws_config) = config.aws_config {
         S3StorageConfig {
             region: Some(aws_config.region.clone()),
-            access_key_id: Some(aws_config.access_key.clone()),
-            secret_access_key: Some(aws_config.secret_key.clone()),
+            access_key_id: aws_config.access_key.clone(),
+            secret_access_key: aws_config.secret_key.clone(),
             session_token: aws_config.session_token.clone(),
             endpoint: aws_config.endpoint.clone(),
             force_path_style_access: aws_config.force_path_style,
@@ -1463,7 +1581,9 @@ async fn upload_split_to_s3_impl(local_split_path: &Path, s3_url: &str, config: 
 
 /// Synchronous wrapper for S3 upload
 fn upload_split_to_s3(local_split_path: &Path, s3_url: &str, config: &MergeConfig) -> Result<()> {
-    let runtime = tokio::runtime::Runtime::new()?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
     runtime.block_on(upload_split_to_s3_impl(local_split_path, s3_url, config))
 }
 

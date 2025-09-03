@@ -241,15 +241,15 @@ pub extern "system" fn Java_com_tantivy4java_SplitCacheManager_createNativeCache
     };
     
     let manager = Arc::new(GlobalSplitCacheManager::new(cache_name.clone(), max_cache_size));
-    let manager_ptr = Arc::as_ptr(&manager) as jlong;
     
     // Store in global registry
     {
         let mut managers = CACHE_MANAGERS.lock().unwrap();
-        managers.insert(cache_name, manager);
+        managers.insert(cache_name.clone(), manager);
     }
     
-    manager_ptr
+    // Use safe registry-based ID instead of dangerous pointer casting
+    crate::utils::register_object(cache_name) as jlong
 }
 
 #[no_mangle]
@@ -262,15 +262,10 @@ pub extern "system" fn Java_com_tantivy4java_SplitCacheManager_closeNativeCacheM
         // Safely find and remove from global registry instead of dangerous Arc::from_raw()
         let mut managers = CACHE_MANAGERS.lock().unwrap();
         
-        // Find the manager by pointer comparison
-        let cache_name_to_remove = managers
-            .iter()
-            .find(|(_, manager_arc)| Arc::as_ptr(manager_arc) as jlong == ptr)
-            .map(|(name, _)| name.clone());
-        
-        if let Some(cache_name) = cache_name_to_remove {
+        // Use safe registry to find cache name, then remove from managers
+        if let Some(cache_name) = crate::utils::with_object::<String, _>(ptr as u64, |name| name.clone()) {
             managers.remove(&cache_name);
-            // Arc will be properly dropped when removed from registry
+            crate::utils::remove_object(ptr as u64);
         }
     }
 }
@@ -287,7 +282,13 @@ pub extern "system" fn Java_com_tantivy4java_SplitCacheManager_getGlobalCacheSta
     
     // Safely access through global registry instead of unsafe pointer cast
     let managers = CACHE_MANAGERS.lock().unwrap();
-    let manager = match managers.values().find(|m| Arc::as_ptr(m) as jlong == ptr) {
+    // Use safe registry to find cache name, then get manager
+    let manager = if let Some(cache_name) = crate::utils::with_object::<String, _>(ptr as u64, |name| name.clone()) {
+        managers.get(&cache_name)
+    } else {
+        None
+    };
+    let manager = match manager {
         Some(manager_arc) => manager_arc,
         None => return std::ptr::null_mut(),
     };
@@ -329,7 +330,13 @@ pub extern "system" fn Java_com_tantivy4java_SplitCacheManager_forceEvictionNati
     
     // Safely access through global registry instead of unsafe pointer cast
     let managers = CACHE_MANAGERS.lock().unwrap();
-    let manager = match managers.values().find(|m| Arc::as_ptr(m) as jlong == ptr) {
+    // Use safe registry to find cache name, then get manager
+    let manager = if let Some(cache_name) = crate::utils::with_object::<String, _>(ptr as u64, |name| name.clone()) {
+        managers.get(&cache_name)
+    } else {
+        None
+    };
+    let manager = match manager {
         Some(manager_arc) => manager_arc,
         None => return,
     };
@@ -430,7 +437,13 @@ pub extern "system" fn Java_com_tantivy4java_SplitCacheManager_preloadComponents
     
     // Safely access through global registry instead of unsafe pointer cast
     let managers = CACHE_MANAGERS.lock().unwrap();
-    let manager = match managers.values().find(|m| Arc::as_ptr(m) as jlong == ptr) {
+    // Use safe registry to find cache name, then get manager
+    let manager = if let Some(cache_name) = crate::utils::with_object::<String, _>(ptr as u64, |name| name.clone()) {
+        managers.get(&cache_name)
+    } else {
+        None
+    };
+    let manager = match manager {
         Some(manager_arc) => manager_arc,
         None => return,
     };
@@ -452,7 +465,13 @@ pub extern "system" fn Java_com_tantivy4java_SplitCacheManager_evictComponentsNa
     
     // Safely access through global registry instead of unsafe pointer cast
     let managers = CACHE_MANAGERS.lock().unwrap();
-    let manager = match managers.values().find(|m| Arc::as_ptr(m) as jlong == ptr) {
+    // Use safe registry to find cache name, then get manager
+    let manager = if let Some(cache_name) = crate::utils::with_object::<String, _>(ptr as u64, |name| name.clone()) {
+        managers.get(&cache_name)
+    } else {
+        None
+    };
+    let manager = match manager {
         Some(manager_arc) => manager_arc,
         None => return,
     };
@@ -475,7 +494,13 @@ pub extern "system" fn Java_com_tantivy4java_SplitCacheManager_searchAcrossAllSp
     
     // Safely access through global registry instead of unsafe pointer cast
     let managers = CACHE_MANAGERS.lock().unwrap();
-    let manager = match managers.values().find(|m| Arc::as_ptr(m) as jlong == ptr) {
+    // Use safe registry to find cache name, then get manager
+    let manager = if let Some(cache_name) = crate::utils::with_object::<String, _>(ptr as u64, |name| name.clone()) {
+        managers.get(&cache_name)
+    } else {
+        None
+    };
+    let manager = match manager {
         Some(manager_arc) => manager_arc,
         None => {
             let _ = env.throw_new("java/lang/RuntimeException", "SplitCacheManager not found in registry");
@@ -505,7 +530,13 @@ pub extern "system" fn Java_com_tantivy4java_SplitCacheManager_searchAcrossSplit
     
     // Safely access through global registry instead of unsafe pointer cast
     let managers = CACHE_MANAGERS.lock().unwrap();
-    let manager = match managers.values().find(|m| Arc::as_ptr(m) as jlong == ptr) {
+    // Use safe registry to find cache name, then get manager
+    let manager = if let Some(cache_name) = crate::utils::with_object::<String, _>(ptr as u64, |name| name.clone()) {
+        managers.get(&cache_name)
+    } else {
+        None
+    };
+    let manager = match manager {
         Some(manager_arc) => manager_arc,
         None => {
             let _ = env.throw_new("java/lang/RuntimeException", "SplitCacheManager not found in registry");

@@ -145,6 +145,13 @@ public class QuickwitSplit {
             this(splitId, numDocs, uncompressedSizeBytes, timeRangeStart, timeRangeEnd, 
                  tags, deleteOpstamp, numMergeOps, -1L, -1L, -1L, -1L);
         }
+        
+        // Constructor with only footer offset information (as requested)
+        public SplitMetadata(long footerStartOffset, long footerEndOffset, 
+                           long hotcacheStartOffset, long hotcacheLength) {
+            this("", 0L, 0L, null, null, new java.util.HashSet<>(), 0L, 0,
+                 footerStartOffset, footerEndOffset, hotcacheStartOffset, hotcacheLength);
+        }
 
         // Getters
         public String getSplitId() { return splitId; }

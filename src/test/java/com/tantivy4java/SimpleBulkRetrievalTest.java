@@ -28,6 +28,7 @@ public class SimpleBulkRetrievalTest {
     private static Path splitPath;
     private static String splitUrl;
     private static Schema schema;
+    private static QuickwitSplit.SplitMetadata metadata;
 
     @BeforeAll
     static void setUpOnce() throws IOException {
@@ -62,7 +63,7 @@ public class SimpleBulkRetrievalTest {
             "simple-index", "test-source", "test-node"
         );
         
-        QuickwitSplit.convertIndexFromPath(indexPath.toString(), splitPath.toString(), splitConfig);
+        metadata = QuickwitSplit.convertIndexFromPath(indexPath.toString(), splitPath.toString(), splitConfig);
         splitUrl = "file://" + splitPath.toAbsolutePath().toString();
         
         System.out.printf("✅ Index created with %,d documents\n", TOTAL_DOCUMENTS);
@@ -126,7 +127,7 @@ public class SimpleBulkRetrievalTest {
     void testVerifyAllDocumentsSearchable() {
         System.out.println("🔍 Verifying all 1,000 documents are searchable...");
         
-        try (SplitSearcher searcher = cacheManager.createSplitSearcher(splitUrl)) {
+        try (SplitSearcher searcher = cacheManager.createSplitSearcher(splitUrl, metadata)) {
             // Search for all documents
             Query query = Query.termQuery(schema, "content", "searchable");
             SearchResult results = searcher.search(query, TOTAL_DOCUMENTS);
@@ -144,7 +145,7 @@ public class SimpleBulkRetrievalTest {
     void testBulkRetrievalBasic() {
         System.out.println("🚀 Testing bulk retrieval API - basic functionality...");
         
-        try (SplitSearcher searcher = cacheManager.createSplitSearcher(splitUrl)) {
+        try (SplitSearcher searcher = cacheManager.createSplitSearcher(splitUrl, metadata)) {
             // Get some document addresses
             Query query = Query.termQuery(schema, "content", "searchable");
             SearchResult results = searcher.search(query, 5);
@@ -198,7 +199,7 @@ public class SimpleBulkRetrievalTest {
     void testComprehensiveFieldValidation() {
         System.out.println("🔍 Comprehensive field validation test...");
         
-        try (SplitSearcher searcher = cacheManager.createSplitSearcher(splitUrl)) {
+        try (SplitSearcher searcher = cacheManager.createSplitSearcher(splitUrl, metadata)) {
             // Get a small set of documents for validation
             Query query = Query.termQuery(schema, "content", "searchable");
             SearchResult results = searcher.search(query, 10);
@@ -392,7 +393,7 @@ public class SimpleBulkRetrievalTest {
     void testIndividualRetrievalBaseline() {
         System.out.println("⏱️ Performance baseline: Individual document retrieval...");
         
-        try (SplitSearcher searcher = cacheManager.createSplitSearcher(splitUrl)) {
+        try (SplitSearcher searcher = cacheManager.createSplitSearcher(splitUrl, metadata)) {
             // Get 100 documents for baseline
             Query query = Query.termQuery(schema, "content", "searchable");
             SearchResult results = searcher.search(query, 100);

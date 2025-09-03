@@ -60,8 +60,16 @@ pub extern "system" fn Java_com_tantivy4java_Query_nativeTermQuery(
         // Get field type
         let field_type = schema.get_field_entry(field).field_type();
         
-        // Convert jobject to JObject for proper API usage
-        let field_value_obj = unsafe { JObject::from_raw(field_value) };
+        // Safely validate field_value before use
+        if field_value.is_null() {
+            return Err("Field value cannot be null".to_string());
+        }
+        
+        // Use safe JObject construction from validated jobject
+        let field_value_obj = unsafe {
+            // SAFETY: We've validated field_value is not null above
+            JObject::from_raw(field_value)
+        };
         
         // Create term based on field type and value type
         let term = match field_type {

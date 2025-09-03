@@ -22,7 +22,8 @@ use quickwit_storage::{
     QuickwitCache
 };
 use anyhow::Context;
-use quickwit_proto::search::SplitIdAndFooterOffsets;
+use quickwit_proto::search::{SplitIdAndFooterOffsets, SearchRequest, LeafSearchRequest};
+use quickwit_common::thread_pool::ThreadPool;
 use quickwit_config::S3StorageConfig;
 use quickwit_directories::{CachingDirectory, HotDirectory, StorageDirectory, BundleDirectory, get_hotcache_from_split};
 use quickwit_common::uri::{Uri, Protocol};
@@ -201,16 +202,33 @@ impl SplitSearcher {
     /// Constructor for SplitSearcher with shared caches (from cache manager)
     /// Uses existing Quickwit crates exactly as intended
     pub fn new_with_shared_caches(config: SplitSearchConfigWithSharedCache) -> anyhow::Result<Self> {
-        // Create a dedicated runtime for this SplitSearcher
+        // Create a dedicated runtime for this SplitSearcher with error handling
         let runtime = Runtime::new()
             .map_err(|e| anyhow::anyhow!("Failed to create Tokio runtime: {}", e))?;
         
-        // Parse the split URI
-        let split_uri = Uri::from_str(&config.split_path)?;
+        // Parse the split URI with validation
+        let split_uri = Uri::from_str(&config.split_path)
+            .map_err(|e| anyhow::anyhow!("Invalid split path '{}': {}", config.split_path, e))?;
+        
+        // Validate that the split path is not empty
+        if config.split_path.trim().is_empty() {
+            return Err(anyhow::anyhow!("Split path cannot be empty"));
+        }
         
         // Create storage resolver and get storage for the split
         use quickwit_config::S3StorageConfig;
         let s3_config = if let Some(aws_config) = &config.aws_config {
+            // Validate AWS configuration before using it
+            if aws_config.access_key.trim().is_empty() {
+                return Err(anyhow::anyhow!("AWS access key cannot be empty"));
+            }
+            if aws_config.secret_key.trim().is_empty() {
+                return Err(anyhow::anyhow!("AWS secret key cannot be empty"));
+            }
+            if aws_config.region.trim().is_empty() {
+                return Err(anyhow::anyhow!("AWS region cannot be empty"));
+            }
+            
             S3StorageConfig {
                 region: Some(aws_config.region.clone()),
                 access_key_id: Some(aws_config.access_key.clone()),
@@ -233,7 +251,9 @@ impl SplitSearcher {
             if let Some(last_slash) = uri_str.rfind('/') {
                 let parent_uri_str = &uri_str[..last_slash];
                 let file_name = &uri_str[last_slash + 1..];
-                (Uri::from_str(parent_uri_str)?, Some(file_name.to_string()))
+                (Uri::from_str(parent_uri_str)
+                    .map_err(|e| anyhow::anyhow!("Invalid parent URI '{}': {}", parent_uri_str, e))?, 
+                 Some(file_name.to_string()))
             } else {
                 (split_uri.clone(), None)
             }
@@ -243,9 +263,28 @@ impl SplitSearcher {
         };
         
         let storage = if split_uri.protocol() == quickwit_common::uri::Protocol::S3 {
-            runtime.block_on(async {
-                storage_resolver.resolve(&storage_uri).await
-            }).map_err(|e| anyhow::anyhow!("Failed to resolve storage for '{}': {}", config.split_path, e))?
+            // Add timeout and better error handling for S3 storage resolution
+            match runtime.block_on(async {
+                // Use a timeout to prevent hanging
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(30), 
+                    storage_resolver.resolve(&storage_uri)
+                ).await
+            }) {
+                Ok(Ok(storage)) => storage,
+                Ok(Err(e)) => {
+                    return Err(anyhow::anyhow!(
+                        "Failed to resolve S3 storage for '{}': {}. Check your AWS credentials, region, and network connectivity.", 
+                        config.split_path, e
+                    ));
+                }
+                Err(_) => {
+                    return Err(anyhow::anyhow!(
+                        "Timeout while resolving S3 storage for '{}'. Check your network connectivity and AWS configuration.", 
+                        config.split_path
+                    ));
+                }
+            }
         } else {
             // For local files, storage won't be used, but we need something for type compatibility
             use quickwit_storage::RamStorage;
@@ -263,17 +302,41 @@ impl SplitSearcher {
         let byte_range_cache = config.shared_byte_range_cache;
         let split_footer_cache = config.shared_split_footer_cache;
         
-        // Use the lazy loading approach with shared caches
-        let (index, hot_directory) = runtime.block_on(async {
-            Self::quickwit_open_index_with_caches_lazy_loading(
-                cached_storage.clone(), &config.split_path, &byte_range_cache, split_footer_cache.as_ref(), file_name.as_deref(), config.footer_offsets.as_ref()
+        // Use the lazy loading approach with shared caches - add timeout and better error handling
+        let (index, hot_directory) = match runtime.block_on(async {
+            // Add timeout for index loading to prevent hanging
+            tokio::time::timeout(
+                std::time::Duration::from_secs(60), // Allow more time for index loading
+                Self::quickwit_open_index_with_caches_lazy_loading(
+                    cached_storage.clone(), 
+                    &config.split_path, 
+                    &byte_range_cache, 
+                    split_footer_cache.as_ref(), 
+                    file_name.as_deref(), 
+                    config.footer_offsets.as_ref()
+                )
             ).await
-        }).map_err(|e| anyhow::anyhow!("Failed to open split index '{}': {}", config.split_path, e))?;
+        }) {
+            Ok(Ok((index, hot_directory))) => (index, hot_directory),
+            Ok(Err(e)) => {
+                return Err(anyhow::anyhow!(
+                    "Failed to open split index '{}': {}. This could be due to: 1) Split file corruption, 2) Network connectivity issues, 3) Insufficient permissions, 4) Invalid file format.", 
+                    config.split_path, e
+                ));
+            }
+            Err(_) => {
+                return Err(anyhow::anyhow!(
+                    "Timeout while loading split index '{}'. The split file may be too large, corrupted, or there are network connectivity issues.",
+                    config.split_path
+                ));
+            }
+        };
         
-        // Create reader with proper reload policy (like Quickwit does)
+        // Create reader with proper reload policy (like Quickwit does) - add error handling
         let reader = index.reader_builder()
             .reload_policy(tantivy::ReloadPolicy::Manual)
-            .try_into()?;
+            .try_into()
+            .map_err(|e| anyhow::anyhow!("Failed to create index reader for '{}': {}. The index may be corrupted or incompatible.", config.split_path, e))?;
         
         Ok(SplitSearcher {
             runtime,
@@ -339,27 +402,49 @@ impl SplitSearcher {
                     
                     debug_log!("Using local file approach for: {:?}", file_path);
                     
-                    // Log optimization status but read full file for now
+                    // Read the complete split file (needed for BundleDirectory creation)
+                    let split_data = std::fs::read(file_path)?;
+                    let split_owned_bytes = OwnedBytes::new(split_data);
+                    debug_log!("📋 Read split file: {} bytes", split_owned_bytes.len());
+                    
+                    // Log optimization status and validate metadata
                     // The real optimization benefit comes from caching and future targeted requests
                     if let Some(offsets) = footer_offsets {
-                        if offsets.enable_lazy_loading {
+                        // DEFENSIVE CODING: Validate metadata for local files too but fall back gracefully
+                        let file_size = split_owned_bytes.len() as u64;
+                        let mut validation_failed = false;
+                        
+                        // Check for obviously invalid offsets
+                        if offsets.footer_start_offset >= offsets.footer_end_offset {
+                            debug_log!("⚠️  Invalid metadata: footer_start_offset ({}) >= footer_end_offset ({}). Falling back to standard loading.", 
+                                      offsets.footer_start_offset, offsets.footer_end_offset);
+                            validation_failed = true;
+                        } else if offsets.footer_end_offset > file_size {
+                            debug_log!("⚠️  Invalid metadata: footer_end_offset ({}) exceeds file size ({}). Falling back to standard loading.", 
+                                      offsets.footer_end_offset, file_size);
+                            validation_failed = true;
+                        } else if offsets.hotcache_start_offset > offsets.footer_end_offset {
+                            debug_log!("⚠️  Invalid metadata: hotcache_start_offset ({}) > footer_end_offset ({}). Falling back to standard loading.", 
+                                      offsets.hotcache_start_offset, offsets.footer_end_offset);
+                            validation_failed = true;
+                        }
+                        
+                        // If validation failed, treat as if no footer offsets were provided
+                        if !validation_failed && offsets.enable_lazy_loading {
                             debug_log!("🚀 OPTIMIZED: Footer offsets available for split optimization");
                             debug_log!("   Footer spans: {} - {} ({} bytes)", 
                                       offsets.footer_start_offset, offsets.footer_end_offset,
                                       offsets.footer_end_offset - offsets.footer_start_offset);
                             debug_log!("   Hotcache: {} bytes at offset {}", 
                                       offsets.hotcache_length, offsets.hotcache_start_offset);
+                        } else if validation_failed {
+                            debug_log!("📁 FALLBACK: Using standard loading due to invalid footer metadata");
                         } else {
                             debug_log!("📁 STANDARD: Footer offsets available but lazy loading disabled");
                         }
                     } else {
                         debug_log!("📁 STANDARD: No footer offsets available, using traditional loading");
                     }
-                    
-                    // Read the complete split file (needed for BundleDirectory creation)
-                    let split_data = std::fs::read(file_path)?;
-                    let split_owned_bytes = OwnedBytes::new(split_data);
-                    debug_log!("📋 Read split file: {} bytes", split_owned_bytes.len());
                     
                     // Extract hotcache from the split
                     let hotcache_bytes = get_hotcache_from_split(split_owned_bytes.clone())
@@ -399,14 +484,131 @@ impl SplitSearcher {
                 
                 debug_log!("Split ID: {}, file path: {:?}", split_id, file_path);
                 
-                // Get or create split footer from cache (ONLY the footer, not the whole file!)
-                let footer_data = Self::get_split_footer_from_cache_or_fetch_s3(
-                    index_storage.clone(),
-                    &file_path,
-                    &split_id,
-                    split_footer_cache,
-                    footer_offsets,
-                ).await?;
+                // Use Quickwit's proper approach when footer offsets are provided from Java
+                let footer_data = if let Some(offsets) = footer_offsets {
+                    if offsets.enable_lazy_loading {
+                        debug_log!("🚀 OPTIMIZED: Using footer offsets from Java for precise S3 fetching");
+                        debug_log!("   Footer spans: {} - {} ({} bytes)", 
+                                  offsets.footer_start_offset, offsets.footer_end_offset,
+                                  offsets.footer_end_offset - offsets.footer_start_offset);
+                        
+                        // Use exact footer offsets provided by Java (like Quickwit's get_split_footer_from_cache_or_fetch)
+                        let possible_cached_footer = split_footer_cache.get(&split_id);
+                        if let Some(cached_footer) = possible_cached_footer {
+                            debug_log!("✅ Using cached footer for split: {}", split_id);
+                            cached_footer
+                        } else {
+                            debug_log!("⬇️  Fetching footer from S3 using precise offsets: {} to {}", 
+                                      offsets.footer_start_offset, offsets.footer_end_offset);
+                            
+                            // DEFENSIVE CODING: Validate metadata before using it but fall back gracefully
+                            let mut validation_failed = false;
+                            
+                            // Check for obviously invalid offsets
+                            if offsets.footer_start_offset >= offsets.footer_end_offset {
+                                debug_log!("⚠️  Invalid metadata: footer_start_offset ({}) >= footer_end_offset ({}). Falling back to standard S3 loading.", 
+                                          offsets.footer_start_offset, offsets.footer_end_offset);
+                                validation_failed = true;
+                            } else if offsets.hotcache_start_offset > offsets.footer_end_offset {
+                                debug_log!("⚠️  Invalid metadata: hotcache_start_offset ({}) > footer_end_offset ({}). Falling back to standard S3 loading.", 
+                                          offsets.hotcache_start_offset, offsets.footer_end_offset);
+                                validation_failed = true;
+                            }
+                            
+                            // Get file size to validate footer offsets (only if basic validation passed)
+                            if !validation_failed {
+                                let file_size = match index_storage.file_num_bytes(&file_path).await {
+                                    Ok(size) => size as u64,
+                                    Err(e) => {
+                                        debug_log!("⚠️  Could not get file size for {}: {}. Using footer offsets as-is.", file_path.display(), e);
+                                        offsets.footer_end_offset // Fallback to metadata value
+                                    }
+                                };
+                                
+                                // Validate offsets against actual file size
+                                if offsets.footer_end_offset > file_size {
+                                    debug_log!("⚠️  Invalid metadata: footer_end_offset ({}) exceeds file size ({}). Falling back to standard S3 loading.", 
+                                              offsets.footer_end_offset, file_size);
+                                    validation_failed = true;
+                                } else if offsets.footer_start_offset > file_size {
+                                    debug_log!("⚠️  Invalid metadata: footer_start_offset ({}) exceeds file size ({}). Falling back to standard S3 loading.", 
+                                              offsets.footer_start_offset, file_size);
+                                    validation_failed = true;
+                                }
+                            }
+                            
+                            if validation_failed {
+                                debug_log!("📁 FALLBACK: Using standard S3 footer loading due to invalid footer metadata");
+                                // Fall back to standard footer loading
+                                Self::get_split_footer_from_cache_or_fetch_s3(
+                                    index_storage.clone(),
+                                    &file_path,
+                                    &split_id,
+                                    split_footer_cache,
+                                    None, // No footer offsets for fallback
+                                ).await?
+                            } else {
+                                // Get file size for safe clamping 
+                                let file_size = match index_storage.file_num_bytes(&file_path).await {
+                                    Ok(size) => size as u64,
+                                    Err(e) => {
+                                        debug_log!("⚠️  Could not get file size for {}: {}. Using footer offsets as-is.", file_path.display(), e);
+                                        offsets.footer_end_offset // Fallback to metadata value
+                                    }
+                                };
+                                
+                                // Clamp footer offsets to actual file size to prevent assertion failures
+                                let safe_footer_start = std::cmp::min(offsets.footer_start_offset, file_size);
+                                let safe_footer_end = std::cmp::min(offsets.footer_end_offset, file_size);
+                                
+                                // Ensure we have a valid range after safety checks
+                                if safe_footer_start >= safe_footer_end {
+                                    debug_log!("⚠️  Invalid range after clamping: {}..{} (file_size={}). Falling back to standard S3 loading.", 
+                                              safe_footer_start, safe_footer_end, file_size);
+                                    Self::get_split_footer_from_cache_or_fetch_s3(
+                                        index_storage.clone(),
+                                        &file_path,
+                                        &split_id,
+                                        split_footer_cache,
+                                        None, // No footer offsets for fallback
+                                    ).await?
+                                } else {
+                                    debug_log!("🛡️  Safe footer range: {}..{} (original: {}..{}, file_size: {})", 
+                                              safe_footer_start, safe_footer_end,
+                                              offsets.footer_start_offset, offsets.footer_end_offset, file_size);
+                                    
+                                    let footer_data = index_storage.get_slice(
+                                        &file_path,
+                                        safe_footer_start as usize..safe_footer_end as usize,
+                                    ).await
+                                    .with_context(|| format!("Failed to fetch footer from S3 for split {}", split_id))?;
+                                    
+                                    // Cache the footer for future use
+                                    split_footer_cache.put(split_id.clone(), footer_data.clone());
+                                    footer_data
+                                }
+                            }
+                        }
+                    } else {
+                        debug_log!("📁 STANDARD: Footer offsets available but lazy loading disabled, using fallback");
+                        Self::get_split_footer_from_cache_or_fetch_s3(
+                            index_storage.clone(),
+                            &file_path,
+                            &split_id,
+                            split_footer_cache,
+                            footer_offsets,
+                        ).await?
+                    }
+                } else {
+                    debug_log!("📁 STANDARD: No footer offsets available, using traditional footer parsing");
+                    Self::get_split_footer_from_cache_or_fetch_s3(
+                        index_storage.clone(),
+                        &file_path,
+                        &split_id,
+                        split_footer_cache,
+                        footer_offsets,
+                    ).await?
+                };
                 
                 debug_log!("Successfully fetched split footer ({} bytes) for split: {}", footer_data.len(), split_id);
                 
@@ -424,7 +626,12 @@ impl SplitSearcher {
                 
                 // Add caching layer
                 let caching_directory = CachingDirectory::new(Arc::new(directory), ephemeral_unbounded_cache.clone());
-                let hot_directory = HotDirectory::open(caching_directory, hotcache_bytes.read_bytes()?)?;
+                
+                // Extract the hotcache bytes to ensure they're available for sync operations
+                let hotcache_data = hotcache_bytes.read_bytes()?;
+                debug_log!("Extracted hotcache data: {} bytes for HotDirectory", hotcache_data.len());
+                
+                let hot_directory = HotDirectory::open(caching_directory, hotcache_data)?;
 
                 let index = Index::open(hot_directory.clone())?;
                 debug_log!("Successfully opened index with lazy S3 loading for split: {}", split_id);
@@ -437,221 +644,77 @@ impl SplitSearcher {
     }
 
 
-    /// Get split footer from cache or fetch from S3 (ONLY footer, not entire file)
-    /// Following Quickwit's get_split_footer_from_cache_or_fetch pattern
+    /// Get split footer from cache or fetch from S3 using format compatible with SplitPayloadBuilder
     async fn get_split_footer_from_cache_or_fetch_s3(
         index_storage: Arc<dyn Storage>,
         split_file: &std::path::Path,
         split_id: &str,
         footer_cache: &MemorySizedCache<String>,
-        footer_offsets: Option<&FooterOffsetConfig>,
+        _footer_offsets: Option<&FooterOffsetConfig>,
     ) -> anyhow::Result<OwnedBytes> {
         // Check cache first
         if let Some(cached_footer) = footer_cache.get(split_id) {
-            debug_log!("Split footer cache HIT for split: {}", split_id);
+            debug_log!("Split footer cache HIT for S3 split: {}", split_id);
             return Ok(cached_footer);
         }
         
-        debug_log!("Split footer cache MISS for split: {}, fetching from S3", split_id);
+        debug_log!("Split footer cache MISS for S3 split: {}, reading footer from S3", split_id);
         
-        // 🚀 OPTIMIZATION: Use pre-computed footer offsets with parallel hot cache loading
-        if let Some(offsets) = footer_offsets {
-            if offsets.enable_lazy_loading {
-                debug_log!("🚀 OPTIMIZED: Using pre-computed footer offsets with parallel hot cache loading");
-                debug_log!("   Footer range: {} - {} ({} bytes)", 
-                          offsets.footer_start_offset, offsets.footer_end_offset,
-                          offsets.footer_end_offset - offsets.footer_start_offset);
-                debug_log!("   Hotcache range: {} + {} ({} bytes)", 
-                          offsets.hotcache_start_offset, offsets.hotcache_length,
-                          offsets.hotcache_length);
-                
-                // 🔥 PARALLEL OPTIMIZATION: Fetch footer AND hotcache simultaneously
-                let footer_future = index_storage.get_slice(
-                    split_file, 
-                    offsets.footer_start_offset as usize..offsets.footer_end_offset as usize
-                );
-                
-                let hotcache_future = index_storage.get_slice(
-                    split_file, 
-                    offsets.hotcache_start_offset as usize..(offsets.hotcache_start_offset + offsets.hotcache_length) as usize
-                );
-                
-                // Execute both requests in parallel
-                let (footer_result, hotcache_result) = tokio::try_join!(footer_future, hotcache_future)?;
-                
-                debug_log!("✅ PARALLEL OPTIMIZED: Successfully fetched footer ({} bytes) and hotcache ({} bytes)", 
-                          footer_result.len(), hotcache_result.len());
-                
-                // Validate hotcache size matches expectation
-                if hotcache_result.len() != offsets.hotcache_length as usize {
-                    debug_log!("⚠️  Hotcache size mismatch: expected {}, got {}", 
-                              offsets.hotcache_length, hotcache_result.len());
-                }
-                
-                // The footer_data already includes the hotcache at the end in Quickwit format
-                // We don't need to reconstruct it since BundleStorage::open_from_split_data expects this format
-                footer_cache.put(split_id.to_string(), footer_result.clone());
-                
-                // Note: hotcache_result could be used for additional optimizations like 
-                // preloading into HotDirectory cache, but for now we rely on the standard flow
-                debug_log!("💾 Both footer and hotcache fetched in parallel - maximum network efficiency achieved");
-                
-                return Ok(footer_result);
-            } else {
-                debug_log!("📁 Footer offsets available but lazy loading disabled, using traditional method");
-            }
-        } else {
-            debug_log!("📁 No footer offsets available, using traditional multi-request method");
-        }
-        
-        // Get file size first
+        // Get the file size first
         let file_len = index_storage.file_num_bytes(split_file).await? as usize;
-        debug_log!("Split file size: {} bytes for split: {}", file_len, split_id);
         
-        // For S3Mock debugging - let's try to get the first few bytes to see what we're actually receiving
-        debug_log!("DEBUG: Requesting first 100 bytes to check S3Mock response");
-        let first_bytes = index_storage.get_slice(split_file, 0..std::cmp::min(100, file_len)).await?;
-        let first_text = String::from_utf8_lossy(first_bytes.as_ref());
-        debug_log!("DEBUG: First 100 bytes contain: '{}'", &first_text);
+        // Read last 4 bytes to get hotcache length (SplitPayloadBuilder uses 4-byte markers)
+        let hotcache_len_bytes = index_storage.get_slice(split_file, file_len - 4..file_len).await?;
+        let hotcache_len = u32::from_le_bytes(hotcache_len_bytes.as_ref().try_into()?) as usize;
         
-        // Check if this looks like an HTML error response
-        if first_text.contains("<html") || first_text.contains("<?xml") || first_text.contains("Error") {
+        debug_log!("Read hotcache length from S3 split: {} bytes", hotcache_len);
+        
+        // Calculate metadata length position (4 bytes before hotcache) with bounds checking
+        let required_overhead = 4 + hotcache_len + 4; // hotcache_len + hotcache + metadata_len
+        if file_len < required_overhead {
             return Err(anyhow::anyhow!(
-                "Split file '{}' contains HTML/XML error response ({} bytes): '{}...' S3Mock is returning an error page instead of the split file. This suggests either:\n1. The file wasn't uploaded successfully\n2. S3Mock doesn't support HTTP Range requests\n3. File path/key mismatch",
-                split_file.display(), file_len, &first_text[..std::cmp::min(100, first_text.len())]
+                "Split file too small ({} bytes) to contain required overhead ({} bytes) for split: {}", 
+                file_len, required_overhead, split_id
             ));
         }
         
-        // Validate file size - split files should be at least a few KB
-        // Also check for suspiciously small files that might be error responses
-        if file_len < 1000 || (file_len > 300 && file_len < 500) {
+        let metadata_len_start = file_len - required_overhead;
+        let metadata_len_bytes = index_storage.get_slice(split_file, metadata_len_start..metadata_len_start + 4).await?;
+        let metadata_len = u32::from_le_bytes(metadata_len_bytes.as_ref().try_into()?) as usize;
+        
+        debug_log!("Read metadata length from S3 split: {} bytes", metadata_len);
+        
+        // Validate that metadata_len doesn't cause underflow
+        if metadata_len > metadata_len_start {
             return Err(anyhow::anyhow!(
-                "Split file '{}' has suspicious size ({} bytes). This might be an HTTP error page instead of a valid split file. Check S3Mock configuration and file upload.",
-                split_file.display(), file_len
+                "Invalid metadata length ({} bytes) would cause underflow for split: {}. File size: {}, metadata_len_start: {}", 
+                metadata_len, split_id, file_len, metadata_len_start
             ));
         }
         
-        // 🚀 OPTIMIZATION: Single-request footer metadata parsing
-        // Instead of 3 separate requests, read tail once to get both lengths
-        // This reduces S3 requests by 66% (3 requests → 1 request)
-        debug_log!("🚀 OPTIMIZED: Single-request footer metadata parsing");
+        // Read the entire footer: [metadata][metadata_len: 4 bytes][hotcache][hotcache_len: 4 bytes]
+        let footer_start = metadata_len_start - metadata_len;
         
-        // Read enough tail bytes to handle largest expected split metadata
-        // Format: [metadata][metadata_len:8][hotcache][hotcache_len:8]
-        // We need at least 16 bytes for the two length fields, but read more for safety
-        const METADATA_TAIL_SIZE: usize = 1024; // 1KB should cover both length fields plus safety margin
-        let tail_start = file_len.saturating_sub(METADATA_TAIL_SIZE);
-        let tail_bytes = index_storage.get_slice(split_file, tail_start..file_len).await?;
-        
-        if tail_bytes.len() < 16 {
+        // Final bounds check before creating the slice
+        if footer_start > file_len {
             return Err(anyhow::anyhow!(
-                "Footer tail too small: expected at least 16 bytes, got {} bytes for split: {}",
-                tail_bytes.len(), split_id
+                "Invalid footer range: start={}, end={}, file_len={} for split: {}", 
+                footer_start, file_len, file_len, split_id
             ));
         }
         
-        debug_log!("Successfully read footer tail ({} bytes) for split: {}", tail_bytes.len(), split_id);
+        let split_footer = index_storage.get_slice(split_file, footer_start..file_len).await?;
         
-        // Parse hotcache length from last 8 bytes of tail
-        let tail_len = tail_bytes.len();
-        let hotcache_len_bytes = &tail_bytes.as_ref()[tail_len - 8..tail_len];
-        let hotcache_len = if hotcache_len_bytes.len() == 8 {
-            let bytes: [u8; 8] = hotcache_len_bytes.try_into()
-                .map_err(|e| anyhow::anyhow!("Failed to convert hotcache length bytes: {}", e))?;
-            u64::from_le_bytes(bytes) as usize
-        } else {
-            return Err(anyhow::anyhow!(
-                "Invalid hotcache length data: expected 8 bytes, got {} bytes for split: {}",
-                hotcache_len_bytes.len(), split_id
-            ));
-        };
-        
-        debug_log!("Hotcache length: {} bytes for split: {}", hotcache_len, split_id);
-        
-        // Parse metadata length from 8 bytes before hotcache length
-        // Position: tail_len - 8 (hotcache_len) - hotcache_len - 8 (metadata_len)
-        let metadata_len_offset_in_tail = tail_len - 8 - hotcache_len - 8;
-        
-        // Check if we have enough data in our tail read
-        if metadata_len_offset_in_tail + 8 > tail_len {
-            // Fallback: if our tail read wasn't large enough, make one more specific request
-            debug_log!("Tail read insufficient for metadata length, making additional request");
-            let metadata_len_start = file_len - 8 - hotcache_len - 8;
-            let metadata_len_bytes = index_storage
-                .get_slice(split_file, metadata_len_start..metadata_len_start + 8)
-                .await?;
-            
-            let metadata_len = if metadata_len_bytes.len() == 8 {
-                let bytes: [u8; 8] = metadata_len_bytes.as_ref().try_into()
-                    .map_err(|e| anyhow::anyhow!("Failed to convert metadata length bytes: {}", e))?;
-                u64::from_le_bytes(bytes) as usize
-            } else {
-                return Err(anyhow::anyhow!(
-                    "Invalid metadata length data: expected 8 bytes, got {} bytes for split: {}",
-                    metadata_len_bytes.len(), split_id
-                ));
-            };
-            
-            // Read the complete footer
-            let footer_start = metadata_len_start - metadata_len;
-            let footer_data = index_storage
-                .get_slice(split_file, footer_start..file_len)
-                .await
-                .with_context(|| {
-                    format!(
-                        "failed to fetch footer from {} for split `{}` (range: {}..{})",
-                        index_storage.uri(),
-                        split_id,
-                        footer_start,
-                        file_len
-                    )
-                })?;
-                
-            debug_log!("Successfully fetched split footer ({} bytes, fallback method) for split: {}", 
-                      footer_data.len(), split_id);
-            return Ok(footer_data);
-        }
-        
-        // Parse metadata length from tail data (optimization successful!)
-        let metadata_len_bytes = &tail_bytes.as_ref()[metadata_len_offset_in_tail..metadata_len_offset_in_tail + 8];
-        let metadata_len = if metadata_len_bytes.len() == 8 {
-            let bytes: [u8; 8] = metadata_len_bytes.try_into()
-                .map_err(|e| anyhow::anyhow!("Failed to convert metadata length bytes: {}", e))?;
-            u64::from_le_bytes(bytes) as usize
-        } else {
-            return Err(anyhow::anyhow!(
-                "Invalid metadata length data: expected 8 bytes, got {} bytes for split: {}",
-                metadata_len_bytes.len(), split_id
-            ));
-        };
-        
-        debug_log!("Metadata length: {} bytes for split: {} (parsed from tail)", metadata_len, split_id);
-        
-        // Calculate footer range and read complete footer
-        let footer_start = file_len - 8 - hotcache_len - 8 - metadata_len;
-        let footer_data = index_storage
-            .get_slice(split_file, footer_start..file_len)
-            .await
-            .with_context(|| {
-                format!(
-                    "failed to fetch footer from {} for split `{}` (range: {}..{})",
-                    index_storage.uri(),
-                    split_id,
-                    footer_start,
-                    file_len
-                )
-            })?;
-        
-        debug_log!("🚀 OPTIMIZED: Successfully fetched split footer ({} bytes) with single-request metadata parsing for split: {}", 
-                  footer_data.len(), split_id);
+        debug_log!("Successfully read split footer ({} bytes) from S3 split: {}", 
+                  split_footer.len(), split_id);
         
         // Cache the footer for future use
-        footer_cache.put(split_id.to_owned(), footer_data.clone());
+        footer_cache.put(split_id.to_owned(), split_footer.clone());
         
-        Ok(footer_data)
+        Ok(split_footer)
     }
     
-    /// Get split footer from cache or fetch from local file (ONLY footer, not entire file)
+    /// Get split footer from cache or fetch from local file using format compatible with SplitPayloadBuilder
     async fn get_split_footer_from_cache_or_fetch_local(
         index_storage: Arc<dyn Storage>,
         split_file: &std::path::Path,
@@ -666,61 +729,58 @@ impl SplitSearcher {
         
         debug_log!("Split footer cache MISS for local split: {}, reading footer from file", split_id);
         
-        // For local files, we can use the same approach as S3
+        // Get the file size first
         let file_len = index_storage.file_num_bytes(split_file).await? as usize;
         
-        // Validate file size - split files should be at least a few KB
-        // Also check for suspiciously small files
-        if file_len < 1000 || (file_len > 300 && file_len < 500) {
+        // Read last 4 bytes to get hotcache length (SplitPayloadBuilder uses 4-byte markers)
+        let hotcache_len_bytes = index_storage.get_slice(split_file, file_len - 4..file_len).await?;
+        let hotcache_len = u32::from_le_bytes(hotcache_len_bytes.as_ref().try_into()?) as usize;
+        
+        debug_log!("Read hotcache length from local split: {} bytes", hotcache_len);
+        
+        // Calculate metadata length position (4 bytes before hotcache) with bounds checking
+        let required_overhead = 4 + hotcache_len + 4; // hotcache_len + hotcache + metadata_len
+        if file_len < required_overhead {
             return Err(anyhow::anyhow!(
-                "Local split file '{}' has suspicious size ({} bytes). This might not be a valid split file.",
-                split_file.display(), file_len
+                "Split file too small ({} bytes) to contain required overhead ({} bytes) for split: {}", 
+                file_len, required_overhead, split_id
             ));
         }
         
-        // Read last 8 bytes to get hotcache length
-        let hotcache_len_bytes = index_storage.get_slice(split_file, file_len - 8..file_len).await?;
+        let metadata_len_start = file_len - required_overhead;
+        let metadata_len_bytes = index_storage.get_slice(split_file, metadata_len_start..metadata_len_start + 4).await?;
+        let metadata_len = u32::from_le_bytes(metadata_len_bytes.as_ref().try_into()?) as usize;
         
-        // Safe conversion with proper error handling
-        let hotcache_len = if hotcache_len_bytes.len() == 8 {
-            let bytes: [u8; 8] = hotcache_len_bytes.as_ref().try_into()
-                .map_err(|e| anyhow::anyhow!("Failed to convert local hotcache length bytes: {} (got {} bytes)", e, hotcache_len_bytes.len()))?;
-            u64::from_le_bytes(bytes) as usize
-        } else {
+        debug_log!("Read metadata length from local split: {} bytes", metadata_len);
+        
+        // Validate that metadata_len doesn't cause underflow
+        if metadata_len > metadata_len_start {
             return Err(anyhow::anyhow!(
-                "Invalid local hotcache length data: expected 8 bytes, got {} bytes. Local split file may be corrupted.", 
-                hotcache_len_bytes.len()
+                "Invalid metadata length ({} bytes) would cause underflow for split: {}. File size: {}, metadata_len_start: {}", 
+                metadata_len, split_id, file_len, metadata_len_start
             ));
-        };
+        }
         
-        // Read metadata length (8 bytes before hotcache)
-        let metadata_len_start = file_len - 8 - hotcache_len - 8;
-        let metadata_len_bytes = index_storage
-            .get_slice(split_file, metadata_len_start..metadata_len_start + 8)
-            .await?;
-        
-        // Safe conversion with proper error handling
-        let metadata_len = if metadata_len_bytes.len() == 8 {
-            let bytes: [u8; 8] = metadata_len_bytes.as_ref().try_into()
-                .map_err(|e| anyhow::anyhow!("Failed to convert local metadata length bytes: {} (got {} bytes)", e, metadata_len_bytes.len()))?;
-            u64::from_le_bytes(bytes) as usize
-        } else {
-            return Err(anyhow::anyhow!(
-                "Invalid local metadata length data: expected 8 bytes, got {} bytes at offset {}. Local split file may be corrupted.", 
-                metadata_len_bytes.len(), metadata_len_start
-            ));
-        };
-        
-        // Read the complete footer
+        // Read the entire footer: [metadata][metadata_len: 4 bytes][hotcache][hotcache_len: 4 bytes]
         let footer_start = metadata_len_start - metadata_len;
-        let footer_data = index_storage.get_slice(split_file, footer_start..file_len).await?;
         
-        debug_log!("Successfully read split footer ({} bytes) from local file for split: {}", footer_data.len(), split_id);
+        // Final bounds check before creating the slice
+        if footer_start > file_len {
+            return Err(anyhow::anyhow!(
+                "Invalid footer range: start={}, end={}, file_len={} for split: {}", 
+                footer_start, file_len, file_len, split_id
+            ));
+        }
         
-        // Cache the footer
-        footer_cache.put(split_id.to_owned(), footer_data.clone());
+        let split_footer = index_storage.get_slice(split_file, footer_start..file_len).await?;
         
-        Ok(footer_data)
+        debug_log!("Successfully read split footer ({} bytes) from local split: {}", 
+                  split_footer.len(), split_id);
+        
+        // Cache the footer for future use
+        footer_cache.put(split_id.to_owned(), split_footer.clone());
+        
+        Ok(split_footer)
     }
 
 
@@ -1073,10 +1133,23 @@ impl SplitSearcher {
             }
         }
         
-        // This should work now because HotDirectory supports sync reads
-        // even with async underlying storage (following Quickwit's design)
-        let search_results = searcher.search(&*query, &collector)
-            .map_err(|e| anyhow::anyhow!("Search execution failed: {}", e))?;
+        // Use Quickwit's pattern: run synchronous search in dedicated thread pool
+        let search_results = {
+            // Create search thread pool following Quickwit's pattern
+            use std::sync::OnceLock;
+            static SEARCH_THREAD_POOL: OnceLock<ThreadPool> = OnceLock::new();
+            let thread_pool = SEARCH_THREAD_POOL.get_or_init(|| ThreadPool::new("tantivy4java-search", None));
+            
+            // Clone what we need for the thread pool
+            let query_clone = query.box_clone();
+            let searcher_clone = searcher.clone();
+            
+            // Run in CPU-intensive thread pool like Quickwit does (this returns a Future)
+            thread_pool.run_cpu_intensive(move || {
+                debug_log!("Running search in dedicated thread pool");
+                searcher_clone.search(&*query_clone, &collector)
+            }).await?.map_err(|e| anyhow::anyhow!("Search execution failed: {}", e))?
+        };
         
         debug_log!("Search completed with {} results", search_results.len());
         
@@ -1522,6 +1595,77 @@ struct FooterOffsetConfig {
     enable_lazy_loading: bool,
 }
 
+impl FooterOffsetConfig {
+    /// Validates that all offset values are sensible and consistent
+    /// Returns an error if any offsets are invalid
+    fn validate(&self) -> anyhow::Result<()> {
+        // Check that footer_start_offset is valid (can be 0 for files that start with footer)
+        // Note: u64 is always >= 0, but we check for consistency with documentation
+        
+        // Check that footer_end_offset is positive and greater than start
+        if self.footer_end_offset == 0 {
+            return Err(anyhow::anyhow!(
+                "Invalid footer_end_offset: {}. Offset must be > 0.", 
+                self.footer_end_offset
+            ));
+        }
+        
+        if self.footer_end_offset <= self.footer_start_offset {
+            return Err(anyhow::anyhow!(
+                "Invalid footer range: start={}, end={}. Footer end must be greater than start.", 
+                self.footer_start_offset, self.footer_end_offset
+            ));
+        }
+        
+        // Check that hotcache_length makes sense (hotcache_start_offset can be 0)
+        // Note: u64 is always >= 0, but we validate the range doesn't overflow
+        
+        // Validate that hotcache doesn't extend beyond reasonable bounds
+        if self.hotcache_length > 0 {
+            match self.hotcache_start_offset.checked_add(self.hotcache_length) {
+                Some(_) => {} // No overflow
+                None => {
+                    return Err(anyhow::anyhow!(
+                        "Invalid hotcache range: start={}, length={}. Range would overflow u64.", 
+                        self.hotcache_start_offset, self.hotcache_length
+                    ));
+                }
+            }
+        }
+        
+        // Check for extremely large values that might indicate corruption or invalid data
+        const MAX_REASONABLE_FILE_SIZE: u64 = 100 * 1024 * 1024 * 1024; // 100GB
+        
+        if self.footer_end_offset > MAX_REASONABLE_FILE_SIZE {
+            return Err(anyhow::anyhow!(
+                "Invalid footer_end_offset: {}. Offset is unreasonably large (> 100GB), likely corrupted metadata.", 
+                self.footer_end_offset
+            ));
+        }
+        
+        if self.hotcache_start_offset > MAX_REASONABLE_FILE_SIZE {
+            return Err(anyhow::anyhow!(
+                "Invalid hotcache_start_offset: {}. Offset is unreasonably large (> 100GB), likely corrupted metadata.", 
+                self.hotcache_start_offset
+            ));
+        }
+        
+        if self.hotcache_length > MAX_REASONABLE_FILE_SIZE {
+            return Err(anyhow::anyhow!(
+                "Invalid hotcache_length: {}. Length is unreasonably large (> 100GB), likely corrupted metadata.", 
+                self.hotcache_length
+            ));
+        }
+        
+        // Log successful validation
+        debug_log!("✅ Footer offsets validation passed: footer={}..{}, hotcache={}+{}", 
+                  self.footer_start_offset, self.footer_end_offset, 
+                  self.hotcache_start_offset, self.hotcache_length);
+        
+        Ok(())
+    }
+}
+
 fn extract_footer_offsets_from_java_map(env: &mut JNIEnv, split_config: &JObject) -> anyhow::Result<Option<FooterOffsetConfig>> {
     // Check if split_config is null/empty
     if split_config.is_null() {
@@ -1708,7 +1852,14 @@ fn create_split_searcher_with_shared_cache(
     // Get shared cache manager and pass its caches to the searcher
     if cache_manager_ptr != 0 {
         let managers = crate::split_cache_manager::CACHE_MANAGERS.lock().unwrap();
-        if let Some(cache_manager) = managers.values().find(|m| Arc::as_ptr(m) as jlong == cache_manager_ptr) {
+        // Use safe registry to find cache name, then get manager
+        let cache_manager = if let Some(cache_name) = crate::utils::with_object::<String, _>(cache_manager_ptr as u64, |name| name.clone()) {
+            managers.get(&cache_name)
+        } else {
+            None
+        };
+        
+        if let Some(cache_manager) = cache_manager {
             cache_manager.add_split(split_path.clone());
             
             // Create configuration using shared caches from cache manager
@@ -1810,7 +1961,9 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_warmupQueryNative(
     };
     
     // Create a new runtime for the warmup to avoid nested block_on
-    let warmup_runtime = match tokio::runtime::Runtime::new() {
+    let warmup_runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build() {
         Ok(rt) => rt,
         Err(e) => {
             debug_log!("❌ WARMUP: Failed to create runtime: {}", e);
@@ -1872,7 +2025,9 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_warmupQueryAdvancedNa
     };
     
     // Create a new runtime for the warmup to avoid nested block_on
-    let warmup_runtime = match tokio::runtime::Runtime::new() {
+    let warmup_runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build() {
         Ok(rt) => rt,
         Err(e) => {
             debug_log!("❌ WARMUP: Failed to create runtime: {}", e);
@@ -2571,9 +2726,11 @@ fn extract_string_list(env: &mut JNIEnv, list_obj: jobject) -> anyhow::Result<Ve
         return Ok(result);
     }
     
-    // REQUIRED unsafe: JNI requires raw jobject -> JObject conversion for type safety
-    // This is a JNI interface requirement, not for performance
-    let list = unsafe { JObject::from_raw(list_obj) };
+    // Safe JObject creation with proper validation
+    let list = unsafe {
+        // SAFETY: We've validated list_obj is not null above
+        JObject::from_raw(list_obj)
+    };
     let size = env.call_method(&list, "size", "()I", &[])?.i()?;
     
     for i in 0..size {
@@ -2792,8 +2949,21 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_docsBulkNative(
         let _ = env.throw_new("java/lang/RuntimeException", "Invalid SplitSearcher pointer");
         return std::ptr::null_mut();
     }
-    let segments_array = unsafe { JIntArray::from_raw(segments) };
-    let doc_ids_array = unsafe { JIntArray::from_raw(doc_ids) };
+    // Validate arrays before creating JNI objects
+    if segments.is_null() || doc_ids.is_null() {
+        let _ = env.throw_new("java/lang/RuntimeException", "Arrays cannot be null");
+        return std::ptr::null_mut();
+    }
+    
+    // Safe array creation with validation
+    let segments_array = unsafe { 
+        // SAFETY: We've validated segments is not null above
+        JIntArray::from_raw(segments) 
+    };
+    let doc_ids_array = unsafe { 
+        // SAFETY: We've validated doc_ids is not null above
+        JIntArray::from_raw(doc_ids) 
+    };
     
     let segments_len = match env.get_array_length(&segments_array) {
         Ok(len) => len as usize,
@@ -2973,8 +3143,9 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_parseBulkDocsNative(
                     return std::ptr::null_mut();
                 }
             };
-            if capacity == 0 {
-                // Return empty ArrayList for empty buffer
+            // Validate both capacity and pointer before creating slice
+            if capacity == 0 || ptr.is_null() {
+                // Return empty ArrayList for empty or invalid buffer
                 match env.find_class("java/util/ArrayList") {
                     Ok(arraylist_class) => {
                         match env.new_object(&arraylist_class, "()V", &[]) {
@@ -2985,8 +3156,17 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_parseBulkDocsNative(
                     Err(_) => return std::ptr::null_mut()
                 }
             }
-            // Copy direct buffer data
-            let src_slice = unsafe { std::slice::from_raw_parts(ptr, capacity) };
+            
+            // Additional safety check - limit maximum buffer size to prevent crashes
+            if capacity > 100_000_000 {  // 100MB limit
+                return std::ptr::null_mut();
+            }
+            
+            // Copy direct buffer data safely
+            let src_slice = unsafe { 
+                // SAFETY: We've validated ptr is not null and capacity is reasonable
+                std::slice::from_raw_parts(ptr, capacity) 
+            };
             src_slice.to_vec()
         },
         Err(_) => {

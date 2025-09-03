@@ -1055,8 +1055,19 @@ fn parse_batch_buffer(env: &mut JNIEnv, writer_ptr: jlong, buffer: JByteBuffer) 
         Err(e) => return Err(format!("Failed to get buffer capacity: {}", e)),
     };
     
-    // Create a slice from the direct buffer
+    // Validate buffer parameters before creating slice
+    if byte_buffer.is_null() || buffer_size == 0 {
+        return Err("Invalid buffer: null pointer or zero size".to_string());
+    }
+    
+    // Additional safety check - limit maximum buffer size to prevent crashes
+    if buffer_size > 100_000_000 {  // 100MB limit
+        return Err("Buffer too large: exceeds 100MB limit".to_string());
+    }
+    
+    // Create a slice from the direct buffer safely
     let buffer_slice = unsafe {
+        // SAFETY: We've validated byte_buffer is not null and buffer_size is reasonable
         std::slice::from_raw_parts(byte_buffer as *const u8, buffer_size)
     };
     

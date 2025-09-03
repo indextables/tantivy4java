@@ -31,6 +31,7 @@ public class MillionRecordBulkRetrievalTest {
     
     private static Path splitPath;
     private static String splitUrl;
+    private static QuickwitSplit.SplitMetadata metadata;
     private static Schema schema;
     private static long indexingTimeMs;
     private static long splitCreationTimeMs;
@@ -73,7 +74,7 @@ public class MillionRecordBulkRetrievalTest {
             "perf-node"
         );
         
-        QuickwitSplit.convertIndexFromPath(indexPath.toString(), splitPath.toString(), splitConfig);
+        metadata = QuickwitSplit.convertIndexFromPath(indexPath.toString(), splitPath.toString(), splitConfig);
         splitUrl = "file://" + splitPath.toAbsolutePath().toString();
         splitCreationTimeMs = System.currentTimeMillis() - splitStartTime;
         
@@ -150,7 +151,7 @@ public class MillionRecordBulkRetrievalTest {
     void testVerifyAllRecordsSearchable() {
         System.out.println("🔍 Verifying all 1,000,000 records are searchable...");
         
-        try (SplitSearcher searcher = cacheManager.createSplitSearcher(splitUrl)) {
+        try (SplitSearcher searcher = cacheManager.createSplitSearcher(splitUrl, metadata)) {
             // Query all documents using a match-all approach
             Query matchAllQuery = Query.allQuery();
             
@@ -194,7 +195,7 @@ public class MillionRecordBulkRetrievalTest {
     void testPerformanceComparisonSubset() {
         System.out.println("📊 Performance Test: Retrieving 10,000 document subset\n");
         
-        try (SplitSearcher searcher = cacheManager.createSplitSearcher(splitUrl)) {
+        try (SplitSearcher searcher = cacheManager.createSplitSearcher(splitUrl, metadata)) {
             // Get a subset of documents for testing
             Query query = Query.rangeQuery(schema, "score", FieldType.INTEGER, 90, 100, true, true);
             SearchResult results = searcher.search(query, 10_000);
@@ -283,7 +284,7 @@ public class MillionRecordBulkRetrievalTest {
         System.out.println("🔥 Stress Test: Retrieving all 1,000,000 records\n");
         System.out.println("  ⚠️  This test is disabled by default. Enable when bulk retrieval is implemented.\n");
         
-        try (SplitSearcher searcher = cacheManager.createSplitSearcher(splitUrl)) {
+        try (SplitSearcher searcher = cacheManager.createSplitSearcher(splitUrl, metadata)) {
             // Get all document addresses
             Query matchAllQuery = Query.allQuery();
             SearchResult results = searcher.search(matchAllQuery, TOTAL_DOCUMENTS);
@@ -379,7 +380,7 @@ public class MillionRecordBulkRetrievalTest {
     void testMemoryEfficiency() {
         System.out.println("💾 Memory Efficiency Test\n");
         
-        try (SplitSearcher searcher = cacheManager.createSplitSearcher(splitUrl)) {
+        try (SplitSearcher searcher = cacheManager.createSplitSearcher(splitUrl, metadata)) {
             // Get a moderate batch for memory testing
             Query query = Query.rangeQuery(schema, "score", FieldType.INTEGER, 95, 100, true, true);
             SearchResult results = searcher.search(query, 5_000);

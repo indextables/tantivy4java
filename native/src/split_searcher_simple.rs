@@ -179,17 +179,8 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_getSplitMetadataNativ
     std::ptr::null_mut()
 }
 
-#[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_SplitSearcher_searchNative(
-    _env: JNIEnv,
-    _class: JClass,
-    _ptr: jlong,
-    _query_ptr: jlong,
-    _limit: jint,
-) -> jobject {
-    // Return null for now - will be implemented when search integration is complete
-    std::ptr::null_mut()
-}
+// searchNative implementation removed to avoid conflicts with split_searcher.rs
+// The real implementation is in split_searcher.rs
 
 #[no_mangle]
 pub extern "system" fn Java_com_tantivy4java_SplitSearcher_preloadComponentsNative(
