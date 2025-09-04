@@ -454,26 +454,12 @@ public class SplitCacheManager implements AutoCloseable {
         validateSplitOffsets(splitPath, metadata);
         
         Map<String, Object> splitConfig = new HashMap<>();
-        
-        // Add AWS configuration from the cache manager
         if (!this.awsConfig.isEmpty()) {
             splitConfig.put("aws_config", this.awsConfig);
         }
         
-        // Add footer offsets for lazy loading optimization
-        splitConfig.put("footer_start_offset", metadata.getFooterStartOffset());
-        splitConfig.put("footer_end_offset", metadata.getFooterEndOffset());
-        splitConfig.put("hotcache_start_offset", metadata.getHotcacheStartOffset());
-        splitConfig.put("hotcache_length", metadata.getHotcacheLength());
-        splitConfig.put("enable_lazy_loading", true);
-        
-        // Add doc mapping JSON if available
-        if (metadata.hasDocMapping()) {
-            splitConfig.put("doc_mapping", metadata.getDocMappingJson());
-            System.out.println("✅ Added doc mapping to split config for: " + splitPath);
-        } else {
-            System.out.println("⚠️  No doc mapping available in metadata for: " + splitPath);
-        }
+        // Pass the entire metadata object to the native layer
+        splitConfig.put("split_metadata", metadata);
         
         // Create searcher with optimized configuration
         SplitSearcher searcher = new SplitSearcher(splitPath, this, splitConfig);

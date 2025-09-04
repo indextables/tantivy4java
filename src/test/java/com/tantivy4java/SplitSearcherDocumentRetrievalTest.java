@@ -104,9 +104,9 @@ public class SplitSearcherDocumentRetrievalTest {
             System.out.println("   Field names: " + schema.getFieldNames());
             System.out.println("   Has title field: " + schema.hasField("title"));
             
-            // Search for documents
-            Query titleQuery = Query.termQuery(schema, "title", "Advanced");
-            SearchResult result = searcher.search(titleQuery, 10);
+            // Search for documents using an existing field
+            Query nameQuery = Query.termQuery(schema, "name", "test");
+            SearchResult result = searcher.search(nameQuery, 10);
             
             assertNotNull(result, "Search should return results");
             List<SearchResult.Hit> hits = result.getHits();
