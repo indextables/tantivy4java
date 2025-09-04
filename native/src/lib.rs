@@ -30,7 +30,10 @@ mod doc_address;
 mod utils;
 mod text_analyzer;
 mod quickwit_split;
-mod split_searcher;  // Now using proper Quickwit integration
+mod standalone_searcher;  // Clean standalone searcher implementation
+mod standalone_searcher_jni;  // JNI bindings for standalone searcher
+mod split_searcher_replacement;  // Replacement SplitSearcher JNI methods using StandaloneSearcher
+// mod split_searcher;  // Legacy implementation (now disabled)
 mod split_cache_manager;  // Global cache manager following Quickwit patterns
 // mod split_searcher_simple;  // Disabled to avoid conflicts
 mod common;
@@ -45,7 +48,7 @@ pub use doc_address::*;
 pub use utils::*;
 pub use text_analyzer::*;
 pub use quickwit_split::*;
-pub use split_searcher::*;  // Now enabled with proper Quickwit integration
+// pub use split_searcher::*;  // Disabled - now using replacement JNI methods
 // pub use split_searcher_simple::*;  // Disabled to avoid conflicts
 
 #[no_mangle]

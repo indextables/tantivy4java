@@ -67,7 +67,7 @@ impl GlobalSplitCacheManager {
             max_file_descriptors: NonZeroU32::new(100).unwrap(),
         };
         
-        let storage_resolver = crate::split_searcher::create_storage_resolver();
+        let storage_resolver = crate::standalone_searcher::create_storage_resolver();
         
         // Ensure we're in the runtime context when creating SplitCache
         let _guard = runtime.enter();
