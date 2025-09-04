@@ -13,8 +13,6 @@ macro_rules! debug_log {
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::ops::RangeInclusive;
-use std::io::Write;
-use std::fs::File;
 use tempfile as temp;
 
 // Add tantivy Directory trait import
@@ -25,18 +23,17 @@ use chrono::{DateTime, Utc};
 use uuid::Uuid;
 use serde::{Serialize, Deserialize};
 use serde_json;
-use base64::{Engine, engine::general_purpose};
 
 // Quickwit imports
-use quickwit_storage::{SplitPayloadBuilder, PutPayload, BundleStorage, RamStorage, Storage, StorageResolver, LocalFileStorageFactory, S3CompatibleObjectStorageFactory};
+use quickwit_storage::{PutPayload, BundleStorage, RamStorage, Storage, StorageResolver, LocalFileStorageFactory, S3CompatibleObjectStorageFactory};
 use quickwit_directories::write_hotcache;
 use quickwit_config::S3StorageConfig;
 use quickwit_common::uri::{Uri, Protocol};
-use quickwit_doc_mapper::{DocMapper, default_doc_mapper_for_test};
-use tantivy::directory::{OwnedBytes, FileSlice};
+use quickwit_doc_mapper::default_doc_mapper_for_test;
+use tantivy::directory::OwnedBytes;
 use std::str::FromStr;
 
-use crate::utils::{convert_throwable, jstring_to_string, string_to_jstring, with_object};
+use crate::utils::{convert_throwable, jstring_to_string, string_to_jstring};
 
 /// Extract or create a DocMapper from a Tantivy index schema
 fn extract_doc_mapping_from_index(tantivy_index: &tantivy::Index) -> Result<String> {
@@ -374,7 +371,7 @@ fn create_quickwit_split(
     _split_metadata: &QuickwitSplitMetadata
 ) -> Result<FooterOffsets, anyhow::Error> {
     use quickwit_storage::SplitPayloadBuilder;
-    use std::path::PathBuf;
+    
     
     debug_log!("create_quickwit_split called with output_path: {:?}", output_path);
     
@@ -1108,7 +1105,7 @@ fn merge_splits_impl(split_urls: &[String], output_path: &str, config: &MergeCon
     use quickwit_directories::UnionDirectory;
     use tantivy::directory::{MmapDirectory, Directory, Advice, DirectoryClone};
     use tantivy::{Index as TantivyIndex, IndexMeta};
-    use tantivy::index::SegmentId;
+    
     
     debug_log!("🔧 MERGE OPERATION: Implementing split merge using Quickwit's efficient approach for {} splits", split_urls.len());
     debug_log!("🚨 MERGE SAFETY: Lazy loading DISABLED for merge operations to prevent range assertion failures");
@@ -1457,8 +1454,8 @@ fn get_tantivy_directory_from_split_bundle(split_path: &str) -> Result<Box<dyn t
 /// CRITICAL: This version is used for merge operations to prevent range assertion failures
 /// It forces full file download instead of using lazy loading with potentially corrupted offsets
 fn get_tantivy_directory_from_split_bundle_full_access(split_path: &str) -> Result<Box<dyn tantivy::Directory>> {
-    use quickwit_storage::{BundleStorage, RamStorage, Storage, PutPayload};
-    use tantivy::directory::{OwnedBytes, MmapDirectory};
+    use quickwit_storage::PutPayload;
+    use tantivy::directory::OwnedBytes;
     use quickwit_directories::BundleDirectory;
     
     debug_log!("🔧 MERGE SAFETY: Opening bundle directory with FULL ACCESS (no lazy loading): {}", split_path);
@@ -1490,7 +1487,7 @@ fn get_tantivy_directory_from_split_bundle_full_access(split_path: &str) -> Resu
 
 /// Combine multiple index metadata using Quickwit's approach
 fn combine_index_meta(mut index_metas: Vec<tantivy::IndexMeta>) -> Result<tantivy::IndexMeta> {
-    use tantivy::IndexMeta;
+    
     
     debug_log!("Combining {} index metadata objects", index_metas.len());
     

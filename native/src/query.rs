@@ -20,7 +20,7 @@
 use jni::objects::{JClass, JString, JObject};
 use jni::sys::{jlong, jboolean, jint, jdouble, jlongArray, jobject};
 use jni::JNIEnv;
-use tantivy::query::{Query as TantivyQuery, TermQuery, AllQuery, BooleanQuery, Occur, RangeQuery, PhraseQuery, FuzzyTermQuery, RegexQuery, BoostQuery, ConstScoreQuery, TermSetQuery, QueryParser};
+use tantivy::query::{Query as TantivyQuery, TermQuery, AllQuery, BooleanQuery, Occur, RangeQuery, PhraseQuery, FuzzyTermQuery, RegexQuery, BoostQuery, ConstScoreQuery, QueryParser};
 use tantivy::schema::{Schema, Term, IndexRecordOption, FieldType as TantivyFieldType, Field};
 use tantivy::DateTime;
 use std::ops::Bound;
@@ -2106,7 +2106,7 @@ pub extern "system" fn Java_com_tantivy4java_SnippetGenerator_nativeCreate(
 
 #[no_mangle]
 pub extern "system" fn Java_com_tantivy4java_SnippetGenerator_nativeSnippetFromDoc(
-    mut env: JNIEnv,
+    env: JNIEnv,
     _class: JClass,
     snippet_generator_ptr: jlong,
     doc_ptr: jlong,
@@ -2118,7 +2118,7 @@ pub extern "system" fn Java_com_tantivy4java_SnippetGenerator_nativeSnippetFromD
 
 #[no_mangle]
 pub extern "system" fn Java_com_tantivy4java_SnippetGenerator_nativeSetMaxNumChars(
-    mut env: JNIEnv,
+    env: JNIEnv,
     _class: JClass,
     snippet_generator_ptr: jlong,
     max_num_chars: jint,
@@ -2225,7 +2225,7 @@ pub extern "system" fn Java_com_tantivy4java_Snippet_nativeClose(
 // Range JNI methods
 #[no_mangle]
 pub extern "system" fn Java_com_tantivy4java_Range_nativeGetStart(
-    mut env: JNIEnv,
+    env: JNIEnv,
     _class: JClass,
     range_ptr: jlong,
 ) -> jint {
@@ -2238,7 +2238,7 @@ pub extern "system" fn Java_com_tantivy4java_Range_nativeGetStart(
 
 #[no_mangle]
 pub extern "system" fn Java_com_tantivy4java_Range_nativeGetEnd(
-    mut env: JNIEnv,
+    env: JNIEnv,
     _class: JClass,
     range_ptr: jlong,
 ) -> jint {

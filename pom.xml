@@ -140,6 +140,32 @@
                 </configuration>
             </plugin>
 
+            <!-- Clean old native libraries before compilation -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-antrun-plugin</artifactId>
+                <version>3.1.0</version>
+                <executions>
+                    <execution>
+                        <id>clean-native-libs</id>
+                        <phase>initialize</phase>
+                        <goals>
+                            <goal>run</goal>
+                        </goals>
+                        <configuration>
+                            <target>
+                                <echo message="Cleaning old native library files..."/>
+                                <delete failonerror="false" verbose="true">
+                                    <fileset dir="${project.basedir}/native" includes="libtantivy4java.*"/>
+                                    <fileset dir="${project.basedir}/native" includes="tantivy4java.dll"/>
+                                </delete>
+                                <echo message="Old native library files cleaned"/>
+                            </target>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+
             <!-- Native library build plugin -->
             <plugin>
                 <groupId>org.codehaus.mojo</groupId>
@@ -156,7 +182,7 @@
                             <executable>cargo</executable>
                             <arguments>
                                 <argument>build</argument>
-                                <!-- SCOTT <argument>- - release</argument> -->
+                                <argument>--release</argument>
                                 <argument>--target-dir</argument>
                                 <argument>${rust.target.dir}</argument>
                             </arguments>
@@ -183,7 +209,6 @@
                             <resources>
                                 <resource>
                                     <directory>${rust.target.dir}/release</directory>
-                                    <directory>${rust.target.dir}/debug</directory>
                                     <includes>
                                         <include>libtantivy4java.so</include>
                                         <include>libtantivy4java.dylib</include>
@@ -239,7 +264,7 @@
                                     <executable>cargo</executable>
                                     <arguments>
                                         <argument>build</argument>
-                                        <!-- SJS <argument>- - release</argument> -->
+                                        <argument>--release</argument>
                                         <argument>--target-dir</argument>
                                         <argument>${rust.target.dir}</argument>
                                     </arguments>

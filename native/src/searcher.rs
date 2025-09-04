@@ -26,7 +26,6 @@ use tantivy::query::Query as TantivyQuery;
 use tantivy::index::SegmentId;
 use std::net::IpAddr;
 use crate::utils::{register_object, remove_object, with_object, with_object_mut, handle_error};
-use serde_json;
 use crate::document::{RetrievedDocument, DocumentWrapper};
 
 // Helper function to extract segment IDs from Java List<String>

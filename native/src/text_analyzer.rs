@@ -2,11 +2,11 @@ use jni::objects::{JClass, JObject, JString, JValue};
 use jni::sys::{jlong, jobject};
 use jni::JNIEnv;
 use tantivy::tokenizer::{
-    SimpleTokenizer, WhitespaceTokenizer, RawTokenizer, Token,
-    LowerCaser, RemoveLongFilter, StopWordFilter, TextAnalyzer as TantivyAnalyzer
+    SimpleTokenizer, WhitespaceTokenizer, RawTokenizer,
+    LowerCaser, RemoveLongFilter, TextAnalyzer as TantivyAnalyzer
 };
 
-use crate::utils::{handle_error, register_object, remove_object, with_object, with_object_mut};
+use crate::utils::{handle_error, register_object, remove_object, with_object_mut};
 
 /// Create a text analyzer with the specified tokenizer
 #[no_mangle]

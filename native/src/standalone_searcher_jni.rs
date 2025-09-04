@@ -1,17 +1,16 @@
 // standalone_searcher_jni.rs - JNI bindings for the clean StandaloneSearcher implementation
 
 use std::sync::Arc;
-use jni::objects::{JClass, JString, JObject, GlobalRef};
-use jni::sys::{jlong, jobject, jstring, jboolean};
+use jni::objects::{JClass, JString};
+use jni::sys::{jlong, jstring};
 use jni::JNIEnv;
 
-use crate::standalone_searcher::{StandaloneSearcher, StandaloneSearchConfig, SplitSearchMetadata, SplitSearchRequest};
+use crate::standalone_searcher::{StandaloneSearcher, StandaloneSearchConfig, SplitSearchMetadata};
 use crate::utils::{register_object, remove_object, with_object};
 use crate::common::to_java_exception;
 
 use quickwit_proto::search::{SearchRequest, LeafSearchResponse};
 use quickwit_doc_mapper::DocMapper;
-use anyhow::Result;
 
 /// Create a new StandaloneSearcher with default configuration
 #[no_mangle]

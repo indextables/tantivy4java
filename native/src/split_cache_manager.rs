@@ -12,7 +12,7 @@ macro_rules! debug_log {
 }
 
 use jni::JNIEnv;
-use jni::objects::{JClass, JObject, JString, JValue};
+use jni::objects::{JClass, JObject, JString};
 use jni::sys::{jlong, jint, jobject};
 
 use quickwit_storage::{ByteRangeCache, SplitCache, MemorySizedCache};
@@ -280,15 +280,15 @@ pub extern "system" fn Java_com_tantivy4java_SplitCacheManager_getGlobalCacheSta
         return std::ptr::null_mut();
     }
     
-    // Safely access through global registry instead of unsafe pointer cast
-    let managers = CACHE_MANAGERS.lock().unwrap();
-    // Use safe registry to find cache name, then get manager
-    let manager = if let Some(cache_name) = crate::utils::with_object::<String, _>(ptr as u64, |name| name.clone()) {
-        managers.get(&cache_name)
-    } else {
-        None
+    // Get cache name FIRST to avoid double-locking
+    let cache_name = match crate::utils::with_object::<String, _>(ptr as u64, |name| name.clone()) {
+        Some(name) => name,
+        None => return std::ptr::null_mut(),
     };
-    let manager = match manager {
+    
+    // THEN access the cache managers registry
+    let managers = CACHE_MANAGERS.lock().unwrap();
+    let manager = match managers.get(&cache_name) {
         Some(manager_arc) => manager_arc,
         None => return std::ptr::null_mut(),
     };
@@ -328,15 +328,15 @@ pub extern "system" fn Java_com_tantivy4java_SplitCacheManager_forceEvictionNati
         return;
     }
     
-    // Safely access through global registry instead of unsafe pointer cast
-    let managers = CACHE_MANAGERS.lock().unwrap();
-    // Use safe registry to find cache name, then get manager
-    let manager = if let Some(cache_name) = crate::utils::with_object::<String, _>(ptr as u64, |name| name.clone()) {
-        managers.get(&cache_name)
-    } else {
-        None
+    // Get cache name FIRST to avoid double-locking
+    let cache_name = match crate::utils::with_object::<String, _>(ptr as u64, |name| name.clone()) {
+        Some(name) => name,
+        None => return,
     };
-    let manager = match manager {
+    
+    // THEN access the cache managers registry
+    let managers = CACHE_MANAGERS.lock().unwrap();
+    let manager = match managers.get(&cache_name) {
         Some(manager_arc) => manager_arc,
         None => return,
     };
@@ -435,15 +435,15 @@ pub extern "system" fn Java_com_tantivy4java_SplitCacheManager_preloadComponents
         return;
     }
     
-    // Safely access through global registry instead of unsafe pointer cast
-    let managers = CACHE_MANAGERS.lock().unwrap();
-    // Use safe registry to find cache name, then get manager
-    let manager = if let Some(cache_name) = crate::utils::with_object::<String, _>(ptr as u64, |name| name.clone()) {
-        managers.get(&cache_name)
-    } else {
-        None
+    // Get cache name FIRST to avoid double-locking
+    let cache_name = match crate::utils::with_object::<String, _>(ptr as u64, |name| name.clone()) {
+        Some(name) => name,
+        None => return,
     };
-    let manager = match manager {
+    
+    // THEN access the cache managers registry
+    let managers = CACHE_MANAGERS.lock().unwrap();
+    let manager = match managers.get(&cache_name) {
         Some(manager_arc) => manager_arc,
         None => return,
     };
@@ -463,15 +463,15 @@ pub extern "system" fn Java_com_tantivy4java_SplitCacheManager_evictComponentsNa
         return;
     }
     
-    // Safely access through global registry instead of unsafe pointer cast
-    let managers = CACHE_MANAGERS.lock().unwrap();
-    // Use safe registry to find cache name, then get manager
-    let manager = if let Some(cache_name) = crate::utils::with_object::<String, _>(ptr as u64, |name| name.clone()) {
-        managers.get(&cache_name)
-    } else {
-        None
+    // Get cache name FIRST to avoid double-locking
+    let cache_name = match crate::utils::with_object::<String, _>(ptr as u64, |name| name.clone()) {
+        Some(name) => name,
+        None => return,
     };
-    let manager = match manager {
+    
+    // THEN access the cache managers registry
+    let managers = CACHE_MANAGERS.lock().unwrap();
+    let manager = match managers.get(&cache_name) {
         Some(manager_arc) => manager_arc,
         None => return,
     };
@@ -492,15 +492,18 @@ pub extern "system" fn Java_com_tantivy4java_SplitCacheManager_searchAcrossAllSp
         return std::ptr::null_mut();
     }
     
-    // Safely access through global registry instead of unsafe pointer cast
-    let managers = CACHE_MANAGERS.lock().unwrap();
-    // Use safe registry to find cache name, then get manager
-    let manager = if let Some(cache_name) = crate::utils::with_object::<String, _>(ptr as u64, |name| name.clone()) {
-        managers.get(&cache_name)
-    } else {
-        None
+    // Get cache name FIRST to avoid double-locking
+    let cache_name = match crate::utils::with_object::<String, _>(ptr as u64, |name| name.clone()) {
+        Some(name) => name,
+        None => {
+            let _ = env.throw_new("java/lang/RuntimeException", "SplitCacheManager not found in registry");
+            return std::ptr::null_mut();
+        }
     };
-    let manager = match manager {
+    
+    // THEN access the cache managers registry
+    let managers = CACHE_MANAGERS.lock().unwrap();
+    let manager = match managers.get(&cache_name) {
         Some(manager_arc) => manager_arc,
         None => {
             let _ = env.throw_new("java/lang/RuntimeException", "SplitCacheManager not found in registry");
@@ -528,15 +531,18 @@ pub extern "system" fn Java_com_tantivy4java_SplitCacheManager_searchAcrossSplit
         return std::ptr::null_mut();
     }
     
-    // Safely access through global registry instead of unsafe pointer cast
-    let managers = CACHE_MANAGERS.lock().unwrap();
-    // Use safe registry to find cache name, then get manager
-    let manager = if let Some(cache_name) = crate::utils::with_object::<String, _>(ptr as u64, |name| name.clone()) {
-        managers.get(&cache_name)
-    } else {
-        None
+    // Get cache name FIRST to avoid double-locking
+    let cache_name = match crate::utils::with_object::<String, _>(ptr as u64, |name| name.clone()) {
+        Some(name) => name,
+        None => {
+            let _ = env.throw_new("java/lang/RuntimeException", "SplitCacheManager not found in registry");
+            return std::ptr::null_mut();
+        }
     };
-    let manager = match manager {
+    
+    // THEN access the cache managers registry
+    let managers = CACHE_MANAGERS.lock().unwrap();
+    let manager = match managers.get(&cache_name) {
         Some(manager_arc) => manager_arc,
         None => {
             let _ = env.throw_new("java/lang/RuntimeException", "SplitCacheManager not found in registry");

@@ -1,7 +1,5 @@
 // standalone_searcher.rs - Clean implementation based on standalone_searcher_design.md
 
-use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -10,8 +8,7 @@ use tokio::sync::Semaphore;
 use anyhow::{Result, Context as AnyhowContext};
 
 use quickwit_storage::{
-    Storage, StorageResolver, MemorySizedCache, QuickwitCache, ByteRangeCache,
-    wrap_storage_with_cache, STORAGE_METRICS, LocalFileStorageFactory, 
+    Storage, StorageResolver, MemorySizedCache, QuickwitCache, STORAGE_METRICS, LocalFileStorageFactory, 
     S3CompatibleObjectStorageFactory
 };
 use quickwit_config::S3StorageConfig;
@@ -20,10 +17,16 @@ use quickwit_doc_mapper::DocMapper;
 use quickwit_search::{leaf_search_single_split, SearcherContext, CanSplitDoBetter};
 use quickwit_search::list_fields_cache::ListFieldsCache;
 use quickwit_search::leaf_cache::LeafSearchCache;
-use quickwit_search::search_permit_provider::{SearchPermitProvider, SearchPermit};
+use quickwit_search::search_permit_provider::{SearchPermitProvider, SearchPermit, compute_initial_memory_allocation};
 use quickwit_config::SearcherConfig;
 use quickwit_common::uri::Uri;
 use tantivy::aggregation::AggregationLimitsGuard;
+
+/// Result of async search operation for JNI bridge
+pub struct SearchResult {
+    pub response: LeafSearchResponse,
+    pub error: Option<anyhow::Error>,
+}
 
 /// Configuration for the standalone searcher
 #[derive(Clone, Debug)]
@@ -231,7 +234,8 @@ impl StandaloneSearcher {
         Self::new(StandaloneSearchConfig::default())
     }
     
-    /// Search a single split
+    /// Search a single split using Quickwit's exact async pattern
+    /// This follows the same pattern as single_doc_mapping_leaf_search
     pub async fn search_split(
         &self,
         split_uri: &str,
@@ -250,21 +254,34 @@ impl StandaloneSearcher {
         // Convert metadata to internal format
         let split_offsets = SplitIdAndFooterOffsets::from(metadata.clone());
         
+        // FOLLOW QUICKWIT'S EXACT PATTERN: Get permits first, then await individual permit
+        let memory_allocation = compute_initial_memory_allocation(
+            &split_offsets,
+            self.context.config.warmup.split_initial_allocation
+        );
+        
+        let permit_futures = self.context.permit_provider.get_permits(vec![memory_allocation]).await;
+        let permit_future = permit_futures.into_iter().next()
+            .expect("Expected one permit future");
+        let mut search_permit = permit_future.await;
+        
         // Execute search using Quickwit's proven search implementation
-        self.search_single_split_internal(
+        self.search_single_split_with_permit(
             storage,
             split_offsets,
             search_request,
             doc_mapper,
+            &mut search_permit,
         ).await
     }
     
-    async fn search_single_split_internal(
+    async fn search_single_split_with_permit(
         &self,
         storage: Arc<dyn Storage>,
         split: SplitIdAndFooterOffsets,
         search_request: SearchRequest,
         doc_mapper: Arc<DocMapper>,
+        search_permit: &mut SearchPermit,
     ) -> Result<LeafSearchResponse> {
         // Create SearcherContext using the proven approach from open_split_bundle
         let searcher_context = SearcherContext {
@@ -285,14 +302,6 @@ impl StandaloneSearcher {
         // Create required dependencies for leaf_search_single_split
         let split_filter = Arc::new(RwLock::new(CanSplitDoBetter::Uninformative));
         let aggregations_limits = (*self.context.aggregation_limits).clone();
-        
-        // Get search permit - we need to provide the memory size for the split
-        let permit_futures = self.context.permit_provider.get_permits(vec![
-            self.context.config.warmup.split_initial_allocation
-        ]).await;
-        let permit_future = permit_futures.into_iter().next()
-            .expect("Expected one permit future");
-        let mut search_permit = permit_future.await;
 
         // Save split_id before move
         let split_id = split.split_id.clone();
@@ -307,13 +316,35 @@ impl StandaloneSearcher {
             doc_mapper,
             split_filter,
             aggregations_limits,
-            &mut search_permit,
+            search_permit,
         ).await
         .with_context(|| format!("Failed to search split: {}", split_id))?;
         
         Ok(result)
     }
     
+    /// Synchronous search method for JNI bridge that avoids block_on deadlocks
+    /// This creates its own runtime to handle the async operations properly
+    pub fn search_split_sync(
+        &self,
+        split_uri: &str,
+        metadata: SplitSearchMetadata,
+        search_request: SearchRequest,
+        doc_mapper: Arc<DocMapper>,
+    ) -> Result<LeafSearchResponse> {
+        // Create a separate current_thread runtime for this operation
+        // This avoids the deadlock issue with nested block_on calls
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .with_context(|| "Failed to create runtime for sync search")?;
+            
+        // Run the async search in the dedicated runtime
+        rt.block_on(async {
+            self.search_split(split_uri, metadata, search_request, doc_mapper).await
+        })
+    }
+
     /// Get cache statistics
     pub fn cache_stats(&self) -> CacheStats {
         self.context.cache_stats()
