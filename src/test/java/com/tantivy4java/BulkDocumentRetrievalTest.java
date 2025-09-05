@@ -10,6 +10,8 @@ import java.time.LocalDateTime;
 import java.util.*;
 import java.util.stream.Collectors;
 
+import com.tantivy4java.SplitRangeQuery.RangeBound;
+
 import static org.junit.jupiter.api.Assertions.*;
 
 /**
@@ -113,7 +115,7 @@ public class BulkDocumentRetrievalTest {
             assertNotNull(searcher, "Split searcher should be created successfully");
             
             // Get a sample of documents to retrieve
-            Query query = Query.termQuery(schema, "content", "comprehensive");
+            SplitQuery query = new SplitTermQuery("content", "comprehensive");
             SearchResult results = searcher.search(query, 20);
             assertTrue(results.getHits().size() >= 10, "Should find multiple documents");
             
@@ -167,7 +169,7 @@ public class BulkDocumentRetrievalTest {
     void testBulkRetrievalFunctionality() {
         try (SplitSearcher searcher = cacheManager.createSplitSearcher(splitUrl, metadata)) {
             // Get some documents to test with
-            Query query = Query.rangeQuery(schema, "score", FieldType.INTEGER, 85, 95, true, true);
+            SplitQuery query = new SplitRangeQuery("score", RangeBound.inclusive("85"), RangeBound.inclusive("95"));
             SearchResult results = searcher.search(query, 15);
             assertTrue(results.getHits().size() >= 10, "Should find documents in score range");
             
@@ -209,7 +211,7 @@ public class BulkDocumentRetrievalTest {
     void testIndividualRetrievalPerformanceBenchmark() {
         try (SplitSearcher searcher = cacheManager.createSplitSearcher(splitUrl, metadata)) {
             // Get documents to test performance with
-            Query query = Query.termQuery(schema, "content", "content"); 
+            SplitQuery query = new SplitTermQuery("content", "content"); 
             SearchResult results = searcher.search(query, TOTAL_DOCUMENTS);
             assertTrue(results.getHits().size() >= 20, "Should find many documents");
             
@@ -274,7 +276,7 @@ public class BulkDocumentRetrievalTest {
     @DisplayName("Test API contract for bulk retrieval methods")
     void testBulkRetrievalAPIContract() {
         try (SplitSearcher searcher = cacheManager.createSplitSearcher(splitUrl, metadata)) {
-            Query query = Query.termQuery(schema, "content", "content");
+            SplitQuery query = new SplitTermQuery("content", "content");
             SearchResult results = searcher.search(query, 10);
             
             List<DocAddress> addresses = results.getHits().stream()

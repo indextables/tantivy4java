@@ -30,6 +30,8 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 
+import com.tantivy4java.SplitRangeQuery.RangeBound;
+
 import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
 import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
 import software.amazon.awssdk.regions.Region;
@@ -669,16 +671,16 @@ public class RealS3EndToEndTest {
             
             // Test 1: Verify total document count
             System.out.println("Test 1: Document count validation");
-            Query allDocsQuery = Query.termQuery(schema, "domain", "customers");
+            SplitQuery allDocsQuery = new SplitTermQuery("domain", "customers");
             SearchResult customersResult = searcher.search(allDocsQuery, 1000);
             
-            allDocsQuery = Query.termQuery(schema, "domain", "products");
+            allDocsQuery = new SplitTermQuery("domain", "products");
             SearchResult productsResult = searcher.search(allDocsQuery, 1000);
             
-            allDocsQuery = Query.termQuery(schema, "domain", "orders");
+            allDocsQuery = new SplitTermQuery("domain", "orders");
             SearchResult ordersResult = searcher.search(allDocsQuery, 1000);
             
-            allDocsQuery = Query.termQuery(schema, "domain", "reviews");
+            allDocsQuery = new SplitTermQuery("domain", "reviews");
             SearchResult reviewsResult = searcher.search(allDocsQuery, 1000);
             
             int totalFoundDocs = customersResult.getHits().size() + 
@@ -726,12 +728,12 @@ public class RealS3EndToEndTest {
             // Test 3: Cross-domain queries
             System.out.println("Test 3: Cross-domain query validation");
             
-            Query titleQuery = Query.termQuery(schema, "name", "Customer");
+            SplitQuery titleQuery = new SplitTermQuery("name", "Customer");
             SearchResult titleResults = searcher.search(titleQuery, 100);
             assertTrue(titleResults.getHits().size() > 0, "Should find documents with 'Customer' in name");
             
             // Range query on numeric fields
-            Query priceRangeQuery = Query.rangeQuery(schema, "price", FieldType.INTEGER, 10, 1000, true, true);
+            SplitQuery priceRangeQuery = new SplitRangeQuery("price", RangeBound.inclusive("10"), RangeBound.inclusive("1000"));
             SearchResult priceResults = searcher.search(priceRangeQuery, 100);
             // Note: Some domains might not have price field, so just check it doesn't crash
             assertNotNull(priceResults, "Range query should not crash");
@@ -741,13 +743,12 @@ public class RealS3EndToEndTest {
             // Test 4: Boolean query combining multiple conditions
             System.out.println("Test 4: Complex boolean query validation");
             
-            Query domainQuery = Query.termQuery(schema, "domain", "products");
-            Query nameQuery = Query.termQuery(schema, "name", "Product");
+            SplitQuery domainQuery = new SplitTermQuery("domain", "products");
+            SplitQuery nameQuery = new SplitTermQuery("name", "Product");
             
-            Query booleanQuery = Query.booleanQuery(Arrays.asList(
-                new Query.OccurQuery(Occur.MUST, domainQuery),
-                new Query.OccurQuery(Occur.MUST, nameQuery)
-            ));
+            SplitQuery booleanQuery = new SplitBooleanQuery()
+                .addMust(domainQuery)
+                .addMust(nameQuery);
             
             SearchResult booleanResults = searcher.search(booleanQuery, 50);
             assertNotNull(booleanResults, "Boolean query should succeed");
@@ -793,7 +794,7 @@ public class RealS3EndToEndTest {
         long coldStartTime = System.nanoTime();
         try (SplitSearcher coldSearcher = perfCacheManager.createSplitSearcher(mergedSplitS3Url, mergedSplitMetadata)) {
             Schema schema = coldSearcher.getSchema();
-            Query testQuery = Query.termQuery(schema, "domain", "customers");
+            SplitQuery testQuery = new SplitTermQuery("domain", "customers");
             SearchResult coldResult = coldSearcher.search(testQuery, 10);
             assertNotNull(coldResult);
         }
@@ -809,7 +810,7 @@ public class RealS3EndToEndTest {
         long warmStartTime = System.nanoTime();
         try (SplitSearcher warmSearcher = perfCacheManager.createSplitSearcher(mergedSplitS3Url, mergedSplitMetadata)) {
             Schema schema = warmSearcher.getSchema();
-            Query testQuery = Query.termQuery(schema, "domain", "customers");
+            SplitQuery testQuery = new SplitTermQuery("domain", "customers");
             SearchResult warmResult = warmSearcher.search(testQuery, 10);
             assertNotNull(warmResult);
         }

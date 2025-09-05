@@ -8,6 +8,8 @@ import java.time.Instant;
 import java.util.HashMap;
 import java.util.Map;
 
+import com.tantivy4java.SplitRangeQuery.RangeBound;
+
 import static org.junit.jupiter.api.Assertions.*;
 
 /**
@@ -121,7 +123,7 @@ public class FooterOptimizationTest {
             assertNotNull(schema, "Schema should be accessible");
             
             // Test search functionality
-            Query query = Query.termQuery(schema, "content", "content");
+            SplitQuery query = new SplitTermQuery("content", "content");
             SearchResult result = searcher.search(query, 10);
             assertNotNull(result, "Search should return results");
             assertTrue(result.getHits().size() > 0, "Should find matching documents");
@@ -239,21 +241,20 @@ public class FooterOptimizationTest {
             Schema schema = searcher.getSchema();
             
             // Test 1: Basic text search
-            Query textQuery = Query.termQuery(schema, "title", "Test");
+            SplitQuery textQuery = new SplitTermQuery("title", "Test");
             SearchResult textResult = searcher.search(textQuery, 20);
             assertTrue(textResult.getHits().size() > 0, "Should find documents with 'Test' in title");
             
             // Test 2: Range query on numeric field
-            Query rangeQuery = Query.rangeQuery(schema, "score", FieldType.INTEGER, 
-                                                87, 92, true, true);
+            SplitQuery rangeQuery = new SplitRangeQuery("score", 
+                                                RangeBound.inclusive("87"), RangeBound.inclusive("92"));
             SearchResult rangeResult = searcher.search(rangeQuery, 10);
             assertTrue(rangeResult.getHits().size() > 0, "Should find documents in score range");
             
             // Test 3: Boolean query combining multiple conditions
-            Query boolQuery = Query.booleanQuery(java.util.Arrays.asList(
-                new Query.OccurQuery(Occur.MUST, textQuery),
-                new Query.OccurQuery(Occur.MUST, rangeQuery)
-            ));
+            SplitQuery boolQuery = new SplitBooleanQuery()
+                .addMust(textQuery)
+                .addMust(rangeQuery);
             SearchResult boolResult = searcher.search(boolQuery, 10);
             assertNotNull(boolResult, "Boolean query should return results");
             

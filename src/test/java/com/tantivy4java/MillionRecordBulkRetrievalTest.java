@@ -152,8 +152,8 @@ public class MillionRecordBulkRetrievalTest {
         System.out.println("🔍 Verifying all 1,000,000 records are searchable...");
         
         try (SplitSearcher searcher = cacheManager.createSplitSearcher(splitUrl, metadata)) {
-            // Query all documents using a match-all approach
-            Query matchAllQuery = Query.allQuery();
+            // Query all documents using a match-all approach with SplitQuery API
+            SplitQuery matchAllQuery = new SplitMatchAllQuery();
             
             // Search with high limit to get total count
             SearchResult results = searcher.search(matchAllQuery, TOTAL_DOCUMENTS);
@@ -169,7 +169,7 @@ public class MillionRecordBulkRetrievalTest {
                 int docIndex = random.nextInt(TOTAL_DOCUMENTS);
                 String expectedId = String.format("doc_%08d", docIndex);
                 
-                Query idQuery = Query.termQuery(schema, "id", expectedId);
+                SplitQuery idQuery = new SplitTermQuery("id", expectedId);
                 SearchResult idResult = searcher.search(idQuery, 1);
                 
                 assertEquals(1, idResult.getHits().size(), 
@@ -196,8 +196,10 @@ public class MillionRecordBulkRetrievalTest {
         System.out.println("📊 Performance Test: Retrieving 10,000 document subset\n");
         
         try (SplitSearcher searcher = cacheManager.createSplitSearcher(splitUrl, metadata)) {
-            // Get a subset of documents for testing
-            Query query = Query.rangeQuery(schema, "score", FieldType.INTEGER, 90, 100, true, true);
+            // Get a subset of documents for testing using SplitRangeQuery
+            SplitQuery query = new SplitRangeQuery("score", 
+                    SplitRangeQuery.RangeBound.inclusive("90"), 
+                    SplitRangeQuery.RangeBound.inclusive("100"));
             SearchResult results = searcher.search(query, 10_000);
             
             List<DocAddress> addresses = results.getHits().stream()
@@ -285,8 +287,8 @@ public class MillionRecordBulkRetrievalTest {
         System.out.println("  ⚠️  This test is disabled by default. Enable when bulk retrieval is implemented.\n");
         
         try (SplitSearcher searcher = cacheManager.createSplitSearcher(splitUrl, metadata)) {
-            // Get all document addresses
-            Query matchAllQuery = Query.allQuery();
+            // Get all document addresses using SplitQuery API
+            SplitQuery matchAllQuery = new SplitMatchAllQuery();
             SearchResult results = searcher.search(matchAllQuery, TOTAL_DOCUMENTS);
             
             List<DocAddress> allAddresses = results.getHits().stream()
@@ -381,8 +383,10 @@ public class MillionRecordBulkRetrievalTest {
         System.out.println("💾 Memory Efficiency Test\n");
         
         try (SplitSearcher searcher = cacheManager.createSplitSearcher(splitUrl, metadata)) {
-            // Get a moderate batch for memory testing
-            Query query = Query.rangeQuery(schema, "score", FieldType.INTEGER, 95, 100, true, true);
+            // Get a moderate batch for memory testing using SplitRangeQuery
+            SplitQuery query = new SplitRangeQuery("score", 
+                    SplitRangeQuery.RangeBound.inclusive("95"), 
+                    SplitRangeQuery.RangeBound.inclusive("100"));
             SearchResult results = searcher.search(query, 5_000);
             
             List<DocAddress> addresses = results.getHits().stream()

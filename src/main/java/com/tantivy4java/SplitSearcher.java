@@ -177,51 +177,43 @@ public class SplitSearcher implements AutoCloseable {
     }
     
     /**
-     * Parse a query string using this split's schema and tokenization settings.
-     * This method provides the same query parsing functionality as Index.parseQuery()
-     * but uses the schema from the split file.
+     * Parse a query string using Quickwit's proven query parser.
+     * This method leverages Quickwit's robust query parsing libraries for reliable
+     * and efficient query parsing with the split's schema.
      * 
-     * @param queryString The query string to parse (e.g., "title:python AND content:machine")
-     * @return Parsed Query object ready for search operations
-     * @throws RuntimeException If the query string is malformed or contains invalid field references
-     * 
-     * @see Index#parseQuery(String)
+     * @param queryString The query string (e.g., "title:hello", "age:[1 TO 100]", "status:active AND priority:high")
+     * @return A SplitQuery that can be used for efficient split searching
      */
-    public Query parseQuery(String queryString) {
-        long queryPtr = parseQueryNative(nativePtr, queryString);
-        return new Query(queryPtr);
+    public SplitQuery parseQuery(String queryString) {
+        Schema schema = getSchema();
+        return SplitQuery.parseQuery(queryString, schema);
     }
     
     /**
-     * Search the split with hot cache optimization
+     * Search the split using a SplitQuery with efficient QueryAst conversion.
+     * This method converts the SplitQuery to Quickwit's QueryAst format and uses
+     * Quickwit's proven search algorithms for optimal performance.
+     * 
+     * @param splitQuery The query to execute (use parseQuery() to create from string)
+     * @param limit Maximum number of results to return
+     * @return SearchResult containing matching documents and their scores
      */
-    public SearchResult search(Query query, int limit) {
-        System.out.println("🔍 Java SplitSearcher.search called with nativePtr=" + nativePtr + ", queryPtr=" + query.getNativePtr() + ", limit=" + limit);
+    public SearchResult search(SplitQuery splitQuery, int limit) {
         if (nativePtr == 0) {
-            System.out.println("❌ Java: nativePtr is 0!");
-            return null;
+            throw new IllegalStateException("SplitSearcher has been closed or not properly initialized");
         }
-        if (query.getNativePtr() == 0) {
-            System.out.println("❌ Java: query.getNativePtr() is 0!");
-            return null;
+        if (splitQuery == null) {
+            throw new IllegalArgumentException("SplitQuery cannot be null");
         }
         
         try {
-            System.out.println("🔍 Java: About to call searchNative...");
-            System.out.flush(); // Force output before native call
+            // Convert SplitQuery to QueryAst JSON using Quickwit libraries
+            String queryAstJson = splitQuery.toQueryAstJson();
             
-            SearchResult result = searchNative(nativePtr, query.getNativePtr(), limit);
-            
-            System.out.println("🔍 Java: searchNative returned: " + result);
-            return result;
-        } catch (UnsatisfiedLinkError e) {
-            System.out.println("❌ Java: UnsatisfiedLinkError: " + e.getMessage());
-            e.printStackTrace();
-            return null;
-        } catch (Throwable e) {
-            System.out.println("❌ Java: searchNative threw throwable: " + e.getClass().getName() + ": " + e.getMessage());
-            e.printStackTrace();
-            return null;
+            // Use the native search method that accepts QueryAst JSON
+            return searchWithQueryAst(nativePtr, queryAstJson, limit);
+        } catch (Exception e) {
+            throw new RuntimeException("Search failed: " + e.getMessage(), e);
         }
     }
     
@@ -454,8 +446,7 @@ public class SplitSearcher implements AutoCloseable {
     // Native methods
     private static native long createNativeWithSharedCache(String splitPath, long cacheManagerPtr, Map<String, Object> splitConfig);
     private static native long getSchemaFromNative(long nativePtr);
-    private static native long parseQueryNative(long nativePtr, String queryString);
-    private static native SearchResult searchNative(long nativePtr, long queryPtr, int limit);
+    private static native SearchResult searchWithQueryAst(long nativePtr, String queryAstJson, int limit);
     private static native Document docNative(long nativePtr, int segment, int docId);
     private static native byte[] docsBulkNative(long nativePtr, int[] segments, int[] docIds);
     private static native List<Document> parseBulkDocsNative(java.nio.ByteBuffer buffer);

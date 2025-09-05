@@ -189,10 +189,10 @@ public class S3MergeMockTest {
                 
                 // Search for documents that should exist from split-1 and split-2
                 // Based on createTestIndex(), each split has documents with "Test Document X for Index Y" titles
-                Query titleQuery = Query.termQuery(schema, "title", "Test");
+                SplitQuery titleQuery = new SplitTermQuery("title", "Test");
                 SearchResult titleResult = searcher.search(titleQuery, 20);
                 
-                Query contentQuery = Query.termQuery(schema, "content", "content");
+                SplitQuery contentQuery = new SplitTermQuery("content", "content");
                 SearchResult contentResult = searcher.search(contentQuery, 20);
                 
                 // Verify we found documents from both source splits

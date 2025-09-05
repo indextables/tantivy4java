@@ -28,11 +28,13 @@ mod index;
 mod searcher;
 mod doc_address;
 mod utils;
+// mod query_conversion;  // Disabled in favor of split_query approach
 mod text_analyzer;
 mod quickwit_split;
 mod standalone_searcher;  // Clean standalone searcher implementation
 mod standalone_searcher_jni;  // JNI bindings for standalone searcher
 mod split_searcher_replacement;  // Replacement SplitSearcher JNI methods using StandaloneSearcher
+mod split_query;  // SplitQuery Java objects and native conversion using Quickwit libraries
 // mod split_searcher;  // Legacy implementation (now disabled)
 mod split_cache_manager;  // Global cache manager following Quickwit patterns
 // mod split_searcher_simple;  // Disabled to avoid conflicts

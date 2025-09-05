@@ -129,7 +129,7 @@ public class SimpleBulkRetrievalTest {
         
         try (SplitSearcher searcher = cacheManager.createSplitSearcher(splitUrl, metadata)) {
             // Search for all documents
-            Query query = Query.termQuery(schema, "content", "searchable");
+            SplitQuery query = new SplitTermQuery("content", "searchable");
             SearchResult results = searcher.search(query, TOTAL_DOCUMENTS);
             
             assertEquals(TOTAL_DOCUMENTS, results.getHits().size(), 
@@ -147,7 +147,7 @@ public class SimpleBulkRetrievalTest {
         
         try (SplitSearcher searcher = cacheManager.createSplitSearcher(splitUrl, metadata)) {
             // Get some document addresses
-            Query query = Query.termQuery(schema, "content", "searchable");
+            SplitQuery query = new SplitTermQuery("content", "searchable");
             SearchResult results = searcher.search(query, 5);
             
             List<DocAddress> addresses = results.getHits().stream()
@@ -201,7 +201,7 @@ public class SimpleBulkRetrievalTest {
         
         try (SplitSearcher searcher = cacheManager.createSplitSearcher(splitUrl, metadata)) {
             // Get a small set of documents for validation
-            Query query = Query.termQuery(schema, "content", "searchable");
+            SplitQuery query = new SplitTermQuery("content", "searchable");
             SearchResult results = searcher.search(query, 10);
             
             List<DocAddress> addresses = results.getHits().stream()
@@ -395,7 +395,7 @@ public class SimpleBulkRetrievalTest {
         
         try (SplitSearcher searcher = cacheManager.createSplitSearcher(splitUrl, metadata)) {
             // Get 100 documents for baseline
-            Query query = Query.termQuery(schema, "content", "searchable");
+            SplitQuery query = new SplitTermQuery("content", "searchable");
             SearchResult results = searcher.search(query, 100);
             
             List<DocAddress> addresses = results.getHits().stream()
