@@ -25,7 +25,7 @@ use tantivy::schema::{Schema, Term, IndexRecordOption, FieldType as TantivyField
 use tantivy::DateTime;
 use std::ops::Bound;
 use time::Month;
-use crate::utils::{register_object, remove_object, with_object, handle_error};
+use crate::utils::{register_object, remove_object, with_object, handle_error, with_arc_safe};
 use crate::extract_helpers::{extract_long_value, extract_double_value};
 
 #[no_mangle]
@@ -50,7 +50,8 @@ pub extern "system" fn Java_com_tantivy4java_Query_nativeTermQuery(
         Err(_) => "position".to_string(),
     };
     
-    let result = with_object::<Schema, Result<Box<dyn TantivyQuery>, String>>(schema_ptr as u64, |schema| {
+    let result = with_arc_safe::<Schema, Result<Box<dyn TantivyQuery>, String>>(schema_ptr, |schema_arc| {
+        let schema = schema_arc.as_ref();
         // Get field by name
         let field = match schema.get_field(&field_name_str) {
             Ok(f) => f,
@@ -234,7 +235,8 @@ pub extern "system" fn Java_com_tantivy4java_Query_nativeTermSetQuery(
         }
     };
     
-    let result = with_object::<Schema, Result<Box<dyn TantivyQuery>, String>>(schema_ptr as u64, |schema| {
+    let result = with_arc_safe::<Schema, Result<Box<dyn TantivyQuery>, String>>(schema_ptr, |schema_arc| {
+        let schema = schema_arc.as_ref();
         // Get field by name
         let field = match schema.get_field(&field_name_str) {
             Ok(f) => f,
@@ -301,7 +303,8 @@ pub extern "system" fn Java_com_tantivy4java_Query_nativeFuzzyTermQuery(
         }
     };
     
-    let result = with_object::<Schema, Result<Box<dyn TantivyQuery>, String>>(schema_ptr as u64, |schema| {
+    let result = with_arc_safe::<Schema, Result<Box<dyn TantivyQuery>, String>>(schema_ptr, |schema_arc| {
+        let schema = schema_arc.as_ref();
         // Get field by name
         let field = match schema.get_field(&field_name_str) {
             Ok(f) => f,
@@ -383,7 +386,8 @@ pub extern "system" fn Java_com_tantivy4java_Query_nativePhraseQuery(
         }
     };
     
-    let result = with_object::<Schema, Result<Box<dyn TantivyQuery>, String>>(schema_ptr as u64, |schema| {
+    let result = with_arc_safe::<Schema, Result<Box<dyn TantivyQuery>, String>>(schema_ptr, |schema_arc| {
+        let schema = schema_arc.as_ref();
         // Get field by name
         let field = match schema.get_field(&field_name_str) {
             Ok(f) => f,
@@ -571,7 +575,8 @@ pub extern "system" fn Java_com_tantivy4java_Query_nativeRegexQuery(
         }
     };
     
-    let result = with_object::<Schema, Result<Box<dyn TantivyQuery>, String>>(schema_ptr as u64, |schema| {
+    let result = with_arc_safe::<Schema, Result<Box<dyn TantivyQuery>, String>>(schema_ptr, |schema_arc| {
+        let schema = schema_arc.as_ref();
         // Get field by name
         let field = match schema.get_field(&field_name_str) {
             Ok(f) => f,
@@ -632,7 +637,8 @@ pub extern "system" fn Java_com_tantivy4java_Query_nativeWildcardQuery(
     };
     
     
-    let result = with_object::<Schema, Result<Box<dyn TantivyQuery>, String>>(schema_ptr as u64, |schema| {
+    let result = with_arc_safe::<Schema, Result<Box<dyn TantivyQuery>, String>>(schema_ptr, |schema_arc| {
+        let schema = schema_arc.as_ref();
         // Get field by name
         let field = match schema.get_field(&field_name_str) {
             Ok(f) => f,
@@ -717,7 +723,8 @@ pub extern "system" fn Java_com_tantivy4java_Query_nativeWildcardQueryLenient(
     
     let is_lenient = lenient != 0;
     
-    let result = with_object::<Schema, Result<Box<dyn TantivyQuery>, String>>(schema_ptr as u64, |schema| {
+    let result = with_arc_safe::<Schema, Result<Box<dyn TantivyQuery>, String>>(schema_ptr, |schema_arc| {
+        let schema = schema_arc.as_ref();
         // Get field by name
         let field = match schema.get_field(&field_name_str) {
             Ok(f) => f,
@@ -1528,7 +1535,8 @@ pub extern "system" fn Java_com_tantivy4java_Query_nativeRangeQuery(
         }
     };
     
-    let result = with_object::<Schema, Result<Box<dyn TantivyQuery>, String>>(schema_ptr as u64, |schema| {
+    let result = with_arc_safe::<Schema, Result<Box<dyn TantivyQuery>, String>>(schema_ptr, |schema_arc| {
+        let schema = schema_arc.as_ref();
         // Get field by name
         let field = match schema.get_field(&field_name_str) {
             Ok(f) => f,

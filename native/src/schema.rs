@@ -22,7 +22,7 @@ use jni::sys::{jboolean, jlong, jint, jobject};
 use jni::JNIEnv;
 use tantivy::schema::{SchemaBuilder, TextOptions, NumericOptions, DateOptions, IpAddrOptions};
 use tantivy::schema::{IndexRecordOption, TextFieldIndexing};
-use crate::utils::{register_object, remove_object, with_object_mut, handle_error};
+use crate::utils::{register_object, remove_object, with_object, with_object_mut, handle_error, with_arc_safe};
 
 #[no_mangle]
 pub extern "system" fn Java_com_tantivy4java_SchemaBuilder_nativeNew(
@@ -479,13 +479,17 @@ pub extern "system" fn Java_com_tantivy4java_Schema_nativeGetFieldNames(
     _class: JClass,
     ptr: jlong,
 ) -> jobject {
-    use crate::utils::with_object;
-    
     if ptr == 0 {
         return std::ptr::null_mut();
     }
     
-    let result = with_object::<tantivy::schema::Schema, Result<jobject, String>>(ptr as u64, |schema| {
+    // Debug logging
+    eprintln!("RUST DEBUG: nativeGetFieldNames called with pointer: {}", ptr);
+    
+    // Try Arc-based access first (for SplitSearcher schemas)
+    let result = with_arc_safe::<tantivy::schema::Schema, Result<jobject, String>>(ptr, |schema_arc| {
+        eprintln!("RUST DEBUG: Arc-based access successful for pointer: {}", ptr);
+        let schema = schema_arc.as_ref();
         // Create ArrayList to hold field names
         let array_list_class = env.find_class("java/util/ArrayList").map_err(|e| e.to_string())?;
         let array_list = env.new_object(&array_list_class, "()V", &[]).map_err(|e| e.to_string())?;
@@ -506,9 +510,43 @@ pub extern "system" fn Java_com_tantivy4java_Schema_nativeGetFieldNames(
         Ok(array_list.into_raw())
     });
     
+    // If Arc-based access failed, try regular object access (for SchemaBuilder schemas)
+    let result = match result {
+        Some(result) => Some(result),
+        None => with_object::<tantivy::schema::Schema, Result<jobject, String>>(ptr as u64, |schema| {
+            // Create ArrayList to hold field names
+            let array_list_class = env.find_class("java/util/ArrayList").map_err(|e| e.to_string())?;
+            let array_list = env.new_object(&array_list_class, "()V", &[]).map_err(|e| e.to_string())?;
+            
+            // Get all fields and add their names to the list
+            for (field, _field_entry) in schema.fields() {
+                let field_name = schema.get_field_name(field);
+                let java_string = env.new_string(field_name).map_err(|e| e.to_string())?;
+                
+                env.call_method(
+                    &array_list,
+                    "add",
+                    "(Ljava/lang/Object;)Z",
+                    &[(&java_string).into()],
+                ).map_err(|e| e.to_string())?;
+            }
+            
+            Ok(array_list.into_raw())
+        })
+    };
+    
     match result {
-        Some(Ok(list)) => list,
-        Some(Err(_)) | None => {
+        Some(Ok(list)) => {
+            eprintln!("RUST DEBUG: nativeGetFieldNames - successfully created field names list");
+            list
+        },
+        Some(Err(e)) => {
+            eprintln!("RUST DEBUG: nativeGetFieldNames - with_arc_safe returned error: {}", e);
+            handle_error(&mut env, "Failed to get field names");
+            std::ptr::null_mut()
+        },
+        None => {
+            eprintln!("RUST DEBUG: nativeGetFieldNames - with_arc_safe returned None, jlong_to_arc failed");
             handle_error(&mut env, "Failed to get field names");
             std::ptr::null_mut()
         }
@@ -522,8 +560,6 @@ pub extern "system" fn Java_com_tantivy4java_Schema_nativeHasField(
     ptr: jlong,
     field_name: JString,
 ) -> jboolean {
-    use crate::utils::with_object;
-    
     if ptr == 0 {
         return 0;
     }
@@ -533,9 +569,13 @@ pub extern "system" fn Java_com_tantivy4java_Schema_nativeHasField(
         Err(_) => return 0,
     };
     
-    let result = with_object::<tantivy::schema::Schema, bool>(ptr as u64, |schema| {
+    // Try Arc-based access first (for SplitSearcher schemas), then regular object access
+    let result = with_arc_safe::<tantivy::schema::Schema, bool>(ptr, |schema_arc| {
+        let schema = schema_arc.as_ref();
         schema.get_field(&field_name_str).is_ok()
-    });
+    }).or_else(|| with_object::<tantivy::schema::Schema, bool>(ptr as u64, |schema| {
+        schema.get_field(&field_name_str).is_ok()
+    }));
     
     result.unwrap_or(false) as jboolean
 }
@@ -553,9 +593,13 @@ pub extern "system" fn Java_com_tantivy4java_Schema_nativeGetFieldCount(
         return 0;
     }
     
-    let result = with_object::<tantivy::schema::Schema, usize>(ptr as u64, |schema| {
+    // Try Arc-based access first (for SplitSearcher schemas), then regular object access
+    let result = with_arc_safe::<tantivy::schema::Schema, usize>(ptr, |schema_arc| {
+        let schema = schema_arc.as_ref();
         schema.fields().count()
-    });
+    }).or_else(|| with_object::<tantivy::schema::Schema, usize>(ptr as u64, |schema| {
+        schema.fields().count()
+    }));
     
     result.unwrap_or(0) as jint
 }

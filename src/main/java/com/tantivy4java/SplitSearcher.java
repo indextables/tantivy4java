@@ -170,7 +170,10 @@ public class SplitSearcher implements AutoCloseable {
      * Get the schema for this split
      */
     public Schema getSchema() {
-        return new Schema(getSchemaFromNative(nativePtr));
+        System.out.println("🔍 Java SplitSearcher.getSchema called with nativePtr=" + nativePtr);
+        long schemaPtr = getSchemaFromNative(nativePtr);
+        System.out.println("🔍 Java getSchemaFromNative returned schemaPtr=" + schemaPtr);
+        return new Schema(schemaPtr);
     }
     
     /**

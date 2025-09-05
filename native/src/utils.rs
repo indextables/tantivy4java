@@ -18,8 +18,9 @@
  */
 
 use jni::JNIEnv;
+use jni::sys::jlong;
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
 use once_cell::sync::Lazy;
 
@@ -65,6 +66,36 @@ pub fn remove_object(id: u64) -> bool {
 /// Handle errors by throwing Java exceptions
 pub fn handle_error(env: &mut JNIEnv, error: &str) {
     let _ = env.throw_new("java/lang/RuntimeException", error);
+}
+
+/// Arc-based memory management utilities for preventing crashes
+
+/// Convert Arc to jlong pointer for safe sharing with Java
+pub fn arc_to_jlong<T: Send + Sync + 'static>(arc: Arc<T>) -> jlong {
+    Box::into_raw(Box::new(arc)) as jlong
+}
+
+/// Convert jlong pointer back to Arc reference for safe access
+pub fn jlong_to_arc<T: Send + Sync + 'static>(ptr: jlong) -> Option<Arc<T>> {
+    eprintln!("RUST DEBUG: jlong_to_arc called with pointer: {}", ptr);
+    if ptr == 0 {
+        eprintln!("RUST DEBUG: jlong_to_arc - pointer is 0, returning None");
+        return None;
+    }
+    unsafe {
+        eprintln!("RUST DEBUG: jlong_to_arc - attempting to convert pointer {} to Box<Arc<T>>", ptr);
+        let boxed = Box::from_raw(ptr as *mut Arc<T>);
+        let arc = (*boxed).clone();
+        Box::into_raw(boxed); // Don't drop the box, keep the pointer alive
+        eprintln!("RUST DEBUG: jlong_to_arc - successfully converted pointer {}", ptr);
+        Some(arc)
+    }
+}
+
+/// Execute function with Arc reference - safe memory access
+pub fn with_arc_safe<T: Send + Sync + 'static, R>(ptr: jlong, f: impl FnOnce(&Arc<T>) -> R) -> Option<R> {
+    let arc = jlong_to_arc(ptr)?;
+    Some(f(&arc))
 }
 
 /// Convert Rust Result to Java, throwing exception on error

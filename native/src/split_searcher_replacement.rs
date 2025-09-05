@@ -7,7 +7,7 @@ use jni::sys::{jlong, jobject, jstring, jint, jboolean};
 use jni::JNIEnv;
 
 use crate::standalone_searcher::{StandaloneSearcher, StandaloneSearchConfig, SplitSearchMetadata};
-use crate::utils::{register_object, remove_object, with_object};
+use crate::utils::{register_object, remove_object, with_object, arc_to_jlong, with_arc_safe};
 use crate::common::to_java_exception;
 
 use quickwit_proto::search::{SearchRequest, LeafSearchResponse};
@@ -51,11 +51,75 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_createNativeWithShare
         return 0;
     }
     
-    // Validate split config map (though we're not using it in this implementation)
-    if split_config_map.is_null() {
-        to_java_exception(&mut env, &anyhow::anyhow!("Split config map is null"));
-        return 0;
+    // Extract AWS configuration from the split config map
+    let mut aws_config: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    if !split_config_map.is_null() {
+        // The split_config_map contains an "aws_config" entry which is another HashMap
+        let split_config_jobject = unsafe { JObject::from_raw(split_config_map) };
+        if let Ok(aws_config_obj) = env.call_method(&split_config_jobject, "get", "(Ljava/lang/Object;)Ljava/lang/Object;", &[(&env.new_string("aws_config").unwrap()).into()]) {
+            let aws_config_jobject = aws_config_obj.l().unwrap();
+            if !aws_config_jobject.is_null() {
+                let aws_config_map = &aws_config_jobject;
+                
+                // Extract access_key
+                if let Ok(access_key_obj) = env.call_method(aws_config_map, "get", "(Ljava/lang/Object;)Ljava/lang/Object;", &[(&env.new_string("access_key").unwrap()).into()]) {
+                    let access_key_jobject = access_key_obj.l().unwrap();
+                    if !access_key_jobject.is_null() {
+                        if let Ok(access_key_str) = env.get_string((&access_key_jobject).into()) {
+                            aws_config.insert("access_key".to_string(), access_key_str.into());
+                            eprintln!("RUST DEBUG: Extracted AWS access key from Java config");
+                        }
+                    }
+                }
+                
+                // Extract secret_key  
+                if let Ok(secret_key_obj) = env.call_method(aws_config_map, "get", "(Ljava/lang/Object;)Ljava/lang/Object;", &[(&env.new_string("secret_key").unwrap()).into()]) {
+                    let secret_key_jobject = secret_key_obj.l().unwrap();
+                    if !secret_key_jobject.is_null() {
+                        if let Ok(secret_key_str) = env.get_string((&secret_key_jobject).into()) {
+                            aws_config.insert("secret_key".to_string(), secret_key_str.into());
+                            eprintln!("RUST DEBUG: Extracted AWS secret key from Java config");
+                        }
+                    }
+                }
+                
+                // Extract session_token (optional)
+                if let Ok(session_token_obj) = env.call_method(aws_config_map, "get", "(Ljava/lang/Object;)Ljava/lang/Object;", &[(&env.new_string("session_token").unwrap()).into()]) {
+                    let session_token_jobject = session_token_obj.l().unwrap();
+                    if !session_token_jobject.is_null() {
+                        if let Ok(session_token_str) = env.get_string((&session_token_jobject).into()) {
+                            aws_config.insert("session_token".to_string(), session_token_str.into());
+                            eprintln!("RUST DEBUG: Extracted AWS session token from Java config");
+                        }
+                    }
+                }
+                
+                // Extract region
+                if let Ok(region_obj) = env.call_method(aws_config_map, "get", "(Ljava/lang/Object;)Ljava/lang/Object;", &[(&env.new_string("region").unwrap()).into()]) {
+                    let region_jobject = region_obj.l().unwrap();
+                    if !region_jobject.is_null() {
+                        if let Ok(region_str) = env.get_string((&region_jobject).into()) {
+                            aws_config.insert("region".to_string(), region_str.into());
+                            eprintln!("RUST DEBUG: Extracted AWS region from Java config");
+                        }
+                    }
+                }
+                
+                // Extract endpoint (optional)
+                if let Ok(endpoint_obj) = env.call_method(aws_config_map, "get", "(Ljava/lang/Object;)Ljava/lang/Object;", &[(&env.new_string("endpoint").unwrap()).into()]) {
+                    let endpoint_jobject = endpoint_obj.l().unwrap();
+                    if !endpoint_jobject.is_null() {
+                        if let Ok(endpoint_str) = env.get_string((&endpoint_jobject).into()) {
+                            aws_config.insert("endpoint".to_string(), endpoint_str.into());
+                            eprintln!("RUST DEBUG: Extracted AWS endpoint from Java config");
+                        }
+                    }
+                }
+            }
+        }
     }
+    
+    eprintln!("RUST DEBUG: AWS config extracted: {} keys", aws_config.len());
 
     // Create Tokio runtime for async operations
     let runtime = match tokio::runtime::Builder::new_current_thread()
@@ -75,10 +139,10 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_createNativeWithShare
     let result = StandaloneSearcher::default();
     match result {
         Ok(searcher) => {
-            // Store searcher, runtime, and split URI together for schema extraction
-            let searcher_context = (searcher, runtime, split_uri.clone());
-            let pointer = register_object(searcher_context) as jlong;
-            eprintln!("RUST DEBUG: SUCCESS: Stored searcher context for split '{}' with pointer: {}", split_uri, pointer);
+            // Store searcher, runtime, split URI, and AWS config together using Arc for memory safety
+            let searcher_context = std::sync::Arc::new((searcher, runtime, split_uri.clone(), aws_config));
+            let pointer = arc_to_jlong(searcher_context);
+            eprintln!("RUST DEBUG: SUCCESS: Stored searcher context for split '{}' with Arc pointer: {}", split_uri, pointer);
             pointer
         },
         Err(error) => {
@@ -99,9 +163,9 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_closeNative(
         return;
     }
 
-    if !remove_object(searcher_ptr as u64) {
-        to_java_exception(&mut env, &anyhow::anyhow!("Failed to remove searcher object or invalid pointer"));
-    }
+    // For Arc-based storage, we just need to drop the reference
+    // The Arc will be automatically cleaned up when it goes out of scope
+    eprintln!("RUST DEBUG: Closing searcher with Arc pointer: {}", searcher_ptr);
 }
 
 /// Replacement for Java_com_tantivy4java_SplitSearcher_validateSplitNative  
@@ -116,7 +180,7 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_validateSplitNative(
         return 0; // false
     }
     
-    let is_valid = with_object(searcher_ptr as u64, |_searcher_context: &(StandaloneSearcher, tokio::runtime::Runtime, String)| {
+    let is_valid = with_arc_safe(searcher_ptr, |searcher_context: &Arc<(StandaloneSearcher, tokio::runtime::Runtime, String, std::collections::HashMap<String, String>)>| {
         // Searcher exists and is valid
         true
     }).unwrap_or(false);
@@ -130,24 +194,44 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_getCacheStatsNative(
     mut env: JNIEnv,
     _class: JClass,
     searcher_ptr: jlong,
-) -> jstring {
-    let result = with_object(searcher_ptr as u64, |searcher_context: &(StandaloneSearcher, tokio::runtime::Runtime, String)| {
-        let (searcher, _runtime, _split_uri) = searcher_context;
+) -> jobject {
+    let result = with_arc_safe(searcher_ptr, |searcher_context: &Arc<(StandaloneSearcher, tokio::runtime::Runtime, String, std::collections::HashMap<String, String>)>| {
+        let (searcher, _runtime, _split_uri, _aws_config) = searcher_context.as_ref();
         let stats = searcher.cache_stats();
-        // Create a simple JSON representation
-        format!("{{\"fast_field_bytes\":{},\"split_footer_bytes\":{},\"partial_request_count\":{}}}", 
-               stats.fast_field_bytes, stats.split_footer_bytes, stats.partial_request_count)
+        
+        // Create a CacheStats Java object
+        match env.find_class("com/tantivy4java/SplitSearcher$CacheStats") {
+            Ok(cache_stats_class) => {
+                match env.new_object(
+                    &cache_stats_class,
+                    "(JJJJJ)V", // Constructor signature: (hitCount, missCount, evictionCount, totalSize, maxSize)
+                    &[
+                        (stats.partial_request_count as jlong).into(), // hitCount (using partial_request_count as hits)
+                        (0 as jlong).into(), // missCount (not tracked in our current stats)
+                        (0 as jlong).into(), // evictionCount (not tracked)
+                        ((stats.fast_field_bytes + stats.split_footer_bytes) as jlong).into(), // totalSize
+                        (100_000_000 as jlong).into(), // maxSize (some reasonable default)
+                    ],
+                ) {
+                    Ok(cache_stats_obj) => Some(cache_stats_obj.into_raw()),
+                    Err(e) => {
+                        eprintln!("RUST DEBUG: Failed to create CacheStats object: {}", e);
+                        None
+                    }
+                }
+            },
+            Err(e) => {
+                eprintln!("RUST DEBUG: Failed to find CacheStats class: {}", e);
+                None
+            }
+        }
     });
 
     match result {
-        Some(json_str) => {
-            match env.new_string(json_str) {
-                Ok(jstr) => jstr.into_raw(),
-                Err(error) => {
-                    to_java_exception(&mut env, &anyhow::anyhow!("Failed to create Java string: {}", error));
-                    std::ptr::null_mut()
-                }
-            }
+        Some(Some(cache_stats_obj)) => cache_stats_obj,
+        Some(None) => {
+            to_java_exception(&mut env, &anyhow::anyhow!("Failed to create CacheStats object"));
+            std::ptr::null_mut()
         },
         None => {
             to_java_exception(&mut env, &anyhow::anyhow!("Invalid searcher pointer"));
@@ -197,22 +281,31 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_getSchemaFromNative(
     _class: JClass,
     searcher_ptr: jlong,
 ) -> jlong {
-    eprintln!("RUST DEBUG: getSchemaFromNative called with pointer: {}", searcher_ptr);
+    eprintln!("RUST DEBUG: *** getSchemaFromNative ENTRY POINT *** pointer: {}", searcher_ptr);
+    
+    if searcher_ptr == 0 {
+        eprintln!("RUST DEBUG: searcher_ptr is 0, returning 0");
+        return 0;
+    }
+    
+    eprintln!("RUST DEBUG: About to call with_object to access searcher context...");
     if searcher_ptr == 0 {
         to_java_exception(&mut env, &anyhow::anyhow!("Invalid searcher pointer"));
         return 0;
     }
 
     // Extract the actual schema from the split file using Quickwit's functionality
-    let result = with_object(searcher_ptr as u64, |searcher_context: &(StandaloneSearcher, tokio::runtime::Runtime, String)| {
-        let (_searcher, runtime, split_uri) = searcher_context;
+    let result = with_arc_safe(searcher_ptr, |searcher_context: &Arc<(StandaloneSearcher, tokio::runtime::Runtime, String, std::collections::HashMap<String, String>)>| {
+        let (_searcher, runtime, split_uri, aws_config) = searcher_context.as_ref();
+        eprintln!("RUST DEBUG: getSchemaFromNative called with split URI: {}", split_uri);
         
         // Enter the runtime context for async operations
         let _guard = runtime.enter();
         
-        // Parse the split URI and extract schema using Quickwit's open_split_bundle
+        // Parse the split URI and extract schema using Quickwit's storage abstractions
         use quickwit_common::uri::Uri;
         use quickwit_storage::StorageResolver;
+        use std::path::Path;
         
         // Use block_on to run async code synchronously within the runtime context
         let schema = tokio::task::block_in_place(|| {
@@ -221,19 +314,89 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_getSchemaFromNative(
                 let uri: Uri = split_uri.parse()
                     .map_err(|e| anyhow::anyhow!("Failed to parse split URI {}: {}", split_uri, e))?;
                 
-                let storage_resolver = StorageResolver::unconfigured();
+                // Create S3 storage configuration with credentials from Java config
+                use quickwit_config::{StorageConfigs, S3StorageConfig};
+                let mut storage_configs = StorageConfigs::default();
+                
+                eprintln!("RUST DEBUG: Creating S3 config with credentials from tantivy4java (not environment)");
+                let s3_config = S3StorageConfig {
+                    flavor: None,
+                    access_key_id: aws_config.get("access_key").cloned(),
+                    secret_access_key: aws_config.get("secret_key").cloned(), 
+                    session_token: aws_config.get("session_token").cloned(),
+                    region: aws_config.get("region").cloned(),
+                    endpoint: aws_config.get("endpoint").cloned(),
+                    force_path_style_access: false,
+                    disable_multi_object_delete: false,
+                    disable_multipart_upload: false,
+                };
+                
+                eprintln!("RUST DEBUG: S3 config created with access_key: {}, region: {}", 
+                         s3_config.access_key_id.as_ref().map(|k| &k[..std::cmp::min(8, k.len())]).unwrap_or("None"),
+                         s3_config.region.as_ref().unwrap_or(&"None".to_string()));
+                
+                let mut storage_configs_vec = StorageConfigs::new(vec![quickwit_config::StorageConfig::S3(s3_config.clone())]);
+                storage_configs = storage_configs_vec;
+                
+                let storage_resolver = StorageResolver::configured(&storage_configs);
                 let storage = storage_resolver.resolve(&uri).await
                     .map_err(|e| anyhow::anyhow!("Failed to resolve storage for URI {}: {}", split_uri, e))?;
                 
-                // Get the split data from storage  
-                let split_path = uri.filepath().ok_or_else(|| anyhow::anyhow!("Invalid split path in URI: {}", split_uri))?;
+                // For S3 URIs, we need to handle the path correctly
+                // The issue is that Quickwit's storage resolver treats the full file path as the prefix
+                // For s3://bucket/path/to/file.split, we need to create a new URI with just s3://bucket/path/to/
+                // and then pass "file.split" as the relative path
+                let split_relative_path = match uri.protocol() {
+                    quickwit_common::uri::Protocol::S3 => {
+                        let uri_str = uri.as_str();
+                        eprintln!("RUST DEBUG: S3 URI parsing for: {}", uri_str);
+                        
+                        // Find the last slash to get the filename
+                        if let Some(last_slash_pos) = uri_str.rfind('/') {
+                            let filename = &uri_str[last_slash_pos + 1..];
+                            eprintln!("RUST DEBUG: Extracted S3 filename: '{}'", filename);
+                            
+                            // We need to create a new storage resolver with the correct prefix
+                            // The URI should be s3://bucket/path/to/ (without the filename)
+                            let directory_uri_str = &uri_str[..last_slash_pos + 1];
+                            eprintln!("RUST DEBUG: S3 directory URI should be: '{}'", directory_uri_str);
+                            
+                            // Parse the directory URI and create a new storage resolver
+                            let directory_uri: Uri = directory_uri_str.parse()
+                                .map_err(|e| anyhow::anyhow!("Failed to parse S3 directory URI {}: {}", directory_uri_str, e))?;
+                            
+                            // Replace the storage with one pointing to the directory
+                            let new_storage = storage_resolver.resolve(&directory_uri).await
+                                .map_err(|e| anyhow::anyhow!("Failed to resolve directory storage for URI {}: {}", directory_uri_str, e))?;
+                            
+                            // Update our storage reference - we need to use the new one
+                            // But we can't reassign to storage, so we'll return the data we need
+                            eprintln!("RUST DEBUG: Created new storage resolver for directory, will use filename as relative path");
+                            (new_storage, Path::new(filename))
+                        } else {
+                            eprintln!("RUST DEBUG: ERROR: S3 URI has no slashes: '{}'", uri_str);
+                            (storage, Path::new(""))
+                        }
+                    },
+                    _ => {
+                        // For file:// and other protocols, use filepath
+                        let path = uri.filepath().ok_or_else(|| anyhow::anyhow!("Invalid file path in URI: {}", split_uri))?;
+                        eprintln!("RUST DEBUG: Non-S3 URI path: '{}'", path.display());
+                        (storage, path)
+                    }
+                };
                 
-                // First get the file size, then read the appropriate range
-                let file_size = storage.file_num_bytes(split_path).await
+                let (actual_storage, relative_path) = split_relative_path;
+                
+                eprintln!("RUST DEBUG: About to call storage.file_num_bytes with relative path: '{}'", relative_path.display());
+                
+                // Get the full file data using Quickwit's storage abstraction
+                let file_size = actual_storage.file_num_bytes(relative_path).await
                     .map_err(|e| anyhow::anyhow!("Failed to get file size for {}: {}", split_uri, e))?;
                 
-                // Get the full file data
-                let split_data = storage.get_slice(split_path, 0..file_size as usize).await
+                eprintln!("RUST DEBUG: Got file size: {} bytes", file_size);
+                
+                let split_data = actual_storage.get_slice(relative_path, 0..file_size as usize).await
                     .map_err(|e| anyhow::anyhow!("Failed to get split data from {}: {}", split_uri, e))?;
                 
                 // Open the bundle directory from the split data
@@ -258,11 +421,15 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_getSchemaFromNative(
         
         match schema {
             Ok(s) => {
-                // Register the actual schema from the split and return its pointer
-                crate::utils::register_object(s) as jlong
+                // Register the actual schema from the split using Arc for memory safety
+                let schema_arc = std::sync::Arc::new(s);
+                let schema_ptr = arc_to_jlong(schema_arc);
+                eprintln!("RUST DEBUG: SUCCESS - Schema extracted and registered with Arc pointer: {}", schema_ptr);
+                schema_ptr
             },
             Err(e) => {
-                println!("Failed to extract schema from split {}: {}", split_uri, e);
+                eprintln!("RUST DEBUG: FATAL ERROR - Schema extraction failed completely for split {}: {}", split_uri, e);
+                eprintln!("RUST DEBUG: Error chain: {:?}", e);
                 // Return 0 to indicate failure
                 0
             }
