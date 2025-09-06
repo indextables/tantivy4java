@@ -68,11 +68,36 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_createNativeWithShare
         return 0;
     }
     
-    // Extract AWS configuration from the split config map
+    // Extract AWS configuration and split metadata from the split config map
     let mut aws_config: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut split_footer_start: u64 = 0;
+    let mut split_footer_end: u64 = 0;
+    
     if !split_config_map.is_null() {
-        // The split_config_map contains an "aws_config" entry which is another HashMap
         let split_config_jobject = unsafe { JObject::from_raw(split_config_map) };
+        
+        // Extract footer offsets
+        if let Ok(footer_start_obj) = env.call_method(&split_config_jobject, "get", "(Ljava/lang/Object;)Ljava/lang/Object;", &[(&env.new_string("footer_start_offset").unwrap()).into()]) {
+            let footer_start_jobject = footer_start_obj.l().unwrap();
+            if !footer_start_jobject.is_null() {
+                if let Ok(footer_start_long) = env.call_method(&footer_start_jobject, "longValue", "()J", &[]) {
+                    split_footer_start = footer_start_long.j().unwrap() as u64;
+                    eprintln!("RUST DEBUG: Extracted footer_start_offset from Java config: {}", split_footer_start);
+                }
+            }
+        }
+        
+        if let Ok(footer_end_obj) = env.call_method(&split_config_jobject, "get", "(Ljava/lang/Object;)Ljava/lang/Object;", &[(&env.new_string("footer_end_offset").unwrap()).into()]) {
+            let footer_end_jobject = footer_end_obj.l().unwrap();
+            if !footer_end_jobject.is_null() {
+                if let Ok(footer_end_long) = env.call_method(&footer_end_jobject, "longValue", "()J", &[]) {
+                    split_footer_end = footer_end_long.j().unwrap() as u64;
+                    eprintln!("RUST DEBUG: Extracted footer_end_offset from Java config: {}", split_footer_end);
+                }
+            }
+        }
+        
+        // Extract AWS config
         if let Ok(aws_config_obj) = env.call_method(&split_config_jobject, "get", "(Ljava/lang/Object;)Ljava/lang/Object;", &[(&env.new_string("aws_config").unwrap()).into()]) {
             let aws_config_jobject = aws_config_obj.l().unwrap();
             if !aws_config_jobject.is_null() {
@@ -136,7 +161,7 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_createNativeWithShare
         }
     }
     
-    eprintln!("RUST DEBUG: AWS config extracted: {} keys", aws_config.len());
+    eprintln!("RUST DEBUG: Config extracted - AWS keys: {}, footer offsets: {}-{}", aws_config.len(), split_footer_start, split_footer_end);
 
     // Create Tokio runtime for async operations
     let runtime = match tokio::runtime::Builder::new_current_thread()
@@ -156,10 +181,11 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_createNativeWithShare
     let result = StandaloneSearcher::default();
     match result {
         Ok(searcher) => {
-            // Store searcher, runtime, split URI, and AWS config together using Arc for memory safety
-            let searcher_context = std::sync::Arc::new((searcher, runtime, split_uri.clone(), aws_config));
+            // Store searcher, runtime, split URI, AWS config, and footer offsets together using Arc for memory safety
+            let searcher_context = std::sync::Arc::new((searcher, runtime, split_uri.clone(), aws_config, split_footer_start, split_footer_end));
             let pointer = arc_to_jlong(searcher_context);
-            eprintln!("RUST DEBUG: SUCCESS: Stored searcher context for split '{}' with Arc pointer: {}", split_uri, pointer);
+            eprintln!("RUST DEBUG: SUCCESS: Stored searcher context for split '{}' with Arc pointer: {}, footer: {}-{}", 
+                     split_uri, pointer, split_footer_start, split_footer_end);
             pointer
         },
         Err(error) => {
@@ -197,7 +223,7 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_validateSplitNative(
         return 0; // false
     }
     
-    let is_valid = with_arc_safe(searcher_ptr, |searcher_context: &Arc<(StandaloneSearcher, tokio::runtime::Runtime, String, std::collections::HashMap<String, String>)>| {
+    let is_valid = with_arc_safe(searcher_ptr, |searcher_context: &Arc<(StandaloneSearcher, tokio::runtime::Runtime, String, std::collections::HashMap<String, String>, u64, u64)>| {
         // Searcher exists and is valid
         true
     }).unwrap_or(false);
@@ -212,8 +238,8 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_getCacheStatsNative(
     _class: JClass,
     searcher_ptr: jlong,
 ) -> jobject {
-    let result = with_arc_safe(searcher_ptr, |searcher_context: &Arc<(StandaloneSearcher, tokio::runtime::Runtime, String, std::collections::HashMap<String, String>)>| {
-        let (searcher, _runtime, _split_uri, _aws_config) = searcher_context.as_ref();
+    let result = with_arc_safe(searcher_ptr, |searcher_context: &Arc<(StandaloneSearcher, tokio::runtime::Runtime, String, std::collections::HashMap<String, String>, u64, u64)>| {
+        let (searcher, _runtime, _split_uri, _aws_config, _footer_start, _footer_end) = searcher_context.as_ref();
         let stats = searcher.cache_stats();
         
         // Create a CacheStats Java object
@@ -286,8 +312,8 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_searchWithQueryAst(
     eprintln!("RUST DEBUG: QueryAst JSON: {}", query_json);
     
     // Use the searcher context to perform search with Quickwit's leaf search approach
-    let result = with_arc_safe(searcher_ptr, |searcher_context: &Arc<(StandaloneSearcher, tokio::runtime::Runtime, String, std::collections::HashMap<String, String>)>| {
-        let (searcher, runtime, split_uri, aws_config) = searcher_context.as_ref();
+    let result = with_arc_safe(searcher_ptr, |searcher_context: &Arc<(StandaloneSearcher, tokio::runtime::Runtime, String, std::collections::HashMap<String, String>, u64, u64)>| {
+        let (searcher, runtime, split_uri, aws_config, footer_start, footer_end) = searcher_context.as_ref();
         
         // Enter the runtime context for async operations
         let _guard = runtime.enter();
@@ -381,23 +407,11 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_searchWithQueryAst(
                 
                 eprintln!("RUST DEBUG: Split file size: {} bytes", file_size);
                 
-                // Read the footer to extract metadata
-                // Following Quickwit's pattern from read_split_footer
-                let hotcache_len_bytes = storage.get_slice(relative_path, file_size as usize - 8..file_size as usize).await
-                    .map_err(|e| anyhow::anyhow!("Failed to read hotcache length: {}", e))?;
-                let hotcache_len = u64::from_le_bytes(hotcache_len_bytes.as_ref().try_into().unwrap()) as usize;
+                // Use footer offsets from Java configuration instead of reading from file
+                let split_footer_start = *footer_start;
+                let split_footer_end = *footer_end;
                 
-                let second_footer_start = file_size as usize - 8 - hotcache_len - 8;
-                let second_footer_bytes = storage
-                    .get_slice(relative_path, second_footer_start..second_footer_start + 8)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("Failed to read second footer: {}", e))?;
-                let second_footer_len = u64::from_le_bytes(second_footer_bytes.as_ref().try_into().unwrap()) as usize;
-                
-                let split_footer_start = (second_footer_start - second_footer_len) as u64;
-                let split_footer_end = file_size;
-                
-                eprintln!("RUST DEBUG: Extracted split footer offsets: start={}, end={}", split_footer_start, split_footer_end);
+                eprintln!("RUST DEBUG: Using footer offsets from Java config: start={}, end={}", split_footer_start, split_footer_end);
                 
                 // Now open the split to get the actual index and extract metadata
                 let split_data = storage.get_slice(relative_path, 0..file_size as usize).await
@@ -624,8 +638,8 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_getSchemaFromNative(
     }
 
     // Extract the actual schema from the split file using Quickwit's functionality
-    let result = with_arc_safe(searcher_ptr, |searcher_context: &Arc<(StandaloneSearcher, tokio::runtime::Runtime, String, std::collections::HashMap<String, String>)>| {
-        let (_searcher, runtime, split_uri, aws_config) = searcher_context.as_ref();
+    let result = with_arc_safe(searcher_ptr, |searcher_context: &Arc<(StandaloneSearcher, tokio::runtime::Runtime, String, std::collections::HashMap<String, String>, u64, u64)>| {
+        let (_searcher, runtime, split_uri, aws_config, _footer_start, _footer_end) = searcher_context.as_ref();
         eprintln!("RUST DEBUG: getSchemaFromNative called with split URI: {}", split_uri);
         
         // Enter the runtime context for async operations
