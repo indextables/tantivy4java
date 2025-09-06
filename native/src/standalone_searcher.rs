@@ -252,13 +252,8 @@ impl StandaloneSearcher {
         search_request: SearchRequest,
         doc_mapper: Arc<DocMapper>,
     ) -> Result<LeafSearchResponse> {
-        // Parse URI string to Uri type
-        let uri: Uri = split_uri.parse()
-            .with_context(|| format!("Failed to parse URI: {}", split_uri))?;
-        
-        // Resolve storage from URI
-        let storage = self.storage_resolver.resolve(&uri).await
-            .with_context(|| format!("Failed to resolve storage for URI: {}", split_uri))?;
+        // Resolve storage using the helper that handles S3 URIs correctly
+        let storage = resolve_storage_for_split(&self.storage_resolver, split_uri).await?;
         
         // Convert metadata to internal format
         let split_offsets = SplitIdAndFooterOffsets::from(metadata.clone());
@@ -371,6 +366,42 @@ impl StandaloneSearcher {
     /// Clear all caches
     pub fn clear_caches(&self) {
         self.context.clear_caches();
+    }
+}
+
+/// Helper function to resolve storage for a split URI
+/// For S3 URIs, this resolves the parent directory instead of the full file path
+/// This is necessary because Quickwit's S3 storage uses the prefix for the directory
+pub async fn resolve_storage_for_split(
+    storage_resolver: &StorageResolver,
+    split_uri: &str,
+) -> Result<Arc<dyn Storage>> {
+    let uri: Uri = split_uri.parse()
+        .with_context(|| format!("Failed to parse URI: {}", split_uri))?;
+    
+    match uri.protocol() {
+        quickwit_common::uri::Protocol::S3 => {
+            // For S3, we need to resolve the directory, not the file
+            let uri_str = uri.as_str();
+            if let Some(last_slash_pos) = uri_str.rfind('/') {
+                let directory_uri_str = &uri_str[..last_slash_pos + 1];
+                let directory_uri: Uri = directory_uri_str.parse()
+                    .with_context(|| format!("Failed to parse S3 directory URI: {}", directory_uri_str))?;
+                
+                eprintln!("QUICKWIT DEBUG: Resolving S3 storage for directory: '{}'", directory_uri_str);
+                storage_resolver.resolve(&directory_uri).await
+                    .with_context(|| format!("Failed to resolve storage for directory URI: {}", directory_uri_str))
+            } else {
+                // Fallback if no slash found (shouldn't happen with valid S3 URIs)
+                storage_resolver.resolve(&uri).await
+                    .with_context(|| format!("Failed to resolve storage for URI: {}", split_uri))
+            }
+        },
+        _ => {
+            // For non-S3 protocols, use the full URI
+            storage_resolver.resolve(&uri).await
+                .with_context(|| format!("Failed to resolve storage for URI: {}", split_uri))
+        }
     }
 }
 

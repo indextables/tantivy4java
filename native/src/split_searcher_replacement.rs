@@ -6,7 +6,7 @@ use jni::objects::{JClass, JString, JObject};
 use jni::sys::{jlong, jobject, jstring, jint, jboolean};
 use jni::JNIEnv;
 
-use crate::standalone_searcher::{StandaloneSearcher, StandaloneSearchConfig, SplitSearchMetadata};
+use crate::standalone_searcher::{StandaloneSearcher, StandaloneSearchConfig, SplitSearchMetadata, resolve_storage_for_split};
 use crate::utils::{register_object, remove_object, with_object, arc_to_jlong, with_arc_safe};
 use crate::common::to_java_exception;
 
@@ -398,58 +398,15 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_searchWithQueryAst(
                 
                 let storage_resolver = StorageResolver::configured(&storage_configs);
                 
-                // Resolve the correct storage based on the URI
-                // Use the same logic as getSchemaFromNative to avoid S3 path issues
-                let split_relative_path = match uri.protocol() {
-                    quickwit_common::uri::Protocol::S3 => {
-                        let uri_str = uri.as_str();
-                        eprintln!("RUST DEBUG: S3 URI parsing for search: {}", uri_str);
-                        
-                        // Find the last slash to get the filename
-                        if let Some(last_slash_pos) = uri_str.rfind('/') {
-                            let filename = &uri_str[last_slash_pos + 1..];
-                            let directory_uri_str = &uri_str[..last_slash_pos + 1];
-                            
-                            eprintln!("RUST DEBUG: S3 search - directory: '{}', filename: '{}'", directory_uri_str, filename);
-                            
-                            // Parse the directory URI and create a new storage resolver
-                            let directory_uri: Uri = directory_uri_str.parse()
-                                .map_err(|e| anyhow::anyhow!("Failed to parse S3 directory URI {}: {}", directory_uri_str, e))?;
-                            
-                            // Replace the storage with one pointing to the directory
-                            let new_storage = storage_resolver.resolve(&directory_uri).await
-                                .map_err(|e| anyhow::anyhow!("Failed to resolve directory storage for URI {}: {}", directory_uri_str, e))?;
-                            
-                            eprintln!("RUST DEBUG: Created S3 storage for directory, using filename '{}' as relative path", filename);
-                            (new_storage, std::path::Path::new(filename))
-                        } else {
-                            return Err(anyhow::anyhow!("Invalid S3 URI format: '{}'", uri_str));
-                        }
-                    },
-                    _ => {
-                        // For file:// and other protocols
-                        // LocalFileStorage requires the directory as the base and filename as relative path
-                        let path = uri.filepath().ok_or_else(|| anyhow::anyhow!("Invalid file path in URI: {}", split_uri))?;
-                        
-                        // Get the parent directory and the filename
-                        let parent_dir = path.parent().ok_or_else(|| anyhow::anyhow!("No parent directory for path: {:?}", path))?;
-                        let filename = path.file_name().ok_or_else(|| anyhow::anyhow!("No filename in path: {:?}", path))?;
-                        
-                        eprintln!("RUST DEBUG: File URI - parent: {:?}, filename: {:?}", parent_dir, filename);
-                        
-                        // Create a URI for the parent directory
-                        let parent_uri_str = format!("file://{}/", parent_dir.display());
-                        let parent_uri: Uri = parent_uri_str.parse()
-                            .map_err(|e| anyhow::anyhow!("Failed to parse parent URI {}: {}", parent_uri_str, e))?;
-                        
-                        let storage = storage_resolver.resolve(&parent_uri).await
-                            .map_err(|e| anyhow::anyhow!("Failed to resolve storage for parent URI {}: {}", parent_uri_str, e))?;
-                        
-                        (storage, std::path::Path::new(filename))
-                    }
-                };
+                // Use the helper function to resolve storage correctly for S3 URIs
+                let storage = resolve_storage_for_split(&storage_resolver, split_uri).await?;
                 
-                let (storage, relative_path) = split_relative_path;
+                // Extract just the filename for the relative path
+                let relative_path = if let Some(last_slash_pos) = split_uri.rfind('/') {
+                    std::path::Path::new(&split_uri[last_slash_pos + 1..])
+                } else {
+                    std::path::Path::new(split_uri)
+                };
                 
                 eprintln!("RUST DEBUG: Reading split file metadata from: '{}'", relative_path.display());
                 
@@ -733,54 +690,16 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_getSchemaFromNative(
                 storage_configs = storage_configs_vec;
                 
                 let storage_resolver = StorageResolver::configured(&storage_configs);
-                let storage = storage_resolver.resolve(&uri).await
-                    .map_err(|e| anyhow::anyhow!("Failed to resolve storage for URI {}: {}", split_uri, e))?;
                 
-                // For S3 URIs, we need to handle the path correctly
-                // The issue is that Quickwit's storage resolver treats the full file path as the prefix
-                // For s3://bucket/path/to/file.split, we need to create a new URI with just s3://bucket/path/to/
-                // and then pass "file.split" as the relative path
-                let split_relative_path = match uri.protocol() {
-                    quickwit_common::uri::Protocol::S3 => {
-                        let uri_str = uri.as_str();
-                        eprintln!("RUST DEBUG: S3 URI parsing for: {}", uri_str);
-                        
-                        // Find the last slash to get the filename
-                        if let Some(last_slash_pos) = uri_str.rfind('/') {
-                            let filename = &uri_str[last_slash_pos + 1..];
-                            eprintln!("RUST DEBUG: Extracted S3 filename: '{}'", filename);
-                            
-                            // We need to create a new storage resolver with the correct prefix
-                            // The URI should be s3://bucket/path/to/ (without the filename)
-                            let directory_uri_str = &uri_str[..last_slash_pos + 1];
-                            eprintln!("RUST DEBUG: S3 directory URI should be: '{}'", directory_uri_str);
-                            
-                            // Parse the directory URI and create a new storage resolver
-                            let directory_uri: Uri = directory_uri_str.parse()
-                                .map_err(|e| anyhow::anyhow!("Failed to parse S3 directory URI {}: {}", directory_uri_str, e))?;
-                            
-                            // Replace the storage with one pointing to the directory
-                            let new_storage = storage_resolver.resolve(&directory_uri).await
-                                .map_err(|e| anyhow::anyhow!("Failed to resolve directory storage for URI {}: {}", directory_uri_str, e))?;
-                            
-                            // Update our storage reference - we need to use the new one
-                            // But we can't reassign to storage, so we'll return the data we need
-                            eprintln!("RUST DEBUG: Created new storage resolver for directory, will use filename as relative path");
-                            (new_storage, Path::new(filename))
-                        } else {
-                            eprintln!("RUST DEBUG: ERROR: S3 URI has no slashes: '{}'", uri_str);
-                            (storage, Path::new(""))
-                        }
-                    },
-                    _ => {
-                        // For file:// and other protocols, use filepath
-                        let path = uri.filepath().ok_or_else(|| anyhow::anyhow!("Invalid file path in URI: {}", split_uri))?;
-                        eprintln!("RUST DEBUG: Non-S3 URI path: '{}'", path.display());
-                        (storage, path)
-                    }
+                // Use the helper function to resolve storage correctly for S3 URIs
+                let actual_storage = resolve_storage_for_split(&storage_resolver, split_uri).await?;
+                
+                // Extract just the filename for the relative path
+                let relative_path = if let Some(last_slash_pos) = split_uri.rfind('/') {
+                    Path::new(&split_uri[last_slash_pos + 1..])
+                } else {
+                    Path::new(split_uri)
                 };
-                
-                let (actual_storage, relative_path) = split_relative_path;
                 
                 eprintln!("RUST DEBUG: About to call storage.file_num_bytes with relative path: '{}'", relative_path.display());
                 
