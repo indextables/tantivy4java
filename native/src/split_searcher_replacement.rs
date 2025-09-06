@@ -287,14 +287,19 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_searchWithQueryAst(
     
     // Use the searcher context to perform search with Quickwit's leaf search approach
     let result = with_arc_safe(searcher_ptr, |searcher_context: &Arc<(StandaloneSearcher, tokio::runtime::Runtime, String, std::collections::HashMap<String, String>)>| {
-        let (_searcher, runtime, split_uri, _aws_config) = searcher_context.as_ref();
+        let (searcher, runtime, split_uri, aws_config) = searcher_context.as_ref();
         
         // Enter the runtime context for async operations
         let _guard = runtime.enter();
         
         // Parse the QueryAst JSON using Quickwit's libraries
         use quickwit_query::query_ast::QueryAst;
-        use quickwit_proto::search::{SearchRequest, LeafSearchRequest, SplitSearchError};
+        use quickwit_proto::search::{SearchRequest, SplitIdAndFooterOffsets};
+        use quickwit_common::uri::Uri;
+        use quickwit_storage::StorageResolver;
+        use quickwit_config::{StorageConfigs, S3StorageConfig};
+        use quickwit_directories::BundleDirectory;
+        use tantivy::directory::FileSlice;
         
         // Use block_in_place to run async code synchronously within the runtime context
         tokio::task::block_in_place(|| {
@@ -305,13 +310,196 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_searchWithQueryAst(
                 
                 eprintln!("RUST DEBUG: Successfully parsed QueryAst: {:?}", query_ast);
                 
-                // Create a basic SearchRequest with the QueryAst
-                // Note: This is a simplified implementation - in production we would need
-                // to properly configure the search request with split metadata, sorting, etc.
+                // First, we need to extract the actual split metadata from the split file
+                // This includes footer offsets, number of documents, and the doc mapper
+                
+                // Parse URI and resolve storage
+                let uri: Uri = split_uri.parse()
+                    .map_err(|e| anyhow::anyhow!("Failed to parse split URI {}: {}", split_uri, e))?;
+                
+                // Create S3 storage configuration with credentials from Java config
+                let mut storage_configs = StorageConfigs::default();
+                
+                eprintln!("RUST DEBUG: Creating S3 config with credentials from Java configuration");
+                let s3_config = S3StorageConfig {
+                    flavor: None,
+                    access_key_id: aws_config.get("access_key").cloned(),
+                    secret_access_key: aws_config.get("secret_key").cloned(), 
+                    session_token: aws_config.get("session_token").cloned(),
+                    region: aws_config.get("region").cloned(),
+                    endpoint: aws_config.get("endpoint").cloned(),
+                    force_path_style_access: false,
+                    disable_multi_object_delete: false,
+                    disable_multipart_upload: false,
+                };
+                
+                let storage_configs_vec = StorageConfigs::new(vec![quickwit_config::StorageConfig::S3(s3_config.clone())]);
+                storage_configs = storage_configs_vec;
+                
+                let storage_resolver = StorageResolver::configured(&storage_configs);
+                
+                // Resolve the correct storage based on the URI
+                let split_relative_path = match uri.protocol() {
+                    quickwit_common::uri::Protocol::S3 => {
+                        let uri_str = uri.as_str();
+                        eprintln!("RUST DEBUG: S3 URI parsing for: {}", uri_str);
+                        
+                        // Find the last slash to get the filename
+                        if let Some(last_slash_pos) = uri_str.rfind('/') {
+                            let filename = &uri_str[last_slash_pos + 1..];
+                            let directory_uri_str = &uri_str[..last_slash_pos + 1];
+                            
+                            eprintln!("RUST DEBUG: S3 directory: '{}', filename: '{}'", directory_uri_str, filename);
+                            
+                            let directory_uri: Uri = directory_uri_str.parse()
+                                .map_err(|e| anyhow::anyhow!("Failed to parse S3 directory URI {}: {}", directory_uri_str, e))?;
+                            
+                            let storage = storage_resolver.resolve(&directory_uri).await
+                                .map_err(|e| anyhow::anyhow!("Failed to resolve directory storage for URI {}: {}", directory_uri_str, e))?;
+                            
+                            (storage, std::path::Path::new(filename))
+                        } else {
+                            return Err(anyhow::anyhow!("Invalid S3 URI format: '{}'", uri_str));
+                        }
+                    },
+                    _ => {
+                        // For file:// and other protocols
+                        let storage = storage_resolver.resolve(&uri).await
+                            .map_err(|e| anyhow::anyhow!("Failed to resolve storage for URI {}: {}", split_uri, e))?;
+                        let path = uri.filepath().ok_or_else(|| anyhow::anyhow!("Invalid file path in URI: {}", split_uri))?;
+                        (storage, path)
+                    }
+                };
+                
+                let (storage, relative_path) = split_relative_path;
+                
+                eprintln!("RUST DEBUG: Reading split file metadata from: '{}'", relative_path.display());
+                
+                // Get the full file data to extract metadata
+                let file_size = storage.file_num_bytes(relative_path).await
+                    .map_err(|e| anyhow::anyhow!("Failed to get file size for {}: {}", split_uri, e))?;
+                
+                eprintln!("RUST DEBUG: Split file size: {} bytes", file_size);
+                
+                // Read the footer to extract metadata
+                // Following Quickwit's pattern from read_split_footer
+                let hotcache_len_bytes = storage.get_slice(relative_path, file_size as usize - 8..file_size as usize).await
+                    .map_err(|e| anyhow::anyhow!("Failed to read hotcache length: {}", e))?;
+                let hotcache_len = u64::from_le_bytes(hotcache_len_bytes.as_ref().try_into().unwrap()) as usize;
+                
+                let second_footer_start = file_size as usize - 8 - hotcache_len - 8;
+                let second_footer_bytes = storage
+                    .get_slice(relative_path, second_footer_start..second_footer_start + 8)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("Failed to read second footer: {}", e))?;
+                let second_footer_len = u64::from_le_bytes(second_footer_bytes.as_ref().try_into().unwrap()) as usize;
+                
+                let split_footer_start = (second_footer_start - second_footer_len) as u64;
+                let split_footer_end = file_size;
+                
+                eprintln!("RUST DEBUG: Extracted split footer offsets: start={}, end={}", split_footer_start, split_footer_end);
+                
+                // Now open the split to get the actual index and extract metadata
+                let split_data = storage.get_slice(relative_path, 0..file_size as usize).await
+                    .map_err(|e| anyhow::anyhow!("Failed to get split data from {}: {}", split_uri, e))?;
+                
+                let split_file_slice = FileSlice::new(std::sync::Arc::new(split_data));
+                
+                // Open the bundle directory to access the index
+                let bundle_directory = BundleDirectory::open_split(split_file_slice)
+                    .map_err(|e| anyhow::anyhow!("Failed to open bundle directory {}: {}", split_uri, e))?;
+                    
+                // Open the index to get actual metadata
+                let index = tantivy::Index::open(bundle_directory)
+                    .map_err(|e| anyhow::anyhow!("Failed to open index from bundle {}: {}", split_uri, e))?;
+                
+                // Get the actual number of documents from the index
+                let reader = index.reader().map_err(|e| anyhow::anyhow!("Failed to create index reader: {}", e))?;
+                let searcher_tantivy = reader.searcher();
+                let num_docs = searcher_tantivy.num_docs();
+                
+                eprintln!("RUST DEBUG: Extracted actual num_docs from index: {}", num_docs);
+                
+                // Extract the split ID from the URI (last component before .split extension)
+                let split_id = relative_path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+                
+                eprintln!("RUST DEBUG: Split ID: {}", split_id);
+                
+                // Create the proper split metadata with REAL values
+                let split_metadata = SplitSearchMetadata {
+                    split_id: split_id.clone(),
+                    split_footer_start,
+                    split_footer_end,
+                    time_range: None, // TODO: Extract from split metadata if available
+                    delete_opstamp: 0,
+                    num_docs,
+                };
+                
+                // Now we need to create the DocMapper from the index schema
+                // The schema from the index contains the field definitions
+                let schema = index.schema();
+                
+                // Build a DocMapping from the tantivy schema
+                // This is the proper way to create a DocMapper that matches the actual index
+                let mut field_mappings = Vec::new();
+                
+                for (field, field_entry) in schema.fields() {
+                    let field_name = schema.get_field_name(field);
+                    let field_type = field_entry.field_type();
+                    
+                    use tantivy::schema::FieldType;
+                    let mapping_type = match field_type {
+                        FieldType::Str(text_options) => {
+                            if text_options.get_indexing_options().is_some() {
+                                "text"
+                            } else {
+                                "keyword"
+                            }
+                        },
+                        FieldType::U64(_) => "u64",
+                        FieldType::I64(_) => "i64",
+                        FieldType::F64(_) => "f64",
+                        FieldType::Bool(_) => "bool",
+                        FieldType::Date(_) => "datetime",
+                        FieldType::Bytes(_) => "bytes",
+                        FieldType::IpAddr(_) => "ip",
+                        FieldType::JsonObject(_) => "json",
+                        FieldType::Facet(_) => "keyword", // Facets are similar to keywords
+                    };
+                    
+                    field_mappings.push(serde_json::json!({
+                        "name": field_name,
+                        "type": mapping_type,
+                    }));
+                }
+                
+                eprintln!("RUST DEBUG: Extracted {} field mappings from index schema", field_mappings.len());
+                
+                let doc_mapping_json = serde_json::json!({
+                    "field_mappings": field_mappings,
+                    "mode": "lenient",
+                    "store_source": true,
+                });
+                
+                // Create DocMapperBuilder from the JSON
+                let doc_mapper_builder: quickwit_doc_mapper::DocMapperBuilder = serde_json::from_value(doc_mapping_json)
+                    .map_err(|e| anyhow::anyhow!("Failed to create DocMapperBuilder: {}", e))?;
+                
+                // Build the DocMapper
+                let doc_mapper = doc_mapper_builder.try_build()
+                    .map_err(|e| anyhow::anyhow!("Failed to build DocMapper: {}", e))?;
+                
+                let doc_mapper_arc = Arc::new(doc_mapper);
+                
+                eprintln!("RUST DEBUG: Successfully created DocMapper from actual index schema");
                 
                 // Create a SearchRequest with the QueryAst
                 let search_request = SearchRequest {
-                    index_id_patterns: vec![], // Not needed for single split search
+                    index_id_patterns: vec![],
                     query_ast: query_json.clone(),
                     max_hits: limit as u64,
                     start_offset: 0,
@@ -321,100 +509,63 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_searchWithQueryAst(
                     snippet_fields: vec![],
                     sort_fields: vec![],
                     search_after: None,
-                    collapse_on: None,
                     scroll_ttl_secs: None,
-                    format: None,
+                    count_hits: quickwit_proto::search::CountHits::CountAll as i32,
                 };
                 
-                eprintln!("RUST DEBUG: Created SearchRequest with QueryAst: {}", query_json);
+                eprintln!("RUST DEBUG: Calling StandaloneSearcher.search_split_sync with REAL parameters:");
+                eprintln!("  - Split URI: {}", split_uri);
+                eprintln!("  - Split ID: {}", split_metadata.split_id);
+                eprintln!("  - Num docs: {}", split_metadata.num_docs);
+                eprintln!("  - Footer offsets: {}-{}", split_metadata.split_footer_start, split_metadata.split_footer_end);
                 
-                // Extract the StandaloneSearcher from the searcher context
-                let (searcher, runtime, split_uri, aws_config) = searcher_context.as_ref();
-                
-                // Get split metadata from the stored context
-                // For now, we'll use basic metadata - in production this would come from the split file
-                let split_metadata = SplitSearchMetadata {
-                    split_id: "test-split".to_string(),
-                    footer_start: 0,
-                    footer_end: 1000,
-                    timestamp_start: None,
-                    timestamp_end: None,
-                    num_docs: 100,  // This should come from actual split metadata
-                };
-                
-                // Create a basic doc mapper - this should also come from the split configuration
-                use quickwit_doc_mapper::{DocMapper, DefaultDocMapperBuilder};
-                use quickwit_config::{DocMapping, IndexingSettings, RetentionPolicy, 
-                                     SearchSettings, TagFilterPolicy};
-                
-                let doc_mapping = DocMapping {
-                    field_mappings: vec![],
-                    tag_fields: std::collections::HashSet::new(),
-                    demux_field: None,
-                    timestamp_field: None,
-                    partition_key: None,
-                    max_num_partitions: 200,
-                    mode: quickwit_config::Mode::Lenient,
-                };
-                
-                let indexing_settings = IndexingSettings::default();
-                let search_settings = SearchSettings::default();
-                let retention_policy_opt = None;
-                
-                let doc_mapper = Arc::new(
-                    DefaultDocMapperBuilder::new(
-                        doc_mapping,
-                        indexing_settings,
-                        search_settings,
-                        retention_policy_opt,
-                    ).build()
-                    .map_err(|e| anyhow::anyhow!("Failed to create doc mapper: {}", e))?
-                );
-                
-                // Perform the actual search using StandaloneSearcher
-                eprintln!("RUST DEBUG: Performing search with StandaloneSearcher...");
-                let leaf_search_response = searcher.search_split(
+                // PERFORM THE ACTUAL REAL SEARCH WITH NO MOCKING!
+                let leaf_search_response = searcher.search_split_sync(
                     split_uri,
                     split_metadata,
                     search_request,
-                    doc_mapper,
-                ).await.map_err(|e| anyhow::anyhow!("Search failed: {}", e))?;
+                    doc_mapper_arc,
+                )?;
                 
-                eprintln!("RUST DEBUG: Search completed! Found {} hits", leaf_search_response.num_hits);
+                eprintln!("RUST DEBUG: REAL SEARCH COMPLETED! Found {} hits from StandaloneSearcher", leaf_search_response.num_hits);
                 
                 // Convert LeafSearchResponse to SearchResult format
-                // Extract PartialHits and convert them to (score, DocAddress) tuples
                 let mut search_results: Vec<(f32, tantivy::DocAddress)> = Vec::new();
                 
                 for partial_hit in leaf_search_response.partial_hits {
-                    // Convert PartialHit to DocAddress
-                    // PartialHit contains segment_ord and doc_id, which form a DocAddress
                     let doc_address = tantivy::DocAddress::new(
                         partial_hit.segment_ord as tantivy::SegmentOrdinal,
                         partial_hit.doc_id as tantivy::DocId,
                     );
                     
-                    // For score, we'll use a simple relevance score
-                    // In production, this would come from the actual Tantivy scoring
-                    let score = 1.0_f32; // Default score - should be computed from sort values
+                    // Extract the actual score from the partial hit
+                    let score = if let Some(sort_value) = partial_hit.sort_value() {
+                        // If there's a sort value, use it as the score
+                        match sort_value {
+                            quickwit_proto::search::SortValue::F64(f) => f as f32,
+                            quickwit_proto::search::SortValue::U64(u) => u as f32,
+                            quickwit_proto::search::SortValue::I64(i) => i as f32,
+                            _ => 1.0_f32,
+                        }
+                    } else {
+                        1.0_f32 // Default score if no sort value
+                    };
                     
                     search_results.push((score, doc_address));
                 }
                 
                 eprintln!("RUST DEBUG: Converted {} hits to SearchResult format", search_results.len());
                 
-                // Register the search results and get a pointer (using existing object system)
+                // Register the search results and get a pointer
                 let search_result_ptr = register_object(search_results) as jlong;
                 
-                eprintln!("RUST DEBUG: Created SearchResult with pointer: {}", search_result_ptr);
-                
-                // Create SearchResult with the valid pointer
+                // Create SearchResult Java object
                 let search_result_class = env.find_class("com/tantivy4java/SearchResult")
                     .map_err(|e| anyhow::anyhow!("Failed to find SearchResult class: {}", e))?;
                 
                 let search_result = env.new_object(
                     &search_result_class,
-                    "(J)V", // Constructor: (nativePtr)
+                    "(J)V",
                     &[(search_result_ptr).into()]
                 ).map_err(|e| anyhow::anyhow!("Failed to create SearchResult: {}", e))?;
                 
