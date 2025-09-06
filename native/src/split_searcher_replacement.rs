@@ -12,7 +12,8 @@ use crate::common::to_java_exception;
 
 use quickwit_proto::search::{SearchRequest, LeafSearchResponse};
 use quickwit_doc_mapper::DocMapper;
-use quickwit_config::{DocMapping, IndexingSettings, SearchSettings};
+use quickwit_config::{DocMapping, IndexingSettings, SearchSettings, S3StorageConfig};
+use quickwit_storage::{StorageResolver, LocalFileStorageFactory, S3CompatibleObjectStorageFactory};
 use anyhow::Result;
 use tantivy::{DocAddress, DocId, SegmentOrdinal};
 
@@ -178,7 +179,41 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_createNativeWithShare
     // Enter the runtime context and create the searcher
     let _guard = runtime.enter();
     
-    let result = StandaloneSearcher::default();
+    // Create a configured storage resolver with AWS credentials if provided
+    let storage_resolver = if aws_config.contains_key("access_key") && aws_config.contains_key("secret_key") {
+        eprintln!("RUST DEBUG: Creating configured storage resolver with AWS credentials");
+        
+        let mut s3_config = S3StorageConfig::default();
+        s3_config.access_key_id = Some(aws_config.get("access_key").unwrap().clone());
+        s3_config.secret_access_key = Some(aws_config.get("secret_key").unwrap().clone());
+        
+        if let Some(session_token) = aws_config.get("session_token") {
+            s3_config.session_token = Some(session_token.clone());
+        }
+        
+        if let Some(region) = aws_config.get("region") {
+            s3_config.region = Some(region.clone());
+        }
+        
+        if let Some(endpoint) = aws_config.get("endpoint") {
+            s3_config.endpoint = Some(endpoint.clone());
+        }
+        
+        if let Some(force_path_style) = aws_config.get("force_path_style") {
+            s3_config.force_path_style_access = force_path_style == "true";
+        }
+        
+        StorageResolver::builder()
+            .register(LocalFileStorageFactory::default())
+            .register(S3CompatibleObjectStorageFactory::new(s3_config))
+            .build()
+            .expect("Failed to create storage resolver")
+    } else {
+        eprintln!("RUST DEBUG: Creating unconfigured storage resolver (no AWS credentials)");
+        StorageResolver::unconfigured()
+    };
+    
+    let result = StandaloneSearcher::with_storage_resolver(StandaloneSearchConfig::default(), storage_resolver);
     match result {
         Ok(searcher) => {
             // Store searcher, runtime, split URI, AWS config, and footer offsets together using Arc for memory safety
@@ -320,16 +355,15 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_searchWithQueryAst(
         
         // Parse the QueryAst JSON using Quickwit's libraries
         use quickwit_query::query_ast::QueryAst;
-        use quickwit_proto::search::{SearchRequest, SplitIdAndFooterOffsets};
+        use quickwit_proto::search::SplitIdAndFooterOffsets;
         use quickwit_common::uri::Uri;
-        use quickwit_storage::StorageResolver;
-        use quickwit_config::{StorageConfigs, S3StorageConfig};
+        use quickwit_config::StorageConfigs;
         use quickwit_directories::BundleDirectory;
         use tantivy::directory::FileSlice;
         
-        // Use block_in_place to run async code synchronously within the runtime context
-        tokio::task::block_in_place(|| {
-            runtime.block_on(async {
+        // Run async code synchronously within the runtime context
+        // Note: We're already in the runtime context via runtime.enter(), so we can use block_on directly
+        runtime.block_on(async {
                 // Parse the QueryAst JSON
                 let query_ast: QueryAst = serde_json::from_str(&query_json)
                     .map_err(|e| anyhow::anyhow!("Failed to parse QueryAst JSON: {}", e))?;
@@ -365,35 +399,53 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_searchWithQueryAst(
                 let storage_resolver = StorageResolver::configured(&storage_configs);
                 
                 // Resolve the correct storage based on the URI
+                // Use the same logic as getSchemaFromNative to avoid S3 path issues
                 let split_relative_path = match uri.protocol() {
                     quickwit_common::uri::Protocol::S3 => {
                         let uri_str = uri.as_str();
-                        eprintln!("RUST DEBUG: S3 URI parsing for: {}", uri_str);
+                        eprintln!("RUST DEBUG: S3 URI parsing for search: {}", uri_str);
                         
                         // Find the last slash to get the filename
                         if let Some(last_slash_pos) = uri_str.rfind('/') {
                             let filename = &uri_str[last_slash_pos + 1..];
                             let directory_uri_str = &uri_str[..last_slash_pos + 1];
                             
-                            eprintln!("RUST DEBUG: S3 directory: '{}', filename: '{}'", directory_uri_str, filename);
+                            eprintln!("RUST DEBUG: S3 search - directory: '{}', filename: '{}'", directory_uri_str, filename);
                             
+                            // Parse the directory URI and create a new storage resolver
                             let directory_uri: Uri = directory_uri_str.parse()
                                 .map_err(|e| anyhow::anyhow!("Failed to parse S3 directory URI {}: {}", directory_uri_str, e))?;
                             
-                            let storage = storage_resolver.resolve(&directory_uri).await
+                            // Replace the storage with one pointing to the directory
+                            let new_storage = storage_resolver.resolve(&directory_uri).await
                                 .map_err(|e| anyhow::anyhow!("Failed to resolve directory storage for URI {}: {}", directory_uri_str, e))?;
                             
-                            (storage, std::path::Path::new(filename))
+                            eprintln!("RUST DEBUG: Created S3 storage for directory, using filename '{}' as relative path", filename);
+                            (new_storage, std::path::Path::new(filename))
                         } else {
                             return Err(anyhow::anyhow!("Invalid S3 URI format: '{}'", uri_str));
                         }
                     },
                     _ => {
                         // For file:// and other protocols
-                        let storage = storage_resolver.resolve(&uri).await
-                            .map_err(|e| anyhow::anyhow!("Failed to resolve storage for URI {}: {}", split_uri, e))?;
+                        // LocalFileStorage requires the directory as the base and filename as relative path
                         let path = uri.filepath().ok_or_else(|| anyhow::anyhow!("Invalid file path in URI: {}", split_uri))?;
-                        (storage, path)
+                        
+                        // Get the parent directory and the filename
+                        let parent_dir = path.parent().ok_or_else(|| anyhow::anyhow!("No parent directory for path: {:?}", path))?;
+                        let filename = path.file_name().ok_or_else(|| anyhow::anyhow!("No filename in path: {:?}", path))?;
+                        
+                        eprintln!("RUST DEBUG: File URI - parent: {:?}, filename: {:?}", parent_dir, filename);
+                        
+                        // Create a URI for the parent directory
+                        let parent_uri_str = format!("file://{}/", parent_dir.display());
+                        let parent_uri: Uri = parent_uri_str.parse()
+                            .map_err(|e| anyhow::anyhow!("Failed to parse parent URI {}: {}", parent_uri_str, e))?;
+                        
+                        let storage = storage_resolver.resolve(&parent_uri).await
+                            .map_err(|e| anyhow::anyhow!("Failed to resolve storage for parent URI {}: {}", parent_uri_str, e))?;
+                        
+                        (storage, std::path::Path::new(filename))
                     }
                 };
                 
@@ -534,12 +586,13 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_searchWithQueryAst(
                 eprintln!("  - Footer offsets: {}-{}", split_metadata.split_footer_start, split_metadata.split_footer_end);
                 
                 // PERFORM THE ACTUAL REAL SEARCH WITH NO MOCKING!
-                let leaf_search_response = searcher.search_split_sync(
+                // We're already in an async context, so use the async method directly
+                let leaf_search_response = searcher.search_split(
                     split_uri,
                     split_metadata,
                     search_request,
                     doc_mapper_arc,
-                )?;
+                ).await?;
                 
                 eprintln!("RUST DEBUG: REAL SEARCH COMPLETED! Found {} hits from StandaloneSearcher", leaf_search_response.num_hits);
                 
@@ -586,7 +639,6 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_searchWithQueryAst(
                 eprintln!("RUST DEBUG: Successfully created SearchResult with {} hits", leaf_search_response.num_hits);
                 
                 Ok(search_result.into_raw())
-            })
         })
     });
     
@@ -647,7 +699,6 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_getSchemaFromNative(
         
         // Parse the split URI and extract schema using Quickwit's storage abstractions
         use quickwit_common::uri::Uri;
-        use quickwit_storage::StorageResolver;
         use std::path::Path;
         
         // Use block_on to run async code synchronously within the runtime context

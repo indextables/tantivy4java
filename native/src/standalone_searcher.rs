@@ -234,6 +234,15 @@ impl StandaloneSearcher {
         Self::new(StandaloneSearchConfig::default())
     }
     
+    /// Create with a specific storage resolver (for configured S3 access)
+    pub fn with_storage_resolver(config: StandaloneSearchConfig, storage_resolver: StorageResolver) -> Result<Self> {
+        let context = Arc::new(StandaloneSearchContext::new(config)?);
+        Ok(Self {
+            context,
+            storage_resolver,
+        })
+    }
+    
     /// Search a single split using Quickwit's exact async pattern
     /// This follows the same pattern as single_doc_mapping_leaf_search
     pub async fn search_split(
@@ -332,17 +341,26 @@ impl StandaloneSearcher {
         search_request: SearchRequest,
         doc_mapper: Arc<DocMapper>,
     ) -> Result<LeafSearchResponse> {
-        // Create a separate current_thread runtime for this operation
-        // This avoids the deadlock issue with nested block_on calls
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .with_context(|| "Failed to create runtime for sync search")?;
-            
-        // Run the async search in the dedicated runtime
-        rt.block_on(async {
-            self.search_split(split_uri, metadata, search_request, doc_mapper).await
-        })
+        // Check if we're already inside a runtime
+        match tokio::runtime::Handle::try_current() {
+            Ok(_) => {
+                // We're already in a runtime context, so we can't use block_on
+                // Instead, we need to spawn a task or use a different approach
+                return Err(anyhow::anyhow!("Cannot create nested runtime - use async search_split method instead"));
+            }
+            Err(_) => {
+                // Not in a runtime, safe to create one
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .with_context(|| "Failed to create runtime for sync search")?;
+                    
+                // Run the async search in the dedicated runtime
+                rt.block_on(async {
+                    self.search_split(split_uri, metadata, search_request, doc_mapper).await
+                })
+            }
+        }
     }
 
     /// Get cache statistics
