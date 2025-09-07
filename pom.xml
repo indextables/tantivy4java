@@ -182,7 +182,6 @@
                             <executable>cargo</executable>
                             <arguments>
                                 <argument>build</argument>
-                                <argument>--release</argument>
                                 <argument>--target-dir</argument>
                                 <argument>${rust.target.dir}</argument>
                             </arguments>
@@ -208,7 +207,7 @@
                             <outputDirectory>${project.build.outputDirectory}/native</outputDirectory>
                             <resources>
                                 <resource>
-                                    <directory>${rust.target.dir}/release</directory>
+                                    <directory>${rust.target.dir}/debug</directory>
                                     <includes>
                                         <include>libtantivy4java.so</include>
                                         <include>libtantivy4java.dylib</include>
@@ -239,9 +238,9 @@
 
     <!-- Build profiles -->
     <profiles>
-        <!-- Linux optimized build profile - automatically activates on Linux -->
+        <!-- Linux debug build profile - automatically activates on Linux -->
         <profile>
-            <id>linux-optimized</id>
+            <id>linux-debug</id>
             <activation>
                 <os>
                     <family>unix</family>
@@ -264,13 +263,12 @@
                                     <executable>cargo</executable>
                                     <arguments>
                                         <argument>build</argument>
-                                        <argument>--release</argument>
                                         <argument>--target-dir</argument>
                                         <argument>${rust.target.dir}</argument>
                                     </arguments>
                                     <workingDirectory>${project.basedir}/native</workingDirectory>
                                     <environmentVariables>
-                                        <!-- Optimize for x86_64 Linux -->
+                                        <!-- Debug build for x86_64 Linux -->
                                         <RUSTFLAGS>-C target-cpu=x86-64</RUSTFLAGS>
                                     </environmentVariables>
                                 </configuration>
