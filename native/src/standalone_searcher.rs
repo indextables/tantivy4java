@@ -107,6 +107,8 @@ pub struct SplitSearchMetadata {
     /// Footer offsets in the split file
     pub split_footer_start: u64,
     pub split_footer_end: u64,
+    /// Actual file size from storage.file_num_bytes()
+    pub file_size: u64,
     /// Number of documents in the split
     pub num_docs: u64,
     /// Optional timestamp range for optimization
@@ -253,22 +255,27 @@ impl StandaloneSearcher {
         doc_mapper: Arc<DocMapper>,
     ) -> Result<LeafSearchResponse> {
         // Resolve storage using the helper that handles S3 URIs correctly
+        println!("SCOTTWIT: search_split : before resolve");
         let storage = resolve_storage_for_split(&self.storage_resolver, split_uri).await?;
+        println!("SCOTTWIT: search_split : after resolve");
         
         // Convert metadata to internal format
         let split_offsets = SplitIdAndFooterOffsets::from(metadata.clone());
         
+        println!("SCOTTWIT: search_split : after resolve2");
         // FOLLOW QUICKWIT'S EXACT PATTERN: Get permits first, then await individual permit
         let memory_allocation = compute_initial_memory_allocation(
             &split_offsets,
             self.context.config.warmup.split_initial_allocation
         );
+        println!("SCOTTWIT: search_split : after resolve3");
         
         let permit_futures = self.context.permit_provider.get_permits(vec![memory_allocation]).await;
         let permit_future = permit_futures.into_iter().next()
             .expect("Expected one permit future");
         let mut search_permit = permit_future.await;
         
+        println!("SCOTTWIT: search_split : after resolve4");
         // Execute search using Quickwit's proven search implementation
         self.search_single_split_with_permit(
             storage,
@@ -351,6 +358,7 @@ impl StandaloneSearcher {
                     .with_context(|| "Failed to create runtime for sync search")?;
                     
                 // Run the async search in the dedicated runtime
+                println!("SCOTTWIT: BEFORE block on");
                 rt.block_on(async {
                     self.search_split(split_uri, metadata, search_request, doc_mapper).await
                 })
@@ -388,7 +396,7 @@ pub async fn resolve_storage_for_split(
                 let directory_uri: Uri = directory_uri_str.parse()
                     .with_context(|| format!("Failed to parse S3 directory URI: {}", directory_uri_str))?;
                 
-                eprintln!("QUICKWIT DEBUG: Resolving S3 storage for directory: '{}'", directory_uri_str);
+                println!("QUICKWIT DEBUG: Resolving S3 storage for directory: '{}'", directory_uri_str);
                 storage_resolver.resolve(&directory_uri).await
                     .with_context(|| format!("Failed to resolve storage for directory URI: {}", directory_uri_str))
             } else {

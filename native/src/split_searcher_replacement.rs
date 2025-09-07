@@ -16,6 +16,7 @@ use quickwit_config::{DocMapping, IndexingSettings, SearchSettings, S3StorageCon
 use quickwit_storage::{StorageResolver, LocalFileStorageFactory, S3CompatibleObjectStorageFactory};
 use anyhow::Result;
 use tantivy::{DocAddress, DocId, SegmentOrdinal};
+use tantivy::schema::Document as DocumentTrait; // For to_named_doc method
 
 /// Simple data structure to hold search results for JNI integration
 #[derive(Debug)]
@@ -420,7 +421,7 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_searchWithQueryAst(
                 let split_footer_start = *footer_start;
                 let split_footer_end = *footer_end;
                 
-                eprintln!("RUST DEBUG: Using footer offsets from Java config: start={}, end={}", split_footer_start, split_footer_end);
+                eprintln!("RUST DEBUG: Using footer offsets from Java config: fileSizeSJS={} start={}, end={}", file_size, split_footer_start, split_footer_end);
                 
                 // Now open the split to get the actual index and extract metadata
                 let split_data = storage.get_slice(relative_path, 0..file_size as usize).await
@@ -457,6 +458,7 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_searchWithQueryAst(
                     split_id: split_id.clone(),
                     split_footer_start,
                     split_footer_end,
+                    file_size, // Use the actual file size from storage.file_num_bytes()
                     time_range: None, // TODO: Extract from split metadata if available
                     delete_opstamp: 0,
                     num_docs,
@@ -613,17 +615,178 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_searchWithQueryAst(
 }
 
 /// Replacement for Java_com_tantivy4java_SplitSearcher_docNative
+/// Implements document retrieval using Quickwit's approach: 
+/// - Opens the split as an index using open_index_with_caches pattern
+/// - Creates a searcher from the index reader
+/// - Uses searcher.doc_async() to retrieve the document
+/// - Converts the document to JSON using DocMapper
+/// - Returns a Java Document object
 #[no_mangle]
 pub extern "system" fn Java_com_tantivy4java_SplitSearcher_docNative(
     mut env: JNIEnv,
     _class: JClass,
     searcher_ptr: jlong,
-    doc_address_ptr: jlong,
+    segment_ord: jint,
+    doc_id: jint,
 ) -> jobject {
-    // Note: Document retrieval would require additional implementation
-    // For now, return null to indicate the method is not fully implemented
-    to_java_exception(&mut env, &anyhow::anyhow!("SplitSearcher.docNative not fully implemented"));
-    std::ptr::null_mut()
+    eprintln!("RUST DEBUG: SplitSearcher.docNative called with segment_ord={}, doc_id={}", segment_ord, doc_id);
+    
+    if searcher_ptr == 0 {
+        eprintln!("RUST ERROR: Invalid searcher pointer");
+        to_java_exception(&mut env, &anyhow::anyhow!("Invalid searcher pointer"));
+        return std::ptr::null_mut();
+    }
+    
+    // Create DocAddress from the provided segment and doc ID
+    let doc_address = tantivy::DocAddress::new(segment_ord as u32, doc_id as u32);
+    eprintln!("RUST DEBUG: Created DocAddress: segment={}, doc={}", doc_address.segment_ord, doc_address.doc_id);
+    
+    // Implement actual document retrieval using Quickwit's approach
+    // Use the searcher context to retrieve the document from the split
+    let result = with_arc_safe(searcher_ptr, |searcher_context: &Arc<(StandaloneSearcher, tokio::runtime::Runtime, String, std::collections::HashMap<String, String>, u64, u64)>| {
+        let (searcher, runtime, split_uri, aws_config, footer_start, footer_end) = searcher_context.as_ref();
+        
+        // Enter the runtime context for async operations
+        let _guard = runtime.enter();
+        
+        eprintln!("RUST DEBUG: Starting document retrieval for split: {}", split_uri);
+        
+        // Run async document retrieval using Quickwit's pattern
+        runtime.block_on(async {
+            // Parse URI and resolve storage (similar to searchWithQueryAst)
+            use quickwit_common::uri::Uri;
+            use quickwit_config::{StorageConfigs, S3StorageConfig};
+            use quickwit_directories::BundleDirectory;
+            use tantivy::directory::FileSlice;
+            use tantivy::ReloadPolicy;
+            use std::path::Path;
+            
+            let uri: Uri = split_uri.parse()
+                .map_err(|e| anyhow::anyhow!("Failed to parse split URI {}: {}", split_uri, e))?;
+            
+            // Create S3 storage configuration with credentials from Java config
+            let s3_config = S3StorageConfig {
+                flavor: None,
+                access_key_id: aws_config.get("access_key").cloned(),
+                secret_access_key: aws_config.get("secret_key").cloned(), 
+                session_token: aws_config.get("session_token").cloned(),
+                region: aws_config.get("region").cloned(),
+                endpoint: aws_config.get("endpoint").cloned(),
+                force_path_style_access: false,
+                disable_multi_object_delete: false,
+                disable_multipart_upload: false,
+            };
+            
+            let storage_configs = StorageConfigs::new(vec![quickwit_config::StorageConfig::S3(s3_config.clone())]);
+            let storage_resolver = StorageResolver::configured(&storage_configs);
+            
+            // Use the helper function to resolve storage correctly for S3 URIs
+            let actual_storage = resolve_storage_for_split(&storage_resolver, split_uri).await?;
+            
+            // Extract just the filename for the relative path
+            let relative_path = if let Some(last_slash_pos) = split_uri.rfind('/') {
+                Path::new(&split_uri[last_slash_pos + 1..])
+            } else {
+                Path::new(split_uri)
+            };
+            
+            eprintln!("RUST DEBUG: Getting split file data from: '{}'", relative_path.display());
+            
+            // Get the full file data using Quickwit's storage abstraction
+            let file_size = actual_storage.file_num_bytes(relative_path).await
+                .map_err(|e| anyhow::anyhow!("Failed to get file size for {}: {}", split_uri, e))?;
+            
+            let split_data = actual_storage.get_slice(relative_path, 0..file_size as usize).await
+                .map_err(|e| anyhow::anyhow!("Failed to get split data from {}: {}", split_uri, e))?;
+            
+            // Open the bundle directory from the split data (similar to getSchemaFromNative)
+            let split_file_slice = FileSlice::new(std::sync::Arc::new(split_data));
+            
+            let bundle_directory = BundleDirectory::open_split(split_file_slice)
+                .map_err(|e| anyhow::anyhow!("Failed to open bundle directory {}: {}", split_uri, e))?;
+                
+            // Extract the index from the bundle directory
+            let index = tantivy::Index::open(bundle_directory)
+                .map_err(|e| anyhow::anyhow!("Failed to open index from bundle {}: {}", split_uri, e))?;
+            
+            eprintln!("RUST DEBUG: Successfully opened index from split");
+            
+            // Create index reader using Quickwit's pattern (from fetch_docs.rs)
+            let index_reader = index
+                .reader_builder()
+                .reload_policy(ReloadPolicy::Manual)
+                .try_into()
+                .map_err(|e| anyhow::anyhow!("Failed to create index reader: {}", e))?;
+            
+            let tantivy_searcher = index_reader.searcher();
+            
+            eprintln!("RUST DEBUG: Created tantivy searcher, attempting to retrieve document at address: segment={}, doc={}", 
+                     doc_address.segment_ord, doc_address.doc_id);
+            
+            // Use searcher.doc() to retrieve the document (synchronous version)
+            let doc: tantivy::schema::TantivyDocument = tantivy_searcher
+                .doc(doc_address)
+                .map_err(|e| anyhow::anyhow!("Failed to retrieve document at address {:?}: {}", doc_address, e))?;
+            
+            eprintln!("RUST DEBUG: Successfully retrieved document from tantivy searcher");
+            
+            // Convert document to named doc (like in fetch_docs.rs line 210)
+            let named_field_doc = doc.to_named_doc(tantivy_searcher.schema());
+            
+            eprintln!("RUST DEBUG: Converted document to named doc with {} fields", named_field_doc.0.len());
+            
+            // Return the document and schema for processing
+            Ok::<(tantivy::schema::TantivyDocument, tantivy::schema::Schema), anyhow::Error>((doc, index.schema()))
+        })
+    });
+    
+    match result {
+        Some(Ok((doc, schema))) => {
+            eprintln!("RUST DEBUG: Document retrieval successful, creating RetrievedDocument");
+            
+            // Create a RetrievedDocument using the proper pattern from searcher.rs
+            // This follows the same approach as Java_com_tantivy4java_Searcher_nativeDoc
+            use crate::document::{DocumentWrapper, RetrievedDocument};
+            
+            let retrieved_doc = RetrievedDocument::new_with_schema(doc, &schema);
+            let wrapper = DocumentWrapper::Retrieved(retrieved_doc);
+            let doc_ptr = crate::utils::register_object(wrapper) as jlong;
+            
+            eprintln!("RUST DEBUG: Successfully created DocumentWrapper::Retrieved with pointer: {}", doc_ptr);
+            
+            // Create Java Document object with the pointer
+            match env.find_class("com/tantivy4java/Document") {
+                Ok(document_class) => {
+                    match env.new_object(&document_class, "(J)V", &[doc_ptr.into()]) {
+                        Ok(document_obj) => {
+                            eprintln!("RUST DEBUG: Successfully created Java Document object with pointer: {}", doc_ptr);
+                            document_obj.into_raw()
+                        },
+                        Err(e) => {
+                            eprintln!("RUST ERROR: Failed to create Document object: {}", e);
+                            to_java_exception(&mut env, &anyhow::anyhow!("Failed to create Document: {}", e));
+                            std::ptr::null_mut()
+                        }
+                    }
+                },
+                Err(e) => {
+                    eprintln!("RUST ERROR: Failed to find Document class: {}", e);
+                    to_java_exception(&mut env, &anyhow::anyhow!("Failed to find Document class: {}", e));
+                    std::ptr::null_mut()
+                }
+            }
+        },
+        Some(Err(e)) => {
+            eprintln!("RUST ERROR: Document retrieval failed: {}", e);
+            to_java_exception(&mut env, &e);
+            std::ptr::null_mut()
+        },
+        None => {
+            eprintln!("RUST ERROR: with_arc_safe returned None - searcher context not found for pointer {}", searcher_ptr);
+            to_java_exception(&mut env, &anyhow::anyhow!("Searcher context not found for pointer {}", searcher_ptr));
+            std::ptr::null_mut()
+        }
+    }
 }
 
 /// Replacement for Java_com_tantivy4java_SplitSearcher_getSchemaFromNative

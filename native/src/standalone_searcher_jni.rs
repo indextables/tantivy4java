@@ -110,6 +110,7 @@ pub extern "system" fn Java_com_tantivy4java_StandaloneSearcher_searchSplitNativ
                 split_id,
                 split_footer_start: footer_start as u64,
                 split_footer_end: footer_end as u64,
+                file_size: 0, // TODO: Need to get actual file size from storage.file_num_bytes()
                 num_docs: num_docs as u64,
                 time_range: None, // Not provided in this basic interface
                 delete_opstamp: delete_opstamp as u64,

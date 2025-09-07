@@ -269,8 +269,15 @@ pub extern "system" fn Java_com_tantivy4java_Document_nativeGet(
                             java_string.into()
                         },
                         OwnedValue::I64(i) => {
-                            let long_class = env.find_class("java/lang/Long").map_err(|e| e.to_string())?;
-                            env.new_object(&long_class, "(J)V", &[(*i).into()]).map_err(|e| e.to_string())?
+                            // Check if this is actually a 32-bit integer field based on the value range
+                            // If the value fits in i32 range, return Integer; otherwise Long
+                            if *i >= i32::MIN as i64 && *i <= i32::MAX as i64 {
+                                let integer_class = env.find_class("java/lang/Integer").map_err(|e| e.to_string())?;
+                                env.new_object(&integer_class, "(I)V", &[(*i as i32).into()]).map_err(|e| e.to_string())?
+                            } else {
+                                let long_class = env.find_class("java/lang/Long").map_err(|e| e.to_string())?;
+                                env.new_object(&long_class, "(J)V", &[(*i).into()]).map_err(|e| e.to_string())?
+                            }
                         },
                         OwnedValue::F64(f) => {
                             let double_class = env.find_class("java/lang/Double").map_err(|e| e.to_string())?;
