@@ -9,6 +9,7 @@ use jni::JNIEnv;
 use crate::standalone_searcher::{StandaloneSearcher, StandaloneSearchConfig, SplitSearchMetadata, resolve_storage_for_split};
 use crate::utils::{register_object, remove_object, with_object, arc_to_jlong, with_arc_safe, release_arc};
 use crate::common::to_java_exception;
+use crate::debug_println;
 
 use serde_json::{Value, Map};
 use quickwit_query::JsonLiteral;
@@ -87,7 +88,7 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_createNativeWithShare
             if !footer_start_jobject.is_null() {
                 if let Ok(footer_start_long) = env.call_method(&footer_start_jobject, "longValue", "()J", &[]) {
                     split_footer_start = footer_start_long.j().unwrap() as u64;
-                    eprintln!("RUST DEBUG: Extracted footer_start_offset from Java config: {}", split_footer_start);
+                    debug_println!("RUST DEBUG: Extracted footer_start_offset from Java config: {}", split_footer_start);
                 }
             }
         }
@@ -97,7 +98,7 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_createNativeWithShare
             if !footer_end_jobject.is_null() {
                 if let Ok(footer_end_long) = env.call_method(&footer_end_jobject, "longValue", "()J", &[]) {
                     split_footer_end = footer_end_long.j().unwrap() as u64;
-                    eprintln!("RUST DEBUG: Extracted footer_end_offset from Java config: {}", split_footer_end);
+                    debug_println!("RUST DEBUG: Extracted footer_end_offset from Java config: {}", split_footer_end);
                 }
             }
         }
@@ -114,7 +115,7 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_createNativeWithShare
                     if !access_key_jobject.is_null() {
                         if let Ok(access_key_str) = env.get_string((&access_key_jobject).into()) {
                             aws_config.insert("access_key".to_string(), access_key_str.into());
-                            eprintln!("RUST DEBUG: Extracted AWS access key from Java config");
+                            debug_println!("RUST DEBUG: Extracted AWS access key from Java config");
                         }
                     }
                 }
@@ -125,7 +126,7 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_createNativeWithShare
                     if !secret_key_jobject.is_null() {
                         if let Ok(secret_key_str) = env.get_string((&secret_key_jobject).into()) {
                             aws_config.insert("secret_key".to_string(), secret_key_str.into());
-                            eprintln!("RUST DEBUG: Extracted AWS secret key from Java config");
+                            debug_println!("RUST DEBUG: Extracted AWS secret key from Java config");
                         }
                     }
                 }
@@ -136,7 +137,7 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_createNativeWithShare
                     if !session_token_jobject.is_null() {
                         if let Ok(session_token_str) = env.get_string((&session_token_jobject).into()) {
                             aws_config.insert("session_token".to_string(), session_token_str.into());
-                            eprintln!("RUST DEBUG: Extracted AWS session token from Java config");
+                            debug_println!("RUST DEBUG: Extracted AWS session token from Java config");
                         }
                     }
                 }
@@ -147,7 +148,7 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_createNativeWithShare
                     if !region_jobject.is_null() {
                         if let Ok(region_str) = env.get_string((&region_jobject).into()) {
                             aws_config.insert("region".to_string(), region_str.into());
-                            eprintln!("RUST DEBUG: Extracted AWS region from Java config");
+                            debug_println!("RUST DEBUG: Extracted AWS region from Java config");
                         }
                     }
                 }
@@ -158,7 +159,7 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_createNativeWithShare
                     if !endpoint_jobject.is_null() {
                         if let Ok(endpoint_str) = env.get_string((&endpoint_jobject).into()) {
                             aws_config.insert("endpoint".to_string(), endpoint_str.into());
-                            eprintln!("RUST DEBUG: Extracted AWS endpoint from Java config");
+                            debug_println!("RUST DEBUG: Extracted AWS endpoint from Java config");
                         }
                     }
                 }
@@ -166,7 +167,7 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_createNativeWithShare
         }
     }
     
-    eprintln!("RUST DEBUG: Config extracted - AWS keys: {}, footer offsets: {}-{}", aws_config.len(), split_footer_start, split_footer_end);
+    debug_println!("RUST DEBUG: Config extracted - AWS keys: {}, footer offsets: {}-{}", aws_config.len(), split_footer_start, split_footer_end);
 
     // Create Tokio runtime for async operations
     let runtime = match tokio::runtime::Builder::new_current_thread()
@@ -185,7 +186,7 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_createNativeWithShare
     
     // Create a configured storage resolver with AWS credentials if provided
     let storage_resolver = if aws_config.contains_key("access_key") && aws_config.contains_key("secret_key") {
-        eprintln!("RUST DEBUG: Creating configured storage resolver with AWS credentials");
+        debug_println!("RUST DEBUG: Creating configured storage resolver with AWS credentials");
         
         let mut s3_config = S3StorageConfig::default();
         s3_config.access_key_id = Some(aws_config.get("access_key").unwrap().clone());
@@ -213,7 +214,7 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_createNativeWithShare
             .build()
             .expect("Failed to create storage resolver")
     } else {
-        eprintln!("RUST DEBUG: Creating unconfigured storage resolver (no AWS credentials)");
+        debug_println!("RUST DEBUG: Creating unconfigured storage resolver (no AWS credentials)");
         StorageResolver::unconfigured()
     };
     
@@ -223,7 +224,7 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_createNativeWithShare
             // Store searcher, runtime, split URI, AWS config, and footer offsets together using Arc for memory safety
             let searcher_context = std::sync::Arc::new((searcher, runtime, split_uri.clone(), aws_config, split_footer_start, split_footer_end));
             let pointer = arc_to_jlong(searcher_context);
-            eprintln!("RUST DEBUG: SUCCESS: Stored searcher context for split '{}' with Arc pointer: {}, footer: {}-{}", 
+            debug_println!("RUST DEBUG: SUCCESS: Stored searcher context for split '{}' with Arc pointer: {}, footer: {}-{}", 
                      split_uri, pointer, split_footer_start, split_footer_end);
             pointer
         },
@@ -246,18 +247,18 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_closeNative(
     }
 
     // Debug: Log call stack to understand why this is being called
-    if std::env::var("TANTIVY4JAVA_DEBUG").unwrap_or_default() == "1" {
-        eprintln!("RUST DEBUG: WARNING - closeNative called for SplitSearcher with ID: {}", searcher_ptr);
-        eprintln!("RUST DEBUG: This should only happen when the SplitSearcher is closed in Java");
+    if *crate::debug::DEBUG_ENABLED {
+        debug_println!("RUST DEBUG: WARNING - closeNative called for SplitSearcher with ID: {}", searcher_ptr);
+        debug_println!("RUST DEBUG: This should only happen when the SplitSearcher is closed in Java");
         
         // Print the stack trace to see where this is being called from
         let backtrace = std::backtrace::Backtrace::capture();
         if backtrace.status() == std::backtrace::BacktraceStatus::Captured {
-            eprintln!("RUST DEBUG: Stack trace for closeNative:");
+            debug_println!("RUST DEBUG: Stack trace for closeNative:");
             let backtrace_str = format!("{}", backtrace);
             for (i, line) in backtrace_str.lines().enumerate() {
                 if i < 20 {  // Print first 20 lines to avoid too much output
-                    eprintln!("  {}", line);
+                    debug_println!("  {}", line);
                 }
             }
         }
@@ -265,7 +266,7 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_closeNative(
 
     // SAFE: Release Arc from registry to prevent memory leaks
     release_arc(searcher_ptr);
-    eprintln!("RUST DEBUG: Closed searcher and released Arc with ID: {}", searcher_ptr);
+    debug_println!("RUST DEBUG: Closed searcher and released Arc with ID: {}", searcher_ptr);
 }
 
 /// Replacement for Java_com_tantivy4java_SplitSearcher_validateSplitNative  
@@ -315,13 +316,13 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_getCacheStatsNative(
                 ) {
                     Ok(cache_stats_obj) => Some(cache_stats_obj.into_raw()),
                     Err(e) => {
-                        eprintln!("RUST DEBUG: Failed to create CacheStats object: {}", e);
+                        debug_println!("RUST DEBUG: Failed to create CacheStats object: {}", e);
                         None
                     }
                 }
             },
             Err(e) => {
-                eprintln!("RUST DEBUG: Failed to find CacheStats class: {}", e);
+                debug_println!("RUST DEBUG: Failed to find CacheStats class: {}", e);
                 None
             }
         }
@@ -350,7 +351,7 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_searchWithQueryAst(
     query_ast_json: JString,
     limit: jint,
 ) -> jobject {
-    // eprintln!("RUST DEBUG: SplitSearcher.searchWithQueryAst called with limit: {}", limit);
+    // debug_println!("RUST DEBUG: SplitSearcher.searchWithQueryAst called with limit: {}", limit);
     
     if searcher_ptr == 0 {
         to_java_exception(&mut env, &anyhow::anyhow!("Invalid searcher pointer"));
@@ -366,19 +367,19 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_searchWithQueryAst(
         }
     };
     
-    // eprintln!("RUST DEBUG: QueryAst JSON: {}", query_json);
+    // debug_println!("RUST DEBUG: QueryAst JSON: {}", query_json);
     
     // Parse and fix range queries with proper field types from schema
     let fixed_query_json = match fix_range_query_types(searcher_ptr, &query_json) {
         Ok(fixed_json) => fixed_json,
         Err(e) => {
-            eprintln!("RUST DEBUG: Failed to fix range query types: {}, using original query", e);
+            debug_println!("RUST DEBUG: Failed to fix range query types: {}, using original query", e);
             query_json.clone()
         }
     };
     
     if fixed_query_json != query_json {
-        eprintln!("RUST DEBUG: Fixed QueryAst JSON: {}", fixed_query_json);
+        debug_println!("RUST DEBUG: Fixed QueryAst JSON: {}", fixed_query_json);
     }
     
     // Use the searcher context to perform search with Quickwit's leaf search approach
@@ -403,7 +404,7 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_searchWithQueryAst(
                 let query_ast: QueryAst = serde_json::from_str(&fixed_query_json)
                     .map_err(|e| anyhow::anyhow!("Failed to parse QueryAst JSON: {}", e))?;
                 
-                eprintln!("RUST DEBUG: Successfully parsed QueryAst: {:?}", query_ast);
+                debug_println!("RUST DEBUG: Successfully parsed QueryAst: {:?}", query_ast);
                 
                 // First, we need to extract the actual split metadata from the split file
                 // This includes footer offsets, number of documents, and the doc mapper
@@ -415,7 +416,7 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_searchWithQueryAst(
                 // Create S3 storage configuration with credentials from Java config
                 let mut storage_configs = StorageConfigs::default();
                 
-                eprintln!("RUST DEBUG: Creating S3 config with credentials from Java configuration");
+                debug_println!("RUST DEBUG: Creating S3 config with credentials from Java configuration");
                 let s3_config = S3StorageConfig {
                     flavor: None,
                     access_key_id: aws_config.get("access_key").cloned(),
@@ -443,19 +444,19 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_searchWithQueryAst(
                     std::path::Path::new(split_uri)
                 };
                 
-                eprintln!("RUST DEBUG: Reading split file metadata from: '{}'", relative_path.display());
+                debug_println!("RUST DEBUG: Reading split file metadata from: '{}'", relative_path.display());
                 
                 // Get the full file data to extract metadata
                 let file_size = storage.file_num_bytes(relative_path).await
                     .map_err(|e| anyhow::anyhow!("Failed to get file size for {}: {}", split_uri, e))?;
                 
-                eprintln!("RUST DEBUG: Split file size: {} bytes", file_size);
+                debug_println!("RUST DEBUG: Split file size: {} bytes", file_size);
                 
                 // Use footer offsets from Java configuration instead of reading from file
                 let split_footer_start = *footer_start;
                 let split_footer_end = *footer_end;
                 
-                eprintln!("RUST DEBUG: Using footer offsets from Java config: fileSizeSJS={} start={}, end={}", file_size, split_footer_start, split_footer_end);
+                debug_println!("RUST DEBUG: Using footer offsets from Java config: fileSizeSJS={} start={}, end={}", file_size, split_footer_start, split_footer_end);
                 
                 // Now open the split to get the actual index and extract metadata
                 let split_data = storage.get_slice(relative_path, 0..file_size as usize).await
@@ -476,7 +477,7 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_searchWithQueryAst(
                 let searcher_tantivy = reader.searcher();
                 let num_docs = searcher_tantivy.num_docs();
                 
-                eprintln!("RUST DEBUG: Extracted actual num_docs from index: {}", num_docs);
+                debug_println!("RUST DEBUG: Extracted actual num_docs from index: {}", num_docs);
                 
                 // Extract the split ID from the URI (last component before .split extension)
                 let split_id = relative_path
@@ -485,7 +486,7 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_searchWithQueryAst(
                     .unwrap_or("unknown")
                     .to_string();
                 
-                eprintln!("RUST DEBUG: Split ID: {}", split_id);
+                debug_println!("RUST DEBUG: Split ID: {}", split_id);
                 
                 // Create the proper split metadata with REAL values
                 let split_metadata = SplitSearchMetadata {
@@ -536,7 +537,7 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_searchWithQueryAst(
                     }));
                 }
                 
-                eprintln!("RUST DEBUG: Extracted {} field mappings from index schema", field_mappings.len());
+                debug_println!("RUST DEBUG: Extracted {} field mappings from index schema", field_mappings.len());
                 
                 let doc_mapping_json = serde_json::json!({
                     "field_mappings": field_mappings,
@@ -554,7 +555,7 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_searchWithQueryAst(
                 
                 let doc_mapper_arc = Arc::new(doc_mapper);
                 
-                eprintln!("RUST DEBUG: Successfully created DocMapper from actual index schema");
+                debug_println!("RUST DEBUG: Successfully created DocMapper from actual index schema");
                 
                 // Create a SearchRequest with the QueryAst
                 let search_request = SearchRequest {
@@ -572,17 +573,17 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_searchWithQueryAst(
                     count_hits: quickwit_proto::search::CountHits::CountAll as i32,
                 };
                 
-                eprintln!("RUST DEBUG: Calling StandaloneSearcher.search_split_sync with REAL parameters:");
-                eprintln!("  - Split URI: {}", split_uri);
-                eprintln!("  - Split ID: {}", split_metadata.split_id);
-                eprintln!("  - Num docs: {}", split_metadata.num_docs);
-                eprintln!("  - Footer offsets: {}-{}", split_metadata.split_footer_start, split_metadata.split_footer_end);
-                // eprintln!("RUST DEBUG: About to call searcher.search_split()...");
+                debug_println!("RUST DEBUG: Calling StandaloneSearcher.search_split_sync with REAL parameters:");
+                debug_println!("  - Split URI: {}", split_uri);
+                debug_println!("  - Split ID: {}", split_metadata.split_id);
+                debug_println!("  - Num docs: {}", split_metadata.num_docs);
+                debug_println!("  - Footer offsets: {}-{}", split_metadata.split_footer_start, split_metadata.split_footer_end);
+                // debug_println!("RUST DEBUG: About to call searcher.search_split()...");
                 
                 // PERFORM THE ACTUAL REAL SEARCH WITH NO MOCKING!
                 // We're already in an async context, so use the async method directly
                 let split_id_for_error = split_metadata.split_id.clone();
-                // eprintln!("RUST DEBUG: Calling searcher.search_split() NOW!");
+                // debug_println!("RUST DEBUG: Calling searcher.search_split() NOW!");
                 let leaf_search_response = match searcher.search_split(
                     split_uri,
                     split_metadata,
@@ -591,14 +592,14 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_searchWithQueryAst(
                 ).await {
                     Ok(response) => response,
                     Err(e) => {
-                        eprintln!("RUST DEBUG: ERROR in searcher.search_split: {}", e);
-                        eprintln!("RUST DEBUG: Full error chain: {:#}", e);
+                        debug_println!("RUST DEBUG: ERROR in searcher.search_split: {}", e);
+                        debug_println!("RUST DEBUG: Full error chain: {:#}", e);
                         // Propagate the full error chain to Java
                         return Err(anyhow::anyhow!("{:#}", e));
                     }
                 };
                 
-                eprintln!("RUST DEBUG: REAL SEARCH COMPLETED! Found {} hits from StandaloneSearcher", leaf_search_response.num_hits);
+                debug_println!("RUST DEBUG: REAL SEARCH COMPLETED! Found {} hits from StandaloneSearcher", leaf_search_response.num_hits);
                 
                 // Convert LeafSearchResponse to SearchResult format
                 let mut search_results: Vec<(f32, tantivy::DocAddress)> = Vec::new();
@@ -625,7 +626,7 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_searchWithQueryAst(
                     search_results.push((score, doc_address));
                 }
                 
-                eprintln!("RUST DEBUG: Converted {} hits to SearchResult format", search_results.len());
+                debug_println!("RUST DEBUG: Converted {} hits to SearchResult format", search_results.len());
                 
                 // Register the search results and get a pointer
                 let search_result_ptr = register_object(search_results) as jlong;
@@ -640,7 +641,7 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_searchWithQueryAst(
                     &[(search_result_ptr).into()]
                 ).map_err(|e| anyhow::anyhow!("Failed to create SearchResult: {}", e))?;
                 
-                eprintln!("RUST DEBUG: Successfully created SearchResult with {} hits", leaf_search_response.num_hits);
+                debug_println!("RUST DEBUG: Successfully created SearchResult with {} hits", leaf_search_response.num_hits);
                 
                 Ok(search_result.into_raw())
         })
@@ -674,17 +675,17 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_docNative(
     segment_ord: jint,
     doc_id: jint,
 ) -> jobject {
-    // eprintln!("RUST DEBUG: SplitSearcher.docNative called with segment_ord={}, doc_id={}", segment_ord, doc_id);
+    // debug_println!("RUST DEBUG: SplitSearcher.docNative called with segment_ord={}, doc_id={}", segment_ord, doc_id);
     
     if searcher_ptr == 0 {
-        eprintln!("RUST ERROR: Invalid searcher pointer");
+        debug_println!("RUST ERROR: Invalid searcher pointer");
         to_java_exception(&mut env, &anyhow::anyhow!("Invalid searcher pointer"));
         return std::ptr::null_mut();
     }
     
     // Create DocAddress from the provided segment and doc ID
     let doc_address = tantivy::DocAddress::new(segment_ord as u32, doc_id as u32);
-    // eprintln!("RUST DEBUG: Created DocAddress: segment={}, doc={}", doc_address.segment_ord, doc_address.doc_id);
+    // debug_println!("RUST DEBUG: Created DocAddress: segment={}, doc={}", doc_address.segment_ord, doc_address.doc_id);
     
     // Implement actual document retrieval using Quickwit's approach
     // Use the searcher context to retrieve the document from the split
@@ -695,7 +696,7 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_docNative(
         let _guard = runtime.enter();
         
         // Only log document retrieval in debug mode if explicitly verbose
-        // eprintln!("RUST DEBUG: Starting document retrieval for split: {}", split_uri);
+        // debug_println!("RUST DEBUG: Starting document retrieval for split: {}", split_uri);
         
         // Run async document retrieval using Quickwit's pattern
         runtime.block_on(async {
@@ -736,7 +737,7 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_docNative(
                 Path::new(split_uri)
             };
             
-            // eprintln!("RUST DEBUG: Getting split file data from: '{}'", relative_path.display());
+            // debug_println!("RUST DEBUG: Getting split file data from: '{}'", relative_path.display());
             
             // Get the full file data using Quickwit's storage abstraction
             let file_size = actual_storage.file_num_bytes(relative_path).await
@@ -755,7 +756,7 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_docNative(
             let index = tantivy::Index::open(bundle_directory)
                 .map_err(|e| anyhow::anyhow!("Failed to open index from bundle {}: {}", split_uri, e))?;
             
-            // eprintln!("RUST DEBUG: Successfully opened index from split");
+            // debug_println!("RUST DEBUG: Successfully opened index from split");
             
             // Create index reader using Quickwit's pattern (from fetch_docs.rs)
             let index_reader = index
@@ -767,7 +768,7 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_docNative(
             let tantivy_searcher = index_reader.searcher();
             
             // Verbose logging commented out for performance
-            // eprintln!("RUST DEBUG: Created tantivy searcher, attempting to retrieve document at address: segment={}, doc={}", 
+            // debug_println!("RUST DEBUG: Created tantivy searcher, attempting to retrieve document at address: segment={}, doc={}", 
             //          doc_address.segment_ord, doc_address.doc_id);
             
             // Use searcher.doc() to retrieve the document (synchronous version)
@@ -776,12 +777,12 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_docNative(
                 .map_err(|e| anyhow::anyhow!("Failed to retrieve document at address {:?}: {}", doc_address, e))?;
             
             // Verbose logging commented out for performance
-            // eprintln!("RUST DEBUG: Successfully retrieved document from tantivy searcher");
+            // debug_println!("RUST DEBUG: Successfully retrieved document from tantivy searcher");
             
             // Convert document to named doc (like in fetch_docs.rs line 210)
             let named_field_doc = doc.to_named_doc(tantivy_searcher.schema());
             
-            // eprintln!("RUST DEBUG: Converted document to named doc with {} fields", named_field_doc.0.len());
+            // debug_println!("RUST DEBUG: Converted document to named doc with {} fields", named_field_doc.0.len());
             
             // Return the document and schema for processing
             Ok::<(tantivy::schema::TantivyDocument, tantivy::schema::Schema), anyhow::Error>((doc, index.schema()))
@@ -790,7 +791,7 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_docNative(
     
     match result {
         Some(Ok((doc, schema))) => {
-            // eprintln!("RUST DEBUG: Document retrieval successful, creating RetrievedDocument");
+            // debug_println!("RUST DEBUG: Document retrieval successful, creating RetrievedDocument");
             
             // Create a RetrievedDocument using the proper pattern from searcher.rs
             // This follows the same approach as Java_com_tantivy4java_Searcher_nativeDoc
@@ -800,37 +801,37 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_docNative(
             let wrapper = DocumentWrapper::Retrieved(retrieved_doc);
             let doc_ptr = crate::utils::register_object(wrapper) as jlong;
             
-            // eprintln!("RUST DEBUG: Successfully created DocumentWrapper::Retrieved with pointer: {}", doc_ptr);
+            // debug_println!("RUST DEBUG: Successfully created DocumentWrapper::Retrieved with pointer: {}", doc_ptr);
             
             // Create Java Document object with the pointer
             match env.find_class("com/tantivy4java/Document") {
                 Ok(document_class) => {
                     match env.new_object(&document_class, "(J)V", &[doc_ptr.into()]) {
                         Ok(document_obj) => {
-                            // eprintln!("RUST DEBUG: Successfully created Java Document object with pointer: {}", doc_ptr);
+                            // debug_println!("RUST DEBUG: Successfully created Java Document object with pointer: {}", doc_ptr);
                             document_obj.into_raw()
                         },
                         Err(e) => {
-                            eprintln!("RUST ERROR: Failed to create Document object: {}", e);
+                            debug_println!("RUST ERROR: Failed to create Document object: {}", e);
                             to_java_exception(&mut env, &anyhow::anyhow!("Failed to create Document: {}", e));
                             std::ptr::null_mut()
                         }
                     }
                 },
                 Err(e) => {
-                    eprintln!("RUST ERROR: Failed to find Document class: {}", e);
+                    debug_println!("RUST ERROR: Failed to find Document class: {}", e);
                     to_java_exception(&mut env, &anyhow::anyhow!("Failed to find Document class: {}", e));
                     std::ptr::null_mut()
                 }
             }
         },
         Some(Err(e)) => {
-            eprintln!("RUST ERROR: Document retrieval failed: {}", e);
+            debug_println!("RUST ERROR: Document retrieval failed: {}", e);
             to_java_exception(&mut env, &e);
             std::ptr::null_mut()
         },
         None => {
-            eprintln!("RUST ERROR: with_arc_safe returned None - searcher context not found for pointer {}", searcher_ptr);
+            debug_println!("RUST ERROR: with_arc_safe returned None - searcher context not found for pointer {}", searcher_ptr);
             to_java_exception(&mut env, &anyhow::anyhow!("Searcher context not found for pointer {}", searcher_ptr));
             std::ptr::null_mut()
         }
@@ -844,14 +845,14 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_getSchemaFromNative(
     _class: JClass,
     searcher_ptr: jlong,
 ) -> jlong {
-    eprintln!("RUST DEBUG: *** getSchemaFromNative ENTRY POINT *** pointer: {}", searcher_ptr);
+    debug_println!("RUST DEBUG: *** getSchemaFromNative ENTRY POINT *** pointer: {}", searcher_ptr);
     
     if searcher_ptr == 0 {
-        eprintln!("RUST DEBUG: searcher_ptr is 0, returning 0");
+        debug_println!("RUST DEBUG: searcher_ptr is 0, returning 0");
         return 0;
     }
     
-    // eprintln!("RUST DEBUG: About to call with_object to access searcher context...");
+    // debug_println!("RUST DEBUG: About to call with_object to access searcher context...");
     if searcher_ptr == 0 {
         to_java_exception(&mut env, &anyhow::anyhow!("Invalid searcher pointer"));
         return 0;
@@ -860,7 +861,7 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_getSchemaFromNative(
     // Extract the actual schema from the split file using Quickwit's functionality
     let result = with_arc_safe(searcher_ptr, |searcher_context: &Arc<(StandaloneSearcher, tokio::runtime::Runtime, String, std::collections::HashMap<String, String>, u64, u64)>| {
         let (_searcher, runtime, split_uri, aws_config, _footer_start, _footer_end) = searcher_context.as_ref();
-        eprintln!("RUST DEBUG: getSchemaFromNative called with split URI: {}", split_uri);
+        debug_println!("RUST DEBUG: getSchemaFromNative called with split URI: {}", split_uri);
         
         // Enter the runtime context for async operations
         let _guard = runtime.enter();
@@ -880,7 +881,7 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_getSchemaFromNative(
                 use quickwit_config::{StorageConfigs, S3StorageConfig};
                 let mut storage_configs = StorageConfigs::default();
                 
-                eprintln!("RUST DEBUG: Creating S3 config with credentials from tantivy4java (not environment)");
+                debug_println!("RUST DEBUG: Creating S3 config with credentials from tantivy4java (not environment)");
                 let s3_config = S3StorageConfig {
                     flavor: None,
                     access_key_id: aws_config.get("access_key").cloned(),
@@ -893,7 +894,7 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_getSchemaFromNative(
                     disable_multipart_upload: false,
                 };
                 
-                eprintln!("RUST DEBUG: S3 config created with access_key: {}, region: {}", 
+                debug_println!("RUST DEBUG: S3 config created with access_key: {}, region: {}", 
                          s3_config.access_key_id.as_ref().map(|k| &k[..std::cmp::min(8, k.len())]).unwrap_or("None"),
                          s3_config.region.as_ref().unwrap_or(&"None".to_string()));
                 
@@ -912,13 +913,13 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_getSchemaFromNative(
                     Path::new(split_uri)
                 };
                 
-                eprintln!("RUST DEBUG: About to call storage.file_num_bytes with relative path: '{}'", relative_path.display());
+                debug_println!("RUST DEBUG: About to call storage.file_num_bytes with relative path: '{}'", relative_path.display());
                 
                 // Get the full file data using Quickwit's storage abstraction
                 let file_size = actual_storage.file_num_bytes(relative_path).await
                     .map_err(|e| anyhow::anyhow!("Failed to get file size for {}: {}", split_uri, e))?;
                 
-                eprintln!("RUST DEBUG: Got file size: {} bytes", file_size);
+                debug_println!("RUST DEBUG: Got file size: {} bytes", file_size);
                 
                 let split_data = actual_storage.get_slice(relative_path, 0..file_size as usize).await
                     .map_err(|e| anyhow::anyhow!("Failed to get split data from {}: {}", split_uri, e))?;
@@ -948,12 +949,12 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_getSchemaFromNative(
                 // Register the actual schema from the split using Arc for memory safety
                 let schema_arc = std::sync::Arc::new(s);
                 let schema_ptr = arc_to_jlong(schema_arc);
-                eprintln!("RUST DEBUG: SUCCESS - Schema extracted and registered with Arc pointer: {}", schema_ptr);
+                debug_println!("RUST DEBUG: SUCCESS - Schema extracted and registered with Arc pointer: {}", schema_ptr);
                 schema_ptr
             },
             Err(e) => {
-                eprintln!("RUST DEBUG: FATAL ERROR - Schema extraction failed completely for split {}: {}", split_uri, e);
-                eprintln!("RUST DEBUG: Error chain: {:?}", e);
+                debug_println!("RUST DEBUG: FATAL ERROR - Schema extraction failed completely for split {}: {}", split_uri, e);
+                debug_println!("RUST DEBUG: Error chain: {:?}", e);
                 // Return 0 to indicate failure
                 0
             }
@@ -962,11 +963,11 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_getSchemaFromNative(
 
     match result {
         Some(schema_ptr) => {
-            eprintln!("SUCCESS: Schema extracted and registered with pointer: {}", schema_ptr);
+            debug_println!("SUCCESS: Schema extracted and registered with pointer: {}", schema_ptr);
             schema_ptr
         },
         None => {
-            eprintln!("ERROR: with_object returned None - searcher context not found for pointer {}", searcher_ptr);
+            debug_println!("ERROR: with_object returned None - searcher context not found for pointer {}", searcher_ptr);
             to_java_exception(&mut env, &anyhow::anyhow!("Searcher context not found for pointer {}", searcher_ptr));
             0
         }
@@ -1003,7 +1004,7 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_preloadComponentsNati
     _components: jobject,
 ) -> jboolean {
     // For now, just return success (1) to allow warmup to complete
-    eprintln!("RUST DEBUG: preloadComponentsNative called - returning success");
+    debug_println!("RUST DEBUG: preloadComponentsNative called - returning success");
     1 // true
 }
 /// Replacement for Java_com_tantivy4java_SplitSearcher_getComponentCacheStatusNative
@@ -1014,7 +1015,7 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_getComponentCacheStat
     _class: JClass,
     _searcher_ptr: jlong,
 ) -> jobject {
-    eprintln!("RUST DEBUG: getComponentCacheStatusNative called - creating empty HashMap");
+    debug_println!("RUST DEBUG: getComponentCacheStatusNative called - creating empty HashMap");
     
     // Create an empty HashMap for component status
     match env.new_object("java/util/HashMap", "()V", &[]) {
@@ -1171,9 +1172,7 @@ fn fix_range_query_object(range_map: &mut Map<String, Value>, schema: &tantivy::
         tantivy::schema::FieldType::IpAddr(_) => "str",
     };
     
-    if std::env::var("TANTIVY4JAVA_DEBUG").unwrap_or_default() == "1" {
-        eprintln!("RUST DEBUG: Field '{}' has type '{}', converting range bounds", field_name, target_type);
-    }
+    debug_println!("RUST DEBUG: Field '{}' has type '{}', converting range bounds", field_name, target_type);
     
     // Fix lower_bound and upper_bound
     if let Some(lower_bound) = range_map.get_mut("lower_bound") {
@@ -1225,9 +1224,7 @@ fn fix_bound_value(bound: &mut Value, target_type: &str, bound_name: &str) -> an
                                 }
                             };
                             
-                            if std::env::var("TANTIVY4JAVA_DEBUG").unwrap_or_default() == "1" {
-                                eprintln!("RUST DEBUG: Converted {} '{}' from String to {} for type {}", bound_name, string_str, new_literal, target_type);
-                            }
+                            debug_println!("RUST DEBUG: Converted {} '{}' from String to {} for type {}", bound_name, string_str, new_literal, target_type);
                             
                             *json_literal = new_literal;
                         }

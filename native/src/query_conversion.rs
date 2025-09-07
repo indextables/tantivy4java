@@ -5,13 +5,14 @@ use anyhow::{Result, anyhow};
 use tantivy::query::{Query as TantivyQuery, TermQuery, BooleanQuery, RangeQuery, PhraseQuery, FuzzyTermQuery, AllQuery, BoostQuery, ConstScoreQuery};
 use tantivy::schema::Schema;
 use quickwit_query::query_ast::{QueryAst, TermQuery as QwTermQuery, BoolQuery, RangeQuery as QwRangeQuery};
+use crate::debug_println;
 
 /// Recursively convert a Tantivy Query to Quickwit QueryAst
 pub fn convert_tantivy_query_to_ast(
     query: &dyn TantivyQuery, 
     schema: &Schema
 ) -> Result<QueryAst> {
-    eprintln!("RUST DEBUG: Converting Tantivy query to QueryAst...");
+    debug_println!("RUST DEBUG: Converting Tantivy query to QueryAst...");
     
     // Try to downcast to specific query types
     // Note: This is tricky because TantivyQuery doesn't provide type information
@@ -22,51 +23,51 @@ pub fn convert_tantivy_query_to_ast(
     
     // Try each query type we support
     if let Some(term_query) = query_any.downcast_ref::<TermQuery>() {
-        eprintln!("RUST DEBUG: Found TermQuery");
+        debug_println!("RUST DEBUG: Found TermQuery");
         return convert_term_query(term_query, schema);
     }
     
     if let Some(boolean_query) = query_any.downcast_ref::<BooleanQuery>() {
-        eprintln!("RUST DEBUG: Found BooleanQuery");
+        debug_println!("RUST DEBUG: Found BooleanQuery");
         return convert_boolean_query(boolean_query, schema);
     }
     
     if let Some(range_query) = query_any.downcast_ref::<RangeQuery>() {
-        eprintln!("RUST DEBUG: Found RangeQuery");
+        debug_println!("RUST DEBUG: Found RangeQuery");
         return convert_range_query(range_query, schema);
     }
     
     if let Some(phrase_query) = query_any.downcast_ref::<PhraseQuery>() {
-        eprintln!("RUST DEBUG: Found PhraseQuery");
+        debug_println!("RUST DEBUG: Found PhraseQuery");
         return convert_phrase_query(phrase_query, schema);
     }
     
     if let Some(fuzzy_query) = query_any.downcast_ref::<FuzzyTermQuery>() {
-        eprintln!("RUST DEBUG: Found FuzzyTermQuery");
+        debug_println!("RUST DEBUG: Found FuzzyTermQuery");
         return convert_fuzzy_query(fuzzy_query, schema);
     }
     
     if let Some(all_query) = query_any.downcast_ref::<AllQuery>() {
-        eprintln!("RUST DEBUG: Found AllQuery");
+        debug_println!("RUST DEBUG: Found AllQuery");
         return convert_all_query(all_query, schema);
     }
     
     if let Some(boost_query) = query_any.downcast_ref::<BoostQuery>() {
-        eprintln!("RUST DEBUG: Found BoostQuery");
+        debug_println!("RUST DEBUG: Found BoostQuery");
         return convert_boost_query(boost_query, schema);
     }
     
     if let Some(const_query) = query_any.downcast_ref::<ConstScoreQuery>() {
-        eprintln!("RUST DEBUG: Found ConstScoreQuery");
+        debug_println!("RUST DEBUG: Found ConstScoreQuery");
         return convert_const_score_query(const_query, schema);
     }
     
-    eprintln!("RUST DEBUG: Unsupported query type");
+    debug_println!("RUST DEBUG: Unsupported query type");
     Err(anyhow!("Unsupported query type for conversion to QueryAst"))
 }
 
 fn convert_term_query(query: &TermQuery, schema: &Schema) -> Result<QueryAst> {
-    eprintln!("RUST DEBUG: Converting TermQuery...");
+    debug_println!("RUST DEBUG: Converting TermQuery...");
     
     // Extract the Term from TermQuery using the public accessor
     let term = query.term();
@@ -114,7 +115,7 @@ fn convert_term_query(query: &TermQuery, schema: &Schema) -> Result<QueryAst> {
         _ => "unknown_value".to_string(),
     };
     
-    eprintln!("RUST DEBUG: Converted TermQuery - field: {}, value: {}", field_name, value_str);
+    debug_println!("RUST DEBUG: Converted TermQuery - field: {}, value: {}", field_name, value_str);
     
     Ok(QueryAst::Term(QwTermQuery {
         field: field_name.to_string(),
@@ -123,7 +124,7 @@ fn convert_term_query(query: &TermQuery, schema: &Schema) -> Result<QueryAst> {
 }
 
 fn convert_boolean_query(query: &BooleanQuery, schema: &Schema) -> Result<QueryAst> {
-    eprintln!("RUST DEBUG: Converting BooleanQuery...");
+    debug_println!("RUST DEBUG: Converting BooleanQuery...");
     
     // Extract clauses using the public accessor
     let clauses = query.clauses();
@@ -143,7 +144,7 @@ fn convert_boolean_query(query: &BooleanQuery, schema: &Schema) -> Result<QueryA
         }
     }
     
-    eprintln!("RUST DEBUG: BooleanQuery converted - must: {}, should: {}, must_not: {}", 
+    debug_println!("RUST DEBUG: BooleanQuery converted - must: {}, should: {}, must_not: {}", 
               must_clauses.len(), should_clauses.len(), must_not_clauses.len());
     
     Ok(QueryAst::Bool(BoolQuery {
@@ -156,7 +157,7 @@ fn convert_boolean_query(query: &BooleanQuery, schema: &Schema) -> Result<QueryA
 }
 
 fn convert_range_query(query: &RangeQuery, schema: &Schema) -> Result<QueryAst> {
-    eprintln!("RUST DEBUG: Converting RangeQuery...");
+    debug_println!("RUST DEBUG: Converting RangeQuery...");
     
     // Get field information using public accessors
     let field = query.field();
@@ -168,7 +169,7 @@ fn convert_range_query(query: &RangeQuery, schema: &Schema) -> Result<QueryAst> 
     // For now, we'll create a placeholder range query
     // TODO: Find a way to extract bounds or add public accessor to RangeQuery
     
-    eprintln!("RUST DEBUG: RangeQuery field: {}, type: {:?}", field_name, value_type);
+    debug_println!("RUST DEBUG: RangeQuery field: {}, type: {:?}", field_name, value_type);
     
     // Create a placeholder range query - this is incomplete
     // In a real implementation, we would need access to the bounds
@@ -181,7 +182,7 @@ fn convert_range_query(query: &RangeQuery, schema: &Schema) -> Result<QueryAst> 
 }
 
 fn convert_phrase_query(query: &PhraseQuery, schema: &Schema) -> Result<QueryAst> {
-    eprintln!("RUST DEBUG: Converting PhraseQuery...");
+    debug_println!("RUST DEBUG: Converting PhraseQuery...");
     
     // Extract field and terms using public accessors
     let field = query.field();
@@ -201,7 +202,7 @@ fn convert_phrase_query(query: &PhraseQuery, schema: &Schema) -> Result<QueryAst
         .collect::<Vec<String>>()
         .join(" ");
     
-    eprintln!("RUST DEBUG: PhraseQuery field: {}, phrase: \"{}\"", field_name, phrase_text);
+    debug_println!("RUST DEBUG: PhraseQuery field: {}, phrase: \"{}\"", field_name, phrase_text);
     
     // Convert to a FullTextQuery - this is the closest equivalent in Quickwit
     // PhraseQuery becomes a FullTextQuery with phrase mode
@@ -217,24 +218,24 @@ fn convert_phrase_query(query: &PhraseQuery, schema: &Schema) -> Result<QueryAst
 }
 
 fn convert_fuzzy_query(query: &FuzzyTermQuery, schema: &Schema) -> Result<QueryAst> {
-    eprintln!("RUST DEBUG: Converting FuzzyTermQuery...");
+    debug_println!("RUST DEBUG: Converting FuzzyTermQuery...");
     // TODO: Convert to appropriate fuzzy query type in QueryAst
     Ok(QueryAst::MatchAll) // Placeholder
 }
 
 fn convert_all_query(query: &AllQuery, schema: &Schema) -> Result<QueryAst> {
-    eprintln!("RUST DEBUG: Converting AllQuery...");
+    debug_println!("RUST DEBUG: Converting AllQuery...");
     Ok(QueryAst::MatchAll)
 }
 
 fn convert_boost_query(query: &BoostQuery, schema: &Schema) -> Result<QueryAst> {
-    eprintln!("RUST DEBUG: Converting BoostQuery...");
+    debug_println!("RUST DEBUG: Converting BoostQuery...");
     // TODO: Extract underlying query and boost value, recursively convert underlying
     Ok(QueryAst::MatchAll) // Placeholder
 }
 
 fn convert_const_score_query(query: &ConstScoreQuery, schema: &Schema) -> Result<QueryAst> {
-    eprintln!("RUST DEBUG: Converting ConstScoreQuery...");
+    debug_println!("RUST DEBUG: Converting ConstScoreQuery...");
     // TODO: Extract underlying query and score, recursively convert underlying
     Ok(QueryAst::MatchAll) // Placeholder
 }

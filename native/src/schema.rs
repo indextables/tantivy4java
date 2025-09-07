@@ -22,7 +22,9 @@ use jni::sys::{jboolean, jlong, jint, jobject};
 use jni::JNIEnv;
 use tantivy::schema::{SchemaBuilder, TextOptions, NumericOptions, DateOptions, IpAddrOptions};
 use tantivy::schema::{IndexRecordOption, TextFieldIndexing};
-use crate::utils::{register_object, remove_object, with_object, with_object_mut, handle_error, with_arc_safe};
+use crate::utils::{register_object, remove_object, with_object, with_object_mut, handle_error, with_arc_safe, arc_to_jlong, release_arc};
+use crate::debug_println;
+use std::sync::Arc;
 
 #[no_mangle]
 pub extern "system" fn Java_com_tantivy4java_SchemaBuilder_nativeNew(
@@ -446,7 +448,10 @@ pub extern "system" fn Java_com_tantivy4java_SchemaBuilder_nativeBuild(
     match builder_opt {
         Some(builder) => {
             let schema = builder.build();
-            register_object(schema) as jlong
+            // Use Arc registry instead of regular object registry for schemas
+            // This is required because Query methods use with_arc_safe to access schemas
+            let schema_arc = Arc::new(schema);
+            arc_to_jlong(schema_arc)
         },
         None => {
             handle_error(&mut env, "Invalid SchemaBuilder pointer");
@@ -470,7 +475,8 @@ pub extern "system" fn Java_com_tantivy4java_Schema_nativeClose(
     _class: JClass,
     ptr: jlong,
 ) {
-    remove_object(ptr as u64);
+    // Release from Arc registry (all schemas should now be in Arc registry)
+    release_arc(ptr);
 }
 
 #[no_mangle]
@@ -484,11 +490,11 @@ pub extern "system" fn Java_com_tantivy4java_Schema_nativeGetFieldNames(
     }
     
     // Debug logging
-    eprintln!("RUST DEBUG: nativeGetFieldNames called with pointer: {}", ptr);
+    debug_println!("RUST DEBUG: nativeGetFieldNames called with pointer: {}", ptr);
     
     // Try Arc-based access first (for SplitSearcher schemas)
     let result = with_arc_safe::<tantivy::schema::Schema, Result<jobject, String>>(ptr, |schema_arc| {
-        eprintln!("RUST DEBUG: Arc-based access successful for pointer: {}", ptr);
+        debug_println!("RUST DEBUG: Arc-based access successful for pointer: {}", ptr);
         let schema = schema_arc.as_ref();
         // Create ArrayList to hold field names
         let array_list_class = env.find_class("java/util/ArrayList").map_err(|e| e.to_string())?;
@@ -537,16 +543,16 @@ pub extern "system" fn Java_com_tantivy4java_Schema_nativeGetFieldNames(
     
     match result {
         Some(Ok(list)) => {
-            eprintln!("RUST DEBUG: nativeGetFieldNames - successfully created field names list");
+            debug_println!("RUST DEBUG: nativeGetFieldNames - successfully created field names list");
             list
         },
         Some(Err(e)) => {
-            eprintln!("RUST DEBUG: nativeGetFieldNames - with_arc_safe returned error: {}", e);
+            debug_println!("RUST DEBUG: nativeGetFieldNames - with_arc_safe returned error: {}", e);
             handle_error(&mut env, "Failed to get field names");
             std::ptr::null_mut()
         },
         None => {
-            eprintln!("RUST DEBUG: nativeGetFieldNames - with_arc_safe returned None, jlong_to_arc failed");
+            debug_println!("RUST DEBUG: nativeGetFieldNames - with_arc_safe returned None, jlong_to_arc failed");
             handle_error(&mut env, "Failed to get field names");
             std::ptr::null_mut()
         }

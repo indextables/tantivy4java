@@ -2,6 +2,7 @@
 
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
+use crate::debug_println;
 
 use bytesize::ByteSize;
 use tokio::sync::Semaphore;
@@ -421,9 +422,7 @@ pub async fn resolve_storage_for_split(
                 let directory_uri: Uri = directory_uri_str.parse()
                     .with_context(|| format!("Failed to parse file directory URI: {}", directory_uri_str))?;
                 
-                if std::env::var("TANTIVY4JAVA_DEBUG").unwrap_or_default() == "1" {
-                    eprintln!("RUST DEBUG: Resolving file:// storage for directory: '{}'", directory_uri_str);
-                }
+                debug_println!("RUST DEBUG: Resolving file:// storage for directory: '{}'", directory_uri_str);
                 storage_resolver.resolve(&directory_uri).await
                     .with_context(|| format!("Failed to resolve storage for file directory URI: {}", directory_uri_str))
             } else {

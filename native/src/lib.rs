@@ -21,6 +21,7 @@ use jni::objects::JClass;
 use jni::sys::jstring;
 use jni::JNIEnv;
 
+mod debug;  // Debug utilities and conditional logging
 mod schema;
 mod document;
 mod query;

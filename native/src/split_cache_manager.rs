@@ -1,13 +1,12 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
+use crate::debug_println;
 
 // Debug logging macro - controlled by TANTIVY4JAVA_DEBUG environment variable
 macro_rules! debug_log {
     ($($arg:tt)*) => {
-        if std::env::var("TANTIVY4JAVA_DEBUG").unwrap_or_default() == "1" {
-            eprintln!("DEBUG: {}", format!($($arg)*));
-        }
+        debug_println!("DEBUG: {}", format!($($arg)*));
     };
 }
 

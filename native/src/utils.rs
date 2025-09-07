@@ -23,6 +23,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
 use once_cell::sync::Lazy;
+use crate::debug_println;
 
 /// Global registry for native objects
 pub static OBJECT_REGISTRY: Lazy<Mutex<HashMap<u64, Box<dyn std::any::Any + Send + Sync>>>> = 
@@ -85,23 +86,17 @@ pub fn arc_to_jlong<T: Send + Sync + 'static>(arc: Arc<T>) -> jlong {
     // Store the Arc in the registry instead of using unsafe pointer manipulation
     registry.insert(id, Box::new(arc));
     
-    if std::env::var("TANTIVY4JAVA_DEBUG").unwrap_or_default() == "1" {
-        eprintln!("RUST DEBUG: arc_to_jlong - registered Arc with ID: {}", id);
-    }
+    debug_println!("RUST DEBUG: arc_to_jlong - registered Arc with ID: {}", id);
     
     id
 }
 
 /// SAFE: Access Arc from registry without unsafe operations
 pub fn jlong_to_arc<T: Send + Sync + 'static>(ptr: jlong) -> Option<Arc<T>> {
-    if std::env::var("TANTIVY4JAVA_DEBUG").unwrap_or_default() == "1" {
-        eprintln!("RUST DEBUG: jlong_to_arc called with ID: {}", ptr);
-    }
+    debug_println!("RUST DEBUG: jlong_to_arc called with ID: {}", ptr);
     
     if ptr == 0 {
-        if std::env::var("TANTIVY4JAVA_DEBUG").unwrap_or_default() == "1" {
-            eprintln!("RUST DEBUG: jlong_to_arc - ID is 0, returning None");
-        }
+        debug_println!("RUST DEBUG: jlong_to_arc - ID is 0, returning None");
         return None;
     }
     
@@ -109,9 +104,7 @@ pub fn jlong_to_arc<T: Send + Sync + 'static>(ptr: jlong) -> Option<Arc<T>> {
     let boxed = registry.get(&ptr)?;
     let arc = boxed.downcast_ref::<Arc<T>>()?;
     
-    if std::env::var("TANTIVY4JAVA_DEBUG").unwrap_or_default() == "1" {
-        eprintln!("RUST DEBUG: jlong_to_arc - successfully found Arc with ID: {}", ptr);
-    }
+    debug_println!("RUST DEBUG: jlong_to_arc - successfully found Arc with ID: {}", ptr);
     
     Some(arc.clone())
 }
@@ -127,11 +120,9 @@ pub fn release_arc(ptr: jlong) {
     if ptr != 0 {
         let mut registry = ARC_REGISTRY.lock().unwrap();
         if registry.remove(&ptr).is_some() {
-            if std::env::var("TANTIVY4JAVA_DEBUG").unwrap_or_default() == "1" {
-                eprintln!("RUST DEBUG: release_arc - removed Arc with ID: {}", ptr);
-            }
-        } else if std::env::var("TANTIVY4JAVA_DEBUG").unwrap_or_default() == "1" {
-            eprintln!("RUST DEBUG: release_arc - Arc with ID {} not found in registry", ptr);
+            debug_println!("RUST DEBUG: release_arc - removed Arc with ID: {}", ptr);
+        } else {
+            debug_println!("RUST DEBUG: release_arc - Arc with ID {} not found in registry", ptr);
         }
     }
 }

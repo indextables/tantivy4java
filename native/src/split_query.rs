@@ -2,6 +2,7 @@
 
 use jni::objects::{JClass, JObject, JString, JValue};
 use jni::sys::{jlong, jobject, jstring};
+use crate::debug_println;
 use jni::JNIEnv;
 use anyhow::{Result, anyhow};
 use std::sync::Arc;
@@ -26,7 +27,7 @@ pub extern "system" fn Java_com_tantivy4java_SplitTermQuery_toQueryAstJson(
             jstring.into_raw()
         }
         Err(e) => {
-            eprintln!("RUST DEBUG: Error converting SplitTermQuery to QueryAst: {}", e);
+            debug_println!("RUST DEBUG: Error converting SplitTermQuery to QueryAst: {}", e);
             let error_json = format!(r#"{{"error": "{}"}}"#, e);
             let jstring = env.new_string(error_json).unwrap_or_else(|_| env.new_string("{}").unwrap());
             jstring.into_raw()
@@ -47,7 +48,7 @@ pub extern "system" fn Java_com_tantivy4java_SplitBooleanQuery_toQueryAstJson(
             jstring.into_raw()
         }
         Err(e) => {
-            eprintln!("RUST DEBUG: Error converting SplitBooleanQuery to QueryAst: {}", e);
+            debug_println!("RUST DEBUG: Error converting SplitBooleanQuery to QueryAst: {}", e);
             let error_json = format!(r#"{{"error": "{}"}}"#, e);
             let jstring = env.new_string(error_json).unwrap_or_else(|_| env.new_string("{}").unwrap());
             jstring.into_raw()
@@ -68,7 +69,7 @@ pub extern "system" fn Java_com_tantivy4java_SplitRangeQuery_toQueryAstJson(
             jstring.into_raw()
         }
         Err(e) => {
-            eprintln!("RUST DEBUG: Error converting SplitRangeQuery to QueryAst: {}", e);
+            debug_println!("RUST DEBUG: Error converting SplitRangeQuery to QueryAst: {}", e);
             let error_json = format!(r#"{{"error": "{}"}}"#, e);
             let jstring = env.new_string(error_json).unwrap_or_else(|_| env.new_string("{}").unwrap());
             jstring.into_raw()
@@ -90,7 +91,7 @@ pub extern "system" fn Java_com_tantivy4java_SplitMatchAllQuery_toQueryAstJson(
             jstring.into_raw()
         }
         Err(e) => {
-            eprintln!("RUST DEBUG: Error serializing MatchAll QueryAst: {}", e);
+            debug_println!("RUST DEBUG: Error serializing MatchAll QueryAst: {}", e);
             let jstring = env.new_string(r#"{"type": "match_all"}"#).unwrap();
             jstring.into_raw()
         }
@@ -110,7 +111,7 @@ pub extern "system" fn Java_com_tantivy4java_SplitQuery_parseQuery(
     match result {
         Ok(query_obj) => query_obj,
         Err(e) => {
-            eprintln!("RUST DEBUG: Error parsing query string: {}", e);
+            debug_println!("RUST DEBUG: Error parsing query string: {}", e);
             // Return null on error
             std::ptr::null_mut()
         }
@@ -197,9 +198,7 @@ fn convert_range_query_to_ast(env: &mut JNIEnv, obj: &JObject) -> Result<String>
     let field_type_jstring: JString = field_type_obj.l()?.into();
     let field_type: String = env.get_string(&field_type_jstring)?.into();
     
-    if std::env::var("TANTIVY4JAVA_DEBUG").unwrap_or_default() == "1" {
-        eprintln!("RUST DEBUG: Converting range query for field '{}' with type '{}'", field, field_type);
-    }
+    debug_println!("RUST DEBUG: Converting range query for field '{}' with type '{}'", field, field_type);
     
     // Convert bounds with field type information
     let lower_bound_jobject = lower_bound_obj.l()?;
@@ -239,9 +238,7 @@ fn convert_range_bound(env: &mut JNIEnv, bound_obj: &JObject, field_type: &str) 
             let value_for_debug = value.clone(); // Clone for debug printing
             
             // Debug: Log field type and value before conversion
-            if std::env::var("TANTIVY4JAVA_DEBUG").unwrap_or_default() == "1" {
-                eprintln!("RUST DEBUG: Converting range bound - field_type: '{}', value: '{}'", field_type, value_for_debug);
-            }
+            debug_println!("RUST DEBUG: Converting range bound - field_type: '{}', value: '{}'", field_type, value_for_debug);
             
             // Convert string value to JsonLiteral based on field type
             let json_literal = match field_type {
@@ -267,15 +264,11 @@ fn convert_range_bound(env: &mut JNIEnv, bound_obj: &JObject, field_type: &str) 
                     // This handles cases where numeric fields like "price" are incorrectly typed as "str"
                     if value.parse::<i64>().is_ok() {
                         let parsed: i64 = value.parse().unwrap();
-                        if std::env::var("TANTIVY4JAVA_DEBUG").unwrap_or_default() == "1" {
-                            eprintln!("RUST DEBUG: Field type '{}' but value '{}' looks like i64, converting to Number", field_type, value);
-                        }
+                        debug_println!("RUST DEBUG: Field type '{}' but value '{}' looks like i64, converting to Number", field_type, value);
                         JsonLiteral::Number(serde_json::Number::from(parsed))
                     } else if value.parse::<f64>().is_ok() {
                         let parsed: f64 = value.parse().unwrap();
-                        if std::env::var("TANTIVY4JAVA_DEBUG").unwrap_or_default() == "1" {
-                            eprintln!("RUST DEBUG: Field type '{}' but value '{}' looks like f64, converting to Number", field_type, value);
-                        }
+                        debug_println!("RUST DEBUG: Field type '{}' but value '{}' looks like f64, converting to Number", field_type, value);
                         let number = serde_json::Number::from_f64(parsed).unwrap();
                         JsonLiteral::Number(number)
                     } else {
@@ -283,21 +276,15 @@ fn convert_range_bound(env: &mut JNIEnv, bound_obj: &JObject, field_type: &str) 
                     }
                 }
                 _ => {
-                    if std::env::var("TANTIVY4JAVA_DEBUG").unwrap_or_default() == "1" {
-                        eprintln!("RUST DEBUG: Unknown field type '{}', defaulting to string", field_type);
-                    }
+                    debug_println!("RUST DEBUG: Unknown field type '{}', defaulting to string", field_type);
                     JsonLiteral::String(value)
                 }
             };
             
             // Debug: Log the final JsonLiteral that was created
-            if std::env::var("TANTIVY4JAVA_DEBUG").unwrap_or_default() == "1" {
-                eprintln!("RUST DEBUG: Created JsonLiteral: {:?}", json_literal);
-            }
+            debug_println!("RUST DEBUG: Created JsonLiteral: {:?}", json_literal);
             
-            if std::env::var("TANTIVY4JAVA_DEBUG").unwrap_or_default() == "1" {
-                eprintln!("RUST DEBUG: Converted bound value '{}' to {:?} for field type '{}'", value_for_debug, json_literal, field_type);
-            }
+            debug_println!("RUST DEBUG: Converted bound value '{}' to {:?} for field type '{}'", value_for_debug, json_literal, field_type);
             
             match bound_type.as_str() {
                 "INCLUSIVE" => Ok(Bound::Included(json_literal)),
@@ -369,7 +356,7 @@ fn parse_query_string(env: &mut JNIEnv, query_string: JString, _schema_ptr: jlon
     // Get the query string
     let query_str: String = env.get_string(&query_string)?.into();
     
-    eprintln!("RUST DEBUG: Parsing query string: {}", query_str);
+    debug_println!("RUST DEBUG: Parsing query string: {}", query_str);
     
     // Use Quickwit's query parser to parse the string into QueryAst
     let query_ast = query_ast_from_user_text(&query_str, None);
@@ -378,7 +365,7 @@ fn parse_query_string(env: &mut JNIEnv, query_string: JString, _schema_ptr: jlon
     let parsed_ast = match query_ast.parse_user_query(&[]) {
         Ok(ast) => ast,
         Err(e) => {
-            eprintln!("RUST DEBUG: Failed to parse user query: {}", e);
+            debug_println!("RUST DEBUG: Failed to parse user query: {}", e);
             // Fallback to basic term query or match all
             if query_str.trim() == "*" {
                 QueryAst::MatchAll
@@ -390,7 +377,7 @@ fn parse_query_string(env: &mut JNIEnv, query_string: JString, _schema_ptr: jlon
         }
     };
     
-    eprintln!("RUST DEBUG: Parsed QueryAst: {:?}", parsed_ast);
+    debug_println!("RUST DEBUG: Parsed QueryAst: {:?}", parsed_ast);
     
     // Convert QueryAst back to appropriate SplitQuery Java object
     let split_query_obj = create_split_query_from_ast(env, &parsed_ast)?;
@@ -420,7 +407,7 @@ fn create_split_query_from_ast(env: &mut JNIEnv, query_ast: &QueryAst) -> Result
         QueryAst::Bool(_bool_query) => {
             // TODO: Implement SplitBooleanQuery creation from QueryAst
             // This is more complex as we need to recursively convert subqueries
-            eprintln!("RUST DEBUG: Boolean query creation from QueryAst not yet implemented");
+            debug_println!("RUST DEBUG: Boolean query creation from QueryAst not yet implemented");
             
             // Fallback to MatchAll for now
             let class = env.find_class("com/tantivy4java/SplitMatchAllQuery")?;
@@ -428,7 +415,7 @@ fn create_split_query_from_ast(env: &mut JNIEnv, query_ast: &QueryAst) -> Result
             Ok(obj.into_raw())
         }
         _ => {
-            eprintln!("RUST DEBUG: Unsupported QueryAst type for SplitQuery conversion: {:?}", query_ast);
+            debug_println!("RUST DEBUG: Unsupported QueryAst type for SplitQuery conversion: {:?}", query_ast);
             
             // Fallback to MatchAll
             let class = env.find_class("com/tantivy4java/SplitMatchAllQuery")?;

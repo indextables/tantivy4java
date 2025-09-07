@@ -199,22 +199,22 @@ public class EscapeAndSpecialFieldsTest {
             // === SCHEMA CREATION ===
             System.out.println("\n📋 Phase 1: Creating schema with boolean and additional field types");
             
-            try (SchemaBuilder builder = new SchemaBuilder()) {
-                builder
+            try (SchemaBuilder builder = new SchemaBuilder();
+                 Schema schema = builder
                     .addTextField("title", true, false, "default", "position")
                     .addIntegerField("id", true, true, true)
                     .addFloatField("rating", true, true, true)
                     .addBooleanField("is_good", true, true, true)
-                    .addDateField("date", true, true, true);
+                    .addDateField("date", true, true, true)
+                    .build()) {
                 // Note: IP address field may not be implemented yet in Java port
                 
-                try (Schema schema = builder.build()) {
-                    System.out.println("✅ Created schema with boolean and additional field types");
-                    
-                    // === INDEX CREATION ===
-                    System.out.println("\n📝 Phase 2: Adding documents with boolean fields");
-                    
-                    try (Index index = new Index(schema, indexPath, false)) {
+                System.out.println("✅ Created schema with boolean and additional field types");
+                
+                // === INDEX CREATION ===
+                System.out.println("\n📝 Phase 2: Adding documents with boolean fields");
+                
+                try (Index index = new Index(schema, indexPath, false)) {
                         try (IndexWriter writer = index.writer(Index.Memory.DEFAULT_HEAP_SIZE, 1)) {
                             
                             // Test 1: Document with boolean true (Python pattern)
@@ -263,6 +263,7 @@ public class EscapeAndSpecialFieldsTest {
                         // === BOOLEAN FIELD TESTS ===
                         System.out.println("\n🔍 Phase 3: Testing boolean field queries");
                         
+                        // Use the original schema that was used to create the index
                         try (Searcher searcher = index.searcher()) {
                             assertEquals(3, searcher.getNumDocs(), "Should have 3 documents");
                             System.out.println("✅ Index contains " + searcher.getNumDocs() + " documents");
@@ -369,7 +370,6 @@ public class EscapeAndSpecialFieldsTest {
                         }
                     }
                 }
-            }
             
             System.out.println("\n🎉 === PYTHON PARITY: BOOLEAN AND SPECIAL FIELDS TEST COMPLETED ===");
             System.out.println("✨ Successfully demonstrated Python tantivy special field compatibility:");
@@ -381,6 +381,7 @@ public class EscapeAndSpecialFieldsTest {
             System.out.println("   🐍 Full Python tantivy boolean field API parity");
             
         } catch (Exception e) {
+            e.printStackTrace();
             fail("Python parity boolean and special fields test failed: " + e.getMessage());
         }
     }

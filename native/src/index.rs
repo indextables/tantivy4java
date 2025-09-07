@@ -24,7 +24,8 @@ use tantivy::{Index as TantivyIndex, IndexSettings, IndexWriter as TantivyIndexW
 use tantivy::schema::Schema;
 use tantivy::query::{Query as TantivyQuery, QueryParser};
 use tantivy::directory::MmapDirectory;
-use crate::utils::{register_object, remove_object, with_object, handle_error};
+use crate::utils::{register_object, remove_object, with_object, handle_error, with_arc_safe, arc_to_jlong};
+use std::sync::Arc;
 
 #[no_mangle]
 pub extern "system" fn Java_com_tantivy4java_Index_nativeNew(
@@ -42,7 +43,8 @@ pub extern "system" fn Java_com_tantivy4java_Index_nativeNew(
         }
     };
     
-    let result = with_object::<Schema, Result<TantivyIndex, String>>(_schema_ptr as u64, |schema| {
+    let result = with_arc_safe::<Schema, Result<TantivyIndex, String>>(_schema_ptr, |schema_arc| {
+        let schema = schema_arc.as_ref();
         if path_str.is_empty() {
             // Create in-memory index
             Ok(TantivyIndex::create_in_ram(schema.clone()))
@@ -217,16 +219,17 @@ pub extern "system" fn Java_com_tantivy4java_Index_nativeGetSchema(
     _class: JClass,
     ptr: jlong,
 ) -> jlong {
-    let result = with_object::<TantivyIndex, Schema>(ptr as u64, |index| {
-        index.schema()
+    let result = with_object::<TantivyIndex, Result<jlong, String>>(ptr as u64, |index| {
+        // Get the schema from the index and return it as an Arc
+        let schema = index.schema();
+        let schema_arc = Arc::new(schema);
+        Ok(arc_to_jlong(schema_arc))
     });
     
     match result {
-        Some(schema) => {
-            register_object(schema) as jlong
-        },
-        None => {
-            handle_error(&mut env, "Invalid Index pointer");
+        Some(Ok(schema_ptr)) => schema_ptr,
+        _ => {
+            handle_error(&mut env, "Failed to get schema from index");
             0
         }
     }
