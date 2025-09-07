@@ -38,6 +38,7 @@ mod split_query;  // SplitQuery Java objects and native conversion using Quickwi
 // mod split_searcher;  // Legacy implementation (now disabled)
 mod split_cache_manager;  // Global cache manager following Quickwit patterns
 // mod split_searcher_simple;  // Disabled to avoid conflicts
+mod test_query_parser;  // Test module for query parser debugging
 mod common;
 mod extract_helpers;
 

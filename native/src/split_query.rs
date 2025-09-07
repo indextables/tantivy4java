@@ -181,22 +181,31 @@ fn convert_boolean_query_to_ast(env: &mut JNIEnv, obj: &JObject) -> Result<Strin
 }
 
 fn convert_range_query_to_ast(env: &mut JNIEnv, obj: &JObject) -> Result<String> {
-    // Extract field and bounds from Java SplitRangeQuery object
+    // Extract field, bounds, and field type from Java SplitRangeQuery object
     let field_obj = env.get_field(obj, "field", "Ljava/lang/String;")
         .map_err(|e| anyhow!("Failed to get field: {}", e))?;
     let lower_bound_obj = env.get_field(obj, "lowerBound", "Lcom/tantivy4java/SplitRangeQuery$RangeBound;")
         .map_err(|e| anyhow!("Failed to get lowerBound: {}", e))?;
     let upper_bound_obj = env.get_field(obj, "upperBound", "Lcom/tantivy4java/SplitRangeQuery$RangeBound;")
         .map_err(|e| anyhow!("Failed to get upperBound: {}", e))?;
+    let field_type_obj = env.get_field(obj, "fieldType", "Ljava/lang/String;")
+        .map_err(|e| anyhow!("Failed to get fieldType: {}", e))?;
     
     let field_jstring: JString = field_obj.l()?.into();
     let field: String = env.get_string(&field_jstring)?.into();
     
-    // Convert bounds
+    let field_type_jstring: JString = field_type_obj.l()?.into();
+    let field_type: String = env.get_string(&field_type_jstring)?.into();
+    
+    if std::env::var("TANTIVY4JAVA_DEBUG").unwrap_or_default() == "1" {
+        eprintln!("RUST DEBUG: Converting range query for field '{}' with type '{}'", field, field_type);
+    }
+    
+    // Convert bounds with field type information
     let lower_bound_jobject = lower_bound_obj.l()?;
     let upper_bound_jobject = upper_bound_obj.l()?;
-    let lower_bound = convert_range_bound(env, &lower_bound_jobject)?;
-    let upper_bound = convert_range_bound(env, &upper_bound_jobject)?;
+    let lower_bound = convert_range_bound(env, &lower_bound_jobject, &field_type)?;
+    let upper_bound = convert_range_bound(env, &upper_bound_jobject, &field_type)?;
     
     // Create QueryAst using Quickwit's range query structure
     let range_query = quickwit_query::query_ast::RangeQuery {
@@ -210,7 +219,7 @@ fn convert_range_query_to_ast(env: &mut JNIEnv, obj: &JObject) -> Result<String>
     serde_json::to_string(&query_ast).map_err(|e| anyhow!("Serialization error: {}", e))
 }
 
-fn convert_range_bound(env: &mut JNIEnv, bound_obj: &JObject) -> Result<Bound<JsonLiteral>> {
+fn convert_range_bound(env: &mut JNIEnv, bound_obj: &JObject, field_type: &str) -> Result<Bound<JsonLiteral>> {
     // Get the bound type
     let type_obj = env.get_field(bound_obj, "type", "Lcom/tantivy4java/SplitRangeQuery$RangeBound$BoundType;")?;
     let type_enum = type_obj.l()?;
@@ -227,9 +236,68 @@ fn convert_range_bound(env: &mut JNIEnv, bound_obj: &JObject) -> Result<Bound<Js
             let value_obj = env.get_field(bound_obj, "value", "Ljava/lang/String;")?;
             let value_jstring: JString = value_obj.l()?.into();
             let value: String = env.get_string(&value_jstring)?.into();
+            let value_for_debug = value.clone(); // Clone for debug printing
             
-            // Convert string value to JsonLiteral
-            let json_literal = JsonLiteral::String(value);
+            // Debug: Log field type and value before conversion
+            if std::env::var("TANTIVY4JAVA_DEBUG").unwrap_or_default() == "1" {
+                eprintln!("RUST DEBUG: Converting range bound - field_type: '{}', value: '{}'", field_type, value_for_debug);
+            }
+            
+            // Convert string value to JsonLiteral based on field type
+            let json_literal = match field_type {
+                "i64" | "int" | "integer" => {
+                    let parsed: i64 = value.parse()
+                        .map_err(|e| anyhow!("Failed to parse '{}' as i64: {}", value, e))?;
+                    JsonLiteral::Number(serde_json::Number::from(parsed))
+                }
+                "u64" | "uint" => {
+                    let parsed: u64 = value.parse()
+                        .map_err(|e| anyhow!("Failed to parse '{}' as u64: {}", value, e))?;
+                    JsonLiteral::Number(serde_json::Number::from(parsed))
+                }
+                "f64" | "float" | "double" => {
+                    let parsed: f64 = value.parse()
+                        .map_err(|e| anyhow!("Failed to parse '{}' as f64: {}", value, e))?;
+                    let number = serde_json::Number::from_f64(parsed)
+                        .ok_or_else(|| anyhow!("Invalid f64 value: {}", parsed))?;
+                    JsonLiteral::Number(number)
+                }
+                "str" | "string" | "text" => {
+                    // Special case: if the field type is string but the value looks numeric, try to parse it
+                    // This handles cases where numeric fields like "price" are incorrectly typed as "str"
+                    if value.parse::<i64>().is_ok() {
+                        let parsed: i64 = value.parse().unwrap();
+                        if std::env::var("TANTIVY4JAVA_DEBUG").unwrap_or_default() == "1" {
+                            eprintln!("RUST DEBUG: Field type '{}' but value '{}' looks like i64, converting to Number", field_type, value);
+                        }
+                        JsonLiteral::Number(serde_json::Number::from(parsed))
+                    } else if value.parse::<f64>().is_ok() {
+                        let parsed: f64 = value.parse().unwrap();
+                        if std::env::var("TANTIVY4JAVA_DEBUG").unwrap_or_default() == "1" {
+                            eprintln!("RUST DEBUG: Field type '{}' but value '{}' looks like f64, converting to Number", field_type, value);
+                        }
+                        let number = serde_json::Number::from_f64(parsed).unwrap();
+                        JsonLiteral::Number(number)
+                    } else {
+                        JsonLiteral::String(value)
+                    }
+                }
+                _ => {
+                    if std::env::var("TANTIVY4JAVA_DEBUG").unwrap_or_default() == "1" {
+                        eprintln!("RUST DEBUG: Unknown field type '{}', defaulting to string", field_type);
+                    }
+                    JsonLiteral::String(value)
+                }
+            };
+            
+            // Debug: Log the final JsonLiteral that was created
+            if std::env::var("TANTIVY4JAVA_DEBUG").unwrap_or_default() == "1" {
+                eprintln!("RUST DEBUG: Created JsonLiteral: {:?}", json_literal);
+            }
+            
+            if std::env::var("TANTIVY4JAVA_DEBUG").unwrap_or_default() == "1" {
+                eprintln!("RUST DEBUG: Converted bound value '{}' to {:?} for field type '{}'", value_for_debug, json_literal, field_type);
+            }
             
             match bound_type.as_str() {
                 "INCLUSIVE" => Ok(Bound::Included(json_literal)),

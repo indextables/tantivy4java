@@ -7,8 +7,11 @@ use jni::sys::{jlong, jobject, jstring, jint, jboolean};
 use jni::JNIEnv;
 
 use crate::standalone_searcher::{StandaloneSearcher, StandaloneSearchConfig, SplitSearchMetadata, resolve_storage_for_split};
-use crate::utils::{register_object, remove_object, with_object, arc_to_jlong, with_arc_safe};
+use crate::utils::{register_object, remove_object, with_object, arc_to_jlong, with_arc_safe, release_arc};
 use crate::common::to_java_exception;
+
+use serde_json::{Value, Map};
+use quickwit_query::JsonLiteral;
 
 use quickwit_proto::search::{SearchRequest, LeafSearchResponse};
 use quickwit_doc_mapper::DocMapper;
@@ -242,9 +245,27 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_closeNative(
         return;
     }
 
-    // For Arc-based storage, we just need to drop the reference
-    // The Arc will be automatically cleaned up when it goes out of scope
-    eprintln!("RUST DEBUG: Closing searcher with Arc pointer: {}", searcher_ptr);
+    // Debug: Log call stack to understand why this is being called
+    if std::env::var("TANTIVY4JAVA_DEBUG").unwrap_or_default() == "1" {
+        eprintln!("RUST DEBUG: WARNING - closeNative called for SplitSearcher with ID: {}", searcher_ptr);
+        eprintln!("RUST DEBUG: This should only happen when the SplitSearcher is closed in Java");
+        
+        // Print the stack trace to see where this is being called from
+        let backtrace = std::backtrace::Backtrace::capture();
+        if backtrace.status() == std::backtrace::BacktraceStatus::Captured {
+            eprintln!("RUST DEBUG: Stack trace for closeNative:");
+            let backtrace_str = format!("{}", backtrace);
+            for (i, line) in backtrace_str.lines().enumerate() {
+                if i < 20 {  // Print first 20 lines to avoid too much output
+                    eprintln!("  {}", line);
+                }
+            }
+        }
+    }
+
+    // SAFE: Release Arc from registry to prevent memory leaks
+    release_arc(searcher_ptr);
+    eprintln!("RUST DEBUG: Closed searcher and released Arc with ID: {}", searcher_ptr);
 }
 
 /// Replacement for Java_com_tantivy4java_SplitSearcher_validateSplitNative  
@@ -329,7 +350,7 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_searchWithQueryAst(
     query_ast_json: JString,
     limit: jint,
 ) -> jobject {
-    eprintln!("RUST DEBUG: SplitSearcher.searchWithQueryAst called with limit: {}", limit);
+    // eprintln!("RUST DEBUG: SplitSearcher.searchWithQueryAst called with limit: {}", limit);
     
     if searcher_ptr == 0 {
         to_java_exception(&mut env, &anyhow::anyhow!("Invalid searcher pointer"));
@@ -345,7 +366,20 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_searchWithQueryAst(
         }
     };
     
-    eprintln!("RUST DEBUG: QueryAst JSON: {}", query_json);
+    // eprintln!("RUST DEBUG: QueryAst JSON: {}", query_json);
+    
+    // Parse and fix range queries with proper field types from schema
+    let fixed_query_json = match fix_range_query_types(searcher_ptr, &query_json) {
+        Ok(fixed_json) => fixed_json,
+        Err(e) => {
+            eprintln!("RUST DEBUG: Failed to fix range query types: {}, using original query", e);
+            query_json.clone()
+        }
+    };
+    
+    if fixed_query_json != query_json {
+        eprintln!("RUST DEBUG: Fixed QueryAst JSON: {}", fixed_query_json);
+    }
     
     // Use the searcher context to perform search with Quickwit's leaf search approach
     let result = with_arc_safe(searcher_ptr, |searcher_context: &Arc<(StandaloneSearcher, tokio::runtime::Runtime, String, std::collections::HashMap<String, String>, u64, u64)>| {
@@ -365,8 +399,8 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_searchWithQueryAst(
         // Run async code synchronously within the runtime context
         // Note: We're already in the runtime context via runtime.enter(), so we can use block_on directly
         runtime.block_on(async {
-                // Parse the QueryAst JSON
-                let query_ast: QueryAst = serde_json::from_str(&query_json)
+                // Parse the QueryAst JSON (with field type fixes)
+                let query_ast: QueryAst = serde_json::from_str(&fixed_query_json)
                     .map_err(|e| anyhow::anyhow!("Failed to parse QueryAst JSON: {}", e))?;
                 
                 eprintln!("RUST DEBUG: Successfully parsed QueryAst: {:?}", query_ast);
@@ -543,15 +577,26 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_searchWithQueryAst(
                 eprintln!("  - Split ID: {}", split_metadata.split_id);
                 eprintln!("  - Num docs: {}", split_metadata.num_docs);
                 eprintln!("  - Footer offsets: {}-{}", split_metadata.split_footer_start, split_metadata.split_footer_end);
+                // eprintln!("RUST DEBUG: About to call searcher.search_split()...");
                 
                 // PERFORM THE ACTUAL REAL SEARCH WITH NO MOCKING!
                 // We're already in an async context, so use the async method directly
-                let leaf_search_response = searcher.search_split(
+                let split_id_for_error = split_metadata.split_id.clone();
+                // eprintln!("RUST DEBUG: Calling searcher.search_split() NOW!");
+                let leaf_search_response = match searcher.search_split(
                     split_uri,
                     split_metadata,
                     search_request,
                     doc_mapper_arc,
-                ).await?;
+                ).await {
+                    Ok(response) => response,
+                    Err(e) => {
+                        eprintln!("RUST DEBUG: ERROR in searcher.search_split: {}", e);
+                        eprintln!("RUST DEBUG: Full error chain: {:#}", e);
+                        // Propagate the full error chain to Java
+                        return Err(anyhow::anyhow!("{:#}", e));
+                    }
+                };
                 
                 eprintln!("RUST DEBUG: REAL SEARCH COMPLETED! Found {} hits from StandaloneSearcher", leaf_search_response.num_hits);
                 
@@ -629,7 +674,7 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_docNative(
     segment_ord: jint,
     doc_id: jint,
 ) -> jobject {
-    eprintln!("RUST DEBUG: SplitSearcher.docNative called with segment_ord={}, doc_id={}", segment_ord, doc_id);
+    // eprintln!("RUST DEBUG: SplitSearcher.docNative called with segment_ord={}, doc_id={}", segment_ord, doc_id);
     
     if searcher_ptr == 0 {
         eprintln!("RUST ERROR: Invalid searcher pointer");
@@ -639,7 +684,7 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_docNative(
     
     // Create DocAddress from the provided segment and doc ID
     let doc_address = tantivy::DocAddress::new(segment_ord as u32, doc_id as u32);
-    eprintln!("RUST DEBUG: Created DocAddress: segment={}, doc={}", doc_address.segment_ord, doc_address.doc_id);
+    // eprintln!("RUST DEBUG: Created DocAddress: segment={}, doc={}", doc_address.segment_ord, doc_address.doc_id);
     
     // Implement actual document retrieval using Quickwit's approach
     // Use the searcher context to retrieve the document from the split
@@ -649,7 +694,8 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_docNative(
         // Enter the runtime context for async operations
         let _guard = runtime.enter();
         
-        eprintln!("RUST DEBUG: Starting document retrieval for split: {}", split_uri);
+        // Only log document retrieval in debug mode if explicitly verbose
+        // eprintln!("RUST DEBUG: Starting document retrieval for split: {}", split_uri);
         
         // Run async document retrieval using Quickwit's pattern
         runtime.block_on(async {
@@ -690,7 +736,7 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_docNative(
                 Path::new(split_uri)
             };
             
-            eprintln!("RUST DEBUG: Getting split file data from: '{}'", relative_path.display());
+            // eprintln!("RUST DEBUG: Getting split file data from: '{}'", relative_path.display());
             
             // Get the full file data using Quickwit's storage abstraction
             let file_size = actual_storage.file_num_bytes(relative_path).await
@@ -709,7 +755,7 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_docNative(
             let index = tantivy::Index::open(bundle_directory)
                 .map_err(|e| anyhow::anyhow!("Failed to open index from bundle {}: {}", split_uri, e))?;
             
-            eprintln!("RUST DEBUG: Successfully opened index from split");
+            // eprintln!("RUST DEBUG: Successfully opened index from split");
             
             // Create index reader using Quickwit's pattern (from fetch_docs.rs)
             let index_reader = index
@@ -720,20 +766,22 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_docNative(
             
             let tantivy_searcher = index_reader.searcher();
             
-            eprintln!("RUST DEBUG: Created tantivy searcher, attempting to retrieve document at address: segment={}, doc={}", 
-                     doc_address.segment_ord, doc_address.doc_id);
+            // Verbose logging commented out for performance
+            // eprintln!("RUST DEBUG: Created tantivy searcher, attempting to retrieve document at address: segment={}, doc={}", 
+            //          doc_address.segment_ord, doc_address.doc_id);
             
             // Use searcher.doc() to retrieve the document (synchronous version)
             let doc: tantivy::schema::TantivyDocument = tantivy_searcher
                 .doc(doc_address)
                 .map_err(|e| anyhow::anyhow!("Failed to retrieve document at address {:?}: {}", doc_address, e))?;
             
-            eprintln!("RUST DEBUG: Successfully retrieved document from tantivy searcher");
+            // Verbose logging commented out for performance
+            // eprintln!("RUST DEBUG: Successfully retrieved document from tantivy searcher");
             
             // Convert document to named doc (like in fetch_docs.rs line 210)
             let named_field_doc = doc.to_named_doc(tantivy_searcher.schema());
             
-            eprintln!("RUST DEBUG: Converted document to named doc with {} fields", named_field_doc.0.len());
+            // eprintln!("RUST DEBUG: Converted document to named doc with {} fields", named_field_doc.0.len());
             
             // Return the document and schema for processing
             Ok::<(tantivy::schema::TantivyDocument, tantivy::schema::Schema), anyhow::Error>((doc, index.schema()))
@@ -742,7 +790,7 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_docNative(
     
     match result {
         Some(Ok((doc, schema))) => {
-            eprintln!("RUST DEBUG: Document retrieval successful, creating RetrievedDocument");
+            // eprintln!("RUST DEBUG: Document retrieval successful, creating RetrievedDocument");
             
             // Create a RetrievedDocument using the proper pattern from searcher.rs
             // This follows the same approach as Java_com_tantivy4java_Searcher_nativeDoc
@@ -752,14 +800,14 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_docNative(
             let wrapper = DocumentWrapper::Retrieved(retrieved_doc);
             let doc_ptr = crate::utils::register_object(wrapper) as jlong;
             
-            eprintln!("RUST DEBUG: Successfully created DocumentWrapper::Retrieved with pointer: {}", doc_ptr);
+            // eprintln!("RUST DEBUG: Successfully created DocumentWrapper::Retrieved with pointer: {}", doc_ptr);
             
             // Create Java Document object with the pointer
             match env.find_class("com/tantivy4java/Document") {
                 Ok(document_class) => {
                     match env.new_object(&document_class, "(J)V", &[doc_ptr.into()]) {
                         Ok(document_obj) => {
-                            eprintln!("RUST DEBUG: Successfully created Java Document object with pointer: {}", doc_ptr);
+                            // eprintln!("RUST DEBUG: Successfully created Java Document object with pointer: {}", doc_ptr);
                             document_obj.into_raw()
                         },
                         Err(e) => {
@@ -803,7 +851,7 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_getSchemaFromNative(
         return 0;
     }
     
-    eprintln!("RUST DEBUG: About to call with_object to access searcher context...");
+    // eprintln!("RUST DEBUG: About to call with_object to access searcher context...");
     if searcher_ptr == 0 {
         to_java_exception(&mut env, &anyhow::anyhow!("Invalid searcher pointer"));
         return 0;
@@ -977,6 +1025,220 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_getComponentCacheStat
         }
     }
 }
+
+/// Helper function to extract schema from split file - extracted from getSchemaFromNative
+fn get_schema_from_split(searcher_ptr: jlong) -> anyhow::Result<tantivy::schema::Schema> {
+    with_arc_safe(searcher_ptr, |searcher_context: &Arc<(StandaloneSearcher, tokio::runtime::Runtime, String, std::collections::HashMap<String, String>, u64, u64)>| {
+        let (_searcher, runtime, split_uri, aws_config, _footer_start, _footer_end) = searcher_context.as_ref();
+        
+        // Enter the runtime context for async operations
+        let _guard = runtime.enter();
+        
+        // Parse the split URI and extract schema using Quickwit's storage abstractions
+        use quickwit_common::uri::Uri;
+        use std::path::Path;
+        
+        // Use block_on to run async code synchronously within the runtime context
+        tokio::task::block_in_place(|| {
+            runtime.block_on(async {
+                // Parse URI and resolve storage
+                let uri: Uri = split_uri.parse()
+                    .map_err(|e| anyhow::anyhow!("Failed to parse split URI {}: {}", split_uri, e))?;
+                
+                // Create S3 storage configuration with credentials from Java config
+                use quickwit_config::{StorageConfigs, S3StorageConfig};
+                
+                let s3_config = S3StorageConfig {
+                    flavor: None,
+                    access_key_id: aws_config.get("access_key").cloned(),
+                    secret_access_key: aws_config.get("secret_key").cloned(), 
+                    session_token: aws_config.get("session_token").cloned(),
+                    region: aws_config.get("region").cloned(),
+                    endpoint: aws_config.get("endpoint").cloned(),
+                    force_path_style_access: false,
+                    disable_multi_object_delete: false,
+                    disable_multipart_upload: false,
+                };
+                
+                let storage_configs = StorageConfigs::new(vec![quickwit_config::StorageConfig::S3(s3_config.clone())]);
+                let storage_resolver = StorageResolver::configured(&storage_configs);
+                
+                // Use the helper function to resolve storage correctly for S3 URIs
+                let actual_storage = resolve_storage_for_split(&storage_resolver, split_uri).await?;
+                
+                // Extract just the filename for the relative path
+                let relative_path = if let Some(last_slash_pos) = split_uri.rfind('/') {
+                    Path::new(&split_uri[last_slash_pos + 1..])
+                } else {
+                    Path::new(split_uri)
+                };
+                
+                // Get the full file data using Quickwit's storage abstraction
+                let file_size = actual_storage.file_num_bytes(relative_path).await
+                    .map_err(|e| anyhow::anyhow!("Failed to get file size for {}: {}", split_uri, e))?;
+                
+                let split_data = actual_storage.get_slice(relative_path, 0..file_size as usize).await
+                    .map_err(|e| anyhow::anyhow!("Failed to get split data from {}: {}", split_uri, e))?;
+                
+                // Open the bundle directory from the split data
+                use quickwit_directories::BundleDirectory;
+                use tantivy::directory::FileSlice;
+                
+                let split_file_slice = FileSlice::new(std::sync::Arc::new(split_data));
+                
+                // Use BundleDirectory::open_split which takes just the FileSlice and handles everything internally
+                let bundle_directory = BundleDirectory::open_split(split_file_slice)
+                    .map_err(|e| anyhow::anyhow!("Failed to open bundle directory {}: {}", split_uri, e))?;
+                    
+                // Extract schema from the bundle directory by opening the index
+                let index = tantivy::Index::open(bundle_directory)
+                    .map_err(|e| anyhow::anyhow!("Failed to open index from bundle {}: {}", split_uri, e))?;
+                
+                Ok(index.schema())
+            })
+        })
+    })
+    .ok_or_else(|| anyhow::anyhow!("Failed to access searcher context"))?
+}
+
+/// Fix range queries in QueryAst JSON by looking up field types from schema
+fn fix_range_query_types(searcher_ptr: jlong, query_json: &str) -> anyhow::Result<String> {
+    // Parse the JSON to find range queries
+    let mut query_value: Value = serde_json::from_str(query_json)?;
+    
+    // Get schema from split file - reuse the same logic as getSchemaFromNative
+    let schema = get_schema_from_split(searcher_ptr)?;
+    
+    // Recursively fix range queries in the JSON
+    fix_range_queries_recursive(&mut query_value, &schema)?;
+    
+    // Convert back to JSON string
+    serde_json::to_string(&query_value).map_err(|e| anyhow::anyhow!("Failed to serialize fixed query: {}", e))
+}
+
+/// Recursively fix range queries in a JSON value
+fn fix_range_queries_recursive(value: &mut Value, schema: &tantivy::schema::Schema) -> anyhow::Result<()> {
+    match value {
+        Value::Object(map) => {
+            // Check if this is a range query
+            if let Some(range_obj) = map.get_mut("range") {
+                if let Some(range_map) = range_obj.as_object_mut() {
+                    fix_range_query_object(range_map, schema)?;
+                }
+            }
+            
+            // Recursively process nested objects
+            for (_, v) in map.iter_mut() {
+                fix_range_queries_recursive(v, schema)?;
+            }
+        }
+        Value::Array(arr) => {
+            // Recursively process array elements
+            for item in arr.iter_mut() {
+                fix_range_queries_recursive(item, schema)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Fix a specific range query object by converting string values to proper types
+fn fix_range_query_object(range_map: &mut Map<String, Value>, schema: &tantivy::schema::Schema) -> anyhow::Result<()> {
+    // Extract field name
+    let field_name = range_map.get("field")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("Range query missing field name"))?;
+    
+    // Get field from schema
+    let field = schema.get_field(field_name)
+        .map_err(|_| anyhow::anyhow!("Field '{}' not found in schema", field_name))?;
+    
+    let field_entry = schema.get_field_entry(field);
+    let field_type = field_entry.field_type();
+    
+    // Determine the target JSON literal type based on Tantivy field type
+    let target_type = match field_type {
+        tantivy::schema::FieldType::I64(_) => "i64",
+        tantivy::schema::FieldType::U64(_) => "u64", 
+        tantivy::schema::FieldType::F64(_) => "f64",
+        tantivy::schema::FieldType::Bool(_) => "bool",
+        tantivy::schema::FieldType::Date(_) => "date",
+        tantivy::schema::FieldType::Str(_) => "str",
+        tantivy::schema::FieldType::Facet(_) => "str",
+        tantivy::schema::FieldType::Bytes(_) => "str",
+        tantivy::schema::FieldType::JsonObject(_) => "str",
+        tantivy::schema::FieldType::IpAddr(_) => "str",
+    };
+    
+    if std::env::var("TANTIVY4JAVA_DEBUG").unwrap_or_default() == "1" {
+        eprintln!("RUST DEBUG: Field '{}' has type '{}', converting range bounds", field_name, target_type);
+    }
+    
+    // Fix lower_bound and upper_bound
+    if let Some(lower_bound) = range_map.get_mut("lower_bound") {
+        fix_bound_value(lower_bound, target_type, "lower_bound")?;
+    }
+    
+    if let Some(upper_bound) = range_map.get_mut("upper_bound") {
+        fix_bound_value(upper_bound, target_type, "upper_bound")?;
+    }
+    
+    Ok(())
+}
+
+/// Fix a bound value (Included/Excluded with JsonLiteral) 
+fn fix_bound_value(bound: &mut Value, target_type: &str, bound_name: &str) -> anyhow::Result<()> {
+    if let Some(bound_obj) = bound.as_object_mut() {
+        // Handle Included/Excluded bounds
+        for (bound_type, json_literal) in bound_obj.iter_mut() {
+            if bound_type == "Included" || bound_type == "Excluded" {
+                if let Some(literal_obj) = json_literal.as_object_mut() {
+                    // Check if this is a String literal that needs conversion
+                    if let Some(string_value) = literal_obj.get("String") {
+                        if let Some(string_str) = string_value.as_str() {
+                            // Convert string to appropriate type
+                            let new_literal = match target_type {
+                                "i64" => {
+                                    let parsed: i64 = string_str.parse()
+                                        .map_err(|_| anyhow::anyhow!("Cannot parse '{}' as i64 in {}", string_str, bound_name))?;
+                                    serde_json::json!({"Number": parsed})
+                                }
+                                "u64" => {
+                                    let parsed: u64 = string_str.parse()
+                                        .map_err(|_| anyhow::anyhow!("Cannot parse '{}' as u64 in {}", string_str, bound_name))?;
+                                    serde_json::json!({"Number": parsed})
+                                }
+                                "f64" => {
+                                    let parsed: f64 = string_str.parse()
+                                        .map_err(|_| anyhow::anyhow!("Cannot parse '{}' as f64 in {}", string_str, bound_name))?;
+                                    serde_json::json!({"Number": parsed})
+                                }
+                                "bool" => {
+                                    let parsed: bool = string_str.parse()
+                                        .map_err(|_| anyhow::anyhow!("Cannot parse '{}' as bool in {}", string_str, bound_name))?;
+                                    serde_json::json!({"Bool": parsed})
+                                }
+                                _ => {
+                                    // Keep as string for other types
+                                    continue;
+                                }
+                            };
+                            
+                            if std::env::var("TANTIVY4JAVA_DEBUG").unwrap_or_default() == "1" {
+                                eprintln!("RUST DEBUG: Converted {} '{}' from String to {} for type {}", bound_name, string_str, new_literal, target_type);
+                            }
+                            
+                            *json_literal = new_literal;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 stub_method!(Java_com_tantivy4java_SplitSearcher_evictComponentsNative, jboolean, 0);
 stub_method!(Java_com_tantivy4java_SplitSearcher_parseQueryNative, jobject, std::ptr::null_mut());
 stub_method!(Java_com_tantivy4java_SplitSearcher_getSchemaJsonNative, jstring, std::ptr::null_mut());

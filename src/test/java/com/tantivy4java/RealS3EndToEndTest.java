@@ -728,12 +728,12 @@ public class RealS3EndToEndTest {
             // Test 3: Cross-domain queries
             System.out.println("Test 3: Cross-domain query validation");
             
-            SplitQuery titleQuery = new SplitTermQuery("name", "Customer");
+            SplitQuery titleQuery = new SplitTermQuery("name", "customer");
             SearchResult titleResults = searcher.search(titleQuery, 100);
-            assertTrue(titleResults.getHits().size() > 0, "Should find documents with 'Customer' in name");
+            assertTrue(titleResults.getHits().size() > 0, "Should find documents with 'customer' in name");
             
             // Range query on numeric fields
-            SplitQuery priceRangeQuery = new SplitRangeQuery("price", RangeBound.inclusive("10"), RangeBound.inclusive("1000"));
+            SplitQuery priceRangeQuery = new SplitRangeQuery("price", RangeBound.inclusive("10"), RangeBound.inclusive("1000"), "i64");
             SearchResult priceResults = searcher.search(priceRangeQuery, 100);
             // Note: Some domains might not have price field, so just check it doesn't crash
             assertNotNull(priceResults, "Range query should not crash");
@@ -744,7 +744,7 @@ public class RealS3EndToEndTest {
             System.out.println("Test 4: Complex boolean query validation");
             
             SplitQuery domainQuery = new SplitTermQuery("domain", "products");
-            SplitQuery nameQuery = new SplitTermQuery("name", "Product");
+            SplitQuery nameQuery = new SplitTermQuery("name", "product");
             
             SplitQuery booleanQuery = new SplitBooleanQuery()
                 .addMust(domainQuery)
@@ -758,7 +758,7 @@ public class RealS3EndToEndTest {
             
         } catch (Exception e) {
             System.err.println("❌ Data validation failed: " + e.getMessage());
-            e.printStackTrace();
+            e.printStackTrace(System.out);
             fail("Data validation failed: " + e.getMessage());
         }
         
@@ -845,8 +845,8 @@ public class RealS3EndToEndTest {
         schemaBuilder.addTextField("domain", true, false, "default", "position");        // Domain identifier
         schemaBuilder.addTextField("name", true, false, "default", "position");          // Entity name
         schemaBuilder.addTextField("description", true, false, "default", "position");   // Description
-        schemaBuilder.addIntegerField("id", true, true, false);                         // Unique ID
-        schemaBuilder.addIntegerField("price", true, true, false);                      // Price (may be 0 for some domains)
+        schemaBuilder.addIntegerField("id", true, true, true);                          // Unique ID - FAST field for range queries
+        schemaBuilder.addIntegerField("price", true, true, true);                       // Price - FAST field for range queries
         schemaBuilder.addTextField("email", true, false, "default", "position");        // Email (customers only)
         schemaBuilder.addTextField("category", true, false, "default", "position");     // Category
         

@@ -255,27 +255,27 @@ impl StandaloneSearcher {
         doc_mapper: Arc<DocMapper>,
     ) -> Result<LeafSearchResponse> {
         // Resolve storage using the helper that handles S3 URIs correctly
-        println!("SCOTTWIT: search_split : before resolve");
+        // println!("SCOTTWIT: search_split : before resolve");
         let storage = resolve_storage_for_split(&self.storage_resolver, split_uri).await?;
-        println!("SCOTTWIT: search_split : after resolve");
+        // println!("SCOTTWIT: search_split : after resolve");
         
         // Convert metadata to internal format
         let split_offsets = SplitIdAndFooterOffsets::from(metadata.clone());
         
-        println!("SCOTTWIT: search_split : after resolve2");
+        // println!("SCOTTWIT: search_split : after resolve2");
         // FOLLOW QUICKWIT'S EXACT PATTERN: Get permits first, then await individual permit
         let memory_allocation = compute_initial_memory_allocation(
             &split_offsets,
             self.context.config.warmup.split_initial_allocation
         );
-        println!("SCOTTWIT: search_split : after resolve3");
+        // println!("SCOTTWIT: search_split : after resolve3");
         
         let permit_futures = self.context.permit_provider.get_permits(vec![memory_allocation]).await;
         let permit_future = permit_futures.into_iter().next()
             .expect("Expected one permit future");
         let mut search_permit = permit_future.await;
         
-        println!("SCOTTWIT: search_split : after resolve4");
+        // println!("SCOTTWIT: search_split : after resolve4");
         // Execute search using Quickwit's proven search implementation
         self.search_single_split_with_permit(
             storage,
@@ -316,6 +316,14 @@ impl StandaloneSearcher {
 
         // Save split_id before move
         let split_id = split.split_id.clone();
+
+        // Debug: Dump the QueryAst before calling leaf_search_single_split
+        println!("TANTIVY4JAVA DEBUG: Split ID: {} QueryAst: {}", split_id, search_request.query_ast);
+        
+        // Parse and print the QueryAst structure
+        if let Ok(parsed_query_ast) = serde_json::from_str::<quickwit_query::query_ast::QueryAst>(&search_request.query_ast) {
+            println!("RUST DEBUG: Successfully parsed QueryAst: {:?}", parsed_query_ast);
+        }
 
         // Use Quickwit's proven leaf_search_single_split function directly
         // This eliminates all the complexity we had in the previous implementation
@@ -358,7 +366,7 @@ impl StandaloneSearcher {
                     .with_context(|| "Failed to create runtime for sync search")?;
                     
                 // Run the async search in the dedicated runtime
-                println!("SCOTTWIT: BEFORE block on");
+                // println!("SCOTTWIT: BEFORE block on");
                 rt.block_on(async {
                     self.search_split(split_uri, metadata, search_request, doc_mapper).await
                 })
@@ -405,8 +413,27 @@ pub async fn resolve_storage_for_split(
                     .with_context(|| format!("Failed to resolve storage for URI: {}", split_uri))
             }
         },
+        quickwit_common::uri::Protocol::File => {
+            // For file://, we also need to resolve the directory, not the file
+            let uri_str = uri.as_str();
+            if let Some(last_slash_pos) = uri_str.rfind('/') {
+                let directory_uri_str = &uri_str[..last_slash_pos + 1];
+                let directory_uri: Uri = directory_uri_str.parse()
+                    .with_context(|| format!("Failed to parse file directory URI: {}", directory_uri_str))?;
+                
+                if std::env::var("TANTIVY4JAVA_DEBUG").unwrap_or_default() == "1" {
+                    eprintln!("RUST DEBUG: Resolving file:// storage for directory: '{}'", directory_uri_str);
+                }
+                storage_resolver.resolve(&directory_uri).await
+                    .with_context(|| format!("Failed to resolve storage for file directory URI: {}", directory_uri_str))
+            } else {
+                // Fallback if no slash found
+                storage_resolver.resolve(&uri).await
+                    .with_context(|| format!("Failed to resolve storage for file URI: {}", split_uri))
+            }
+        },
         _ => {
-            // For non-S3 protocols, use the full URI
+            // For other protocols, use the full URI
             storage_resolver.resolve(&uri).await
                 .with_context(|| format!("Failed to resolve storage for URI: {}", split_uri))
         }

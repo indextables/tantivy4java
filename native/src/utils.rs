@@ -68,34 +68,72 @@ pub fn handle_error(env: &mut JNIEnv, error: &str) {
     let _ = env.throw_new("java/lang/RuntimeException", error);
 }
 
-/// Arc-based memory management utilities for preventing crashes
+/// SAFE Arc-based memory management utilities using registry pattern
 
-/// Convert Arc to jlong pointer for safe sharing with Java
+/// Global registry for Arc objects - prevents memory safety issues
+pub static ARC_REGISTRY: Lazy<Mutex<HashMap<jlong, Box<dyn std::any::Any + Send + Sync>>>> = 
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+/// Thread-safe atomic counter for generating unique Arc IDs
+static ARC_NEXT_ID: AtomicU64 = AtomicU64::new(1);
+
+/// SAFE: Register Arc in global registry and return handle
 pub fn arc_to_jlong<T: Send + Sync + 'static>(arc: Arc<T>) -> jlong {
-    Box::into_raw(Box::new(arc)) as jlong
+    let mut registry = ARC_REGISTRY.lock().unwrap();
+    let id = ARC_NEXT_ID.fetch_add(1, Ordering::SeqCst) as jlong;
+    
+    // Store the Arc in the registry instead of using unsafe pointer manipulation
+    registry.insert(id, Box::new(arc));
+    
+    if std::env::var("TANTIVY4JAVA_DEBUG").unwrap_or_default() == "1" {
+        eprintln!("RUST DEBUG: arc_to_jlong - registered Arc with ID: {}", id);
+    }
+    
+    id
 }
 
-/// Convert jlong pointer back to Arc reference for safe access
+/// SAFE: Access Arc from registry without unsafe operations
 pub fn jlong_to_arc<T: Send + Sync + 'static>(ptr: jlong) -> Option<Arc<T>> {
-    eprintln!("RUST DEBUG: jlong_to_arc called with pointer: {}", ptr);
+    if std::env::var("TANTIVY4JAVA_DEBUG").unwrap_or_default() == "1" {
+        eprintln!("RUST DEBUG: jlong_to_arc called with ID: {}", ptr);
+    }
+    
     if ptr == 0 {
-        eprintln!("RUST DEBUG: jlong_to_arc - pointer is 0, returning None");
+        if std::env::var("TANTIVY4JAVA_DEBUG").unwrap_or_default() == "1" {
+            eprintln!("RUST DEBUG: jlong_to_arc - ID is 0, returning None");
+        }
         return None;
     }
-    unsafe {
-        eprintln!("RUST DEBUG: jlong_to_arc - attempting to convert pointer {} to Box<Arc<T>>", ptr);
-        let boxed = Box::from_raw(ptr as *mut Arc<T>);
-        let arc = (*boxed).clone();
-        Box::into_raw(boxed); // Don't drop the box, keep the pointer alive
-        eprintln!("RUST DEBUG: jlong_to_arc - successfully converted pointer {}", ptr);
-        Some(arc)
+    
+    let registry = ARC_REGISTRY.lock().unwrap();
+    let boxed = registry.get(&ptr)?;
+    let arc = boxed.downcast_ref::<Arc<T>>()?;
+    
+    if std::env::var("TANTIVY4JAVA_DEBUG").unwrap_or_default() == "1" {
+        eprintln!("RUST DEBUG: jlong_to_arc - successfully found Arc with ID: {}", ptr);
     }
+    
+    Some(arc.clone())
 }
 
-/// Execute function with Arc reference - safe memory access
+/// SAFE: Execute function with Arc reference from registry
 pub fn with_arc_safe<T: Send + Sync + 'static, R>(ptr: jlong, f: impl FnOnce(&Arc<T>) -> R) -> Option<R> {
     let arc = jlong_to_arc(ptr)?;
     Some(f(&arc))
+}
+
+/// SAFE: Remove Arc from registry to prevent memory leaks
+pub fn release_arc(ptr: jlong) {
+    if ptr != 0 {
+        let mut registry = ARC_REGISTRY.lock().unwrap();
+        if registry.remove(&ptr).is_some() {
+            if std::env::var("TANTIVY4JAVA_DEBUG").unwrap_or_default() == "1" {
+                eprintln!("RUST DEBUG: release_arc - removed Arc with ID: {}", ptr);
+            }
+        } else if std::env::var("TANTIVY4JAVA_DEBUG").unwrap_or_default() == "1" {
+            eprintln!("RUST DEBUG: release_arc - Arc with ID {} not found in registry", ptr);
+        }
+    }
 }
 
 /// Convert Rust Result to Java, throwing exception on error
