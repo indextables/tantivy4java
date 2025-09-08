@@ -17,9 +17,10 @@
  * under the License.
  */
 
-use jni::objects::{JClass, JString, JObject, JByteBuffer};
+use jni::objects::{JClass, JString, JObject, JByteBuffer, ReleaseMode};
 use jni::sys::{jlong, jboolean, jint, jobject};
 use jni::JNIEnv;
+use jni::sys::jlongArray as JLongArray;
 use tantivy::{IndexWriter as TantivyIndexWriter, Searcher as TantivySearcher, DocAddress as TantivyDocAddress, DateTime, Term};
 use tantivy::schema::{TantivyDocument, Field, Schema, Facet};
 use tantivy::query::Query as TantivyQuery;
@@ -210,6 +211,123 @@ pub extern "system" fn Java_com_tantivy4java_Searcher_nativeDoc(
 }
 
 #[no_mangle]
+pub extern "system" fn Java_com_tantivy4java_Searcher_nativeDocBatch(
+    mut env: JNIEnv,
+    _class: JClass,
+    searcher_ptr: jlong,
+    doc_address_ptrs: JLongArray,
+) -> JLongArray {
+    // Convert JNI array to proper JArray type
+    let doc_addresses_array = unsafe { jni::objects::JLongArray::from_raw(doc_address_ptrs) };
+    
+    // Get the array of document address pointers
+    let array_len = match env.get_array_length(&doc_addresses_array) {
+        Ok(len) => len as usize,
+        Err(e) => {
+            handle_error(&mut env, &format!("Failed to get array length: {}", e));
+            return std::ptr::null_mut();
+        }
+    };
+    
+    let mut addresses = vec![0i64; array_len];
+    if let Err(e) = env.get_long_array_region(&doc_addresses_array, 0, &mut addresses) {
+        handle_error(&mut env, &format!("Failed to get array elements: {}", e));
+        return std::ptr::null_mut();
+    }
+    
+    // Convert to Vec of DocAddress objects
+    let mut tantivy_addresses = Vec::new();
+    for &addr_ptr in addresses.iter() {
+        let tantivy_doc_address = match with_arc_safe::<TantivyDocAddress, Option<TantivyDocAddress>>(addr_ptr, |doc_address| {
+            Some(**doc_address)
+        }) {
+            Some(Some(addr)) => addr,
+            _ => {
+                handle_error(&mut env, &format!("Invalid DocAddress pointer at index {}", tantivy_addresses.len()));
+                return std::ptr::null_mut();
+            }
+        };
+        tantivy_addresses.push(tantivy_doc_address);
+    }
+    
+    // Get the searcher and schema once
+    let result = with_arc_safe::<Mutex<TantivySearcher>, Result<(Vec<tantivy::schema::TantivyDocument>, tantivy::schema::Schema), String>>(
+        searcher_ptr, 
+        |searcher_mutex| {
+            let searcher = searcher_mutex.lock().unwrap();
+            let schema = searcher.schema().clone();
+            
+            // Sort addresses by segment for better cache locality
+            let mut indexed_addresses: Vec<(usize, TantivyDocAddress)> = tantivy_addresses
+                .into_iter()
+                .enumerate()
+                .collect();
+            indexed_addresses.sort_by_key(|(_, addr)| (addr.segment_ord, addr.doc_id));
+            
+            // Retrieve all documents efficiently
+            let mut documents = vec![None; indexed_addresses.len()];
+            for (original_index, addr) in indexed_addresses {
+                match searcher.doc(addr) {
+                    Ok(doc) => documents[original_index] = Some(doc),
+                    Err(e) => return Err(format!("Failed to retrieve document at index {}: {}", original_index, e)),
+                }
+            }
+            
+            // Convert Option<Document> to Document, returning error if any failed
+            let documents: Result<Vec<_>, _> = documents
+                .into_iter()
+                .enumerate()
+                .map(|(i, opt)| opt.ok_or_else(|| format!("Document at index {} was not retrieved", i)))
+                .collect();
+            
+            match documents {
+                Ok(docs) => Ok((docs, schema)),
+                Err(e) => Err(e),
+            }
+        }
+    );
+    
+    match result {
+        Some(Ok((documents, schema))) => {
+            // Convert documents to Document wrappers and get their pointers
+            let doc_ptrs: Vec<jlong> = documents
+                .into_iter()
+                .map(|document| {
+                    let retrieved_doc = RetrievedDocument::new_with_schema(document, &schema);
+                    let wrapper = DocumentWrapper::Retrieved(retrieved_doc);
+                    let wrapper_arc = Arc::new(Mutex::new(wrapper));
+                    arc_to_jlong(wrapper_arc)
+                })
+                .collect();
+            
+            // Create Java long array with document pointers
+            match env.new_long_array(doc_ptrs.len() as i32) {
+                Ok(array) => {
+                    if let Err(e) = env.set_long_array_region(&array, 0, &doc_ptrs) {
+                        handle_error(&mut env, &format!("Failed to set array region: {}", e));
+                        std::ptr::null_mut()
+                    } else {
+                        array.into_raw()
+                    }
+                }
+                Err(e) => {
+                    handle_error(&mut env, &format!("Failed to create long array: {}", e));
+                    std::ptr::null_mut()
+                }
+            }
+        },
+        Some(Err(err)) => {
+            handle_error(&mut env, &err);
+            std::ptr::null_mut()
+        },
+        None => {
+            handle_error(&mut env, "Invalid Searcher pointer");
+            std::ptr::null_mut()
+        }
+    }
+}
+
+#[no_mangle]
 pub extern "system" fn Java_com_tantivy4java_Searcher_nativeDocFreq(
     mut env: JNIEnv,
     _class: JClass,
@@ -310,7 +428,7 @@ pub extern "system" fn Java_com_tantivy4java_IndexWriter_nativeAddDocument(
     
     // Now get the schema and build the document, then add it
     let result = with_arc_safe::<Mutex<TantivyIndexWriter>, Result<u64, String>>(ptr, |writer_mutex| {
-        let mut writer = writer_mutex.lock().unwrap();
+        let writer = writer_mutex.lock().unwrap();
         // Get schema from the writer
         let schema = writer.index().schema();
         let document = doc_builder_clone.build(&schema).map_err(|e| e.to_string())?;
@@ -348,7 +466,7 @@ pub extern "system" fn Java_com_tantivy4java_IndexWriter_nativeAddJson(
     };
     
     let result = with_arc_safe::<Mutex<TantivyIndexWriter>, Result<u64, String>>(ptr, |writer_mutex| {
-        let mut writer = writer_mutex.lock().unwrap();
+        let writer = writer_mutex.lock().unwrap();
         // Parse JSON and add document
         let schema = writer.index().schema();
         let document = match tantivy::schema::TantivyDocument::parse_json(&schema, &json_str) {
@@ -491,7 +609,7 @@ pub extern "system" fn Java_com_tantivy4java_IndexWriter_nativeDeleteAllDocument
     ptr: jlong,
 ) {
     let result = with_arc_safe::<Mutex<TantivyIndexWriter>, Result<(), String>>(ptr, |writer_mutex| {
-        let mut writer = writer_mutex.lock().unwrap();
+        let writer = writer_mutex.lock().unwrap();
         let _count = writer.delete_all_documents();
         Ok(())
     });
@@ -578,7 +696,7 @@ pub extern "system" fn Java_com_tantivy4java_IndexWriter_nativeDeleteDocumentsBy
     };
     
     let result = with_arc_safe::<Mutex<TantivyIndexWriter>, Result<u64, String>>(ptr, |writer_mutex| {
-        let mut writer = writer_mutex.lock().unwrap();
+        let writer = writer_mutex.lock().unwrap();
         // Delete documents by term
         let deleted_count = writer.delete_term(term);
         // Note: Tantivy's delete_term returns the number of delete operations, not necessarily 
@@ -618,7 +736,7 @@ pub extern "system" fn Java_com_tantivy4java_IndexWriter_nativeDeleteDocumentsBy
     };
     
     let result = with_arc_safe::<Mutex<TantivyIndexWriter>, Result<u64, String>>(ptr, |writer_mutex| {
-        let mut writer = writer_mutex.lock().unwrap();
+        let writer = writer_mutex.lock().unwrap();
         // Use the pre-cloned query to avoid nested object registry access
         Ok(writer.delete_query(query_clone).map_err(|e| e.to_string())?)
     });
@@ -1164,7 +1282,7 @@ fn parse_batch_documents(_env: &mut JNIEnv, writer_ptr: jlong, buffer: &[u8]) ->
     
     // Process each document
     let opstamps = with_arc_safe::<Mutex<TantivyIndexWriter>, Result<Vec<u64>, String>>(writer_ptr, |writer_mutex| {
-        let mut writer = writer_mutex.lock().unwrap();
+        let writer = writer_mutex.lock().unwrap();
         let schema = writer.index().schema();
         let mut opstamps = Vec::with_capacity(doc_count);
         

@@ -24,7 +24,7 @@ use serde::{Serialize, Deserialize};
 use serde_json;
 
 // Quickwit imports
-use quickwit_storage::{PutPayload, BundleStorage, BundleStorageFileOffsets, RamStorage, Storage, StorageResolver, LocalFileStorageFactory, S3CompatibleObjectStorageFactory, SplitPayloadBuilder};
+use quickwit_storage::{PutPayload, BundleStorage, RamStorage, Storage, StorageResolver, LocalFileStorageFactory, S3CompatibleObjectStorageFactory, SplitPayloadBuilder};
 use quickwit_directories::write_hotcache;
 use quickwit_config::S3StorageConfig;
 use quickwit_common::uri::{Uri, Protocol};
@@ -369,11 +369,11 @@ fn create_quickwit_split(
     output_path: &PathBuf, 
     _split_metadata: &QuickwitSplitMetadata
 ) -> Result<FooterOffsets, anyhow::Error> {
-    use tantivy::directory::{MmapDirectory, Directory};
-    use tantivy::directory::FileSlice;
+    use tantivy::directory::MmapDirectory;
+    
     use uuid::Uuid;
-    use std::collections::HashMap;
-    use std::path::Path;
+    
+    
     
     debug_log!("🔧 OFFICIAL API: Using Quickwit's SplitPayloadBuilder for proper split creation");
     debug_log!("create_quickwit_split called with output_path: {:?}", output_path);

@@ -227,6 +227,34 @@ public class SplitSearcher implements AutoCloseable {
     }
     
     /**
+     * Retrieve multiple documents by their addresses in a single batch operation.
+     * This is significantly more efficient than calling doc() multiple times,
+     * especially for large numbers of documents.
+     * 
+     * @param docAddresses List of document addresses
+     * @return List of documents in the same order as the input addresses
+     */
+    public List<Document> docBatch(List<DocAddress> docAddresses) {
+        if (docAddresses == null || docAddresses.isEmpty()) {
+            return new ArrayList<>();
+        }
+        
+        // Convert to arrays for JNI transfer
+        int[] segments = new int[docAddresses.size()];
+        int[] docIds = new int[docAddresses.size()];
+        
+        for (int i = 0; i < docAddresses.size(); i++) {
+            DocAddress addr = docAddresses.get(i);
+            segments[i] = addr.getSegmentOrd();
+            docIds[i] = addr.getDoc();
+        }
+        
+        // Call native batch retrieval
+        Document[] docs = docBatchNative(nativePtr, segments, docIds);
+        return Arrays.asList(docs);
+    }
+    
+    /**
      * Retrieve multiple documents efficiently using zero-copy semantics.
      * This method serializes all requested documents into a single ByteBuffer
      * for optimal performance when retrieving many documents.
@@ -448,6 +476,7 @@ public class SplitSearcher implements AutoCloseable {
     private static native long getSchemaFromNative(long nativePtr);
     private static native SearchResult searchWithQueryAst(long nativePtr, String queryAstJson, int limit);
     private static native Document docNative(long nativePtr, int segment, int docId);
+    private static native Document[] docBatchNative(long nativePtr, int[] segments, int[] docIds);
     private static native byte[] docsBulkNative(long nativePtr, int[] segments, int[] docIds);
     private static native List<Document> parseBulkDocsNative(java.nio.ByteBuffer buffer);
     private static native void preloadComponentsNative(long nativePtr, IndexComponent[] components);

@@ -207,7 +207,7 @@ pub extern "system" fn Java_com_tantivy4java_StandaloneSearcher_clearCachesNativ
 /// Close the searcher and free resources
 #[no_mangle]
 pub extern "system" fn Java_com_tantivy4java_StandaloneSearcher_closeNative(
-    mut env: JNIEnv,
+    env: JNIEnv,
     _class: JClass,
     searcher_ptr: jlong,
 ) {

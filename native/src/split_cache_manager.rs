@@ -14,12 +14,13 @@ use jni::JNIEnv;
 use jni::objects::{JClass, JObject, JString};
 use jni::sys::{jlong, jint, jobject};
 
-use quickwit_storage::{ByteRangeCache, SplitCache, MemorySizedCache};
 use tokio::runtime::Runtime;
-// Note: LeafSearchCache might be in a different location in Quickwit codebase
-// For now, we'll implement a simpler cache structure that follows Quickwit patterns
+use crate::global_cache::{get_configured_storage_resolver, get_global_searcher_context};
+use quickwit_config::S3StorageConfig;
+// Note: Using global caches following Quickwit's pattern
 
 /// Global cache manager that follows Quickwit's multi-level caching architecture
+/// This now uses the global caches from GLOBAL_SEARCHER_COMPONENTS
 pub struct GlobalSplitCacheManager {
     cache_name: String,
     max_cache_size: u64,
@@ -27,11 +28,8 @@ pub struct GlobalSplitCacheManager {
     // Runtime for async operations
     runtime: Runtime,
     
-    // Global shared caches following Quickwit's actual architecture
-    // Using the available Quickwit cache types
-    split_cache: Arc<SplitCache>,
-    byte_range_cache: ByteRangeCache,
-    split_footer_cache: Arc<MemorySizedCache<String>>, // Cache for split footers (shared per schema+AWS config)
+    // AWS configuration for storage resolver
+    s3_config: Option<S3StorageConfig>,
     
     // Statistics
     total_hits: AtomicU64,
@@ -45,55 +43,20 @@ pub struct GlobalSplitCacheManager {
 
 impl GlobalSplitCacheManager {
     pub fn new(cache_name: String, max_cache_size: u64) -> Self {
-        // Create runtime first
+        debug_println!("RUST DEBUG: Creating GlobalSplitCacheManager '{}' using global caches", cache_name);
+        
+        // Create runtime for async operations
         let runtime = Runtime::new().expect("Failed to create Tokio runtime for cache manager");
         
-        // Create proper Quickwit caches following their architecture
-        // Use the available Quickwit cache constructors
-        // Create proper SplitCache with temporary directory and storage resolver
-        use quickwit_config::SplitCacheLimits;
-        use tempfile::TempDir;
-        use std::num::NonZeroU32;
-        use bytesize::ByteSize;
-        
-        let temp_dir = TempDir::new().expect("Failed to create temp dir");
-        
-        // Create SplitCacheLimits manually since default() isn't available
-        let limits = SplitCacheLimits {
-            max_num_bytes: ByteSize::mb(max_cache_size / (1024 * 1024)), // Convert to MB
-            max_num_splits: NonZeroU32::new(10_000).unwrap(),
-            num_concurrent_downloads: NonZeroU32::new(1).unwrap(),
-            max_file_descriptors: NonZeroU32::new(100).unwrap(),
-        };
-        
-        let storage_resolver = crate::standalone_searcher::create_storage_resolver();
-        
-        // Ensure we're in the runtime context when creating SplitCache
-        let _guard = runtime.enter();
-        let split_cache = SplitCache::with_root_path(
-            temp_dir.path().to_path_buf(),
-            storage_resolver,
-            limits,
-        ).expect("Failed to create SplitCache");
-        
-        // 🚀 OPTIMIZATION: Controlled ByteRangeCache resource allocation
-        // Reserve 25% of cache size for ByteRangeCache operations (optimal for mixed workloads)
-        // Note: ByteRangeCache has infinite capacity but we control total system memory usage
-        let _byte_range_cache_budget = max_cache_size / 4; // 25% allocation for byte ranges
-        let byte_range_cache = ByteRangeCache::with_infinite_capacity(
-            &quickwit_storage::STORAGE_METRICS.shortlived_cache,
-        );
-        
-        // Create split footer cache (shared across all splits with same schema+AWS config)
-        let split_footer_cache = Arc::new(MemorySizedCache::with_capacity_in_bytes(50_000_000, &quickwit_storage::STORAGE_METRICS.shortlived_cache)); // 50MB for footers
+        // Note: We're using the global caches from GLOBAL_SEARCHER_COMPONENTS
+        // This ensures all split cache managers share the same underlying caches
+        // following Quickwit's architecture pattern
         
         Self {
             cache_name,
             max_cache_size,
             runtime,
-            split_cache,
-            byte_range_cache,
-            split_footer_cache,
+            s3_config: None,
             total_hits: AtomicU64::new(0),
             total_misses: AtomicU64::new(0),
             total_evictions: AtomicU64::new(0),
@@ -179,17 +142,19 @@ impl GlobalSplitCacheManager {
         }
     }
     
-    // Accessors for the Quickwit caches
-    pub fn get_split_cache(&self) -> Arc<SplitCache> {
-        self.split_cache.clone()
+    // Set AWS configuration for storage resolver
+    pub fn set_aws_config(&mut self, s3_config: S3StorageConfig) {
+        self.s3_config = Some(s3_config);
     }
     
-    pub fn get_byte_range_cache(&self) -> &ByteRangeCache {
-        &self.byte_range_cache
+    // Get configured storage resolver using the AWS config if set
+    pub fn get_storage_resolver(&self) -> quickwit_storage::StorageResolver {
+        get_configured_storage_resolver(self.s3_config.clone())
     }
     
-    pub fn get_split_footer_cache(&self) -> Arc<MemorySizedCache<String>> {
-        self.split_footer_cache.clone()
+    // Get the global searcher context with all shared caches
+    pub fn get_searcher_context(&self) -> Arc<quickwit_search::SearcherContext> {
+        get_global_searcher_context()
     }
     
     pub fn force_eviction(&self, _target_size_bytes: u64) {

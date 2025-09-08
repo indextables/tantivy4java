@@ -227,44 +227,31 @@ public class MillionRecordBulkRetrievalTest {
             System.out.printf("    Rate: %,d docs/sec\n", (long)(testSize / (classicTimeMs / 1000.0)));
             System.out.printf("    Per-doc: %.3f μs\n\n", (classicTimeNs / 1000.0) / testSize);
             
-            // Method 2: Bulk retrieval (zero-copy)
-            System.out.println("  Method 2: Zero-Copy Bulk Retrieval");
+            // Method 2: Batch document retrieval (new optimized method)
+            System.out.println("  Method 2: Batch Document Retrieval");
             System.out.println("  ------------------------------------");
             long bulkStartTime = System.nanoTime();
             List<Document> bulkDocs = new ArrayList<>();
             
-            try {
-                // Process in batches for bulk retrieval
-                for (int i = 0; i < addresses.size(); i += RETRIEVAL_BATCH_SIZE) {
-                    int end = Math.min(i + RETRIEVAL_BATCH_SIZE, addresses.size());
-                    List<DocAddress> batch = addresses.subList(i, end);
-                    
-                    ByteBuffer bulkBuffer = searcher.docsBulk(batch);
-                    if (bulkBuffer != null) {
-                        List<Document> batchDocs = searcher.parseBulkDocs(bulkBuffer);
-                        bulkDocs.addAll(batchDocs);
-                    }
-                }
-            } catch (RuntimeException e) {
-                // If bulk retrieval not implemented, use stub behavior
-                System.out.println("    ⚠️  Bulk retrieval not yet implemented (using stub)");
-                bulkDocs = searcher.parseBulkDocs(null);
+            // Process in batches for bulk retrieval
+            for (int i = 0; i < addresses.size(); i += RETRIEVAL_BATCH_SIZE) {
+                int end = Math.min(i + RETRIEVAL_BATCH_SIZE, addresses.size());
+                List<DocAddress> batch = addresses.subList(i, end);
+                
+                // Use the new batch retrieval method
+                List<Document> batchDocs = searcher.docBatch(batch);
+                bulkDocs.addAll(batchDocs);
             }
             
             long bulkTimeNs = System.nanoTime() - bulkStartTime;
             double bulkTimeMs = bulkTimeNs / 1_000_000.0;
             
-            if (!bulkDocs.isEmpty()) {
-                System.out.printf("    Time: %.2f ms\n", bulkTimeMs);
-                System.out.printf("    Rate: %,d docs/sec\n", (long)(testSize / (bulkTimeMs / 1000.0)));
-                System.out.printf("    Per-doc: %.3f μs\n", (bulkTimeNs / 1000.0) / testSize);
-                
-                double speedup = classicTimeMs / bulkTimeMs;
-                System.out.printf("\n  🚀 Performance Improvement: %.2fx faster\n", speedup);
-            } else {
-                System.out.printf("    Time: %.2f ms (stub only)\n", bulkTimeMs);
-                System.out.println("    Actual bulk retrieval will show significant speedup");
-            }
+            System.out.printf("    Time: %.2f ms\n", bulkTimeMs);
+            System.out.printf("    Rate: %,d docs/sec\n", (long)(testSize / (bulkTimeMs / 1000.0)));
+            System.out.printf("    Per-doc: %.3f μs\n", (bulkTimeNs / 1000.0) / testSize);
+            
+            double speedup = classicTimeMs / bulkTimeMs;
+            System.out.printf("\n  🚀 Performance Improvement: %.2fx faster\n", speedup);
             
             // Cleanup documents
             for (Document doc : classicDocs) {
@@ -324,37 +311,29 @@ public class MillionRecordBulkRetrievalTest {
             System.out.printf("    Estimated rate: %,d docs/sec\n\n", 
                 (long)(TOTAL_DOCUMENTS / (estimatedClassicTotalMs / 1000.0)));
             
-            // Method 2: Bulk retrieval for all documents
-            System.out.println("  Method 2: Zero-Copy Bulk Retrieval (All 1M docs)");
+            // Method 2: Batch retrieval for all documents
+            System.out.println("  Method 2: Batch Document Retrieval (All 1M docs)");
             System.out.println("  --------------------------------------------------");
             long bulkStartTime = System.nanoTime();
             AtomicInteger bulkCount = new AtomicInteger(0);
             
-            try {
-                // Process in larger batches for bulk retrieval
-                int largeBatchSize = 10_000;
-                for (int i = 0; i < allAddresses.size(); i += largeBatchSize) {
-                    int end = Math.min(i + largeBatchSize, allAddresses.size());
-                    List<DocAddress> batch = allAddresses.subList(i, end);
-                    
-                    ByteBuffer bulkBuffer = searcher.docsBulk(batch);
-                    if (bulkBuffer != null) {
-                        List<Document> batchDocs = searcher.parseBulkDocs(bulkBuffer);
-                        for (Document doc : batchDocs) {
-                            assertNotNull(doc.getFirst("id"));
-                            bulkCount.incrementAndGet();
-                            doc.close();
-                        }
-                    }
-                    
-                    if ((i + largeBatchSize) % 100_000 == 0) {
-                        System.out.printf("    Progress: %,d documents retrieved...\n", 
-                            i + largeBatchSize);
-                    }
+            // Process in larger batches for bulk retrieval
+            int largeBatchSize = 10_000;
+            for (int i = 0; i < allAddresses.size(); i += largeBatchSize) {
+                int end = Math.min(i + largeBatchSize, allAddresses.size());
+                List<DocAddress> batch = allAddresses.subList(i, end);
+                
+                List<Document> batchDocs = searcher.docBatch(batch);
+                for (Document doc : batchDocs) {
+                    assertNotNull(doc.getFirst("id"));
+                    bulkCount.incrementAndGet();
+                    doc.close();
                 }
-            } catch (RuntimeException e) {
-                System.out.println("    ⚠️  Bulk retrieval not yet implemented");
-                return;
+                
+                if ((i + largeBatchSize) % 100_000 == 0) {
+                    System.out.printf("    Progress: %,d documents retrieved...\n", 
+                        i + largeBatchSize);
+                }
             }
             
             long bulkTimeNs = System.nanoTime() - bulkStartTime;
@@ -428,38 +407,29 @@ public class MillionRecordBulkRetrievalTest {
             System.gc();
             Thread.sleep(100);
             
-            // Method 2: Bulk retrieval memory usage
+            // Method 2: Batch retrieval memory usage
             long beforeBulkMemory = runtime.totalMemory() - runtime.freeMemory();
             
-            try {
-                ByteBuffer bulkBuffer = searcher.docsBulk(addresses);
-                if (bulkBuffer != null) {
-                    List<Document> bulkDocs = searcher.parseBulkDocs(bulkBuffer);
-                    
-                    long afterBulkMemory = runtime.totalMemory() - runtime.freeMemory();
-                    long bulkMemoryUsed = afterBulkMemory - beforeBulkMemory;
-                    
-                    System.out.println("  Zero-Copy Bulk Retrieval:");
-                    System.out.printf("    Memory used: %,d bytes (%.2f MB)\n", 
-                        bulkMemoryUsed, bulkMemoryUsed / (1024.0 * 1024.0));
-                    System.out.printf("    Per document: %,d bytes\n", 
-                        bulkMemoryUsed / addresses.size());
-                    
-                    if (classicMemoryUsed > 0 && bulkMemoryUsed > 0) {
-                        double memoryRatio = (double) classicMemoryUsed / bulkMemoryUsed;
-                        System.out.printf("\n  📉 Memory Efficiency: %.2fx less memory used\n", 
-                            memoryRatio);
-                    }
-                    
-                    // Cleanup
-                    for (Document doc : bulkDocs) {
-                        doc.close();
-                    }
-                }
-            } catch (RuntimeException e) {
-                System.out.println("  Zero-Copy Bulk Retrieval:");
-                System.out.println("    ⚠️  Not yet implemented (stub mode)");
-                System.out.println("    Bulk retrieval will use significantly less memory");
+            List<Document> bulkDocs = searcher.docBatch(addresses);
+            
+            long afterBulkMemory = runtime.totalMemory() - runtime.freeMemory();
+            long bulkMemoryUsed = afterBulkMemory - beforeBulkMemory;
+            
+            System.out.println("  Batch Document Retrieval:");
+            System.out.printf("    Memory used: %,d bytes (%.2f MB)\n", 
+                bulkMemoryUsed, bulkMemoryUsed / (1024.0 * 1024.0));
+            System.out.printf("    Per document: %,d bytes\n", 
+                bulkMemoryUsed / addresses.size());
+            
+            if (classicMemoryUsed > 0 && bulkMemoryUsed > 0) {
+                double memoryRatio = (double) classicMemoryUsed / bulkMemoryUsed;
+                System.out.printf("\n  📉 Memory Efficiency: %.2fx less memory used\n", 
+                    memoryRatio);
+            }
+            
+            // Cleanup
+            for (Document doc : bulkDocs) {
+                doc.close();
             }
             
             System.out.println("\n  ✅ Memory efficiency test complete\n");

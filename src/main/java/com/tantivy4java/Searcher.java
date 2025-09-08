@@ -21,6 +21,7 @@ package com.tantivy4java;
 
 import java.util.Map;
 import java.util.List;
+import java.util.ArrayList;
 
 /**
  * Searcher for querying a Tantivy index.
@@ -126,6 +127,40 @@ public class Searcher implements AutoCloseable {
     }
 
     /**
+     * Get multiple documents by their addresses in a single batch operation.
+     * This is significantly more efficient than calling doc() multiple times,
+     * especially for large numbers of documents.
+     * 
+     * @param docAddresses List of document addresses
+     * @return List of documents in the same order as the input addresses
+     */
+    public List<Document> docBatch(List<DocAddress> docAddresses) {
+        if (closed) {
+            throw new IllegalStateException("Searcher has been closed");
+        }
+        if (docAddresses == null || docAddresses.isEmpty()) {
+            return new ArrayList<>();
+        }
+        
+        // Convert DocAddress list to array of native pointers
+        long[] addressPtrs = new long[docAddresses.size()];
+        for (int i = 0; i < docAddresses.size(); i++) {
+            addressPtrs[i] = docAddresses.get(i).getNativePtr();
+        }
+        
+        // Call native batch retrieval method
+        long[] docPtrs = nativeDocBatch(nativePtr, addressPtrs);
+        
+        // Convert native document pointers to Document objects
+        List<Document> documents = new ArrayList<>(docPtrs.length);
+        for (long ptr : docPtrs) {
+            documents.add(new Document(ptr));
+        }
+        
+        return documents;
+    }
+
+    /**
      * Get the document frequency for a field value.
      * @param fieldName Field name
      * @param fieldValue Field value
@@ -178,6 +213,7 @@ public class Searcher implements AutoCloseable {
     private static native int nativeGetNumDocs(long ptr);
     private static native int nativeGetNumSegments(long ptr);
     private static native long nativeDoc(long ptr, long docAddressPtr);
+    private static native long[] nativeDocBatch(long ptr, long[] docAddressPtrs);
     private static native int nativeDocFreq(long ptr, String fieldName, Object fieldValue);
     private static native List<String> nativeGetSegmentIds(long ptr);
     private static native void nativeClose(long ptr);

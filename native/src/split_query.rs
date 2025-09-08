@@ -5,14 +5,11 @@ use jni::sys::{jlong, jobject, jstring};
 use crate::debug_println;
 use jni::JNIEnv;
 use anyhow::{Result, anyhow};
-use std::sync::Arc;
 
-use tantivy::schema::Schema;
 use std::ops::Bound;
 use quickwit_query::query_ast::{QueryAst, query_ast_from_user_text};
-use quickwit_query::{create_default_quickwit_tokenizer_manager, BooleanOperand, JsonLiteral, MatchAllOrNone};
+use quickwit_query::JsonLiteral;
 
-use crate::utils::with_arc_safe;
 
 /// Convert a SplitTermQuery to QueryAst JSON
 #[no_mangle]
@@ -80,7 +77,7 @@ pub extern "system" fn Java_com_tantivy4java_SplitRangeQuery_toQueryAstJson(
 /// Convert a SplitMatchAllQuery to QueryAst JSON
 #[no_mangle]
 pub extern "system" fn Java_com_tantivy4java_SplitMatchAllQuery_toQueryAstJson(
-    mut env: JNIEnv,
+    env: JNIEnv,
     _obj: JObject,
 ) -> jstring {
     // MatchAll is simple - just return the MatchAll QueryAst
