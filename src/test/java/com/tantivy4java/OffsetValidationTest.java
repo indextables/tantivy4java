@@ -33,17 +33,28 @@ public class OffsetValidationTest {
         SplitCacheManager cacheManager = SplitCacheManager.getInstance(config);
         
         // This should NOT throw an exception - validation should pass
-        try {
-            // We expect this to fail at the native layer since we don't have an actual split file,
-            // but the Java validation should pass
-            cacheManager.createSplitSearcher("/tmp/nonexistent.split", validMetadata);
-            fail("Expected native layer error for nonexistent file, but got none");
+        try (SplitSearcher searcher = cacheManager.createSplitSearcher("/tmp/nonexistent.split", validMetadata)) {
+            // Validation passed - the SplitSearcher was created successfully
+            // The file existence error will only occur when we try to actually use the searcher
+            assertNotNull(searcher, "SplitSearcher should be created with valid metadata");
+            System.out.println("✅ Valid offsets passed validation and SplitSearcher created successfully");
+            
+            // Now try to use the searcher - this should fail with file not found
+            try {
+                SplitQuery query = new SplitTermQuery("test", "value");
+                searcher.search(query, 1);
+                fail("Expected native layer error when searching nonexistent file, but got none");
+            } catch (Exception searchException) {
+                // This is expected - should get a native error about the file not existing
+                assertFalse(searchException.getMessage().contains("Invalid split metadata"), 
+                           "Should not get offset validation error for valid offsets");
+                System.out.println("✅ Got expected native error when searching: " + searchException.getMessage());
+            }
         } catch (Exception e) {
-            // This is expected - we should get a native error about the file not existing
-            // But the exception should NOT be about invalid offsets
+            // If creation failed, ensure it's not due to offset validation issues
             assertFalse(e.getMessage().contains("Invalid split metadata"), 
                        "Should not get offset validation error for valid offsets");
-            System.out.println("✅ Valid offsets passed validation, got expected native error: " + e.getMessage());
+            System.out.println("✅ Got exception during creation (acceptable): " + e.getMessage());
         }
     }
     

@@ -716,7 +716,7 @@ public class RealS3EndToEndTest {
             if (productsResult.getHits().size() > 0) {
                 try (Document productDoc = searcher.doc(productsResult.getHits().get(0).getDocAddress())) {
                     String productName = (String) productDoc.getFirst("name");
-                    Integer price = (Integer) productDoc.getFirst("price");
+                    Long price = (Long) productDoc.getFirst("price");
                     assertNotNull(productName, "Product should have name");
                     assertNotNull(price, "Product should have price");
                     assertTrue(price > 0, "Price should be positive");
