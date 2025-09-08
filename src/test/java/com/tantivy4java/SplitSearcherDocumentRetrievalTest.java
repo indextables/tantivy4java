@@ -88,7 +88,7 @@ public class SplitSearcherDocumentRetrievalTest {
         );
         
         metadata = QuickwitSplit.convertIndexFromPath(indexPath.toString(), splitPath.toString(), config);
-        splitUrl = "file://" + splitPath.toAbsolutePath().toString();
+        splitUrl = splitPath.toAbsolutePath().toString();
     }
 
     @Test

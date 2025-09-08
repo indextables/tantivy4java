@@ -2,7 +2,6 @@
 
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
-use crate::debug_println;
 
 use bytesize::ByteSize;
 use anyhow::{Result, Context as AnyhowContext};
@@ -18,6 +17,7 @@ use quickwit_doc_mapper::DocMapper;
 use quickwit_search::{leaf_search_single_split, SearcherContext, CanSplitDoBetter};
 use quickwit_search::search_permit_provider::{SearchPermit, compute_initial_memory_allocation};
 use quickwit_common::uri::Uri;
+use crate::debug_println;
 
 /// Result of async search operation for JNI bridge
 pub struct SearchResult {
@@ -367,13 +367,48 @@ impl StandaloneSearcher {
     }
 }
 
-/// Helper function to resolve storage for a split URI
+/// Helper function to resolve storage for a split URI or file path
 /// For S3 URIs, this resolves the parent directory instead of the full file path
+/// For direct file paths, this treats them as local file paths and resolves the directory
 /// This is necessary because Quickwit's S3 storage uses the prefix for the directory
 pub async fn resolve_storage_for_split(
     storage_resolver: &StorageResolver,
     split_uri: &str,
 ) -> Result<Arc<dyn Storage>> {
+    // Handle direct file paths (no protocol)
+    if !split_uri.contains("://") {
+        let path = std::path::Path::new(split_uri);
+        
+        // Check if split_uri is already a directory path (ends with slash)
+        if split_uri.ends_with('/') {
+            // It's already a directory path, use it directly
+            let directory_uri_str = format!("file://{}", split_uri);
+            let directory_uri: Uri = directory_uri_str.parse()
+                .with_context(|| format!("Failed to parse local directory URI: {}", directory_uri_str))?;
+            
+            debug_println!("RUST DEBUG: Resolving local file storage for directory: '{}'", directory_uri_str);
+            return storage_resolver.resolve(&directory_uri).await
+                .with_context(|| format!("Failed to resolve storage for local directory: {}", directory_uri_str));
+        } else {
+            // This is a file path, convert to file:// URI for the directory containing the file
+            if let Some(parent_dir) = path.parent() {
+                let directory_uri_str = format!("file://{}/", parent_dir.display());
+                let directory_uri: Uri = directory_uri_str.parse()
+                    .with_context(|| format!("Failed to parse local file directory URI: {}", directory_uri_str))?;
+                
+                debug_println!("RUST DEBUG: Resolving local file storage for directory: '{}'", directory_uri_str);
+                return storage_resolver.resolve(&directory_uri).await
+                    .with_context(|| format!("Failed to resolve storage for local file directory: {}", directory_uri_str));
+            } else {
+                // Use current directory if no parent
+                let directory_uri: Uri = "file://./".parse()
+                    .with_context(|| "Failed to parse current directory URI")?;
+                return storage_resolver.resolve(&directory_uri).await
+                    .with_context(|| "Failed to resolve storage for current directory");
+            }
+        }
+    }
+
     let uri: Uri = split_uri.parse()
         .with_context(|| format!("Failed to parse URI: {}", split_uri))?;
     

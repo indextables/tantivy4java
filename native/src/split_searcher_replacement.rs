@@ -448,11 +448,20 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_searchWithQueryAst(
                 // Use the helper function to resolve storage correctly for S3 URIs
                 let storage = resolve_storage_for_split(&storage_resolver, split_uri).await?;
                 
-                // Extract just the filename for the relative path
-                let relative_path = if let Some(last_slash_pos) = split_uri.rfind('/') {
-                    std::path::Path::new(&split_uri[last_slash_pos + 1..])
+                // Extract relative path - for direct file paths, use just the filename
+                let relative_path = if split_uri.contains("://") {
+                    // This is a URI, extract just the filename
+                    if let Some(last_slash_pos) = split_uri.rfind('/') {
+                        std::path::Path::new(&split_uri[last_slash_pos + 1..])
+                    } else {
+                        std::path::Path::new(split_uri)
+                    }
                 } else {
+                    // This is a direct file path, extract just the filename
                     std::path::Path::new(split_uri)
+                        .file_name()
+                        .map(|name| std::path::Path::new(name))
+                        .unwrap_or_else(|| std::path::Path::new(split_uri))
                 };
                 
                 debug_println!("RUST DEBUG: Reading split file metadata from: '{}'", relative_path.display());
@@ -1010,11 +1019,20 @@ fn retrieve_document_from_split(
             let storage_resolver = StorageResolver::configured(&storage_configs);
             let actual_storage = resolve_storage_for_split(&storage_resolver, split_uri).await?;
             
-            // Extract just the filename for the relative path
-            let relative_path = if let Some(last_slash_pos) = split_uri.rfind('/') {
-                Path::new(&split_uri[last_slash_pos + 1..])
+            // Extract relative path - for direct file paths, use just the filename
+            let relative_path = if split_uri.contains("://") {
+                // This is a URI, extract just the filename
+                if let Some(last_slash_pos) = split_uri.rfind('/') {
+                    Path::new(&split_uri[last_slash_pos + 1..])
+                } else {
+                    Path::new(split_uri)
+                }
             } else {
+                // This is a direct file path, extract just the filename
                 Path::new(split_uri)
+                    .file_name()
+                    .map(|name| Path::new(name))
+                    .unwrap_or_else(|| Path::new(split_uri))
             };
             
             // Get the full file data using Quickwit's storage abstraction
@@ -1098,17 +1116,7 @@ fn retrieve_documents_batch_from_split_optimized(
                 use std::path::Path;
                 use std::sync::Arc;
                 
-                // Create split metadata for Quickwit's open_index_with_caches
-                let split_metadata = SplitIdAndFooterOffsets {
-                    split_id: format!("tantivy4java-split-{}", 
-                        split_uri.chars().filter(|c| c.is_alphanumeric()).collect::<String>()),
-                    split_footer_start: *footer_start,
-                    split_footer_end: *footer_end,
-                    timestamp_start: Some(0), // Not used for our purposes
-                    timestamp_end: Some(i64::MAX), // Not used for our purposes
-                    num_docs: 0, // Will be filled by Quickwit
-                };
-                
+                // Use the same storage resolution approach as individual document retrieval
                 // Create S3 storage configuration
                 let s3_config = S3StorageConfig {
                     flavor: None,
@@ -1122,8 +1130,7 @@ fn retrieve_documents_batch_from_split_optimized(
                     disable_multipart_upload: false,
                 };
                 
-                // Create storage that points to the directory containing the split (not the split file itself)
-                // This is what open_index_with_caches expects
+                // Create storage that points to the directory containing the split (same as individual retrieval)
                 let split_dir_uri = if let Some(last_slash_pos) = split_uri.rfind('/') {
                     &split_uri[..last_slash_pos + 1] // Include the trailing slash
                 } else {
@@ -1134,25 +1141,28 @@ fn retrieve_documents_batch_from_split_optimized(
                 let storage_resolver = StorageResolver::configured(&storage_configs);
                 let index_storage = resolve_storage_for_split(&storage_resolver, split_dir_uri).await?;
                 
-                // Use global SearcherContext with shared caches instead of creating new ones
-                let searcher_context = crate::global_cache::get_global_searcher_context();
+                // Extract just the filename as the relative path (same as individual retrieval)
+                let relative_path = if let Some(last_slash_pos) = split_uri.rfind('/') {
+                    std::path::Path::new(&split_uri[last_slash_pos + 1..])
+                } else {
+                    std::path::Path::new(split_uri)
+                };
                 
-                // Create short-lived ByteRangeCache per operation (Quickwit pattern for optimal memory use)
-                let byte_range_cache = quickwit_storage::ByteRangeCache::with_infinite_capacity(
-                    &quickwit_storage::STORAGE_METRICS.shortlived_cache
-                );
+                // Get split file data directly (same approach as individual retrieval)
+                let file_size = index_storage.file_num_bytes(relative_path).await
+                    .map_err(|e| anyhow::anyhow!("Failed to get file size for {}: {}", split_uri, e))?;
                 
-                // Use Quickwit's open_index_with_caches with global shared caches
-                let (mut index, _hot_directory) = open_index_with_caches(
-                    &searcher_context,
-                    index_storage,
-                    &split_metadata,
-                    None, // tokenizer_manager - we'll set it manually if needed
-                    Some(byte_range_cache.clone()), // Use shared ByteRangeCache
-                ).await
-                .map_err(|e| anyhow::anyhow!("Failed to open index with caches for {}: {}", split_uri, e))?;
+                let split_data = index_storage.get_slice(relative_path, 0..file_size as usize).await
+                    .map_err(|e| anyhow::anyhow!("Failed to get split data from {}: {}", split_uri, e))?;
                 
-                // Add executor like Quickwit does (fetch_docs.rs line 183-186)
+                let split_file_slice = tantivy::directory::FileSlice::new(std::sync::Arc::new(split_data));
+                let bundle_directory = quickwit_directories::BundleDirectory::open_split(split_file_slice)
+                    .map_err(|e| anyhow::anyhow!("Failed to open bundle directory {}: {}", split_uri, e))?;
+                    
+                let mut index = tantivy::Index::open(bundle_directory)
+                    .map_err(|e| anyhow::anyhow!("Failed to open index from bundle {}: {}", split_uri, e))?;
+                
+                // Use the same Quickwit optimizations as individual method
                 let tantivy_executor = search_thread_pool()
                     .get_underlying_rayon_thread_pool()
                     .into();
@@ -1355,11 +1365,20 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_getSchemaFromNative(
                 // Use the helper function to resolve storage correctly for S3 URIs
                 let actual_storage = resolve_storage_for_split(&storage_resolver, split_uri).await?;
                 
-                // Extract just the filename for the relative path
-                let relative_path = if let Some(last_slash_pos) = split_uri.rfind('/') {
-                    Path::new(&split_uri[last_slash_pos + 1..])
+                // Extract relative path - for direct file paths, use just the filename
+                let relative_path = if split_uri.contains("://") {
+                    // This is a URI, extract just the filename
+                    if let Some(last_slash_pos) = split_uri.rfind('/') {
+                        Path::new(&split_uri[last_slash_pos + 1..])
+                    } else {
+                        Path::new(split_uri)
+                    }
                 } else {
+                    // This is a direct file path, extract just the filename
                     Path::new(split_uri)
+                        .file_name()
+                        .map(|name| Path::new(name))
+                        .unwrap_or_else(|| Path::new(split_uri))
                 };
                 
                 debug_println!("RUST DEBUG: About to call storage.file_num_bytes with relative path: '{}'", relative_path.display());

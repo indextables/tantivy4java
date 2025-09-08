@@ -6,6 +6,7 @@ import org.junit.jupiter.api.io.TempDir;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.file.Path;
+import java.nio.file.Files;
 import java.time.LocalDateTime;
 import java.util.*;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -28,6 +29,9 @@ public class MillionRecordBulkRetrievalTest {
     
     @TempDir
     static Path tempDir;
+    
+    // Also keep a permanent copy in case temp cleanup is too aggressive
+    private static Path permanentSplitPath;
     
     private static Path splitPath;
     private static String splitUrl;
@@ -75,7 +79,13 @@ public class MillionRecordBulkRetrievalTest {
         );
         
         metadata = QuickwitSplit.convertIndexFromPath(indexPath.toString(), splitPath.toString(), splitConfig);
-        splitUrl = "file://" + splitPath.toAbsolutePath().toString();
+        
+        // Create a permanent copy in system temp to avoid JUnit @TempDir cleanup issues
+        Path systemTempDir = Path.of(System.getProperty("java.io.tmpdir"));
+        permanentSplitPath = systemTempDir.resolve("tantivy4java-million-record-" + System.currentTimeMillis() + ".split");
+        Files.copy(splitPath, permanentSplitPath, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+        
+        splitUrl = permanentSplitPath.toAbsolutePath().toString();
         splitCreationTimeMs = System.currentTimeMillis() - splitStartTime;
         
         System.out.printf("✅ Index created with %,d documents in %.2f seconds\n", 
@@ -136,13 +146,17 @@ public class MillionRecordBulkRetrievalTest {
     
     @AfterAll
     static void tearDown() {
+        System.out.println("🧹 Final cleanup - closing cache manager");
         if (cacheManager != null) {
             try {
                 cacheManager.close();
             } catch (Exception e) {
-                // Log error but continue cleanup
+                System.err.println("⚠️  Failed to close cache manager: " + e.getMessage());
             }
         }
+        // Let system temp cleanup handle the permanent split file
+        // (removing explicit file deletion to avoid JUnit lifecycle issues)
+        System.out.println("🧹 Cleanup complete - system will handle temp file cleanup");
     }
 
     @Test
@@ -438,6 +452,7 @@ public class MillionRecordBulkRetrievalTest {
             fail("Test interrupted");
         }
     }
+    
     
     // Helper methods
     private static String generateContent(int index) {
