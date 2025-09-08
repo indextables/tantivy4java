@@ -204,12 +204,69 @@ pub extern "system" fn Java_com_tantivy4java_SplitCacheManager_createNativeCache
         _ => 200_000_000, // 200MB default
     };
     
-    let manager = Arc::new(GlobalSplitCacheManager::new(cache_name.clone(), max_cache_size));
+    let mut manager = GlobalSplitCacheManager::new(cache_name.clone(), max_cache_size);
+    
+    // Extract AWS configuration from the Java CacheConfig
+    if let Ok(aws_config_map) = env.call_method(&config, "getAwsConfig", "()Ljava/util/Map;", &[]) {
+        let aws_map_obj = aws_config_map.l().unwrap();
+        
+        // Extract AWS configuration values
+        let mut access_key = None;
+        let mut secret_key = None;
+        let mut session_token = None;
+        let mut region = None;
+        let mut endpoint = None;
+        let mut path_style_access = false;
+        
+        // Helper function to extract string value from HashMap
+        let extract_string_value = |env: &mut JNIEnv, map_obj: &JObject, key: &str| -> Option<String> {
+            let key_jstring = env.new_string(key).ok()?;
+            let value = env.call_method(map_obj, "get", "(Ljava/lang/Object;)Ljava/lang/Object;", &[(&key_jstring).into()]).ok()?.l().ok()?;
+            if value.is_null() {
+                return None;
+            }
+            let value_jstring = JString::from(value);
+            let value_string = env.get_string(&value_jstring).ok()?;
+            Some(value_string.to_string_lossy().to_string())
+        };
+        
+        access_key = extract_string_value(&mut env, &aws_map_obj, "access_key");
+        secret_key = extract_string_value(&mut env, &aws_map_obj, "secret_key");
+        session_token = extract_string_value(&mut env, &aws_map_obj, "session_token");
+        region = extract_string_value(&mut env, &aws_map_obj, "region");
+        endpoint = extract_string_value(&mut env, &aws_map_obj, "endpoint");
+        
+        // Extract path_style_access boolean value
+        if let Some(path_style_str) = extract_string_value(&mut env, &aws_map_obj, "path_style_access") {
+            path_style_access = path_style_str == "true";
+        }
+        
+        // Create S3StorageConfig if we have access key and secret key
+        if let (Some(access_key), Some(secret_key)) = (access_key, secret_key) {
+            debug_println!("RUST DEBUG: Configuring S3 storage with access_key, region: {:?}, endpoint: {:?}, path_style_access: {}", 
+                         region, endpoint, path_style_access);
+            
+            let s3_config = S3StorageConfig {
+                access_key_id: Some(access_key),
+                secret_access_key: Some(secret_key),
+                session_token,
+                region: Some(region.unwrap_or_else(|| "us-east-1".to_string())),
+                endpoint,
+                force_path_style_access: path_style_access,
+                ..Default::default()
+            };
+            
+            // Set the S3 config on the manager
+            manager.set_aws_config(s3_config);
+        }
+    }
+    
+    let manager_arc = Arc::new(manager);
     
     // Store in global registry
     {
         let mut managers = CACHE_MANAGERS.lock().unwrap();
-        managers.insert(cache_name.clone(), manager);
+        managers.insert(cache_name.clone(), manager_arc.clone());
     }
     
     // Use Arc registry for safe memory management

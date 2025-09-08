@@ -35,6 +35,13 @@ import java.util.concurrent.atomic.AtomicLong;
  *     .withAwsCredentials(key, secret, sessionToken) // Credentials with session token
  *     .withAwsRegion(region);                        // Region configured separately
  * 
+ * // For S3-compatible storage requiring path-style access (S3Mock, MinIO, LocalStack):
+ * SplitCacheManager.CacheConfig s3MockConfig = new SplitCacheManager.CacheConfig("test-cache")
+ *     .withAwsCredentials(accessKey, secretKey)
+ *     .withAwsRegion("us-east-1")
+ *     .withAwsEndpoint("http://localhost:9090")
+ *     .withAwsPathStyleAccess(true);  // Required for S3Mock and MinIO
+ * 
  * SplitCacheManager cacheManager = SplitCacheManager.getInstance(config);
  * 
  * // Multiple searchers sharing the same cache
@@ -139,6 +146,24 @@ public class SplitCacheManager implements AutoCloseable {
         
         public CacheConfig withAwsEndpoint(String endpoint) {
             this.awsConfig.put("endpoint", endpoint);
+            return this;
+        }
+        
+        /**
+         * Configure AWS path-style access for S3-compatible storage.
+         * 
+         * Path-style access uses URLs like http://endpoint/bucket/key instead of 
+         * http://bucket.endpoint/key. This is required for:
+         * - S3Mock testing environments
+         * - MinIO self-hosted instances
+         * - Custom S3-compatible storage solutions
+         * - LocalStack local AWS emulation
+         * 
+         * @param pathStyleAccess true to enable path-style access, false for virtual-hosted style
+         * @return this CacheConfig for method chaining
+         */
+        public CacheConfig withAwsPathStyleAccess(boolean pathStyleAccess) {
+            this.awsConfig.put("path_style_access", String.valueOf(pathStyleAccess));
             return this;
         }
         
