@@ -129,7 +129,16 @@ fn convert_term_query_to_ast(env: &mut JNIEnv, obj: &JObject) -> Result<String> 
     let value_jstring: JString = value_obj.l()?.into();
     
     let field: String = env.get_string(&field_jstring)?.into();
-    let value: String = env.get_string(&value_jstring)?.into();
+    let mut value: String = env.get_string(&value_jstring)?.into();
+    
+    // The default tokenizer in Quickwit/Tantivy lowercases all text during indexing.
+    // For text fields, we need to lowercase the search term to match.
+    // TODO: This should ideally check the field's tokenizer configuration,
+    // but for now we'll lowercase all term queries since most text fields use the default tokenizer.
+    value = value.to_lowercase();
+    
+    debug_println!("RUST DEBUG: SplitTermQuery - field: '{}', original value: '{}', lowercased: '{}'", 
+                   field, env.get_string(&value_jstring)?.to_str()?, value);
     
     // Create QueryAst using Quickwit's term query structure
     let term_query = quickwit_query::query_ast::TermQuery {

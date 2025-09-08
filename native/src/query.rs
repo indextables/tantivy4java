@@ -85,14 +85,18 @@ pub extern "system" fn Java_com_tantivy4java_Query_nativeTermQuery(
                     Err(_) => return Err("Invalid field value for text field".to_string()),
                 };
                 
-                // For text fields that are indexed, use tokenization to match how the index was created
-                if let Some(text_field_indexing) = &text_options.get_indexing_options() {
-                    // Use the same tokenizer that was used during indexing
-                    // For simplicity, we'll lowercase the term (which is what the default tokenizer does)
+                // Text fields are always indexed in tantivy (matching tantivy-py behavior)
+                // Check which tokenizer is being used
+                let uses_default_tokenizer = text_options.get_indexing_options()
+                    .map(|opts| opts.tokenizer().to_string() == "default")
+                    .unwrap_or(true); // Default to true if no explicit indexing options
+                
+                if uses_default_tokenizer {
+                    // The default tokenizer lowercases text, so we need to lowercase the search term
                     let tokenized_term = field_value_str.to_lowercase();
                     Term::from_field_text(field, &tokenized_term)
                 } else {
-                    // For non-indexed text fields, use exact match
+                    // For other tokenizers, use the term as-is
                     Term::from_field_text(field, &field_value_str)
                 }
             },
