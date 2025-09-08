@@ -21,7 +21,8 @@ use jni::objects::JClass;
 use jni::sys::{jlong, jint};
 use jni::JNIEnv;
 use tantivy::DocAddress as TantivyDocAddress;
-use crate::utils::{register_object, remove_object, with_object};
+use crate::utils::{arc_to_jlong, release_arc, with_arc_safe};
+use std::sync::Arc;
 
 #[no_mangle]
 pub extern "system" fn Java_com_tantivy4java_DocAddress_nativeNew(
@@ -31,7 +32,8 @@ pub extern "system" fn Java_com_tantivy4java_DocAddress_nativeNew(
     doc: jint,
 ) -> jlong {
     let doc_address = TantivyDocAddress::new(segment_ord as u32, doc as u32);
-    register_object(doc_address) as jlong
+    let doc_address_arc = Arc::new(doc_address);
+    arc_to_jlong(doc_address_arc)
 }
 
 #[no_mangle]
@@ -40,8 +42,8 @@ pub extern "system" fn Java_com_tantivy4java_DocAddress_nativeGetSegmentOrd(
     _class: JClass,
     ptr: jlong,
 ) -> jint {
-    with_object::<TantivyDocAddress, jint>(ptr as u64, |doc_address| {
-        doc_address.segment_ord as jint
+    with_arc_safe::<TantivyDocAddress, jint>(ptr, |doc_address_arc| {
+        doc_address_arc.segment_ord as jint
     }).unwrap_or(0)
 }
 
@@ -51,8 +53,8 @@ pub extern "system" fn Java_com_tantivy4java_DocAddress_nativeGetDoc(
     _class: JClass,
     ptr: jlong,
 ) -> jint {
-    with_object::<TantivyDocAddress, jint>(ptr as u64, |doc_address| {
-        doc_address.doc_id as jint
+    with_arc_safe::<TantivyDocAddress, jint>(ptr, |doc_address_arc| {
+        doc_address_arc.doc_id as jint
     }).unwrap_or(0)
 }
 
@@ -62,5 +64,5 @@ pub extern "system" fn Java_com_tantivy4java_DocAddress_nativeClose(
     _class: JClass,
     ptr: jlong,
 ) {
-    remove_object(ptr as u64);
+    release_arc(ptr);
 }

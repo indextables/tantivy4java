@@ -6,7 +6,7 @@ use jni::sys::{jlong, jstring};
 use jni::JNIEnv;
 
 use crate::standalone_searcher::{StandaloneSearcher, StandaloneSearchConfig, SplitSearchMetadata};
-use crate::utils::{register_object, remove_object, with_object};
+use crate::utils::{arc_to_jlong, with_arc_safe, release_arc};
 use crate::common::to_java_exception;
 
 use quickwit_proto::search::{SearchRequest, LeafSearchResponse};
@@ -20,7 +20,10 @@ pub extern "system" fn Java_com_tantivy4java_StandaloneSearcher_createNative(
 ) -> jlong {
     let result = StandaloneSearcher::default();
     match result {
-        Ok(searcher) => register_object(searcher) as jlong,
+        Ok(searcher) => {
+            let searcher_arc = Arc::new(searcher);
+            arc_to_jlong(searcher_arc)
+        },
         Err(error) => {
             to_java_exception(&mut env, &error);
             0
@@ -59,7 +62,10 @@ pub extern "system" fn Java_com_tantivy4java_StandaloneSearcher_createWithConfig
 
     let result = StandaloneSearcher::new(config);
     match result {
-        Ok(searcher) => register_object(searcher) as jlong,
+        Ok(searcher) => {
+            let searcher_arc = Arc::new(searcher);
+            arc_to_jlong(searcher_arc)
+        },
         Err(error) => {
             to_java_exception(&mut env, &error);
             0
@@ -98,7 +104,7 @@ pub extern "system" fn Java_com_tantivy4java_StandaloneSearcher_searchSplitNativ
         }
     };
 
-    let result = with_object(searcher_ptr as u64, |searcher: &StandaloneSearcher| {
+    let result = with_arc_safe::<StandaloneSearcher, anyhow::Result<LeafSearchResponse>>(searcher_ptr, |searcher| {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -117,12 +123,12 @@ pub extern "system" fn Java_com_tantivy4java_StandaloneSearcher_searchSplitNativ
             };
 
             // Get search request and doc mapper from pointers
-            let search_request = with_object(search_request_ptr as u64, |req: &SearchRequest| {
-                req.clone()
+            let search_request = with_arc_safe::<SearchRequest, SearchRequest>(search_request_ptr, |req| {
+                (**req).clone()
             }).ok_or_else(|| anyhow::anyhow!("Invalid search request pointer"))?;
 
-            let doc_mapper = with_object(doc_mapper_ptr as u64, |mapper: &Arc<DocMapper>| {
-                mapper.clone()
+            let doc_mapper = with_arc_safe::<Arc<DocMapper>, Arc<DocMapper>>(doc_mapper_ptr, |mapper| {
+                (**mapper).clone()
             }).ok_or_else(|| anyhow::anyhow!("Invalid doc mapper pointer"))?;
 
             // Perform the search
@@ -133,7 +139,10 @@ pub extern "system" fn Java_com_tantivy4java_StandaloneSearcher_searchSplitNativ
     });
 
     match result {
-        Some(Ok(response)) => register_object(response) as jlong,
+        Some(Ok(response)) => {
+            let response_arc = Arc::new(response);
+            arc_to_jlong(response_arc)
+        },
         Some(Err(error)) => {
             to_java_exception(&mut env, &error);
             0
@@ -152,7 +161,7 @@ pub extern "system" fn Java_com_tantivy4java_StandaloneSearcher_getCacheStatsNat
     _class: JClass,
     searcher_ptr: jlong,
 ) -> jstring {
-    let result = with_object(searcher_ptr as u64, |searcher: &StandaloneSearcher| {
+    let result = with_arc_safe::<StandaloneSearcher, String>(searcher_ptr, |searcher| {
         let stats = searcher.cache_stats();
         let stats_json = serde_json::json!({
             "fast_field_bytes": stats.fast_field_bytes,
@@ -186,7 +195,7 @@ pub extern "system" fn Java_com_tantivy4java_StandaloneSearcher_clearCachesNativ
     _class: JClass,
     searcher_ptr: jlong,
 ) {
-    let result = with_object(searcher_ptr as u64, |searcher: &StandaloneSearcher| {
+    let result = with_arc_safe::<StandaloneSearcher, ()>(searcher_ptr, |searcher| {
         searcher.clear_caches();
     });
 
@@ -206,7 +215,6 @@ pub extern "system" fn Java_com_tantivy4java_StandaloneSearcher_closeNative(
         return;
     }
 
-    if !remove_object(searcher_ptr as u64) {
-        to_java_exception(&mut env, &anyhow::anyhow!("Failed to remove searcher object or invalid pointer"));
-    }
+    // Release the Arc from registry
+    release_arc(searcher_ptr);
 }

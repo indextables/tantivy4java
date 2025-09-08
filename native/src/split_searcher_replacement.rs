@@ -7,7 +7,7 @@ use jni::sys::{jlong, jobject, jstring, jint, jboolean};
 use jni::JNIEnv;
 
 use crate::standalone_searcher::{StandaloneSearcher, StandaloneSearchConfig, SplitSearchMetadata, resolve_storage_for_split};
-use crate::utils::{register_object, remove_object, with_object, arc_to_jlong, with_arc_safe, release_arc};
+use crate::utils::{arc_to_jlong, with_arc_safe, release_arc};
 use crate::common::to_java_exception;
 use crate::debug_println;
 
@@ -628,8 +628,9 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_searchWithQueryAst(
                 
                 debug_println!("RUST DEBUG: Converted {} hits to SearchResult format", search_results.len());
                 
-                // Register the search results and get a pointer
-                let search_result_ptr = register_object(search_results) as jlong;
+                // Register the search results using Arc registry
+                let search_results_arc = Arc::new(search_results);
+                let search_result_ptr = arc_to_jlong(search_results_arc);
                 
                 // Create SearchResult Java object
                 let search_result_class = env.find_class("com/tantivy4java/SearchResult")
@@ -799,7 +800,8 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_docNative(
             
             let retrieved_doc = RetrievedDocument::new_with_schema(doc, &schema);
             let wrapper = DocumentWrapper::Retrieved(retrieved_doc);
-            let doc_ptr = crate::utils::register_object(wrapper) as jlong;
+            let wrapper_arc = std::sync::Arc::new(std::sync::Mutex::new(wrapper));
+            let doc_ptr = crate::utils::arc_to_jlong(wrapper_arc);
             
             // debug_println!("RUST DEBUG: Successfully created DocumentWrapper::Retrieved with pointer: {}", doc_ptr);
             

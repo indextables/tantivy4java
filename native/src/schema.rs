@@ -22,9 +22,9 @@ use jni::sys::{jboolean, jlong, jint, jobject};
 use jni::JNIEnv;
 use tantivy::schema::{SchemaBuilder, TextOptions, NumericOptions, DateOptions, IpAddrOptions};
 use tantivy::schema::{IndexRecordOption, TextFieldIndexing};
-use crate::utils::{register_object, remove_object, with_object, with_object_mut, handle_error, with_arc_safe, arc_to_jlong, release_arc};
+use crate::utils::{handle_error, with_arc_safe, arc_to_jlong, release_arc};
 use crate::debug_println;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 #[no_mangle]
 pub extern "system" fn Java_com_tantivy4java_SchemaBuilder_nativeNew(
@@ -32,7 +32,8 @@ pub extern "system" fn Java_com_tantivy4java_SchemaBuilder_nativeNew(
     _class: JClass,
 ) -> jlong {
     let builder = SchemaBuilder::new();
-    register_object(builder) as jlong
+    let builder_arc = Arc::new(Mutex::new(builder));
+    arc_to_jlong(builder_arc)
 }
 
 #[no_mangle]
@@ -81,7 +82,8 @@ pub extern "system" fn Java_com_tantivy4java_SchemaBuilder_nativeAddTextField(
         Err(_) => "position".to_string(),
     };
     
-    let result = with_object_mut::<SchemaBuilder, Result<(), String>>(ptr as u64, |builder| {
+    let result = with_arc_safe::<Mutex<SchemaBuilder>, Result<(), String>>(ptr, |builder_mutex| {
+        let mut builder = builder_mutex.lock().unwrap();
         // Build text options
         let mut text_options = TextOptions::default();
         
@@ -148,7 +150,8 @@ pub extern "system" fn Java_com_tantivy4java_SchemaBuilder_nativeAddIntegerField
         }
     };
     
-    let result = with_object_mut::<SchemaBuilder, Result<(), String>>(ptr as u64, |builder| {
+    let result = with_arc_safe::<Mutex<SchemaBuilder>, Result<(), String>>(ptr, |builder_mutex| {
+        let mut builder = builder_mutex.lock().unwrap();
         let mut options = NumericOptions::default();
         
         if _stored != 0 {
@@ -196,7 +199,8 @@ pub extern "system" fn Java_com_tantivy4java_SchemaBuilder_nativeAddFloatField(
         }
     };
     
-    let result = with_object_mut::<SchemaBuilder, Result<(), String>>(ptr as u64, |builder| {
+    let result = with_arc_safe::<Mutex<SchemaBuilder>, Result<(), String>>(ptr, |builder_mutex| {
+        let mut builder = builder_mutex.lock().unwrap();
         let mut options = NumericOptions::default();
         
         if _stored != 0 {
@@ -244,7 +248,8 @@ pub extern "system" fn Java_com_tantivy4java_SchemaBuilder_nativeAddUnsignedFiel
         }
     };
     
-    let result = with_object_mut::<SchemaBuilder, Result<(), String>>(ptr as u64, |builder| {
+    let result = with_arc_safe::<Mutex<SchemaBuilder>, Result<(), String>>(ptr, |builder_mutex| {
+        let mut builder = builder_mutex.lock().unwrap();
         let mut options = NumericOptions::default();
         
         if _stored != 0 {
@@ -292,7 +297,8 @@ pub extern "system" fn Java_com_tantivy4java_SchemaBuilder_nativeAddBooleanField
         }
     };
     
-    let result = with_object_mut::<SchemaBuilder, Result<(), String>>(ptr as u64, |builder| {
+    let result = with_arc_safe::<Mutex<SchemaBuilder>, Result<(), String>>(ptr, |builder_mutex| {
+        let mut builder = builder_mutex.lock().unwrap();
         let mut options = NumericOptions::default();
         
         if _stored != 0 {
@@ -340,7 +346,8 @@ pub extern "system" fn Java_com_tantivy4java_SchemaBuilder_nativeAddDateField(
         }
     };
     
-    with_object_mut::<SchemaBuilder, ()>(ptr as u64, |builder| {
+    with_arc_safe::<Mutex<SchemaBuilder>, ()>(ptr, |builder_mutex| {
+        let mut builder = builder_mutex.lock().unwrap();
         let mut date_options = DateOptions::default();
         
         if stored != 0 {
@@ -414,7 +421,8 @@ pub extern "system" fn Java_com_tantivy4java_SchemaBuilder_nativeAddIpAddrField(
         }
     };
     
-    with_object_mut::<SchemaBuilder, ()>(ptr as u64, |builder| {
+    with_arc_safe::<Mutex<SchemaBuilder>, ()>(ptr, |builder_mutex| {
+        let mut builder = builder_mutex.lock().unwrap();
         let mut ip_options = IpAddrOptions::default();
         
         if stored != 0 {
@@ -439,19 +447,28 @@ pub extern "system" fn Java_com_tantivy4java_SchemaBuilder_nativeBuild(
     _class: JClass,
     ptr: jlong,
 ) -> jlong {
-    // For build, we need to consume the SchemaBuilder, so we need to take it out of the registry
-    let builder_opt = {
-        let mut registry = crate::utils::OBJECT_REGISTRY.lock().unwrap();
-        registry.remove(&(ptr as u64)).and_then(|boxed| boxed.downcast::<SchemaBuilder>().ok())
+    // For build, we need to consume the SchemaBuilder, so we need to take it out of the Arc registry
+    let builder_arc = {
+        let mut registry = crate::utils::ARC_REGISTRY.lock().unwrap();
+        registry.remove(&ptr).and_then(|boxed| boxed.downcast::<Arc<Mutex<SchemaBuilder>>>().ok().map(|b| *b))
     };
     
-    match builder_opt {
-        Some(builder) => {
-            let schema = builder.build();
-            // Use Arc registry instead of regular object registry for schemas
-            // This is required because Query methods use with_arc_safe to access schemas
-            let schema_arc = Arc::new(schema);
-            arc_to_jlong(schema_arc)
+    match builder_arc {
+        Some(arc) => {
+            // Try to extract the SchemaBuilder from the Arc<Mutex<SchemaBuilder>>
+            match Arc::try_unwrap(arc) {
+                Ok(mutex) => {
+                    let builder = mutex.into_inner().unwrap();
+                    let schema = builder.build();
+                    // Use Arc registry for the built schema
+                    let schema_arc = Arc::new(schema);
+                    arc_to_jlong(schema_arc)
+                },
+                Err(_) => {
+                    handle_error(&mut env, "Cannot build schema: SchemaBuilder is still in use");
+                    0
+                }
+            }
         },
         None => {
             handle_error(&mut env, "Invalid SchemaBuilder pointer");
@@ -466,7 +483,7 @@ pub extern "system" fn Java_com_tantivy4java_SchemaBuilder_nativeClose(
     _class: JClass,
     ptr: jlong,
 ) {
-    remove_object(ptr as u64);
+    release_arc(ptr);
 }
 
 #[no_mangle]
@@ -519,7 +536,8 @@ pub extern "system" fn Java_com_tantivy4java_Schema_nativeGetFieldNames(
     // If Arc-based access failed, try regular object access (for SchemaBuilder schemas)
     let result = match result {
         Some(result) => Some(result),
-        None => with_object::<tantivy::schema::Schema, Result<jobject, String>>(ptr as u64, |schema| {
+        None => with_arc_safe::<tantivy::schema::Schema, Result<jobject, String>>(ptr, |schema_arc| {
+            let schema = schema_arc.as_ref();
             // Create ArrayList to hold field names
             let array_list_class = env.find_class("java/util/ArrayList").map_err(|e| e.to_string())?;
             let array_list = env.new_object(&array_list_class, "()V", &[]).map_err(|e| e.to_string())?;
@@ -579,7 +597,8 @@ pub extern "system" fn Java_com_tantivy4java_Schema_nativeHasField(
     let result = with_arc_safe::<tantivy::schema::Schema, bool>(ptr, |schema_arc| {
         let schema = schema_arc.as_ref();
         schema.get_field(&field_name_str).is_ok()
-    }).or_else(|| with_object::<tantivy::schema::Schema, bool>(ptr as u64, |schema| {
+    }).or_else(|| with_arc_safe::<tantivy::schema::Schema, bool>(ptr, |schema_arc| {
+        let schema = schema_arc.as_ref();
         schema.get_field(&field_name_str).is_ok()
     }));
     
@@ -592,7 +611,6 @@ pub extern "system" fn Java_com_tantivy4java_Schema_nativeGetFieldCount(
     _class: JClass,
     ptr: jlong,
 ) -> jint {
-    use crate::utils::with_object;
     use jni::sys::jint;
     
     if ptr == 0 {
@@ -603,7 +621,8 @@ pub extern "system" fn Java_com_tantivy4java_Schema_nativeGetFieldCount(
     let result = with_arc_safe::<tantivy::schema::Schema, usize>(ptr, |schema_arc| {
         let schema = schema_arc.as_ref();
         schema.fields().count()
-    }).or_else(|| with_object::<tantivy::schema::Schema, usize>(ptr as u64, |schema| {
+    }).or_else(|| with_arc_safe::<tantivy::schema::Schema, usize>(ptr, |schema_arc| {
+        let schema = schema_arc.as_ref();
         schema.fields().count()
     }));
     
@@ -617,14 +636,14 @@ pub extern "system" fn Java_com_tantivy4java_Schema_nativeGetFieldNamesByType(
     ptr: jlong,
     field_type: jint,
 ) -> jobject {
-    use crate::utils::with_object;
     use tantivy::schema::FieldType as TantivyFieldType;
     
     if ptr == 0 {
         return std::ptr::null_mut();
     }
     
-    let result = with_object::<tantivy::schema::Schema, Result<jobject, String>>(ptr as u64, |schema| {
+    let result = with_arc_safe::<tantivy::schema::Schema, Result<jobject, String>>(ptr, |schema_arc| {
+        let schema = schema_arc.as_ref();
         // Create ArrayList to hold field names
         let array_list_class = env.find_class("java/util/ArrayList").map_err(|e| e.to_string())?;
         let array_list = env.new_object(&array_list_class, "()V", &[]).map_err(|e| e.to_string())?;
@@ -681,14 +700,14 @@ pub extern "system" fn Java_com_tantivy4java_Schema_nativeGetFieldNamesByCapabil
     indexed: jint,
     fast: jint,
 ) -> jobject {
-    use crate::utils::with_object;
     use tantivy::schema::FieldType as TantivyFieldType;
     
     if ptr == 0 {
         return std::ptr::null_mut();
     }
     
-    let result = with_object::<tantivy::schema::Schema, Result<jobject, String>>(ptr as u64, |schema| {
+    let result = with_arc_safe::<tantivy::schema::Schema, Result<jobject, String>>(ptr, |schema_arc| {
+        let schema = schema_arc.as_ref();
         // Create ArrayList to hold field names
         let array_list_class = env.find_class("java/util/ArrayList").map_err(|e| e.to_string())?;
         let array_list = env.new_object(&array_list_class, "()V", &[]).map_err(|e| e.to_string())?;
@@ -775,7 +794,6 @@ pub extern "system" fn Java_com_tantivy4java_Schema_nativeGetFieldInfo(
     ptr: jlong,
     field_name: JString,
 ) -> jobject {
-    use crate::utils::with_object;
     use tantivy::schema::FieldType as TantivyFieldType;
     
     if ptr == 0 {
@@ -787,7 +805,8 @@ pub extern "system" fn Java_com_tantivy4java_Schema_nativeGetFieldInfo(
         Err(_) => return std::ptr::null_mut(),
     };
     
-    let result = with_object::<tantivy::schema::Schema, Result<jobject, String>>(ptr as u64, |schema| {
+    let result = with_arc_safe::<tantivy::schema::Schema, Result<jobject, String>>(ptr, |schema_arc| {
+        let schema = schema_arc.as_ref();
         let field = match schema.get_field(&field_name_str) {
             Ok(f) => f,
             Err(_) => return Ok(std::ptr::null_mut()),
@@ -904,14 +923,14 @@ pub extern "system" fn Java_com_tantivy4java_Schema_nativeGetAllFieldInfo(
     _class: JClass,
     ptr: jlong,
 ) -> jobject {
-    use crate::utils::with_object;
     use tantivy::schema::FieldType as TantivyFieldType;
     
     if ptr == 0 {
         return std::ptr::null_mut();
     }
     
-    let result = with_object::<tantivy::schema::Schema, Result<jobject, String>>(ptr as u64, |schema| {
+    let result = with_arc_safe::<tantivy::schema::Schema, Result<jobject, String>>(ptr, |schema_arc| {
+        let schema = schema_arc.as_ref();
         // Create ArrayList to hold FieldInfo objects
         let array_list_class = env.find_class("java/util/ArrayList").map_err(|e| e.to_string())?;
         let array_list = env.new_object(&array_list_class, "()V", &[]).map_err(|e| e.to_string())?;
@@ -1037,14 +1056,14 @@ pub extern "system" fn Java_com_tantivy4java_Schema_nativeGetSchemaSummary(
     _class: JClass,
     ptr: jlong,
 ) -> jobject {
-    use crate::utils::with_object;
     use jni::sys::jobject;
     
     if ptr == 0 {
         return std::ptr::null_mut();
     }
     
-    let result = with_object::<tantivy::schema::Schema, Result<jobject, String>>(ptr as u64, |schema| {
+    let result = with_arc_safe::<tantivy::schema::Schema, Result<jobject, String>>(ptr, |schema_arc| {
+        let schema = schema_arc.as_ref();
         let mut summary = String::new();
         summary.push_str(&format!("Schema with {} fields:\n", schema.fields().count()));
         

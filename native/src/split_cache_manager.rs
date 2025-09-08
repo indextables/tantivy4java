@@ -247,8 +247,9 @@ pub extern "system" fn Java_com_tantivy4java_SplitCacheManager_createNativeCache
         managers.insert(cache_name.clone(), manager);
     }
     
-    // Use safe registry-based ID instead of dangerous pointer casting
-    crate::utils::register_object(cache_name) as jlong
+    // Use Arc registry for safe memory management
+    let cache_name_arc = Arc::new(cache_name);
+    crate::utils::arc_to_jlong(cache_name_arc)
 }
 
 #[no_mangle]
@@ -261,10 +262,11 @@ pub extern "system" fn Java_com_tantivy4java_SplitCacheManager_closeNativeCacheM
         // Safely find and remove from global registry instead of dangerous Arc::from_raw()
         let mut managers = CACHE_MANAGERS.lock().unwrap();
         
-        // Use safe registry to find cache name, then remove from managers
-        if let Some(cache_name) = crate::utils::with_object::<String, _>(ptr as u64, |name| name.clone()) {
-            managers.remove(&cache_name);
-            crate::utils::remove_object(ptr as u64);
+        // Use Arc registry to find cache name, then remove from managers
+        if let Some(cache_name_arc) = crate::utils::jlong_to_arc::<String>(ptr) {
+            managers.remove(&*cache_name_arc);
+            // Release the Arc from registry
+            crate::utils::release_arc(ptr);
         }
     }
 }
@@ -280,8 +282,8 @@ pub extern "system" fn Java_com_tantivy4java_SplitCacheManager_getGlobalCacheSta
     }
     
     // Get cache name FIRST to avoid double-locking
-    let cache_name = match crate::utils::with_object::<String, _>(ptr as u64, |name| name.clone()) {
-        Some(name) => name,
+    let cache_name = match crate::utils::jlong_to_arc::<String>(ptr) {
+        Some(name_arc) => (*name_arc).clone(),
         None => return std::ptr::null_mut(),
     };
     
@@ -328,8 +330,8 @@ pub extern "system" fn Java_com_tantivy4java_SplitCacheManager_forceEvictionNati
     }
     
     // Get cache name FIRST to avoid double-locking
-    let cache_name = match crate::utils::with_object::<String, _>(ptr as u64, |name| name.clone()) {
-        Some(name) => name,
+    let cache_name = match crate::utils::jlong_to_arc::<String>(ptr) {
+        Some(name_arc) => (*name_arc).clone(),
         None => return,
     };
     
@@ -435,8 +437,8 @@ pub extern "system" fn Java_com_tantivy4java_SplitCacheManager_preloadComponents
     }
     
     // Get cache name FIRST to avoid double-locking
-    let cache_name = match crate::utils::with_object::<String, _>(ptr as u64, |name| name.clone()) {
-        Some(name) => name,
+    let cache_name = match crate::utils::jlong_to_arc::<String>(ptr) {
+        Some(name_arc) => (*name_arc).clone(),
         None => return,
     };
     
@@ -463,8 +465,8 @@ pub extern "system" fn Java_com_tantivy4java_SplitCacheManager_evictComponentsNa
     }
     
     // Get cache name FIRST to avoid double-locking
-    let cache_name = match crate::utils::with_object::<String, _>(ptr as u64, |name| name.clone()) {
-        Some(name) => name,
+    let cache_name = match crate::utils::jlong_to_arc::<String>(ptr) {
+        Some(name_arc) => (*name_arc).clone(),
         None => return,
     };
     
@@ -492,8 +494,8 @@ pub extern "system" fn Java_com_tantivy4java_SplitCacheManager_searchAcrossAllSp
     }
     
     // Get cache name FIRST to avoid double-locking
-    let cache_name = match crate::utils::with_object::<String, _>(ptr as u64, |name| name.clone()) {
-        Some(name) => name,
+    let cache_name = match crate::utils::jlong_to_arc::<String>(ptr) {
+        Some(name_arc) => (*name_arc).clone(),
         None => {
             let _ = env.throw_new("java/lang/RuntimeException", "SplitCacheManager not found in registry");
             return std::ptr::null_mut();
@@ -531,8 +533,8 @@ pub extern "system" fn Java_com_tantivy4java_SplitCacheManager_searchAcrossSplit
     }
     
     // Get cache name FIRST to avoid double-locking
-    let cache_name = match crate::utils::with_object::<String, _>(ptr as u64, |name| name.clone()) {
-        Some(name) => name,
+    let cache_name = match crate::utils::jlong_to_arc::<String>(ptr) {
+        Some(name_arc) => (*name_arc).clone(),
         None => {
             let _ = env.throw_new("java/lang/RuntimeException", "SplitCacheManager not found in registry");
             return std::ptr::null_mut();

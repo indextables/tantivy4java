@@ -96,7 +96,7 @@ public class JsonAndQueryParsingTest {
                                     
                                     try (Document doc = searcher.doc(hits.get(0).getDocAddress())) {
                                         List<Object> titles = doc.get("title");
-                                        long id = (Long) doc.get("id").get(0);
+                                        long id = ((Number) doc.get("id").get(0)).longValue();
                                         double rating = (Double) doc.get("rating").get(0);
                                         
                                         System.out.println("    📄 ID: " + id + ", Rating: " + rating);
@@ -121,7 +121,7 @@ public class JsonAndQueryParsingTest {
                                     
                                     for (SearchResult.Hit hit : hits) {
                                         try (Document doc = searcher.doc(hit.getDocAddress())) {
-                                            long id = (Long) doc.get("id").get(0);
+                                            long id = ((Number) doc.get("id").get(0)).longValue();
                                             double rating = (Double) doc.get("rating").get(0);
                                             String title = doc.get("title").get(0).toString();
                                             

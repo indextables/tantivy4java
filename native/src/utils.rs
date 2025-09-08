@@ -25,45 +25,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use once_cell::sync::Lazy;
 use crate::debug_println;
 
-/// Global registry for native objects
-pub static OBJECT_REGISTRY: Lazy<Mutex<HashMap<u64, Box<dyn std::any::Any + Send + Sync>>>> = 
-    Lazy::new(|| Mutex::new(HashMap::new()));
-
-/// Thread-safe atomic counter for generating unique IDs
-static NEXT_ID: AtomicU64 = AtomicU64::new(1);
-
-/// Register a native object and return its handle
-pub fn register_object<T: 'static + Send + Sync>(obj: T) -> u64 {
-    let mut registry = OBJECT_REGISTRY.lock().unwrap();
-
-    let id = NEXT_ID.fetch_add(1, Ordering::SeqCst);
-    registry.insert(id, Box::new(obj));
-    id
-}
-
-/// Execute a function with a reference to a registered object
-pub fn with_object<T: 'static, R>(id: u64, f: impl FnOnce(&T) -> R) -> Option<R> {
-    let registry = OBJECT_REGISTRY.lock().unwrap();
-    let boxed = registry.get(&id)?;
-    let obj = boxed.downcast_ref::<T>()?;
-    Some(f(obj))
-}
-
-/// Execute a function with a mutable reference to a registered object
-pub fn with_object_mut<T: 'static, R>(id: u64, f: impl FnOnce(&mut T) -> R) -> Option<R> {
-    let mut registry = OBJECT_REGISTRY.lock().unwrap();
-    let boxed = registry.get_mut(&id)?;
-    // Safe downcast using Any trait - this is the correct way to do dynamic casting
-    let obj = boxed.downcast_mut::<T>()?;
-    Some(f(obj))
-}
-
-/// Remove an object from the registry
-pub fn remove_object(id: u64) -> bool {
-    let mut registry = OBJECT_REGISTRY.lock().unwrap();
-    registry.remove(&id).is_some()
-}
-
 /// Handle errors by throwing Java exceptions
 pub fn handle_error(env: &mut JNIEnv, error: &str) {
     let _ = env.throw_new("java/lang/RuntimeException", error);

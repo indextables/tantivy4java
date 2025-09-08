@@ -24,8 +24,8 @@ use tantivy::{Index as TantivyIndex, IndexSettings, IndexWriter as TantivyIndexW
 use tantivy::schema::Schema;
 use tantivy::query::{Query as TantivyQuery, QueryParser};
 use tantivy::directory::MmapDirectory;
-use crate::utils::{register_object, remove_object, with_object, handle_error, with_arc_safe, arc_to_jlong};
-use std::sync::Arc;
+use crate::utils::{handle_error, with_arc_safe, arc_to_jlong, release_arc};
+use std::sync::{Arc, Mutex};
 
 #[no_mangle]
 pub extern "system" fn Java_com_tantivy4java_Index_nativeNew(
@@ -59,7 +59,8 @@ pub extern "system" fn Java_com_tantivy4java_Index_nativeNew(
     
     match result {
         Some(Ok(index)) => {
-            register_object(index) as jlong
+            let index_arc = Arc::new(Mutex::new(index));
+            arc_to_jlong(index_arc)
         },
         Some(Err(err)) => {
             handle_error(&mut env, &err);
@@ -99,7 +100,8 @@ pub extern "system" fn Java_com_tantivy4java_Index_nativeOpen(
     
     match result {
         Ok(index) => {
-            register_object(index) as jlong
+            let index_arc = Arc::new(Mutex::new(index));
+            arc_to_jlong(index_arc)
         },
         Err(err) => {
             handle_error(&mut env, &err);
@@ -153,7 +155,8 @@ pub extern "system" fn Java_com_tantivy4java_Index_nativeWriter(
     heap_size: jint,
     num_threads: jint,
 ) -> jlong {
-    let result = with_object::<TantivyIndex, Result<TantivyIndexWriter, String>>(ptr as u64, |index| {
+    let result = with_arc_safe::<Mutex<TantivyIndex>, Result<TantivyIndexWriter, String>>(ptr, |index_mutex| {
+        let index = index_mutex.lock().unwrap();
         let heap_size_bytes = if heap_size > 0 { heap_size as usize } else { 50_000_000 }; // 50MB default
         let num_threads_val = if num_threads > 0 { num_threads as usize } else { 1 };
         
@@ -163,7 +166,8 @@ pub extern "system" fn Java_com_tantivy4java_Index_nativeWriter(
     
     match result {
         Some(Ok(writer)) => {
-            register_object(writer) as jlong
+            let writer_arc = Arc::new(Mutex::new(writer));
+            arc_to_jlong(writer_arc)
         },
         Some(Err(err)) => {
             handle_error(&mut env, &err);
@@ -193,14 +197,16 @@ pub extern "system" fn Java_com_tantivy4java_Index_nativeSearcher(
     _class: JClass,
     ptr: jlong,
 ) -> jlong {
-    let result = with_object::<TantivyIndex, Result<tantivy::Searcher, String>>(ptr as u64, |index| {
+    let result = with_arc_safe::<Mutex<TantivyIndex>, Result<tantivy::Searcher, String>>(ptr, |index_mutex| {
+        let index = index_mutex.lock().unwrap();
         let reader = index.reader().map_err(|e| e.to_string())?;
         Ok(reader.searcher())
     });
     
     match result {
         Some(Ok(searcher)) => {
-            register_object(searcher) as jlong
+            let searcher_arc = Arc::new(Mutex::new(searcher));
+            arc_to_jlong(searcher_arc)
         },
         Some(Err(err)) => {
             handle_error(&mut env, &err);
@@ -219,7 +225,8 @@ pub extern "system" fn Java_com_tantivy4java_Index_nativeGetSchema(
     _class: JClass,
     ptr: jlong,
 ) -> jlong {
-    let result = with_object::<TantivyIndex, Result<jlong, String>>(ptr as u64, |index| {
+    let result = with_arc_safe::<Mutex<TantivyIndex>, Result<jlong, String>>(ptr, |index_mutex| {
+        let index = index_mutex.lock().unwrap();
         // Get the schema from the index and return it as an Arc
         let schema = index.schema();
         let schema_arc = Arc::new(schema);
@@ -241,7 +248,8 @@ pub extern "system" fn Java_com_tantivy4java_Index_nativeReload(
     _class: JClass,
     ptr: jlong,
 ) {
-    let result = with_object::<TantivyIndex, Result<(), String>>(ptr as u64, |_index| {
+    let result = with_arc_safe::<Mutex<TantivyIndex>, Result<(), String>>(ptr, |index_mutex| {
+        let _index = index_mutex.lock().unwrap();
         // In Tantivy, we don't need to explicitly reload the index
         // The reader will automatically pick up changes when a new searcher is created
         // But we can call this to ensure any pending changes are committed
@@ -290,7 +298,8 @@ pub extern "system" fn Java_com_tantivy4java_Index_nativeParseQuery(
         Vec::new()
     };
     
-    let result = with_object::<TantivyIndex, Result<Box<dyn TantivyQuery>, String>>(ptr as u64, |index| {
+    let result = with_arc_safe::<Mutex<TantivyIndex>, Result<Box<dyn TantivyQuery>, String>>(ptr, |index_mutex| {
+        let index = index_mutex.lock().unwrap();
         let schema = index.schema();
         
         // Get default fields
@@ -316,7 +325,7 @@ pub extern "system" fn Java_com_tantivy4java_Index_nativeParseQuery(
         }
         
         // Create query parser
-        let query_parser = QueryParser::for_index(index, default_fields.clone());
+        let query_parser = QueryParser::for_index(&*index, default_fields.clone());
         
         // Parse the query using our fixed parser with schema and field info
         let parsed_query = parse_query_with_phrase_fix(&query_parser, &query_str, &schema, &default_fields)
@@ -327,7 +336,8 @@ pub extern "system" fn Java_com_tantivy4java_Index_nativeParseQuery(
     
     match result {
         Some(Ok(query)) => {
-            register_object(query) as jlong
+            let query_arc = Arc::new(query);
+            arc_to_jlong(query_arc)
         },
         Some(Err(err)) => {
             handle_error(&mut env, &err);
@@ -523,5 +533,5 @@ pub extern "system" fn Java_com_tantivy4java_Index_nativeClose(
     _class: JClass,
     ptr: jlong,
 ) {
-    remove_object(ptr as u64);
+    release_arc(ptr);
 }
