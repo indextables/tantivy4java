@@ -170,6 +170,20 @@ public class Schema implements AutoCloseable {
         return nativeGetSchemaSummary(nativePtr);
     }
     
+    /**
+     * Creates a copy of this Schema with its own native pointer.
+     * The cloned Schema has identical field definitions but can be closed 
+     * independently without affecting the original Schema.
+     * 
+     * @return A new Schema instance with identical field definitions
+     * @throws IllegalStateException if this Schema has been closed
+     */
+    public Schema copy() {
+        if (closed) {
+            throw new IllegalStateException("Cannot copy a closed Schema");
+        }
+        return new Schema(nativeClone(nativePtr));
+    }
 
     @Override
     public void close() {
@@ -190,4 +204,5 @@ public class Schema implements AutoCloseable {
     private static native List<String> nativeGetFieldNamesByType(long nativePtr, int fieldType);
     private static native List<String> nativeGetFieldNamesByCapabilities(long nativePtr, int stored, int indexed, int fast);
     private static native String nativeGetSchemaSummary(long nativePtr);
+    private static native long nativeClone(long nativePtr);
 }

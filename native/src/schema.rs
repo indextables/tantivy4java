@@ -1084,3 +1084,52 @@ pub extern "system" fn Java_com_tantivy4java_Schema_nativeGetSchemaSummary(
         }
     }
 }
+
+#[no_mangle]
+pub extern "system" fn Java_com_tantivy4java_Schema_nativeClone(
+    mut env: JNIEnv,
+    _class: JClass,
+    ptr: jlong,
+) -> jlong {
+    if ptr == 0 {
+        handle_error(&mut env, "Cannot clone: Invalid Schema pointer");
+        return 0;
+    }
+    
+    debug_println!("RUST DEBUG: nativeClone called with pointer: {}", ptr);
+    
+    let result = with_arc_safe::<tantivy::schema::Schema, Result<jlong, String>>(ptr, |schema_arc| {
+        let schema = schema_arc.as_ref();
+        
+        // Clone the schema - Tantivy's Schema implements Clone
+        let cloned_schema = schema.clone();
+        
+        debug_println!("RUST DEBUG: Schema cloned successfully, original fields: {}, cloned fields: {}", 
+                     schema.fields().count(), cloned_schema.fields().count());
+        
+        // Create a new Arc for the cloned schema and register it
+        let cloned_arc = Arc::new(cloned_schema);
+        let new_ptr = arc_to_jlong(cloned_arc);
+        
+        debug_println!("RUST DEBUG: Cloned schema registered with new pointer: {}", new_ptr);
+        
+        Ok(new_ptr)
+    });
+    
+    match result {
+        Some(Ok(cloned_ptr)) => {
+            debug_println!("RUST DEBUG: nativeClone completed successfully, returning pointer: {}", cloned_ptr);
+            cloned_ptr
+        },
+        Some(Err(e)) => {
+            debug_println!("RUST DEBUG: nativeClone failed with error: {}", e);
+            handle_error(&mut env, &format!("Failed to clone schema: {}", e));
+            0
+        },
+        None => {
+            debug_println!("RUST DEBUG: nativeClone failed - invalid pointer or Arc access failed");
+            handle_error(&mut env, "Cannot clone: Invalid Schema pointer or schema already closed");
+            0
+        }
+    }
+}
