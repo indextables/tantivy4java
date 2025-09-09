@@ -219,7 +219,7 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_createNativeWithShare
             s3_config.endpoint = Some(endpoint.clone());
         }
         
-        if let Some(force_path_style) = aws_config.get("force_path_style") {
+        if let Some(force_path_style) = aws_config.get("path_style_access") {
             s3_config.force_path_style_access = force_path_style == "true";
         }
         
@@ -435,7 +435,7 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_searchWithQueryAst(
                     session_token: aws_config.get("session_token").cloned(),
                     region: aws_config.get("region").cloned(),
                     endpoint: aws_config.get("endpoint").cloned(),
-                    force_path_style_access: false,
+                    force_path_style_access: aws_config.get("path_style_access").map_or(false, |v| v == "true"),
                     disable_multi_object_delete: false,
                     disable_multipart_upload: false,
                 };
@@ -884,7 +884,7 @@ fn retrieve_document_from_split_optimized(
                     session_token: aws_config.get("session_token").cloned(),
                     region: aws_config.get("region").cloned(),
                     endpoint: aws_config.get("endpoint").cloned(),
-                    force_path_style_access: false,
+                    force_path_style_access: aws_config.get("path_style_access").map_or(false, |v| v == "true"),
                     disable_multi_object_delete: false,
                     disable_multipart_upload: false,
                 };
@@ -1010,7 +1010,7 @@ fn retrieve_document_from_split(
                 session_token: aws_config.get("session_token").cloned(),
                 region: aws_config.get("region").cloned(),
                 endpoint: aws_config.get("endpoint").cloned(),
-                force_path_style_access: false,
+                force_path_style_access: aws_config.get("path_style_access").map_or(false, |v| v == "true"),
                 disable_multi_object_delete: false,
                 disable_multipart_upload: false,
             };
@@ -1125,7 +1125,7 @@ fn retrieve_documents_batch_from_split_optimized(
                     session_token: aws_config.get("session_token").cloned(),
                     region: aws_config.get("region").cloned(),
                     endpoint: aws_config.get("endpoint").cloned(),
-                    force_path_style_access: false,
+                    force_path_style_access: aws_config.get("path_style_access").map_or(false, |v| v == "true"),
                     disable_multi_object_delete: false,
                     disable_multipart_upload: false,
                 };
@@ -1348,7 +1348,7 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_getSchemaFromNative(
                     session_token: aws_config.get("session_token").cloned(),
                     region: aws_config.get("region").cloned(),
                     endpoint: aws_config.get("endpoint").cloned(),
-                    force_path_style_access: false,
+                    force_path_style_access: aws_config.get("path_style_access").map_or(false, |v| v == "true"),
                     disable_multi_object_delete: false,
                     disable_multipart_upload: false,
                 };
@@ -1524,7 +1524,7 @@ fn get_schema_from_split(searcher_ptr: jlong) -> anyhow::Result<tantivy::schema:
                     session_token: aws_config.get("session_token").cloned(),
                     region: aws_config.get("region").cloned(),
                     endpoint: aws_config.get("endpoint").cloned(),
-                    force_path_style_access: false,
+                    force_path_style_access: aws_config.get("path_style_access").map_or(false, |v| v == "true"),
                     disable_multi_object_delete: false,
                     disable_multipart_upload: false,
                 };
