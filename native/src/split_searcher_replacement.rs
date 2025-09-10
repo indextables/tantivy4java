@@ -10,6 +10,7 @@ use crate::standalone_searcher::{StandaloneSearcher, StandaloneSearchConfig, Spl
 use crate::utils::{arc_to_jlong, with_arc_safe, release_arc};
 use crate::common::to_java_exception;
 use crate::debug_println;
+use crate::split_query::{store_split_schema};
 use quickwit_common::thread_pool::ThreadPool;
 
 use serde_json::{Value, Map};
@@ -1365,6 +1366,12 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_getSchemaFromNative(
             match create_schema_from_doc_mapping(doc_mapping_str) {
                 Ok(schema) => {
                     debug_println!("RUST DEBUG: ✅ Successfully created schema from doc mapping without I/O!");
+                    
+                    // Store schema clone in cache for parseQuery field extraction  
+                    debug_println!("RUST DEBUG: About to store schema for split URI: {}", split_uri);
+                    store_split_schema(split_uri, schema.clone());
+                    debug_println!("RUST DEBUG: Schema caching completed");
+                    
                     // Register the schema using Arc for memory safety
                     let schema_arc = std::sync::Arc::new(schema);
                     let schema_ptr = arc_to_jlong(schema_arc);
@@ -1472,6 +1479,13 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_getSchemaFromNative(
         
         match schema {
             Ok(s) => {
+                // Store schema clone in cache for parseQuery field extraction  
+                debug_println!("RUST DEBUG: About to store schema for split URI (I/O fallback): {}", split_uri);
+                debug_println!("RUST DEBUG: BEFORE store_split_schema call");
+                store_split_schema(split_uri, s.clone());
+                debug_println!("RUST DEBUG: AFTER store_split_schema call");
+                debug_println!("RUST DEBUG: Schema caching completed (I/O fallback)");
+                
                 // Register the actual schema from the split using Arc for memory safety
                 let schema_arc = std::sync::Arc::new(s);
                 let schema_ptr = arc_to_jlong(schema_arc);
