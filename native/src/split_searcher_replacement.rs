@@ -92,6 +92,7 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_createNativeWithShare
     let mut aws_config: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     let mut split_footer_start: u64 = 0;
     let mut split_footer_end: u64 = 0;
+    let mut doc_mapping_json: Option<String> = None;
     
     if !split_config_map.is_null() {
         let split_config_jobject = unsafe { JObject::from_raw(split_config_map) };
@@ -179,9 +180,22 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_createNativeWithShare
                 }
             }
         }
+        
+        // Extract doc mapping JSON if available
+        if let Ok(doc_mapping_obj) = env.call_method(&split_config_jobject, "get", "(Ljava/lang/Object;)Ljava/lang/Object;", &[(&env.new_string("doc_mapping").unwrap()).into()]) {
+            let doc_mapping_jobject = doc_mapping_obj.l().unwrap();
+            if !doc_mapping_jobject.is_null() {
+                if let Ok(doc_mapping_str) = env.get_string((&doc_mapping_jobject).into()) {
+                    doc_mapping_json = Some(doc_mapping_str.into());
+                    debug_println!("RUST DEBUG: Extracted doc mapping JSON from Java config ({} chars)", doc_mapping_json.as_ref().unwrap().len());
+                }
+            }
+        }
     }
     
-    debug_println!("RUST DEBUG: Config extracted - AWS keys: {}, footer offsets: {}-{}", aws_config.len(), split_footer_start, split_footer_end);
+    debug_println!("RUST DEBUG: Config extracted - AWS keys: {}, footer offsets: {}-{}, doc_mapping: {}", 
+                aws_config.len(), split_footer_start, split_footer_end, 
+                doc_mapping_json.as_ref().map(|s| format!("{}chars", s.len())).unwrap_or_else(|| "None".to_string()));
 
     // Create Tokio runtime for async operations
     let runtime = match tokio::runtime::Builder::new_current_thread()
@@ -232,8 +246,8 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_createNativeWithShare
     };
     match result {
         Ok(searcher) => {
-            // Store searcher, runtime, split URI, AWS config, and footer offsets together using Arc for memory safety
-            let searcher_context = std::sync::Arc::new((searcher, runtime, split_uri.clone(), aws_config, split_footer_start, split_footer_end));
+            // Store searcher, runtime, split URI, AWS config, footer offsets, and doc mapping JSON together using Arc for memory safety
+            let searcher_context = std::sync::Arc::new((searcher, runtime, split_uri.clone(), aws_config, split_footer_start, split_footer_end, doc_mapping_json));
             let pointer = arc_to_jlong(searcher_context);
             debug_println!("RUST DEBUG: SUCCESS: Stored searcher context for split '{}' with Arc pointer: {}, footer: {}-{}", 
                      split_uri, pointer, split_footer_start, split_footer_end);
@@ -292,7 +306,7 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_validateSplitNative(
         return 0; // false
     }
     
-    let is_valid = with_arc_safe(searcher_ptr, |searcher_context: &Arc<(StandaloneSearcher, tokio::runtime::Runtime, String, std::collections::HashMap<String, String>, u64, u64)>| {
+    let is_valid = with_arc_safe(searcher_ptr, |searcher_context: &Arc<(StandaloneSearcher, tokio::runtime::Runtime, String, std::collections::HashMap<String, String>, u64, u64, Option<String>)>| {
         // Searcher exists and is valid
         true
     }).unwrap_or(false);
@@ -307,8 +321,8 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_getCacheStatsNative(
     _class: JClass,
     searcher_ptr: jlong,
 ) -> jobject {
-    let result = with_arc_safe(searcher_ptr, |searcher_context: &Arc<(StandaloneSearcher, tokio::runtime::Runtime, String, std::collections::HashMap<String, String>, u64, u64)>| {
-        let (searcher, _runtime, _split_uri, _aws_config, _footer_start, _footer_end) = searcher_context.as_ref();
+    let result = with_arc_safe(searcher_ptr, |searcher_context: &Arc<(StandaloneSearcher, tokio::runtime::Runtime, String, std::collections::HashMap<String, String>, u64, u64, Option<String>)>| {
+        let (searcher, _runtime, _split_uri, _aws_config, _footer_start, _footer_end, _doc_mapping) = searcher_context.as_ref();
         let stats = searcher.cache_stats();
         
         // Create a CacheStats Java object
@@ -394,8 +408,8 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_searchWithQueryAst(
     }
     
     // Use the searcher context to perform search with Quickwit's leaf search approach
-    let result = with_arc_safe(searcher_ptr, |searcher_context: &Arc<(StandaloneSearcher, tokio::runtime::Runtime, String, std::collections::HashMap<String, String>, u64, u64)>| {
-        let (searcher, runtime, split_uri, aws_config, footer_start, footer_end) = searcher_context.as_ref();
+    let result = with_arc_safe(searcher_ptr, |searcher_context: &Arc<(StandaloneSearcher, tokio::runtime::Runtime, String, std::collections::HashMap<String, String>, u64, u64, Option<String>)>| {
+        let (searcher, runtime, split_uri, aws_config, footer_start, footer_end, doc_mapping_json) = searcher_context.as_ref();
         
         // Enter the runtime context for async operations
         let _guard = runtime.enter();
@@ -821,8 +835,8 @@ fn retrieve_document_from_split_optimized(
     use crate::utils::with_arc_safe;
     
     // Get split URI from the searcher context
-    let split_uri = with_arc_safe(searcher_ptr, |searcher_context: &Arc<(StandaloneSearcher, tokio::runtime::Runtime, String, std::collections::HashMap<String, String>, u64, u64)>| {
-        let (_, _, split_uri, _, _, _) = searcher_context.as_ref();
+    let split_uri = with_arc_safe(searcher_ptr, |searcher_context: &Arc<(StandaloneSearcher, tokio::runtime::Runtime, String, std::collections::HashMap<String, String>, u64, u64, Option<String>)>| {
+        let (_, _, split_uri, _, _, _, _) = searcher_context.as_ref();
         split_uri.clone()
     }).ok_or_else(|| anyhow::anyhow!("Invalid searcher context"))?;
     
@@ -842,8 +856,8 @@ fn retrieve_document_from_split_optimized(
     }
     
     // Cache miss - create searcher using the same optimizations as our batch method
-    let result = with_arc_safe(searcher_ptr, |searcher_context: &Arc<(StandaloneSearcher, tokio::runtime::Runtime, String, std::collections::HashMap<String, String>, u64, u64)>| {
-        let (standalone_searcher, runtime, split_uri, aws_config, footer_start, footer_end) = searcher_context.as_ref();
+    let result = with_arc_safe(searcher_ptr, |searcher_context: &Arc<(StandaloneSearcher, tokio::runtime::Runtime, String, std::collections::HashMap<String, String>, u64, u64, Option<String>)>| {
+        let (standalone_searcher, runtime, split_uri, aws_config, footer_start, footer_end, _doc_mapping) = searcher_context.as_ref();
         
         let _guard = runtime.enter();
         
@@ -983,8 +997,8 @@ fn retrieve_document_from_split(
     use std::sync::Arc;
     
     // Use the searcher context to retrieve the document from the split
-    let result = with_arc_safe(searcher_ptr, |searcher_context: &Arc<(StandaloneSearcher, tokio::runtime::Runtime, String, std::collections::HashMap<String, String>, u64, u64)>| {
-        let (searcher, runtime, split_uri, aws_config, footer_start, footer_end) = searcher_context.as_ref();
+    let result = with_arc_safe(searcher_ptr, |searcher_context: &Arc<(StandaloneSearcher, tokio::runtime::Runtime, String, std::collections::HashMap<String, String>, u64, u64, Option<String>)>| {
+        let (searcher, runtime, split_uri, aws_config, footer_start, footer_end, _doc_mapping) = searcher_context.as_ref();
         
         // Enter the runtime context for async operations
         let _guard = runtime.enter();
@@ -1098,8 +1112,8 @@ fn retrieve_documents_batch_from_split_optimized(
     // Sort by DocAddress for cache locality (following Quickwit pattern)
     doc_addresses.sort();
     
-    let result = with_arc_safe(searcher_ptr, |searcher_context: &Arc<(StandaloneSearcher, tokio::runtime::Runtime, String, std::collections::HashMap<String, String>, u64, u64)>| {
-        let (searcher, runtime, split_uri, aws_config, footer_start, footer_end) = searcher_context.as_ref();
+    let result = with_arc_safe(searcher_ptr, |searcher_context: &Arc<(StandaloneSearcher, tokio::runtime::Runtime, String, std::collections::HashMap<String, String>, u64, u64, Option<String>)>| {
+        let (searcher, runtime, split_uri, aws_config, footer_start, footer_end, _doc_mapping) = searcher_context.as_ref();
         
         let _guard = runtime.enter();
         
@@ -1297,6 +1311,27 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_docNative(
     }
 }
 
+/// Create Tantivy schema from Quickwit doc mapping JSON
+/// This is a major optimization that avoids expensive S3 I/O operations
+fn create_schema_from_doc_mapping(doc_mapping_json: &str) -> anyhow::Result<tantivy::schema::Schema> {
+    debug_println!("RUST DEBUG: Creating schema from doc mapping JSON");
+    
+    // Parse the doc mapping JSON
+    use quickwit_doc_mapper::DocMapperBuilder;
+    let doc_mapper_builder: DocMapperBuilder = serde_json::from_str(doc_mapping_json)
+        .map_err(|e| anyhow::anyhow!("Failed to parse doc mapping JSON: {}", e))?;
+    
+    // Build the DocMapper
+    let doc_mapper = doc_mapper_builder.try_build()
+        .map_err(|e| anyhow::anyhow!("Failed to build DocMapper: {}", e))?;
+    
+    // Extract the Tantivy schema from the DocMapper
+    let schema = doc_mapper.schema();
+    
+    debug_println!("RUST DEBUG: Successfully created Tantivy schema from doc mapping with {} fields", schema.num_fields());
+    Ok(schema.clone())
+}
+
 /// Replacement for Java_com_tantivy4java_SplitSearcher_getSchemaFromNative
 #[no_mangle]
 pub extern "system" fn Java_com_tantivy4java_SplitSearcher_getSchemaFromNative(
@@ -1318,11 +1353,34 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_getSchemaFromNative(
     }
 
     // Extract the actual schema from the split file using Quickwit's functionality
-    let result = with_arc_safe(searcher_ptr, |searcher_context: &Arc<(StandaloneSearcher, tokio::runtime::Runtime, String, std::collections::HashMap<String, String>, u64, u64)>| {
-        let (_searcher, runtime, split_uri, aws_config, _footer_start, _footer_end) = searcher_context.as_ref();
+    let result = with_arc_safe(searcher_ptr, |searcher_context: &Arc<(StandaloneSearcher, tokio::runtime::Runtime, String, std::collections::HashMap<String, String>, u64, u64, Option<String>)>| {
+        let (_searcher, runtime, split_uri, aws_config, _footer_start, _footer_end, doc_mapping_json) = searcher_context.as_ref();
         debug_println!("RUST DEBUG: getSchemaFromNative called with split URI: {}", split_uri);
         
-        // Enter the runtime context for async operations
+        // 🚀 OPTIMIZATION: Use doc mapping JSON if available instead of expensive I/O
+        if let Some(doc_mapping_str) = doc_mapping_json {
+            debug_println!("RUST DEBUG: 🚀 OPTIMIZATION ACTIVE: Using cached doc mapping JSON instead of I/O ({} chars)", doc_mapping_str.len());
+            
+            // Parse the doc mapping JSON and create schema from it
+            match create_schema_from_doc_mapping(doc_mapping_str) {
+                Ok(schema) => {
+                    debug_println!("RUST DEBUG: ✅ Successfully created schema from doc mapping without I/O!");
+                    // Register the schema using Arc for memory safety
+                    let schema_arc = std::sync::Arc::new(schema);
+                    let schema_ptr = arc_to_jlong(schema_arc);
+                    debug_println!("RUST DEBUG: 🚀 OPTIMIZATION SUCCESS - Schema created from doc mapping with pointer: {}", schema_ptr);
+                    return schema_ptr;
+                },
+                Err(e) => {
+                    debug_println!("RUST DEBUG: ⚠️ Failed to create schema from doc mapping: {}, falling back to I/O", e);
+                    // Fall through to expensive I/O method
+                }
+            }
+        } else {
+            debug_println!("RUST DEBUG: ⚠️ No doc mapping available, falling back to expensive I/O method");
+        }
+        
+        // Enter the runtime context for async operations (EXPENSIVE FALLBACK)
         let _guard = runtime.enter();
         
         // Parse the split URI and extract schema using Quickwit's storage abstractions
@@ -1497,8 +1555,8 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_getComponentCacheStat
 
 /// Helper function to extract schema from split file - extracted from getSchemaFromNative
 fn get_schema_from_split(searcher_ptr: jlong) -> anyhow::Result<tantivy::schema::Schema> {
-    with_arc_safe(searcher_ptr, |searcher_context: &Arc<(StandaloneSearcher, tokio::runtime::Runtime, String, std::collections::HashMap<String, String>, u64, u64)>| {
-        let (_searcher, runtime, split_uri, aws_config, _footer_start, _footer_end) = searcher_context.as_ref();
+    with_arc_safe(searcher_ptr, |searcher_context: &Arc<(StandaloneSearcher, tokio::runtime::Runtime, String, std::collections::HashMap<String, String>, u64, u64, Option<String>)>| {
+        let (_searcher, runtime, split_uri, aws_config, _footer_start, _footer_end, _doc_mapping_json) = searcher_context.as_ref();
         
         // Enter the runtime context for async operations
         let _guard = runtime.enter();

@@ -28,7 +28,7 @@ use quickwit_storage::{PutPayload, BundleStorage, RamStorage, Storage, StorageRe
 use quickwit_directories::write_hotcache;
 use quickwit_config::S3StorageConfig;
 use quickwit_common::uri::{Uri, Protocol};
-use quickwit_doc_mapper::default_doc_mapper_for_test;
+// Removed: use quickwit_doc_mapper::default_doc_mapper_for_test; - now creating real doc mapping from schema
 use tantivy::directory::OwnedBytes;
 use std::str::FromStr;
 
@@ -41,19 +41,132 @@ fn extract_doc_mapping_from_index(tantivy_index: &tantivy::Index) -> Result<Stri
     
     debug_log!("Extracting doc mapping from Tantivy schema with {} fields", schema.fields().count());
     
-    // For now, we'll create a default DocMapper and serialize it
-    // This is a placeholder - in a real implementation, we'd need to reconstruct
-    // the DocMapper from the Tantivy schema, but that's complex and may not be 
-    // fully possible since some original mapping information is lost during schema creation
-    let doc_mapper = default_doc_mapper_for_test();
+    // Create field mappings from the actual Tantivy schema
+    let mut field_mappings = std::collections::HashMap::new();
     
-    // Serialize the DocMapper to JSON
-    let doc_mapping_json = serde_json::to_string(&doc_mapper)
-        .map_err(|e| anyhow!("Failed to serialize DocMapper to JSON: {}", e))?;
+    for (field, field_entry) in schema.fields() {
+        let field_name = field_entry.name();
+        debug_log!("  Processing field: {} with type: {:?}", field_name, field_entry.field_type());
+        
+        // Map Tantivy field types to Quickwit field mapping types
+        let field_mapping = match field_entry.field_type() {
+            tantivy::schema::FieldType::Str(_) => {
+                // Text field
+                serde_json::json!({
+                    "name": field_name,
+                    "type": "text",
+                    "stored": field_entry.is_stored(),
+                    "indexed": field_entry.is_indexed(),
+                    "fast": field_entry.is_fast()
+                })
+            },
+            tantivy::schema::FieldType::U64(_) => {
+                // Unsigned integer field
+                serde_json::json!({
+                    "name": field_name,
+                    "type": "u64",
+                    "stored": field_entry.is_stored(),
+                    "indexed": field_entry.is_indexed(),
+                    "fast": field_entry.is_fast()
+                })
+            },
+            tantivy::schema::FieldType::I64(_) => {
+                // Signed integer field
+                serde_json::json!({
+                    "name": field_name,
+                    "type": "i64",
+                    "stored": field_entry.is_stored(),
+                    "indexed": field_entry.is_indexed(),
+                    "fast": field_entry.is_fast()
+                })
+            },
+            tantivy::schema::FieldType::F64(_) => {
+                // Float field
+                serde_json::json!({
+                    "name": field_name,
+                    "type": "f64",
+                    "stored": field_entry.is_stored(),
+                    "indexed": field_entry.is_indexed(),
+                    "fast": field_entry.is_fast()
+                })
+            },
+            tantivy::schema::FieldType::Bool(_) => {
+                // Boolean field
+                serde_json::json!({
+                    "name": field_name,
+                    "type": "bool",
+                    "stored": field_entry.is_stored(),
+                    "indexed": field_entry.is_indexed(),
+                    "fast": field_entry.is_fast()
+                })
+            },
+            tantivy::schema::FieldType::Date(_) => {
+                // Date field
+                serde_json::json!({
+                    "name": field_name,
+                    "type": "datetime",
+                    "stored": field_entry.is_stored(),
+                    "indexed": field_entry.is_indexed(),
+                    "fast": field_entry.is_fast()
+                })
+            },
+            tantivy::schema::FieldType::Facet(_) => {
+                // Facet field
+                serde_json::json!({
+                    "name": field_name,
+                    "type": "text",
+                    "tokenizer": "raw",
+                    "stored": field_entry.is_stored(),
+                    "indexed": field_entry.is_indexed(),
+                    "fast": field_entry.is_fast()
+                })
+            },
+            tantivy::schema::FieldType::Bytes(_) => {
+                // Bytes field
+                serde_json::json!({
+                    "name": field_name,
+                    "type": "bytes",
+                    "stored": field_entry.is_stored(),
+                    "indexed": field_entry.is_indexed(),
+                    "fast": field_entry.is_fast()
+                })
+            },
+            tantivy::schema::FieldType::JsonObject(_) => {
+                // JSON object field
+                serde_json::json!({
+                    "name": field_name,
+                    "type": "object",
+                    "stored": field_entry.is_stored()
+                })
+            },
+            tantivy::schema::FieldType::IpAddr(_) => {
+                // IP address field
+                serde_json::json!({
+                    "name": field_name,
+                    "type": "ip",
+                    "stored": field_entry.is_stored(),
+                    "indexed": field_entry.is_indexed(),
+                    "fast": field_entry.is_fast()
+                })
+            }
+        };
+        
+        field_mappings.insert(field_name.to_string(), field_mapping);
+    }
     
-    debug_log!("Successfully extracted doc mapping JSON ({} bytes)", doc_mapping_json.len());
+    // Create the doc mapping JSON structure
+    let doc_mapping_json = serde_json::json!({
+        "field_mappings": field_mappings,
+        "mode": "lenient",
+        "store_source": true
+    });
     
-    Ok(doc_mapping_json)
+    let doc_mapping_str = serde_json::to_string(&doc_mapping_json)
+        .map_err(|e| anyhow!("Failed to serialize DocMapping to JSON: {}", e))?;
+    
+    debug_log!("Successfully created doc mapping JSON from actual Tantivy schema ({} bytes)", doc_mapping_str.len());
+    
+    Ok(doc_mapping_str)
 }
 
 /// Configuration for split conversion passed from Java
