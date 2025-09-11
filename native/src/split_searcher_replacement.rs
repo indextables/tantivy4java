@@ -15,15 +15,52 @@ use quickwit_common::thread_pool::ThreadPool;
 
 use serde_json::{Value, Map};
 
-use quickwit_proto::search::SearchRequest;
-use quickwit_config::S3StorageConfig;
-use quickwit_storage::StorageResolver;
+use quickwit_proto::search::{SearchRequest, SplitIdAndFooterOffsets};
+use quickwit_config::{S3StorageConfig, SearcherConfig};
+use quickwit_storage::{StorageResolver, ByteRangeCache, SplitCache, wrap_storage_with_cache, STORAGE_METRICS, MemorySizedCache};
+use bytesize::ByteSize;
+use quickwit_search::leaf::{open_index_with_caches, open_split_bundle};
+use quickwit_search::SearcherContext;
+use quickwit_directories::{StorageDirectory, HotDirectory, CachingDirectory};
 use tantivy::schema::Document as DocumentTrait; // For to_named_doc method
 
 /// Thread pool for search operations (matches Quickwit's pattern exactly)
 fn search_thread_pool() -> &'static ThreadPool {
     static SEARCH_THREAD_POOL: OnceLock<ThreadPool> = OnceLock::new();
     SEARCH_THREAD_POOL.get_or_init(|| ThreadPool::new("search", None))
+}
+
+/// Check if footer metadata is available for optimizations
+fn has_footer_metadata(footer_start: u64, footer_end: u64) -> bool {
+    footer_start > 0 && footer_end > 0 && footer_end > footer_start
+}
+
+/// Extract split ID from URI (filename without extension)
+fn extract_split_id_from_uri(split_uri: &str) -> String {
+    if let Some(last_slash_pos) = split_uri.rfind('/') {
+        let filename = &split_uri[last_slash_pos + 1..];
+        if let Some(dot_pos) = filename.rfind('.') {
+            filename[..dot_pos].to_string()
+        } else {
+            filename.to_string()
+        }
+    } else {
+        if let Some(dot_pos) = split_uri.rfind('.') {
+            split_uri[..dot_pos].to_string()
+        } else {
+            split_uri.to_string()
+        }
+    }
+}
+
+/// Create minimal SearcherContext for Quickwit functions
+/// Uses tantivy4java's cache configuration but creates Quickwit-compatible caches
+fn create_minimal_searcher_context() -> anyhow::Result<SearcherContext> {
+    // Create basic searcher config with default values
+    let searcher_config = SearcherConfig::default();
+    
+    // Use Quickwit's constructor to handle all cache creation properly
+    Ok(SearcherContext::new(searcher_config, None))
 }
 
 /// Cached Tantivy searcher for efficient single document retrieval
@@ -1050,21 +1087,56 @@ fn retrieve_document_from_split(
                     .unwrap_or_else(|| Path::new(split_uri))
             };
             
-            // Get the full file data using Quickwit's storage abstraction
-            let file_size = actual_storage.file_num_bytes(relative_path).await
-                .map_err(|e| anyhow::anyhow!("Failed to get file size for {}: {}", split_uri, e))?;
-            
-            let split_data = actual_storage.get_slice(relative_path, 0..file_size as usize).await
-                .map_err(|e| anyhow::anyhow!("Failed to get split data from {}: {}", split_uri, e))?;
-            
-            // Open the bundle directory from the split data
-            let split_file_slice = FileSlice::new(std::sync::Arc::new(split_data));
-            let bundle_directory = BundleDirectory::open_split(split_file_slice)
-                .map_err(|e| anyhow::anyhow!("Failed to open bundle directory {}: {}", split_uri, e))?;
+            // 🚀 OPTIMIZATION: Use Quickwit's optimized path when footer metadata is available
+            let index = if has_footer_metadata(*footer_start, *footer_end) {
+                debug_println!("RUST DEBUG: 🚀 Using Quickwit optimized path with hotcache (footer: {}..{})", footer_start, footer_end);
                 
-            // Extract the index from the bundle directory
-            let index = tantivy::Index::open(bundle_directory)
-                .map_err(|e| anyhow::anyhow!("Failed to open index from bundle {}: {}", split_uri, e))?;
+                // Create SplitIdAndFooterOffsets for Quickwit's open_index_with_caches
+                let footer_offsets = SplitIdAndFooterOffsets {
+                    split_id: extract_split_id_from_uri(split_uri),
+                    split_footer_start: *footer_start,
+                    split_footer_end: *footer_end,
+                    timestamp_start: Some(0),
+                    timestamp_end: Some(i64::MAX),
+                    num_docs: 0, // Will be filled by Quickwit
+                };
+                
+                // Create minimal SearcherContext for Quickwit functions
+                let searcher_context = create_minimal_searcher_context()
+                    .map_err(|e| anyhow::anyhow!("Failed to create searcher context: {}", e))?;
+                
+                // ✅ Use Quickwit's proven function with hotcache optimization
+                let (index, _hot_directory) = open_index_with_caches(
+                    &searcher_context,
+                    actual_storage.clone(),
+                    &footer_offsets,
+                    None, // tokenizer_manager
+                    Some(ByteRangeCache::with_infinite_capacity(&STORAGE_METRICS.shortlived_cache))
+                ).await.map_err(|e| anyhow::anyhow!("Quickwit open_index_with_caches failed: {}", e))?;
+                
+                debug_println!("RUST DEBUG: ✅ Successfully opened index with Quickwit hotcache optimization");
+                index
+            } else {
+                debug_println!("RUST DEBUG: ⚠️ Footer metadata not available, falling back to full download");
+                
+                // Fallback: Get the full file data (original behavior for missing metadata)
+                let file_size = actual_storage.file_num_bytes(relative_path).await
+                    .map_err(|e| anyhow::anyhow!("Failed to get file size for {}: {}", split_uri, e))?;
+                
+                let split_data = actual_storage.get_slice(relative_path, 0..file_size as usize).await
+                    .map_err(|e| anyhow::anyhow!("Failed to get split data from {}: {}", split_uri, e))?;
+                
+                debug_println!("RUST DEBUG: ⚠️ Downloaded full split file: {} bytes", split_data.len());
+                
+                // Open the bundle directory from the split data
+                let split_file_slice = FileSlice::new(std::sync::Arc::new(split_data));
+                let bundle_directory = BundleDirectory::open_split(split_file_slice)
+                    .map_err(|e| anyhow::anyhow!("Failed to open bundle directory {}: {}", split_uri, e))?;
+                    
+                // Extract the index from the bundle directory
+                tantivy::Index::open(bundle_directory)
+                    .map_err(|e| anyhow::anyhow!("Failed to open index from bundle {}: {}", split_uri, e))?
+            };
             
             // Create index reader using Quickwit's optimizations (from fetch_docs.rs line 187-192)
             const NUM_CONCURRENT_REQUESTS: usize = 30; // from fetch_docs.rs
@@ -1163,19 +1235,54 @@ fn retrieve_documents_batch_from_split_optimized(
                     std::path::Path::new(split_uri)
                 };
                 
-                // Get split file data directly (same approach as individual retrieval)
-                let file_size = index_storage.file_num_bytes(relative_path).await
-                    .map_err(|e| anyhow::anyhow!("Failed to get file size for {}: {}", split_uri, e))?;
-                
-                let split_data = index_storage.get_slice(relative_path, 0..file_size as usize).await
-                    .map_err(|e| anyhow::anyhow!("Failed to get split data from {}: {}", split_uri, e))?;
-                
-                let split_file_slice = tantivy::directory::FileSlice::new(std::sync::Arc::new(split_data));
-                let bundle_directory = quickwit_directories::BundleDirectory::open_split(split_file_slice)
-                    .map_err(|e| anyhow::anyhow!("Failed to open bundle directory {}: {}", split_uri, e))?;
+                // 🚀 BATCH OPTIMIZATION: Use Quickwit's optimized path when footer metadata is available
+                let mut index = if has_footer_metadata(*footer_start, *footer_end) {
+                    debug_println!("RUST DEBUG: 🚀 Using Quickwit optimized path for batch retrieval (footer: {}..{})", footer_start, footer_end);
                     
-                let mut index = tantivy::Index::open(bundle_directory)
-                    .map_err(|e| anyhow::anyhow!("Failed to open index from bundle {}: {}", split_uri, e))?;
+                    // Create SplitIdAndFooterOffsets for Quickwit's open_index_with_caches
+                    let footer_offsets = SplitIdAndFooterOffsets {
+                        split_id: extract_split_id_from_uri(split_uri),
+                        split_footer_start: *footer_start,
+                        split_footer_end: *footer_end,
+                        timestamp_start: Some(0),
+                        timestamp_end: Some(i64::MAX),
+                        num_docs: 0, // Will be filled by Quickwit
+                    };
+                    
+                    // Create minimal SearcherContext for Quickwit functions
+                    let searcher_context = create_minimal_searcher_context()
+                        .map_err(|e| anyhow::anyhow!("Failed to create searcher context: {}", e))?;
+                    
+                    // ✅ Use Quickwit's proven function with hotcache optimization for batch operations
+                    let (index, _hot_directory) = open_index_with_caches(
+                        &searcher_context,
+                        index_storage.clone(),
+                        &footer_offsets,
+                        None, // tokenizer_manager
+                        None  // No ephemeral cache for batch operations (as per fetch_docs.rs)
+                    ).await.map_err(|e| anyhow::anyhow!("Quickwit batch open_index_with_caches failed: {}", e))?;
+                    
+                    debug_println!("RUST DEBUG: ✅ Successfully opened index with Quickwit hotcache optimization for batch retrieval");
+                    index
+                } else {
+                    debug_println!("RUST DEBUG: ⚠️ Footer metadata not available for batch retrieval, falling back to full download");
+                    
+                    // Fallback: Get the full file data (original behavior for missing metadata)
+                    let file_size = index_storage.file_num_bytes(relative_path).await
+                        .map_err(|e| anyhow::anyhow!("Failed to get file size for {}: {}", split_uri, e))?;
+                    
+                    let split_data = index_storage.get_slice(relative_path, 0..file_size as usize).await
+                        .map_err(|e| anyhow::anyhow!("Failed to get split data from {}: {}", split_uri, e))?;
+                    
+                    debug_println!("RUST DEBUG: ⚠️ Downloaded full split file for batch: {} bytes", split_data.len());
+                    
+                    let split_file_slice = tantivy::directory::FileSlice::new(std::sync::Arc::new(split_data));
+                    let bundle_directory = quickwit_directories::BundleDirectory::open_split(split_file_slice)
+                        .map_err(|e| anyhow::anyhow!("Failed to open bundle directory {}: {}", split_uri, e))?;
+                        
+                    tantivy::Index::open(bundle_directory)
+                        .map_err(|e| anyhow::anyhow!("Failed to open index from bundle {}: {}", split_uri, e))?
+                };
                 
                 // Use the same Quickwit optimizations as individual method
                 let tantivy_executor = search_thread_pool()
