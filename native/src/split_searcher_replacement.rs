@@ -10,7 +10,7 @@ use crate::standalone_searcher::{StandaloneSearcher, StandaloneSearchConfig, Spl
 use crate::utils::{arc_to_jlong, with_arc_safe, release_arc};
 use crate::common::to_java_exception;
 use crate::debug_println;
-use crate::split_query::{store_split_schema};
+use crate::split_query::{store_split_schema, get_split_schema};
 use quickwit_common::thread_pool::ThreadPool;
 
 use serde_json::{Value, Map};
@@ -33,6 +33,14 @@ fn search_thread_pool() -> &'static ThreadPool {
 /// Check if footer metadata is available for optimizations
 fn has_footer_metadata(footer_start: u64, footer_end: u64) -> bool {
     footer_start > 0 && footer_end > 0 && footer_end > footer_start
+}
+
+/// Check if split URI is remote (S3/cloud) vs local file
+/// Quickwit's hotcache optimization is designed for remote splits, not local files
+fn is_remote_split(split_uri: &str) -> bool {
+    split_uri.starts_with("s3://") || 
+    split_uri.starts_with("http://") || 
+    split_uri.starts_with("https://")
 }
 
 /// Extract split ID from URI (filename without extension)
@@ -220,14 +228,23 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_createNativeWithShare
         }
         
         // Extract doc mapping JSON if available
+        debug_println!("RUST DEBUG: Attempting to extract doc mapping from Java config...");
         if let Ok(doc_mapping_obj) = env.call_method(&split_config_jobject, "get", "(Ljava/lang/Object;)Ljava/lang/Object;", &[(&env.new_string("doc_mapping").unwrap()).into()]) {
+            debug_println!("RUST DEBUG: Got doc_mapping_obj from Java HashMap");
             let doc_mapping_jobject = doc_mapping_obj.l().unwrap();
             if !doc_mapping_jobject.is_null() {
+                debug_println!("RUST DEBUG: doc_mapping_jobject is not null, attempting to extract string");
                 if let Ok(doc_mapping_str) = env.get_string((&doc_mapping_jobject).into()) {
                     doc_mapping_json = Some(doc_mapping_str.into());
-                    debug_println!("RUST DEBUG: Extracted doc mapping JSON from Java config ({} chars)", doc_mapping_json.as_ref().unwrap().len());
+                    debug_println!("RUST DEBUG: ✅ SUCCESS - Extracted doc mapping JSON from Java config ({} chars)", doc_mapping_json.as_ref().unwrap().len());
+                } else {
+                    debug_println!("RUST DEBUG: ⚠️ Failed to convert doc_mapping_jobject to string");
                 }
+            } else {
+                debug_println!("RUST DEBUG: ⚠️ doc_mapping_jobject is null");
             }
+        } else {
+            debug_println!("RUST DEBUG: ⚠️ Failed to call get method on HashMap for 'doc_mapping' key");
         }
     }
     
@@ -414,25 +431,29 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_searchWithQueryAst(
     query_ast_json: JString,
     limit: jint,
 ) -> jobject {
-    // debug_println!("RUST DEBUG: SplitSearcher.searchWithQueryAst called with limit: {}", limit);
+    let method_start_time = std::time::Instant::now();
+    debug_println!("RUST DEBUG: ⏱️ searchWithQueryAst ENTRY POINT [TIMING START] - limit: {}", limit);
     
     if searcher_ptr == 0 {
+        debug_println!("RUST DEBUG: ⏱️ searchWithQueryAst ERROR: Invalid searcher pointer [TIMING: {}ms]", method_start_time.elapsed().as_millis());
         to_java_exception(&mut env, &anyhow::anyhow!("Invalid searcher pointer"));
         return std::ptr::null_mut();
     }
     
     // Extract QueryAst JSON string
+    let query_extract_start = std::time::Instant::now();
     let query_json: String = match env.get_string(&query_ast_json) {
         Ok(java_str) => java_str.into(),
         Err(e) => {
+            debug_println!("RUST DEBUG: ⏱️ searchWithQueryAst ERROR: Failed to extract QueryAst JSON [TIMING: {}ms]", method_start_time.elapsed().as_millis());
             to_java_exception(&mut env, &anyhow::anyhow!("Failed to extract QueryAst JSON: {}", e));
             return std::ptr::null_mut();
         }
     };
-    
-    // debug_println!("RUST DEBUG: QueryAst JSON: {}", query_json);
+    debug_println!("RUST DEBUG: ⏱️ Query JSON extraction completed [TIMING: {}ms]", query_extract_start.elapsed().as_millis());
     
     // Parse and fix range queries with proper field types from schema
+    let query_fix_start = std::time::Instant::now();
     let fixed_query_json = match fix_range_query_types(searcher_ptr, &query_json) {
         Ok(fixed_json) => fixed_json,
         Err(e) => {
@@ -440,12 +461,15 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_searchWithQueryAst(
             query_json.clone()
         }
     };
+    debug_println!("RUST DEBUG: ⏱️ Query type fixing completed [TIMING: {}ms]", query_fix_start.elapsed().as_millis());
     
     if fixed_query_json != query_json {
         debug_println!("RUST DEBUG: Fixed QueryAst JSON: {}", fixed_query_json);
     }
     
     // Use the searcher context to perform search with Quickwit's leaf search approach
+    let search_execution_start = std::time::Instant::now();
+    debug_println!("RUST DEBUG: ⏱️ Starting search execution [TIMING: {}ms]", method_start_time.elapsed().as_millis());
     let result = with_arc_safe(searcher_ptr, |searcher_context: &Arc<(StandaloneSearcher, tokio::runtime::Runtime, String, std::collections::HashMap<String, String>, u64, u64, Option<String>)>| {
         let (searcher, runtime, split_uri, aws_config, footer_start, footer_end, doc_mapping_json) = searcher_context.as_ref();
         
@@ -461,6 +485,8 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_searchWithQueryAst(
         use tantivy::directory::FileSlice;
         
         // Run async code synchronously within the runtime context
+        let async_block_start = std::time::Instant::now();
+        debug_println!("RUST DEBUG: ⏱️ Starting async block for search [TIMING: {}ms]", method_start_time.elapsed().as_millis());
         // Note: We're already in the runtime context via runtime.enter(), so we can use block_on directly
         runtime.block_on(async {
                 // Parse the QueryAst JSON (with field type fixes)
@@ -1087,8 +1113,10 @@ fn retrieve_document_from_split(
                     .unwrap_or_else(|| Path::new(split_uri))
             };
             
-            // 🚀 OPTIMIZATION: Use Quickwit's optimized path when footer metadata is available
-            let index = if has_footer_metadata(*footer_start, *footer_end) {
+            // 🚀 OPTIMIZATION: Use Quickwit's optimized path when footer metadata is available AND split is remote
+            debug_println!("RUST DEBUG: Checking optimization conditions - footer_metadata: {}, is_remote: {}", 
+                has_footer_metadata(*footer_start, *footer_end), is_remote_split(split_uri));
+            let index = if has_footer_metadata(*footer_start, *footer_end) && is_remote_split(split_uri) {
                 debug_println!("RUST DEBUG: 🚀 Using Quickwit optimized path with hotcache (footer: {}..{})", footer_start, footer_end);
                 
                 // Create SplitIdAndFooterOffsets for Quickwit's open_index_with_caches
@@ -1235,8 +1263,10 @@ fn retrieve_documents_batch_from_split_optimized(
                     std::path::Path::new(split_uri)
                 };
                 
-                // 🚀 BATCH OPTIMIZATION: Use Quickwit's optimized path when footer metadata is available
-                let mut index = if has_footer_metadata(*footer_start, *footer_end) {
+                // 🚀 BATCH OPTIMIZATION: Use Quickwit's optimized path when footer metadata is available for remote splits
+                debug_println!("RUST DEBUG: Checking batch optimization conditions - footer_metadata: {}, is_remote: {}", 
+                    has_footer_metadata(*footer_start, *footer_end), is_remote_split(split_uri));
+                let mut index = if has_footer_metadata(*footer_start, *footer_end) && is_remote_split(split_uri) {
                     debug_println!("RUST DEBUG: 🚀 Using Quickwit optimized path for batch retrieval (footer: {}..{})", footer_start, footer_end);
                     
                     // Create SplitIdAndFooterOffsets for Quickwit's open_index_with_caches
@@ -1370,49 +1400,63 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_docNative(
     segment_ord: jint,
     doc_id: jint,
 ) -> jobject {
-    // debug_println!("RUST DEBUG: SplitSearcher.docNative called with segment_ord={}, doc_id={}", segment_ord, doc_id);
+    let method_start_time = std::time::Instant::now();
+    debug_println!("RUST DEBUG: ⏱️ docNative ENTRY POINT [TIMING START] - segment_ord={}, doc_id={}", segment_ord, doc_id);
     
     if searcher_ptr == 0 {
-        debug_println!("RUST ERROR: Invalid searcher pointer");
+        debug_println!("RUST DEBUG: ⏱️ docNative ERROR: Invalid searcher pointer [TIMING: {}ms]", method_start_time.elapsed().as_millis());
         to_java_exception(&mut env, &anyhow::anyhow!("Invalid searcher pointer"));
         return std::ptr::null_mut();
     }
     
     // Create DocAddress from the provided segment and doc ID
+    let doc_address_start = std::time::Instant::now();
     let doc_address = tantivy::DocAddress::new(segment_ord as u32, doc_id as u32);
+    debug_println!("RUST DEBUG: ⏱️ DocAddress creation completed [TIMING: {}ms]", doc_address_start.elapsed().as_millis());
     
     // Use Quickwit's optimized approach for document retrieval
+    let retrieval_start = std::time::Instant::now();
+    debug_println!("RUST DEBUG: ⏱️ 🔥 CALLING retrieve_document_from_split_optimized (POTENTIAL BOTTLENECK) [TIMING: {}ms]", method_start_time.elapsed().as_millis());
     match retrieve_document_from_split_optimized(searcher_ptr, doc_address) {
         Ok((doc, schema)) => {
+            debug_println!("RUST DEBUG: ⏱️ 🔥 retrieve_document_from_split_optimized COMPLETED [TIMING: {}ms]", retrieval_start.elapsed().as_millis());
+            
             // Create a RetrievedDocument using the proper pattern from searcher.rs
+            let wrapper_creation_start = std::time::Instant::now();
             use crate::document::{DocumentWrapper, RetrievedDocument};
             
             let retrieved_doc = RetrievedDocument::new_with_schema(doc, &schema);
             let wrapper = DocumentWrapper::Retrieved(retrieved_doc);
             let wrapper_arc = std::sync::Arc::new(std::sync::Mutex::new(wrapper));
             let doc_ptr = crate::utils::arc_to_jlong(wrapper_arc);
+            debug_println!("RUST DEBUG: ⏱️ Document wrapper creation completed [TIMING: {}ms]", wrapper_creation_start.elapsed().as_millis());
             
             // Create Java Document object with the pointer
+            let java_obj_start = std::time::Instant::now();
             match env.find_class("com/tantivy4java/Document") {
                 Ok(document_class) => {
                     match env.new_object(&document_class, "(J)V", &[doc_ptr.into()]) {
-                        Ok(document_obj) => document_obj.into_raw(),
+                        Ok(document_obj) => {
+                            debug_println!("RUST DEBUG: ⏱️ Java Document object creation completed [TIMING: {}ms]", java_obj_start.elapsed().as_millis());
+                            debug_println!("RUST DEBUG: ⏱️ SUCCESS: docNative completed [TOTAL TIMING: {}ms]", method_start_time.elapsed().as_millis());
+                            document_obj.into_raw()
+                        },
                         Err(e) => {
-                            debug_println!("RUST ERROR: Failed to create Document object: {}", e);
+                            debug_println!("RUST DEBUG: ⏱️ ERROR: Failed to create Document object: {} [TOTAL TIMING: {}ms]", e, method_start_time.elapsed().as_millis());
                             to_java_exception(&mut env, &anyhow::anyhow!("Failed to create Document: {}", e));
                             std::ptr::null_mut()
                         }
                     }
                 },
                 Err(e) => {
-                    debug_println!("RUST ERROR: Failed to find Document class: {}", e);
+                    debug_println!("RUST DEBUG: ⏱️ ERROR: Failed to find Document class: {} [TOTAL TIMING: {}ms]", e, method_start_time.elapsed().as_millis());
                     to_java_exception(&mut env, &anyhow::anyhow!("Failed to find Document class: {}", e));
                     std::ptr::null_mut()
                 }
             }
         },
         Err(e) => {
-            debug_println!("RUST ERROR: Document retrieval failed: {}", e);
+            debug_println!("RUST DEBUG: ⏱️ 🔥 ERROR: retrieve_document_from_split_optimized FAILED: {} [TIMING: {}ms] [TOTAL TIMING: {}ms]", e, retrieval_start.elapsed().as_millis(), method_start_time.elapsed().as_millis());
             to_java_exception(&mut env, &e);
             std::ptr::null_mut()
         }
@@ -1455,6 +1499,9 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_getSchemaFromNative(
     }
     
     // debug_println!("RUST DEBUG: About to call with_object to access searcher context...");
+    let method_start_time = std::time::Instant::now();
+    debug_println!("RUST DEBUG: ⏱️ getSchemaFromNative ENTRY POINT [TIMING START]");
+    
     if searcher_ptr == 0 {
         to_java_exception(&mut env, &anyhow::anyhow!("Invalid searcher pointer"));
         return 0;
@@ -1463,38 +1510,42 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_getSchemaFromNative(
     // Extract the actual schema from the split file using Quickwit's functionality
     let result = with_arc_safe(searcher_ptr, |searcher_context: &Arc<(StandaloneSearcher, tokio::runtime::Runtime, String, std::collections::HashMap<String, String>, u64, u64, Option<String>)>| {
         let (_searcher, runtime, split_uri, aws_config, _footer_start, _footer_end, doc_mapping_json) = searcher_context.as_ref();
-        debug_println!("RUST DEBUG: getSchemaFromNative called with split URI: {}", split_uri);
+        debug_println!("RUST DEBUG: getSchemaFromNative called with split URI: {} [TIMING: {}ms]", split_uri, method_start_time.elapsed().as_millis());
         
         // 🚀 OPTIMIZATION: Use doc mapping JSON if available instead of expensive I/O
         if let Some(doc_mapping_str) = doc_mapping_json {
-            debug_println!("RUST DEBUG: 🚀 OPTIMIZATION ACTIVE: Using cached doc mapping JSON instead of I/O ({} chars)", doc_mapping_str.len());
+            let optimization_start = std::time::Instant::now();
+            debug_println!("RUST DEBUG: ⏱️ 🚀 OPTIMIZATION ACTIVE: Using cached doc mapping JSON instead of I/O ({} chars) [TIMING: {}ms]", doc_mapping_str.len(), method_start_time.elapsed().as_millis());
             
             // Parse the doc mapping JSON and create schema from it
             match create_schema_from_doc_mapping(doc_mapping_str) {
                 Ok(schema) => {
-                    debug_println!("RUST DEBUG: ✅ Successfully created schema from doc mapping without I/O!");
+                    debug_println!("RUST DEBUG: ⏱️ ✅ Schema creation from doc mapping completed [TIMING: {}ms]", optimization_start.elapsed().as_millis());
                     
                     // Store schema clone in cache for parseQuery field extraction  
+                    let cache_start = std::time::Instant::now();
                     debug_println!("RUST DEBUG: About to store schema for split URI: {}", split_uri);
                     store_split_schema(split_uri, schema.clone());
-                    debug_println!("RUST DEBUG: Schema caching completed");
+                    debug_println!("RUST DEBUG: ⏱️ Schema caching completed [TIMING: {}ms]", cache_start.elapsed().as_millis());
                     
                     // Register the schema using Arc for memory safety
                     let schema_arc = std::sync::Arc::new(schema);
                     let schema_ptr = arc_to_jlong(schema_arc);
-                    debug_println!("RUST DEBUG: 🚀 OPTIMIZATION SUCCESS - Schema created from doc mapping with pointer: {}", schema_ptr);
+                    debug_println!("RUST DEBUG: ⏱️ 🚀 OPTIMIZATION SUCCESS - Schema created from doc mapping with pointer: {} [TOTAL TIMING: {}ms]", schema_ptr, method_start_time.elapsed().as_millis());
                     return schema_ptr;
                 },
                 Err(e) => {
-                    debug_println!("RUST DEBUG: ⚠️ Failed to create schema from doc mapping: {}, falling back to I/O", e);
+                    debug_println!("RUST DEBUG: ⚠️ Failed to create schema from doc mapping: {}, falling back to I/O [TIMING: {}ms]", e, optimization_start.elapsed().as_millis());
                     // Fall through to expensive I/O method
                 }
             }
         } else {
-            debug_println!("RUST DEBUG: ⚠️ No doc mapping available, falling back to expensive I/O method");
+            debug_println!("RUST DEBUG: ⚠️ No doc mapping available, falling back to expensive I/O method [TIMING: {}ms]", method_start_time.elapsed().as_millis());
         }
         
         // Enter the runtime context for async operations (EXPENSIVE FALLBACK)
+        let fallback_start = std::time::Instant::now();
+        debug_println!("RUST DEBUG: ⏱️ ⚠️ STARTING EXPENSIVE I/O FALLBACK [TIMING: {}ms]", method_start_time.elapsed().as_millis());
         let _guard = runtime.enter();
         
         // Parse the split URI and extract schema using Quickwit's storage abstractions
@@ -1504,12 +1555,17 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_getSchemaFromNative(
         // Use block_on to run async code synchronously within the runtime context
         let schema = tokio::task::block_in_place(|| {
             runtime.block_on(async {
+                let async_start = std::time::Instant::now();
+                debug_println!("RUST DEBUG: ⏱️ Starting async block [TIMING: {}ms]", method_start_time.elapsed().as_millis());
                 // Parse URI and resolve storage
+                let uri_parse_start = std::time::Instant::now();
                 let uri: Uri = split_uri.parse()
                     .map_err(|e| anyhow::anyhow!("Failed to parse split URI {}: {}", split_uri, e))?;
+                debug_println!("RUST DEBUG: ⏱️ URI parsing completed [TIMING: {}ms]", uri_parse_start.elapsed().as_millis());
                 
                 // Create S3 storage configuration with credentials from Java config
                 use quickwit_config::{StorageConfigs, S3StorageConfig};
+                let storage_config_start = std::time::Instant::now();
                 let mut storage_configs = StorageConfigs::default();
                 
                 debug_println!("RUST DEBUG: Creating S3 config with credentials from tantivy4java (not environment)");
@@ -1533,9 +1589,12 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_getSchemaFromNative(
                 storage_configs = storage_configs_vec;
                 
                 let storage_resolver = StorageResolver::configured(&storage_configs);
+                debug_println!("RUST DEBUG: ⏱️ Storage config creation completed [TIMING: {}ms]", storage_config_start.elapsed().as_millis());
                 
                 // Use the helper function to resolve storage correctly for S3 URIs
+                let storage_resolve_start = std::time::Instant::now();
                 let actual_storage = resolve_storage_for_split(&storage_resolver, split_uri).await?;
+                debug_println!("RUST DEBUG: ⏱️ Storage resolution completed [TIMING: {}ms]", storage_resolve_start.elapsed().as_millis());
                 
                 // Extract relative path - for direct file paths, use just the filename
                 let relative_path = if split_uri.contains("://") {
@@ -1553,54 +1612,85 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_getSchemaFromNative(
                         .unwrap_or_else(|| Path::new(split_uri))
                 };
                 
-                debug_println!("RUST DEBUG: About to call storage.file_num_bytes with relative path: '{}'", relative_path.display());
+                debug_println!("RUST DEBUG: ⏱️ 🚀 USING QUICKWIT'S STANDARD HOTCACHE OPTIMIZATION [TIMING: {}ms]", method_start_time.elapsed().as_millis());
+                debug_println!("RUST DEBUG: Footer range: {} to {}", _footer_start, _footer_end);
                 
-                // Get the full file data using Quickwit's storage abstraction
-                let file_size = actual_storage.file_num_bytes(relative_path).await
-                    .map_err(|e| anyhow::anyhow!("Failed to get file size for {}: {}", split_uri, e))?;
+                // Use Quickwit's standard approach with proper hotcache optimization
+                let quickwit_setup_start = std::time::Instant::now();
+                use quickwit_search::leaf::open_index_with_caches;
+                use quickwit_proto::search::SplitIdAndFooterOffsets;
+                use quickwit_storage::ByteRangeCache;
                 
-                debug_println!("RUST DEBUG: Got file size: {} bytes", file_size);
+                // Extract split ID from the path
+                let split_id = relative_path.file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("unknown")
+                    .to_string();
                 
-                let split_data = actual_storage.get_slice(relative_path, 0..file_size as usize).await
-                    .map_err(|e| anyhow::anyhow!("Failed to get split data from {}: {}", split_uri, e))?;
+                // Create SplitIdAndFooterOffsets from our footer metadata
+                let split_and_footer_offsets = SplitIdAndFooterOffsets {
+                    split_id,
+                    split_footer_start: *_footer_start,
+                    split_footer_end: *_footer_end,
+                    timestamp_start: None,
+                    timestamp_end: None,
+                    num_docs: 0,
+                };
                 
-                // Open the bundle directory from the split data
-                use quickwit_directories::BundleDirectory;
-                use tantivy::directory::FileSlice;
+                debug_println!("RUST DEBUG: Created SplitIdAndFooterOffsets with footer: {} to {}", 
+                         split_and_footer_offsets.split_footer_start, split_and_footer_offsets.split_footer_end);
                 
-                let split_file_slice = FileSlice::new(std::sync::Arc::new(split_data));
+                // Create searcher context (required for open_index_with_caches)
+                let searcher_context = crate::global_cache::get_global_searcher_context();
                 
-                // Use BundleDirectory::open_split which takes just the FileSlice and handles everything internally
-                let bundle_directory = BundleDirectory::open_split(split_file_slice)
-                    .map_err(|e| anyhow::anyhow!("Failed to open bundle directory {}: {}", split_uri, e))?;
+                // Create ephemeral cache for this operation
+                let byte_range_cache = ByteRangeCache::with_infinite_capacity(
+                    &quickwit_storage::STORAGE_METRICS.shortlived_cache
+                );
+                
+                debug_println!("RUST DEBUG: ⏱️ Quickwit setup completed [TIMING: {}ms]", quickwit_setup_start.elapsed().as_millis());
+                
+                // Use Quickwit's optimized open_index_with_caches which properly handles hotcache
+                let index_open_start = std::time::Instant::now();
+                debug_println!("RUST DEBUG: ⏱️ 🔥 CALLING open_index_with_caches (POTENTIAL BOTTLENECK) [TIMING: {}ms]", method_start_time.elapsed().as_millis());
+                let (index, _hot_directory) = open_index_with_caches(
+                    &searcher_context,
+                    actual_storage,
+                    &split_and_footer_offsets,
+                    None, // No tokenizer manager needed for schema extraction
+                    Some(byte_range_cache),
+                ).await.map_err(|e| anyhow::anyhow!("Failed to open index with caches {}: {}", split_uri, e))?;
+                debug_println!("RUST DEBUG: ⏱️ 🔥 open_index_with_caches COMPLETED [TIMING: {}ms]", index_open_start.elapsed().as_millis());
                     
-                // Extract schema from the bundle directory by opening the index
-                let index = tantivy::Index::open(bundle_directory)
-                    .map_err(|e| anyhow::anyhow!("Failed to open index from bundle {}: {}", split_uri, e))?;
-                    
+                let schema_extract_start = std::time::Instant::now();
                 let schema = index.schema();
+                debug_println!("RUST DEBUG: ⏱️ Schema extraction from index completed [TIMING: {}ms]", schema_extract_start.elapsed().as_millis());
                 
+                debug_println!("RUST DEBUG: ⏱️ Total async block completed [TIMING: {}ms]", async_start.elapsed().as_millis());
                 Ok::<tantivy::schema::Schema, anyhow::Error>(schema)
             })
         });
         
+        debug_println!("RUST DEBUG: ⏱️ EXPENSIVE I/O FALLBACK COMPLETED [TIMING: {}ms]", fallback_start.elapsed().as_millis());
+        
         match schema {
             Ok(s) => {
                 // Store schema clone in cache for parseQuery field extraction  
+                let final_cache_start = std::time::Instant::now();
                 debug_println!("RUST DEBUG: About to store schema for split URI (I/O fallback): {}", split_uri);
                 debug_println!("RUST DEBUG: BEFORE store_split_schema call");
                 store_split_schema(split_uri, s.clone());
                 debug_println!("RUST DEBUG: AFTER store_split_schema call");
-                debug_println!("RUST DEBUG: Schema caching completed (I/O fallback)");
+                debug_println!("RUST DEBUG: ⏱️ Schema caching completed (I/O fallback) [TIMING: {}ms]", final_cache_start.elapsed().as_millis());
                 
                 // Register the actual schema from the split using Arc for memory safety
                 let schema_arc = std::sync::Arc::new(s);
                 let schema_ptr = arc_to_jlong(schema_arc);
-                debug_println!("RUST DEBUG: SUCCESS - Schema extracted and registered with Arc pointer: {}", schema_ptr);
+                debug_println!("RUST DEBUG: ⏱️ SUCCESS - Schema extracted and registered with Arc pointer: {} [TOTAL TIMING: {}ms]", schema_ptr, method_start_time.elapsed().as_millis());
                 schema_ptr
             },
             Err(e) => {
-                debug_println!("RUST DEBUG: FATAL ERROR - Schema extraction failed completely for split {}: {}", split_uri, e);
+                debug_println!("RUST DEBUG: ⏱️ FATAL ERROR - Schema extraction failed completely for split {}: {} [TOTAL TIMING: {}ms]", split_uri, e, method_start_time.elapsed().as_millis());
                 debug_println!("RUST DEBUG: Error chain: {:?}", e);
                 // Return 0 to indicate failure
                 0
@@ -1610,11 +1700,11 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_getSchemaFromNative(
 
     match result {
         Some(schema_ptr) => {
-            debug_println!("SUCCESS: Schema extracted and registered with pointer: {}", schema_ptr);
+            debug_println!("⏱️ SUCCESS: Schema extracted and registered with pointer: {} [TOTAL METHOD TIMING: {}ms]", schema_ptr, method_start_time.elapsed().as_millis());
             schema_ptr
         },
         None => {
-            debug_println!("ERROR: with_object returned None - searcher context not found for pointer {}", searcher_ptr);
+            debug_println!("⏱️ ERROR: with_object returned None - searcher context not found for pointer {} [TOTAL METHOD TIMING: {}ms]", searcher_ptr, method_start_time.elapsed().as_millis());
             to_java_exception(&mut env, &anyhow::anyhow!("Searcher context not found for pointer {}", searcher_ptr));
             0
         }
@@ -1751,17 +1841,44 @@ fn get_schema_from_split(searcher_ptr: jlong) -> anyhow::Result<tantivy::schema:
 
 /// Fix range queries in QueryAst JSON by looking up field types from schema
 fn fix_range_query_types(searcher_ptr: jlong, query_json: &str) -> anyhow::Result<String> {
-    // Parse the JSON to find range queries
-    let mut query_value: Value = serde_json::from_str(query_json)?;
+    let fix_start = std::time::Instant::now();
+    debug_println!("RUST DEBUG: ⏱️ fix_range_query_types ENTRY POINT [TIMING START]");
     
-    // Get schema from split file - reuse the same logic as getSchemaFromNative
-    let schema = get_schema_from_split(searcher_ptr)?;
+    // Parse the JSON to find range queries
+    let parse_start = std::time::Instant::now();
+    let mut query_value: Value = serde_json::from_str(query_json)?;
+    debug_println!("RUST DEBUG: ⏱️ Query JSON parsing completed [TIMING: {}ms]", parse_start.elapsed().as_millis());
+    
+    // 🚀 OPTIMIZATION: Try to get cached schema first instead of expensive I/O
+    let schema_start = std::time::Instant::now();
+    let schema = with_arc_safe(searcher_ptr, |searcher_context: &Arc<(StandaloneSearcher, tokio::runtime::Runtime, String, std::collections::HashMap<String, String>, u64, u64, Option<String>)>| {
+        let (_searcher, _runtime, split_uri, _aws_config, _footer_start, _footer_end, _doc_mapping_json) = searcher_context.as_ref();
+        
+        // First try to get schema from cache
+        if let Some(cached_schema) = get_split_schema(split_uri) {
+            debug_println!("RUST DEBUG: ⏱️ 🚀 Using CACHED schema instead of expensive I/O [TIMING: {}ms]", schema_start.elapsed().as_millis());
+            return Ok(cached_schema);
+        }
+        
+        // Fallback to expensive I/O only if cache miss
+        debug_println!("RUST DEBUG: ⚠️ Cache miss, falling back to expensive I/O for schema [TIMING: {}ms]", schema_start.elapsed().as_millis());
+        get_schema_from_split(searcher_ptr)
+    }).ok_or_else(|| anyhow::anyhow!("Failed to access searcher context"))??;
+    
+    debug_println!("RUST DEBUG: ⏱️ Schema retrieval completed [TIMING: {}ms]", schema_start.elapsed().as_millis());
     
     // Recursively fix range queries in the JSON
+    let recursive_start = std::time::Instant::now();
     fix_range_queries_recursive(&mut query_value, &schema)?;
+    debug_println!("RUST DEBUG: ⏱️ Range query fixing completed [TIMING: {}ms]", recursive_start.elapsed().as_millis());
     
     // Convert back to JSON string
-    serde_json::to_string(&query_value).map_err(|e| anyhow::anyhow!("Failed to serialize fixed query: {}", e))
+    let serialize_start = std::time::Instant::now();
+    let result = serde_json::to_string(&query_value).map_err(|e| anyhow::anyhow!("Failed to serialize fixed query: {}", e))?;
+    debug_println!("RUST DEBUG: ⏱️ JSON serialization completed [TIMING: {}ms]", serialize_start.elapsed().as_millis());
+    
+    debug_println!("RUST DEBUG: ⏱️ fix_range_query_types COMPLETED [TOTAL TIMING: {}ms]", fix_start.elapsed().as_millis());
+    Ok(result)
 }
 
 /// Recursively fix range queries in a JSON value

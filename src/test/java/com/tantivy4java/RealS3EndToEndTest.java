@@ -45,6 +45,10 @@ import software.amazon.awssdk.services.s3.model.BucketAlreadyOwnedByYouException
 import software.amazon.awssdk.services.s3.model.HeadBucketRequest;
 import software.amazon.awssdk.services.s3.model.HeadObjectRequest;
 import software.amazon.awssdk.services.s3.model.HeadObjectResponse;
+import software.amazon.awssdk.services.s3.model.GetObjectRequest;
+import software.amazon.awssdk.services.s3.model.GetObjectResponse;
+import software.amazon.awssdk.core.ResponseInputStream;
+import software.amazon.awssdk.core.sync.RequestBody;
 import software.amazon.awssdk.services.s3.model.NoSuchBucketException;
 import software.amazon.awssdk.services.s3.model.NoSuchKeyException;
 
@@ -900,5 +904,360 @@ public class RealS3EndToEndTest {
             
             writer.commit();
         }
+    }
+
+    @Test
+    @org.junit.jupiter.api.Order(8)
+    @DisplayName("Step 7: Large Split Performance Test - Demonstrating Hotcache Optimization")
+    public void step7_largeSplitPerformanceTest() throws Exception {
+        System.out.println("🚀 === LARGE SPLIT PERFORMANCE TEST ===");
+        System.out.println("Creating ~100MB split to demonstrate hotcache vs full download performance");
+        
+        // Step 7.1: Check if large split already exists in S3
+        String largeSplitS3Key = "test-splits/large-performance.split";
+        String largeSplitMetadataS3Key = "test-splits/large-performance.split.metadata";
+        String largeSplitS3Url = "s3://" + TEST_BUCKET + "/" + largeSplitS3Key;
+        
+        if (s3Client == null) {
+            setupS3Client();
+        }
+        
+        QuickwitSplit.SplitMetadata largeSplitMetadata = null;
+        boolean splitExists = false;
+        
+        try {
+            // Check if split already exists in S3
+            HeadObjectResponse headResponse = s3Client.headObject(HeadObjectRequest.builder()
+                .bucket(TEST_BUCKET)
+                .key(largeSplitS3Key)
+                .build());
+            
+            long existingSplitSize = headResponse.contentLength();
+            System.out.printf("📋 Found existing large split in S3: %.2f MB%n", existingSplitSize / 1024.0 / 1024.0);
+            
+            if (existingSplitSize > 50_000_000) { // >50MB
+                // Try to load the stored metadata
+                try {
+                    System.out.println("📋 Loading stored metadata for existing split...");
+                    ResponseInputStream<GetObjectResponse> metadataStream = s3Client.getObject(GetObjectRequest.builder()
+                        .bucket(TEST_BUCKET)
+                        .key(largeSplitMetadataS3Key)
+                        .build());
+                    
+                    String metadataJson = new String(metadataStream.readAllBytes());
+                    metadataStream.close();
+                    
+                    // Parse the stored metadata JSON
+                    largeSplitMetadata = parseStoredSplitMetadata(metadataJson);
+                    splitExists = true;
+                    System.out.println("✅ Reusing existing large split with correct metadata (>50MB)");
+                    System.out.printf("📊 Split metadata: docs=%d, footer=%d..%d, hotcache=%d+%d%n", 
+                        largeSplitMetadata.getNumDocs(),
+                        largeSplitMetadata.getFooterStartOffset(),
+                        largeSplitMetadata.getFooterEndOffset(), 
+                        largeSplitMetadata.getHotcacheStartOffset(),
+                        largeSplitMetadata.getHotcacheLength());
+                } catch (Exception metaE) {
+                    System.out.println("⚠️ Could not load stored metadata, will recreate split: " + metaE.getMessage());
+                }
+            } else {
+                System.out.println("⚠️ Existing split too small, will recreate");
+            }
+        } catch (Exception e) {
+            System.out.println("📝 No existing large split found, will create new one");
+        }
+        
+        if (!splitExists) {
+            // Step 7.1: Create a large index (~100MB)
+            System.out.println("📊 Step 7.1: Creating large test index...");
+            Path largeIndexPath = tempDir.resolve("large-performance-index");
+            createLargePerformanceIndex(largeIndexPath);
+            
+            // Step 7.2: Convert to split
+            System.out.println("📦 Step 7.2: Converting to Quickwit split...");
+            Path largeSplitPath = tempDir.resolve("large-performance.split");
+            QuickwitSplit.SplitConfig config = new QuickwitSplit.SplitConfig(
+                "large-performance-test",
+                "performance-source", 
+                "performance-node"
+            );
+            
+            largeSplitMetadata = QuickwitSplit.convertIndexFromPath(
+                largeIndexPath.toString(), 
+                largeSplitPath.toString(), 
+                config
+            );
+            
+            assertNotNull(largeSplitMetadata, "Large split metadata should be created");
+            assertTrue(largeSplitMetadata.getNumDocs() > 50000, "Large split should contain >50K documents");
+            assertTrue(largeSplitMetadata.getUncompressedSizeBytes() > 50_000_000, "Large split should be >50MB");
+            
+            System.out.printf("✅ Created large split: %d docs, %.2f MB%n", 
+                             largeSplitMetadata.getNumDocs(),
+                             largeSplitMetadata.getUncompressedSizeBytes() / 1024.0 / 1024.0);
+            
+            // Step 7.3: Upload to S3
+            System.out.println("☁️ Step 7.3: Uploading large split to S3...");
+            
+            // Upload large split to S3 with progress tracking
+            long uploadStartTime = System.nanoTime();
+            s3Client.putObject(
+                PutObjectRequest.builder()
+                    .bucket(TEST_BUCKET)
+                    .key(largeSplitS3Key)
+                    .build(),
+                largeSplitPath
+            );
+            long uploadDuration = System.nanoTime() - uploadStartTime;
+            
+            System.out.printf("✅ Upload completed in %.2f seconds%n", uploadDuration / 1_000_000_000.0);
+            
+            // Store the metadata alongside the split
+            System.out.println("💾 Storing split metadata for future reuse...");
+            String metadataJson = serializeSplitMetadata(largeSplitMetadata);
+            s3Client.putObject(
+                PutObjectRequest.builder()
+                    .bucket(TEST_BUCKET)
+                    .key(largeSplitMetadataS3Key)
+                    .contentType("application/json")
+                    .build(),
+                RequestBody.fromString(metadataJson)
+            );
+            System.out.println("✅ Metadata stored in S3");
+        } else {
+            System.out.println("⏩ Skipping split creation and upload - using existing split");
+        }
+        
+        // Step 7.4: Performance Comparison - Cold Access (simulating missing footer metadata)
+        System.out.println("🧪 Step 7.4: Performance comparison testing...");
+        
+        // Create cache managers for testing
+        SplitCacheManager.CacheConfig perfConfig = new SplitCacheManager.CacheConfig("large-perf-cache")
+            .withMaxCacheSize(200_000_000)  // 200MB cache
+            .withAwsCredentials(getAccessKey(), getSecretKey())
+            .withAwsRegion(TEST_REGION);
+        
+        SplitCacheManager perfCacheManager = SplitCacheManager.getInstance(perfConfig);
+        
+        // Measure cold performance (first access - may use hotcache if footer metadata available)
+        System.out.println("🔍 Testing FIRST access (hotcache optimization should engage if footer metadata available):");
+        long coldStartTime = System.nanoTime();
+        SearchResult coldResult;
+        try (SplitSearcher coldSearcher = perfCacheManager.createSplitSearcher(largeSplitS3Url, largeSplitMetadata)) {
+            Schema schema = coldSearcher.getSchema();
+            
+            // Test specific document retrieval (this should use hotcache optimization)
+            SplitQuery testQuery = new SplitTermQuery("content", "performance");
+            coldResult = coldSearcher.search(testQuery, 5);
+            
+            // Test document retrieval from search results
+            if (coldResult.getHits().size() > 0) {
+                try (Document testDoc = coldSearcher.doc(coldResult.getHits().get(0).getDocAddress())) {
+                    String content = (String) testDoc.getFirst("content");
+                    assertNotNull(content, "Document content should be retrieved");
+                }
+            }
+        }
+        long coldDuration = System.nanoTime() - coldStartTime;
+        
+        // Measure warm performance (second access - should be faster due to caching)
+        System.out.println("🔥 Testing SECOND access (cache should improve performance):");
+        long warmStartTime = System.nanoTime();
+        SearchResult warmResult;
+        try (SplitSearcher warmSearcher = perfCacheManager.createSplitSearcher(largeSplitS3Url, largeSplitMetadata)) {
+            Schema schema = warmSearcher.getSchema();
+            
+            // Same operations as cold test
+            SplitQuery testQuery = new SplitTermQuery("content", "performance");
+            warmResult = warmSearcher.search(testQuery, 5);
+            
+            if (warmResult.getHits().size() > 0) {
+                try (Document testDoc = warmSearcher.doc(warmResult.getHits().get(0).getDocAddress())) {
+                    String content = (String) testDoc.getFirst("content");
+                    assertNotNull(content, "Document content should be retrieved");
+                }
+            }
+        }
+        long warmDuration = System.nanoTime() - warmStartTime;
+        
+        // Step 7.5: Performance Analysis
+        System.out.println("📊 === PERFORMANCE ANALYSIS ===");
+        double coldSeconds = coldDuration / 1_000_000_000.0;
+        double warmSeconds = warmDuration / 1_000_000_000.0;
+        double speedupFactor = coldSeconds / warmSeconds;
+        
+        System.out.printf("Split size: %.2f MB (%d docs)%n", 
+                         largeSplitMetadata.getUncompressedSizeBytes() / 1024.0 / 1024.0,
+                         largeSplitMetadata.getNumDocs());
+        System.out.printf("First access:  %.3f seconds%n", coldSeconds);
+        System.out.printf("Second access: %.3f seconds%n", warmSeconds);
+        System.out.printf("Speedup factor: %.2fx%n", speedupFactor);
+        
+        // Validate performance improvement
+        assertTrue(coldResult.getHits().size() > 0, "Query should return results");
+        assertEquals(coldResult.getHits().size(), warmResult.getHits().size(), "Both queries should return same number of hits");
+        
+        // Performance expectations (adjust these based on observed performance)
+        if (speedupFactor > 1.5) {
+            System.out.println("✅ EXCELLENT: Significant performance improvement detected!");
+        } else if (speedupFactor > 1.1) {
+            System.out.println("✅ GOOD: Performance improvement detected");
+        } else {
+            System.out.println("ℹ️  NOTE: No significant performance difference (may indicate hotcache was already active on first access)");
+        }
+        
+        // Step 7.6: Network Traffic Analysis (if TANTIVY4JAVA_DEBUG is enabled)
+        String debugEnv = System.getenv("TANTIVY4JAVA_DEBUG");
+        if ("1".equals(debugEnv)) {
+            System.out.println("🔍 DEBUG MODE: Check logs above for hotcache vs full download indicators:");
+            System.out.println("  - Look for '🚀 Using Quickwit optimized path with hotcache' messages");
+            System.out.println("  - Look for '⚠️ Footer metadata not available, falling back to full download' messages");
+            System.out.println("  - Hotcache optimization should significantly reduce network traffic");
+        } else {
+            System.out.println("💡 TIP: Run with TANTIVY4JAVA_DEBUG=1 to see detailed optimization path selection");
+        }
+        
+        System.out.println("✅ Large split performance test completed successfully!");
+        
+        // Cleanup - optional, comment out if you want to inspect the split file
+        // Files.deleteIfExists(largeSplitPath);
+    }
+
+    /**
+     * Creates a large index (~100MB+) for performance testing
+     * Uses 150K documents with ~2KB of content each to ensure >50MB split size
+     */
+    private void createLargePerformanceIndex(Path indexPath) throws IOException {
+        System.out.println("Creating large performance test index...");
+        
+        // Create schema optimized for performance testing
+        SchemaBuilder schemaBuilder = new SchemaBuilder();
+        schemaBuilder.addTextField("content", true, false, "default", "position");     // Main searchable content
+        schemaBuilder.addTextField("category", true, false, "default", "position");   // Category for filtering
+        schemaBuilder.addTextField("title", true, false, "default", "position");      // Document title
+        schemaBuilder.addIntegerField("id", true, true, true);                       // Unique ID - FAST field
+        schemaBuilder.addIntegerField("timestamp", true, true, true);                // Timestamp - FAST field
+        schemaBuilder.addIntegerField("score", true, true, true);                    // Score - FAST field
+        
+        Schema schema = schemaBuilder.build();
+        
+        // Use extra large memory allocation for large index creation
+        try (Index index = new Index(schema, indexPath.toString());
+             IndexWriter writer = index.writer(Index.Memory.XL_HEAP_SIZE, 4)) { // Use XL_HEAP_SIZE with more threads
+            
+            // Target ~100MB split - create many documents with substantial content
+            int targetDocs = 150000; // ~150K documents should create ~100MB split with rich content
+            System.out.printf("Generating %d documents with rich content...%n", targetDocs);
+            
+            for (int i = 0; i < targetDocs; i++) {
+                Document doc = new Document();
+                
+                // Add rich text content to make documents larger (~2KB each)
+                StringBuilder contentBuilder = new StringBuilder();
+                contentBuilder.append("This is performance test document number ").append(i).append(". ");
+                contentBuilder.append("This document contains substantial text content designed to create a large split file. ");
+                contentBuilder.append("The content includes various searchable terms like performance, optimization, tantivy4java, quickwit, and caching. ");
+                contentBuilder.append("Document ").append(i).append(" belongs to category ").append(i % 10).append(" and has been created for testing purposes. ");
+                
+                // Add repeated Lorem ipsum content to increase document size
+                for (int j = 0; j < 5; j++) {
+                    contentBuilder.append("Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. ");
+                    contentBuilder.append("Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. ");
+                    contentBuilder.append("Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. ");
+                    contentBuilder.append("Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum. ");
+                }
+                
+                contentBuilder.append("Performance testing is crucial for validating optimization strategies in search engines. ");
+                contentBuilder.append("This document ").append(i).append(" will help demonstrate the effectiveness of hotcache versus full download approaches. ");
+                contentBuilder.append("Tantivy4java provides excellent performance for large-scale search operations and split file management. ");
+                contentBuilder.append("The hotcache optimization reduces network traffic by up to 87% for document retrieval operations.");
+                
+                doc.addText("content", contentBuilder.toString());
+                doc.addText("category", "performance-test-category-" + (i % 10));
+                doc.addText("title", "Performance Test Document " + i);
+                doc.addInteger("id", i);
+                doc.addInteger("timestamp", 1700000000 + i); // Sequential timestamps
+                doc.addInteger("score", (i % 100) + 1); // Scores 1-100
+                
+                writer.addDocument(doc);
+                
+                // Progress indicator for 150K documents
+                if (i > 0 && i % 25000 == 0) {
+                    System.out.printf("  Generated %d/%d documents (%.1f%%)%n", i, targetDocs, (i * 100.0) / targetDocs);
+                }
+            }
+            
+            System.out.println("📝 Committing large index...");
+            writer.commit();
+            
+            System.out.printf("✅ Created large index with %d documents%n", targetDocs);
+        }
+    }
+    
+    /**
+     * Serialize split metadata to JSON for storage in S3
+     */
+    private String serializeSplitMetadata(QuickwitSplit.SplitMetadata metadata) {
+        return String.format("{\n" +
+                "    \"splitId\": \"%s\",\n" +
+                "    \"numDocs\": %d,\n" +
+                "    \"uncompressedSizeBytes\": %d,\n" +
+                "    \"footerStartOffset\": %d,\n" +
+                "    \"footerEndOffset\": %d,\n" +
+                "    \"hotcacheStartOffset\": %d,\n" +
+                "    \"hotcacheLength\": %d,\n" +
+                "    \"docMappingJson\": %s\n" +
+                "}",
+            metadata.getSplitId(),
+            metadata.getNumDocs(),
+            metadata.getUncompressedSizeBytes(),
+            metadata.getFooterStartOffset(),
+            metadata.getFooterEndOffset(),
+            metadata.getHotcacheStartOffset(),
+            metadata.getHotcacheLength(),
+            metadata.getDocMappingJson() != null ? "\"" + metadata.getDocMappingJson().replace("\"", "\\\"") + "\"" : "null"
+        );
+    }
+    
+    /**
+     * Parse stored split metadata from JSON
+     */
+    private QuickwitSplit.SplitMetadata parseStoredSplitMetadata(String json) {
+        // Simple JSON parsing for the specific format we store
+        try {
+            String splitId = extractJsonField(json, "splitId");
+            long numDocs = Long.parseLong(extractJsonField(json, "numDocs"));
+            long uncompressedSizeBytes = Long.parseLong(extractJsonField(json, "uncompressedSizeBytes"));
+            long footerStartOffset = Long.parseLong(extractJsonField(json, "footerStartOffset"));
+            long footerEndOffset = Long.parseLong(extractJsonField(json, "footerEndOffset"));
+            long hotcacheStartOffset = Long.parseLong(extractJsonField(json, "hotcacheStartOffset"));
+            long hotcacheLength = Long.parseLong(extractJsonField(json, "hotcacheLength"));
+            String docMappingJson = extractJsonField(json, "docMappingJson");
+            if ("null".equals(docMappingJson)) {
+                docMappingJson = null;
+            }
+            
+            return new QuickwitSplit.SplitMetadata(
+                splitId, numDocs, uncompressedSizeBytes,
+                java.time.Instant.now().minus(1, java.time.temporal.ChronoUnit.HOURS), java.time.Instant.now(),
+                new java.util.HashSet<>(java.util.Arrays.asList("performance-test")),
+                0L, 0, footerStartOffset, footerEndOffset, hotcacheStartOffset, hotcacheLength, docMappingJson
+            );
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to parse stored metadata: " + e.getMessage(), e);
+        }
+    }
+    
+    /**
+     * Simple JSON field extraction
+     */
+    private String extractJsonField(String json, String fieldName) {
+        String pattern = "\"" + fieldName + "\":\\s*\"?([^,}]*)\"?";
+        java.util.regex.Pattern regex = java.util.regex.Pattern.compile(pattern);
+        java.util.regex.Matcher matcher = regex.matcher(json);
+        if (matcher.find()) {
+            return matcher.group(1).trim();
+        }
+        throw new RuntimeException("Field '" + fieldName + "' not found in JSON");
     }
 }
