@@ -1030,22 +1030,61 @@ fn retrieve_document_from_split_optimized(
                     std::path::Path::new(split_uri)
                 };
                 
-                // Get the full file data using Quickwit's storage abstraction for document retrieval
-                // (We need BundleDirectory for synchronous document access, not StorageDirectory)
-                let file_size = index_storage.file_num_bytes(relative_path).await
-                    .map_err(|e| anyhow::anyhow!("Failed to get file size for {}: {}", split_uri, e))?;
-
-                let split_data = index_storage.get_slice(relative_path, 0..file_size as usize).await
-                    .map_err(|e| anyhow::anyhow!("Failed to get split data from {}: {}", split_uri, e))?;
-
-                let split_file_slice = tantivy::directory::FileSlice::new(std::sync::Arc::new(split_data));
-                let bundle_directory = quickwit_directories::BundleDirectory::open_split(split_file_slice)
-                    .map_err(|e| anyhow::anyhow!("Failed to open bundle directory {}: {}", split_uri, e))?;
+                // 🚀 INDIVIDUAL DOC OPTIMIZATION: Use same hotcache optimization as batch retrieval
+                let mut index = if has_footer_metadata(*footer_start, *footer_end) && is_remote_split(split_uri) {
+                    debug_println!("RUST DEBUG: 🚀 Using Quickwit optimized path for individual document retrieval (footer: {}..{})", footer_start, footer_end);
                     
-                let index_creation_start = std::time::Instant::now();
-                let mut index = tantivy::Index::open(bundle_directory)
-                    .map_err(|e| anyhow::anyhow!("Failed to open index from bundle {}: {}", split_uri, e))?;
-                debug_println!("RUST DEBUG: ⏱️ 📖 BundleDirectory index creation completed [TIMING: {}ms]", index_creation_start.elapsed().as_millis());
+                    use quickwit_proto::search::SplitIdAndFooterOffsets;
+                    use quickwit_search::leaf::open_index_with_caches;
+                    
+                    // Create SplitIdAndFooterOffsets for Quickwit's open_index_with_caches
+                    let footer_offsets = SplitIdAndFooterOffsets {
+                        split_id: extract_split_id_from_uri(split_uri),
+                        split_footer_start: *footer_start,
+                        split_footer_end: *footer_end,
+                        timestamp_start: Some(0),
+                        timestamp_end: Some(i64::MAX),
+                        num_docs: 0, // Will be filled by Quickwit
+                    };
+                    
+                    // Create minimal SearcherContext for Quickwit functions
+                    let searcher_context = create_minimal_searcher_context()
+                        .map_err(|e| anyhow::anyhow!("Failed to create searcher context: {}", e))?;
+                    
+                    // ✅ Use Quickwit's proven function with hotcache optimization
+                    let index_creation_start = std::time::Instant::now();
+                    let (index, _hot_directory) = open_index_with_caches(
+                        &searcher_context,
+                        index_storage.clone(),
+                        &footer_offsets,
+                        None, // tokenizer_manager
+                        None  // No ephemeral cache
+                    ).await.map_err(|e| anyhow::anyhow!("Quickwit individual open_index_with_caches failed: {}", e))?;
+                    
+                    debug_println!("RUST DEBUG: ⏱️ 📖 Quickwit hotcache index creation completed [TIMING: {}ms]", index_creation_start.elapsed().as_millis());
+                    debug_println!("RUST DEBUG: ✅ Successfully opened index with Quickwit hotcache optimization for individual document retrieval");
+                    index
+                } else {
+                    debug_println!("RUST DEBUG: ⚠️ Footer metadata not available for individual document retrieval, falling back to full download");
+                    
+                    // Fallback: Get the full file data using Quickwit's storage abstraction for document retrieval
+                    // (We need BundleDirectory for synchronous document access, not StorageDirectory)
+                    let file_size = index_storage.file_num_bytes(relative_path).await
+                        .map_err(|e| anyhow::anyhow!("Failed to get file size for {}: {}", split_uri, e))?;
+
+                    let split_data = index_storage.get_slice(relative_path, 0..file_size as usize).await
+                        .map_err(|e| anyhow::anyhow!("Failed to get split data from {}: {}", split_uri, e))?;
+
+                    let split_file_slice = tantivy::directory::FileSlice::new(std::sync::Arc::new(split_data));
+                    let bundle_directory = quickwit_directories::BundleDirectory::open_split(split_file_slice)
+                        .map_err(|e| anyhow::anyhow!("Failed to open bundle directory {}: {}", split_uri, e))?;
+                        
+                    let index_creation_start = std::time::Instant::now();
+                    let mut index = tantivy::Index::open(bundle_directory)
+                        .map_err(|e| anyhow::anyhow!("Failed to open index from bundle {}: {}", split_uri, e))?;
+                    debug_println!("RUST DEBUG: ⏱️ 📖 BundleDirectory fallback index creation completed [TIMING: {}ms]", index_creation_start.elapsed().as_millis());
+                    index
+                };
                 
                 // Use the same Quickwit optimizations as our batch method
                 let tantivy_executor = search_thread_pool()
@@ -1076,11 +1115,12 @@ fn retrieve_document_from_split_optimized(
                 debug_println!("RUST DEBUG: ⏱️ 📖 Searcher caching completed [TIMING: {}ms]", caching_start.elapsed().as_millis());
                 debug_println!("RUST DEBUG: ⏱️ 📖 TOTAL INDEX OPENING completed [TIMING: {}ms]", index_opening_start.elapsed().as_millis());
                 
-                // Retrieve the document
+                // Retrieve the document using async method (same as batch retrieval for StorageDirectory compatibility)
                 let doc_retrieval_start = std::time::Instant::now();
-                let doc = searcher.doc(doc_address)
+                let doc = searcher.doc_async(doc_address)
+                    .await
                     .map_err(|e| anyhow::anyhow!("Failed to retrieve document: {}", e))?;
-                let schema = searcher.schema();
+                let schema = index.schema();
                 debug_println!("RUST DEBUG: ⏱️ 📖 Document retrieval completed [TIMING: {}ms]", doc_retrieval_start.elapsed().as_millis());
                 
                 Ok::<(tantivy::schema::TantivyDocument, tantivy::schema::Schema), anyhow::Error>((doc, schema.clone()))
