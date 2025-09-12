@@ -696,7 +696,22 @@ pub extern "system" fn Java_com_tantivy4java_QuickwitSplit_nativeReadSplitMetada
         let split_data = std::fs::read(path)?;
         let owned_bytes = OwnedBytes::new(split_data);
         
-        // Parse the split using Quickwit's BundleStorage
+        // Create BundleDirectory directly from the split data to extract Tantivy index
+        let split_file_slice = tantivy::directory::FileSlice::new(std::sync::Arc::new(owned_bytes.clone()));
+        let bundle_directory = quickwit_directories::BundleDirectory::open_split(split_file_slice)
+            .map_err(|e| anyhow!("Failed to open bundle directory: {}", e))?;
+        
+        // Open the Tantivy index from the bundle directory
+        let tantivy_index = tantivy::Index::open(bundle_directory)
+            .map_err(|e| anyhow!("Failed to open Tantivy index from bundle: {}", e))?;
+        
+        // Extract doc mapping JSON from the Tantivy index schema
+        let doc_mapping_json = extract_doc_mapping_from_index(&tantivy_index)
+            .map_err(|e| anyhow!("Failed to extract doc mapping from split index: {}", e))?;
+        
+        debug_log!("Successfully extracted doc mapping from split ({} bytes)", doc_mapping_json.len());
+        
+        // Parse the split using Quickwit's BundleStorage for file count (keeping for metadata)
         let ram_storage = std::sync::Arc::new(RamStorage::default());
         let bundle_path = std::path::PathBuf::from("temp.split");
         let (_hotcache, bundle_storage) = BundleStorage::open_from_split_data_with_owned_bytes(
@@ -727,8 +742,8 @@ pub extern "system" fn Java_com_tantivy4java_QuickwitSplit_nativeReadSplitMetada
             hotcache_start_offset: None,
             hotcache_length: None,
             
-            // Doc mapping JSON not available when reading existing split files
-            doc_mapping_json: None,
+            // Extract doc mapping JSON from the split's Tantivy index
+            doc_mapping_json: Some(doc_mapping_json),
         };
         
         debug_log!("Successfully read Quickwit split with {} files", file_count);

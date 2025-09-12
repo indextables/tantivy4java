@@ -107,6 +107,7 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_createNativeWithShare
     cache_manager_ptr: jlong,
     split_config_map: jobject,
 ) -> jlong {
+    eprintln!("🚀 SIMPLE DEBUG: createNativeWithSharedCache method called!");
     // Validate JString parameter first to prevent SIGSEGV
     if split_uri_jstr.is_null() {
         to_java_exception(&mut env, &anyhow::anyhow!("Split URI parameter is null"));
@@ -431,6 +432,9 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_searchWithQueryAst(
     query_ast_json: JString,
     limit: jint,
 ) -> jobject {
+    eprintln!("🚀 SIMPLE DEBUG: searchWithQueryAst method called!");
+    // Also use debug_println for consistency
+    debug_println!("🚀 NATIVE DEBUG: searchWithQueryAst ENTRY - This should show native method is being called!");
     let method_start_time = std::time::Instant::now();
     debug_println!("RUST DEBUG: ⏱️ searchWithQueryAst ENTRY POINT [TIMING START] - limit: {}", limit);
     
@@ -499,13 +503,16 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_searchWithQueryAst(
                 // This includes footer offsets, number of documents, and the doc mapper
                 
                 // Parse URI and resolve storage
+                let storage_setup_start = std::time::Instant::now();
+                debug_println!("RUST DEBUG: ⏱️ 🔧 SEARCH STORAGE SETUP - Starting storage resolution for: {}", split_uri);
+                
                 let uri: Uri = split_uri.parse()
                     .map_err(|e| anyhow::anyhow!("Failed to parse split URI {}: {}", split_uri, e))?;
                 
                 // Create S3 storage configuration with credentials from Java config
                 let mut storage_configs = StorageConfigs::default();
                 
-                debug_println!("RUST DEBUG: Creating S3 config with credentials from Java configuration");
+                debug_println!("RUST DEBUG: ⏱️ 🔧 Creating S3 config with credentials from Java configuration");
                 let s3_config = S3StorageConfig {
                     flavor: None,
                     access_key_id: aws_config.get("access_key").cloned(),
@@ -525,6 +532,7 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_searchWithQueryAst(
                 
                 // Use the helper function to resolve storage correctly for S3 URIs
                 let storage = resolve_storage_for_split(&storage_resolver, split_uri).await?;
+                debug_println!("RUST DEBUG: ⏱️ 🔧 SEARCH STORAGE SETUP completed [TIMING: {}ms]", storage_setup_start.elapsed().as_millis());
                 
                 // Extract relative path - for direct file paths, use just the filename
                 let relative_path = if split_uri.contains("://") {
@@ -544,31 +552,40 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_searchWithQueryAst(
                 
                 debug_println!("RUST DEBUG: Reading split file metadata from: '{}'", relative_path.display());
                 
-                // Get the full file data to extract metadata
-                let file_size = storage.file_num_bytes(relative_path).await
-                    .map_err(|e| anyhow::anyhow!("Failed to get file size for {}: {}", split_uri, e))?;
-                
-                debug_println!("RUST DEBUG: Split file size: {} bytes", file_size);
-                
-                // Use footer offsets from Java configuration instead of reading from file
+                // Use footer offsets from Java configuration for optimized access
                 let split_footer_start = *footer_start;
                 let split_footer_end = *footer_end;
                 
-                debug_println!("RUST DEBUG: Using footer offsets from Java config: fileSizeSJS={} start={}, end={}", file_size, split_footer_start, split_footer_end);
+                debug_println!("RUST DEBUG: 🚀 Using Quickwit optimized path with open_index_with_caches - NO full file download");
+                debug_println!("RUST DEBUG: Footer offsets from Java config: start={}, end={}", split_footer_start, split_footer_end);
                 
-                // Now open the split to get the actual index and extract metadata
-                let split_data = storage.get_slice(relative_path, 0..file_size as usize).await
-                    .map_err(|e| anyhow::anyhow!("Failed to get split data from {}: {}", split_uri, e))?;
-                
-                let split_file_slice = FileSlice::new(std::sync::Arc::new(split_data));
-                
-                // Open the bundle directory to access the index
-                let bundle_directory = BundleDirectory::open_split(split_file_slice)
-                    .map_err(|e| anyhow::anyhow!("Failed to open bundle directory {}: {}", split_uri, e))?;
+                // Create SplitIdAndFooterOffsets for Quickwit optimization
+                let split_id = relative_path.file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("unknown");
                     
-                // Open the index to get actual metadata
-                let index = tantivy::Index::open(bundle_directory)
-                    .map_err(|e| anyhow::anyhow!("Failed to open index from bundle {}: {}", split_uri, e))?;
+                let split_and_footer_offsets = quickwit_proto::search::SplitIdAndFooterOffsets {
+                    split_id: split_id.to_string(),
+                    split_footer_start,
+                    split_footer_end,
+                    num_docs: 0, // Not used for opening, will be filled later
+                    timestamp_start: None,
+                    timestamp_end: None,
+                };
+                
+                // Create proper SearcherContext for Quickwit functions
+                let quickwit_searcher_context = crate::global_cache::get_global_searcher_context();
+                
+                // Use Quickwit's complete optimized index opening (does all the work!)
+                let (index, _hot_directory) = quickwit_search::leaf::open_index_with_caches(
+                    &quickwit_searcher_context,
+                    storage.clone(),
+                    &split_and_footer_offsets,
+                    None, // tokenizer_manager
+                    None, // ephemeral_unbounded_cache
+                ).await.map_err(|e| anyhow::anyhow!("Failed to open index with caches {}: {}", split_uri, e))?;
+                
+                debug_println!("RUST DEBUG: ✅ Quickwit optimized index opening completed successfully");
                 
                 // Get the actual number of documents from the index
                 let reader = index.reader().map_err(|e| anyhow::anyhow!("Failed to create index reader: {}", e))?;
@@ -591,7 +608,7 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_searchWithQueryAst(
                     split_id: split_id.clone(),
                     split_footer_start,
                     split_footer_end,
-                    file_size, // Use the actual file size from storage.file_num_bytes()
+                    file_size: split_footer_end, // Footer end is effectively the file size
                     time_range: None, // TODO: Extract from split metadata if available
                     delete_opstamp: 0,
                     num_docs,
@@ -671,17 +688,18 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_searchWithQueryAst(
                     count_hits: quickwit_proto::search::CountHits::CountAll as i32,
                 };
                 
-                debug_println!("RUST DEBUG: Calling StandaloneSearcher.search_split_sync with REAL parameters:");
+                debug_println!("RUST DEBUG: ⏱️ 🔍 SEARCH EXECUTION - Calling StandaloneSearcher.search_split_sync with parameters:");
                 debug_println!("  - Split URI: {}", split_uri);
                 debug_println!("  - Split ID: {}", split_metadata.split_id);
                 debug_println!("  - Num docs: {}", split_metadata.num_docs);
                 debug_println!("  - Footer offsets: {}-{}", split_metadata.split_footer_start, split_metadata.split_footer_end);
-                // debug_println!("RUST DEBUG: About to call searcher.search_split()...");
                 
                 // PERFORM THE ACTUAL REAL SEARCH WITH NO MOCKING!
+                let search_exec_start = std::time::Instant::now();
+                debug_println!("RUST DEBUG: ⏱️ 🔍 Starting actual search execution via searcher.search_split()");
+                
                 // We're already in an async context, so use the async method directly
                 let split_id_for_error = split_metadata.split_id.clone();
-                // debug_println!("RUST DEBUG: Calling searcher.search_split() NOW!");
                 let leaf_search_response = match searcher.search_split(
                     split_uri,
                     split_metadata,
@@ -690,14 +708,14 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_searchWithQueryAst(
                 ).await {
                     Ok(response) => response,
                     Err(e) => {
-                        debug_println!("RUST DEBUG: ERROR in searcher.search_split: {}", e);
+                        debug_println!("RUST DEBUG: ⏱️ 🔍 ERROR in searcher.search_split [TIMING: {}ms]: {}", search_exec_start.elapsed().as_millis(), e);
                         debug_println!("RUST DEBUG: Full error chain: {:#}", e);
                         // Propagate the full error chain to Java
                         return Err(anyhow::anyhow!("{:#}", e));
                     }
                 };
                 
-                debug_println!("RUST DEBUG: REAL SEARCH COMPLETED! Found {} hits from StandaloneSearcher", leaf_search_response.num_hits);
+                debug_println!("RUST DEBUG: ⏱️ 🔍 SEARCH EXECUTION completed [TIMING: {}ms] - Found {} hits", search_exec_start.elapsed().as_millis(), leaf_search_response.num_hits);
                 
                 // Convert LeafSearchResponse to SearchResult format
                 let mut search_results: Vec<(f32, tantivy::DocAddress)> = Vec::new();
@@ -896,30 +914,41 @@ fn retrieve_document_from_split_optimized(
     searcher_ptr: jlong,
     doc_address: tantivy::DocAddress,
 ) -> Result<(tantivy::schema::TantivyDocument, tantivy::schema::Schema), anyhow::Error> {
+    let function_start = std::time::Instant::now();
+    debug_println!("RUST DEBUG: ⏱️ 🚀 retrieve_document_from_split_optimized ENTRY [TIMING START]");
+    
     use crate::utils::with_arc_safe;
     
     // Get split URI from the searcher context
+    let uri_extraction_start = std::time::Instant::now();
     let split_uri = with_arc_safe(searcher_ptr, |searcher_context: &Arc<(StandaloneSearcher, tokio::runtime::Runtime, String, std::collections::HashMap<String, String>, u64, u64, Option<String>)>| {
         let (_, _, split_uri, _, _, _, _) = searcher_context.as_ref();
         split_uri.clone()
     }).ok_or_else(|| anyhow::anyhow!("Invalid searcher context"))?;
+    debug_println!("RUST DEBUG: ⏱️ Split URI extraction completed [TIMING: {}ms]", uri_extraction_start.elapsed().as_millis());
     
     // Check cache first - simple and effective
+    let cache_check_start = std::time::Instant::now();
     let searcher_cache = get_searcher_cache();
     let cached_searcher = {
         let cache = searcher_cache.lock().unwrap();
         cache.get(&split_uri).cloned()
     };
+    debug_println!("RUST DEBUG: ⏱️ Cache lookup completed [TIMING: {}ms] - cache_hit: {}", cache_check_start.elapsed().as_millis(), cached_searcher.is_some());
     
     if let Some(searcher) = cached_searcher {
         // Use cached searcher - very fast path (cache hit)
+        let cache_hit_start = std::time::Instant::now();
+        debug_println!("RUST DEBUG: ⏱️ 🎯 CACHE HIT - using cached searcher for document retrieval");
         let doc = searcher.doc(doc_address)
             .map_err(|e| anyhow::anyhow!("Failed to retrieve document: {}", e))?;
         let schema = searcher.schema();
+        debug_println!("RUST DEBUG: ⏱️ ✅ CACHE HIT document retrieval completed [TIMING: {}ms] [TOTAL: {}ms]", cache_hit_start.elapsed().as_millis(), function_start.elapsed().as_millis());
         return Ok((doc, schema.clone()));
     }
     
     // Cache miss - create searcher using the same optimizations as our batch method
+    debug_println!("RUST DEBUG: ⏱️ ⚠️ CACHE MISS - creating new searcher (EXPENSIVE OPERATION)");
     let result = with_arc_safe(searcher_ptr, |searcher_context: &Arc<(StandaloneSearcher, tokio::runtime::Runtime, String, std::collections::HashMap<String, String>, u64, u64, Option<String>)>| {
         let (standalone_searcher, runtime, split_uri, aws_config, footer_start, footer_end, _doc_mapping) = searcher_context.as_ref();
         
@@ -969,15 +998,18 @@ fn retrieve_document_from_split_optimized(
                 
                 // Create storage that points to the directory containing the split (not the split file itself)
                 // This is what open_index_with_caches expects
+                let storage_resolution_start = std::time::Instant::now();
                 let split_dir_uri = if let Some(last_slash_pos) = split_uri.rfind('/') {
                     &split_uri[..last_slash_pos + 1] // Include the trailing slash
                 } else {
                     split_uri // If no slash, use the full URI as directory
                 };
+                debug_println!("RUST DEBUG: ⏱️ 🔧 STORAGE RESOLUTION - Creating S3 storage configuration");
                 
                 let storage_configs = StorageConfigs::new(vec![quickwit_config::StorageConfig::S3(s3_config.clone())]);
                 let storage_resolver = StorageResolver::configured(&storage_configs);
                 let index_storage = resolve_storage_for_split(&storage_resolver, split_dir_uri).await?;
+                debug_println!("RUST DEBUG: ⏱️ 🔧 STORAGE RESOLUTION completed [TIMING: {}ms]", storage_resolution_start.elapsed().as_millis());
                 
                 // Use global SearcherContext for long-term shared caches (Quickwit pattern)
                 let searcher_context = crate::global_cache::get_global_searcher_context();
@@ -989,25 +1021,31 @@ fn retrieve_document_from_split_optimized(
                 
                 // Manual index opening with Quickwit caching components
                 // (open_index_with_caches expects Quickwit's native split format, but we use bundle format)
+                let index_opening_start = std::time::Instant::now();
+                debug_println!("RUST DEBUG: ⏱️ 📖 INDEX OPENING - Starting file download and index creation");
+                
                 let relative_path = if let Some(last_slash_pos) = split_uri.rfind('/') {
                     std::path::Path::new(&split_uri[last_slash_pos + 1..])
                 } else {
                     std::path::Path::new(split_uri)
                 };
                 
+                // Get the full file data using Quickwit's storage abstraction for document retrieval
+                // (We need BundleDirectory for synchronous document access, not StorageDirectory)
                 let file_size = index_storage.file_num_bytes(relative_path).await
                     .map_err(|e| anyhow::anyhow!("Failed to get file size for {}: {}", split_uri, e))?;
-                
-                // Use ByteRangeCache for storage operations (Quickwit pattern)
+
                 let split_data = index_storage.get_slice(relative_path, 0..file_size as usize).await
                     .map_err(|e| anyhow::anyhow!("Failed to get split data from {}: {}", split_uri, e))?;
-                
+
                 let split_file_slice = tantivy::directory::FileSlice::new(std::sync::Arc::new(split_data));
                 let bundle_directory = quickwit_directories::BundleDirectory::open_split(split_file_slice)
                     .map_err(|e| anyhow::anyhow!("Failed to open bundle directory {}: {}", split_uri, e))?;
                     
+                let index_creation_start = std::time::Instant::now();
                 let mut index = tantivy::Index::open(bundle_directory)
                     .map_err(|e| anyhow::anyhow!("Failed to open index from bundle {}: {}", split_uri, e))?;
+                debug_println!("RUST DEBUG: ⏱️ 📖 BundleDirectory index creation completed [TIMING: {}ms]", index_creation_start.elapsed().as_millis());
                 
                 // Use the same Quickwit optimizations as our batch method
                 let tantivy_executor = search_thread_pool()
@@ -1016,6 +1054,7 @@ fn retrieve_document_from_split_optimized(
                 index.set_executor(tantivy_executor);
                 
                 // Same cache settings as batch method
+                let searcher_creation_start = std::time::Instant::now();
                 const NUM_CONCURRENT_REQUESTS: usize = 30; // From fetch_docs.rs
                 let index_reader = index
                     .reader_builder()
@@ -1025,18 +1064,24 @@ fn retrieve_document_from_split_optimized(
                     .map_err(|e| anyhow::anyhow!("Failed to create index reader: {}", e))?;
                 
                 let searcher = Arc::new(index_reader.searcher());
+                debug_println!("RUST DEBUG: ⏱️ 📖 Searcher creation completed [TIMING: {}ms]", searcher_creation_start.elapsed().as_millis());
                 
                 // Cache the searcher for future single document retrievals
+                let caching_start = std::time::Instant::now();
                 {
                     let searcher_cache = get_searcher_cache();
                     let mut cache = searcher_cache.lock().unwrap();
                     cache.insert(split_uri.clone(), searcher.clone());
                 }
+                debug_println!("RUST DEBUG: ⏱️ 📖 Searcher caching completed [TIMING: {}ms]", caching_start.elapsed().as_millis());
+                debug_println!("RUST DEBUG: ⏱️ 📖 TOTAL INDEX OPENING completed [TIMING: {}ms]", index_opening_start.elapsed().as_millis());
                 
                 // Retrieve the document
+                let doc_retrieval_start = std::time::Instant::now();
                 let doc = searcher.doc(doc_address)
                     .map_err(|e| anyhow::anyhow!("Failed to retrieve document: {}", e))?;
                 let schema = searcher.schema();
+                debug_println!("RUST DEBUG: ⏱️ 📖 Document retrieval completed [TIMING: {}ms]", doc_retrieval_start.elapsed().as_millis());
                 
                 Ok::<(tantivy::schema::TantivyDocument, tantivy::schema::Schema), anyhow::Error>((doc, schema.clone()))
             })
@@ -1044,9 +1089,18 @@ fn retrieve_document_from_split_optimized(
     });
     
     match result {
-        Some(Ok(doc_and_schema)) => Ok(doc_and_schema),
-        Some(Err(e)) => Err(e),
-        None => Err(anyhow::anyhow!("Searcher context not found for pointer {}", searcher_ptr)),
+        Some(Ok(doc_and_schema)) => {
+            debug_println!("RUST DEBUG: ⏱️ ✅ CACHE MISS document retrieval completed [TOTAL: {}ms]", function_start.elapsed().as_millis());
+            Ok(doc_and_schema)
+        },
+        Some(Err(e)) => {
+            debug_println!("RUST DEBUG: ⏱️ ❌ CACHE MISS failed [TOTAL: {}ms] - Error: {}", function_start.elapsed().as_millis(), e);
+            Err(e)
+        },
+        None => {
+            debug_println!("RUST DEBUG: ⏱️ ❌ Invalid searcher context [TOTAL: {}ms]", function_start.elapsed().as_millis());
+            Err(anyhow::anyhow!("Searcher context not found for pointer {}", searcher_ptr))
+        },
     }
 }
 
@@ -1400,6 +1454,8 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_docNative(
     segment_ord: jint,
     doc_id: jint,
 ) -> jobject {
+    eprintln!("🚀 SIMPLE DEBUG: docNative method called!");
+    debug_println!("🚀 NATIVE DEBUG: docNative ENTRY - Document retrieval starting!");
     let method_start_time = std::time::Instant::now();
     debug_println!("RUST DEBUG: ⏱️ docNative ENTRY POINT [TIMING START] - segment_ord={}, doc_id={}", segment_ord, doc_id);
     
@@ -1491,6 +1547,7 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_getSchemaFromNative(
     _class: JClass,
     searcher_ptr: jlong,
 ) -> jlong {
+    eprintln!("🚀 SIMPLE DEBUG: getSchemaFromNative method called!");
     debug_println!("RUST DEBUG: *** getSchemaFromNative ENTRY POINT *** pointer: {}", searcher_ptr);
     
     if searcher_ptr == 0 {
@@ -1509,7 +1566,7 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_getSchemaFromNative(
 
     // Extract the actual schema from the split file using Quickwit's functionality
     let result = with_arc_safe(searcher_ptr, |searcher_context: &Arc<(StandaloneSearcher, tokio::runtime::Runtime, String, std::collections::HashMap<String, String>, u64, u64, Option<String>)>| {
-        let (_searcher, runtime, split_uri, aws_config, _footer_start, _footer_end, doc_mapping_json) = searcher_context.as_ref();
+        let (_searcher, runtime, split_uri, aws_config, footer_start, footer_end, doc_mapping_json) = searcher_context.as_ref();
         debug_println!("RUST DEBUG: getSchemaFromNative called with split URI: {} [TIMING: {}ms]", split_uri, method_start_time.elapsed().as_millis());
         
         // 🚀 OPTIMIZATION: Use doc mapping JSON if available instead of expensive I/O
@@ -1547,6 +1604,7 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_getSchemaFromNative(
         let fallback_start = std::time::Instant::now();
         debug_println!("RUST DEBUG: ⏱️ ⚠️ STARTING EXPENSIVE I/O FALLBACK [TIMING: {}ms]", method_start_time.elapsed().as_millis());
         let _guard = runtime.enter();
+        
         
         // Parse the split URI and extract schema using Quickwit's storage abstractions
         use quickwit_common::uri::Uri;
@@ -1613,7 +1671,7 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_getSchemaFromNative(
                 };
                 
                 debug_println!("RUST DEBUG: ⏱️ 🚀 USING QUICKWIT'S STANDARD HOTCACHE OPTIMIZATION [TIMING: {}ms]", method_start_time.elapsed().as_millis());
-                debug_println!("RUST DEBUG: Footer range: {} to {}", _footer_start, _footer_end);
+                debug_println!("RUST DEBUG: Footer range: {} to {}", footer_start, footer_end);
                 
                 // Use Quickwit's standard approach with proper hotcache optimization
                 let quickwit_setup_start = std::time::Instant::now();
@@ -1630,8 +1688,8 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_getSchemaFromNative(
                 // Create SplitIdAndFooterOffsets from our footer metadata
                 let split_and_footer_offsets = SplitIdAndFooterOffsets {
                     split_id,
-                    split_footer_start: *_footer_start,
-                    split_footer_end: *_footer_end,
+                    split_footer_start: *footer_start,
+                    split_footer_end: *footer_end,
                     timestamp_start: None,
                     timestamp_end: None,
                     num_docs: 0,

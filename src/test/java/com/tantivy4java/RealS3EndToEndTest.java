@@ -1039,49 +1039,96 @@ public class RealS3EndToEndTest {
         
         SplitCacheManager perfCacheManager = SplitCacheManager.getInstance(perfConfig);
         
-        // Measure cold performance (first access - may use hotcache if footer metadata available)
+        // Measure cold performance with detailed profiling
         System.out.println("🔍 Testing FIRST access (hotcache optimization should engage if footer metadata available):");
         long coldStartTime = System.nanoTime();
         SearchResult coldResult;
         try (SplitSearcher coldSearcher = perfCacheManager.createSplitSearcher(largeSplitS3Url, largeSplitMetadata)) {
+            
+            // Phase 1: Schema retrieval
+            long schemaStartTime = System.nanoTime();
             Schema schema = coldSearcher.getSchema();
+            long schemaEndTime = System.nanoTime();
+            System.out.printf("    📋 Schema retrieval: %.3f seconds%n", (schemaEndTime - schemaStartTime) / 1_000_000_000.0);
             
-            // Test specific document retrieval (this should use hotcache optimization)
+            // Phase 2: Query execution (includes warmup, index opening, search)
+            long searchStartTime = System.nanoTime();
+            
+            // Test multiple query types to exercise the full search pipeline
             SplitQuery testQuery = new SplitTermQuery("content", "performance");
-            coldResult = coldSearcher.search(testQuery, 5);
+            coldResult = coldSearcher.search(testQuery, 10);
             
-            // Test document retrieval from search results
+            // Additional queries to ensure warmup and hotcache are fully exercised
+            SplitQuery domainQuery = new SplitTermQuery("domain", "customers");
+            SearchResult domainResult = coldSearcher.search(domainQuery, 5);
+            
+            SplitQuery nameQuery = new SplitTermQuery("name", "customer");
+            SearchResult nameResult = coldSearcher.search(nameQuery, 3);
+            
+            long searchEndTime = System.nanoTime();
+            System.out.printf("    🔍 Query execution: %.3f seconds (includes warmup, index opening, 3 searches)%n", (searchEndTime - searchStartTime) / 1_000_000_000.0);
+            System.out.printf("      📊 Query results: %d + %d + %d hits%n", 
+                             coldResult.getHits().size(), domainResult.getHits().size(), nameResult.getHits().size());
+            
+            // Phase 3: Document retrieval from search results
             if (coldResult.getHits().size() > 0) {
+                long docStartTime = System.nanoTime();
                 try (Document testDoc = coldSearcher.doc(coldResult.getHits().get(0).getDocAddress())) {
                     String content = (String) testDoc.getFirst("content");
                     assertNotNull(content, "Document content should be retrieved");
+                    long docEndTime = System.nanoTime();
+                    System.out.printf("    📄 Document retrieval: %.3f seconds%n", (docEndTime - docStartTime) / 1_000_000_000.0);
                 }
             }
         }
         long coldDuration = System.nanoTime() - coldStartTime;
         
-        // Measure warm performance (second access - should be faster due to caching)
+        // Measure warm performance with detailed profiling
         System.out.println("🔥 Testing SECOND access (cache should improve performance):");
         long warmStartTime = System.nanoTime();
         SearchResult warmResult;
         try (SplitSearcher warmSearcher = perfCacheManager.createSplitSearcher(largeSplitS3Url, largeSplitMetadata)) {
+            
+            // Phase 1: Schema retrieval (should be faster due to caching)
+            long schemaStartTime = System.nanoTime();
             Schema schema = warmSearcher.getSchema();
+            long schemaEndTime = System.nanoTime();
+            System.out.printf("    📋 Schema retrieval: %.3f seconds (cached)%n", (schemaEndTime - schemaStartTime) / 1_000_000_000.0);
             
-            // Same operations as cold test
+            // Phase 2: Query execution (should be faster due to hotcache)
+            long searchStartTime = System.nanoTime();
+            
+            // Same query pattern as cold test to compare performance
             SplitQuery testQuery = new SplitTermQuery("content", "performance");
-            warmResult = warmSearcher.search(testQuery, 5);
+            warmResult = warmSearcher.search(testQuery, 10);
             
+            // Additional queries to test hotcache effectiveness
+            SplitQuery domainQuery = new SplitTermQuery("domain", "customers");
+            SearchResult domainResult = warmSearcher.search(domainQuery, 5);
+            
+            SplitQuery nameQuery = new SplitTermQuery("name", "customer");
+            SearchResult nameResult = warmSearcher.search(nameQuery, 3);
+            
+            long searchEndTime = System.nanoTime();
+            System.out.printf("    🔍 Query execution: %.3f seconds (with hotcache, 3 searches)%n", (searchEndTime - searchStartTime) / 1_000_000_000.0);
+            System.out.printf("      📊 Query results: %d + %d + %d hits%n", 
+                             warmResult.getHits().size(), domainResult.getHits().size(), nameResult.getHits().size());
+            
+            // Phase 3: Document retrieval (should be faster due to caching)
             if (warmResult.getHits().size() > 0) {
+                long docStartTime = System.nanoTime();
                 try (Document testDoc = warmSearcher.doc(warmResult.getHits().get(0).getDocAddress())) {
                     String content = (String) testDoc.getFirst("content");
                     assertNotNull(content, "Document content should be retrieved");
+                    long docEndTime = System.nanoTime();
+                    System.out.printf("    📄 Document retrieval: %.3f seconds (cached)%n", (docEndTime - docStartTime) / 1_000_000_000.0);
                 }
             }
         }
         long warmDuration = System.nanoTime() - warmStartTime;
         
-        // Step 7.5: Performance Analysis
-        System.out.println("📊 === PERFORMANCE ANALYSIS ===");
+        // Step 7.5: Comprehensive Performance Analysis
+        System.out.println("📊 === COMPREHENSIVE PERFORMANCE ANALYSIS ===");
         double coldSeconds = coldDuration / 1_000_000_000.0;
         double warmSeconds = warmDuration / 1_000_000_000.0;
         double speedupFactor = coldSeconds / warmSeconds;
@@ -1089,9 +1136,33 @@ public class RealS3EndToEndTest {
         System.out.printf("Split size: %.2f MB (%d docs)%n", 
                          largeSplitMetadata.getUncompressedSizeBytes() / 1024.0 / 1024.0,
                          largeSplitMetadata.getNumDocs());
-        System.out.printf("First access:  %.3f seconds%n", coldSeconds);
-        System.out.printf("Second access: %.3f seconds%n", warmSeconds);
-        System.out.printf("Speedup factor: %.2fx%n", speedupFactor);
+        System.out.printf("🧊 FIRST access (cold):  %.3f seconds%n", coldSeconds);
+        System.out.printf("🔥 SECOND access (warm): %.3f seconds%n", warmSeconds);
+        System.out.printf("⚡ Speedup factor: %.2fx%n", speedupFactor);
+        
+        // Performance analysis
+        if (speedupFactor >= 1.5) {
+            System.out.println("✅ EXCELLENT: Significant performance improvement detected!");
+            System.out.println("   🚀 Hotcache optimization is working effectively");
+        } else if (speedupFactor >= 1.1) {
+            System.out.println("✅ GOOD: Moderate performance improvement detected");
+            System.out.println("   📈 Caching is providing some benefit");  
+        } else {
+            System.out.println("⚠️  WARNING: Limited performance improvement");
+            System.out.println("   🐌 Cache effectiveness may be limited or network-bound");
+        }
+        
+        // Calculate theoretical vs actual performance
+        double networkBaseline = 2.0; // Assume ~2 seconds for network operations
+        double expectedImprovement = Math.max(1.0, coldSeconds - networkBaseline) / networkBaseline;
+        System.out.printf("📈 Expected improvement ratio: %.2fx (theory)%n", expectedImprovement);
+        System.out.printf("📊 Actual improvement ratio:   %.2fx (measured)%n", speedupFactor);
+        
+        if (speedupFactor >= expectedImprovement * 0.7) {
+            System.out.println("🎯 OPTIMIZATION STATUS: Meeting expectations (>70% of theoretical max)");
+        } else {
+            System.out.println("🔧 OPTIMIZATION STATUS: Below expectations - potential for further optimization");
+        }
         
         // Validate performance improvement
         assertTrue(coldResult.getHits().size() > 0, "Query should return results");
