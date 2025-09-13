@@ -41,8 +41,8 @@ fn extract_doc_mapping_from_index(tantivy_index: &tantivy::Index) -> Result<Stri
     
     debug_log!("Extracting doc mapping from Tantivy schema with {} fields", schema.fields().count());
     
-    // Create field mappings from the actual Tantivy schema
-    let mut field_mappings = std::collections::HashMap::new();
+    // Create field mappings from the actual Tantivy schema as an array (not HashMap)
+    let mut field_mappings = Vec::new();
     
     for (field, field_entry) in schema.fields() {
         let field_name = field_entry.name();
@@ -151,15 +151,12 @@ fn extract_doc_mapping_from_index(tantivy_index: &tantivy::Index) -> Result<Stri
             }
         };
         
-        field_mappings.insert(field_name.to_string(), field_mapping);
+        field_mappings.push(field_mapping);
     }
     
-    // Create the doc mapping JSON structure
-    let doc_mapping_json = serde_json::json!({
-        "field_mappings": field_mappings,
-        "mode": "lenient",
-        "store_source": true
-    });
+    // Create the doc mapping JSON structure as just the field_mappings array
+    // DocMapperBuilder expects the root to be a sequence of field mappings
+    let doc_mapping_json = serde_json::json!(field_mappings);
     
     let doc_mapping_str = serde_json::to_string(&doc_mapping_json)
         .map_err(|e| anyhow!("Failed to serialize DocMapping to JSON: {}", e))?;

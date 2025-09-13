@@ -253,7 +253,7 @@ pub fn initialize_global_cache(config: GlobalCacheConfig) -> bool {
 }
 
 /// Get the global searcher components, initializing with defaults if needed
-fn get_global_components() -> &'static GlobalSearcherComponents {
+pub fn get_global_components() -> &'static GlobalSearcherComponents {
     GLOBAL_SEARCHER_COMPONENTS.get_or_init(|| {
         debug_println!("RUST DEBUG: Initializing global searcher components with defaults");
         GlobalSearcherComponents::new(GlobalCacheConfig::default())

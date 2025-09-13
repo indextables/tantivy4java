@@ -11,6 +11,11 @@ use crate::utils::{arc_to_jlong, with_arc_safe, release_arc};
 use crate::common::to_java_exception;
 use crate::debug_println;
 use crate::split_query::{store_split_schema, get_split_schema};
+use quickwit_search::{SearcherContext, search_permit_provider::SearchPermitProvider};
+use quickwit_search::leaf_cache::LeafSearchCache;
+use quickwit_search::list_fields_cache::ListFieldsCache;
+use tantivy::aggregation::AggregationLimitsGuard;
+use tokio::sync::Semaphore;
 use quickwit_common::thread_pool::ThreadPool;
 
 use serde_json::{Value, Map};
@@ -20,7 +25,6 @@ use quickwit_config::{S3StorageConfig, SearcherConfig};
 use quickwit_storage::{StorageResolver, ByteRangeCache, SplitCache, wrap_storage_with_cache, STORAGE_METRICS, MemorySizedCache};
 use bytesize::ByteSize;
 use quickwit_search::leaf::{open_index_with_caches, open_split_bundle};
-use quickwit_search::SearcherContext;
 use quickwit_directories::{StorageDirectory, HotDirectory, CachingDirectory};
 use tantivy::schema::Document as DocumentTrait; // For to_named_doc method
 
@@ -61,14 +65,45 @@ fn extract_split_id_from_uri(split_uri: &str) -> String {
     }
 }
 
-/// Create minimal SearcherContext for Quickwit functions
-/// Uses tantivy4java's cache configuration but creates Quickwit-compatible caches
+/// Create SearcherContext using the global cache system
+/// This ensures proper SplitCache is used to avoid repeated index opening
 fn create_minimal_searcher_context() -> anyhow::Result<SearcherContext> {
-    // Create basic searcher config with default values
-    let searcher_config = SearcherConfig::default();
+    // Use the global cache system which includes proper SplitCache configuration
+    debug_println!("RUST DEBUG: Creating SearcherContext from global components");
+    use crate::global_cache::get_global_components;
+    let global_components = get_global_components();
     
-    // Use Quickwit's constructor to handle all cache creation properly
-    Ok(SearcherContext::new(searcher_config, None))
+    // Create new SearcherContext using the global components which include the SplitCache
+    let searcher_config = quickwit_config::SearcherConfig::default();
+    let arc_context = global_components.create_searcher_context(searcher_config);
+    
+    // Extract the SearcherContext from the Arc by recreating it
+    // This ensures we have the SplitCache configured properly
+    let context = &*arc_context;
+    Ok(SearcherContext {
+        searcher_config: context.searcher_config.clone(),
+        fast_fields_cache: context.fast_fields_cache.clone(),
+        search_permit_provider: SearchPermitProvider::new(
+            context.searcher_config.max_num_concurrent_split_searches,
+            context.searcher_config.warmup_memory_budget,
+        ),
+        split_footer_cache: MemorySizedCache::with_capacity_in_bytes(
+            context.searcher_config.split_footer_cache_capacity.as_u64() as usize,
+            &quickwit_storage::STORAGE_METRICS.split_footer_cache,
+        ),
+        split_stream_semaphore: Semaphore::new(context.searcher_config.max_num_concurrent_split_streams),
+        leaf_search_cache: LeafSearchCache::new(
+            context.searcher_config.partial_request_cache_capacity.as_u64() as usize
+        ),
+        list_fields_cache: ListFieldsCache::new(
+            context.searcher_config.partial_request_cache_capacity.as_u64() as usize
+        ),
+        split_cache_opt: context.split_cache_opt.clone(),
+        aggregation_limit: AggregationLimitsGuard::new(
+            Some(context.searcher_config.aggregation_memory_limit.as_u64()),
+            Some(context.searcher_config.aggregation_bucket_limit),
+        ),
+    })
 }
 
 /// Cached Tantivy searcher for efficient single document retrieval
@@ -1563,6 +1598,7 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_docNative(
 /// This is a major optimization that avoids expensive S3 I/O operations
 fn create_schema_from_doc_mapping(doc_mapping_json: &str) -> anyhow::Result<tantivy::schema::Schema> {
     debug_println!("RUST DEBUG: Creating schema from doc mapping JSON");
+    debug_println!("RUST DEBUG: 🔍 RAW DOC MAPPING JSON ({} chars): '{}'", doc_mapping_json.len(), doc_mapping_json);
     
     // Parse the doc mapping JSON
     use quickwit_doc_mapper::DocMapperBuilder;
