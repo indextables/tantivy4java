@@ -1046,13 +1046,36 @@ fn retrieve_document_from_split_optimized(
     
     if let Some(searcher) = cached_searcher {
         // Use cached searcher - very fast path (cache hit)
+        // IMPORTANT: Use async method for StorageDirectory compatibility
         let cache_hit_start = std::time::Instant::now();
         debug_println!("RUST DEBUG: ⏱️ 🎯 CACHE HIT - using cached searcher for document retrieval");
-        let doc = searcher.doc(doc_address)
-            .map_err(|e| anyhow::anyhow!("Failed to retrieve document: {}", e))?;
-        let schema = searcher.schema();
-        debug_println!("RUST DEBUG: ⏱️ ✅ CACHE HIT document retrieval completed [TIMING: {}ms] [TOTAL: {}ms]", cache_hit_start.elapsed().as_millis(), function_start.elapsed().as_millis());
-        return Ok((doc, schema.clone()));
+        
+        // Extract the runtime and use async document retrieval
+        let doc_and_schema = with_arc_safe(searcher_ptr, |searcher_context: &Arc<(StandaloneSearcher, tokio::runtime::Runtime, String, std::collections::HashMap<String, String>, u64, u64, Option<String>)>| {
+            let (_standalone_searcher, runtime, _split_uri, _aws_config, _footer_start, _footer_end, _doc_mapping) = searcher_context.as_ref();
+            
+            let _guard = runtime.enter();
+            tokio::task::block_in_place(|| {
+                runtime.block_on(async {
+                    let doc = searcher.doc_async(doc_address)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("Failed to retrieve document: {}", e))?;
+                    let schema = searcher.schema();
+                    Ok::<(tantivy::schema::TantivyDocument, tantivy::schema::Schema), anyhow::Error>((doc, schema.clone()))
+                })
+            })
+        }).ok_or_else(|| anyhow::anyhow!("Invalid searcher context for cached retrieval"))?;
+        
+        match doc_and_schema {
+            Ok((doc, schema)) => {
+                debug_println!("RUST DEBUG: ⏱️ ✅ CACHE HIT document retrieval completed [TIMING: {}ms] [TOTAL: {}ms]", cache_hit_start.elapsed().as_millis(), function_start.elapsed().as_millis());
+                return Ok((doc, schema));
+            }
+            Err(e) => {
+                debug_println!("RUST DEBUG: ⏱️ ❌ CACHE HIT failed, falling through to cache miss: {}", e);
+                // Fall through to cache miss path
+            }
+        }
     }
     
     // Cache miss - create searcher using the same optimizations as our batch method
