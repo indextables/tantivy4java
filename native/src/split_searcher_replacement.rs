@@ -1602,7 +1602,7 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_docNative(
     segment_ord: jint,
     doc_id: jint,
 ) -> jobject {
-    eprintln!("🚀 SIMPLE DEBUG: docNative method called!");
+    debug_println!("🚀 SIMPLE DEBUG: docNative method called!");
     debug_println!("🚀 NATIVE DEBUG: docNative ENTRY - Document retrieval starting!");
     let method_start_time = std::time::Instant::now();
     debug_println!("RUST DEBUG: ⏱️ docNative ENTRY POINT [TIMING START] - segment_ord={}, doc_id={}", segment_ord, doc_id);
