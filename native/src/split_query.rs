@@ -17,6 +17,14 @@ use quickwit_query::JsonLiteral;
 static SPLIT_SCHEMA_CACHE: Lazy<Arc<Mutex<HashMap<String, tantivy::schema::Schema>>>> = 
     Lazy::new(|| Arc::new(Mutex::new(HashMap::new())));
 
+/// Convert a QueryAst to JSON string using Quickwit's proven serialization
+fn convert_query_ast_to_json_string(query: QueryAst) -> Result<String> {
+    // Use Quickwit's proven serde serialization - this automatically handles
+    // the "type" field and proper format that Quickwit expects
+    serde_json::to_string(&query)
+        .map_err(|e| anyhow!("Failed to serialize QueryAst to JSON: {}", e))
+}
+
 /// Store schema clone for a split URI
 pub fn store_split_schema(split_uri: &str, schema: tantivy::schema::Schema) {
     debug_println!("RUST DEBUG: *** STORE_SPLIT_SCHEMA CALLED WITH URI: {}", split_uri);
@@ -40,7 +48,7 @@ pub fn get_split_schema(split_uri: &str) -> Option<tantivy::schema::Schema> {
     }
 }
 
-/// Convert a SplitTermQuery to QueryAst JSON
+/// Convert a SplitTermQuery to QueryAst JSON (FOR TESTING ONLY - Production should use SplitSearcher.search() directly)
 #[no_mangle]
 pub extern "system" fn Java_com_tantivy4java_SplitTermQuery_toQueryAstJson(
     mut env: JNIEnv,
@@ -49,19 +57,24 @@ pub extern "system" fn Java_com_tantivy4java_SplitTermQuery_toQueryAstJson(
     let result = convert_term_query_to_ast(&mut env, &obj);
     match result {
         Ok(json) => {
-            let jstring = env.new_string(json).unwrap_or_else(|_| env.new_string("{}").unwrap());
-            jstring.into_raw()
+            match env.new_string(json) {
+                Ok(jstring) => jstring.into_raw(),
+                Err(e) => {
+                    debug_println!("RUST DEBUG: Failed to create JString from QueryAst JSON: {}", e);
+                    crate::common::to_java_exception(&mut env, &anyhow::anyhow!("Failed to create JString from QueryAst JSON: {}", e));
+                    std::ptr::null_mut()
+                }
+            }
         }
         Err(e) => {
             debug_println!("RUST DEBUG: Error converting SplitTermQuery to QueryAst: {}", e);
-            let error_json = format!(r#"{{"error": "{}"}}"#, e);
-            let jstring = env.new_string(error_json).unwrap_or_else(|_| env.new_string("{}").unwrap());
-            jstring.into_raw()
+            crate::common::to_java_exception(&mut env, &e);
+            std::ptr::null_mut()
         }
     }
 }
 
-/// Convert a SplitBooleanQuery to QueryAst JSON
+/// Convert a SplitBooleanQuery to QueryAst JSON (FOR TESTING ONLY - Production should use SplitSearcher.search() directly)
 #[no_mangle]
 pub extern "system" fn Java_com_tantivy4java_SplitBooleanQuery_toQueryAstJson(
     mut env: JNIEnv,
@@ -70,19 +83,52 @@ pub extern "system" fn Java_com_tantivy4java_SplitBooleanQuery_toQueryAstJson(
     let result = convert_boolean_query_to_ast(&mut env, &obj);
     match result {
         Ok(json) => {
-            let jstring = env.new_string(json).unwrap_or_else(|_| env.new_string("{}").unwrap());
-            jstring.into_raw()
+            match env.new_string(json) {
+                Ok(jstring) => jstring.into_raw(),
+                Err(e) => {
+                    debug_println!("RUST DEBUG: Failed to create JString from QueryAst JSON: {}", e);
+                    crate::common::to_java_exception(&mut env, &anyhow::anyhow!("Failed to create JString from QueryAst JSON: {}", e));
+                    std::ptr::null_mut()
+                }
+            }
         }
         Err(e) => {
             debug_println!("RUST DEBUG: Error converting SplitBooleanQuery to QueryAst: {}", e);
-            let error_json = format!(r#"{{"error": "{}"}}"#, e);
-            let jstring = env.new_string(error_json).unwrap_or_else(|_| env.new_string("{}").unwrap());
-            jstring.into_raw()
+            crate::common::to_java_exception(&mut env, &e);
+            std::ptr::null_mut()
         }
     }
 }
 
-/// Convert a SplitRangeQuery to QueryAst JSON
+/// Convert a SplitMatchAllQuery to QueryAst JSON (FOR TESTING ONLY - Production should use SplitSearcher.search() directly)
+#[no_mangle]
+pub extern "system" fn Java_com_tantivy4java_SplitMatchAllQuery_toQueryAstJson(
+    mut env: JNIEnv,
+    _obj: JObject,
+) -> jstring {
+    // MatchAll is simple - just convert to JSON directly
+    let query_ast = QueryAst::MatchAll;
+    let result = convert_query_ast_to_json_string(query_ast);
+    match result {
+        Ok(json) => {
+            match env.new_string(json) {
+                Ok(jstring) => jstring.into_raw(),
+                Err(e) => {
+                    debug_println!("RUST DEBUG: Failed to create JString from QueryAst JSON: {}", e);
+                    crate::common::to_java_exception(&mut env, &anyhow::anyhow!("Failed to create JString from QueryAst JSON: {}", e));
+                    std::ptr::null_mut()
+                }
+            }
+        }
+        Err(e) => {
+            debug_println!("RUST DEBUG: Error converting SplitMatchAllQuery to QueryAst: {}", e);
+            crate::common::to_java_exception(&mut env, &e);
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Convert a SplitRangeQuery to QueryAst JSON (FOR TESTING ONLY - Production should use SplitSearcher.search() directly)
 #[no_mangle]
 pub extern "system" fn Java_com_tantivy4java_SplitRangeQuery_toQueryAstJson(
     mut env: JNIEnv,
@@ -91,38 +137,23 @@ pub extern "system" fn Java_com_tantivy4java_SplitRangeQuery_toQueryAstJson(
     let result = convert_range_query_to_ast(&mut env, &obj);
     match result {
         Ok(json) => {
-            let jstring = env.new_string(json).unwrap_or_else(|_| env.new_string("{}").unwrap());
-            jstring.into_raw()
+            match env.new_string(json) {
+                Ok(jstring) => jstring.into_raw(),
+                Err(e) => {
+                    debug_println!("RUST DEBUG: Failed to create JString from QueryAst JSON: {}", e);
+                    crate::common::to_java_exception(&mut env, &anyhow::anyhow!("Failed to create JString from QueryAst JSON: {}", e));
+                    std::ptr::null_mut()
+                }
+            }
         }
         Err(e) => {
             debug_println!("RUST DEBUG: Error converting SplitRangeQuery to QueryAst: {}", e);
-            let error_json = format!(r#"{{"error": "{}"}}"#, e);
-            let jstring = env.new_string(error_json).unwrap_or_else(|_| env.new_string("{}").unwrap());
-            jstring.into_raw()
+            crate::common::to_java_exception(&mut env, &e);
+            std::ptr::null_mut()
         }
     }
 }
 
-/// Convert a SplitMatchAllQuery to QueryAst JSON
-#[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_SplitMatchAllQuery_toQueryAstJson(
-    env: JNIEnv,
-    _obj: JObject,
-) -> jstring {
-    // MatchAll is simple - just return the MatchAll QueryAst
-    let query_ast = QueryAst::MatchAll;
-    match serde_json::to_string(&query_ast) {
-        Ok(json) => {
-            let jstring = env.new_string(json).unwrap_or_else(|_| env.new_string("{}").unwrap());
-            jstring.into_raw()
-        }
-        Err(e) => {
-            debug_println!("RUST DEBUG: Error serializing MatchAll QueryAst: {}", e);
-            let jstring = env.new_string(r#"{"type": "match_all"}"#).unwrap();
-            jstring.into_raw()
-        }
-    }
-}
 
 /// Parse a query string into a SplitQuery using Quickwit's query parser
 #[no_mangle]
@@ -144,7 +175,13 @@ pub extern "system" fn Java_com_tantivy4java_SplitQuery_parseQuery(
     }
 }
 
+// Wrapper function for JNI layer - converts to JSON string
 fn convert_term_query_to_ast(env: &mut JNIEnv, obj: &JObject) -> Result<String> {
+    let query_ast = convert_term_query_to_query_ast(env, obj)?;
+    convert_query_ast_to_json_string(query_ast)
+}
+
+fn convert_term_query_to_query_ast(env: &mut JNIEnv, obj: &JObject) -> Result<QueryAst> {
     // Extract field and value from Java SplitTermQuery object
     let field_obj = env.get_field(obj, "field", "Ljava/lang/String;")
         .map_err(|e| anyhow!("Failed to get field: {}", e))?;
@@ -166,18 +203,27 @@ fn convert_term_query_to_ast(env: &mut JNIEnv, obj: &JObject) -> Result<String> 
     debug_println!("RUST DEBUG: SplitTermQuery - field: '{}', original value: '{}', lowercased: '{}'", 
                    field, env.get_string(&value_jstring)?.to_str()?, value);
     
-    // Create QueryAst using Quickwit's term query structure
-    let term_query = quickwit_query::query_ast::TermQuery {
+    // Create proper Quickwit QueryAst using official structures
+    use quickwit_query::query_ast::TermQuery;
+    
+    let term_query = TermQuery {
         field,
         value,
     };
+    
     let query_ast = QueryAst::Term(term_query);
     
-    // Serialize to JSON
-    serde_json::to_string(&query_ast).map_err(|e| anyhow!("Serialization error: {}", e))
+    debug_println!("RUST DEBUG: Created TermQuery QueryAst using native Quickwit structures");
+    Ok(query_ast)
 }
 
+// Wrapper function for JNI layer - converts to JSON string
 fn convert_boolean_query_to_ast(env: &mut JNIEnv, obj: &JObject) -> Result<String> {
+    let query_ast = convert_boolean_query_to_query_ast(env, obj)?;
+    convert_query_ast_to_json_string(query_ast)
+}
+
+fn convert_boolean_query_to_query_ast(env: &mut JNIEnv, obj: &JObject) -> Result<QueryAst> {
     // Extract clauses from Java SplitBooleanQuery object
     let must_list_obj = env.get_field(obj, "mustQueries", "Ljava/util/List;")
         .map_err(|e| anyhow!("Failed to get mustQueries: {}", e))?;
@@ -202,21 +248,30 @@ fn convert_boolean_query_to_ast(env: &mut JNIEnv, obj: &JObject) -> Result<Strin
         Some(int_val.i()? as usize)
     };
     
-    // Create QueryAst using Quickwit's bool query structure
-    let bool_query = quickwit_query::query_ast::BoolQuery {
+    // Create proper Quickwit BoolQuery using official structures
+    use quickwit_query::query_ast::BoolQuery;
+    
+    let bool_query = BoolQuery {
         must: must_clauses,
-        should: should_clauses,
         must_not: must_not_clauses,
-        filter: Vec::new(), // SplitBooleanQuery doesn't have filter clauses yet
+        should: should_clauses,
+        filter: Vec::new(), // Java SplitBooleanQuery doesn't have filter, but Quickwit BoolQuery does
         minimum_should_match,
     };
+    
     let query_ast = QueryAst::Bool(bool_query);
     
-    // Serialize to JSON
-    serde_json::to_string(&query_ast).map_err(|e| anyhow!("Serialization error: {}", e))
+    debug_println!("RUST DEBUG: Created BooleanQuery QueryAst using native Quickwit structures");
+    Ok(query_ast)
 }
 
+// Wrapper function for JNI layer - converts to JSON string  
 fn convert_range_query_to_ast(env: &mut JNIEnv, obj: &JObject) -> Result<String> {
+    let query_ast = convert_range_query_to_query_ast(env, obj)?;
+    convert_query_ast_to_json_string(query_ast)
+}
+
+fn convert_range_query_to_query_ast(env: &mut JNIEnv, obj: &JObject) -> Result<QueryAst> {
     // Extract field, bounds, and field type from Java SplitRangeQuery object
     let field_obj = env.get_field(obj, "field", "Ljava/lang/String;")
         .map_err(|e| anyhow!("Failed to get field: {}", e))?;
@@ -241,16 +296,19 @@ fn convert_range_query_to_ast(env: &mut JNIEnv, obj: &JObject) -> Result<String>
     let lower_bound = convert_range_bound(env, &lower_bound_jobject, &field_type)?;
     let upper_bound = convert_range_bound(env, &upper_bound_jobject, &field_type)?;
     
-    // Create QueryAst using Quickwit's range query structure
-    let range_query = quickwit_query::query_ast::RangeQuery {
+    // Create proper Quickwit RangeQuery using official structures
+    use quickwit_query::query_ast::RangeQuery;
+    
+    let range_query = RangeQuery {
         field,
         lower_bound,
         upper_bound,
     };
+    
     let query_ast = QueryAst::Range(range_query);
     
-    // Serialize to JSON
-    serde_json::to_string(&query_ast).map_err(|e| anyhow!("Serialization error: {}", e))
+    debug_println!("RUST DEBUG: Created RangeQuery QueryAst using native Quickwit structures");
+    Ok(query_ast)
 }
 
 fn convert_range_bound(env: &mut JNIEnv, bound_obj: &JObject, field_type: &str) -> Result<Bound<JsonLiteral>> {
@@ -355,7 +413,7 @@ fn convert_query_list(env: &mut JNIEnv, list_obj: JObject) -> Result<Vec<QueryAs
     Ok(queries)
 }
 
-fn convert_split_query_to_ast(env: &mut JNIEnv, query_obj: &JObject) -> Result<QueryAst> {
+pub fn convert_split_query_to_ast(env: &mut JNIEnv, query_obj: &JObject) -> Result<QueryAst> {
     // Determine the actual type of the SplitQuery object
     let class = env.get_object_class(query_obj)?;
     let class_name_obj = env.call_method(class, "getName", "()Ljava/lang/String;", &[])?;
@@ -364,28 +422,47 @@ fn convert_split_query_to_ast(env: &mut JNIEnv, query_obj: &JObject) -> Result<Q
     
     match class_name.as_str() {
         "com.tantivy4java.SplitTermQuery" => {
-            // Parse as term query
-            let json = convert_term_query_to_ast(env, query_obj)?;
-            serde_json::from_str(&json).map_err(|e| anyhow!("Failed to parse term query JSON: {}", e))
+            // Create QueryAst directly using native Quickwit structures
+            convert_term_query_to_query_ast(env, query_obj)
         }
         "com.tantivy4java.SplitBooleanQuery" => {
-            // Parse as boolean query  
-            let json = convert_boolean_query_to_ast(env, query_obj)?;
-            serde_json::from_str(&json).map_err(|e| anyhow!("Failed to parse boolean query JSON: {}", e))
+            // Create QueryAst directly using native Quickwit structures
+            convert_boolean_query_to_query_ast(env, query_obj)
         }
         "com.tantivy4java.SplitRangeQuery" => {
-            // Parse as range query
-            let json = convert_range_query_to_ast(env, query_obj)?;
-            serde_json::from_str(&json).map_err(|e| anyhow!("Failed to parse range query JSON: {}", e))
+            // Create QueryAst directly using native Quickwit structures
+            convert_range_query_to_query_ast(env, query_obj)
         }
         "com.tantivy4java.SplitMatchAllQuery" => {
             Ok(QueryAst::MatchAll)
+        }
+        "com.tantivy4java.SplitParsedQuery" => {
+            // SplitParsedQuery already contains the QueryAst as JSON - parse it back
+            convert_parsed_query_to_query_ast(env, query_obj)
         }
         _ => {
             Err(anyhow!("Unsupported SplitQuery type: {}", class_name))
         }
     }
 }
+
+fn convert_parsed_query_to_query_ast(env: &mut JNIEnv, obj: &JObject) -> Result<QueryAst> {
+    // Extract the queryAstJson field from SplitParsedQuery
+    let json_obj = env.get_field(obj, "queryAstJson", "Ljava/lang/String;")
+        .map_err(|e| anyhow!("Failed to get queryAstJson field: {}", e))?;
+    let json_jstring: JString = json_obj.l()?.into();
+    let json_str: String = env.get_string(&json_jstring)?.into();
+    
+    debug_println!("RUST DEBUG: SplitParsedQuery - deserializing JSON: {}", json_str);
+    
+    // Parse the JSON back into QueryAst using Quickwit's proven deserialization
+    let query_ast: QueryAst = serde_json::from_str(&json_str)
+        .map_err(|e| anyhow!("Failed to deserialize QueryAst JSON '{}': {}", json_str, e))?;
+    
+    debug_println!("RUST DEBUG: Successfully converted SplitParsedQuery to QueryAst: {:?}", query_ast);
+    Ok(query_ast)
+}
+
 
 fn parse_query_string(env: &mut JNIEnv, query_string: JString, schema_ptr: jlong, default_search_fields: jobject) -> Result<jobject> {
     debug_println!("RUST DEBUG: *** parse_query_string CALLED ***");
@@ -611,3 +688,13 @@ fn extract_fields_from_schema(schema: &tantivy::schema::Schema) -> Result<Vec<St
     debug_println!("RUST DEBUG: Extracted {} text fields from schema: {:?}", text_fields.len(), text_fields);
     Ok(text_fields)
 }
+
+/// Helper function to convert JsonLiteral to serde_json::Value
+fn convert_json_literal_to_value(literal: JsonLiteral) -> serde_json::Value {
+    match literal {
+        JsonLiteral::String(s) => serde_json::Value::String(s),
+        JsonLiteral::Number(n) => serde_json::Value::Number(n),
+        JsonLiteral::Bool(b) => serde_json::Value::Bool(b),
+    }
+}
+

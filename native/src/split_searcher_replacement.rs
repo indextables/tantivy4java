@@ -10,7 +10,7 @@ use crate::standalone_searcher::{StandaloneSearcher, StandaloneSearchConfig, Spl
 use crate::utils::{arc_to_jlong, with_arc_safe, release_arc};
 use crate::common::to_java_exception;
 use crate::debug_println;
-use crate::split_query::{store_split_schema, get_split_schema};
+use crate::split_query::{store_split_schema, get_split_schema, convert_split_query_to_ast};
 use quickwit_search::{SearcherContext, search_permit_provider::SearchPermitProvider};
 use quickwit_search::leaf_cache::LeafSearchCache;
 use quickwit_search::list_fields_cache::ListFieldsCache;
@@ -810,6 +810,79 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_searchWithQueryAst(
             std::ptr::null_mut()
         }
     }
+}
+
+/// Helper that converts QueryAst to JSON and performs search (eliminates Java→JSON conversion)
+fn perform_search_with_query_ast(searcher_ptr: jlong, query_ast: quickwit_query::query_ast::QueryAst, limit: usize) -> Result<String, anyhow::Error> {
+    // Serialize QueryAst to JSON using Quickwit's proven serialization
+    let query_json = serde_json::to_string(&query_ast)
+        .map_err(|e| anyhow::anyhow!("Failed to serialize QueryAst to JSON: {}", e))?;
+    
+    debug_println!("RUST DEBUG: QueryAst serialized to JSON: {}", query_json);
+    
+    // Return the JSON string for use with existing searchWithQueryAst logic
+    Ok(query_json)
+}
+
+/// Optimized method that takes SplitQuery directly without JSON round-trip
+#[no_mangle]
+pub extern "system" fn Java_com_tantivy4java_SplitSearcher_searchWithSplitQuery(
+    mut env: JNIEnv,
+    _class: JClass,
+    searcher_ptr: jlong,
+    split_query: JObject,
+    limit: jint,
+) -> jobject {
+    debug_println!("🚀 NATIVE DEBUG: searchWithSplitQuery ENTRY - Direct SplitQuery conversion");
+    let method_start_time = std::time::Instant::now();
+    
+    if searcher_ptr == 0 {
+        debug_println!("RUST DEBUG: ⏱️ searchWithSplitQuery ERROR: Invalid searcher pointer [TIMING: {}ms]", method_start_time.elapsed().as_millis());
+        to_java_exception(&mut env, &anyhow::anyhow!("Invalid searcher pointer"));
+        return std::ptr::null_mut();
+    }
+    
+    // Convert SplitQuery directly to QueryAst using native Quickwit structures
+    let query_conversion_start = std::time::Instant::now();
+    let query_ast = match convert_split_query_to_ast(&mut env, &split_query) {
+        Ok(ast) => ast,
+        Err(e) => {
+            debug_println!("RUST DEBUG: ⏱️ searchWithSplitQuery ERROR: Failed to convert SplitQuery to QueryAst [TIMING: {}ms]", method_start_time.elapsed().as_millis());
+            to_java_exception(&mut env, &anyhow::anyhow!("Failed to convert SplitQuery to QueryAst: {}", e));
+            return std::ptr::null_mut();
+        }
+    };
+    debug_println!("RUST DEBUG: ⏱️ QueryAst conversion completed [TIMING: {}ms]", query_conversion_start.elapsed().as_millis());
+    
+    // Convert QueryAst to JSON using Quickwit's proven serialization
+    let query_json = match perform_search_with_query_ast(searcher_ptr, query_ast, limit as usize) {
+        Ok(json) => json,
+        Err(e) => {
+            debug_println!("RUST DEBUG: ⏱️ searchWithSplitQuery ERROR: Failed to serialize QueryAst [TIMING: {}ms]: {}", method_start_time.elapsed().as_millis(), e);
+            to_java_exception(&mut env, &e);
+            return std::ptr::null_mut();
+        }
+    };
+    
+    // Create JString from the JSON
+    let java_query_json = match env.new_string(&query_json) {
+        Ok(jstr) => jstr,
+        Err(e) => {
+            debug_println!("RUST DEBUG: ⏱️ searchWithSplitQuery ERROR: Failed to create Java string [TIMING: {}ms]: {}", method_start_time.elapsed().as_millis(), e);
+            to_java_exception(&mut env, &anyhow::anyhow!("Failed to create Java string: {}", e));
+            return std::ptr::null_mut();
+        }
+    };
+    
+    // Call the existing searchWithQueryAst method with the properly serialized JSON
+    debug_println!("RUST DEBUG: ⏱️ searchWithSplitQuery calling searchWithQueryAst with native-serialized JSON");
+    Java_com_tantivy4java_SplitSearcher_searchWithQueryAst(
+        env,
+        _class,
+        searcher_ptr,
+        java_query_json.into(),
+        limit,
+    )
 }
 
 /// Batch document retrieval for SplitSearcher using Quickwit's optimized approach

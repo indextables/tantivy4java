@@ -518,27 +518,6 @@ public class SplitCacheManager implements AutoCloseable {
         return searcher;
     }
     
-    /**
-     * TEMPORARY COMPATIBILITY METHOD - for existing tests only
-     * @deprecated This method provides temporary backward compatibility for existing tests.
-     * Use createSplitSearcher(String, QuickwitSplit.SplitMetadata) for production code.
-     * This method uses fallback parsing without footer optimization.
-     */
-    @Deprecated
-    public SplitSearcher createSplitSearcherXXX(String splitPath) {
-        System.err.println("⚠️  WARNING: Using deprecated createSplitSearcher(String) without optimization.");
-        System.err.println("   For production code, use createSplitSearcher(String, QuickwitSplit.SplitMetadata)");
-        System.err.println("   to enable 87% network traffic reduction and proper lazy loading.");
-        
-        // Pass AWS configuration from the cache manager to the searcher
-        Map<String, Object> splitConfig = new HashMap<>();
-        if (!this.awsConfig.isEmpty()) {
-            splitConfig.put("aws_config", this.awsConfig);
-        }
-        // Disable lazy loading for backward compatibility
-        splitConfig.put("enable_lazy_loading", false);
-        return createSplitSearcher(splitPath, splitConfig);
-    }
     
     /**
      * Create multiple split searchers sharing the same cache (batch creation)

@@ -207,11 +207,8 @@ public class SplitSearcher implements AutoCloseable {
         }
         
         try {
-            // Convert SplitQuery to QueryAst JSON using Quickwit libraries
-            String queryAstJson = splitQuery.toQueryAstJson();
-            
-            // Use the native search method that accepts QueryAst JSON
-            return searchWithQueryAst(nativePtr, queryAstJson, limit);
+            // Pass SplitQuery object directly to native layer for efficient QueryAst conversion
+            return searchWithSplitQuery(nativePtr, splitQuery, limit);
         } catch (Exception e) {
             throw new RuntimeException("Search failed: " + e.getMessage(), e);
         }
@@ -475,6 +472,7 @@ public class SplitSearcher implements AutoCloseable {
     private static native long createNativeWithSharedCache(String splitPath, long cacheManagerPtr, Map<String, Object> splitConfig);
     private static native long getSchemaFromNative(long nativePtr);
     private static native SearchResult searchWithQueryAst(long nativePtr, String queryAstJson, int limit);
+    private static native SearchResult searchWithSplitQuery(long nativePtr, SplitQuery splitQuery, int limit);
     private static native Document docNative(long nativePtr, int segment, int docId);
     private static native Document[] docBatchNative(long nativePtr, int[] segments, int[] docIds);
     private static native byte[] docsBulkNative(long nativePtr, int[] segments, int[] docIds);

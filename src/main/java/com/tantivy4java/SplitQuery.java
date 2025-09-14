@@ -7,6 +7,11 @@ package com.tantivy4java;
  */
 public abstract class SplitQuery {
     
+    static {
+        // Ensure native library is loaded for all SplitQuery subclasses
+        Tantivy.initialize();
+    }
+    
     /**
      * Convert this query to a Quickwit QueryAst JSON string for split searching.
      * This is handled natively using Quickwit's query parsing libraries.

@@ -6,7 +6,7 @@
 
     <groupId>com.tantivy4java</groupId>
     <artifactId>tantivy4java</artifactId>
-    <version>0.24.0</version>
+    <version>0.24.1</version>
     <packaging>jar</packaging>
 
     <name>Tantivy4Java</name>
