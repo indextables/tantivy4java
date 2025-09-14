@@ -47,15 +47,12 @@ pub fn arc_to_jlong<T: Send + Sync + 'static>(arc: Arc<T>) -> jlong {
     // Store the Arc in the registry instead of using unsafe pointer manipulation
     registry.insert(id, Box::new(arc));
     
-    debug_println!("RUST DEBUG: arc_to_jlong - registered Arc with ID: {}", id);
     
     id
 }
 
 /// SAFE: Access Arc from registry without unsafe operations
 pub fn jlong_to_arc<T: Send + Sync + 'static>(ptr: jlong) -> Option<Arc<T>> {
-    debug_println!("RUST DEBUG: jlong_to_arc called with ID: {}", ptr);
-    
     if ptr == 0 {
         debug_println!("RUST DEBUG: jlong_to_arc - ID is 0, returning None");
         return None;
@@ -65,7 +62,6 @@ pub fn jlong_to_arc<T: Send + Sync + 'static>(ptr: jlong) -> Option<Arc<T>> {
     let boxed = registry.get(&ptr)?;
     let arc = boxed.downcast_ref::<Arc<T>>()?;
     
-    debug_println!("RUST DEBUG: jlong_to_arc - successfully found Arc with ID: {}", ptr);
     
     Some(arc.clone())
 }

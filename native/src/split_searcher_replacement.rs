@@ -1446,6 +1446,54 @@ fn retrieve_documents_batch_from_split_optimized(
         // Use block_in_place to run async code synchronously (Quickwit pattern)
         tokio::task::block_in_place(|| {
             runtime.block_on(async {
+                // ✅ OPTIMIZATION: Check searcher cache first (like individual retrieval)
+                let searcher_cache = get_searcher_cache();
+                let cached_searcher_option = {
+                    let cache = searcher_cache.lock().unwrap();
+                    cache.get(split_uri).cloned()
+                };
+
+                // If we have a cached searcher, use it for concurrent batch processing
+                if let Some(cached_searcher) = cached_searcher_option {
+                    debug_println!("RUST DEBUG: ✅ BATCH CACHE HIT: Using cached searcher for batch processing");
+                    let schema = cached_searcher.schema(); // Get schema from cached searcher
+
+                    // ✅ QUICKWIT CONCURRENT PATTERN: Use cached searcher with concurrency
+                    const NUM_CONCURRENT_REQUESTS: usize = 30;
+
+                    let doc_futures = doc_addresses.into_iter().map(|doc_addr| {
+                        let moved_searcher = cached_searcher.clone(); // Reuse cached searcher
+                        let moved_schema = schema.clone();
+                        async move {
+                            let doc: tantivy::schema::TantivyDocument = moved_searcher
+                                .doc_async(doc_addr)
+                                .await
+                                .map_err(|e| anyhow::anyhow!("Failed to retrieve document at address {:?}: {}", doc_addr, e))?;
+
+                            // Create a RetrievedDocument and register it
+                            use crate::document::{DocumentWrapper, RetrievedDocument};
+                            let retrieved_doc = RetrievedDocument::new_with_schema(doc, &moved_schema);
+                            let wrapper = DocumentWrapper::Retrieved(retrieved_doc);
+                            let wrapper_arc = std::sync::Arc::new(std::sync::Mutex::new(wrapper));
+                            let doc_ptr = crate::utils::arc_to_jlong(wrapper_arc);
+
+                            Ok::<jobject, anyhow::Error>(doc_ptr as jobject)
+                        }
+                    });
+
+                    // Execute concurrent batch retrieval with cached searcher
+                    use futures::stream::{StreamExt, TryStreamExt};
+                    let doc_ptrs: Vec<jobject> = futures::stream::iter(doc_futures)
+                        .buffer_unordered(NUM_CONCURRENT_REQUESTS)
+                        .try_collect::<Vec<_>>()
+                        .await
+                        .map_err(|e| anyhow::anyhow!("Cached searcher batch retrieval failed: {}", e))?;
+
+                    return Ok::<Vec<jobject>, anyhow::Error>(doc_ptrs);
+                }
+
+                debug_println!("RUST DEBUG: ⚠️ BATCH CACHE MISS: Creating new searcher for batch processing");
+
                 use quickwit_common::uri::Uri;
                 use quickwit_config::{StorageConfigs, S3StorageConfig};
                 use quickwit_proto::search::SplitIdAndFooterOffsets;
@@ -1557,27 +1605,47 @@ fn retrieve_documents_batch_from_split_optimized(
                 // Create Arc searcher for sharing across async operations (fetch_docs.rs line 193)
                 let tantivy_searcher = std::sync::Arc::new(index_reader.searcher());
                 let schema = index.schema();
-                
-                // Retrieve documents using async pattern like Quickwit (fetch_docs.rs line 200-252)
-                let mut doc_ptrs = Vec::new();
-                
-                for doc_addr in doc_addresses {
-                    // Use doc_async like Quickwit - QUICKWIT OPTIMIZATION (fetch_docs.rs line 205-207)
-                    let doc: tantivy::schema::TantivyDocument = tantivy_searcher
-                        .doc_async(doc_addr)
-                        .await
-                        .map_err(|e| anyhow::anyhow!("Failed to retrieve document at address {:?}: {}", doc_addr, e))?;
-                    
-                    // Create a RetrievedDocument and register it
-                    use crate::document::{DocumentWrapper, RetrievedDocument};
-                    
-                    let retrieved_doc = RetrievedDocument::new_with_schema(doc, &schema);
-                    let wrapper = DocumentWrapper::Retrieved(retrieved_doc);
-                    let wrapper_arc = std::sync::Arc::new(std::sync::Mutex::new(wrapper));
-                    let doc_ptr = crate::utils::arc_to_jlong(wrapper_arc);
-                    
-                    doc_ptrs.push(doc_ptr as jobject);
+
+                // ✅ CACHE NEW SEARCHER: Store the newly created searcher for future reuse
+                {
+                    let searcher_cache = get_searcher_cache();
+                    let mut cache = searcher_cache.lock().unwrap();
+                    cache.insert(split_uri.clone(), tantivy_searcher.clone());
+                    debug_println!("RUST DEBUG: ✅ CACHED NEW SEARCHER: Stored searcher for future batch operations");
                 }
+                
+                // ✅ QUICKWIT CONCURRENT PATTERN: Use concurrent document retrieval (fetch_docs.rs line 200-258)
+
+                // Create async futures for concurrent document retrieval (like Quickwit)
+                let doc_futures = doc_addresses.into_iter().map(|doc_addr| {
+                    let moved_searcher = tantivy_searcher.clone(); // Clone Arc for concurrent access
+                    let moved_schema = schema.clone(); // Clone schema for each future
+                    async move {
+                        // Use doc_async like Quickwit - QUICKWIT OPTIMIZATION (fetch_docs.rs line 205-207)
+                        let doc: tantivy::schema::TantivyDocument = moved_searcher
+                            .doc_async(doc_addr)
+                            .await
+                            .map_err(|e| anyhow::anyhow!("Failed to retrieve document at address {:?}: {}", doc_addr, e))?;
+
+                        // Create a RetrievedDocument and register it
+                        use crate::document::{DocumentWrapper, RetrievedDocument};
+
+                        let retrieved_doc = RetrievedDocument::new_with_schema(doc, &moved_schema);
+                        let wrapper = DocumentWrapper::Retrieved(retrieved_doc);
+                        let wrapper_arc = std::sync::Arc::new(std::sync::Mutex::new(wrapper));
+                        let doc_ptr = crate::utils::arc_to_jlong(wrapper_arc);
+
+                        Ok::<jobject, anyhow::Error>(doc_ptr as jobject)
+                    }
+                });
+
+                // ✅ QUICKWIT CONCURRENT EXECUTION: Process up to NUM_CONCURRENT_REQUESTS simultaneously
+                use futures::stream::{StreamExt, TryStreamExt};
+                let doc_ptrs: Vec<jobject> = futures::stream::iter(doc_futures)
+                    .buffer_unordered(NUM_CONCURRENT_REQUESTS) // Quickwit's concurrent processing pattern
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("Concurrent document retrieval failed: {}", e))?;
                 
                 Ok::<Vec<jobject>, anyhow::Error>(doc_ptrs)
             })

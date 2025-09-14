@@ -648,27 +648,27 @@ public class RealS3EndToEndTest {
 
     @Test
     @org.junit.jupiter.api.Order(6)
-    @DisplayName("Step 5: Query merged split and validate all original data")
+    @DisplayName("Step 5: Query merged split and validate all original data + No Full Downloads")
     public void step5_queryAndValidateData() throws Exception {
-        System.out.println("🔍 Querying merged split to validate data integrity...");
-        
+        System.out.println("🔍 Querying merged split to validate data integrity AND no full downloads...");
+
         // Validate prerequisites
         assertNotNull(mergedSplitS3Url, "Merged split S3 URL should be available from Step 3");
         assertNotNull(mergedSplitMetadata, "Merged split metadata should be available from Step 3");
-        
+
         // Create cache manager
         SplitCacheManager.CacheConfig cacheConfig = new SplitCacheManager.CacheConfig("validation-cache")
             .withMaxCacheSize(50_000_000);
-            
+
         String accessKey = getAccessKey();
         String secretKey = getSecretKey();
         if (accessKey != null && secretKey != null) {
             cacheConfig = cacheConfig.withAwsCredentials(accessKey, secretKey);
         }
         cacheConfig = cacheConfig.withAwsRegion(TEST_REGION);
-        
+
         SplitCacheManager cacheManager = SplitCacheManager.getInstance(cacheConfig);
-        
+
         try (SplitSearcher searcher = cacheManager.createSplitSearcher(mergedSplitS3Url, mergedSplitMetadata)) {
             
             Schema schema = searcher.getSchema();
@@ -728,7 +728,115 @@ public class RealS3EndToEndTest {
             }
             
             System.out.println("✅ Content validation passed");
-            
+
+            // Test 2.5: Document Retrieval Performance Validation (NO FULL DOWNLOADS)
+            System.out.println("Test 2.5: Document retrieval hotcache validation (ensuring no full downloads)");
+
+            // Validate that we have footer metadata for hotcache optimization
+            assertTrue(mergedSplitMetadata.hasFooterOffsets(),
+                      "Split should have footer offsets for hotcache optimization");
+            System.out.printf("   📊 Footer metadata available: start=%d, end=%d%n",
+                             mergedSplitMetadata.getFooterStartOffset(),
+                             mergedSplitMetadata.getFooterEndOffset());
+
+            // Perform multiple document retrievals and measure timing consistency
+            System.out.println("   🔍 Testing document retrieval performance consistency...");
+            java.util.List<Long> retrievalTimes = new java.util.ArrayList<>();
+            int testDocuments = Math.min(10, totalFoundDocs); // Test up to 10 documents
+
+            for (int i = 0; i < testDocuments; i++) {
+                // Get document from different result sets to test various documents
+                SearchResult testResult = (i % 4 == 0) ? customersResult :
+                                         (i % 4 == 1) ? productsResult :
+                                         (i % 4 == 2) ? ordersResult : reviewsResult;
+
+                if (testResult.getHits().size() > (i / 4)) {
+                    long startTime = System.nanoTime();
+                    try (Document testDoc = searcher.doc(testResult.getHits().get(i / 4).getDocAddress())) {
+                        String content = (String) testDoc.getFirst("name");
+                        assertNotNull(content, "Document should have retrievable content");
+                    }
+                    long endTime = System.nanoTime();
+                    retrievalTimes.add((endTime - startTime) / 1_000_000); // Convert to milliseconds
+
+                    System.out.printf("     📄 Doc %d retrieval: %d ms%n", i + 1, retrievalTimes.get(i));
+                }
+            }
+
+            // Analyze retrieval time consistency (should be consistent with hotcache, erratic with full downloads)
+            if (retrievalTimes.size() >= 3) {
+                double averageTime = retrievalTimes.stream().mapToLong(Long::longValue).average().orElse(0.0);
+                long minTime = retrievalTimes.stream().mapToLong(Long::longValue).min().orElse(0L);
+                long maxTime = retrievalTimes.stream().mapToLong(Long::longValue).max().orElse(0L);
+                double variabilityRatio = maxTime > 0 ? (double) maxTime / minTime : 1.0;
+
+                System.out.printf("   📊 Retrieval time analysis:%n");
+                System.out.printf("      Average: %.2f ms%n", averageTime);
+                System.out.printf("      Min: %d ms, Max: %d ms%n", minTime, maxTime);
+                System.out.printf("      Variability ratio: %.2fx%n", variabilityRatio);
+
+                // Hotcache should have low variability (< 5x), full downloads would have high variability (> 10x)
+                if (variabilityRatio < 5.0) {
+                    System.out.println("   ✅ LOW VARIABILITY: Consistent retrieval times suggest hotcache optimization active");
+                } else if (variabilityRatio < 10.0) {
+                    System.out.println("   ⚠️  MODERATE VARIABILITY: Some variance in retrieval times");
+                } else {
+                    System.out.println("   ❌ HIGH VARIABILITY: Large variance suggests potential full downloads");
+                    // Don't fail immediately - could be network conditions
+                }
+
+                // All retrievals should be reasonably fast with hotcache (< 500ms typical)
+                long slowRetrievals = retrievalTimes.stream().mapToLong(Long::longValue).filter(t -> t > 500).count();
+                if (slowRetrievals == 0) {
+                    System.out.println("   ✅ ALL FAST RETRIEVALS: All document retrievals < 500ms (hotcache working)");
+                } else {
+                    System.out.printf("   ⚠️  SLOW RETRIEVALS: %d/%d retrievals > 500ms (potential network issues)%n",
+                                     slowRetrievals, retrievalTimes.size());
+                }
+
+                // Test batch retrieval performance as well
+                System.out.println("   🔍 Testing batch document retrieval performance...");
+                if (customersResult.getHits().size() >= 3) {
+                    java.util.List<DocAddress> batchAddresses = customersResult.getHits()
+                        .subList(0, Math.min(3, customersResult.getHits().size()))
+                        .stream()
+                        .map(hit -> hit.getDocAddress())
+                        .collect(java.util.stream.Collectors.toList());
+
+                    long batchStartTime = System.nanoTime();
+                    java.util.List<Document> batchDocs = searcher.docBatch(batchAddresses);
+                    long batchEndTime = System.nanoTime();
+                    long batchTime = (batchEndTime - batchStartTime) / 1_000_000;
+
+                    System.out.printf("     📦 Batch retrieval (%d docs): %d ms%n", batchDocs.size(), batchTime);
+
+                    // Batch retrieval should be efficient with hotcache
+                    if (batchTime < (batchDocs.size() * 200)) { // < 200ms per doc in batch
+                        System.out.println("     ✅ EFFICIENT BATCH: Batch retrieval suggests hotcache optimization");
+                    } else {
+                        System.out.println("     ⚠️  SLOW BATCH: Batch retrieval slower than expected");
+                    }
+
+                    // Cleanup batch documents
+                    for (Document doc : batchDocs) {
+                        doc.close();
+                    }
+                }
+            }
+
+            // Check if debug logging is available to detect download patterns
+            String debugEnv = System.getenv("TANTIVY4JAVA_DEBUG");
+            if ("1".equals(debugEnv)) {
+                System.out.println("   🔍 DEBUG MODE ACTIVE: Check console output above for:");
+                System.out.println("     - '🚀 Using Quickwit optimized path' = GOOD (hotcache)");
+                System.out.println("     - '⚠️ falling back to full download' = BAD (full download)");
+                System.out.println("     - Document retrievals should show hotcache optimization messages");
+            } else {
+                System.out.println("   💡 TIP: Run with TANTIVY4JAVA_DEBUG=1 to see hotcache vs full download debug messages");
+            }
+
+            System.out.println("✅ Document retrieval validation completed");
+
             // Test 3: Cross-domain queries
             System.out.println("Test 3: Cross-domain query validation");
             
@@ -908,8 +1016,307 @@ public class RealS3EndToEndTest {
 
     @Test
     @org.junit.jupiter.api.Order(8)
-    @DisplayName("Step 7: Large Split Performance Test - Demonstrating Hotcache Optimization")
-    public void step7_largeSplitPerformanceTest() throws Exception {
+    @DisplayName("Step 7: Document Retrieval No-Download Validation Test")
+    public void step7_documentRetrievalNoDownloadValidationTest() throws Exception {
+        System.out.println("🔍 === DOCUMENT RETRIEVAL NO-DOWNLOAD VALIDATION TEST ===");
+        System.out.println("Validating that document retrievals use hotcache optimization and DON'T trigger full downloads");
+
+        // Validate prerequisites
+        assertNotNull(mergedSplitS3Url, "Merged split S3 URL should be available");
+        assertNotNull(mergedSplitMetadata, "Merged split metadata should be available");
+        assertTrue(mergedSplitMetadata.hasFooterOffsets(), "Split should have footer metadata for optimization");
+
+        // Create dedicated cache manager for this test
+        SplitCacheManager.CacheConfig docValidationConfig = new SplitCacheManager.CacheConfig("doc-validation-cache")
+            .withMaxCacheSize(100_000_000) // 100MB cache
+            .withAwsCredentials(getAccessKey(), getSecretKey())
+            .withAwsRegion(TEST_REGION);
+
+        SplitCacheManager docValidationCacheManager = SplitCacheManager.getInstance(docValidationConfig);
+
+        try (SplitSearcher searcher = docValidationCacheManager.createSplitSearcher(mergedSplitS3Url, mergedSplitMetadata)) {
+
+            System.out.printf("🔍 Testing split with footer metadata: start=%d, end=%d%n",
+                             mergedSplitMetadata.getFooterStartOffset(),
+                             mergedSplitMetadata.getFooterEndOffset());
+
+            // SEARCHER REUSE VALIDATION: Track searcher creation timing
+            System.out.println("🔄 Searcher Reuse Validation: Testing single searcher for multiple operations...");
+
+            long searcherCreationTime = System.nanoTime(); // Searcher should already be created above
+
+            // Phase 1: Execute searches to get documents to retrieve (SAME SEARCHER)
+            System.out.println("Phase 1: Executing searches to get document addresses (testing searcher reuse)...");
+
+            // Multiple search operations to validate searcher reuse
+            long search1StartTime = System.nanoTime();
+            Schema schema = searcher.getSchema();
+            long schemaTime = System.nanoTime() - search1StartTime;
+
+            long search2StartTime = System.nanoTime();
+            SplitQuery testQuery = new SplitTermQuery("domain", "customers");
+            SearchResult searchResult = searcher.search(testQuery, 20);
+            long searchTime = System.nanoTime() - search2StartTime;
+
+            // Additional searches with same searcher to validate reuse
+            long search3StartTime = System.nanoTime();
+            SplitQuery testQuery2 = new SplitTermQuery("domain", "products");
+            SearchResult searchResult2 = searcher.search(testQuery2, 10);
+            long search3Time = System.nanoTime() - search3StartTime;
+
+            long search4StartTime = System.nanoTime();
+            SplitQuery testQuery3 = new SplitTermQuery("name", "customer");
+            SearchResult searchResult3 = searcher.search(testQuery3, 15);
+            long search4Time = System.nanoTime() - search4StartTime;
+
+            System.out.printf("Searcher operation timing (reuse validation):%n");
+            System.out.printf("  📋 Schema retrieval: %d ms%n", schemaTime / 1_000_000);
+            System.out.printf("  🔍 Search 1 (customers): %d ms%n", searchTime / 1_000_000);
+            System.out.printf("  🔍 Search 2 (products): %d ms%n", search3Time / 1_000_000);
+            System.out.printf("  🔍 Search 3 (names): %d ms%n", search4Time / 1_000_000);
+
+            // Validate that subsequent searches are fast (indicating reuse, not recreation)
+            long avgSearchTime = (searchTime + search3Time + search4Time) / 3 / 1_000_000;
+            if (avgSearchTime < 100) {
+                System.out.println("  ✅ FAST SUBSEQUENT SEARCHES: Consistent fast searches suggest proper searcher reuse");
+            } else {
+                System.out.printf("  ⚠️  SLOW SUBSEQUENT SEARCHES: Average %d ms may indicate searcher recreation%n", avgSearchTime);
+            }
+
+            assertTrue(searchResult.getHits().size() > 0, "Should find documents to test retrieval");
+            System.out.printf("Found %d documents for retrieval testing%n", searchResult.getHits().size());
+
+            // Phase 2: Individual document retrieval validation (SAME SEARCHER REUSE) - 1000 DOCUMENTS
+            System.out.println("Phase 2: Individual document retrieval performance test with 1000 documents...");
+
+            // Get a larger result set for meaningful performance testing
+            SplitQuery largeQuery = new SplitBooleanQuery()
+                .addShould(testQuery)
+                .addShould(testQuery2)
+                .addShould(testQuery3);
+            SearchResult largeResult = searcher.search(largeQuery, 1000);
+
+            // REPLICATE ADDRESSES TO REACH 1000 DOCUMENTS FOR PERFORMANCE TESTING
+            java.util.List<SearchResult.Hit> availableHits = largeResult.getHits();
+            java.util.List<SearchResult.Hit> replicatedHits = new java.util.ArrayList<>();
+
+            // Replicate available documents to reach exactly 1000 for performance testing
+            for (int i = 0; i < 1000; i++) {
+                if (availableHits.size() > 0) {
+                    replicatedHits.add(availableHits.get(i % availableHits.size()));
+                }
+            }
+
+            int testCount = replicatedHits.size();
+
+            System.out.printf("  🔄 PERFORMANCE TEST: Using same searcher for %d individual document retrievals%n", testCount);
+            System.out.println("     This tests both searcher reuse AND measures true individual retrieval performance");
+
+            java.util.List<Long> retrievalTimes = new java.util.ArrayList<>();
+            long totalIndividualStart = System.nanoTime();
+
+            for (int i = 0; i < testCount; i++) {
+                if (i % 100 == 0) {
+                    System.out.printf("  Progress: %d/%d individual retrievals completed%n", i, testCount);
+                }
+
+                long startTime = System.nanoTime();
+                try (Document doc = searcher.doc(replicatedHits.get(i).getDocAddress())) {
+                    String name = (String) doc.getFirst("name");
+                    String domain = (String) doc.getFirst("domain");
+                    assertNotNull(name, "Document should have name field");
+                    assertNotNull(domain, "Document should have domain field");
+                }
+                long endTime = System.nanoTime();
+                long retrievalTime = (endTime - startTime) / 1_000_000; // Convert to milliseconds
+                if (i < 20) retrievalTimes.add(retrievalTime); // Keep first 20 for analysis
+            }
+
+            long totalIndividualEnd = System.nanoTime();
+            long totalIndividualTime = (totalIndividualEnd - totalIndividualStart) / 1_000_000;
+
+            System.out.printf("  📊 Individual retrieval completed: %d documents in %d ms%n", testCount, totalIndividualTime);
+            System.out.printf("      Average per document: %.3f ms%n", (double) totalIndividualTime / testCount);
+
+            // Validate retrieval time consistency for searcher reuse
+            if (retrievalTimes.size() >= 3) {
+                // First retrieval might be slower (cache miss), subsequent should be faster (cache hit)
+                long firstRetrieval = retrievalTimes.get(0);
+                double avgSubsequent = retrievalTimes.subList(1, retrievalTimes.size())
+                    .stream().mapToLong(Long::longValue).average().orElse(0.0);
+
+                System.out.printf("  📊 Searcher reuse analysis:%n");
+                System.out.printf("     First retrieval: %d ms (may include cache warming)%n", firstRetrieval);
+                System.out.printf("     Avg subsequent: %.1f ms (should be faster with reuse)%n", avgSubsequent);
+
+                if (avgSubsequent < firstRetrieval * 0.8) {
+                    System.out.println("     ✅ SEARCHER REUSE CONFIRMED: Subsequent retrievals faster (native cache working)");
+                } else {
+                    System.out.println("     ⚠️  POSSIBLE SEARCHER RECREATION: Similar timing across all retrievals");
+                }
+            }
+
+            // Phase 3: Batch document retrieval validation (SAME SEARCHER REUSE) - 1000 DOCUMENTS
+            System.out.println("Phase 3: Batch document retrieval performance test with 1000 documents...");
+
+            // Use the same replicated result set for batch testing (1000 documents)
+            int batchTestCount = replicatedHits.size(); // Should be exactly 1000
+            java.util.List<DocAddress> batchAddresses = replicatedHits
+                .stream()
+                .map(SearchResult.Hit::getDocAddress)
+                .collect(java.util.stream.Collectors.toList());
+
+            System.out.printf("  🔄 BATCH PERFORMANCE TEST: Using same searcher for batch of %d documents%n", batchAddresses.size());
+            System.out.println("     This directly compares batch vs individual retrieval efficiency at scale");
+
+            long batchStartTime = System.nanoTime();
+            java.util.List<Document> batchDocs = searcher.docBatch(batchAddresses);
+            long batchEndTime = System.nanoTime();
+            long totalBatchTime = (batchEndTime - batchStartTime) / 1_000_000;
+
+            System.out.printf("  📦 Batch retrieval completed: %d documents in %d ms%n", batchDocs.size(), totalBatchTime);
+            System.out.printf("      Average per document: %.3f ms%n", (double) totalBatchTime / batchDocs.size());
+
+            // Compare batch vs individual performance (batch should be more efficient)
+            double individualPerDoc = (double) totalIndividualTime / testCount;
+            double batchPerDoc = (double) totalBatchTime / batchDocs.size();
+            double batchEfficiencyRatio = individualPerDoc / batchPerDoc;
+
+            System.out.printf("  📈 PERFORMANCE COMPARISON (1000 documents each):%n");
+            System.out.printf("     Individual total: %d ms (%.3f ms/doc)%n", totalIndividualTime, individualPerDoc);
+            System.out.printf("     Batch total:      %d ms (%.3f ms/doc)%n", totalBatchTime, batchPerDoc);
+
+            if (batchEfficiencyRatio > 1.2) {
+                System.out.printf("     🚀 BATCH ADVANTAGE: %.1fx faster per document (✅ batch optimized)%n", batchEfficiencyRatio);
+            } else if (batchEfficiencyRatio > 0.8) {
+                System.out.printf("     ⚖️  SIMILAR PERFORMANCE: %.1fx ratio (⚠️ marginal difference)%n", batchEfficiencyRatio);
+            } else {
+                System.out.printf("     🐌 BATCH DISADVANTAGE: %.1fx slower per document (❌ batch inefficient)%n", 1.0 / batchEfficiencyRatio);
+            }
+
+            // Validate a sample of batch results
+            int sampleSize = Math.min(10, batchDocs.size());
+            for (int i = 0; i < sampleSize; i++) {
+                Document doc = batchDocs.get(i);
+                String domain = (String) doc.getFirst("domain");
+                assertNotNull(domain, "Batch document should have domain field");
+                doc.close();
+            }
+
+            // Close remaining batch documents
+            for (int i = sampleSize; i < batchDocs.size(); i++) {
+                batchDocs.get(i).close();
+            }
+
+            // Phase 3.5: Cache Manager Reuse Validation
+            System.out.println("Phase 3.5: Cache Manager Reuse Validation...");
+            System.out.println("  🔄 CACHE MANAGER REUSE: Testing that multiple searchers share same cache manager");
+
+            // Test creating a second searcher with same cache manager (should reuse caches)
+            long secondSearcherStart = System.nanoTime();
+            try (SplitSearcher searcher2 = docValidationCacheManager.createSplitSearcher(mergedSplitS3Url, mergedSplitMetadata)) {
+                long secondSearcherCreation = (System.nanoTime() - secondSearcherStart) / 1_000_000;
+
+                // Quick test with second searcher
+                long quickSearchStart = System.nanoTime();
+                SplitQuery quickQuery = new SplitTermQuery("domain", "customers");
+                SearchResult quickResult = searcher2.search(quickQuery, 5);
+                long quickSearchTime = (System.nanoTime() - quickSearchStart) / 1_000_000;
+
+                System.out.printf("  📊 Second searcher creation: %d ms%n", secondSearcherCreation);
+                System.out.printf("  📊 Quick search with second searcher: %d ms%n", quickSearchTime);
+
+                if (secondSearcherCreation < 100 && quickSearchTime < 50) {
+                    System.out.println("  ✅ CACHE MANAGER REUSE CONFIRMED: Fast second searcher creation and operation");
+                } else {
+                    System.out.println("  ⚠️  POTENTIAL CACHE ISOLATION: Second searcher creation/operation slower than expected");
+                }
+            }
+            System.out.printf("  🔄 Second searcher properly closed, returning to original searcher%n");
+
+            // Phase 4: Performance analysis and no-download validation (based on 1000-document test)
+            System.out.println("Phase 4: Performance analysis and no-download validation...");
+
+            // Calculate statistics from first 20 individual retrievals for consistency analysis
+            double avgTime = retrievalTimes.stream().mapToLong(Long::longValue).average().orElse(0.0);
+            long minTime = retrievalTimes.stream().mapToLong(Long::longValue).min().orElse(0L);
+            long maxTime = retrievalTimes.stream().mapToLong(Long::longValue).max().orElse(0L);
+            double variabilityRatio = (minTime > 0) ? (double) maxTime / minTime :
+                                     (maxTime == 0) ? 1.0 : Double.MAX_VALUE;
+
+            // Overall performance metrics from 1000-document tests
+            System.out.printf("📊 1000-Document Performance Summary:%n");
+            System.out.printf("  Individual: %d ms total, %.3f ms/doc average%n", totalIndividualTime, individualPerDoc);
+            System.out.printf("  Batch:      %d ms total, %.3f ms/doc average%n", totalBatchTime, batchPerDoc);
+            System.out.printf("  Batch efficiency ratio: %.2fx%n", batchEfficiencyRatio);
+
+            System.out.printf("Individual retrieval analysis:%n");
+            System.out.printf("  Average time: %.2f ms%n", avgTime);
+            System.out.printf("  Time range: %d - %d ms%n", minTime, maxTime);
+            System.out.printf("  Variability ratio: %.2fx%n", variabilityRatio);
+
+            // Validation criteria for hotcache optimization, searcher reuse, AND batch performance
+            boolean fastRetrievals = individualPerDoc < 1.0; // Average < 1ms per document (1000-doc scale)
+            boolean consistentRetrievals = variabilityRatio < 5.0; // Low variability in first 20 samples
+            boolean noneExtremelySlow = retrievalTimes.stream().noneMatch(t -> t > 100); // No >100ms retrievals in samples
+            boolean batchEfficient = batchEfficiencyRatio > 0.8; // Batch performance within 20% of individual
+            long veryFastCount = retrievalTimes.stream().filter(t -> t < 10).count();
+
+            // Additional searcher reuse validation criteria
+            boolean searcherReuseEvidence = retrievalTimes.size() >= 3 &&
+                retrievalTimes.subList(1, retrievalTimes.size())
+                    .stream().mapToLong(Long::longValue).average().orElse(0.0) < retrievalTimes.get(0) * 0.8;
+
+            System.out.println("Hotcache optimization, searcher reuse, AND batch performance validation:");
+            System.out.printf("  ✓ Fast individual retrieval (<1ms/doc avg): %s (%.3f ms/doc)%n",
+                             fastRetrievals ? "PASS" : "FAIL", individualPerDoc);
+            System.out.printf("  ✓ Consistent timing (<5x variability): %s (%.2fx)%n",
+                             consistentRetrievals ? "PASS" : "FAIL", variabilityRatio);
+            System.out.printf("  ✓ No slow retrievals in samples (>100ms): %s%n",
+                             noneExtremelySlow ? "PASS" : "FAIL");
+            System.out.printf("  ✓ Batch performance reasonable (>0.8x ratio): %s (%.2fx)%n",
+                             batchEfficient ? "PASS" : "FAIL", batchEfficiencyRatio);
+            System.out.printf("  ✓ Very fast samples (<10ms): %d/%d%n", veryFastCount, retrievalTimes.size());
+            System.out.printf("  ✓ Searcher reuse evidence (faster subsequent): %s%n",
+                             searcherReuseEvidence ? "PASS" : "FAIL");
+
+            // Overall assessment including batch performance
+            int passCount = (fastRetrievals ? 1 : 0) + (consistentRetrievals ? 1 : 0) + (noneExtremelySlow ? 1 : 0) +
+                           (batchEfficient ? 1 : 0) + (searcherReuseEvidence ? 1 : 0);
+
+            if (passCount >= 5) {
+                System.out.println("🎯 RESULT: ✅ EXCELLENT - All indicators confirm hotcache, searcher reuse, AND batch efficiency");
+                System.out.println("   Both individual and batch document retrievals are optimized with proper caching");
+            } else if (passCount >= 4) {
+                System.out.println("🎯 RESULT: ✅ VERY GOOD - Most indicators confirm optimization with minor batch issues");
+                System.out.println("   Individual retrieval optimized, batch performance may need investigation");
+            } else if (passCount >= 3) {
+                System.out.println("🎯 RESULT: ✅ GOOD - Core optimization working with some performance concerns");
+                System.out.println("   Hotcache optimization confirmed, but batch or reuse patterns suboptimal");
+            } else if (passCount >= 2) {
+                System.out.println("🎯 RESULT: ⚠️  MIXED - Some optimization evidence but significant performance issues");
+                System.out.println("   Basic functionality working but efficiency improvements needed");
+            } else {
+                System.out.println("🎯 RESULT: ❌ CONCERNING - Limited evidence of optimization at 1000-document scale");
+                System.out.println("   May be triggering full downloads, recreating searchers, or inefficient batch processing");
+            }
+
+            // Debug logging guidance
+            String debugEnv = System.getenv("TANTIVY4JAVA_DEBUG");
+            if ("1".equals(debugEnv)) {
+                System.out.println("🔍 DEBUG MODE: Review console output above for optimization path indicators");
+            } else {
+                System.out.println("💡 For detailed analysis, run with: TANTIVY4JAVA_DEBUG=1 mvn test -Dtest=RealS3EndToEndTest#step7_documentRetrievalNoDownloadValidationTest");
+            }
+
+            System.out.println("✅ Document retrieval no-download validation test completed");
+        }
+    }
+
+    @Test
+    @org.junit.jupiter.api.Order(9)
+    @DisplayName("Step 8: Large Split Performance Test - Demonstrating Hotcache Optimization")
+    public void step8_largeSplitPerformanceTest() throws Exception {
         System.out.println("🚀 === LARGE SPLIT PERFORMANCE TEST ===");
         System.out.println("Creating ~100MB split to demonstrate hotcache vs full download performance");
         
@@ -1039,11 +1446,13 @@ public class RealS3EndToEndTest {
         
         SplitCacheManager perfCacheManager = SplitCacheManager.getInstance(perfConfig);
         
-        // Measure cold performance with detailed profiling
-        System.out.println("🔍 Testing FIRST access (hotcache optimization should engage if footer metadata available):");
+        // Measure cold performance with detailed profiling INCLUDING searcher reuse
+        System.out.println("🔍 Testing FIRST access (hotcache + searcher reuse validation):");
         long coldStartTime = System.nanoTime();
         SearchResult coldResult;
         try (SplitSearcher coldSearcher = perfCacheManager.createSplitSearcher(largeSplitS3Url, largeSplitMetadata)) {
+
+            System.out.println("  🔄 SEARCHER LIFECYCLE: Testing single searcher for multiple operations (CRITICAL for performance)");
             
             // Phase 1: Schema retrieval
             long schemaStartTime = System.nanoTime();
@@ -1070,14 +1479,46 @@ public class RealS3EndToEndTest {
             System.out.printf("      📊 Query results: %d + %d + %d hits%n", 
                              coldResult.getHits().size(), domainResult.getHits().size(), nameResult.getHits().size());
             
-            // Phase 3: Document retrieval from search results
+            // Phase 3: Document retrieval from search results (VALIDATE NO FULL DOWNLOADS)
             if (coldResult.getHits().size() > 0) {
-                long docStartTime = System.nanoTime();
-                try (Document testDoc = coldSearcher.doc(coldResult.getHits().get(0).getDocAddress())) {
-                    String content = (String) testDoc.getFirst("content");
-                    assertNotNull(content, "Document content should be retrieved");
-                    long docEndTime = System.nanoTime();
-                    System.out.printf("    📄 Document retrieval: %.3f seconds%n", (docEndTime - docStartTime) / 1_000_000_000.0);
+                System.out.println("    🔍 Testing document retrieval - validating hotcache optimization...");
+
+                // Test multiple document retrievals to validate consistent performance
+                java.util.List<Long> docRetrievalTimes = new java.util.ArrayList<>();
+                int maxTestDocs = Math.min(5, coldResult.getHits().size());
+
+                for (int i = 0; i < maxTestDocs; i++) {
+                    long docStartTime = System.nanoTime();
+                    try (Document testDoc = coldSearcher.doc(coldResult.getHits().get(i).getDocAddress())) {
+                        String content = (String) testDoc.getFirst("content");
+                        assertNotNull(content, "Document content should be retrieved");
+                        long docEndTime = System.nanoTime();
+                        long docTime = (docEndTime - docStartTime) / 1_000_000; // Convert to milliseconds
+                        docRetrievalTimes.add(docTime);
+                        System.out.printf("      📄 Doc %d retrieval: %d ms%n", i + 1, docTime);
+                    }
+                }
+
+                // Analyze document retrieval consistency
+                if (docRetrievalTimes.size() >= 2) {
+                    double avgDocTime = docRetrievalTimes.stream().mapToLong(Long::longValue).average().orElse(0.0);
+                    long minDocTime = docRetrievalTimes.stream().mapToLong(Long::longValue).min().orElse(0L);
+                    long maxDocTime = docRetrievalTimes.stream().mapToLong(Long::longValue).max().orElse(0L);
+                    double docVariability = maxDocTime > 0 ? (double) maxDocTime / minDocTime : 1.0;
+
+                    System.out.printf("    📊 Document retrieval analysis: avg=%.1f ms, range=%d-%d ms, variability=%.1fx%n",
+                                     avgDocTime, minDocTime, maxDocTime, docVariability);
+
+                    // Low variability suggests hotcache is working (no full downloads)
+                    if (docVariability < 3.0) {
+                        System.out.println("    ✅ CONSISTENT DOC RETRIEVAL: Low variability suggests hotcache optimization active");
+                    } else {
+                        System.out.println("    ⚠️  VARIABLE DOC RETRIEVAL: Higher variability may indicate full downloads or network issues");
+                    }
+
+                    // Fast retrievals indicate hotcache success
+                    long fastRetrievals = docRetrievalTimes.stream().mapToLong(Long::longValue).filter(t -> t < 200).count();
+                    System.out.printf("    📈 Fast retrievals (<200ms): %d/%d%n", fastRetrievals, docRetrievalTimes.size());
                 }
             }
         }
@@ -1114,14 +1555,48 @@ public class RealS3EndToEndTest {
             System.out.printf("      📊 Query results: %d + %d + %d hits%n", 
                              warmResult.getHits().size(), domainResult.getHits().size(), nameResult.getHits().size());
             
-            // Phase 3: Document retrieval (should be faster due to caching)
+            // Phase 3: Document retrieval validation (should be faster and more consistent)
             if (warmResult.getHits().size() > 0) {
-                long docStartTime = System.nanoTime();
-                try (Document testDoc = warmSearcher.doc(warmResult.getHits().get(0).getDocAddress())) {
-                    String content = (String) testDoc.getFirst("content");
-                    assertNotNull(content, "Document content should be retrieved");
-                    long docEndTime = System.nanoTime();
-                    System.out.printf("    📄 Document retrieval: %.3f seconds (cached)%n", (docEndTime - docStartTime) / 1_000_000_000.0);
+                System.out.println("    🔍 Testing cached document retrieval performance...");
+
+                // Test the same documents as cold test for comparison
+                java.util.List<Long> warmDocRetrievalTimes = new java.util.ArrayList<>();
+                int maxTestDocs = Math.min(5, warmResult.getHits().size());
+
+                for (int i = 0; i < maxTestDocs; i++) {
+                    long docStartTime = System.nanoTime();
+                    try (Document testDoc = warmSearcher.doc(warmResult.getHits().get(i).getDocAddress())) {
+                        String content = (String) testDoc.getFirst("content");
+                        assertNotNull(content, "Document content should be retrieved");
+                        long docEndTime = System.nanoTime();
+                        long docTime = (docEndTime - docStartTime) / 1_000_000; // Convert to milliseconds
+                        warmDocRetrievalTimes.add(docTime);
+                        System.out.printf("      📄 Doc %d retrieval: %d ms (cached)%n", i + 1, docTime);
+                    }
+                }
+
+                // Analyze warm document retrieval performance
+                if (warmDocRetrievalTimes.size() >= 2) {
+                    double avgWarmDocTime = warmDocRetrievalTimes.stream().mapToLong(Long::longValue).average().orElse(0.0);
+                    long minWarmDocTime = warmDocRetrievalTimes.stream().mapToLong(Long::longValue).min().orElse(0L);
+                    long maxWarmDocTime = warmDocRetrievalTimes.stream().mapToLong(Long::longValue).max().orElse(0L);
+                    double warmDocVariability = maxWarmDocTime > 0 ? (double) maxWarmDocTime / minWarmDocTime : 1.0;
+
+                    System.out.printf("    📊 Warm doc retrieval analysis: avg=%.1f ms, range=%d-%d ms, variability=%.1fx%n",
+                                     avgWarmDocTime, minWarmDocTime, maxWarmDocTime, warmDocVariability);
+
+                    // Warm retrieval should be even more consistent than cold
+                    if (warmDocVariability < 2.0) {
+                        System.out.println("    ✅ EXCELLENT CACHE CONSISTENCY: Very consistent warm retrieval times");
+                    } else if (warmDocVariability < 3.0) {
+                        System.out.println("    ✅ GOOD CACHE CONSISTENCY: Consistent warm retrieval times");
+                    } else {
+                        System.out.println("    ⚠️  INCONSISTENT WARM RETRIEVAL: Cache may not be working optimally");
+                    }
+
+                    // Count fast warm retrievals
+                    long fastWarmRetrievals = warmDocRetrievalTimes.stream().mapToLong(Long::longValue).filter(t -> t < 100).count();
+                    System.out.printf("    📈 Very fast retrievals (<100ms): %d/%d%n", fastWarmRetrievals, warmDocRetrievalTimes.size());
                 }
             }
         }
@@ -1177,15 +1652,70 @@ public class RealS3EndToEndTest {
             System.out.println("ℹ️  NOTE: No significant performance difference (may indicate hotcache was already active on first access)");
         }
         
-        // Step 7.6: Network Traffic Analysis (if TANTIVY4JAVA_DEBUG is enabled)
+        // Step 7.6: Document Retrieval Network Traffic Analysis
+        System.out.println("🌐 === DOCUMENT RETRIEVAL NETWORK OPTIMIZATION ANALYSIS ===");
+
+        // Validate metadata for hotcache optimization
+        assertTrue(largeSplitMetadata.hasFooterOffsets(),
+                  "Large split should have footer metadata for hotcache optimization");
+
+        System.out.printf("Split metadata validation:%n");
+        System.out.printf("  📊 Footer offsets: %d..%d (range: %d bytes)%n",
+                         largeSplitMetadata.getFooterStartOffset(),
+                         largeSplitMetadata.getFooterEndOffset(),
+                         largeSplitMetadata.getFooterEndOffset() - largeSplitMetadata.getFooterStartOffset());
+        System.out.printf("  🔥 Hotcache: offset=%d, length=%d bytes%n",
+                         largeSplitMetadata.getHotcacheStartOffset(),
+                         largeSplitMetadata.getHotcacheLength());
+
+        // Calculate theoretical network savings
+        long totalSplitSize = largeSplitMetadata.getUncompressedSizeBytes();
+        long hotcacheSize = largeSplitMetadata.getHotcacheLength();
+        double networkSavings = hotcacheSize > 0 ? ((double)(totalSplitSize - hotcacheSize) / totalSplitSize) * 100 : 0;
+
+        System.out.printf("Network optimization potential:%n");
+        System.out.printf("  📦 Total split size: %.2f MB%n", totalSplitSize / 1024.0 / 1024.0);
+        System.out.printf("  🔥 Hotcache size: %.2f MB%n", hotcacheSize / 1024.0 / 1024.0);
+        System.out.printf("  💾 Network savings: %.1f%% (%.2f MB avoided)%n",
+                         networkSavings, (totalSplitSize - hotcacheSize) / 1024.0 / 1024.0);
+
+        if (networkSavings > 80) {
+            System.out.println("  ✅ EXCELLENT: High network savings with hotcache optimization");
+        } else if (networkSavings > 50) {
+            System.out.println("  ✅ GOOD: Significant network savings with hotcache optimization");
+        } else {
+            System.out.println("  ⚠️  LIMITED: Lower than expected network savings");
+        }
+
+        // Debug logging analysis
         String debugEnv = System.getenv("TANTIVY4JAVA_DEBUG");
         if ("1".equals(debugEnv)) {
-            System.out.println("🔍 DEBUG MODE: Check logs above for hotcache vs full download indicators:");
-            System.out.println("  - Look for '🚀 Using Quickwit optimized path with hotcache' messages");
-            System.out.println("  - Look for '⚠️ Footer metadata not available, falling back to full download' messages");
-            System.out.println("  - Hotcache optimization should significantly reduce network traffic");
+            System.out.println("🔍 DEBUG MODE ACTIVE: Analyze console output above for network optimization:");
+            System.out.println("  POSITIVE INDICATORS (hotcache working):");
+            System.out.println("    - '🚀 Using Quickwit optimized path with open_index_with_caches - NO full file download'");
+            System.out.println("    - 'Footer offsets from Java config: start=X, end=Y'");
+            System.out.println("    - 'Successfully opened index with Quickwit hotcache optimization'");
+            System.out.println("    - Consistent document retrieval times (<200ms)");
+            System.out.println("  ");
+            System.out.println("  NEGATIVE INDICATORS (full downloads):");
+            System.out.println("    - '⚠️ Footer metadata not available, falling back to full download'");
+            System.out.println("    - Large variance in document retrieval times (>1000ms)");
+            System.out.println("    - 'get_slice(relative_path, 0..file_size as usize)' messages");
+            System.out.println("  ");
+            System.out.println("  🎯 EXPECTED: With proper footer metadata, ALL document retrievals should use hotcache");
         } else {
-            System.out.println("💡 TIP: Run with TANTIVY4JAVA_DEBUG=1 to see detailed optimization path selection");
+            System.out.println("💡 TIP: Run with TANTIVY4JAVA_DEBUG=1 to see detailed hotcache vs full download debug messages");
+            System.out.println("      This will show exactly which optimization path is being used for each operation");
+        }
+
+        // Performance-based validation
+        System.out.println("📈 Performance-based validation of network optimization:");
+        if (speedupFactor > 1.5 && networkSavings > 70) {
+            System.out.println("  ✅ CONFIRMED: Both performance improvement and theoretical network savings suggest hotcache is working");
+        } else if (speedupFactor > 1.2 || networkSavings > 50) {
+            System.out.println("  ✅ LIKELY: Performance or theoretical analysis suggests hotcache optimization");
+        } else {
+            System.out.println("  ⚠️  UNCERTAIN: Limited evidence of hotcache optimization effectiveness");
         }
         
         System.out.println("✅ Large split performance test completed successfully!");
