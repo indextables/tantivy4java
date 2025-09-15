@@ -440,6 +440,10 @@ pub fn convert_split_query_to_ast(env: &mut JNIEnv, query_obj: &JObject) -> Resu
             // SplitParsedQuery already contains the QueryAst as JSON - parse it back
             convert_parsed_query_to_query_ast(env, query_obj)
         }
+        "com.tantivy4java.SplitPhraseQuery" => {
+            // Create QueryAst directly using native Quickwit structures
+            convert_phrase_query_to_query_ast(env, query_obj)
+        }
         _ => {
             Err(anyhow!("Unsupported SplitQuery type: {}", class_name))
         }
@@ -698,3 +702,94 @@ fn convert_json_literal_to_value(literal: JsonLiteral) -> serde_json::Value {
     }
 }
 
+/// Convert a SplitPhraseQuery to QueryAst JSON (FOR TESTING ONLY - Production should use SplitSearcher.search() directly)
+#[no_mangle]
+pub extern "system" fn Java_com_tantivy4java_SplitPhraseQuery_toQueryAstJson(
+    mut env: JNIEnv,
+    obj: JObject,
+) -> jstring {
+    let result = convert_phrase_query_to_ast(&mut env, &obj);
+    match result {
+        Ok(json) => {
+            match env.new_string(json) {
+                Ok(jstring) => jstring.into_raw(),
+                Err(e) => {
+                    debug_println!("RUST DEBUG: Failed to create JString from QueryAst JSON: {}", e);
+                    crate::common::to_java_exception(&mut env, &anyhow::anyhow!("Failed to create JString from QueryAst JSON: {}", e));
+                    std::ptr::null_mut()
+                }
+            }
+        }
+        Err(e) => {
+            debug_println!("RUST DEBUG: Error converting SplitPhraseQuery to QueryAst: {}", e);
+            crate::common::to_java_exception(&mut env, &e);
+            std::ptr::null_mut()
+        }
+    }
+}
+
+// Wrapper function for JNI layer - converts to JSON string
+fn convert_phrase_query_to_ast(env: &mut JNIEnv, obj: &JObject) -> Result<String> {
+    let query_ast = convert_phrase_query_to_query_ast(env, obj)?;
+    convert_query_ast_to_json_string(query_ast)
+}
+
+fn convert_phrase_query_to_query_ast(env: &mut JNIEnv, obj: &JObject) -> Result<QueryAst> {
+    // Extract field, terms, and slop from Java SplitPhraseQuery object
+    let field_obj = env.get_field(obj, "field", "Ljava/lang/String;")
+        .map_err(|e| anyhow!("Failed to get field: {}", e))?;
+    let terms_obj = env.get_field(obj, "terms", "Ljava/util/List;")
+        .map_err(|e| anyhow!("Failed to get terms: {}", e))?;
+    let slop_obj = env.get_field(obj, "slop", "I")
+        .map_err(|e| anyhow!("Failed to get slop: {}", e))?;
+
+    let field_jstring: JString = field_obj.l()?.into();
+    let field: String = env.get_string(&field_jstring)?.into();
+
+    let slop = slop_obj.i()? as u32;
+
+    // Convert Java List<String> to Rust Vec<String>
+    let terms_list = terms_obj.l()?;
+    let mut terms = Vec::new();
+
+    // Get list size
+    let list_size = env.call_method(&terms_list, "size", "()I", &[])?;
+    let size = list_size.i()?;
+
+    // Extract each term from the list
+    for i in 0..size {
+        let index_value = JValue::Int(i);
+        let term_obj = env.call_method(&terms_list, "get", "(I)Ljava/lang/Object;", &[index_value])?;
+        let term_jstring: JString = term_obj.l()?.into();
+        let term: String = env.get_string(&term_jstring)?.into();
+
+        // Lowercase term for text field tokenization compatibility
+        terms.push(term.to_lowercase());
+    }
+
+    // Create phrase string by joining terms with spaces
+    let phrase = terms.join(" ");
+
+    debug_println!("RUST DEBUG: SplitPhraseQuery - field: '{}', terms: {:?}, phrase: '{}', slop: {}",
+                   field, terms, phrase, slop);
+
+    // Create proper Quickwit QueryAst using FullText query with Phrase mode
+    use quickwit_query::query_ast::{FullTextQuery, FullTextParams, FullTextMode};
+    use quickwit_query::MatchAllOrNone;
+
+    let full_text_query = FullTextQuery {
+        field,
+        text: phrase,
+        params: FullTextParams {
+            tokenizer: None,
+            mode: FullTextMode::Phrase { slop },
+            zero_terms_query: MatchAllOrNone::MatchNone,
+        },
+        lenient: false,
+    };
+
+    let query_ast = QueryAst::FullText(full_text_query);
+
+    debug_println!("RUST DEBUG: Created PhraseQuery QueryAst using FullText with Phrase mode");
+    Ok(query_ast)
+}

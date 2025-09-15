@@ -668,7 +668,9 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_searchWithQueryAst(
                                 let tokenizer_name = indexing_options.tokenizer();
                                 ("text", Some(tokenizer_name.to_string()))
                             } else {
-                                ("keyword", None)
+                                // Store-only text fields should still be "text" type, not "keyword"
+                                // Quickwit's DocMapper only supports "text" type for Str fields
+                                ("text", None)
                             }
                         },
                         FieldType::U64(_) => ("u64", None),
