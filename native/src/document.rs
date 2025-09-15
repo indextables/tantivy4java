@@ -30,6 +30,7 @@ use crate::utils::{handle_error, with_arc_safe, arc_to_jlong, release_arc};
 use std::sync::{Arc, Mutex};
 use serde_json;
 
+
 /// Unified document type that can handle both creation and retrieval
 #[derive(Clone)]
 pub enum DocumentWrapper {
@@ -104,11 +105,20 @@ impl DocumentBuilder {
             IpAddr::V4(ipv4) => ipv4.to_ipv6_mapped(),
             IpAddr::V6(ipv6) => ipv6,
         };
-        
+
         self.field_values
             .entry(field_name)
             .or_default()
             .push(OwnedValue::IpAddr(ipv6_value));
+    }
+
+    pub fn add_json(&mut self, field_name: String, json_object: BTreeMap<String, OwnedValue>) {
+        // Convert BTreeMap to Vec<(String, OwnedValue)> for tantivy
+        let json_vec: Vec<(String, OwnedValue)> = json_object.into_iter().collect();
+        self.field_values
+            .entry(field_name)
+            .or_default()
+            .push(OwnedValue::Object(json_vec));
     }
     
     pub fn build(self, schema: &Schema) -> Result<TantivyDocument, String> {
@@ -127,6 +137,11 @@ impl DocumentBuilder {
                     OwnedValue::Bool(b) => doc.add_bool(field, b),
                     OwnedValue::Date(dt) => doc.add_date(field, dt),
                     OwnedValue::IpAddr(ipv6) => doc.add_ip_addr(field, ipv6),
+                    OwnedValue::Object(obj) => {
+                        // Convert Vec<(String, OwnedValue)> to BTreeMap for tantivy
+                        let json_map: BTreeMap<String, OwnedValue> = obj.into_iter().collect();
+                        doc.add_object(field, json_map);
+                    },
                     _ => return Err(format!("Unsupported value type for field '{}'", field_name)),
                 }
             }
@@ -653,11 +668,56 @@ pub extern "system" fn Java_com_tantivy4java_Document_nativeAddBytes(
 pub extern "system" fn Java_com_tantivy4java_Document_nativeAddJson(
     mut env: JNIEnv,
     _class: JClass,
-    _ptr: jlong,
-    _field_name: JString,
-    _value: JObject,
+    ptr: jlong,
+    field_name: JString,
+    json_string: JString,
 ) {
-    handle_error(&mut env, "Document native methods not fully implemented yet");
+    let field_name_str: String = match env.get_string(&field_name) {
+        Ok(s) => s.into(),
+        Err(_) => {
+            handle_error(&mut env, "Invalid field name");
+            return;
+        }
+    };
+
+    let json_str: String = match env.get_string(&json_string) {
+        Ok(s) => s.into(),
+        Err(_) => {
+            handle_error(&mut env, "Invalid JSON string");
+            return;
+        }
+    };
+
+    let result = with_arc_safe::<Mutex<DocumentWrapper>, Result<(), String>>(ptr, |wrapper_mutex| {
+        let mut doc_wrapper = wrapper_mutex.lock().unwrap();
+        match &mut *doc_wrapper {
+            DocumentWrapper::Builder(ref mut doc_builder) => {
+                // Parse JSON string into a BTreeMap<String, OwnedValue>
+                let json_value: std::collections::BTreeMap<String, tantivy::schema::OwnedValue> =
+                    match serde_json::from_str(&json_str) {
+                        Ok(value) => value,
+                        Err(e) => return Err(format!("Invalid JSON format: {}", e))
+                    };
+
+                // Add JSON object using the helper method
+                doc_builder.add_json(field_name_str, json_value);
+                Ok(())
+            },
+            DocumentWrapper::Retrieved(_) => {
+                Err("Cannot add values to retrieved documents".to_string())
+            }
+        }
+    });
+
+    match result {
+        Some(Ok(())) => {},
+        Some(Err(err)) => {
+            handle_error(&mut env, &err);
+        },
+        None => {
+            handle_error(&mut env, "Invalid Document pointer");
+        }
+    }
 }
 
 #[no_mangle]
@@ -704,6 +764,56 @@ pub extern "system" fn Java_com_tantivy4java_Document_nativeAddIpAddr(
             }
         }
     });
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_tantivy4java_Document_nativeAddString(
+    mut env: JNIEnv,
+    _class: JClass,
+    ptr: jlong,
+    field_name: JString,
+    value: JString,
+) {
+    let field_name_str: String = match env.get_string(&field_name) {
+        Ok(s) => s.into(),
+        Err(_) => {
+            handle_error(&mut env, "Invalid field name");
+            return;
+        }
+    };
+
+    let value_str: String = match env.get_string(&value) {
+        Ok(s) => s.into(),
+        Err(_) => {
+            handle_error(&mut env, "Invalid string value");
+            return;
+        }
+    };
+
+    let result = with_arc_safe::<Mutex<DocumentWrapper>, Result<(), String>>(ptr, |wrapper_mutex| {
+        let mut doc_wrapper = wrapper_mutex.lock().unwrap();
+        match &mut *doc_wrapper {
+            DocumentWrapper::Builder(ref mut doc_builder) => {
+                // For string fields, we store them as text values
+                // The distinction between string and text fields is handled at the schema level
+                doc_builder.add_text(field_name_str, value_str);
+                Ok(())
+            },
+            DocumentWrapper::Retrieved(_) => {
+                Err("Cannot add values to retrieved documents".to_string())
+            }
+        }
+    });
+
+    match result {
+        Some(Ok(())) => {},
+        Some(Err(err)) => {
+            handle_error(&mut env, &err);
+        },
+        None => {
+            handle_error(&mut env, "Invalid Document pointer");
+        }
+    }
 }
 
 #[no_mangle]

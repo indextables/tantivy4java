@@ -20,7 +20,7 @@
 use jni::objects::{JClass, JString};
 use jni::sys::{jboolean, jlong, jint, jobject};
 use jni::JNIEnv;
-use tantivy::schema::{SchemaBuilder, TextOptions, NumericOptions, DateOptions, IpAddrOptions};
+use tantivy::schema::{SchemaBuilder, TextOptions, NumericOptions, DateOptions, IpAddrOptions, JsonObjectOptions};
 use tantivy::schema::{IndexRecordOption, TextFieldIndexing};
 use crate::utils::{handle_error, with_arc_safe, arc_to_jlong, release_arc};
 use crate::debug_println;
@@ -370,13 +370,74 @@ pub extern "system" fn Java_com_tantivy4java_SchemaBuilder_nativeAddDateField(
 pub extern "system" fn Java_com_tantivy4java_SchemaBuilder_nativeAddJsonField(
     mut env: JNIEnv,
     _class: JClass,
-    _ptr: jlong,
-    _name: JString,
-    _stored: jboolean,
-    _tokenizer_name: JString,
-    _index_option: JString,
+    ptr: jlong,
+    name: JString,
+    stored: jboolean,
+    tokenizer_name: JString,
+    index_option: JString,
 ) {
-    handle_error(&mut env, "SchemaBuilder native methods not fully implemented yet");
+    let field_name: String = match env.get_string(&name) {
+        Ok(s) => s.into(),
+        Err(_) => {
+            handle_error(&mut env, "Invalid field name");
+            return;
+        }
+    };
+
+    let tokenizer_str: String = match env.get_string(&tokenizer_name) {
+        Ok(s) => s.into(),
+        Err(_) => {
+            handle_error(&mut env, "Invalid tokenizer name");
+            return;
+        }
+    };
+
+    let index_option_str: String = match env.get_string(&index_option) {
+        Ok(s) => s.into(),
+        Err(_) => {
+            handle_error(&mut env, "Invalid index option");
+            return;
+        }
+    };
+
+    let result = with_arc_safe::<Mutex<SchemaBuilder>, Result<(), String>>(ptr, |builder_mutex| {
+        let mut builder = builder_mutex.lock().unwrap();
+
+        // Create JSON field options
+        let mut json_options = JsonObjectOptions::default();
+
+        if stored != 0 {
+            json_options = json_options.set_stored();
+        }
+
+        // Set up indexing with the specified tokenizer
+        let index_record_option = match index_option_str.as_str() {
+            "position" => IndexRecordOption::WithFreqsAndPositions,
+            "freq" => IndexRecordOption::WithFreqs,
+            "basic" => IndexRecordOption::Basic,
+            _ => IndexRecordOption::Basic,
+        };
+
+        let indexing = TextFieldIndexing::default()
+            .set_tokenizer(&tokenizer_str)
+            .set_index_option(index_record_option);
+
+        json_options = json_options.set_indexing_options(indexing);
+
+        // Add the JSON field to the builder
+        builder.add_json_field(&field_name, json_options);
+        Ok(())
+    });
+
+    match result {
+        Some(Ok(())) => {},
+        Some(Err(err)) => {
+            handle_error(&mut env, &err);
+        },
+        None => {
+            handle_error(&mut env, "Invalid SchemaBuilder pointer");
+        }
+    }
 }
 
 #[no_mangle]
@@ -484,6 +545,63 @@ pub extern "system" fn Java_com_tantivy4java_SchemaBuilder_nativeClose(
     ptr: jlong,
 ) {
     release_arc(ptr);
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_tantivy4java_SchemaBuilder_nativeAddStringField(
+    mut env: JNIEnv,
+    _class: JClass,
+    ptr: jlong,
+    name: JString,
+    stored: jboolean,
+    indexed: jboolean,
+    fast: jboolean,
+) {
+    let field_name: String = match env.get_string(&name) {
+        Ok(s) => s.into(),
+        Err(_) => {
+            handle_error(&mut env, "Invalid field name");
+            return;
+        }
+    };
+
+    let result = with_arc_safe::<Mutex<SchemaBuilder>, Result<(), String>>(ptr, |builder_mutex| {
+        let mut builder = builder_mutex.lock().unwrap();
+        let mut text_options = TextOptions::default();
+
+        if stored != 0 {
+            text_options = text_options.set_stored();
+        }
+
+        if fast != 0 {
+            // For string fields, we use "raw" tokenizer for exact matching
+            text_options = text_options.set_fast(Some("raw"));
+        }
+
+        if indexed != 0 {
+            // For string fields, use "raw" tokenizer which doesn't tokenize,
+            // providing exact string matching behavior
+            let indexing = TextFieldIndexing::default()
+                .set_tokenizer("raw")
+                .set_index_option(IndexRecordOption::Basic);
+
+            text_options = text_options.set_indexing_options(indexing);
+        }
+
+        // Add the field to the builder as a text field with raw tokenizer
+        builder.add_text_field(&field_name, text_options);
+        Ok(())
+    });
+
+    match result {
+        Some(Ok(())) => {},
+        Some(Err(err)) => {
+            handle_error(&mut env, &err);
+        },
+        None => {
+            handle_error(&mut env, "Invalid SchemaBuilder pointer");
+        }
+    }
 }
 
 #[no_mangle]

@@ -1347,9 +1347,8 @@ fn parse_single_document(schema: &Schema, buffer: &[u8], offset: usize) -> Resul
                 },
                 FieldValue::Bytes(bytes) => document.add_bytes(field, &bytes),
                 FieldValue::Json(json_str) => {
-                    // For JSON fields, we'll store the raw JSON string
-                    // This matches how the existing IndexWriter.addJson works
-                    document.add_text(field, &json_str);
+                    // JSON field implementation needs proper tantivy API - throw error for now
+                    return Err("JSON field implementation not yet complete - use text fields instead".to_string());
                 },
                 FieldValue::IpAddr(ip_str) => {
                     // Parse IP address - convert to IPv6 format for Tantivy

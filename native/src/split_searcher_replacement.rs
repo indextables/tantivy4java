@@ -662,29 +662,38 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_searchWithQueryAst(
                     let field_type = field_entry.field_type();
                     
                     use tantivy::schema::FieldType;
-                    let mapping_type = match field_type {
+                    let (mapping_type, tokenizer) = match field_type {
                         FieldType::Str(text_options) => {
-                            if text_options.get_indexing_options().is_some() {
-                                "text"
+                            if let Some(indexing_options) = text_options.get_indexing_options() {
+                                let tokenizer_name = indexing_options.tokenizer();
+                                ("text", Some(tokenizer_name.to_string()))
                             } else {
-                                "keyword"
+                                ("keyword", None)
                             }
                         },
-                        FieldType::U64(_) => "u64",
-                        FieldType::I64(_) => "i64",
-                        FieldType::F64(_) => "f64",
-                        FieldType::Bool(_) => "bool",
-                        FieldType::Date(_) => "datetime",
-                        FieldType::Bytes(_) => "bytes",
-                        FieldType::IpAddr(_) => "ip",
-                        FieldType::JsonObject(_) => "json",
-                        FieldType::Facet(_) => "keyword", // Facets are similar to keywords
+                        FieldType::U64(_) => ("u64", None),
+                        FieldType::I64(_) => ("i64", None),
+                        FieldType::F64(_) => ("f64", None),
+                        FieldType::Bool(_) => ("bool", None),
+                        FieldType::Date(_) => ("datetime", None),
+                        FieldType::Bytes(_) => ("bytes", None),
+                        FieldType::IpAddr(_) => ("ip", None),
+                        FieldType::JsonObject(_) => ("json", None),
+                        FieldType::Facet(_) => ("keyword", None), // Facets are similar to keywords
                     };
-                    
-                    field_mappings.push(serde_json::json!({
+
+                    let mut field_mapping = serde_json::json!({
                         "name": field_name,
                         "type": mapping_type,
-                    }));
+                    });
+
+                    // Add tokenizer information for text fields
+                    if let Some(tokenizer_name) = tokenizer {
+                        field_mapping["tokenizer"] = serde_json::Value::String(tokenizer_name);
+                        debug_println!("RUST DEBUG: Field '{}' has tokenizer '{}'", field_name, field_mapping["tokenizer"]);
+                    }
+
+                    field_mappings.push(field_mapping);
                 }
                 
                 debug_println!("RUST DEBUG: Extracted {} field mappings from index schema", field_mappings.len());
@@ -1758,26 +1767,127 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_docNative(
     }
 }
 
-/// Create Tantivy schema from Quickwit doc mapping JSON
-/// This is a major optimization that avoids expensive S3 I/O operations
+/// Create Tantivy schema from field mappings JSON array
+/// This handles the field mappings array format used by QuickwitSplit
 fn create_schema_from_doc_mapping(doc_mapping_json: &str) -> anyhow::Result<tantivy::schema::Schema> {
-    debug_println!("RUST DEBUG: Creating schema from doc mapping JSON");
-    debug_println!("RUST DEBUG: 🔍 RAW DOC MAPPING JSON ({} chars): '{}'", doc_mapping_json.len(), doc_mapping_json);
-    
-    // Parse the doc mapping JSON
-    use quickwit_doc_mapper::DocMapperBuilder;
-    let doc_mapper_builder: DocMapperBuilder = serde_json::from_str(doc_mapping_json)
-        .map_err(|e| anyhow::anyhow!("Failed to parse doc mapping JSON: {}", e))?;
-    
-    // Build the DocMapper
-    let doc_mapper = doc_mapper_builder.try_build()
-        .map_err(|e| anyhow::anyhow!("Failed to build DocMapper: {}", e))?;
-    
-    // Extract the Tantivy schema from the DocMapper
-    let schema = doc_mapper.schema();
-    
-    debug_println!("RUST DEBUG: Successfully created Tantivy schema from doc mapping with {} fields", schema.num_fields());
-    Ok(schema.clone())
+    debug_println!("RUST DEBUG: Creating schema from field mappings JSON");
+    debug_println!("RUST DEBUG: 🔍 RAW FIELD MAPPINGS JSON ({} chars): '{}'", doc_mapping_json.len(), doc_mapping_json);
+
+    // Parse the field mappings JSON array
+    #[derive(serde::Deserialize)]
+    struct FieldMapping {
+        name: String,
+        #[serde(rename = "type")]
+        field_type: String,
+        stored: Option<bool>,
+        indexed: Option<bool>,
+        fast: Option<bool>,
+        tokenizer: Option<String>,
+    }
+
+    let field_mappings: Vec<FieldMapping> = serde_json::from_str(doc_mapping_json)
+        .map_err(|e| anyhow::anyhow!("Failed to parse field mappings JSON: {}", e))?;
+
+    debug_println!("RUST DEBUG: Parsed {} field mappings", field_mappings.len());
+
+    // Create Tantivy schema builder
+    let mut schema_builder = tantivy::schema::Schema::builder();
+
+    // Add each field to the schema
+    for field_mapping in field_mappings {
+        let stored = field_mapping.stored.unwrap_or(false);
+        let indexed = field_mapping.indexed.unwrap_or(false);
+        let fast = field_mapping.fast.unwrap_or(false);
+        let tokenizer = field_mapping.tokenizer.as_deref().unwrap_or("default");
+
+        debug_println!("RUST DEBUG: Adding field '{}' type '{}' stored={} indexed={} fast={} tokenizer='{}'",
+            field_mapping.name, field_mapping.field_type, stored, indexed, fast, tokenizer);
+
+        match field_mapping.field_type.as_str() {
+            "text" => {
+                let mut text_options = tantivy::schema::TextOptions::default();
+                if stored {
+                    text_options = text_options.set_stored();
+                }
+                if indexed {
+                    let text_indexing = tantivy::schema::TextFieldIndexing::default()
+                        .set_tokenizer(tokenizer)
+                        .set_index_option(tantivy::schema::IndexRecordOption::WithFreqsAndPositions);
+                    text_options = text_options.set_indexing_options(text_indexing);
+                }
+                if fast {
+                    text_options = text_options.set_fast(Some("default"));
+                }
+                schema_builder.add_text_field(&field_mapping.name, text_options);
+            },
+            "i64" => {
+                let mut int_options = tantivy::schema::NumericOptions::default();
+                if stored {
+                    int_options = int_options.set_stored();
+                }
+                if indexed {
+                    int_options = int_options.set_indexed();
+                }
+                if fast {
+                    int_options = int_options.set_fast();
+                }
+                schema_builder.add_i64_field(&field_mapping.name, int_options);
+            },
+            "f64" => {
+                let mut float_options = tantivy::schema::NumericOptions::default();
+                if stored {
+                    float_options = float_options.set_stored();
+                }
+                if indexed {
+                    float_options = float_options.set_indexed();
+                }
+                if fast {
+                    float_options = float_options.set_fast();
+                }
+                schema_builder.add_f64_field(&field_mapping.name, float_options);
+            },
+            "bool" => {
+                let mut bool_options = tantivy::schema::NumericOptions::default();
+                if stored {
+                    bool_options = bool_options.set_stored();
+                }
+                if indexed {
+                    bool_options = bool_options.set_indexed();
+                }
+                if fast {
+                    bool_options = bool_options.set_fast();
+                }
+                schema_builder.add_bool_field(&field_mapping.name, bool_options);
+            },
+            "object" => {
+                let mut json_options = tantivy::schema::JsonObjectOptions::default();
+                if stored {
+                    json_options = json_options.set_stored();
+                }
+                schema_builder.add_json_field(&field_mapping.name, json_options);
+            },
+            other => {
+                debug_println!("RUST DEBUG: ⚠️ Unsupported field type '{}' for field '{}', treating as text", other, field_mapping.name);
+                // Fallback to text field for unknown types
+                let mut text_options = tantivy::schema::TextOptions::default();
+                if stored {
+                    text_options = text_options.set_stored();
+                }
+                if indexed {
+                    text_options = text_options.set_indexing_options(
+                        tantivy::schema::TextFieldIndexing::default()
+                            .set_tokenizer("default")
+                            .set_index_option(tantivy::schema::IndexRecordOption::WithFreqsAndPositions)
+                    );
+                }
+                schema_builder.add_text_field(&field_mapping.name, text_options);
+            }
+        }
+    }
+
+    let schema = schema_builder.build();
+    debug_println!("RUST DEBUG: Successfully created Tantivy schema from field mappings with {} fields", schema.num_fields());
+    Ok(schema)
 }
 
 /// Replacement for Java_com_tantivy4java_SplitSearcher_getSchemaFromNative
@@ -2330,6 +2440,162 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_parseBulkDocsNative(
         Ok(empty_list) => empty_list.into_raw(),
         Err(_) => std::ptr::null_mut(),
     }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_tantivy4java_SplitSearcher_tokenizeNative(
+    mut env: JNIEnv,
+    _class: JClass,
+    searcher_ptr: jlong,
+    field_name: JString,
+    text: JString,
+) -> jobject {
+    // Extract field name and text from JNI
+    let field_name_str: String = match env.get_string(&field_name) {
+        Ok(s) => s.into(),
+        Err(e) => {
+            to_java_exception(&mut env, &anyhow::anyhow!("Invalid field name: {}", e));
+            return std::ptr::null_mut();
+        }
+    };
+
+    let text_str: String = match env.get_string(&text) {
+        Ok(s) => s.into(),
+        Err(e) => {
+            to_java_exception(&mut env, &anyhow::anyhow!("Invalid text: {}", e));
+            return std::ptr::null_mut();
+        }
+    };
+
+    debug_println!("RUST DEBUG: tokenizeNative called for field '{}' with text '{}'", field_name_str, text_str);
+
+    // Get the searcher context and schema (same pattern as get_schema_from_split)
+    let result = with_arc_safe(searcher_ptr, |searcher_context: &Arc<(StandaloneSearcher, tokio::runtime::Runtime, String, std::collections::HashMap<String, String>, u64, u64, Option<String>)>| {
+        let (_searcher, _runtime, _split_uri, _aws_config, _footer_start, _footer_end, doc_mapping_json) = searcher_context.as_ref();
+
+        // Get schema from doc mapping - throw exception if not available
+        let schema = if let Some(doc_mapping) = doc_mapping_json {
+            match create_schema_from_doc_mapping(doc_mapping) {
+                Ok(schema) => schema,
+                Err(e) => {
+                    return Err(anyhow::anyhow!("Failed to create schema from doc mapping for tokenization: {}", e));
+                }
+            }
+        } else {
+            return Err(anyhow::anyhow!("Doc mapping not available for tokenization - split searcher not properly initialized"));
+        };
+
+        // Find the field in the schema
+        let field = match schema.get_field(&field_name_str) {
+            Ok(field) => field,
+            Err(_) => {
+                return Err(anyhow::anyhow!("Field '{}' not found in schema", field_name_str));
+            }
+        };
+
+        // Get the field entry to determine the tokenizer
+        let field_entry = schema.get_field_entry(field);
+
+        // Create a text analyzer for the field
+        let mut tokenizer = match field_entry.field_type() {
+            tantivy::schema::FieldType::Str(text_options) => {
+                // For text fields, get the tokenizer from indexing options
+                if let Some(indexing_options) = text_options.get_indexing_options() {
+                    let tokenizer_name = indexing_options.tokenizer();
+                    debug_println!("RUST DEBUG: Field '{}' uses tokenizer '{}'", field_name_str, tokenizer_name);
+
+                    // Create the tokenizer based on the name
+                    match tokenizer_name {
+                        "default" => {
+                            tantivy::tokenizer::TextAnalyzer::builder(tantivy::tokenizer::SimpleTokenizer::default())
+                                .filter(tantivy::tokenizer::RemoveLongFilter::limit(40))
+                                .filter(tantivy::tokenizer::LowerCaser)
+                                .build()
+                        },
+                        "raw" => {
+                            // For string fields (raw tokenizer), return the original text as a single token
+                            debug_println!("RUST DEBUG: Using raw tokenizer for field '{}'", field_name_str);
+                            let tokens = vec![text_str.clone()];
+                            return create_token_list(&mut env, tokens);
+                        },
+                        "whitespace" => {
+                            tantivy::tokenizer::TextAnalyzer::builder(tantivy::tokenizer::WhitespaceTokenizer::default())
+                                .build()
+                        },
+                        "keyword" => {
+                            // Keyword tokenizer treats the entire input as a single token
+                            let tokens = vec![text_str.clone()];
+                            return create_token_list(&mut env, tokens);
+                        },
+                        _ => {
+                            // Default to simple tokenizer for unknown tokenizers
+                            debug_println!("RUST DEBUG: Unknown tokenizer '{}', using default", tokenizer_name);
+                            tantivy::tokenizer::TextAnalyzer::builder(tantivy::tokenizer::SimpleTokenizer::default())
+                                .filter(tantivy::tokenizer::RemoveLongFilter::limit(40))
+                                .filter(tantivy::tokenizer::LowerCaser)
+                                .build()
+                        }
+                    }
+                } else {
+                    // No indexing options means it's not indexed, but we can still tokenize
+                    tantivy::tokenizer::TextAnalyzer::builder(tantivy::tokenizer::SimpleTokenizer::default())
+                        .filter(tantivy::tokenizer::RemoveLongFilter::limit(40))
+                        .filter(tantivy::tokenizer::LowerCaser)
+                        .build()
+                }
+            },
+            _ => {
+                // For non-text fields (numbers, dates, etc.), return the original text as a single token
+                debug_println!("RUST DEBUG: Non-text field '{}', returning original text as single token", field_name_str);
+                let tokens = vec![text_str.clone()];
+                return create_token_list(&mut env, tokens);
+            }
+        };
+
+        // Tokenize the text
+        let mut token_stream = tokenizer.token_stream(&text_str);
+        let mut tokens = Vec::new();
+
+        while let Some(token) = token_stream.next() {
+            tokens.push(token.text.clone());
+        }
+
+        debug_println!("RUST DEBUG: Tokenized '{}' into {} tokens: {:?}", text_str, tokens.len(), tokens);
+
+        create_token_list(&mut env, tokens)
+    });
+
+    match result {
+        Some(Ok(tokens_list)) => tokens_list,
+        Some(Err(e)) => {
+            to_java_exception(&mut env, &e);
+            std::ptr::null_mut()
+        },
+        None => {
+            to_java_exception(&mut env, &anyhow::anyhow!("Invalid SplitSearcher pointer"));
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Helper function to create a Java List<String> from a vector of tokens
+fn create_token_list(env: &mut JNIEnv, tokens: Vec<String>) -> Result<jobject, anyhow::Error> {
+    // Create ArrayList
+    let array_list_class = env.find_class("java/util/ArrayList")?;
+    let array_list = env.new_object(&array_list_class, "()V", &[])?;
+
+    // Add each token to the list
+    for token in tokens {
+        let java_string = env.new_string(&token)?;
+        env.call_method(
+            &array_list,
+            "add",
+            "(Ljava/lang/Object;)Z",
+            &[(&java_string).into()],
+        )?;
+    }
+
+    Ok(array_list.into_raw())
 }
 
 
