@@ -32,7 +32,8 @@ public enum FieldType {
     FACET(7),
     BYTES(8),
     JSON(9),
-    IP_ADDR(10);
+    IP_ADDR(10),
+    STRING(11);
 
     private final int value;
 

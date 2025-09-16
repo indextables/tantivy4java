@@ -1,26 +1,26 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
+use crate::debug_println;
 
 // Debug logging macro - controlled by TANTIVY4JAVA_DEBUG environment variable
 macro_rules! debug_log {
     ($($arg:tt)*) => {
-        if std::env::var("TANTIVY4JAVA_DEBUG").unwrap_or_default() == "1" {
-            eprintln!("DEBUG: {}", format!($($arg)*));
-        }
+        debug_println!("DEBUG: {}", format!($($arg)*));
     };
 }
 
 use jni::JNIEnv;
-use jni::objects::{JClass, JObject, JString, JValue};
+use jni::objects::{JClass, JObject, JString};
 use jni::sys::{jlong, jint, jobject};
 
-use quickwit_storage::{ByteRangeCache, SplitCache, MemorySizedCache};
 use tokio::runtime::Runtime;
-// Note: LeafSearchCache might be in a different location in Quickwit codebase
-// For now, we'll implement a simpler cache structure that follows Quickwit patterns
+use crate::global_cache::{get_configured_storage_resolver, get_global_searcher_context};
+use quickwit_config::S3StorageConfig;
+// Note: Using global caches following Quickwit's pattern
 
 /// Global cache manager that follows Quickwit's multi-level caching architecture
+/// This now uses the global caches from GLOBAL_SEARCHER_COMPONENTS
 pub struct GlobalSplitCacheManager {
     cache_name: String,
     max_cache_size: u64,
@@ -28,11 +28,8 @@ pub struct GlobalSplitCacheManager {
     // Runtime for async operations
     runtime: Runtime,
     
-    // Global shared caches following Quickwit's actual architecture
-    // Using the available Quickwit cache types
-    split_cache: Arc<SplitCache>,
-    byte_range_cache: ByteRangeCache,
-    split_footer_cache: Arc<MemorySizedCache<String>>, // Cache for split footers (shared per schema+AWS config)
+    // AWS configuration for storage resolver
+    s3_config: Option<S3StorageConfig>,
     
     // Statistics
     total_hits: AtomicU64,
@@ -46,55 +43,20 @@ pub struct GlobalSplitCacheManager {
 
 impl GlobalSplitCacheManager {
     pub fn new(cache_name: String, max_cache_size: u64) -> Self {
-        // Create runtime first
+        debug_println!("RUST DEBUG: Creating GlobalSplitCacheManager '{}' using global caches", cache_name);
+        
+        // Create runtime for async operations
         let runtime = Runtime::new().expect("Failed to create Tokio runtime for cache manager");
         
-        // Create proper Quickwit caches following their architecture
-        // Use the available Quickwit cache constructors
-        // Create proper SplitCache with temporary directory and storage resolver
-        use quickwit_config::SplitCacheLimits;
-        use tempfile::TempDir;
-        use std::num::NonZeroU32;
-        use bytesize::ByteSize;
-        
-        let temp_dir = TempDir::new().expect("Failed to create temp dir");
-        
-        // Create SplitCacheLimits manually since default() isn't available
-        let limits = SplitCacheLimits {
-            max_num_bytes: ByteSize::mb(max_cache_size / (1024 * 1024)), // Convert to MB
-            max_num_splits: NonZeroU32::new(10_000).unwrap(),
-            num_concurrent_downloads: NonZeroU32::new(1).unwrap(),
-            max_file_descriptors: NonZeroU32::new(100).unwrap(),
-        };
-        
-        let storage_resolver = crate::standalone_searcher::create_storage_resolver();
-        
-        // Ensure we're in the runtime context when creating SplitCache
-        let _guard = runtime.enter();
-        let split_cache = SplitCache::with_root_path(
-            temp_dir.path().to_path_buf(),
-            storage_resolver,
-            limits,
-        ).expect("Failed to create SplitCache");
-        
-        // 🚀 OPTIMIZATION: Controlled ByteRangeCache resource allocation
-        // Reserve 25% of cache size for ByteRangeCache operations (optimal for mixed workloads)
-        // Note: ByteRangeCache has infinite capacity but we control total system memory usage
-        let _byte_range_cache_budget = max_cache_size / 4; // 25% allocation for byte ranges
-        let byte_range_cache = ByteRangeCache::with_infinite_capacity(
-            &quickwit_storage::STORAGE_METRICS.shortlived_cache,
-        );
-        
-        // Create split footer cache (shared across all splits with same schema+AWS config)
-        let split_footer_cache = Arc::new(MemorySizedCache::with_capacity_in_bytes(50_000_000, &quickwit_storage::STORAGE_METRICS.shortlived_cache)); // 50MB for footers
+        // Note: We're using the global caches from GLOBAL_SEARCHER_COMPONENTS
+        // This ensures all split cache managers share the same underlying caches
+        // following Quickwit's architecture pattern
         
         Self {
             cache_name,
             max_cache_size,
             runtime,
-            split_cache,
-            byte_range_cache,
-            split_footer_cache,
+            s3_config: None,
             total_hits: AtomicU64::new(0),
             total_misses: AtomicU64::new(0),
             total_evictions: AtomicU64::new(0),
@@ -180,17 +142,19 @@ impl GlobalSplitCacheManager {
         }
     }
     
-    // Accessors for the Quickwit caches
-    pub fn get_split_cache(&self) -> Arc<SplitCache> {
-        self.split_cache.clone()
+    // Set AWS configuration for storage resolver
+    pub fn set_aws_config(&mut self, s3_config: S3StorageConfig) {
+        self.s3_config = Some(s3_config);
     }
     
-    pub fn get_byte_range_cache(&self) -> &ByteRangeCache {
-        &self.byte_range_cache
+    // Get configured storage resolver using the AWS config if set
+    pub fn get_storage_resolver(&self) -> quickwit_storage::StorageResolver {
+        get_configured_storage_resolver(self.s3_config.clone())
     }
     
-    pub fn get_split_footer_cache(&self) -> Arc<MemorySizedCache<String>> {
-        self.split_footer_cache.clone()
+    // Get the global searcher context with all shared caches
+    pub fn get_searcher_context(&self) -> Arc<quickwit_search::SearcherContext> {
+        get_global_searcher_context()
     }
     
     pub fn force_eviction(&self, _target_size_bytes: u64) {
@@ -240,16 +204,74 @@ pub extern "system" fn Java_com_tantivy4java_SplitCacheManager_createNativeCache
         _ => 200_000_000, // 200MB default
     };
     
-    let manager = Arc::new(GlobalSplitCacheManager::new(cache_name.clone(), max_cache_size));
+    let mut manager = GlobalSplitCacheManager::new(cache_name.clone(), max_cache_size);
+    
+    // Extract AWS configuration from the Java CacheConfig
+    if let Ok(aws_config_map) = env.call_method(&config, "getAwsConfig", "()Ljava/util/Map;", &[]) {
+        let aws_map_obj = aws_config_map.l().unwrap();
+        
+        // Extract AWS configuration values
+        let mut access_key = None;
+        let mut secret_key = None;
+        let mut session_token = None;
+        let mut region = None;
+        let mut endpoint = None;
+        let mut path_style_access = false;
+        
+        // Helper function to extract string value from HashMap
+        let extract_string_value = |env: &mut JNIEnv, map_obj: &JObject, key: &str| -> Option<String> {
+            let key_jstring = env.new_string(key).ok()?;
+            let value = env.call_method(map_obj, "get", "(Ljava/lang/Object;)Ljava/lang/Object;", &[(&key_jstring).into()]).ok()?.l().ok()?;
+            if value.is_null() {
+                return None;
+            }
+            let value_jstring = JString::from(value);
+            let value_string = env.get_string(&value_jstring).ok()?;
+            Some(value_string.to_string_lossy().to_string())
+        };
+        
+        access_key = extract_string_value(&mut env, &aws_map_obj, "access_key");
+        secret_key = extract_string_value(&mut env, &aws_map_obj, "secret_key");
+        session_token = extract_string_value(&mut env, &aws_map_obj, "session_token");
+        region = extract_string_value(&mut env, &aws_map_obj, "region");
+        endpoint = extract_string_value(&mut env, &aws_map_obj, "endpoint");
+        
+        // Extract path_style_access boolean value
+        if let Some(path_style_str) = extract_string_value(&mut env, &aws_map_obj, "path_style_access") {
+            path_style_access = path_style_str == "true";
+        }
+        
+        // Create S3StorageConfig if we have access key and secret key
+        if let (Some(access_key), Some(secret_key)) = (access_key, secret_key) {
+            debug_println!("RUST DEBUG: Configuring S3 storage with access_key, region: {:?}, endpoint: {:?}, path_style_access: {}", 
+                         region, endpoint, path_style_access);
+            
+            let s3_config = S3StorageConfig {
+                access_key_id: Some(access_key),
+                secret_access_key: Some(secret_key),
+                session_token,
+                region: Some(region.unwrap_or_else(|| "us-east-1".to_string())),
+                endpoint,
+                force_path_style_access: path_style_access,
+                ..Default::default()
+            };
+            
+            // Set the S3 config on the manager
+            manager.set_aws_config(s3_config);
+        }
+    }
+    
+    let manager_arc = Arc::new(manager);
     
     // Store in global registry
     {
         let mut managers = CACHE_MANAGERS.lock().unwrap();
-        managers.insert(cache_name.clone(), manager);
+        managers.insert(cache_name.clone(), manager_arc.clone());
     }
     
-    // Use safe registry-based ID instead of dangerous pointer casting
-    crate::utils::register_object(cache_name) as jlong
+    // Use Arc registry for safe memory management
+    let cache_name_arc = Arc::new(cache_name);
+    crate::utils::arc_to_jlong(cache_name_arc)
 }
 
 #[no_mangle]
@@ -262,10 +284,11 @@ pub extern "system" fn Java_com_tantivy4java_SplitCacheManager_closeNativeCacheM
         // Safely find and remove from global registry instead of dangerous Arc::from_raw()
         let mut managers = CACHE_MANAGERS.lock().unwrap();
         
-        // Use safe registry to find cache name, then remove from managers
-        if let Some(cache_name) = crate::utils::with_object::<String, _>(ptr as u64, |name| name.clone()) {
-            managers.remove(&cache_name);
-            crate::utils::remove_object(ptr as u64);
+        // Use Arc registry to find cache name, then remove from managers
+        if let Some(cache_name_arc) = crate::utils::jlong_to_arc::<String>(ptr) {
+            managers.remove(&*cache_name_arc);
+            // Release the Arc from registry
+            crate::utils::release_arc(ptr);
         }
     }
 }
@@ -280,15 +303,15 @@ pub extern "system" fn Java_com_tantivy4java_SplitCacheManager_getGlobalCacheSta
         return std::ptr::null_mut();
     }
     
-    // Safely access through global registry instead of unsafe pointer cast
-    let managers = CACHE_MANAGERS.lock().unwrap();
-    // Use safe registry to find cache name, then get manager
-    let manager = if let Some(cache_name) = crate::utils::with_object::<String, _>(ptr as u64, |name| name.clone()) {
-        managers.get(&cache_name)
-    } else {
-        None
+    // Get cache name FIRST to avoid double-locking
+    let cache_name = match crate::utils::jlong_to_arc::<String>(ptr) {
+        Some(name_arc) => (*name_arc).clone(),
+        None => return std::ptr::null_mut(),
     };
-    let manager = match manager {
+    
+    // THEN access the cache managers registry
+    let managers = CACHE_MANAGERS.lock().unwrap();
+    let manager = match managers.get(&cache_name) {
         Some(manager_arc) => manager_arc,
         None => return std::ptr::null_mut(),
     };
@@ -328,15 +351,15 @@ pub extern "system" fn Java_com_tantivy4java_SplitCacheManager_forceEvictionNati
         return;
     }
     
-    // Safely access through global registry instead of unsafe pointer cast
-    let managers = CACHE_MANAGERS.lock().unwrap();
-    // Use safe registry to find cache name, then get manager
-    let manager = if let Some(cache_name) = crate::utils::with_object::<String, _>(ptr as u64, |name| name.clone()) {
-        managers.get(&cache_name)
-    } else {
-        None
+    // Get cache name FIRST to avoid double-locking
+    let cache_name = match crate::utils::jlong_to_arc::<String>(ptr) {
+        Some(name_arc) => (*name_arc).clone(),
+        None => return,
     };
-    let manager = match manager {
+    
+    // THEN access the cache managers registry
+    let managers = CACHE_MANAGERS.lock().unwrap();
+    let manager = match managers.get(&cache_name) {
         Some(manager_arc) => manager_arc,
         None => return,
     };
@@ -435,15 +458,15 @@ pub extern "system" fn Java_com_tantivy4java_SplitCacheManager_preloadComponents
         return;
     }
     
-    // Safely access through global registry instead of unsafe pointer cast
-    let managers = CACHE_MANAGERS.lock().unwrap();
-    // Use safe registry to find cache name, then get manager
-    let manager = if let Some(cache_name) = crate::utils::with_object::<String, _>(ptr as u64, |name| name.clone()) {
-        managers.get(&cache_name)
-    } else {
-        None
+    // Get cache name FIRST to avoid double-locking
+    let cache_name = match crate::utils::jlong_to_arc::<String>(ptr) {
+        Some(name_arc) => (*name_arc).clone(),
+        None => return,
     };
-    let manager = match manager {
+    
+    // THEN access the cache managers registry
+    let managers = CACHE_MANAGERS.lock().unwrap();
+    let manager = match managers.get(&cache_name) {
         Some(manager_arc) => manager_arc,
         None => return,
     };
@@ -463,15 +486,15 @@ pub extern "system" fn Java_com_tantivy4java_SplitCacheManager_evictComponentsNa
         return;
     }
     
-    // Safely access through global registry instead of unsafe pointer cast
-    let managers = CACHE_MANAGERS.lock().unwrap();
-    // Use safe registry to find cache name, then get manager
-    let manager = if let Some(cache_name) = crate::utils::with_object::<String, _>(ptr as u64, |name| name.clone()) {
-        managers.get(&cache_name)
-    } else {
-        None
+    // Get cache name FIRST to avoid double-locking
+    let cache_name = match crate::utils::jlong_to_arc::<String>(ptr) {
+        Some(name_arc) => (*name_arc).clone(),
+        None => return,
     };
-    let manager = match manager {
+    
+    // THEN access the cache managers registry
+    let managers = CACHE_MANAGERS.lock().unwrap();
+    let manager = match managers.get(&cache_name) {
         Some(manager_arc) => manager_arc,
         None => return,
     };
@@ -492,15 +515,18 @@ pub extern "system" fn Java_com_tantivy4java_SplitCacheManager_searchAcrossAllSp
         return std::ptr::null_mut();
     }
     
-    // Safely access through global registry instead of unsafe pointer cast
-    let managers = CACHE_MANAGERS.lock().unwrap();
-    // Use safe registry to find cache name, then get manager
-    let manager = if let Some(cache_name) = crate::utils::with_object::<String, _>(ptr as u64, |name| name.clone()) {
-        managers.get(&cache_name)
-    } else {
-        None
+    // Get cache name FIRST to avoid double-locking
+    let cache_name = match crate::utils::jlong_to_arc::<String>(ptr) {
+        Some(name_arc) => (*name_arc).clone(),
+        None => {
+            let _ = env.throw_new("java/lang/RuntimeException", "SplitCacheManager not found in registry");
+            return std::ptr::null_mut();
+        }
     };
-    let manager = match manager {
+    
+    // THEN access the cache managers registry
+    let managers = CACHE_MANAGERS.lock().unwrap();
+    let manager = match managers.get(&cache_name) {
         Some(manager_arc) => manager_arc,
         None => {
             let _ = env.throw_new("java/lang/RuntimeException", "SplitCacheManager not found in registry");
@@ -528,15 +554,18 @@ pub extern "system" fn Java_com_tantivy4java_SplitCacheManager_searchAcrossSplit
         return std::ptr::null_mut();
     }
     
-    // Safely access through global registry instead of unsafe pointer cast
-    let managers = CACHE_MANAGERS.lock().unwrap();
-    // Use safe registry to find cache name, then get manager
-    let manager = if let Some(cache_name) = crate::utils::with_object::<String, _>(ptr as u64, |name| name.clone()) {
-        managers.get(&cache_name)
-    } else {
-        None
+    // Get cache name FIRST to avoid double-locking
+    let cache_name = match crate::utils::jlong_to_arc::<String>(ptr) {
+        Some(name_arc) => (*name_arc).clone(),
+        None => {
+            let _ = env.throw_new("java/lang/RuntimeException", "SplitCacheManager not found in registry");
+            return std::ptr::null_mut();
+        }
     };
-    let manager = match manager {
+    
+    // THEN access the cache managers registry
+    let managers = CACHE_MANAGERS.lock().unwrap();
+    let manager = match managers.get(&cache_name) {
         Some(manager_arc) => manager_arc,
         None => {
             let _ = env.throw_new("java/lang/RuntimeException", "SplitCacheManager not found in registry");

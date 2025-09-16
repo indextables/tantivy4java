@@ -8,6 +8,8 @@ import java.time.Instant;
 import java.util.HashMap;
 import java.util.Map;
 
+import com.tantivy4java.SplitRangeQuery.RangeBound;
+
 import static org.junit.jupiter.api.Assertions.*;
 
 /**
@@ -121,7 +123,7 @@ public class FooterOptimizationTest {
             assertNotNull(schema, "Schema should be accessible");
             
             // Test search functionality
-            Query query = Query.termQuery(schema, "content", "content");
+            SplitQuery query = new SplitTermQuery("content", "content");
             SearchResult result = searcher.search(query, 10);
             assertNotNull(result, "Search should return results");
             assertTrue(result.getHits().size() > 0, "Should find matching documents");
@@ -131,46 +133,7 @@ public class FooterOptimizationTest {
         }
     }
     
-    @Test
-    @org.junit.jupiter.api.Order(2)
-    @DisplayName("Test that deprecated API warns about missing optimization")
-    void testDeprecatedAPIWarning() {
-        System.out.println("⚠️  Testing deprecated API warning...");
-        
-        String splitUrl = "file://" + splitPath.toAbsolutePath();
-        
-        // Capture system error output to verify warning is shown
-        java.io.ByteArrayOutputStream errorOutput = new java.io.ByteArrayOutputStream();
-        java.io.PrintStream originalErr = System.err;
-        System.setErr(new java.io.PrintStream(errorOutput));
-        
-        try {
-            // This should work but show deprecation warnings (using the deprecated single-param method)
-            Map<String, Object> fallbackConfig = new HashMap<>();
-            SplitSearcher searcher = cacheManager.createSplitSearcherXXX(splitUrl);
-            searcher.close();
-            
-            // Restore System.err and check for warning message
-            System.setErr(originalErr);
-            String errorText = errorOutput.toString();
-            
-            assertTrue(errorText.contains("WARNING: Using deprecated createSplitSearcher"), 
-                      "Should show deprecation warning");
-            assertTrue(errorText.contains("87% network traffic reduction"), 
-                      "Should mention optimization benefits");
-            
-            System.out.println("   ✅ Deprecated API shows proper warning about missing optimization");
-            
-        } catch (Exception e) {
-            System.setErr(originalErr);
-            // The deprecated method might throw UnsupportedOperationException, which is acceptable
-            if (e instanceof UnsupportedOperationException) {
-                System.out.println("   ✅ Deprecated API correctly throws UnsupportedOperationException");
-            } else {
-                fail("Unexpected exception: " + e.getMessage());
-            }
-        }
-    }
+    // Deprecated test removed - the deprecated createSplitSearcherXXX method has been removed
     
     @Test 
     @org.junit.jupiter.api.Order(3)
@@ -239,21 +202,20 @@ public class FooterOptimizationTest {
             Schema schema = searcher.getSchema();
             
             // Test 1: Basic text search
-            Query textQuery = Query.termQuery(schema, "title", "Test");
+            SplitQuery textQuery = new SplitTermQuery("title", "Test");
             SearchResult textResult = searcher.search(textQuery, 20);
             assertTrue(textResult.getHits().size() > 0, "Should find documents with 'Test' in title");
             
             // Test 2: Range query on numeric field
-            Query rangeQuery = Query.rangeQuery(schema, "score", FieldType.INTEGER, 
-                                                87, 92, true, true);
+            SplitQuery rangeQuery = new SplitRangeQuery("score", 
+                                                RangeBound.inclusive("87"), RangeBound.inclusive("92"));
             SearchResult rangeResult = searcher.search(rangeQuery, 10);
             assertTrue(rangeResult.getHits().size() > 0, "Should find documents in score range");
             
             // Test 3: Boolean query combining multiple conditions
-            Query boolQuery = Query.booleanQuery(java.util.Arrays.asList(
-                new Query.OccurQuery(Occur.MUST, textQuery),
-                new Query.OccurQuery(Occur.MUST, rangeQuery)
-            ));
+            SplitQuery boolQuery = new SplitBooleanQuery()
+                .addMust(textQuery)
+                .addMust(rangeQuery);
             SearchResult boolResult = searcher.search(boolQuery, 10);
             assertNotNull(boolResult, "Boolean query should return results");
             

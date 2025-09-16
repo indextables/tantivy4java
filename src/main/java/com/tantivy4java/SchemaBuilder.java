@@ -290,6 +290,32 @@ public class SchemaBuilder implements AutoCloseable {
     }
 
     /**
+     * Add a string field to the schema.
+     * String fields are for exact string matching (not tokenized like text fields).
+     * @param name Field name
+     * @param stored Whether the field should be stored
+     * @param indexed Whether the field should be indexed
+     * @param fast Whether the field should support fast access
+     * @return This builder for method chaining
+     */
+    public SchemaBuilder addStringField(String name, boolean stored, boolean indexed, boolean fast) {
+        if (closed) {
+            throw new IllegalStateException("SchemaBuilder has been closed");
+        }
+        nativeAddStringField(nativePtr, name, stored, indexed, fast);
+        return this;
+    }
+
+    /**
+     * Add a string field with default options.
+     * @param name Field name
+     * @return This builder for method chaining
+     */
+    public SchemaBuilder addStringField(String name) {
+        return addStringField(name, false, false, false);
+    }
+
+    /**
      * Build the schema from the configured fields.
      * @return A new Schema instance
      */
@@ -323,6 +349,7 @@ public class SchemaBuilder implements AutoCloseable {
     private static native void nativeAddFacetField(long ptr, String name);
     private static native void nativeAddBytesField(long ptr, String name, boolean stored, boolean indexed, boolean fast, String indexOption);
     private static native void nativeAddIpAddrField(long ptr, String name, boolean stored, boolean indexed, boolean fast);
+    private static native void nativeAddStringField(long ptr, String name, boolean stored, boolean indexed, boolean fast);
     private static native long nativeBuild(long ptr);
     private static native void nativeClose(long ptr);
 }

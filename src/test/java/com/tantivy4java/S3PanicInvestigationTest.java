@@ -182,7 +182,7 @@ public class S3PanicInvestigationTest {
                     System.out.println("   Schema field count: " + retrievedSchema.getFieldNames().size());
                     
                     // Try a simple search
-                    Query query = Query.termQuery(retrievedSchema, "title", "Title");
+                    SplitQuery query = new SplitTermQuery("title", "Title");
                     SearchResult result = searcher.search(query, 10);
                     System.out.println("   Search results: " + result.getHits().size() + " hits");
                     

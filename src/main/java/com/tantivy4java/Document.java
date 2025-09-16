@@ -224,7 +224,39 @@ public class Document implements AutoCloseable {
         if (closed) {
             throw new IllegalStateException("Document has been closed");
         }
-        nativeAddJson(nativePtr, fieldName, value);
+        String jsonString = convertToJsonString(value);
+        nativeAddJson(nativePtr, fieldName, jsonString);
+    }
+
+    /**
+     * Simple JSON conversion for basic objects
+     */
+    private String convertToJsonString(Object value) {
+        if (value == null) {
+            return "null";
+        }
+        if (value instanceof String) {
+            return "\"" + ((String) value).replace("\"", "\\\"") + "\"";
+        }
+        if (value instanceof Number || value instanceof Boolean) {
+            return value.toString();
+        }
+        if (value instanceof java.util.Map) {
+            @SuppressWarnings("unchecked")
+            java.util.Map<String, Object> map = (java.util.Map<String, Object>) value;
+            StringBuilder json = new StringBuilder("{");
+            boolean first = true;
+            for (java.util.Map.Entry<String, Object> entry : map.entrySet()) {
+                if (!first) json.append(",");
+                first = false;
+                json.append("\"").append(entry.getKey()).append("\":");
+                json.append(convertToJsonString(entry.getValue()));
+            }
+            json.append("}");
+            return json.toString();
+        }
+        // Fallback: convert to string and quote it
+        return "\"" + value.toString().replace("\"", "\\\"") + "\"";
     }
 
     /**
@@ -237,6 +269,19 @@ public class Document implements AutoCloseable {
             throw new IllegalStateException("Document has been closed");
         }
         nativeAddIpAddr(nativePtr, fieldName, ipAddr);
+    }
+
+    /**
+     * Add a string value to a field.
+     * String fields are for exact string matching (not tokenized like text fields).
+     * @param fieldName Field name
+     * @param value String value
+     */
+    public void addString(String fieldName, String value) {
+        if (closed) {
+            throw new IllegalStateException("Document has been closed");
+        }
+        nativeAddString(nativePtr, fieldName, value);
     }
 
     /**
@@ -305,8 +350,9 @@ public class Document implements AutoCloseable {
     private static native void nativeAddDate(long ptr, String fieldName, LocalDateTime date);
     private static native void nativeAddFacet(long ptr, String fieldName, long facetPtr);
     private static native void nativeAddBytes(long ptr, String fieldName, byte[] bytes);
-    private static native void nativeAddJson(long ptr, String fieldName, Object value);
+    private static native void nativeAddJson(long ptr, String fieldName, String jsonString);
     private static native void nativeAddIpAddr(long ptr, String fieldName, String ipAddr);
+    private static native void nativeAddString(long ptr, String fieldName, String value);
     private static native int nativeGetNumFields(long ptr);
     private static native boolean nativeIsEmpty(long ptr);
     private static native void nativeClose(long ptr);

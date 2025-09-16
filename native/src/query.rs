@@ -20,12 +20,13 @@
 use jni::objects::{JClass, JString, JObject};
 use jni::sys::{jlong, jboolean, jint, jdouble, jlongArray, jobject};
 use jni::JNIEnv;
-use tantivy::query::{Query as TantivyQuery, TermQuery, AllQuery, BooleanQuery, Occur, RangeQuery, PhraseQuery, FuzzyTermQuery, RegexQuery, BoostQuery, ConstScoreQuery, TermSetQuery, QueryParser};
+use tantivy::query::{Query as TantivyQuery, TermQuery, AllQuery, BooleanQuery, Occur, RangeQuery, PhraseQuery, FuzzyTermQuery, RegexQuery, BoostQuery, ConstScoreQuery, QueryParser};
 use tantivy::schema::{Schema, Term, IndexRecordOption, FieldType as TantivyFieldType, Field};
 use tantivy::DateTime;
 use std::ops::Bound;
 use time::Month;
-use crate::utils::{register_object, remove_object, with_object, handle_error};
+use crate::utils::{handle_error, with_arc_safe, arc_to_jlong, release_arc};
+use std::sync::Arc;
 use crate::extract_helpers::{extract_long_value, extract_double_value};
 
 #[no_mangle]
@@ -50,7 +51,8 @@ pub extern "system" fn Java_com_tantivy4java_Query_nativeTermQuery(
         Err(_) => "position".to_string(),
     };
     
-    let result = with_object::<Schema, Result<Box<dyn TantivyQuery>, String>>(schema_ptr as u64, |schema| {
+    let result = with_arc_safe::<Schema, Result<Box<dyn TantivyQuery>, String>>(schema_ptr, |schema_arc| {
+        let schema = schema_arc.as_ref();
         // Get field by name
         let field = match schema.get_field(&field_name_str) {
             Ok(f) => f,
@@ -83,14 +85,18 @@ pub extern "system" fn Java_com_tantivy4java_Query_nativeTermQuery(
                     Err(_) => return Err("Invalid field value for text field".to_string()),
                 };
                 
-                // For text fields that are indexed, use tokenization to match how the index was created
-                if let Some(text_field_indexing) = &text_options.get_indexing_options() {
-                    // Use the same tokenizer that was used during indexing
-                    // For simplicity, we'll lowercase the term (which is what the default tokenizer does)
+                // Text fields are always indexed in tantivy (matching tantivy-py behavior)
+                // Check which tokenizer is being used
+                let uses_default_tokenizer = text_options.get_indexing_options()
+                    .map(|opts| opts.tokenizer().to_string() == "default")
+                    .unwrap_or(true); // Default to true if no explicit indexing options
+                
+                if uses_default_tokenizer {
+                    // The default tokenizer lowercases text, so we need to lowercase the search term
                     let tokenized_term = field_value_str.to_lowercase();
                     Term::from_field_text(field, &tokenized_term)
                 } else {
-                    // For non-indexed text fields, use exact match
+                    // For other tokenizers, use the term as-is
                     Term::from_field_text(field, &field_value_str)
                 }
             },
@@ -205,7 +211,8 @@ pub extern "system" fn Java_com_tantivy4java_Query_nativeTermQuery(
     
     match result {
         Some(Ok(query)) => {
-            register_object(query) as jlong
+            let query_arc = Arc::new(query);
+            arc_to_jlong(query_arc)
         },
         Some(Err(err)) => {
             handle_error(&mut env, &err);
@@ -234,7 +241,8 @@ pub extern "system" fn Java_com_tantivy4java_Query_nativeTermSetQuery(
         }
     };
     
-    let result = with_object::<Schema, Result<Box<dyn TantivyQuery>, String>>(schema_ptr as u64, |schema| {
+    let result = with_arc_safe::<Schema, Result<Box<dyn TantivyQuery>, String>>(schema_ptr, |schema_arc| {
+        let schema = schema_arc.as_ref();
         // Get field by name
         let field = match schema.get_field(&field_name_str) {
             Ok(f) => f,
@@ -253,7 +261,10 @@ pub extern "system" fn Java_com_tantivy4java_Query_nativeTermSetQuery(
     });
     
     match result {
-        Some(Ok(query)) => register_object(query) as jlong,
+        Some(Ok(query)) => {
+            let query_arc = Arc::new(query);
+            arc_to_jlong(query_arc)
+        },
         Some(Err(err)) => {
             handle_error(&mut env, &err);
             0
@@ -271,7 +282,8 @@ pub extern "system" fn Java_com_tantivy4java_Query_nativeAllQuery(
     _class: JClass,
 ) -> jlong {
     let query = AllQuery;
-    register_object(Box::new(query) as Box<dyn TantivyQuery>) as jlong
+    let query_arc = Arc::new(Box::new(query) as Box<dyn TantivyQuery>);
+    arc_to_jlong(query_arc)
 }
 
 #[no_mangle]
@@ -301,7 +313,8 @@ pub extern "system" fn Java_com_tantivy4java_Query_nativeFuzzyTermQuery(
         }
     };
     
-    let result = with_object::<Schema, Result<Box<dyn TantivyQuery>, String>>(schema_ptr as u64, |schema| {
+    let result = with_arc_safe::<Schema, Result<Box<dyn TantivyQuery>, String>>(schema_ptr, |schema_arc| {
+        let schema = schema_arc.as_ref();
         // Get field by name
         let field = match schema.get_field(&field_name_str) {
             Ok(f) => f,
@@ -339,7 +352,8 @@ pub extern "system" fn Java_com_tantivy4java_Query_nativeFuzzyTermQuery(
     
     match result {
         Some(Ok(query)) => {
-            register_object(query) as jlong
+            let query_arc = Arc::new(query);
+            arc_to_jlong(query_arc)
         },
         Some(Err(err)) => {
             handle_error(&mut env, &err);
@@ -383,7 +397,8 @@ pub extern "system" fn Java_com_tantivy4java_Query_nativePhraseQuery(
         }
     };
     
-    let result = with_object::<Schema, Result<Box<dyn TantivyQuery>, String>>(schema_ptr as u64, |schema| {
+    let result = with_arc_safe::<Schema, Result<Box<dyn TantivyQuery>, String>>(schema_ptr, |schema_arc| {
+        let schema = schema_arc.as_ref();
         // Get field by name
         let field = match schema.get_field(&field_name_str) {
             Ok(f) => f,
@@ -436,7 +451,8 @@ pub extern "system" fn Java_com_tantivy4java_Query_nativePhraseQuery(
     
     match result {
         Some(Ok(query)) => {
-            register_object(query) as jlong
+            let query_arc = Arc::new(query);
+            arc_to_jlong(query_arc)
         },
         Some(Err(err)) => {
             handle_error(&mut env, &err);
@@ -479,7 +495,8 @@ pub extern "system" fn Java_com_tantivy4java_Query_nativeBooleanQuery(
     
     for (occur, query_ptr) in occur_queries {
         // Get the query from the object store
-        let query_box = match with_object::<Box<dyn TantivyQuery>, Option<Box<dyn TantivyQuery>>>(query_ptr as u64, |query| {
+        let query_box = match with_arc_safe::<Box<dyn TantivyQuery>, Option<Box<dyn TantivyQuery>>>(query_ptr, |query_arc| {
+            let query = query_arc.as_ref();
             // We need to clone the query to avoid ownership issues
             Some(query.box_clone())
         }) {
@@ -497,7 +514,8 @@ pub extern "system" fn Java_com_tantivy4java_Query_nativeBooleanQuery(
     let boolean_query = BooleanQuery::from(tantivy_subqueries);
     let boxed_query: Box<dyn TantivyQuery> = Box::new(boolean_query);
     
-    register_object(boxed_query) as jlong
+    let query_arc = Arc::new(boxed_query);
+    arc_to_jlong(query_arc)
 }
 
 #[no_mangle]
@@ -523,7 +541,8 @@ pub extern "system" fn Java_com_tantivy4java_Query_nativeBoostQuery(
         return 0;
     }
     
-    let result = with_object::<Box<dyn TantivyQuery>, Result<Box<dyn TantivyQuery>, String>>(query_ptr as u64, |query| {
+    let result = with_arc_safe::<Box<dyn TantivyQuery>, Result<Box<dyn TantivyQuery>, String>>(query_ptr, |query_arc| {
+        let query = query_arc.as_ref();
         // Clone the query to avoid ownership issues
         let cloned_query = query.box_clone();
         
@@ -534,7 +553,8 @@ pub extern "system" fn Java_com_tantivy4java_Query_nativeBoostQuery(
     
     match result {
         Some(Ok(query)) => {
-            register_object(query) as jlong
+            let query_arc = Arc::new(query);
+            arc_to_jlong(query_arc)
         },
         Some(Err(err)) => {
             handle_error(&mut env, &err);
@@ -571,7 +591,8 @@ pub extern "system" fn Java_com_tantivy4java_Query_nativeRegexQuery(
         }
     };
     
-    let result = with_object::<Schema, Result<Box<dyn TantivyQuery>, String>>(schema_ptr as u64, |schema| {
+    let result = with_arc_safe::<Schema, Result<Box<dyn TantivyQuery>, String>>(schema_ptr, |schema_arc| {
+        let schema = schema_arc.as_ref();
         // Get field by name
         let field = match schema.get_field(&field_name_str) {
             Ok(f) => f,
@@ -594,7 +615,8 @@ pub extern "system" fn Java_com_tantivy4java_Query_nativeRegexQuery(
     
     match result {
         Some(Ok(query)) => {
-            register_object(query) as jlong
+            let query_arc = Arc::new(query);
+            arc_to_jlong(query_arc)
         },
         Some(Err(err)) => {
             handle_error(&mut env, &err);
@@ -632,7 +654,8 @@ pub extern "system" fn Java_com_tantivy4java_Query_nativeWildcardQuery(
     };
     
     
-    let result = with_object::<Schema, Result<Box<dyn TantivyQuery>, String>>(schema_ptr as u64, |schema| {
+    let result = with_arc_safe::<Schema, Result<Box<dyn TantivyQuery>, String>>(schema_ptr, |schema_arc| {
+        let schema = schema_arc.as_ref();
         // Get field by name
         let field = match schema.get_field(&field_name_str) {
             Ok(f) => f,
@@ -675,7 +698,8 @@ pub extern "system" fn Java_com_tantivy4java_Query_nativeWildcardQuery(
     
     match result {
         Some(Ok(query)) => {
-            register_object(query) as jlong
+            let query_arc = Arc::new(query);
+            arc_to_jlong(query_arc)
         },
         Some(Err(err)) => {
             handle_error(&mut env, &err);
@@ -717,7 +741,8 @@ pub extern "system" fn Java_com_tantivy4java_Query_nativeWildcardQueryLenient(
     
     let is_lenient = lenient != 0;
     
-    let result = with_object::<Schema, Result<Box<dyn TantivyQuery>, String>>(schema_ptr as u64, |schema| {
+    let result = with_arc_safe::<Schema, Result<Box<dyn TantivyQuery>, String>>(schema_ptr, |schema_arc| {
+        let schema = schema_arc.as_ref();
         // Get field by name
         let field = match schema.get_field(&field_name_str) {
             Ok(f) => f,
@@ -776,7 +801,8 @@ pub extern "system" fn Java_com_tantivy4java_Query_nativeWildcardQueryLenient(
     
     match result {
         Some(Ok(query)) => {
-            register_object(query) as jlong
+            let query_arc = Arc::new(query);
+            arc_to_jlong(query_arc)
         },
         Some(Err(err)) => {
             handle_error(&mut env, &err);
@@ -1484,7 +1510,8 @@ pub extern "system" fn Java_com_tantivy4java_Query_nativeConstScoreQuery(
         return 0;
     }
     
-    let result = with_object::<Box<dyn TantivyQuery>, Result<Box<dyn TantivyQuery>, String>>(query_ptr as u64, |query| {
+    let result = with_arc_safe::<Box<dyn TantivyQuery>, Result<Box<dyn TantivyQuery>, String>>(query_ptr, |query_arc| {
+        let query = query_arc.as_ref();
         // Clone the query to avoid ownership issues
         let cloned_query = query.box_clone();
         
@@ -1495,7 +1522,8 @@ pub extern "system" fn Java_com_tantivy4java_Query_nativeConstScoreQuery(
     
     match result {
         Some(Ok(query)) => {
-            register_object(query) as jlong
+            let query_arc = Arc::new(query);
+            arc_to_jlong(query_arc)
         },
         Some(Err(err)) => {
             handle_error(&mut env, &err);
@@ -1528,7 +1556,8 @@ pub extern "system" fn Java_com_tantivy4java_Query_nativeRangeQuery(
         }
     };
     
-    let result = with_object::<Schema, Result<Box<dyn TantivyQuery>, String>>(schema_ptr as u64, |schema| {
+    let result = with_arc_safe::<Schema, Result<Box<dyn TantivyQuery>, String>>(schema_ptr, |schema_arc| {
+        let schema = schema_arc.as_ref();
         // Get field by name
         let field = match schema.get_field(&field_name_str) {
             Ok(f) => f,
@@ -1705,7 +1734,8 @@ pub extern "system" fn Java_com_tantivy4java_Query_nativeRangeQuery(
     
     match result {
         Some(Ok(query)) => {
-            register_object(query) as jlong
+            let query_arc = Arc::new(query);
+            arc_to_jlong(query_arc)
         },
         Some(Err(err)) => {
             handle_error(&mut env, &err);
@@ -1752,7 +1782,8 @@ pub extern "system" fn Java_com_tantivy4java_Query_nativeToString(
     _class: JClass,
     query_ptr: jlong,
 ) -> jobject {
-    let result = with_object::<Box<dyn TantivyQuery>, Option<String>>(query_ptr as u64, |query| {
+    let result = with_arc_safe::<Box<dyn TantivyQuery>, Option<String>>(query_ptr, |query_arc| {
+        let query = query_arc.as_ref();
         Some(format_query_concise(query))
     });
     
@@ -1779,7 +1810,7 @@ pub extern "system" fn Java_com_tantivy4java_Query_nativeClose(
     _class: JClass,
     ptr: jlong,
 ) {
-    remove_object(ptr as u64);
+    release_arc(ptr);
 }
 
 // Helper function to extract OccurQuery objects from Java List
@@ -2101,24 +2132,26 @@ pub extern "system" fn Java_com_tantivy4java_SnippetGenerator_nativeCreate(
     // Return a valid stub pointer for SnippetGenerator
     // We'll use a simple boxed integer as a placeholder
     let stub_snippet_generator = Box::new(1u64); // Simple stub object
-    register_object(stub_snippet_generator) as jlong
+    let generator_arc = Arc::new(stub_snippet_generator);
+    arc_to_jlong(generator_arc)
 }
 
 #[no_mangle]
 pub extern "system" fn Java_com_tantivy4java_SnippetGenerator_nativeSnippetFromDoc(
-    mut env: JNIEnv,
+    env: JNIEnv,
     _class: JClass,
     snippet_generator_ptr: jlong,
     doc_ptr: jlong,
 ) -> jlong {
     // Return a valid stub pointer for Snippet
     let stub_snippet = Box::new(2u64); // Simple stub object
-    register_object(stub_snippet) as jlong
+    let snippet_arc = Arc::new(stub_snippet);
+    arc_to_jlong(snippet_arc)
 }
 
 #[no_mangle]
 pub extern "system" fn Java_com_tantivy4java_SnippetGenerator_nativeSetMaxNumChars(
-    mut env: JNIEnv,
+    env: JNIEnv,
     _class: JClass,
     snippet_generator_ptr: jlong,
     max_num_chars: jint,
@@ -2132,7 +2165,8 @@ pub extern "system" fn Java_com_tantivy4java_SnippetGenerator_nativeClose(
     _class: JClass,
     ptr: jlong,
 ) {
-    remove_object(ptr as u64);
+    // Stub implementation - snippets not yet implemented
+    // In future, would use: release_arc(ptr);
 }
 
 // Snippet JNI methods
@@ -2183,7 +2217,8 @@ pub extern "system" fn Java_com_tantivy4java_Snippet_nativeGetHighlighted(
                 Ok(array_list) => {
                     // Create a stub range (6-12, highlighting "sample")
                     let stub_range_data = Box::new((6usize, 12usize)); // (start, end) tuple
-                    let range_ptr = register_object(stub_range_data) as jlong;
+                    let range_arc = Arc::new(stub_range_data);
+                    let range_ptr = arc_to_jlong(range_arc);
                     
                     // Try to create Range object and add to list
                     match env.find_class("com/tantivy4java/Range") {
@@ -2219,34 +2254,31 @@ pub extern "system" fn Java_com_tantivy4java_Snippet_nativeClose(
     _class: JClass,
     ptr: jlong,
 ) {
-    remove_object(ptr as u64);
+    // Stub implementation - snippets not yet implemented
+    // In future, would use: release_arc(ptr);
 }
 
 // Range JNI methods
 #[no_mangle]
 pub extern "system" fn Java_com_tantivy4java_Range_nativeGetStart(
-    mut env: JNIEnv,
+    env: JNIEnv,
     _class: JClass,
     range_ptr: jlong,
 ) -> jint {
-    // Return start position from stub range tuple
-    let result = with_object(range_ptr as u64, |range_tuple: &(usize, usize)| {
-        range_tuple.0 as jint
-    });
-    result.unwrap_or(6) // Default to position 6
+    // Stub implementation - ranges not yet implemented
+    // Would use with_arc_safe for real implementation
+    6 // Default to position 6
 }
 
 #[no_mangle]
 pub extern "system" fn Java_com_tantivy4java_Range_nativeGetEnd(
-    mut env: JNIEnv,
+    env: JNIEnv,
     _class: JClass,
     range_ptr: jlong,
 ) -> jint {
-    // Return end position from stub range tuple
-    let result = with_object(range_ptr as u64, |range_tuple: &(usize, usize)| {
-        range_tuple.1 as jint
-    });
-    result.unwrap_or(12) // Default to position 12
+    // Stub implementation - ranges not yet implemented
+    // Would use with_arc_safe for real implementation
+    12 // Default to position 12
 }
 
 #[no_mangle]
@@ -2255,8 +2287,8 @@ pub extern "system" fn Java_com_tantivy4java_Range_nativeClose(
     _class: JClass,
     ptr: jlong,
 ) {
-    // Remove the stub range tuple object
-    remove_object(ptr as u64);
+    // Stub implementation - ranges not yet implemented
+    // In future, would use: release_arc(ptr);
 }
 
 // QueryParser JNI methods
@@ -2281,61 +2313,48 @@ pub extern "system" fn Java_com_tantivy4java_Index_nativeParseQuerySimple(
         return 0;
     }
     
-    // Get the index from registry without using with_object to avoid potential deadlock
-    let registry = match crate::utils::OBJECT_REGISTRY.lock() {
-        Ok(registry) => registry,
-        Err(_) => {
-            handle_error(&mut env, "Failed to lock object registry");
-            return 0;
-        }
-    };
-    
-    let index = match registry.get(&(index_ptr as u64)) {
-        Some(boxed) => match boxed.downcast_ref::<tantivy::Index>() {
-            Some(index) => index,
-            None => {
-                handle_error(&mut env, "Invalid index object type");
-                return 0;
+    // Parse query using the Arc-based index
+    let parsed_query = with_arc_safe::<std::sync::Mutex<tantivy::Index>, Option<Box<dyn TantivyQuery>>>(
+        index_ptr,
+        |index_mutex| {
+            let index = index_mutex.lock().unwrap();
+            
+            // Get schema and find text fields
+            let schema = index.schema();
+            let mut default_fields = Vec::new();
+            
+            for (field, field_entry) in schema.fields() {
+                if let tantivy::schema::FieldType::Str(_) = field_entry.field_type() {
+                    default_fields.push(field);
+                }
             }
+            
+            if default_fields.is_empty() {
+                return None;
+            }
+            
+            // Create query parser and parse query
+            let query_parser = QueryParser::for_index(&*index, default_fields);
+            match query_parser.parse_query(&query_str) {
+                Ok(query) => Some(query),
+                Err(_) => None
+            }
+        }
+    );
+    
+    match parsed_query {
+        Some(Some(query)) => {
+            // Register the query using Arc registry
+            let query_arc = Arc::new(query);
+            arc_to_jlong(query_arc)
+        },
+        Some(None) => {
+            handle_error(&mut env, &format!("Failed to parse query '{}'", query_str));
+            0
         },
         None => {
-            handle_error(&mut env, "Invalid index pointer");
-            return 0;
-        }
-    };
-    
-    // Get schema and find text fields
-    let schema = index.schema();
-    let mut default_fields = Vec::new();
-    
-    for (field, field_entry) in schema.fields() {
-        if let tantivy::schema::FieldType::Str(_) = field_entry.field_type() {
-            default_fields.push(field);
+            handle_error(&mut env, "Invalid index pointer or no text fields found");
+            0
         }
     }
-    
-    if default_fields.is_empty() {
-        drop(registry); // Release lock before error handling
-        handle_error(&mut env, "No text fields found in schema for query parsing");
-        return 0;
-    }
-    
-    // Create query parser and parse query
-    let query_parser = QueryParser::for_index(index, default_fields);
-    let parsed_query = match query_parser.parse_query(&query_str) {
-        Ok(query) => query,
-        Err(e) => {
-            drop(registry); // Release lock before error handling
-            handle_error(&mut env, &format!("Failed to parse query '{}': {}", query_str, e));
-            return 0;
-        }
-    };
-    
-    // Release the registry lock before registering new object
-    drop(registry);
-    
-    // Register the query and return pointer
-    let query_box: Box<dyn TantivyQuery> = parsed_query;
-    let ptr = crate::utils::register_object(query_box);
-    ptr as jlong
 }

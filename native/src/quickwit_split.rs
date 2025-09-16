@@ -1,20 +1,17 @@
 use jni::objects::{JClass, JObject, JString, JValue};
 use jni::sys::jobject;
 use jni::JNIEnv;
+use crate::debug_println;
 
 // Debug logging macro - controlled by TANTIVY4JAVA_DEBUG environment variable
 macro_rules! debug_log {
     ($($arg:tt)*) => {
-        if std::env::var("TANTIVY4JAVA_DEBUG").unwrap_or_default() == "1" {
-            eprintln!("DEBUG: {}", format!($($arg)*));
-        }
+        debug_println!("DEBUG: {}", format!($($arg)*));
     };
 }
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::ops::RangeInclusive;
-use std::io::Write;
-use std::fs::File;
 use tempfile as temp;
 
 // Add tantivy Directory trait import
@@ -25,18 +22,17 @@ use chrono::{DateTime, Utc};
 use uuid::Uuid;
 use serde::{Serialize, Deserialize};
 use serde_json;
-use base64::{Engine, engine::general_purpose};
 
 // Quickwit imports
-use quickwit_storage::{SplitPayloadBuilder, PutPayload, BundleStorage, RamStorage, Storage, StorageResolver, LocalFileStorageFactory, S3CompatibleObjectStorageFactory};
+use quickwit_storage::{PutPayload, BundleStorage, RamStorage, Storage, StorageResolver, LocalFileStorageFactory, S3CompatibleObjectStorageFactory, SplitPayloadBuilder};
 use quickwit_directories::write_hotcache;
 use quickwit_config::S3StorageConfig;
 use quickwit_common::uri::{Uri, Protocol};
-use quickwit_doc_mapper::{DocMapper, default_doc_mapper_for_test};
-use tantivy::directory::{OwnedBytes, FileSlice};
+// Removed: use quickwit_doc_mapper::default_doc_mapper_for_test; - now creating real doc mapping from schema
+use tantivy::directory::OwnedBytes;
 use std::str::FromStr;
 
-use crate::utils::{convert_throwable, jstring_to_string, string_to_jstring, with_object};
+use crate::utils::{convert_throwable, jstring_to_string, string_to_jstring};
 
 /// Extract or create a DocMapper from a Tantivy index schema
 fn extract_doc_mapping_from_index(tantivy_index: &tantivy::Index) -> Result<String> {
@@ -45,19 +41,129 @@ fn extract_doc_mapping_from_index(tantivy_index: &tantivy::Index) -> Result<Stri
     
     debug_log!("Extracting doc mapping from Tantivy schema with {} fields", schema.fields().count());
     
-    // For now, we'll create a default DocMapper and serialize it
-    // This is a placeholder - in a real implementation, we'd need to reconstruct
-    // the DocMapper from the Tantivy schema, but that's complex and may not be 
-    // fully possible since some original mapping information is lost during schema creation
-    let doc_mapper = default_doc_mapper_for_test();
+    // Create field mappings from the actual Tantivy schema as an array (not HashMap)
+    let mut field_mappings = Vec::new();
     
-    // Serialize the DocMapper to JSON
-    let doc_mapping_json = serde_json::to_string(&doc_mapper)
-        .map_err(|e| anyhow!("Failed to serialize DocMapper to JSON: {}", e))?;
+    for (field, field_entry) in schema.fields() {
+        let field_name = field_entry.name();
+        debug_log!("  Processing field: {} with type: {:?}", field_name, field_entry.field_type());
+        
+        // Map Tantivy field types to Quickwit field mapping types
+        let field_mapping = match field_entry.field_type() {
+            tantivy::schema::FieldType::Str(_) => {
+                // Text field
+                serde_json::json!({
+                    "name": field_name,
+                    "type": "text",
+                    "stored": field_entry.is_stored(),
+                    "indexed": field_entry.is_indexed(),
+                    "fast": field_entry.is_fast()
+                })
+            },
+            tantivy::schema::FieldType::U64(_) => {
+                // Unsigned integer field
+                serde_json::json!({
+                    "name": field_name,
+                    "type": "u64",
+                    "stored": field_entry.is_stored(),
+                    "indexed": field_entry.is_indexed(),
+                    "fast": field_entry.is_fast()
+                })
+            },
+            tantivy::schema::FieldType::I64(_) => {
+                // Signed integer field
+                serde_json::json!({
+                    "name": field_name,
+                    "type": "i64",
+                    "stored": field_entry.is_stored(),
+                    "indexed": field_entry.is_indexed(),
+                    "fast": field_entry.is_fast()
+                })
+            },
+            tantivy::schema::FieldType::F64(_) => {
+                // Float field
+                serde_json::json!({
+                    "name": field_name,
+                    "type": "f64",
+                    "stored": field_entry.is_stored(),
+                    "indexed": field_entry.is_indexed(),
+                    "fast": field_entry.is_fast()
+                })
+            },
+            tantivy::schema::FieldType::Bool(_) => {
+                // Boolean field
+                serde_json::json!({
+                    "name": field_name,
+                    "type": "bool",
+                    "stored": field_entry.is_stored(),
+                    "indexed": field_entry.is_indexed(),
+                    "fast": field_entry.is_fast()
+                })
+            },
+            tantivy::schema::FieldType::Date(_) => {
+                // Date field
+                serde_json::json!({
+                    "name": field_name,
+                    "type": "datetime",
+                    "stored": field_entry.is_stored(),
+                    "indexed": field_entry.is_indexed(),
+                    "fast": field_entry.is_fast()
+                })
+            },
+            tantivy::schema::FieldType::Facet(_) => {
+                // Facet field
+                serde_json::json!({
+                    "name": field_name,
+                    "type": "text",
+                    "tokenizer": "raw",
+                    "stored": field_entry.is_stored(),
+                    "indexed": field_entry.is_indexed(),
+                    "fast": field_entry.is_fast()
+                })
+            },
+            tantivy::schema::FieldType::Bytes(_) => {
+                // Bytes field
+                serde_json::json!({
+                    "name": field_name,
+                    "type": "bytes",
+                    "stored": field_entry.is_stored(),
+                    "indexed": field_entry.is_indexed(),
+                    "fast": field_entry.is_fast()
+                })
+            },
+            tantivy::schema::FieldType::JsonObject(_) => {
+                // JSON object field
+                serde_json::json!({
+                    "name": field_name,
+                    "type": "object",
+                    "stored": field_entry.is_stored()
+                })
+            },
+            tantivy::schema::FieldType::IpAddr(_) => {
+                // IP address field
+                serde_json::json!({
+                    "name": field_name,
+                    "type": "ip",
+                    "stored": field_entry.is_stored(),
+                    "indexed": field_entry.is_indexed(),
+                    "fast": field_entry.is_fast()
+                })
+            }
+        };
+        
+        field_mappings.push(field_mapping);
+    }
     
-    debug_log!("Successfully extracted doc mapping JSON ({} bytes)", doc_mapping_json.len());
+    // Create the doc mapping JSON structure as just the field_mappings array
+    // DocMapperBuilder expects the root to be a sequence of field mappings
+    let doc_mapping_json = serde_json::json!(field_mappings);
     
-    Ok(doc_mapping_json)
+    let doc_mapping_str = serde_json::to_string(&doc_mapping_json)
+        .map_err(|e| anyhow!("Failed to serialize DocMapping to JSON: {}", e))?;
+    
+    debug_log!("Successfully created doc mapping JSON from actual Tantivy schema ({} bytes)", doc_mapping_str.len());
+    
+    Ok(doc_mapping_str)
 }
 
 /// Configuration for split conversion passed from Java
@@ -373,206 +479,161 @@ fn create_quickwit_split(
     output_path: &PathBuf, 
     _split_metadata: &QuickwitSplitMetadata
 ) -> Result<FooterOffsets, anyhow::Error> {
-    use quickwit_storage::SplitPayloadBuilder;
-    use std::path::PathBuf;
+    use tantivy::directory::MmapDirectory;
     
+    use uuid::Uuid;
+    
+    
+    
+    debug_log!("🔧 OFFICIAL API: Using Quickwit's SplitPayloadBuilder for proper split creation");
     debug_log!("create_quickwit_split called with output_path: {:?}", output_path);
     
-    // Collect all Tantivy index files
-    let mut split_files = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(index_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let filename = path.file_name().unwrap().to_str().unwrap();
-            
-            // Skip lock files and split files, include only Tantivy index files
-            if filename.starts_with(".tantivy") || filename.ends_with(".split") {
-                continue;
-            }
-            
-            if path.is_file() {
-                debug_log!("Including file in split: {:?}", filename);
-                split_files.push(path);
-            }
-        }
-    }
-    
-    debug_log!("Total files collected for split: {}", split_files.len());
-    
-    // Sort files for consistent ordering
-    split_files.sort();
-    
-    // Create proper split fields metadata from the Tantivy index schema
-    let split_fields = {
-        // Extract field metadata from the Tantivy index
-        let searcher = tantivy_index.reader()
-            .map_err(|e| anyhow::anyhow!("Failed to create reader for field metadata extraction: {}", e))?
-            .searcher();
-        
-        let segment_ids: Vec<_> = searcher.segment_readers().iter().map(|sr| sr.segment_id()).collect();
-        let mut all_field_metadata = Vec::new();
-        
-        // Collect field metadata from all segments
-        for segment_reader in searcher.segment_readers() {
-            let field_metadata = segment_reader.fields_metadata();
-            all_field_metadata.extend(field_metadata);
-        }
-        
-        debug_log!("Extracted {} field metadata entries from index", all_field_metadata.len());
-        
-        // Use Quickwit's serialization functions to create proper field metadata
-        use quickwit_proto::search::{ListFields, ListFieldsEntryResponse, serialize_split_fields};
-        
-        let fields: Vec<ListFieldsEntryResponse> = all_field_metadata.into_iter().flat_map(|metadata_vec| {
-            metadata_vec.into_iter().map(|field_metadata| {
-                let field_type = match field_metadata.typ {
-                    tantivy::schema::Type::Str => quickwit_proto::search::ListFieldType::Str as i32,
-                    tantivy::schema::Type::U64 => quickwit_proto::search::ListFieldType::U64 as i32,
-                    tantivy::schema::Type::I64 => quickwit_proto::search::ListFieldType::I64 as i32,
-                    tantivy::schema::Type::F64 => quickwit_proto::search::ListFieldType::F64 as i32,
-                    tantivy::schema::Type::Bool => quickwit_proto::search::ListFieldType::Bool as i32,
-                    tantivy::schema::Type::Date => quickwit_proto::search::ListFieldType::Date as i32,
-                    tantivy::schema::Type::Facet => quickwit_proto::search::ListFieldType::Facet as i32,
-                    tantivy::schema::Type::Bytes => quickwit_proto::search::ListFieldType::Bytes as i32,
-                    _ => quickwit_proto::search::ListFieldType::Str as i32, // Default fallback
-                };
-                
-                debug_log!("Field '{}' - type: {:?}, indexed: {}, fast: {}", 
-                    field_metadata.field_name, field_metadata.typ, field_metadata.indexed, field_metadata.fast);
-                    
-                ListFieldsEntryResponse {
-                    field_name: field_metadata.field_name.clone(),
-                    field_type,
-                    searchable: field_metadata.indexed,
-                    aggregatable: field_metadata.fast,
-                    index_ids: Vec::new(),
-                    non_searchable_index_ids: Vec::new(), 
-                    non_aggregatable_index_ids: Vec::new(),
-                }
-            })
-        }).collect();
-        
-        let list_fields = ListFields { fields };
-        serialize_split_fields(list_fields)
-    };
-    
-    // Create proper hotcache using Quickwit's write_hotcache function
-    let hotcache = {
-        let mut hotcache_buffer = Vec::new();
-        
-        // Open the index directory to generate hotcache from (use the index_dir parameter)
-        use tantivy::directory::MmapDirectory;
-        let mmap_directory = MmapDirectory::open(index_dir)?;
-        
-        // Use Quickwit's write_hotcache function exactly like they do
-        write_hotcache(mmap_directory, &mut hotcache_buffer)
-            .map_err(|e| anyhow::anyhow!("Failed to generate hotcache: {}", e))?;
-        
-        hotcache_buffer
-    };
-    
-    // Use Quickwit's real SplitPayloadBuilder to create proper split format
+    // Create async runtime for Quickwit operations
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|e| anyhow::anyhow!("Failed to create tokio runtime: {}", e))?;
     
     runtime.block_on(async {
-        // Create the split payload using Quickwit's actual implementation
-        // This should create the correct format: [Files][FilesMetadata][FilesMetadata length 8 byte LE][Hotcache][Hotcache length 8 byte LE]
+        // ✅ STEP 1: Collect all Tantivy index files first
+        let split_id = Uuid::new_v4().to_string();
+        debug_log!("✅ OFFICIAL API: Creating split with split_id: {}", split_id);
+        
+        // Get files from the directory by reading the filesystem
+        let file_entries: Vec<_> = std::fs::read_dir(index_dir)?
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                let path = entry.path();
+                if !path.is_file() {
+                    return false;
+                }
+                
+                let filename = path.file_name().unwrap().to_string_lossy();
+                // Skip lock files and split files, include only Tantivy index files
+                !filename.starts_with(".tantivy") && !filename.ends_with(".split")
+            })
+            .map(|entry| entry.path())
+            .collect();
+        
+        debug_log!("✅ OFFICIAL API: Found {} files in index directory", file_entries.len());
+        for file_path in &file_entries {
+            debug_log!("✅ OFFICIAL API: Will include file: {}", file_path.display());
+        }
+        
+        // ✅ STEP 2: Generate hotcache using Quickwit's official function
+        let mmap_directory = MmapDirectory::open(index_dir)?;
+        let hotcache = {
+            let mut hotcache_buffer = Vec::new();
+            
+            debug_log!("✅ OFFICIAL API: Generating hotcache using Quickwit's write_hotcache");
+            write_hotcache(mmap_directory, &mut hotcache_buffer)
+                .map_err(|e| anyhow::anyhow!("Failed to generate hotcache: {}", e))?;
+            
+            debug_log!("✅ OFFICIAL API: Generated {} bytes of hotcache", hotcache_buffer.len());
+            hotcache_buffer
+        };
+        
+        // ✅ STEP 3: Create empty serialized split fields (for now)
+        let serialized_split_fields = Vec::new();
+        debug_log!("✅ OFFICIAL API: Using empty serialized split fields");
+        
+        // ✅ STEP 4: Create split payload using official API
+        debug_log!("✅ OFFICIAL API: Creating split payload with official get_split_payload()");
         let split_payload = SplitPayloadBuilder::get_split_payload(
-            &split_files,
-            &split_fields,
+            &file_entries,
+            &serialized_split_fields,
             &hotcache
         )?;
         
-        // Write the payload to the output file
+        // ✅ STEP 5: Write payload to output file
         let payload_bytes = split_payload.read_all().await?;
         std::fs::write(output_path, &payload_bytes)?;
         
-        debug_log!("Successfully wrote split file: {:?} ({} bytes)", output_path, payload_bytes.len());
+        debug_log!("✅ OFFICIAL API: Successfully wrote split file: {:?} ({} bytes)", output_path, payload_bytes.len());
         
-        // Debug: Check the actual bytes at the end of the file to see what format was created
-        let file_len = payload_bytes.len();
-        if file_len >= 16 {
-            let last_16_bytes = &payload_bytes[file_len-16..file_len];
-            debug_log!("Last 16 bytes of split file: {:?}", last_16_bytes);
-            
-            // Try to read the last 8 bytes as u64 LE (should be hotcache length)
-            let last_8_bytes = &payload_bytes[file_len-8..file_len];
-            if last_8_bytes.len() == 8 {
-                if let Ok(last_8_array) = <[u8; 8]>::try_from(last_8_bytes) {
-                    let hotcache_len = u64::from_le_bytes(last_8_array);
-                debug_log!("Last 8 bytes as u64 LE (should be hotcache length): {}", hotcache_len);
-                
-                    // Try to read the 8 bytes before that as u64 LE (should be metadata length)
-                    if file_len >= hotcache_len as usize + 16 {
-                        let metadata_len_start = file_len - 8 - hotcache_len as usize - 8;
-                        if metadata_len_start < file_len && metadata_len_start + 8 <= file_len {
-                            let metadata_len_bytes = &payload_bytes[metadata_len_start..metadata_len_start + 8];
-                            if let Ok(metadata_len_array) = <[u8; 8]>::try_from(metadata_len_bytes) {
-                                let metadata_len = u64::from_le_bytes(metadata_len_array);
-                                debug_log!("Metadata length from split: {}", metadata_len);
-                            }
-                        }
-                    }
-                }
-            }
+        // ✅ STEP 6: Extract actual footer information from the created split
+        // Instead of manual calculation, read the actual format Quickwit created
+        let file_len = payload_bytes.len() as u64;
+        
+        // Read the last 4 bytes to get hotcache length (Quickwit uses u32, not u64)
+        if file_len < 8 {
+            return Err(anyhow::anyhow!("Split file too small: {} bytes", file_len));
         }
         
-        // Calculate footer offsets based on what SplitPayloadBuilder actually created
-        // The SplitPayloadBuilder should have created the correct Quickwit format
-        let total_file_size = payload_bytes.len() as u64;
-        let hotcache_length = hotcache.len() as u64;
-        let metadata_length = split_fields.len() as u64;
+        let hotcache_len_bytes = &payload_bytes[file_len as usize - 4..];
+        let hotcache_length = u32::from_le_bytes(
+            hotcache_len_bytes.try_into()
+                .map_err(|_| anyhow::anyhow!("Failed to read hotcache length"))?
+        ) as u64;
         
-        // Footer structure in Quickwit format (from end backwards):
-        // - Last 8 bytes: hotcache length (u64 LE) 
-        // - Before that: hotcache data
-        // - Before that: 8 bytes metadata length (u64 LE)
-        // - Before that: metadata data
-        let footer_end_offset = total_file_size;
-        let hotcache_start_offset = total_file_size - 8 - hotcache_length;  
-        let footer_start_offset = hotcache_start_offset - 8 - metadata_length;
+        debug_log!("✅ OFFICIAL API: Read hotcache length from split: {} bytes", hotcache_length);
         
-        // Validate that our calculated offsets make sense
-        if footer_start_offset >= footer_end_offset {
+        // Calculate hotcache start (4 bytes before hotcache for length field)
+        let hotcache_start_offset = file_len - 4 - hotcache_length;
+        
+        // Read metadata length from 4 bytes before hotcache
+        if hotcache_start_offset < 4 {
+            return Err(anyhow::anyhow!("Invalid hotcache start offset: {}", hotcache_start_offset));
+        }
+        
+        let metadata_len_start = hotcache_start_offset as usize - 4;
+        let metadata_len_bytes = &payload_bytes[metadata_len_start..metadata_len_start + 4];
+        let metadata_length = u32::from_le_bytes(
+            metadata_len_bytes.try_into()
+                .map_err(|_| anyhow::anyhow!("Failed to read metadata length"))?
+        ) as u64;
+        
+        debug_log!("✅ OFFICIAL API: Read metadata length from split: {} bytes", metadata_length);
+        
+        // Calculate footer start (where BundleStorageFileOffsets JSON begins)
+        let footer_start_offset = hotcache_start_offset - 4 - metadata_length;
+        
+        debug_log!("✅ OFFICIAL API: Calculated footer offsets from actual split structure:");
+        debug_log!("   footer_start_offset = {} (where BundleStorageFileOffsets begins)", footer_start_offset);
+        debug_log!("   hotcache_start_offset = {} (where hotcache begins)", hotcache_start_offset);
+        debug_log!("   file_len = {} (total file size)", file_len);
+        debug_log!("   metadata_length = {} bytes", metadata_length);
+        debug_log!("   hotcache_length = {} bytes", hotcache_length);
+        
+        // Validate footer structure
+        if footer_start_offset >= hotcache_start_offset {
             return Err(anyhow::anyhow!(
-                "Invalid footer calculation: start({}) >= end({}) - file_size={}, metadata_len={}, hotcache_len={}", 
-                footer_start_offset, footer_end_offset, total_file_size, metadata_length, hotcache_length
+                "Invalid footer structure: footer_start({}) >= hotcache_start({})", 
+                footer_start_offset, hotcache_start_offset
             ));
+        }
+        
+        // Verify we can read the metadata section
+        let metadata_start = footer_start_offset as usize;
+        let metadata_end = (footer_start_offset + metadata_length) as usize;
+        if metadata_end > payload_bytes.len() {
+            return Err(anyhow::anyhow!(
+                "Metadata section extends beyond file: {}..{} > {}", 
+                metadata_start, metadata_end, payload_bytes.len()
+            ));
+        }
+        
+        // Debug: Verify we can parse the metadata section
+        let metadata_bytes = &payload_bytes[metadata_start..metadata_end];
+        match std::str::from_utf8(metadata_bytes) {
+            Ok(metadata_str) => {
+                debug_log!("✅ OFFICIAL API: Successfully extracted metadata section ({} bytes)", metadata_str.len());
+                debug_log!("✅ OFFICIAL API: Metadata preview: {}", 
+                    &metadata_str[..std::cmp::min(200, metadata_str.len())]);
+            },
+            Err(e) => {
+                debug_log!("⚠️  OFFICIAL API: Metadata section is not UTF-8 (binary format): {}", e);
+            }
         }
         
         let footer_offsets = FooterOffsets {
             footer_start_offset,
-            footer_end_offset,
+            footer_end_offset: file_len,
             hotcache_start_offset,
             hotcache_length,
         };
         
-        debug_log!("🔍 FOOTER CALCULATION DEBUG:");
-        debug_log!("   total_file_size = {}", total_file_size);
-        debug_log!("   metadata_length = {}", metadata_length);
-        debug_log!("   hotcache_length = {}", hotcache_length);
-        debug_log!("   footer_end_offset = {} (= total_file_size)", footer_end_offset);
-        debug_log!("   hotcache_start_offset = {} (= {} - 8 - {})", hotcache_start_offset, total_file_size, hotcache_length);
-        debug_log!("   footer_start_offset = {} (= {} - 8 - {})", footer_start_offset, hotcache_start_offset, metadata_length);
-        
-        // CRITICAL: Check for values that would cause subtraction overflow
-        if footer_end_offset > u32::MAX as u64 {
-            debug_log!("🚨 WARNING: footer_end_offset ({}) > u32::MAX ({}), may cause overflow", footer_end_offset, u32::MAX);
-        }
-        if footer_start_offset > u32::MAX as u64 {
-            debug_log!("🚨 WARNING: footer_start_offset ({}) > u32::MAX ({}), may cause overflow", footer_start_offset, u32::MAX);
-        }
-        if hotcache_start_offset > u32::MAX as u64 {
-            debug_log!("🚨 WARNING: hotcache_start_offset ({}) > u32::MAX ({}), may cause overflow", hotcache_start_offset, u32::MAX);
-        }
-        
-        debug_log!("Split footer offsets: metadata={}..{} ({} bytes), hotcache={}..{} ({} bytes)", 
-            footer_start_offset, hotcache_start_offset, metadata_length,
-            hotcache_start_offset, footer_end_offset - 8, hotcache_length);
-        
+        debug_log!("✅ OFFICIAL API: Split creation completed successfully with proper Quickwit format");
         Ok::<FooterOffsets, anyhow::Error>(footer_offsets)
     })
 }
@@ -632,7 +693,22 @@ pub extern "system" fn Java_com_tantivy4java_QuickwitSplit_nativeReadSplitMetada
         let split_data = std::fs::read(path)?;
         let owned_bytes = OwnedBytes::new(split_data);
         
-        // Parse the split using Quickwit's BundleStorage
+        // Create BundleDirectory directly from the split data to extract Tantivy index
+        let split_file_slice = tantivy::directory::FileSlice::new(std::sync::Arc::new(owned_bytes.clone()));
+        let bundle_directory = quickwit_directories::BundleDirectory::open_split(split_file_slice)
+            .map_err(|e| anyhow!("Failed to open bundle directory: {}", e))?;
+        
+        // Open the Tantivy index from the bundle directory
+        let tantivy_index = tantivy::Index::open(bundle_directory)
+            .map_err(|e| anyhow!("Failed to open Tantivy index from bundle: {}", e))?;
+        
+        // Extract doc mapping JSON from the Tantivy index schema
+        let doc_mapping_json = extract_doc_mapping_from_index(&tantivy_index)
+            .map_err(|e| anyhow!("Failed to extract doc mapping from split index: {}", e))?;
+        
+        debug_log!("Successfully extracted doc mapping from split ({} bytes)", doc_mapping_json.len());
+        
+        // Parse the split using Quickwit's BundleStorage for file count (keeping for metadata)
         let ram_storage = std::sync::Arc::new(RamStorage::default());
         let bundle_path = std::path::PathBuf::from("temp.split");
         let (_hotcache, bundle_storage) = BundleStorage::open_from_split_data_with_owned_bytes(
@@ -663,8 +739,8 @@ pub extern "system" fn Java_com_tantivy4java_QuickwitSplit_nativeReadSplitMetada
             hotcache_start_offset: None,
             hotcache_length: None,
             
-            // Doc mapping JSON not available when reading existing split files
-            doc_mapping_json: None,
+            // Extract doc mapping JSON from the split's Tantivy index
+            doc_mapping_json: Some(doc_mapping_json),
         };
         
         debug_log!("Successfully read Quickwit split with {} files", file_count);
@@ -1108,7 +1184,7 @@ fn merge_splits_impl(split_urls: &[String], output_path: &str, config: &MergeCon
     use quickwit_directories::UnionDirectory;
     use tantivy::directory::{MmapDirectory, Directory, Advice, DirectoryClone};
     use tantivy::{Index as TantivyIndex, IndexMeta};
-    use tantivy::index::SegmentId;
+    
     
     debug_log!("🔧 MERGE OPERATION: Implementing split merge using Quickwit's efficient approach for {} splits", split_urls.len());
     debug_log!("🚨 MERGE SAFETY: Lazy loading DISABLED for merge operations to prevent range assertion failures");
@@ -1457,8 +1533,8 @@ fn get_tantivy_directory_from_split_bundle(split_path: &str) -> Result<Box<dyn t
 /// CRITICAL: This version is used for merge operations to prevent range assertion failures
 /// It forces full file download instead of using lazy loading with potentially corrupted offsets
 fn get_tantivy_directory_from_split_bundle_full_access(split_path: &str) -> Result<Box<dyn tantivy::Directory>> {
-    use quickwit_storage::{BundleStorage, RamStorage, Storage, PutPayload};
-    use tantivy::directory::{OwnedBytes, MmapDirectory};
+    use quickwit_storage::PutPayload;
+    use tantivy::directory::OwnedBytes;
     use quickwit_directories::BundleDirectory;
     
     debug_log!("🔧 MERGE SAFETY: Opening bundle directory with FULL ACCESS (no lazy loading): {}", split_path);
@@ -1490,7 +1566,7 @@ fn get_tantivy_directory_from_split_bundle_full_access(split_path: &str) -> Resu
 
 /// Combine multiple index metadata using Quickwit's approach
 fn combine_index_meta(mut index_metas: Vec<tantivy::IndexMeta>) -> Result<tantivy::IndexMeta> {
-    use tantivy::IndexMeta;
+    
     
     debug_log!("Combining {} index metadata objects", index_metas.len());
     

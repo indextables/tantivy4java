@@ -2,11 +2,12 @@ use jni::objects::{JClass, JObject, JString, JValue};
 use jni::sys::{jlong, jobject};
 use jni::JNIEnv;
 use tantivy::tokenizer::{
-    SimpleTokenizer, WhitespaceTokenizer, RawTokenizer, Token,
-    LowerCaser, RemoveLongFilter, StopWordFilter, TextAnalyzer as TantivyAnalyzer
+    SimpleTokenizer, WhitespaceTokenizer, RawTokenizer,
+    LowerCaser, RemoveLongFilter, TextAnalyzer as TantivyAnalyzer
 };
 
-use crate::utils::{handle_error, register_object, remove_object, with_object, with_object_mut};
+use crate::utils::{handle_error, arc_to_jlong, release_arc, with_arc_safe};
+use std::sync::{Arc, Mutex};
 
 /// Create a text analyzer with the specified tokenizer
 #[no_mangle]
@@ -31,7 +32,8 @@ pub extern "system" fn Java_com_tantivy4java_TextAnalyzer_nativeCreateAnalyzer(
         }
     };
 
-    register_object(Box::new(analyzer)) as jlong
+    let analyzer_arc = Arc::new(Mutex::new(Box::new(analyzer)));
+    arc_to_jlong(analyzer_arc)
 }
 
 /// Tokenize text using the specified tokenizer (static method)
@@ -95,10 +97,11 @@ pub extern "system" fn Java_com_tantivy4java_TextAnalyzer_nativeAnalyze(
         }
     };
 
-    let result = with_object_mut::<Box<TantivyAnalyzer>, Option<Vec<String>>>(
-        analyzer_ptr as u64, 
-        |analyzer| {
-            Some(tokenize_text(analyzer, &text_str))
+    let result = with_arc_safe::<Mutex<Box<TantivyAnalyzer>>, Option<Vec<String>>>(
+        analyzer_ptr, 
+        |analyzer_mutex| {
+            let mut analyzer = analyzer_mutex.lock().unwrap();
+            Some(tokenize_text(&mut **analyzer, &text_str))
         }
     );
 
@@ -126,7 +129,7 @@ pub extern "system" fn Java_com_tantivy4java_TextAnalyzer_nativeClose(
     _class: JClass,
     analyzer_ptr: jlong,
 ) {
-    remove_object(analyzer_ptr as u64);
+    release_arc(analyzer_ptr);
 }
 
 /// Create a text analyzer based on the tokenizer name

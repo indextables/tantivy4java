@@ -170,55 +170,102 @@ public class SplitSearcher implements AutoCloseable {
      * Get the schema for this split
      */
     public Schema getSchema() {
-        return new Schema(getSchemaFromNative(nativePtr));
+        System.out.println("🔍 Java SplitSearcher.getSchema called with nativePtr=" + nativePtr);
+        long schemaPtr = getSchemaFromNative(nativePtr);
+        System.out.println("🔍 Java getSchemaFromNative returned schemaPtr=" + schemaPtr);
+        return new Schema(schemaPtr);
     }
     
     /**
-     * Parse a query string using this split's schema and tokenization settings.
-     * This method provides the same query parsing functionality as Index.parseQuery()
-     * but uses the schema from the split file.
+     * Parse a query string using Quickwit's proven query parser.
+     * This method leverages Quickwit's robust query parsing libraries for reliable
+     * and efficient query parsing with the split's schema.
      * 
-     * @param queryString The query string to parse (e.g., "title:python AND content:machine")
-     * @return Parsed Query object ready for search operations
-     * @throws RuntimeException If the query string is malformed or contains invalid field references
-     * 
-     * @see Index#parseQuery(String)
+     * @param queryString The query string (e.g., "title:hello", "age:[1 TO 100]", "status:active AND priority:high")
+     * @return A SplitQuery that can be used for efficient split searching
      */
-    public Query parseQuery(String queryString) {
-        long queryPtr = parseQueryNative(nativePtr, queryString);
-        return new Query(queryPtr);
-    }
-    
-    /**
-     * Search the split with hot cache optimization
-     */
-    public SearchResult search(Query query, int limit) {
-        System.out.println("🔍 Java SplitSearcher.search called with nativePtr=" + nativePtr + ", queryPtr=" + query.getNativePtr() + ", limit=" + limit);
-        if (nativePtr == 0) {
-            System.out.println("❌ Java: nativePtr is 0!");
-            return null;
+    public SplitQuery parseQuery(String queryString) {
+        if (queryString == null || queryString.trim().isEmpty()) {
+            throw new IllegalArgumentException("Query string cannot be null or empty");
         }
-        if (query.getNativePtr() == 0) {
-            System.out.println("❌ Java: query.getNativePtr() is 0!");
-            return null;
+        Schema schema = getSchema();
+        return SplitQuery.parseQuery(queryString, schema);
+    }
+
+    /**
+     * Parse a query string with specific default search fields.
+     * This provides API compatibility with the main Tantivy Index.parseQuery() method.
+     *
+     * When no field is specified in the query (e.g., just "hello" instead of "title:hello"),
+     * the query will search across all specified default fields.
+     *
+     * Examples:
+     * - parseQuery("machine", Arrays.asList("title")) → searches for "machine" in title field
+     * - parseQuery("machine", Arrays.asList("title", "category")) → searches for "machine" in both fields
+     * - parseQuery("title:machine", Arrays.asList("category")) → ignores default fields, searches title explicitly
+     *
+     * @param queryString The query string to parse
+     * @param defaultFieldNames List of field names to search when no field is specified in the query
+     * @return A SplitQuery that can be used for efficient split searching
+     * @throws IllegalArgumentException if queryString is null or empty, or if any field name is invalid
+     */
+    public SplitQuery parseQuery(String queryString, java.util.List<String> defaultFieldNames) {
+        if (queryString == null || queryString.trim().isEmpty()) {
+            throw new IllegalArgumentException("Query string cannot be null or empty");
+        }
+        if (defaultFieldNames == null) {
+            defaultFieldNames = java.util.Collections.emptyList();
+        }
+
+        // Convert List<String> to String[] for native method
+        String[] defaultFieldArray = defaultFieldNames.toArray(new String[0]);
+
+        Schema schema = getSchema();
+        return SplitQuery.parseQuery(queryString, schema, defaultFieldArray);
+    }
+
+    /**
+     * Parse a query string with a single default search field.
+     * This is a convenience method for the common case of searching within one specific field.
+     *
+     * Examples:
+     * - parseQuery("machine", "title") → searches for "machine" in title field
+     * - parseQuery("title:learning", "category") → ignores default field, searches title explicitly
+     *
+     * @param queryString The query string to parse
+     * @param defaultFieldName Field name to search when no field is specified in the query
+     * @return A SplitQuery that can be used for efficient split searching
+     * @throws IllegalArgumentException if queryString is null/empty or fieldName is null/empty
+     */
+    public SplitQuery parseQuery(String queryString, String defaultFieldName) {
+        if (defaultFieldName == null || defaultFieldName.trim().isEmpty()) {
+            throw new IllegalArgumentException("Default field name cannot be null or empty");
+        }
+        return parseQuery(queryString, java.util.Arrays.asList(defaultFieldName));
+    }
+    
+    /**
+     * Search the split using a SplitQuery with efficient QueryAst conversion.
+     * This method converts the SplitQuery to Quickwit's QueryAst format and uses
+     * Quickwit's proven search algorithms for optimal performance.
+     * 
+     * @param splitQuery The query to execute (use parseQuery() to create from string)
+     * @param limit Maximum number of results to return
+     * @return SearchResult containing matching documents and their scores
+     */
+    public SearchResult search(SplitQuery splitQuery, int limit) {
+        if (nativePtr == 0) {
+            throw new IllegalStateException("SplitSearcher has been closed or not properly initialized");
+        }
+        if (splitQuery == null) {
+            throw new IllegalArgumentException("SplitQuery cannot be null");
         }
         
         try {
-            System.out.println("🔍 Java: About to call searchNative...");
-            System.out.flush(); // Force output before native call
-            
-            SearchResult result = searchNative(nativePtr, query.getNativePtr(), limit);
-            
-            System.out.println("🔍 Java: searchNative returned: " + result);
-            return result;
-        } catch (UnsatisfiedLinkError e) {
-            System.out.println("❌ Java: UnsatisfiedLinkError: " + e.getMessage());
-            e.printStackTrace();
-            return null;
-        } catch (Throwable e) {
-            System.out.println("❌ Java: searchNative threw throwable: " + e.getClass().getName() + ": " + e.getMessage());
-            e.printStackTrace();
-            return null;
+            // Pass SplitQuery object directly to native layer for efficient QueryAst conversion
+            return searchWithSplitQuery(nativePtr, splitQuery, limit);
+        } catch (Exception e) {
+            throw new RuntimeException("Search failed: " + e.getMessage(), e);
         }
     }
     
@@ -229,6 +276,34 @@ public class SplitSearcher implements AutoCloseable {
      */
     public Document doc(DocAddress docAddress) {
         return docNative(nativePtr, docAddress.getSegmentOrd(), docAddress.getDoc());
+    }
+    
+    /**
+     * Retrieve multiple documents by their addresses in a single batch operation.
+     * This is significantly more efficient than calling doc() multiple times,
+     * especially for large numbers of documents.
+     * 
+     * @param docAddresses List of document addresses
+     * @return List of documents in the same order as the input addresses
+     */
+    public List<Document> docBatch(List<DocAddress> docAddresses) {
+        if (docAddresses == null || docAddresses.isEmpty()) {
+            return new ArrayList<>();
+        }
+        
+        // Convert to arrays for JNI transfer
+        int[] segments = new int[docAddresses.size()];
+        int[] docIds = new int[docAddresses.size()];
+        
+        for (int i = 0; i < docAddresses.size(); i++) {
+            DocAddress addr = docAddresses.get(i);
+            segments[i] = addr.getSegmentOrd();
+            docIds[i] = addr.getDoc();
+        }
+        
+        // Call native batch retrieval
+        Document[] docs = docBatchNative(nativePtr, segments, docIds);
+        return Arrays.asList(docs);
     }
     
     /**
@@ -436,7 +511,35 @@ public class SplitSearcher implements AutoCloseable {
         public Map<String, Long> getComponentSizes() { return componentSizes; }
         public double getHotCacheRatio() { return (double) hotCacheSize / totalSize; }
     }
-    
+
+    /**
+     * Tokenize a string using the proper tokenizer for the specified field.
+     * This method uses the field's schema configuration to determine the correct
+     * tokenizer and returns the list of tokens that would be generated for indexing.
+     *
+     * @param fieldName The name of the field (must exist in the schema)
+     * @param text The text to tokenize
+     * @return List of tokens generated by the field's tokenizer
+     * @throws IllegalArgumentException if the field doesn't exist or text is null
+     */
+    public List<String> tokenize(String fieldName, String text) {
+        if (nativePtr == 0) {
+            throw new IllegalStateException("SplitSearcher has been closed or not properly initialized");
+        }
+        if (fieldName == null || fieldName.trim().isEmpty()) {
+            throw new IllegalArgumentException("Field name cannot be null or empty");
+        }
+        if (text == null) {
+            throw new IllegalArgumentException("Text to tokenize cannot be null");
+        }
+
+        try {
+            return tokenizeNative(nativePtr, fieldName, text);
+        } catch (Exception e) {
+            throw new RuntimeException("Tokenization failed for field '" + fieldName + "': " + e.getMessage(), e);
+        }
+    }
+
     @Override
     public void close() {
         if (nativePtr != 0) {
@@ -451,9 +554,10 @@ public class SplitSearcher implements AutoCloseable {
     // Native methods
     private static native long createNativeWithSharedCache(String splitPath, long cacheManagerPtr, Map<String, Object> splitConfig);
     private static native long getSchemaFromNative(long nativePtr);
-    private static native long parseQueryNative(long nativePtr, String queryString);
-    private static native SearchResult searchNative(long nativePtr, long queryPtr, int limit);
+    private static native SearchResult searchWithQueryAst(long nativePtr, String queryAstJson, int limit);
+    private static native SearchResult searchWithSplitQuery(long nativePtr, SplitQuery splitQuery, int limit);
     private static native Document docNative(long nativePtr, int segment, int docId);
+    private static native Document[] docBatchNative(long nativePtr, int[] segments, int[] docIds);
     private static native byte[] docsBulkNative(long nativePtr, int[] segments, int[] docIds);
     private static native List<Document> parseBulkDocsNative(java.nio.ByteBuffer buffer);
     private static native void preloadComponentsNative(long nativePtr, IndexComponent[] components);
@@ -466,5 +570,6 @@ public class SplitSearcher implements AutoCloseable {
     private static native List<String> listSplitFilesNative(long nativePtr);
     private static native boolean validateSplitNative(long nativePtr);
     private static native SplitMetadata getSplitMetadataNative(long nativePtr);
+    private static native List<String> tokenizeNative(long nativePtr, String fieldName, String text);
     private static native void closeNative(long nativePtr);
 }

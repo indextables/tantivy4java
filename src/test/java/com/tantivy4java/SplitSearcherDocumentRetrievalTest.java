@@ -88,7 +88,7 @@ public class SplitSearcherDocumentRetrievalTest {
         );
         
         metadata = QuickwitSplit.convertIndexFromPath(indexPath.toString(), splitPath.toString(), config);
-        splitUrl = "file://" + splitPath.toAbsolutePath().toString();
+        splitUrl = splitPath.toAbsolutePath().toString();
     }
 
     @Test
@@ -104,9 +104,9 @@ public class SplitSearcherDocumentRetrievalTest {
             System.out.println("   Field names: " + schema.getFieldNames());
             System.out.println("   Has title field: " + schema.hasField("title"));
             
-            // Search for documents using an existing field
-            Query nameQuery = Query.termQuery(schema, "name", "test");
-            SearchResult result = searcher.search(nameQuery, 10);
+            // Search for documents using new SplitQuery API
+            SplitQuery titleQuery = new SplitTermQuery("title", "Advanced");
+            SearchResult result = searcher.search(titleQuery, 10);
             
             assertNotNull(result, "Search should return results");
             List<SearchResult.Hit> hits = result.getHits();
@@ -171,31 +171,28 @@ public class SplitSearcherDocumentRetrievalTest {
         try (SplitSearcher searcher = cacheManager.createSplitSearcher(splitUrl, metadata)) {
             Schema schema = searcher.getSchema();
             
-            // Test 1: Term query
+            // Test 1: Term query using SplitQuery API
             System.out.println("📝 Testing term query document retrieval");
-            Query termQuery = Query.termQuery(schema, "title", "Advanced");
+            SplitQuery termQuery = new SplitTermQuery("title", "Advanced");
             testDocumentRetrievalForQuery(searcher, termQuery, "Term Query");
             
-            // Test 2: Text content query 
+            // Test 2: Text content query using SplitQuery API
             System.out.println("📝 Testing content query document retrieval");
-            Query contentQuery = Query.termQuery(schema, "content", "test");
+            SplitQuery contentQuery = new SplitTermQuery("content", "test");
             testDocumentRetrievalForQuery(searcher, contentQuery, "Content Query");
             
-            // Test 3: Boolean query combining title searches
+            // Test 3: Boolean query combining title searches using SplitQuery API
             System.out.println("📝 Testing boolean query document retrieval");
-            Query titleQuery1 = Query.termQuery(schema, "title", "Advanced");
-            Query titleQuery2 = Query.termQuery(schema, "title", "Document");
-            Query boolQuery = Query.booleanQuery(
-                java.util.Arrays.asList(
-                    new Query.OccurQuery(Occur.MUST, titleQuery1),
-                    new Query.OccurQuery(Occur.SHOULD, titleQuery2)
-                )
-            );
+            SplitQuery titleQuery1 = new SplitTermQuery("title", "Advanced");
+            SplitQuery titleQuery2 = new SplitTermQuery("title", "Document");
+            SplitQuery boolQuery = new SplitBooleanQuery()
+                    .addMust(titleQuery1)
+                    .addShould(titleQuery2);
             testDocumentRetrievalForQuery(searcher, boolQuery, "Boolean Query");
         }
     }
     
-    private void testDocumentRetrievalForQuery(SplitSearcher searcher, Query query, String queryType) {
+    private void testDocumentRetrievalForQuery(SplitSearcher searcher, SplitQuery query, String queryType) {
         SearchResult result = searcher.search(query, 5);
         assertNotNull(result, queryType + " should return results");
         
@@ -259,7 +256,7 @@ public class SplitSearcherDocumentRetrievalTest {
     void testDocumentRetrievalPerformanceAndCaching() {
         try (SplitSearcher searcher = cacheManager.createSplitSearcher(splitUrl, metadata)) {
             Schema schema = searcher.getSchema();
-            Query query = Query.termQuery(schema, "title", "Document");
+            SplitQuery query = new SplitTermQuery("title", "Document");
             SearchResult result = searcher.search(query, 3);
             
             List<SearchResult.Hit> hits = result.getHits();
@@ -301,7 +298,7 @@ public class SplitSearcherDocumentRetrievalTest {
             Schema schema = searcher.getSchema();
             
             // Search for a specific document we know the pattern of
-            Query titleQuery = Query.termQuery(schema, "title", "Document");
+            SplitQuery titleQuery = new SplitTermQuery("title", "Document");
             SearchResult result = searcher.search(titleQuery, 5);
             
             assertNotNull(result, "Search should return results");
@@ -389,7 +386,7 @@ public class SplitSearcherDocumentRetrievalTest {
     void testDocumentLifecycleManagement() {
         try (SplitSearcher searcher = cacheManager.createSplitSearcher(splitUrl, metadata)) {
             Schema schema = searcher.getSchema();
-            Query query = Query.termQuery(schema, "content", "test");
+            SplitQuery query = new SplitTermQuery("content", "test");
             SearchResult result = searcher.search(query, 2);
             
             List<SearchResult.Hit> hits = result.getHits();
@@ -411,6 +408,48 @@ public class SplitSearcherDocumentRetrievalTest {
                 System.out.println("✅ Document lifecycle test completed successfully");
             }
             
+            result.close();
+        }
+    }
+    
+    @Test
+    @DisplayName("Test SplitQuery parsing and QueryAst conversion")
+    void testSplitQueryParsing() {
+        try (SplitSearcher searcher = cacheManager.createSplitSearcher(splitUrl, metadata)) {
+            // Test 1: Simple query string parsing
+            System.out.println("📝 Testing SplitQuery parsing functionality");
+            SplitQuery parsedQuery = searcher.parseQuery("title:Advanced");
+            assertNotNull(parsedQuery, "Parsed query should not be null");
+            
+            SearchResult result = searcher.search(parsedQuery, 5);
+            assertNotNull(result, "Search with parsed query should return results");
+            System.out.println("✅ Simple query parsing successful");
+            
+            // Test 2: Complex query string parsing
+            System.out.println("📝 Testing complex query string parsing");
+            SplitQuery complexQuery = searcher.parseQuery("title:Document AND content:test");
+            assertNotNull(complexQuery, "Complex parsed query should not be null");
+            
+            SearchResult complexResult = searcher.search(complexQuery, 5);
+            assertNotNull(complexResult, "Search with complex parsed query should return results");
+            System.out.println("✅ Complex query parsing successful");
+            
+            // Test 3: Compare direct SplitQuery construction vs parsing
+            System.out.println("📝 Testing direct vs parsed query equivalence");
+            SplitQuery directQuery = new SplitTermQuery("title", "Advanced");
+            SplitQuery parsedEquivalent = searcher.parseQuery("title:Advanced");
+            
+            SearchResult directResult = searcher.search(directQuery, 10);
+            SearchResult parsedResult = searcher.search(parsedEquivalent, 10);
+            
+            // Results should be equivalent (both should find documents)
+            assertEquals(directResult.getHits().size() > 0, parsedResult.getHits().size() > 0,
+                    "Direct and parsed queries should have equivalent results");
+            System.out.println("✅ Query equivalence test successful");
+            
+            directResult.close();
+            parsedResult.close();
+            complexResult.close();
             result.close();
         }
     }

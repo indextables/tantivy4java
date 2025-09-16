@@ -26,8 +26,10 @@ use tantivy::DateTime;
 use std::net::IpAddr;
 use std::collections::BTreeMap;
 use chrono::{self, Datelike, Timelike};
-use crate::utils::{register_object, remove_object, with_object_mut, with_object, handle_error};
+use crate::utils::{handle_error, with_arc_safe, arc_to_jlong, release_arc};
+use std::sync::{Arc, Mutex};
 use serde_json;
+
 
 /// Unified document type that can handle both creation and retrieval
 #[derive(Clone)]
@@ -103,11 +105,20 @@ impl DocumentBuilder {
             IpAddr::V4(ipv4) => ipv4.to_ipv6_mapped(),
             IpAddr::V6(ipv6) => ipv6,
         };
-        
+
         self.field_values
             .entry(field_name)
             .or_default()
             .push(OwnedValue::IpAddr(ipv6_value));
+    }
+
+    pub fn add_json(&mut self, field_name: String, json_object: BTreeMap<String, OwnedValue>) {
+        // Convert BTreeMap to Vec<(String, OwnedValue)> for tantivy
+        let json_vec: Vec<(String, OwnedValue)> = json_object.into_iter().collect();
+        self.field_values
+            .entry(field_name)
+            .or_default()
+            .push(OwnedValue::Object(json_vec));
     }
     
     pub fn build(self, schema: &Schema) -> Result<TantivyDocument, String> {
@@ -126,6 +137,11 @@ impl DocumentBuilder {
                     OwnedValue::Bool(b) => doc.add_bool(field, b),
                     OwnedValue::Date(dt) => doc.add_date(field, dt),
                     OwnedValue::IpAddr(ipv6) => doc.add_ip_addr(field, ipv6),
+                    OwnedValue::Object(obj) => {
+                        // Convert Vec<(String, OwnedValue)> to BTreeMap for tantivy
+                        let json_map: BTreeMap<String, OwnedValue> = obj.into_iter().collect();
+                        doc.add_object(field, json_map);
+                    },
                     _ => return Err(format!("Unsupported value type for field '{}'", field_name)),
                 }
             }
@@ -225,7 +241,8 @@ pub extern "system" fn Java_com_tantivy4java_Document_nativeNew(
 ) -> jlong {
     let document_builder = DocumentBuilder::new();
     let wrapper = DocumentWrapper::Builder(document_builder);
-    register_object(wrapper) as jlong
+    let wrapper_arc = Arc::new(Mutex::new(wrapper));
+    arc_to_jlong(wrapper_arc)
 }
 
 #[no_mangle]
@@ -254,7 +271,8 @@ pub extern "system" fn Java_com_tantivy4java_Document_nativeGet(
         }
     };
     
-    let result = with_object::<DocumentWrapper, Result<jobject, String>>(ptr as u64, |doc_wrapper| {
+    let result = with_arc_safe::<Mutex<DocumentWrapper>, Result<jobject, String>>(ptr, |wrapper_mutex| {
+        let doc_wrapper = wrapper_mutex.lock().unwrap();
         match doc_wrapper.get_field_values(&field_name_str) {
             Some(values) => {
                 // Create ArrayList to return the values
@@ -269,6 +287,7 @@ pub extern "system" fn Java_com_tantivy4java_Document_nativeGet(
                             java_string.into()
                         },
                         OwnedValue::I64(i) => {
+                            // Always return Long objects for consistency with test expectations
                             let long_class = env.find_class("java/lang/Long").map_err(|e| e.to_string())?;
                             env.new_object(&long_class, "(J)V", &[(*i).into()]).map_err(|e| e.to_string())?
                         },
@@ -401,8 +420,9 @@ pub extern "system" fn Java_com_tantivy4java_Document_nativeAddText(
         }
     };
     
-    let result = with_object_mut::<DocumentWrapper, Result<(), String>>(ptr as u64, |doc_wrapper| {
-        match doc_wrapper {
+    let result = with_arc_safe::<Mutex<DocumentWrapper>, Result<(), String>>(ptr, |wrapper_mutex| {
+        let mut doc_wrapper = wrapper_mutex.lock().unwrap();
+        match &mut *doc_wrapper {
             DocumentWrapper::Builder(ref mut doc_builder) => {
                 doc_builder.add_text(field_name_str, text_str);
                 Ok(())
@@ -440,8 +460,9 @@ pub extern "system" fn Java_com_tantivy4java_Document_nativeAddUnsigned(
         }
     };
     
-    let result = with_object_mut::<DocumentWrapper, Result<(), String>>(ptr as u64, |doc_wrapper| {
-        match doc_wrapper {
+    let result = with_arc_safe::<Mutex<DocumentWrapper>, Result<(), String>>(ptr, |wrapper_mutex| {
+        let mut doc_wrapper = wrapper_mutex.lock().unwrap();
+        match &mut *doc_wrapper {
             DocumentWrapper::Builder(ref mut doc_builder) => {
                 doc_builder.add_unsigned(field_name_str, value as u64);
                 Ok(())
@@ -479,8 +500,9 @@ pub extern "system" fn Java_com_tantivy4java_Document_nativeAddInteger(
         }
     };
     
-    let result = with_object_mut::<DocumentWrapper, Result<(), String>>(ptr as u64, |doc_wrapper| {
-        match doc_wrapper {
+    let result = with_arc_safe::<Mutex<DocumentWrapper>, Result<(), String>>(ptr, |wrapper_mutex| {
+        let mut doc_wrapper = wrapper_mutex.lock().unwrap();
+        match &mut *doc_wrapper {
             DocumentWrapper::Builder(ref mut doc_builder) => {
                 doc_builder.add_integer(field_name_str, value as i64);
                 Ok(())
@@ -518,8 +540,9 @@ pub extern "system" fn Java_com_tantivy4java_Document_nativeAddFloat(
         }
     };
     
-    let result = with_object_mut::<DocumentWrapper, Result<(), String>>(ptr as u64, |doc_wrapper| {
-        match doc_wrapper {
+    let result = with_arc_safe::<Mutex<DocumentWrapper>, Result<(), String>>(ptr, |wrapper_mutex| {
+        let mut doc_wrapper = wrapper_mutex.lock().unwrap();
+        match &mut *doc_wrapper {
             DocumentWrapper::Builder(ref mut doc_builder) => {
                 doc_builder.add_float(field_name_str, value);
                 Ok(())
@@ -557,8 +580,9 @@ pub extern "system" fn Java_com_tantivy4java_Document_nativeAddBoolean(
         }
     };
     
-    let result = with_object_mut::<DocumentWrapper, Result<(), String>>(ptr as u64, |doc_wrapper| {
-        match doc_wrapper {
+    let result = with_arc_safe::<Mutex<DocumentWrapper>, Result<(), String>>(ptr, |wrapper_mutex| {
+        let mut doc_wrapper = wrapper_mutex.lock().unwrap();
+        match &mut *doc_wrapper {
             DocumentWrapper::Builder(ref mut doc_builder) => {
                 doc_builder.add_boolean(field_name_str, value != 0);
                 Ok(())
@@ -605,8 +629,9 @@ pub extern "system" fn Java_com_tantivy4java_Document_nativeAddDate(
         }
     };
     
-    with_object_mut::<DocumentWrapper, ()>(ptr as u64, |wrapper| {
-        match wrapper {
+    with_arc_safe::<Mutex<DocumentWrapper>, ()>(ptr, |wrapper_mutex| {
+        let mut wrapper = wrapper_mutex.lock().unwrap();
+        match &mut *wrapper {
             DocumentWrapper::Builder(doc_builder) => {
                 doc_builder.add_date(field_name_str, tantivy_datetime);
             },
@@ -643,11 +668,56 @@ pub extern "system" fn Java_com_tantivy4java_Document_nativeAddBytes(
 pub extern "system" fn Java_com_tantivy4java_Document_nativeAddJson(
     mut env: JNIEnv,
     _class: JClass,
-    _ptr: jlong,
-    _field_name: JString,
-    _value: JObject,
+    ptr: jlong,
+    field_name: JString,
+    json_string: JString,
 ) {
-    handle_error(&mut env, "Document native methods not fully implemented yet");
+    let field_name_str: String = match env.get_string(&field_name) {
+        Ok(s) => s.into(),
+        Err(_) => {
+            handle_error(&mut env, "Invalid field name");
+            return;
+        }
+    };
+
+    let json_str: String = match env.get_string(&json_string) {
+        Ok(s) => s.into(),
+        Err(_) => {
+            handle_error(&mut env, "Invalid JSON string");
+            return;
+        }
+    };
+
+    let result = with_arc_safe::<Mutex<DocumentWrapper>, Result<(), String>>(ptr, |wrapper_mutex| {
+        let mut doc_wrapper = wrapper_mutex.lock().unwrap();
+        match &mut *doc_wrapper {
+            DocumentWrapper::Builder(ref mut doc_builder) => {
+                // Parse JSON string into a BTreeMap<String, OwnedValue>
+                let json_value: std::collections::BTreeMap<String, tantivy::schema::OwnedValue> =
+                    match serde_json::from_str(&json_str) {
+                        Ok(value) => value,
+                        Err(e) => return Err(format!("Invalid JSON format: {}", e))
+                    };
+
+                // Add JSON object using the helper method
+                doc_builder.add_json(field_name_str, json_value);
+                Ok(())
+            },
+            DocumentWrapper::Retrieved(_) => {
+                Err("Cannot add values to retrieved documents".to_string())
+            }
+        }
+    });
+
+    match result {
+        Some(Ok(())) => {},
+        Some(Err(err)) => {
+            handle_error(&mut env, &err);
+        },
+        None => {
+            handle_error(&mut env, "Invalid Document pointer");
+        }
+    }
 }
 
 #[no_mangle]
@@ -683,8 +753,9 @@ pub extern "system" fn Java_com_tantivy4java_Document_nativeAddIpAddr(
         }
     };
     
-    with_object_mut::<DocumentWrapper, ()>(ptr as u64, |wrapper| {
-        match wrapper {
+    with_arc_safe::<Mutex<DocumentWrapper>, ()>(ptr, |wrapper_mutex| {
+        let mut wrapper = wrapper_mutex.lock().unwrap();
+        match &mut *wrapper {
             DocumentWrapper::Builder(doc_builder) => {
                 doc_builder.add_ip_addr(field_name_str, ip_addr_parsed);
             },
@@ -696,12 +767,63 @@ pub extern "system" fn Java_com_tantivy4java_Document_nativeAddIpAddr(
 }
 
 #[no_mangle]
+pub extern "system" fn Java_com_tantivy4java_Document_nativeAddString(
+    mut env: JNIEnv,
+    _class: JClass,
+    ptr: jlong,
+    field_name: JString,
+    value: JString,
+) {
+    let field_name_str: String = match env.get_string(&field_name) {
+        Ok(s) => s.into(),
+        Err(_) => {
+            handle_error(&mut env, "Invalid field name");
+            return;
+        }
+    };
+
+    let value_str: String = match env.get_string(&value) {
+        Ok(s) => s.into(),
+        Err(_) => {
+            handle_error(&mut env, "Invalid string value");
+            return;
+        }
+    };
+
+    let result = with_arc_safe::<Mutex<DocumentWrapper>, Result<(), String>>(ptr, |wrapper_mutex| {
+        let mut doc_wrapper = wrapper_mutex.lock().unwrap();
+        match &mut *doc_wrapper {
+            DocumentWrapper::Builder(ref mut doc_builder) => {
+                // For string fields, we store them as text values
+                // The distinction between string and text fields is handled at the schema level
+                doc_builder.add_text(field_name_str, value_str);
+                Ok(())
+            },
+            DocumentWrapper::Retrieved(_) => {
+                Err("Cannot add values to retrieved documents".to_string())
+            }
+        }
+    });
+
+    match result {
+        Some(Ok(())) => {},
+        Some(Err(err)) => {
+            handle_error(&mut env, &err);
+        },
+        None => {
+            handle_error(&mut env, "Invalid Document pointer");
+        }
+    }
+}
+
+#[no_mangle]
 pub extern "system" fn Java_com_tantivy4java_Document_nativeGetNumFields(
     _env: JNIEnv,
     _class: JClass,
     ptr: jlong,
 ) -> jint {
-    with_object::<DocumentWrapper, jint>(ptr as u64, |doc_wrapper| {
+    with_arc_safe::<Mutex<DocumentWrapper>, jint>(ptr, |wrapper_mutex| {
+        let doc_wrapper = wrapper_mutex.lock().unwrap();
         doc_wrapper.num_fields() as jint
     }).unwrap_or(0)
 }
@@ -712,7 +834,8 @@ pub extern "system" fn Java_com_tantivy4java_Document_nativeIsEmpty(
     _class: JClass,
     ptr: jlong,
 ) -> jboolean {
-    with_object::<DocumentWrapper, jboolean>(ptr as u64, |doc_wrapper| {
+    with_arc_safe::<Mutex<DocumentWrapper>, jboolean>(ptr, |wrapper_mutex| {
+        let doc_wrapper = wrapper_mutex.lock().unwrap();
         if doc_wrapper.is_empty() { 1 } else { 0 }
     }).unwrap_or(1)
 }
@@ -723,7 +846,7 @@ pub extern "system" fn Java_com_tantivy4java_Document_nativeClose(
     _class: JClass,
     ptr: jlong,
 ) {
-    remove_object(ptr as u64);
+    release_arc(ptr);
 }
 
 // Helper function to convert Java LocalDateTime to Tantivy DateTime
@@ -778,7 +901,8 @@ pub fn create_java_document_from_retrieved(env: &mut JNIEnv, retrieved_doc: Retr
     let document_wrapper = DocumentWrapper::Retrieved(retrieved_doc);
     
     // Register the document and return the pointer
-    let doc_ptr = register_object(document_wrapper);
+    let wrapper_arc = Arc::new(Mutex::new(document_wrapper));
+    let doc_ptr = arc_to_jlong(wrapper_arc) as u64;
     
     Ok(doc_ptr as jlong)
 }

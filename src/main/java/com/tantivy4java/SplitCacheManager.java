@@ -35,6 +35,13 @@ import java.util.concurrent.atomic.AtomicLong;
  *     .withAwsCredentials(key, secret, sessionToken) // Credentials with session token
  *     .withAwsRegion(region);                        // Region configured separately
  * 
+ * // For S3-compatible storage requiring path-style access (S3Mock, MinIO, LocalStack):
+ * SplitCacheManager.CacheConfig s3MockConfig = new SplitCacheManager.CacheConfig("test-cache")
+ *     .withAwsCredentials(accessKey, secretKey)
+ *     .withAwsRegion("us-east-1")
+ *     .withAwsEndpoint("http://localhost:9090")
+ *     .withAwsPathStyleAccess(true);  // Required for S3Mock and MinIO
+ * 
  * SplitCacheManager cacheManager = SplitCacheManager.getInstance(config);
  * 
  * // Multiple searchers sharing the same cache
@@ -139,6 +146,24 @@ public class SplitCacheManager implements AutoCloseable {
         
         public CacheConfig withAwsEndpoint(String endpoint) {
             this.awsConfig.put("endpoint", endpoint);
+            return this;
+        }
+        
+        /**
+         * Configure AWS path-style access for S3-compatible storage.
+         * 
+         * Path-style access uses URLs like http://endpoint/bucket/key instead of 
+         * http://bucket.endpoint/key. This is required for:
+         * - S3Mock testing environments
+         * - MinIO self-hosted instances
+         * - Custom S3-compatible storage solutions
+         * - LocalStack local AWS emulation
+         * 
+         * @param pathStyleAccess true to enable path-style access, false for virtual-hosted style
+         * @return this CacheConfig for method chaining
+         */
+        public CacheConfig withAwsPathStyleAccess(boolean pathStyleAccess) {
+            this.awsConfig.put("path_style_access", String.valueOf(pathStyleAccess));
             return this;
         }
         
@@ -392,6 +417,16 @@ public class SplitCacheManager implements AutoCloseable {
     }
     
     /**
+     * Get all active SplitCacheManager instances.
+     * This method is used by GlobalCacheUtils to perform system-wide cache operations.
+     * 
+     * @return Map of cache keys to SplitCacheManager instances
+     */
+    static Map<String, SplitCacheManager> getAllInstances() {
+        return new HashMap<>(instances);
+    }
+    
+    /**
      * Validate cache configuration for consistency.
      * With the comprehensive cache key approach, configurations are automatically 
      * unique and consistent - identical configs share instances, different configs get separate instances.
@@ -479,27 +514,6 @@ public class SplitCacheManager implements AutoCloseable {
         return searcher;
     }
     
-    /**
-     * TEMPORARY COMPATIBILITY METHOD - for existing tests only
-     * @deprecated This method provides temporary backward compatibility for existing tests.
-     * Use createSplitSearcher(String, QuickwitSplit.SplitMetadata) for production code.
-     * This method uses fallback parsing without footer optimization.
-     */
-    @Deprecated
-    public SplitSearcher createSplitSearcherXXX(String splitPath) {
-        System.err.println("⚠️  WARNING: Using deprecated createSplitSearcher(String) without optimization.");
-        System.err.println("   For production code, use createSplitSearcher(String, QuickwitSplit.SplitMetadata)");
-        System.err.println("   to enable 87% network traffic reduction and proper lazy loading.");
-        
-        // Pass AWS configuration from the cache manager to the searcher
-        Map<String, Object> splitConfig = new HashMap<>();
-        if (!this.awsConfig.isEmpty()) {
-            splitConfig.put("aws_config", this.awsConfig);
-        }
-        // Disable lazy loading for backward compatibility
-        splitConfig.put("enable_lazy_loading", false);
-        return createSplitSearcher(splitPath, splitConfig);
-    }
     
     /**
      * Create multiple split searchers sharing the same cache (batch creation)
@@ -624,6 +638,117 @@ public class SplitCacheManager implements AutoCloseable {
      */
     public void forceEviction(long targetSizeBytes) {
         forceEvictionNative(nativePtr, targetSizeBytes);
+    }
+    
+    /**
+     * Flush all caches across the entire caching system.
+     * This performs a comprehensive cache clear including:
+     * - LeafSearchCache (query result cache)
+     * - ByteRangeCache (storage byte range cache) 
+     * - ComponentCache (fast fields, postings, etc.)
+     * - All searcher-specific caches
+     * 
+     * @return CacheFlushStats containing information about what was flushed
+     */
+    public CacheFlushStats flushAllCaches() {
+        GlobalCacheStats beforeStats = getGlobalCacheStats();
+        
+        // Force complete eviction (target size = 0 means flush everything)
+        forceEvictionNative(nativePtr, 0);
+        
+        // Evict all components for all managed splits
+        Set<SplitSearcher.IndexComponent> allComponents = EnumSet.allOf(SplitSearcher.IndexComponent.class);
+        for (String splitPath : managedSearchers.keySet()) {
+            evictComponents(splitPath, allComponents);
+        }
+        
+        GlobalCacheStats afterStats = getGlobalCacheStats();
+        
+        return new CacheFlushStats(beforeStats, afterStats, managedSearchers.size());
+    }
+    
+    /**
+     * Flush caches for a specific split only.
+     * 
+     * @param splitPath Path to the split file
+     * @return true if the split was found and caches were flushed, false if split not managed by this cache manager
+     */
+    public boolean flushSplitCaches(String splitPath) {
+        if (!managedSearchers.containsKey(splitPath)) {
+            return false;
+        }
+        
+        // Evict all components for this specific split
+        Set<SplitSearcher.IndexComponent> allComponents = EnumSet.allOf(SplitSearcher.IndexComponent.class);
+        evictComponents(splitPath, allComponents);
+        
+        return true;
+    }
+    
+    /**
+     * Flush specific cache types across all splits.
+     * 
+     * @param cacheTypes Set of cache types to flush
+     */
+    public void flushCacheTypes(Set<CacheType> cacheTypes) {
+        if (cacheTypes.contains(CacheType.LEAF_SEARCH) || cacheTypes.contains(CacheType.BYTE_RANGE)) {
+            // These are global caches, force partial eviction
+            forceEvictionNative(nativePtr, getGlobalCacheStats().getCurrentSize() / 2);
+        }
+        
+        if (cacheTypes.contains(CacheType.COMPONENT)) {
+            // Evict all components for all splits
+            Set<SplitSearcher.IndexComponent> allComponents = EnumSet.allOf(SplitSearcher.IndexComponent.class);
+            for (String splitPath : managedSearchers.keySet()) {
+                evictComponents(splitPath, allComponents);
+            }
+        }
+    }
+    
+    /**
+     * Statistics about cache flushing operation
+     */
+    public static class CacheFlushStats {
+        private final long bytesFreedTotal;
+        private final long itemsEvicted;
+        private final int splitsAffected;
+        private final GlobalCacheStats beforeStats;
+        private final GlobalCacheStats afterStats;
+        
+        public CacheFlushStats(GlobalCacheStats beforeStats, GlobalCacheStats afterStats, int splitsAffected) {
+            this.beforeStats = beforeStats;
+            this.afterStats = afterStats;
+            this.splitsAffected = splitsAffected;
+            this.bytesFreedTotal = beforeStats.getCurrentSize() - afterStats.getCurrentSize();
+            this.itemsEvicted = (beforeStats.getTotalHits() + beforeStats.getTotalMisses()) - 
+                               (afterStats.getTotalHits() + afterStats.getTotalMisses());
+        }
+        
+        public long getBytesFreed() { return bytesFreedTotal; }
+        public long getItemsEvicted() { return itemsEvicted; }
+        public int getSplitsAffected() { return splitsAffected; }
+        public GlobalCacheStats getBeforeStats() { return beforeStats; }
+        public GlobalCacheStats getAfterStats() { return afterStats; }
+        
+        @Override
+        public String toString() {
+            return String.format("CacheFlushStats{bytesFreed=%d, itemsEvicted=%d, splitsAffected=%d, " +
+                               "beforeSize=%d, afterSize=%d}", 
+                               bytesFreedTotal, itemsEvicted, splitsAffected, 
+                               beforeStats.getCurrentSize(), afterStats.getCurrentSize());
+        }
+    }
+    
+    /**
+     * Cache types that can be selectively flushed
+     */
+    public enum CacheType {
+        /** Query result cache (per split_id + query) */
+        LEAF_SEARCH,
+        /** Storage byte range cache (per file_path + range) */  
+        BYTE_RANGE,
+        /** Index component cache (fast fields, postings, etc.) */
+        COMPONENT
     }
     
     @Override

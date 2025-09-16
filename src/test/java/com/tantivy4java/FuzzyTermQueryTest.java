@@ -31,7 +31,9 @@ public class FuzzyTermQueryTest {
                     .addTextField("body", true, false, "default", "position")
                     .addTextField("tags", true, true, "default", "position");
                 
-                try (Schema schema = builder.build()) {
+                // Build schema and keep it alive for the entire test
+                Schema schema = builder.build();
+                try {
                     System.out.println("✅ Created schema with text fields for fuzzy matching");
                     
                     // === PHASE 2: INDEX CREATION AND DOCUMENT INDEXING ===
@@ -218,6 +220,9 @@ public class FuzzyTermQueryTest {
                             }
                         }
                     }
+                } finally {
+                    // Close the schema when done
+                    schema.close();
                 }
             }
             

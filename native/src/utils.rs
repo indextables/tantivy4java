@@ -18,53 +18,70 @@
  */
 
 use jni::JNIEnv;
+use jni::sys::jlong;
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
 use once_cell::sync::Lazy;
-
-/// Global registry for native objects
-pub static OBJECT_REGISTRY: Lazy<Mutex<HashMap<u64, Box<dyn std::any::Any + Send + Sync>>>> = 
-    Lazy::new(|| Mutex::new(HashMap::new()));
-
-/// Thread-safe atomic counter for generating unique IDs
-static NEXT_ID: AtomicU64 = AtomicU64::new(1);
-
-/// Register a native object and return its handle
-pub fn register_object<T: 'static + Send + Sync>(obj: T) -> u64 {
-    let mut registry = OBJECT_REGISTRY.lock().unwrap();
-
-    let id = NEXT_ID.fetch_add(1, Ordering::SeqCst);
-    registry.insert(id, Box::new(obj));
-    id
-}
-
-/// Execute a function with a reference to a registered object
-pub fn with_object<T: 'static, R>(id: u64, f: impl FnOnce(&T) -> R) -> Option<R> {
-    let registry = OBJECT_REGISTRY.lock().unwrap();
-    let boxed = registry.get(&id)?;
-    let obj = boxed.downcast_ref::<T>()?;
-    Some(f(obj))
-}
-
-/// Execute a function with a mutable reference to a registered object
-pub fn with_object_mut<T: 'static, R>(id: u64, f: impl FnOnce(&mut T) -> R) -> Option<R> {
-    let mut registry = OBJECT_REGISTRY.lock().unwrap();
-    let boxed = registry.get_mut(&id)?;
-    // Safe downcast using Any trait - this is the correct way to do dynamic casting
-    let obj = boxed.downcast_mut::<T>()?;
-    Some(f(obj))
-}
-
-/// Remove an object from the registry
-pub fn remove_object(id: u64) -> bool {
-    let mut registry = OBJECT_REGISTRY.lock().unwrap();
-    registry.remove(&id).is_some()
-}
+use crate::debug_println;
 
 /// Handle errors by throwing Java exceptions
 pub fn handle_error(env: &mut JNIEnv, error: &str) {
     let _ = env.throw_new("java/lang/RuntimeException", error);
+}
+
+/// SAFE Arc-based memory management utilities using registry pattern
+
+/// Global registry for Arc objects - prevents memory safety issues
+pub static ARC_REGISTRY: Lazy<Mutex<HashMap<jlong, Box<dyn std::any::Any + Send + Sync>>>> = 
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+/// Thread-safe atomic counter for generating unique Arc IDs
+static ARC_NEXT_ID: AtomicU64 = AtomicU64::new(1);
+
+/// SAFE: Register Arc in global registry and return handle
+pub fn arc_to_jlong<T: Send + Sync + 'static>(arc: Arc<T>) -> jlong {
+    let mut registry = ARC_REGISTRY.lock().unwrap();
+    let id = ARC_NEXT_ID.fetch_add(1, Ordering::SeqCst) as jlong;
+    
+    // Store the Arc in the registry instead of using unsafe pointer manipulation
+    registry.insert(id, Box::new(arc));
+    
+    
+    id
+}
+
+/// SAFE: Access Arc from registry without unsafe operations
+pub fn jlong_to_arc<T: Send + Sync + 'static>(ptr: jlong) -> Option<Arc<T>> {
+    if ptr == 0 {
+        debug_println!("RUST DEBUG: jlong_to_arc - ID is 0, returning None");
+        return None;
+    }
+    
+    let registry = ARC_REGISTRY.lock().unwrap();
+    let boxed = registry.get(&ptr)?;
+    let arc = boxed.downcast_ref::<Arc<T>>()?;
+    
+    
+    Some(arc.clone())
+}
+
+/// SAFE: Execute function with Arc reference from registry
+pub fn with_arc_safe<T: Send + Sync + 'static, R>(ptr: jlong, f: impl FnOnce(&Arc<T>) -> R) -> Option<R> {
+    let arc = jlong_to_arc(ptr)?;
+    Some(f(&arc))
+}
+
+/// SAFE: Remove Arc from registry to prevent memory leaks
+pub fn release_arc(ptr: jlong) {
+    if ptr != 0 {
+        let mut registry = ARC_REGISTRY.lock().unwrap();
+        if registry.remove(&ptr).is_some() {
+            debug_println!("RUST DEBUG: release_arc - removed Arc with ID: {}", ptr);
+        } else {
+            debug_println!("RUST DEBUG: release_arc - Arc with ID {} not found in registry", ptr);
+        }
+    }
 }
 
 /// Convert Rust Result to Java, throwing exception on error

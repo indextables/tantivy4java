@@ -97,7 +97,7 @@ public class NumericFieldsTest {
                                     try (Document doc = searcher.doc(hit.getDocAddress())) {
                                         List<Object> ids = doc.get("id");
                                         assertFalse(ids.isEmpty(), "ID should not be empty");
-                                        Long id = (Long) ids.get(0);
+                                        Long id = ((Number) ids.get(0)).longValue();
                                         
                                         List<Object> ratings = doc.get("rating");
                                         assertFalse(ratings.isEmpty(), "Rating should not be empty");

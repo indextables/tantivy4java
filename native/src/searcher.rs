@@ -17,16 +17,17 @@
  * under the License.
  */
 
-use jni::objects::{JClass, JString, JObject, JByteBuffer};
+use jni::objects::{JClass, JString, JObject, JByteBuffer, ReleaseMode};
 use jni::sys::{jlong, jboolean, jint, jobject};
 use jni::JNIEnv;
+use jni::sys::jlongArray as JLongArray;
 use tantivy::{IndexWriter as TantivyIndexWriter, Searcher as TantivySearcher, DocAddress as TantivyDocAddress, DateTime, Term};
 use tantivy::schema::{TantivyDocument, Field, Schema, Facet};
 use tantivy::query::Query as TantivyQuery;
 use tantivy::index::SegmentId;
 use std::net::IpAddr;
-use crate::utils::{register_object, remove_object, with_object, with_object_mut, handle_error};
-use serde_json;
+use crate::utils::{handle_error, with_arc_safe, arc_to_jlong, release_arc};
+use std::sync::{Arc, Mutex};
 use crate::document::{RetrievedDocument, DocumentWrapper};
 
 // Helper function to extract segment IDs from Java List<String>
@@ -79,8 +80,8 @@ pub extern "system" fn Java_com_tantivy4java_Searcher_nativeSearch(
     _offset: jint,
     _order: jint,
 ) -> jlong {
-    // Clone the query first to avoid nested locks
-    let query_clone = match with_object::<Box<dyn TantivyQuery>, Box<dyn TantivyQuery>>(query_ptr as u64, |query| {
+    // Clone the query using Arc registry
+    let query_clone = match with_arc_safe::<Box<dyn TantivyQuery>, Box<dyn TantivyQuery>>(query_ptr, |query| {
         query.box_clone()
     }) {
         Some(q) => q,
@@ -90,7 +91,8 @@ pub extern "system" fn Java_com_tantivy4java_Searcher_nativeSearch(
         }
     };
     
-    let result = with_object::<TantivySearcher, Result<Vec<(f32, tantivy::DocAddress)>, String>>(ptr as u64, |searcher| {
+    let result = with_arc_safe::<Mutex<TantivySearcher>, Result<Vec<(f32, tantivy::DocAddress)>, String>>(ptr, |searcher_mutex| {
+        let searcher = searcher_mutex.lock().unwrap();
         let collector = tantivy::collector::TopDocs::with_limit(limit as usize);
         let search_result = searcher.search(query_clone.as_ref(), &collector).map_err(|e| e.to_string())?;
         Ok(search_result)
@@ -98,7 +100,8 @@ pub extern "system" fn Java_com_tantivy4java_Searcher_nativeSearch(
     
     match result {
         Some(Ok(top_docs)) => {
-            register_object(top_docs) as jlong
+            let top_docs_arc = Arc::new(top_docs);
+            arc_to_jlong(top_docs_arc)
         },
         Some(Err(err)) => {
             handle_error(&mut env, &err);
@@ -129,7 +132,8 @@ pub extern "system" fn Java_com_tantivy4java_Searcher_nativeGetNumDocs(
     _class: JClass,
     ptr: jlong,
 ) -> jint {
-    with_object::<TantivySearcher, jint>(ptr as u64, |searcher| {
+    with_arc_safe::<Mutex<TantivySearcher>, jint>(ptr, |searcher_mutex| {
+        let searcher = searcher_mutex.lock().unwrap();
         searcher.num_docs() as jint
     }).unwrap_or(0)
 }
@@ -140,7 +144,8 @@ pub extern "system" fn Java_com_tantivy4java_Searcher_nativeGetNumSegments(
     _class: JClass,
     ptr: jlong,
 ) -> jint {
-    with_object::<TantivySearcher, jint>(ptr as u64, |searcher| {
+    with_arc_safe::<Mutex<TantivySearcher>, jint>(ptr, |searcher_mutex| {
+        let searcher = searcher_mutex.lock().unwrap();
         searcher.segment_readers().len() as jint
     }).unwrap_or(0)
 }
@@ -153,8 +158,8 @@ pub extern "system" fn Java_com_tantivy4java_Searcher_nativeDoc(
     doc_address_ptr: jlong,
 ) -> jlong {
     // Get the DocAddress object
-    let tantivy_doc_address = match with_object::<TantivyDocAddress, Option<TantivyDocAddress>>(doc_address_ptr as u64, |doc_address| {
-        Some(*doc_address)
+    let tantivy_doc_address = match with_arc_safe::<TantivyDocAddress, Option<TantivyDocAddress>>(doc_address_ptr, |doc_address| {
+        Some(**doc_address)
     }) {
         Some(Some(addr)) => addr,
         _ => {
@@ -164,7 +169,8 @@ pub extern "system" fn Java_com_tantivy4java_Searcher_nativeDoc(
     };
     
     // Get the document from the searcher
-    let result = with_object::<TantivySearcher, Result<tantivy::schema::TantivyDocument, String>>(searcher_ptr as u64, |searcher| {
+    let result = with_arc_safe::<Mutex<TantivySearcher>, Result<tantivy::schema::TantivyDocument, String>>(searcher_ptr, |searcher_mutex| {
+        let searcher = searcher_mutex.lock().unwrap();
         match searcher.doc(tantivy_doc_address) {
             Ok(doc) => Ok(doc),
             Err(e) => Err(e.to_string()),
@@ -174,7 +180,8 @@ pub extern "system" fn Java_com_tantivy4java_Searcher_nativeDoc(
     match result {
         Some(Ok(document)) => {
             // Get the schema from the searcher to convert the document properly
-            let schema_result = with_object::<TantivySearcher, Option<tantivy::schema::Schema>>(searcher_ptr as u64, |searcher| {
+            let schema_result = with_arc_safe::<Mutex<TantivySearcher>, Option<tantivy::schema::Schema>>(searcher_ptr, |searcher_mutex| {
+                let searcher = searcher_mutex.lock().unwrap();
                 Some(searcher.schema().clone())
             });
             
@@ -183,7 +190,8 @@ pub extern "system" fn Java_com_tantivy4java_Searcher_nativeDoc(
                     // Convert TantivyDocument to RetrievedDocument with proper field access
                     let retrieved_doc = RetrievedDocument::new_with_schema(document, &schema);
                     let wrapper = DocumentWrapper::Retrieved(retrieved_doc);
-                    register_object(wrapper) as jlong
+                    let wrapper_arc = Arc::new(Mutex::new(wrapper));
+                    arc_to_jlong(wrapper_arc)
                 },
                 _ => {
                     handle_error(&mut env, "Failed to get schema from searcher");
@@ -198,6 +206,123 @@ pub extern "system" fn Java_com_tantivy4java_Searcher_nativeDoc(
         None => {
             handle_error(&mut env, "Invalid Searcher pointer");
             0
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_tantivy4java_Searcher_nativeDocBatch(
+    mut env: JNIEnv,
+    _class: JClass,
+    searcher_ptr: jlong,
+    doc_address_ptrs: JLongArray,
+) -> JLongArray {
+    // Convert JNI array to proper JArray type
+    let doc_addresses_array = unsafe { jni::objects::JLongArray::from_raw(doc_address_ptrs) };
+    
+    // Get the array of document address pointers
+    let array_len = match env.get_array_length(&doc_addresses_array) {
+        Ok(len) => len as usize,
+        Err(e) => {
+            handle_error(&mut env, &format!("Failed to get array length: {}", e));
+            return std::ptr::null_mut();
+        }
+    };
+    
+    let mut addresses = vec![0i64; array_len];
+    if let Err(e) = env.get_long_array_region(&doc_addresses_array, 0, &mut addresses) {
+        handle_error(&mut env, &format!("Failed to get array elements: {}", e));
+        return std::ptr::null_mut();
+    }
+    
+    // Convert to Vec of DocAddress objects
+    let mut tantivy_addresses = Vec::new();
+    for &addr_ptr in addresses.iter() {
+        let tantivy_doc_address = match with_arc_safe::<TantivyDocAddress, Option<TantivyDocAddress>>(addr_ptr, |doc_address| {
+            Some(**doc_address)
+        }) {
+            Some(Some(addr)) => addr,
+            _ => {
+                handle_error(&mut env, &format!("Invalid DocAddress pointer at index {}", tantivy_addresses.len()));
+                return std::ptr::null_mut();
+            }
+        };
+        tantivy_addresses.push(tantivy_doc_address);
+    }
+    
+    // Get the searcher and schema once
+    let result = with_arc_safe::<Mutex<TantivySearcher>, Result<(Vec<tantivy::schema::TantivyDocument>, tantivy::schema::Schema), String>>(
+        searcher_ptr, 
+        |searcher_mutex| {
+            let searcher = searcher_mutex.lock().unwrap();
+            let schema = searcher.schema().clone();
+            
+            // Sort addresses by segment for better cache locality
+            let mut indexed_addresses: Vec<(usize, TantivyDocAddress)> = tantivy_addresses
+                .into_iter()
+                .enumerate()
+                .collect();
+            indexed_addresses.sort_by_key(|(_, addr)| (addr.segment_ord, addr.doc_id));
+            
+            // Retrieve all documents efficiently
+            let mut documents = vec![None; indexed_addresses.len()];
+            for (original_index, addr) in indexed_addresses {
+                match searcher.doc(addr) {
+                    Ok(doc) => documents[original_index] = Some(doc),
+                    Err(e) => return Err(format!("Failed to retrieve document at index {}: {}", original_index, e)),
+                }
+            }
+            
+            // Convert Option<Document> to Document, returning error if any failed
+            let documents: Result<Vec<_>, _> = documents
+                .into_iter()
+                .enumerate()
+                .map(|(i, opt)| opt.ok_or_else(|| format!("Document at index {} was not retrieved", i)))
+                .collect();
+            
+            match documents {
+                Ok(docs) => Ok((docs, schema)),
+                Err(e) => Err(e),
+            }
+        }
+    );
+    
+    match result {
+        Some(Ok((documents, schema))) => {
+            // Convert documents to Document wrappers and get their pointers
+            let doc_ptrs: Vec<jlong> = documents
+                .into_iter()
+                .map(|document| {
+                    let retrieved_doc = RetrievedDocument::new_with_schema(document, &schema);
+                    let wrapper = DocumentWrapper::Retrieved(retrieved_doc);
+                    let wrapper_arc = Arc::new(Mutex::new(wrapper));
+                    arc_to_jlong(wrapper_arc)
+                })
+                .collect();
+            
+            // Create Java long array with document pointers
+            match env.new_long_array(doc_ptrs.len() as i32) {
+                Ok(array) => {
+                    if let Err(e) = env.set_long_array_region(&array, 0, &doc_ptrs) {
+                        handle_error(&mut env, &format!("Failed to set array region: {}", e));
+                        std::ptr::null_mut()
+                    } else {
+                        array.into_raw()
+                    }
+                }
+                Err(e) => {
+                    handle_error(&mut env, &format!("Failed to create long array: {}", e));
+                    std::ptr::null_mut()
+                }
+            }
+        },
+        Some(Err(err)) => {
+            handle_error(&mut env, &err);
+            std::ptr::null_mut()
+        },
+        None => {
+            handle_error(&mut env, "Invalid Searcher pointer");
+            std::ptr::null_mut()
         }
     }
 }
@@ -220,7 +345,8 @@ pub extern "system" fn Java_com_tantivy4java_Searcher_nativeGetSegmentIds(
     _class: JClass,
     ptr: jlong,
 ) -> jobject {
-    let result = with_object::<TantivySearcher, Result<Vec<String>, String>>(ptr as u64, |searcher| {
+    let result = with_arc_safe::<Mutex<TantivySearcher>, Result<Vec<String>, String>>(ptr, |searcher_mutex| {
+        let searcher = searcher_mutex.lock().unwrap();
         let segment_ids: Vec<String> = searcher
             .segment_readers()
             .iter()
@@ -272,7 +398,7 @@ pub extern "system" fn Java_com_tantivy4java_Searcher_nativeClose(
     _class: JClass,
     ptr: jlong,
 ) {
-    remove_object(ptr as u64);
+    release_arc(ptr);
 }
 
 // IndexWriter native methods
@@ -286,8 +412,9 @@ pub extern "system" fn Java_com_tantivy4java_IndexWriter_nativeAddDocument(
     use crate::document::{DocumentWrapper, DocumentBuilder};
     
     // First, clone the DocumentBuilder to avoid nested locks
-    let doc_builder_clone = match with_object::<DocumentWrapper, Option<DocumentBuilder>>(doc_ptr as u64, |doc_wrapper| {
-        match doc_wrapper {
+    let doc_builder_clone = match with_arc_safe::<Mutex<DocumentWrapper>, Option<DocumentBuilder>>(doc_ptr, |wrapper_mutex| {
+        let doc_wrapper = wrapper_mutex.lock().unwrap();
+        match &*doc_wrapper {
             DocumentWrapper::Builder(doc_builder) => Some(doc_builder.clone()),
             DocumentWrapper::Retrieved(_) => None,
         }
@@ -300,7 +427,8 @@ pub extern "system" fn Java_com_tantivy4java_IndexWriter_nativeAddDocument(
     };
     
     // Now get the schema and build the document, then add it
-    let result = with_object_mut::<TantivyIndexWriter, Result<u64, String>>(ptr as u64, |writer| {
+    let result = with_arc_safe::<Mutex<TantivyIndexWriter>, Result<u64, String>>(ptr, |writer_mutex| {
+        let writer = writer_mutex.lock().unwrap();
         // Get schema from the writer
         let schema = writer.index().schema();
         let document = doc_builder_clone.build(&schema).map_err(|e| e.to_string())?;
@@ -337,7 +465,8 @@ pub extern "system" fn Java_com_tantivy4java_IndexWriter_nativeAddJson(
         }
     };
     
-    let result = with_object_mut::<TantivyIndexWriter, Result<u64, String>>(ptr as u64, |writer| {
+    let result = with_arc_safe::<Mutex<TantivyIndexWriter>, Result<u64, String>>(ptr, |writer_mutex| {
+        let writer = writer_mutex.lock().unwrap();
         // Parse JSON and add document
         let schema = writer.index().schema();
         let document = match tantivy::schema::TantivyDocument::parse_json(&schema, &json_str) {
@@ -403,7 +532,8 @@ pub extern "system" fn Java_com_tantivy4java_IndexWriter_nativeCommit(
     _class: JClass,
     ptr: jlong,
 ) -> jlong {
-    let result = with_object_mut::<TantivyIndexWriter, Result<u64, String>>(ptr as u64, |writer| {
+    let result = with_arc_safe::<Mutex<TantivyIndexWriter>, Result<u64, String>>(ptr, |writer_mutex| {
+        let mut writer = writer_mutex.lock().unwrap();
         writer.commit().map_err(|e| e.to_string())
     });
     
@@ -428,7 +558,8 @@ pub extern "system" fn Java_com_tantivy4java_IndexWriter_nativeRollback(
     _class: JClass,
     ptr: jlong,
 ) -> jlong {
-    let result = with_object_mut::<TantivyIndexWriter, Result<u64, String>>(ptr as u64, |writer| {
+    let result = with_arc_safe::<Mutex<TantivyIndexWriter>, Result<u64, String>>(ptr, |writer_mutex| {
+        let mut writer = writer_mutex.lock().unwrap();
         writer.rollback().map_err(|e| e.to_string())
     });
     
@@ -451,7 +582,8 @@ pub extern "system" fn Java_com_tantivy4java_IndexWriter_nativeGarbageCollectFil
     _class: JClass,
     ptr: jlong,
 ) {
-    let result = with_object::<TantivyIndexWriter, Result<(), String>>(ptr as u64, |writer| {
+    let result = with_arc_safe::<Mutex<TantivyIndexWriter>, Result<(), String>>(ptr, |writer_mutex| {
+        let writer = writer_mutex.lock().unwrap();
         // Use futures executor to handle the async garbage collection
         match futures::executor::block_on(writer.garbage_collect_files()) {
             Ok(_) => Ok(()),
@@ -476,7 +608,8 @@ pub extern "system" fn Java_com_tantivy4java_IndexWriter_nativeDeleteAllDocument
     _class: JClass,
     ptr: jlong,
 ) {
-    let result = with_object_mut::<TantivyIndexWriter, Result<(), String>>(ptr as u64, |writer| {
+    let result = with_arc_safe::<Mutex<TantivyIndexWriter>, Result<(), String>>(ptr, |writer_mutex| {
+        let writer = writer_mutex.lock().unwrap();
         let _count = writer.delete_all_documents();
         Ok(())
     });
@@ -498,7 +631,8 @@ pub extern "system" fn Java_com_tantivy4java_IndexWriter_nativeGetCommitOpstamp(
     _class: JClass,
     ptr: jlong,
 ) -> jlong {
-    let result = with_object::<TantivyIndexWriter, u64>(ptr as u64, |writer| {
+    let result = with_arc_safe::<Mutex<TantivyIndexWriter>, u64>(ptr, |writer_mutex| {
+        let writer = writer_mutex.lock().unwrap();
         writer.commit_opstamp()
     });
     
@@ -542,7 +676,8 @@ pub extern "system" fn Java_com_tantivy4java_IndexWriter_nativeDeleteDocumentsBy
     // Convert the Java object to the appropriate Term outside the closure to avoid deadlocks
     let term = match (|| -> Result<_, String> {
         // Get schema first
-        let schema = with_object::<TantivyIndexWriter, Schema>(ptr as u64, |writer| {
+        let schema = with_arc_safe::<Mutex<TantivyIndexWriter>, Schema>(ptr, |writer_mutex| {
+            let writer = writer_mutex.lock().unwrap();
             writer.index().schema()
         }).ok_or_else(|| "Invalid IndexWriter pointer".to_string())?;
         
@@ -560,7 +695,8 @@ pub extern "system" fn Java_com_tantivy4java_IndexWriter_nativeDeleteDocumentsBy
         }
     };
     
-    let result = with_object_mut::<TantivyIndexWriter, Result<u64, String>>(ptr as u64, |writer| {
+    let result = with_arc_safe::<Mutex<TantivyIndexWriter>, Result<u64, String>>(ptr, |writer_mutex| {
+        let writer = writer_mutex.lock().unwrap();
         // Delete documents by term
         let deleted_count = writer.delete_term(term);
         // Note: Tantivy's delete_term returns the number of delete operations, not necessarily 
@@ -589,8 +725,8 @@ pub extern "system" fn Java_com_tantivy4java_IndexWriter_nativeDeleteDocumentsBy
     query_ptr: jlong,
 ) -> jlong {
     // Clone the query first to avoid nested locks and deadlocks
-    let query_clone = match with_object::<Box<dyn TantivyQuery>, Box<dyn TantivyQuery>>(query_ptr as u64, |query| {
-        query.box_clone()
+    let query_clone = match with_arc_safe::<Box<dyn TantivyQuery>, Box<dyn TantivyQuery>>(query_ptr, |query_arc| {
+        query_arc.box_clone()
     }) {
         Some(q) => q,
         None => {
@@ -599,7 +735,8 @@ pub extern "system" fn Java_com_tantivy4java_IndexWriter_nativeDeleteDocumentsBy
         }
     };
     
-    let result = with_object_mut::<TantivyIndexWriter, Result<u64, String>>(ptr as u64, |writer| {
+    let result = with_arc_safe::<Mutex<TantivyIndexWriter>, Result<u64, String>>(ptr, |writer_mutex| {
+        let writer = writer_mutex.lock().unwrap();
         // Use the pre-cloned query to avoid nested object registry access
         Ok(writer.delete_query(query_clone).map_err(|e| e.to_string())?)
     });
@@ -623,17 +760,24 @@ pub extern "system" fn Java_com_tantivy4java_IndexWriter_nativeWaitMergingThread
     _class: JClass,
     ptr: jlong,
 ) {
-    // wait_merging_threads consumes the IndexWriter, so we need to remove it from the registry
-    let writer_opt = {
-        let mut registry = crate::utils::OBJECT_REGISTRY.lock().unwrap();
-        registry.remove(&(ptr as u64)).and_then(|boxed| boxed.downcast::<TantivyIndexWriter>().ok())
+    // wait_merging_threads consumes the IndexWriter, so we need to remove it from the Arc registry
+    let writer_arc = {
+        let mut registry = crate::utils::ARC_REGISTRY.lock().unwrap();
+        registry.remove(&ptr).and_then(|boxed| boxed.downcast::<Arc<Mutex<TantivyIndexWriter>>>().ok().map(|b| *b))
     };
     
-    let result = match writer_opt {
-        Some(writer) => {
-            match writer.wait_merging_threads() {
-                Ok(()) => Ok(()),
-                Err(e) => Err(e.to_string()),
+    let result = match writer_arc {
+        Some(arc) => {
+            // Try to extract the IndexWriter from the Arc<Mutex<TantivyIndexWriter>>
+            match Arc::try_unwrap(arc) {
+                Ok(mutex) => {
+                    let writer = mutex.into_inner().unwrap();
+                    match writer.wait_merging_threads() {
+                        Ok(()) => Ok(()),
+                        Err(e) => Err(e.to_string()),
+                    }
+                },
+                Err(_) => Err("Cannot wait on merging threads: IndexWriter is still in use".to_string()),
             }
         },
         None => Err("Invalid IndexWriter pointer".to_string()),
@@ -667,7 +811,8 @@ pub extern "system" fn Java_com_tantivy4java_IndexWriter_nativeMerge(
         Vec::new()
     };
     
-    let result = with_object_mut::<TantivyIndexWriter, Result<tantivy::SegmentMeta, String>>(ptr as u64, |writer| {
+    let result = with_arc_safe::<Mutex<TantivyIndexWriter>, Result<tantivy::SegmentMeta, String>>(ptr, |writer_mutex| {
+        let mut writer = writer_mutex.lock().unwrap();
         // Convert segment IDs to tantivy SegmentIds
         let tantivy_segment_ids: Result<Vec<SegmentId>, String> = segment_id_vec
             .iter()
@@ -693,7 +838,8 @@ pub extern "system" fn Java_com_tantivy4java_IndexWriter_nativeMerge(
     match result {
         Some(Ok(segment_meta)) => {
             // Register the resulting segment metadata and return pointer
-            register_object(segment_meta) as jlong
+            let segment_meta_arc = Arc::new(segment_meta);
+            arc_to_jlong(segment_meta_arc)
         },
         Some(Err(err)) => {
             handle_error(&mut env, &err);
@@ -712,7 +858,7 @@ pub extern "system" fn Java_com_tantivy4java_IndexWriter_nativeClose(
     _class: JClass,
     ptr: jlong,
 ) {
-    remove_object(ptr as u64);
+    release_arc(ptr);
 }
 
 // Supporting classes native methods - moved to separate modules
@@ -724,9 +870,9 @@ pub extern "system" fn Java_com_tantivy4java_SearchResult_nativeGetHits(
     _ptr: jlong,
 ) -> jobject {
     // Clone the search results to avoid holding locks during object creation
-    let search_results_clone = match with_object::<Vec<(f32, tantivy::DocAddress)>, Option<Vec<(f32, tantivy::DocAddress)>>>(
-        _ptr as u64, 
-        |search_results| Some(search_results.clone())
+    let search_results_clone = match with_arc_safe::<Vec<(f32, tantivy::DocAddress)>, Option<Vec<(f32, tantivy::DocAddress)>>>(
+        _ptr, 
+        |search_results_arc| Some((**search_results_arc).clone())
     ) {
         Some(Some(results)) => results,
         _ => {
@@ -742,7 +888,8 @@ pub extern "system" fn Java_com_tantivy4java_SearchResult_nativeGetHits(
         
         for (score, doc_address) in search_results_clone.iter() {
             // Create DocAddress object first
-            let doc_address_ptr = register_object(*doc_address) as jlong;
+            let doc_address_arc = Arc::new(*doc_address);
+            let doc_address_ptr = arc_to_jlong(doc_address_arc);
             let doc_address_class = env.find_class("com/tantivy4java/DocAddress").map_err(|e| e.to_string())?;
             let doc_address_obj = env.new_object(&doc_address_class, "(J)V", &[doc_address_ptr.into()]).map_err(|e| e.to_string())?;
             
@@ -779,7 +926,7 @@ pub extern "system" fn Java_com_tantivy4java_SearchResult_nativeClose(
     _class: JClass,
     ptr: jlong,
 ) {
-    remove_object(ptr as u64);
+    release_arc(ptr);
 }
 
 #[no_mangle]
@@ -798,7 +945,7 @@ pub extern "system" fn Java_com_tantivy4java_Explanation_nativeClose(
     _class: JClass,
     ptr: jlong,
 ) {
-    remove_object(ptr as u64);
+    release_arc(ptr);
 }
 
 // TextAnalyzer methods are now implemented in text_analyzer.rs
@@ -880,7 +1027,7 @@ pub extern "system" fn Java_com_tantivy4java_Facet_nativeClose(
     _class: JClass,
     ptr: jlong,
 ) {
-    remove_object(ptr as u64);
+    release_arc(ptr);
 }
 
 // Helper function to convert Java Object to Tantivy Term
@@ -974,7 +1121,8 @@ pub extern "system" fn Java_com_tantivy4java_SegmentMeta_nativeGetSegmentId(
     _class: JClass,
     ptr: jlong,
 ) -> jobject {
-    let result = with_object::<tantivy::SegmentMeta, Option<String>>(ptr as u64, |segment_meta| {
+    let result = with_arc_safe::<tantivy::SegmentMeta, Option<String>>(ptr, |segment_meta_arc| {
+        let segment_meta = segment_meta_arc.as_ref();
         Some(segment_meta.id().uuid_string())
     });
     
@@ -1001,7 +1149,8 @@ pub extern "system" fn Java_com_tantivy4java_SegmentMeta_nativeGetMaxDoc(
     _class: JClass,
     ptr: jlong,
 ) -> jlong {
-    let result = with_object::<tantivy::SegmentMeta, Option<u32>>(ptr as u64, |segment_meta| {
+    let result = with_arc_safe::<tantivy::SegmentMeta, Option<u32>>(ptr, |segment_meta_arc| {
+        let segment_meta = segment_meta_arc.as_ref();
         Some(segment_meta.max_doc())
     });
     
@@ -1020,7 +1169,8 @@ pub extern "system" fn Java_com_tantivy4java_SegmentMeta_nativeGetNumDeletedDocs
     _class: JClass,
     ptr: jlong,
 ) -> jlong {
-    let result = with_object::<tantivy::SegmentMeta, Option<u32>>(ptr as u64, |segment_meta| {
+    let result = with_arc_safe::<tantivy::SegmentMeta, Option<u32>>(ptr, |segment_meta_arc| {
+        let segment_meta = segment_meta_arc.as_ref();
         Some(segment_meta.num_deleted_docs())
     });
     
@@ -1039,7 +1189,7 @@ pub extern "system" fn Java_com_tantivy4java_SegmentMeta_nativeClose(
     _class: JClass,
     ptr: jlong,
 ) {
-    remove_object(ptr as u64);
+    release_arc(ptr);
 }
 
 /// Parse batch document buffer according to the Tantivy4Java batch protocol
@@ -1131,7 +1281,8 @@ fn parse_batch_documents(_env: &mut JNIEnv, writer_ptr: jlong, buffer: &[u8]) ->
     }
     
     // Process each document
-    let opstamps = with_object_mut::<TantivyIndexWriter, Result<Vec<u64>, String>>(writer_ptr as u64, |writer| {
+    let opstamps = with_arc_safe::<Mutex<TantivyIndexWriter>, Result<Vec<u64>, String>>(writer_ptr, |writer_mutex| {
+        let writer = writer_mutex.lock().unwrap();
         let schema = writer.index().schema();
         let mut opstamps = Vec::with_capacity(doc_count);
         
@@ -1196,9 +1347,8 @@ fn parse_single_document(schema: &Schema, buffer: &[u8], offset: usize) -> Resul
                 },
                 FieldValue::Bytes(bytes) => document.add_bytes(field, &bytes),
                 FieldValue::Json(json_str) => {
-                    // For JSON fields, we'll store the raw JSON string
-                    // This matches how the existing IndexWriter.addJson works
-                    document.add_text(field, &json_str);
+                    // JSON field implementation needs proper tantivy API - throw error for now
+                    return Err("JSON field implementation not yet complete - use text fields instead".to_string());
                 },
                 FieldValue::IpAddr(ip_str) => {
                     // Parse IP address - convert to IPv6 format for Tantivy

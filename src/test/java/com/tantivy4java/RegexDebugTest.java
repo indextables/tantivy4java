@@ -33,6 +33,7 @@ import java.nio.file.Path;
  */
 public class RegexDebugTest {
     private Path tempDir;
+    private SchemaBuilder schemaBuilder;
     private Schema schema;
     private Index index;
     private IndexWriter writer;
@@ -43,12 +44,11 @@ public class RegexDebugTest {
         tempDir = Files.createTempDirectory("regex_debug");
         
         // EXACT schema setup from AdvancedQueryTest
-        try (SchemaBuilder builder = new SchemaBuilder()) {
-            builder
-                .addTextField("title", true, false, "default", "position")
-                .addTextField("category", true, true, "default", "position");
-            schema = builder.build();
-        }
+        schemaBuilder = new SchemaBuilder();
+        schemaBuilder
+            .addTextField("title", true, false, "default", "position")
+            .addTextField("category", true, true, "default", "position");
+        schema = schemaBuilder.build();
         
         // EXACT index setup from AdvancedQueryTest  
         index = new Index(schema, tempDir.toString(), false);
@@ -64,7 +64,8 @@ public class RegexDebugTest {
         writer.commit();
         writer.close();
         
-        index.reload();
+        // Don't reload the index - just get a searcher directly
+        // index.reload();
         searcher = index.searcher();
     }
     
@@ -72,6 +73,8 @@ public class RegexDebugTest {
     public void tearDown() throws Exception {
         if (searcher != null) searcher.close();
         if (index != null) index.close();
+        if (schema != null) schema.close();
+        if (schemaBuilder != null) schemaBuilder.close();
         
         // Clean up temp directory
         Files.walk(tempDir)
@@ -89,9 +92,12 @@ public class RegexDebugTest {
     public void testRegexQueryExactMatch() {
         System.out.println("=== REGEX DEBUG TEST ===");
         
+        // Use the original schema that was used to create the index
+        // Schema currentSchema = index.getSchema();
+        
         // Test the EXACT same regex query that works in AdvancedQueryTest
-        try (Query regexQuery = Query.regexQuery(schema, "category", "eng.*")) {
-            SearchResult result = searcher.search(regexQuery, 10);
+        try (Query regexQuery = Query.regexQuery(schema, "category", "eng.*");
+             SearchResult result = searcher.search(regexQuery, 10)) {
             System.out.println("Regex query 'eng.*' on category field found: " + result.getHits().size() + " hits");
             
             for (SearchResult.Hit hit : result.getHits()) {
@@ -106,15 +112,15 @@ public class RegexDebugTest {
         }
         
         // Test term query to verify indexing works
-        try (Query termQuery = Query.termQuery(schema, "category", "engineering")) {
-            SearchResult result = searcher.search(termQuery, 10);
+        try (Query termQuery = Query.termQuery(schema, "category", "engineering");
+             SearchResult result = searcher.search(termQuery, 10)) {
             System.out.println("Term query 'engineering' on category field found: " + result.getHits().size() + " hits");
             assertEquals(1, result.getHits().size(), "Term query should find the document");
         }
         
         // Test wildcard query using same setup
-        try (Query wildcardQuery = Query.wildcardQuery(schema, "category", "eng*")) {
-            SearchResult result = searcher.search(wildcardQuery, 10);
+        try (Query wildcardQuery = Query.wildcardQuery(schema, "category", "eng*");
+             SearchResult result = searcher.search(wildcardQuery, 10)) {
             System.out.println("Wildcard query 'eng*' on category field found: " + result.getHits().size() + " hits");
             // This should work if wildcard implementation is correct
             assertEquals(1, result.getHits().size(), "Wildcard query should find the 'engineering' document");
