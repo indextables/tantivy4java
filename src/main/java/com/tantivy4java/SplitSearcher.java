@@ -185,8 +185,63 @@ public class SplitSearcher implements AutoCloseable {
      * @return A SplitQuery that can be used for efficient split searching
      */
     public SplitQuery parseQuery(String queryString) {
+        if (queryString == null || queryString.trim().isEmpty()) {
+            throw new IllegalArgumentException("Query string cannot be null or empty");
+        }
         Schema schema = getSchema();
         return SplitQuery.parseQuery(queryString, schema);
+    }
+
+    /**
+     * Parse a query string with specific default search fields.
+     * This provides API compatibility with the main Tantivy Index.parseQuery() method.
+     *
+     * When no field is specified in the query (e.g., just "hello" instead of "title:hello"),
+     * the query will search across all specified default fields.
+     *
+     * Examples:
+     * - parseQuery("machine", Arrays.asList("title")) → searches for "machine" in title field
+     * - parseQuery("machine", Arrays.asList("title", "category")) → searches for "machine" in both fields
+     * - parseQuery("title:machine", Arrays.asList("category")) → ignores default fields, searches title explicitly
+     *
+     * @param queryString The query string to parse
+     * @param defaultFieldNames List of field names to search when no field is specified in the query
+     * @return A SplitQuery that can be used for efficient split searching
+     * @throws IllegalArgumentException if queryString is null or empty, or if any field name is invalid
+     */
+    public SplitQuery parseQuery(String queryString, java.util.List<String> defaultFieldNames) {
+        if (queryString == null || queryString.trim().isEmpty()) {
+            throw new IllegalArgumentException("Query string cannot be null or empty");
+        }
+        if (defaultFieldNames == null) {
+            defaultFieldNames = java.util.Collections.emptyList();
+        }
+
+        // Convert List<String> to String[] for native method
+        String[] defaultFieldArray = defaultFieldNames.toArray(new String[0]);
+
+        Schema schema = getSchema();
+        return SplitQuery.parseQuery(queryString, schema, defaultFieldArray);
+    }
+
+    /**
+     * Parse a query string with a single default search field.
+     * This is a convenience method for the common case of searching within one specific field.
+     *
+     * Examples:
+     * - parseQuery("machine", "title") → searches for "machine" in title field
+     * - parseQuery("title:learning", "category") → ignores default field, searches title explicitly
+     *
+     * @param queryString The query string to parse
+     * @param defaultFieldName Field name to search when no field is specified in the query
+     * @return A SplitQuery that can be used for efficient split searching
+     * @throws IllegalArgumentException if queryString is null/empty or fieldName is null/empty
+     */
+    public SplitQuery parseQuery(String queryString, String defaultFieldName) {
+        if (defaultFieldName == null || defaultFieldName.trim().isEmpty()) {
+            throw new IllegalArgumentException("Default field name cannot be null or empty");
+        }
+        return parseQuery(queryString, java.util.Arrays.asList(defaultFieldName));
     }
     
     /**
