@@ -4478,6 +4478,7 @@ dependencies = [
  "futures",
  "jni",
  "lazy_static",
+ "memmap2",
  "num_cpus",
  "once_cell",
  "postcard",

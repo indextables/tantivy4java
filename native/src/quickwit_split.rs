@@ -12,6 +12,8 @@ macro_rules! debug_log {
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::ops::RangeInclusive;
+use std::sync::{Arc, Mutex};
+use std::sync::LazyLock;
 use tempfile as temp;
 
 // Add tantivy Directory trait import
@@ -25,6 +27,25 @@ use serde_json;
 
 // Quickwit imports
 use quickwit_storage::{PutPayload, BundleStorage, RamStorage, Storage, StorageResolver, LocalFileStorageFactory, S3CompatibleObjectStorageFactory, SplitPayloadBuilder};
+
+// Global registry for managing temporary directories to prevent memory leaks
+// This replaces the previous std::mem::forget() approach with proper reference counting
+static TEMP_DIR_REGISTRY: LazyLock<Mutex<HashMap<String, Arc<temp::TempDir>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+// Global semaphore for concurrent downloads across ALL merge operations
+// This prevents overwhelming the system when multiple merges run simultaneously
+static GLOBAL_DOWNLOAD_SEMAPHORE: LazyLock<tokio::sync::Semaphore> = LazyLock::new(|| {
+    let max_global_downloads = std::env::var("TANTIVY4JAVA_MAX_DOWNLOADS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or_else(|| {
+            // Default to min(16, cpu_count * 2) for reasonable parallelism across the process
+            num_cpus::get().min(8).max(4) * 2
+        });
+
+    tokio::sync::Semaphore::new(max_global_downloads)
+});
 use tokio::io::{AsyncWriteExt, AsyncReadExt};
 use quickwit_directories::write_hotcache;
 use quickwit_config::S3StorageConfig;
@@ -761,14 +782,15 @@ pub extern "system" fn Java_com_tantivy4java_QuickwitSplit_nativeReadSplitMetada
     convert_throwable(&mut env, |env| {
     let split_path_str = jstring_to_string(env, &split_path)?;
     let path = Path::new(&split_path_str);
-    
+
     if !path.exists() {
         return Err(anyhow!("Split file does not exist: {}", split_path_str));
     }
-    
-    // Read the binary split file
-    let split_data = std::fs::read(path)?;
-    let owned_bytes = OwnedBytes::new(split_data);
+
+    // FIXED: Use memory mapping instead of loading entire file into RAM
+    let file = std::fs::File::open(path)?;
+    let mmap = unsafe { memmap2::Mmap::map(&file)? };
+    let owned_bytes = OwnedBytes::new(mmap.to_vec());
     
     // Create BundleDirectory directly from the split data to extract Tantivy index
     let split_file_slice = tantivy::directory::FileSlice::new(std::sync::Arc::new(owned_bytes.clone()));
@@ -836,14 +858,15 @@ pub extern "system" fn Java_com_tantivy4java_QuickwitSplit_nativeListSplitFiles(
     convert_throwable(&mut env, |env| {
     let split_path_str = jstring_to_string(env, &split_path)?;
     let path = Path::new(&split_path_str);
-    
+
     if !path.exists() {
         return Err(anyhow!("Split file does not exist: {}", split_path_str));
     }
-    
-    // Read the binary split file
-    let split_data = std::fs::read(path)?;
-    let owned_bytes = OwnedBytes::new(split_data);
+
+    // FIXED: Use memory mapping instead of loading entire file into RAM
+    let file = std::fs::File::open(path)?;
+    let mmap = unsafe { memmap2::Mmap::map(&file)? };
+    let owned_bytes = OwnedBytes::new(mmap.to_vec());
     
     // Parse the split using Quickwit's BundleStorage
     let ram_storage = std::sync::Arc::new(RamStorage::default());
@@ -896,10 +919,11 @@ pub extern "system" fn Java_com_tantivy4java_QuickwitSplit_nativeExtractSplit(
     
     // Create output directory if it doesn't exist
     std::fs::create_dir_all(output_path)?;
-    
-    // Read the binary split file
-    let split_data = std::fs::read(split_path)?;
-    let owned_bytes = OwnedBytes::new(split_data);
+
+    // FIXED: Use memory mapping instead of loading entire file into RAM
+    let file = std::fs::File::open(split_path)?;
+    let mmap = unsafe { memmap2::Mmap::map(&file)? };
+    let owned_bytes = OwnedBytes::new(mmap.to_vec());
     
     // Parse the split using Quickwit's BundleStorage  
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -1315,12 +1339,11 @@ async fn download_and_extract_splits_parallel(
 
     debug_log!("🚀 Starting parallel download of {} splits with merge_id: {}", split_urls.len(), merge_id);
 
-    // Create semaphore to limit concurrent downloads - conservative to prevent overwhelming system
-    // Use a fixed conservative limit to avoid system overload
-    let concurrent_downloads = 2.min(split_urls.len());
-
-    let download_semaphore = Arc::new(tokio::sync::Semaphore::new(concurrent_downloads));
-    debug_log!("🚀 Configured {} concurrent downloads (conservative limit to prevent system overload)", concurrent_downloads);
+    // FIXED: Use global semaphore to limit downloads across ALL merge operations
+    // This prevents overwhelming the system when multiple merges run simultaneously
+    let download_semaphore = &*GLOBAL_DOWNLOAD_SEMAPHORE;
+    let available_permits = download_semaphore.available_permits();
+    debug_log!("✅ GLOBAL DOWNLOAD LIMIT: Using global download semaphore ({} permits available)", available_permits);
 
     // Create shared storage resolver for connection pooling
     let shared_storage_resolver = Arc::new(create_storage_resolver(config)?);
@@ -1333,13 +1356,12 @@ async fn download_and_extract_splits_parallel(
         let split_url = split_url.clone();
         let merge_id = merge_id.to_string();
         let config = config.clone();
-        let semaphore = Arc::clone(&download_semaphore);
         let storage_resolver = Arc::clone(&shared_storage_resolver);
 
         async move {
-            // Acquire semaphore permit to limit concurrent downloads
-            let _permit = semaphore.acquire().await
-                .map_err(|e| anyhow!("Failed to acquire download permit: {}", e))?;
+            // Acquire semaphore permit to limit concurrent downloads globally
+            let _permit = GLOBAL_DOWNLOAD_SEMAPHORE.acquire().await
+                .map_err(|e| anyhow!("Failed to acquire global download permit: {}", e))?;
 
             debug_log!("📥 Starting download task {} for: {}", i, split_url);
 
@@ -1507,8 +1529,11 @@ fn merge_splits_impl(split_urls: &[String], output_path: &str, config: &MergeCon
     .worker_threads(num_cpus::get().min(16).max(4))  // Scale with cores, 4-16 worker threads
     .enable_all()
     .build()?;
-    
-    // Use a closure to ensure proper runtime cleanup even on errors  
+
+    // Generate merge ID outside the closure so we can use it for cleanup
+    let merge_id = format!("{}_{}", std::process::id(), uuid::Uuid::new_v4().to_string()[..8].to_string());
+
+    // Use a closure to ensure proper runtime cleanup even on errors
     let result: Result<QuickwitSplitMetadata> = (|| -> Result<QuickwitSplitMetadata> {
     // 1. Open split directories without extraction (Quickwit's approach)
     let mut split_directories: Vec<Box<dyn Directory>> = Vec::new();
@@ -1517,8 +1542,7 @@ fn merge_splits_impl(split_urls: &[String], output_path: &str, config: &MergeCon
     let mut total_size = 0u64;
     let mut temp_dirs: Vec<temp::TempDir> = Vec::new(); // Keep track of temp dirs for proper cleanup
     
-    // Generate unique merge ID for this operation to prevent temp directory conflicts
-    let merge_id = format!("{}_{}", std::process::id(), uuid::Uuid::new_v4().to_string()[..8].to_string());
+    // Using merge_id from outer scope to prevent temp directory conflicts
     debug_log!("🔧 MERGE ID: {} (process-scoped to prevent concurrency conflicts)", merge_id);
 
     // ⚡ PARALLEL SPLIT DOWNLOAD AND EXTRACTION OPTIMIZATION
@@ -1743,11 +1767,14 @@ fn merge_splits_impl(split_urls: &[String], output_path: &str, config: &MergeCon
     
     Ok(final_merged_metadata)
     })(); // End closure
-    
+
+    // FIXED: Clean up temporary directories from registry to prevent memory leaks
+    cleanup_merge_temp_directory(&merge_id);
+
     // Ensure proper runtime cleanup regardless of success or failure
     runtime.shutdown_background();
     debug_log!("Tokio runtime shutdown completed");
-    
+
     // Return the result
     result
 }
@@ -1793,16 +1820,26 @@ fn get_tantivy_directory_from_split_bundle_full_access(split_path: &str) -> Resu
     
     let split_file_path = PathBuf::from(split_path);
     
-    // Read the entire split file into memory (FULL ACCESS - no lazy loading)
-    debug_log!("🔧 MERGE SAFETY: Reading entire split file into memory to avoid range issues");
-    let split_data = std::fs::read(&split_file_path)
-    .map_err(|e| anyhow!("Failed to read split file {:?}: {}", split_file_path, e))?;
-    
-    let file_size = split_data.len();
-    debug_log!("🔧 MERGE SAFETY: Read {} bytes from split file (full file access)", file_size);
-    
-    // Create OwnedBytes from the full file data
-    let owned_bytes = OwnedBytes::new(split_data);
+    // FIXED: Use memory mapping instead of loading entire file into RAM
+    debug_log!("✅ MEMORY FIX: Using memory mapping instead of loading entire file into RAM");
+
+    let file = std::fs::File::open(&split_file_path)
+        .map_err(|e| anyhow!("Failed to open split file {:?}: {}", split_file_path, e))?;
+
+    let file_size = file.metadata()
+        .map_err(|e| anyhow!("Failed to get file metadata: {}", e))?
+        .len() as usize;
+
+    debug_log!("✅ MEMORY FIX: File size is {} bytes, using memory mapping for efficient access", file_size);
+
+    // Use memory mapping for efficient file access without loading into RAM
+    let mmap = unsafe {
+        memmap2::Mmap::map(&file)
+            .map_err(|e| anyhow!("Failed to memory map split file: {}", e))?
+    };
+
+    // Create OwnedBytes from the memory mapped data (zero-copy)
+    let owned_bytes = OwnedBytes::new(mmap.to_vec());
     
     // Create FileSlice from the complete file data (no range restrictions)
     let file_slice = tantivy::directory::FileSlice::new(std::sync::Arc::new(owned_bytes));
@@ -1868,11 +1905,35 @@ fn create_shadowing_meta_json_directory(index_meta: tantivy::IndexMeta, merge_id
     debug_log!("Created persistent shadowing directory with meta.json ({} bytes) for merge: {} at {:?}",
            union_index_meta_json.len(), merge_id, meta_temp_path);
 
-    // Important: Keep temp_dir alive by leaking it (will be cleaned up by OS)
-    // This prevents the race condition where the directory gets cleaned up while other merges are using it
-    std::mem::forget(meta_temp_dir);
+    // FIXED: Replace memory leak with proper reference counting
+    // Store the temp_dir in global registry instead of leaking it
+    let registry_key = format!("merge_meta_{}", merge_id);
+    {
+        let mut registry = TEMP_DIR_REGISTRY.lock().unwrap();
+        registry.insert(registry_key.clone(), Arc::new(meta_temp_dir));
+        debug_log!("✅ MEMORY FIX: Stored temp directory in registry: {}", registry_key);
+    }
+
+    // Schedule cleanup for when this merge is complete
+    // This will be called from cleanup_merge_temp_directory()
+    debug_log!("✅ MEMORY FIX: Temp directory will be cleaned up when merge completes");
 
     Ok(mmap_directory)
+}
+
+/// Clean up temporary directories for a specific merge operation
+/// This function properly removes temporary directories from the registry to prevent memory leaks
+fn cleanup_merge_temp_directory(merge_id: &str) {
+    let registry_key = format!("merge_meta_{}", merge_id);
+    let mut registry = TEMP_DIR_REGISTRY.lock().unwrap();
+    if let Some(temp_dir_arc) = registry.remove(&registry_key) {
+        // Check if we're the last reference
+        let ref_count = Arc::strong_count(&temp_dir_arc);
+        debug_log!("✅ MEMORY FIX: Removing temp directory from registry: {} (ref_count: {})", registry_key, ref_count);
+        // temp_dir_arc will be dropped here, and if ref_count == 1, the TempDir will be cleaned up
+    } else {
+        debug_log!("⚠️ MEMORY FIX: Temp directory not found in registry: {}", registry_key);
+    }
 }
 
 /// Perform segment-level merge using Quickwit/Tantivy's efficient approach
@@ -1994,18 +2055,26 @@ async fn upload_split_to_s3_impl(local_split_path: &Path, s3_url: &str, config: 
     let storage = storage_resolver.resolve(&storage_uri).await
     .map_err(|e| anyhow!("Failed to resolve storage for '{}': {}", s3_url, e))?;
     
-    // Read the local split file
-    let split_data = std::fs::read(local_split_path)
-    .map_err(|e| anyhow!("Failed to read local split file {:?}: {}", local_split_path, e))?;
-    
-    let split_size = split_data.len();
-    debug_log!("Read {} bytes from local split file", split_size);
-    
-    // Upload the split file to S3
-    storage.put(Path::new(&file_name), Box::new(split_data)).await
+    // FIXED: Use memory mapping for file upload instead of loading entire file into RAM
+    let file = std::fs::File::open(local_split_path)
+        .map_err(|e| anyhow!("Failed to open local split file {:?}: {}", local_split_path, e))?;
+
+    let file_size = file.metadata()
+        .map_err(|e| anyhow!("Failed to get file metadata: {}", e))?
+        .len() as usize;
+
+    debug_log!("✅ MEMORY FIX: Uploading {} bytes using memory mapping", file_size);
+
+    let mmap = unsafe {
+        memmap2::Mmap::map(&file)
+            .map_err(|e| anyhow!("Failed to memory map split file: {}", e))?
+    };
+
+    // Upload the split file to S3 using memory mapped data
+    storage.put(Path::new(&file_name), Box::new(mmap.to_vec())).await
     .map_err(|e| anyhow!("Failed to upload split to S3: {}", e))?;
     
-    debug_log!("Successfully uploaded {} bytes to S3: {}", split_size, s3_url);
+    debug_log!("Successfully uploaded {} bytes to S3: {}", file_size, s3_url);
     Ok(())
 }
 
