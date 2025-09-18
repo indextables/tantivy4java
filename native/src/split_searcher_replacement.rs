@@ -1148,9 +1148,17 @@ fn retrieve_document_from_split_optimized(
                 } else {
                     split_uri
                 };
-                
+
+                // For split_id, use the filename without .split extension if present
+                // This is what Quickwit expects for the split identifier
+                let split_id = if split_filename.ends_with(".split") {
+                    &split_filename[..split_filename.len() - 6] // Remove ".split"
+                } else {
+                    split_filename
+                };
+
                 let split_metadata = SplitIdAndFooterOffsets {
-                    split_id: split_filename.to_string(),
+                    split_id: split_id.to_string(),
                     split_footer_start: *footer_start,
                     split_footer_end: *footer_end,
                     timestamp_start: Some(0), // Not used for our purposes
