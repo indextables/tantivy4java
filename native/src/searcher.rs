@@ -25,6 +25,7 @@ use tantivy::{IndexWriter as TantivyIndexWriter, Searcher as TantivySearcher, Do
 use tantivy::schema::{TantivyDocument, Field, Schema, Facet};
 use tantivy::query::Query as TantivyQuery;
 use tantivy::index::SegmentId;
+use tantivy::aggregation::intermediate_agg_result::IntermediateAggregationResults;
 use std::net::IpAddr;
 use crate::utils::{handle_error, with_arc_safe, arc_to_jlong, release_arc};
 use std::sync::{Arc, Mutex};

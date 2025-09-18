@@ -4493,6 +4493,7 @@ dependencies = [
  "quickwit-storage",
  "serde",
  "serde_json",
+ "serde_yaml",
  "tantivy",
  "tempfile",
  "time",
