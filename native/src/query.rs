@@ -191,6 +191,29 @@ pub extern "system" fn Java_com_tantivy4java_Query_nativeTermQuery(
                 );
                 Term::from_field_date(field, date_value)
             },
+            tantivy::schema::FieldType::I64(_) => {
+                // Handle signed integer fields (I64)
+                if field_value_obj.is_null() {
+                    return Err("Field value cannot be null for integer field".to_string());
+                }
+
+                // Check if it's a Long/Integer
+                if let Ok(true) = env.is_instance_of(&field_value_obj, "java/lang/Long") {
+                    let long_value = env.call_method(&field_value_obj, "longValue", "()J", &[])
+                        .map_err(|e| format!("Failed to get long value: {}", e))?
+                        .j()
+                        .map_err(|e| format!("Failed to convert long value: {}", e))?;
+                    Term::from_field_i64(field, long_value)
+                } else if let Ok(true) = env.is_instance_of(&field_value_obj, "java/lang/Integer") {
+                    let int_value = env.call_method(&field_value_obj, "intValue", "()I", &[])
+                        .map_err(|e| format!("Failed to get int value: {}", e))?
+                        .i()
+                        .map_err(|e| format!("Failed to convert int value: {}", e))?;
+                    Term::from_field_i64(field, int_value as i64)
+                } else {
+                    return Err("Expected Long or Integer value for signed integer field".to_string());
+                }
+            },
             _ => {
                 return Err(format!("Unsupported field type for term query: {:?}", field_type));
             }

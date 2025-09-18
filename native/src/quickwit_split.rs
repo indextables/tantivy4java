@@ -1238,12 +1238,12 @@ async fn download_and_extract_splits_parallel(
 
     debug_log!("🚀 Starting parallel download of {} splits with merge_id: {}", split_urls.len(), merge_id);
 
-    // Create semaphore to limit concurrent downloads - optimized for Spark on high-performance EC2
-    // Scale aggressively: at least 1 download per CPU core, up to 64 for very large instances
-    let concurrent_downloads = num_cpus::get().min(64).max(4);
+    // Create semaphore to limit concurrent downloads - conservative to prevent overwhelming system
+    // Use a fixed conservative limit to avoid system overload
+    let concurrent_downloads = 2.min(split_urls.len());
 
     let download_semaphore = Arc::new(tokio::sync::Semaphore::new(concurrent_downloads));
-    debug_log!("🚀 Configured {} concurrent downloads for {}-core system (1:1 CPU scaling, max 64)", concurrent_downloads, num_cpus::get());
+    debug_log!("🚀 Configured {} concurrent downloads (conservative limit to prevent system overload)", concurrent_downloads);
 
     // Create shared storage resolver for connection pooling
     let shared_storage_resolver = Arc::new(create_storage_resolver(config)?);
