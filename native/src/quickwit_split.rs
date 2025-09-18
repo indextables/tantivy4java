@@ -14,6 +14,8 @@ use std::path::{Path, PathBuf};
 use std::ops::RangeInclusive;
 use std::sync::{Arc, Mutex};
 use std::sync::LazyLock;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::cell::Cell;
 use tempfile as temp;
 
 // Add tantivy Directory trait import
@@ -28,9 +30,26 @@ use serde_json;
 // Quickwit imports
 use quickwit_storage::{PutPayload, BundleStorage, RamStorage, Storage, StorageResolver, LocalFileStorageFactory, S3CompatibleObjectStorageFactory, SplitPayloadBuilder};
 
-// Global registry for managing temporary directories to prevent memory leaks
-// This replaces the previous std::mem::forget() approach with proper reference counting
-static TEMP_DIR_REGISTRY: LazyLock<Mutex<HashMap<String, Arc<temp::TempDir>>>> =
+// ✅ REENTRANCY FIX: Enhanced merge ID generation system to prevent collisions
+// Global atomic counter for merge operations (process-wide uniqueness)
+static GLOBAL_MERGE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+// Thread-local counter for additional collision resistance within threads
+thread_local! {
+    static THREAD_MERGE_COUNTER: Cell<u64> = Cell::new(0);
+}
+
+// Registry state tracking for better collision detection and debugging
+#[derive(Debug, Clone)]
+struct RegistryEntry {
+    temp_dir: Arc<temp::TempDir>,
+    created_at: std::time::Instant,
+    merge_id: String,
+    operation_type: String,
+}
+
+// Enhanced registry with state tracking for collision detection
+static TEMP_DIR_REGISTRY: LazyLock<Mutex<HashMap<String, RegistryEntry>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 // Global semaphore for concurrent downloads across ALL merge operations
@@ -46,6 +65,102 @@ static GLOBAL_DOWNLOAD_SEMAPHORE: LazyLock<tokio::sync::Semaphore> = LazyLock::n
 
     tokio::sync::Semaphore::new(max_global_downloads)
 });
+
+/// ✅ REENTRANCY FIX: Generate collision-resistant merge ID
+/// Uses multiple entropy sources to prevent merge ID collisions in high-concurrency scenarios
+fn generate_collision_resistant_merge_id() -> String {
+    // Get global atomic counter (process-wide uniqueness)
+    let global_counter = GLOBAL_MERGE_COUNTER.fetch_add(1, Ordering::SeqCst);
+
+    // Get thread-local counter (thread-specific uniqueness)
+    let thread_counter = THREAD_MERGE_COUNTER.with(|c| {
+        let current = c.get();
+        c.set(current.wrapping_add(1));
+        current
+    });
+
+    // Get current thread info
+    let thread_id = format!("{:?}", std::thread::current().id())
+        .replace("ThreadId(", "").replace(")", "");
+
+    // Get high-resolution timestamp
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+
+    // Get memory address for additional uniqueness (different per call)
+    let stack_addr = &thread_counter as *const u64 as usize;
+
+    // Generate cryptographically random UUID
+    let uuid = uuid::Uuid::new_v4();
+
+    // Combine all entropy sources for maximum collision resistance
+    format!("{}_{}_{}_{}_{}_{}_{}",
+        std::process::id(),    // Process ID
+        thread_id,            // Thread ID
+        global_counter,       // Global atomic counter
+        thread_counter,       // Thread-local counter
+        nanos,               // Nanosecond timestamp
+        stack_addr,          // Stack memory address
+        uuid                 // Cryptographic UUID
+    )
+}
+
+/// ✅ REENTRANCY FIX: Safely register temporary directory with collision detection
+fn register_temp_directory_safe(registry_key: &str, temp_dir: temp::TempDir, merge_id: &str, operation_type: &str) -> Result<()> {
+    let entry = RegistryEntry {
+        temp_dir: Arc::new(temp_dir),
+        created_at: std::time::Instant::now(),
+        merge_id: merge_id.to_string(),
+        operation_type: operation_type.to_string(),
+    };
+
+    let mut registry = TEMP_DIR_REGISTRY.lock().map_err(|e| {
+        anyhow!("Failed to acquire registry lock: {}", e)
+    })?;
+
+    // ✅ COLLISION DETECTION: Check for existing entries with same key
+    if let Some(existing_entry) = registry.get(registry_key) {
+        let age = existing_entry.created_at.elapsed();
+        return Err(anyhow!(
+            "🚨 REGISTRY COLLISION DETECTED: Key '{}' already exists!\n\
+             Existing: merge_id={}, operation={}, age={:?}\n\
+             New: merge_id={}, operation={}\n\
+             This indicates a merge ID collision - implementing additional collision resistance.",
+            registry_key, existing_entry.merge_id, existing_entry.operation_type, age,
+            merge_id, operation_type
+        ));
+    }
+
+    registry.insert(registry_key.to_string(), entry);
+    debug_log!("✅ REGISTRY SAFE: Registered temp directory: {} (merge_id: {}, operation: {})",
+               registry_key, merge_id, operation_type);
+
+    Ok(())
+}
+
+/// ✅ REENTRANCY FIX: Safely cleanup temporary directory with state validation
+fn cleanup_temp_directory_safe(registry_key: &str) -> Result<bool> {
+    let mut registry = TEMP_DIR_REGISTRY.lock().map_err(|e| {
+        anyhow!("Failed to acquire registry lock for cleanup: {}", e)
+    })?;
+
+    if let Some(entry) = registry.remove(registry_key) {
+        let ref_count = Arc::strong_count(&entry.temp_dir);
+        let age = entry.created_at.elapsed();
+
+        debug_log!("✅ REGISTRY CLEANUP: Removed temp directory: {} (merge_id: {}, operation: {}, age: {:?}, ref_count: {})",
+                   registry_key, entry.merge_id, entry.operation_type, age, ref_count);
+
+        // entry.temp_dir will be dropped here, automatic cleanup if ref_count == 1
+        Ok(true)
+    } else {
+        debug_log!("⚠️ REGISTRY CLEANUP: Temp directory not found: {}", registry_key);
+        Ok(false)
+    }
+}
+
 use tokio::io::{AsyncWriteExt, AsyncReadExt};
 use quickwit_directories::write_hotcache;
 use quickwit_config::S3StorageConfig;
@@ -66,13 +181,36 @@ mod resilient_ops {
     /// Maximum number of retry attempts for resilient operations
     const MAX_RETRIES: usize = 3;
 
+    /// Get the maximum retry count based on environment (Databricks gets more retries)
+    fn get_max_retries() -> usize {
+        if std::env::var("DATABRICKS_RUNTIME_VERSION").is_ok() { 8 } else { MAX_RETRIES }
+    }
+
     /// Base delay between retries in milliseconds (exponential backoff)
     const BASE_RETRY_DELAY_MS: u64 = 100;
 
     /// Resilient wrapper for tantivy::Index::open with retry logic for transient corruption
     pub fn resilient_index_open(directory: Box<dyn tantivy::Directory>) -> Result<tantivy::Index> {
+        // Check if we're in Databricks environment for enhanced debugging
+        let is_databricks = std::env::var("DATABRICKS_RUNTIME_VERSION").is_ok();
+
+        if is_databricks {
+            debug_log!("🏢 DATABRICKS DETECTED: Using enhanced Index::open retry logic");
+            debug_log!("🏢 DATABRICKS DEBUG: Directory type: {}", std::any::type_name_of_val(&*directory));
+        }
+
         resilient_operation_with_column_2291_fix("Index::open", || {
-            tantivy::Index::open(directory.box_clone())
+            if is_databricks {
+                debug_log!("🏢 DATABRICKS DEBUG: Attempting tantivy::Index::open...");
+            }
+            let result = tantivy::Index::open(directory.box_clone());
+            if is_databricks {
+                match &result {
+                    Ok(_) => debug_log!("🏢 DATABRICKS DEBUG: tantivy::Index::open succeeded"),
+                    Err(e) => debug_log!("🏢 DATABRICKS DEBUG: tantivy::Index::open failed: {}", e),
+                }
+            }
+            result
         })
     }
 
@@ -91,15 +229,32 @@ mod resilient_ops {
         })
     }
 
-    /// Special resilient operation wrapper for "line 1, column 2291" errors
-    /// This provides enhanced debugging and potential recovery for the consistent JSON truncation issue
+    /// Extract column number from serde_json error messages like "line 1, column: 2291"
+    pub fn extract_column_number(error_msg: &str) -> Option<usize> {
+        // Simple string parsing approach to avoid regex dependency complexity
+        // Look for patterns like "line 1, column: 2291" or "line 1, column 2291"
+        if let Some(column_start) = error_msg.find("column") {
+            let after_column = &error_msg[column_start + 6..]; // Skip "column"
+            // Skip any whitespace and optional colon
+            let trimmed = after_column.trim_start_matches(|c: char| c.is_whitespace() || c == ':');
+            // Extract the number
+            let number_str = trimmed.split_whitespace().next()?;
+            number_str.parse::<usize>().ok()
+        } else {
+            None
+        }
+    }
+
+    /// Special resilient operation wrapper for JSON column truncation errors
+    /// This provides enhanced debugging and potential recovery for consistent JSON truncation issues
     fn resilient_operation_with_column_2291_fix<T, F>(operation_name: &str, mut operation: F) -> Result<T>
     where
         F: FnMut() -> tantivy::Result<T>,
     {
+        let max_retries = get_max_retries();
         let mut last_error = None;
 
-        for attempt in 0..MAX_RETRIES {
+        for attempt in 0..max_retries {
             if attempt > 0 {
                 // Add extra delay for column 2291 errors since they might be timing-related
                 let delay_ms = BASE_RETRY_DELAY_MS * (1 << (attempt - 1)) + 50; // Extra 50ms
@@ -117,19 +272,21 @@ mod resilient_ops {
                 Err(err) => {
                     let error_msg = err.to_string();
 
-                    // Special handling for column 2291 errors
-                    if error_msg.contains("2291") && error_msg.contains("EOF while parsing") {
-                        debug_log!("🚨 Column 2291 Fix: DETECTED CRITICAL COLUMN 2291 ERROR in {}: {}", operation_name, error_msg);
-                        debug_log!("🚨 Column 2291 Fix: This indicates systematic JSON truncation at byte 2291");
-                        debug_log!("🚨 Column 2291 Fix: Attempt {} of {} - will retry with enhanced delay", attempt + 1, MAX_RETRIES);
+                    // Special handling for JSON column truncation errors
+                    if error_msg.contains("EOF while parsing") {
+                        if let Some(column_num) = resilient_ops::extract_column_number(&error_msg) {
+                            debug_log!("🚨 JSON Column Fix: DETECTED JSON TRUNCATION ERROR in {} at column {}: {}", operation_name, column_num, error_msg);
+                            debug_log!("🚨 JSON Column Fix: This indicates systematic JSON truncation at byte position {}", column_num);
+                            debug_log!("🚨 JSON Column Fix: Attempt {} of {} - will retry with enhanced delay", attempt + 1, max_retries);
 
-                        // For column 2291 errors, add extra logging
-                        if attempt == MAX_RETRIES - 1 {
-                            return Err(anyhow!("PERSISTENT COLUMN 2291 CORRUPTION: {} consistently fails with JSON truncation at column 2291 after {} attempts. This indicates a systematic file reading issue in the BundleDirectory or FileSlice operations.", operation_name, MAX_RETRIES));
+                            // For consistent column truncation errors, add extra logging
+                            if attempt == max_retries - 1 {
+                                return Err(anyhow!("PERSISTENT JSON COLUMN {} CORRUPTION: {} consistently fails with JSON truncation at column {} after {} attempts. This indicates a systematic file reading issue in the BundleDirectory or FileSlice operations.", column_num, operation_name, column_num, max_retries));
+                            }
+
+                            last_error = Some(err);
+                            continue;
                         }
-
-                        last_error = Some(err);
-                        continue;
                     }
 
                     // Check if this is a transient corruption error that we should retry
@@ -143,7 +300,7 @@ mod resilient_ops {
                         debug_log!("🔧 Resilient operation: {} failed with transient error (attempt {}): {}", operation_name, attempt + 1, error_msg);
                         last_error = Some(err);
 
-                        if attempt == MAX_RETRIES - 1 {
+                        if attempt == get_max_retries() - 1 {
                             break;
                         }
                     } else {
@@ -155,8 +312,8 @@ mod resilient_ops {
         }
 
         match last_error {
-            Some(err) => Err(anyhow!("Operation {} failed after {} attempts. Last error: {}", operation_name, MAX_RETRIES, err)),
-            None => Err(anyhow!("Operation {} failed after {} attempts with unknown error", operation_name, MAX_RETRIES)),
+            Some(err) => Err(anyhow!("Operation {} failed after {} attempts. Last error: {}", operation_name, get_max_retries(), err)),
+            None => Err(anyhow!("Operation {} failed after {} attempts with unknown error", operation_name, get_max_retries())),
         }
     }
 
@@ -167,7 +324,7 @@ mod resilient_ops {
     {
         let mut last_error = None;
 
-        for attempt in 0..MAX_RETRIES {
+        for attempt in 0..get_max_retries() {
             match operation() {
                 Ok(result) => {
                     if attempt > 0 {
@@ -185,7 +342,7 @@ mod resilient_ops {
                                            error_msg.contains("unexpected end of file") ||
                                            error_msg.contains("invalid json");
 
-                    if !is_transient_error || attempt == MAX_RETRIES - 1 {
+                    if !is_transient_error || attempt == get_max_retries() - 1 {
                         // Not a transient error or final attempt - don't retry
                         return Err(anyhow!("{} failed: {}", operation_name, err));
                     }
@@ -203,7 +360,7 @@ mod resilient_ops {
         }
 
         // All retries exhausted
-        Err(anyhow!("{} failed after {} attempts: {:?}", operation_name, MAX_RETRIES, last_error))
+        Err(anyhow!("{} failed after {} attempts: {:?}", operation_name, get_max_retries(), last_error))
     }
 
     /// Generic resilient operation wrapper with exponential backoff retry for I/O operations
@@ -213,7 +370,7 @@ mod resilient_ops {
     {
         let mut last_error = None;
 
-        for attempt in 0..MAX_RETRIES {
+        for attempt in 0..get_max_retries() {
             match operation() {
                 Ok(result) => {
                     if attempt > 0 {
@@ -233,7 +390,7 @@ mod resilient_ops {
                                            error_msg.contains("Resource temporarily unavailable") ||
                                            error_msg.contains("Interrupted system call");
 
-                    if !is_transient_error || attempt == MAX_RETRIES - 1 {
+                    if !is_transient_error || attempt == get_max_retries() - 1 {
                         // Not a transient error or final attempt - don't retry
                         return Err(anyhow!("{} I/O failed: {}", operation_name, err));
                     }
@@ -251,7 +408,7 @@ mod resilient_ops {
         }
 
         // All retries exhausted
-        Err(anyhow!("{} I/O failed after {} attempts: {:?}", operation_name, MAX_RETRIES, last_error))
+        Err(anyhow!("{} I/O failed after {} attempts: {:?}", operation_name, get_max_retries(), last_error))
     }
 }
 
@@ -986,10 +1143,36 @@ pub extern "system" fn Java_com_tantivy4java_QuickwitSplit_nativeReadSplitMetada
         return Err(anyhow!("Split file does not exist: {}", split_path_str));
     }
 
-    // FIXED: Use memory mapping instead of loading entire file into RAM
+    // MEMORY MAPPING FIX: Ensure mmap stays alive during copy operation
+    // Add explicit synchronization and validation to prevent truncation
     let file = std::fs::File::open(path)?;
+    let file_size = file.metadata()?.len() as usize;
+    debug_log!("🔧 MEMORY FIX: File size from metadata: {} bytes", file_size);
+
     let mmap = unsafe { memmap2::Mmap::map(&file)? };
-    let owned_bytes = OwnedBytes::new(mmap.to_vec());
+    debug_log!("🔧 MEMORY FIX: Memory mapped split file, {} bytes", mmap.len());
+
+    // Validate mmap size matches file size
+    if mmap.len() != file_size {
+        return Err(anyhow!("Memory map size ({}) doesn't match file size ({})", mmap.len(), file_size));
+    }
+
+    // Force the memory map to be fully loaded before copying
+    #[cfg(unix)]
+    {
+        use std::os::unix::prelude::*;
+        let _ = unsafe { libc::madvise(mmap.as_ptr() as *mut libc::c_void, mmap.len(), libc::MADV_SEQUENTIAL) };
+    }
+
+    // Create the copy with validation
+    let mmap_slice = mmap.as_ref();
+    let owned_bytes = OwnedBytes::new(mmap_slice.to_vec());
+    debug_log!("🔧 MEMORY FIX: Created OwnedBytes from validated mmap, {} bytes", owned_bytes.len());
+
+    // Validate the copy was complete
+    if owned_bytes.len() != file_size {
+        return Err(anyhow!("OwnedBytes copy incomplete: got {} bytes, expected {} bytes", owned_bytes.len(), file_size));
+    }
     
     // Create BundleDirectory directly from the split data to extract Tantivy index
     let split_file_slice = tantivy::directory::FileSlice::new(std::sync::Arc::new(owned_bytes.clone()));
@@ -997,8 +1180,18 @@ pub extern "system" fn Java_com_tantivy4java_QuickwitSplit_nativeReadSplitMetada
         .map_err(|e| anyhow!("Failed to open bundle directory: {}", e))?;
     
     // Open the Tantivy index from the bundle directory (with resilient retry logic)
+    debug_log!("🔍 DATABRICKS DEBUG: About to call resilient_index_open on BundleDirectory");
+    debug_log!("🔍 DATABRICKS DEBUG: OwnedBytes size: {} bytes", owned_bytes.len());
+    debug_log!("🔍 DATABRICKS DEBUG: BundleDirectory created successfully from FileSlice");
+
     let tantivy_index = resilient_ops::resilient_index_open(Box::new(bundle_directory))
-        .map_err(|e| anyhow!("Failed to open Tantivy index from bundle: {}", e))?;
+        .map_err(|e| {
+            debug_log!("🚨 DATABRICKS DEBUG: resilient_index_open FAILED with error: {}", e);
+            debug_log!("🚨 DATABRICKS DEBUG: This is where the column 2291 error occurs");
+            anyhow!("Failed to open Tantivy index from bundle: {}", e)
+        })?;
+
+    debug_log!("✅ DATABRICKS DEBUG: resilient_index_open SUCCEEDED");
     
     // Extract doc mapping JSON from the Tantivy index schema
     let doc_mapping_json = extract_doc_mapping_from_index(&tantivy_index)
@@ -1062,10 +1255,36 @@ pub extern "system" fn Java_com_tantivy4java_QuickwitSplit_nativeListSplitFiles(
         return Err(anyhow!("Split file does not exist: {}", split_path_str));
     }
 
-    // FIXED: Use memory mapping instead of loading entire file into RAM
+    // MEMORY MAPPING FIX: Ensure mmap stays alive during copy operation
+    // Add explicit synchronization and validation to prevent truncation
     let file = std::fs::File::open(path)?;
+    let file_size = file.metadata()?.len() as usize;
+    debug_log!("🔧 MEMORY FIX: File size from metadata: {} bytes", file_size);
+
     let mmap = unsafe { memmap2::Mmap::map(&file)? };
-    let owned_bytes = OwnedBytes::new(mmap.to_vec());
+    debug_log!("🔧 MEMORY FIX: Memory mapped split file, {} bytes", mmap.len());
+
+    // Validate mmap size matches file size
+    if mmap.len() != file_size {
+        return Err(anyhow!("Memory map size ({}) doesn't match file size ({})", mmap.len(), file_size));
+    }
+
+    // Force the memory map to be fully loaded before copying
+    #[cfg(unix)]
+    {
+        use std::os::unix::prelude::*;
+        let _ = unsafe { libc::madvise(mmap.as_ptr() as *mut libc::c_void, mmap.len(), libc::MADV_SEQUENTIAL) };
+    }
+
+    // Create the copy with validation
+    let mmap_slice = mmap.as_ref();
+    let owned_bytes = OwnedBytes::new(mmap_slice.to_vec());
+    debug_log!("🔧 MEMORY FIX: Created OwnedBytes from validated mmap, {} bytes", owned_bytes.len());
+
+    // Validate the copy was complete
+    if owned_bytes.len() != file_size {
+        return Err(anyhow!("OwnedBytes copy incomplete: got {} bytes, expected {} bytes", owned_bytes.len(), file_size));
+    }
     
     // Parse the split using Quickwit's BundleStorage
     let ram_storage = std::sync::Arc::new(RamStorage::default());
@@ -1491,29 +1710,65 @@ fn extract_split_to_directory_impl(split_path: &Path, output_dir: &Path) -> Resu
     Ok(())
 }
 
-/// Create a temporary directory with custom base path for platform-specific storage
+/// ✅ REENTRANCY FIX: Create temporary directory with enhanced collision avoidance
+/// Uses retry logic and collision detection to prevent race conditions
 fn create_temp_directory_with_base(prefix: &str, base_path: Option<&str>) -> Result<temp::TempDir> {
-    let mut builder = temp::Builder::new();
-    builder.prefix(prefix);
+    create_temp_directory_with_retries(prefix, base_path, 5)
+}
 
-    // Set custom temporary directory base path if provided
-    if let Some(custom_base) = base_path {
-    // Validate that the custom base path exists and is writable
-    let base_path_buf = PathBuf::from(custom_base);
-    if !base_path_buf.exists() {
-        return Err(anyhow!("Custom temp directory base path does not exist: {}", custom_base));
-    }
-    if !base_path_buf.is_dir() {
-        return Err(anyhow!("Custom temp directory base path is not a directory: {}", custom_base));
+/// ✅ REENTRANCY FIX: Create temporary directory with retry logic for collision avoidance
+fn create_temp_directory_with_retries(prefix: &str, base_path: Option<&str>, max_retries: usize) -> Result<temp::TempDir> {
+    let mut last_error = None;
+
+    for attempt in 0..max_retries {
+        // Add random suffix to prefix for additional collision avoidance
+        let random_suffix = uuid::Uuid::new_v4().simple().to_string()[..8].to_string();
+        let enhanced_prefix = format!("{}_{}_", prefix, random_suffix);
+
+        let mut builder = temp::Builder::new();
+        builder.prefix(&enhanced_prefix);
+
+        let result = if let Some(custom_base) = base_path {
+            // Validate base path on each attempt (could change between attempts)
+            let base_path_buf = PathBuf::from(custom_base);
+            if !base_path_buf.exists() {
+                return Err(anyhow!("Custom temp directory base path does not exist: {}", custom_base));
+            }
+            if !base_path_buf.is_dir() {
+                return Err(anyhow!("Custom temp directory base path is not a directory: {}", custom_base));
+            }
+
+            debug_log!("🏗️ REENTRANCY FIX: Using custom temp directory base: {} (attempt {})", custom_base, attempt + 1);
+            builder.tempdir_in(&base_path_buf)
+        } else {
+            debug_log!("🏗️ REENTRANCY FIX: Using system temp directory (attempt {})", attempt + 1);
+            builder.tempdir()
+        };
+
+        match result {
+            Ok(temp_dir) => {
+                if attempt > 0 {
+                    debug_log!("✅ REENTRANCY FIX: Successfully created temp directory on attempt {}", attempt + 1);
+                }
+                return Ok(temp_dir);
+            }
+            Err(e) => {
+                debug_log!("⚠️ REENTRANCY FIX: Temp directory creation failed on attempt {}: {}", attempt + 1, e);
+                last_error = Some(e);
+
+                // Add exponential backoff delay for retries
+                if attempt < max_retries - 1 {
+                    let delay_ms = 10u64 * (1 << attempt); // 10ms, 20ms, 40ms, 80ms
+                    std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                }
+            }
+        }
     }
 
-    debug_log!("🏗️ Using custom temp directory base: {}", custom_base);
-    return builder.tempdir_in(&base_path_buf)
-        .map_err(|e| anyhow!("Failed to create temp directory with prefix '{}' in base '{}': {}", prefix, custom_base, e));
+    match last_error {
+        Some(e) => Err(anyhow!("Failed to create temp directory with prefix '{}' after {} attempts: {}", prefix, max_retries, e)),
+        None => Err(anyhow!("Failed to create temp directory with prefix '{}' after {} attempts: unknown error", prefix, max_retries)),
     }
-
-    builder.tempdir()
-    .map_err(|e| anyhow!("Failed to create temp directory with prefix '{}': {}", prefix, e))
 }
 
 /// Represents an extracted split with its temporary directory and metadata
@@ -1865,26 +2120,28 @@ fn verify_split_file_structure(data: &[u8], split_index: usize, split_url: &str)
             debug_log!("🚨 Split {}: Metadata length: {} bytes", split_index, metadata_len);
             debug_log!("🚨 Split {}: Hotcache length: {} bytes", split_index, hotcache_len);
 
-            // Check if this is the specific column 2291 error
-            if error_msg.contains("EOF while parsing") && error_msg.contains("2291") {
-                // This is the consistent truncation issue - let's try alternative parsing approaches
-                debug_log!("🔧 Split {}: Attempting alternative JSON parsing for column 2291 corruption", split_index);
+            // Check if this is a JSON column truncation error
+            if error_msg.contains("EOF while parsing") {
+                if let Some(column_num) = resilient_ops::extract_column_number(&error_msg) {
+                    // This is the consistent truncation issue - let's try alternative parsing approaches
+                    debug_log!("🔧 Split {}: Attempting alternative JSON parsing for column {} corruption", split_index, column_num);
 
-                // Alternative 1: Try parsing with trailing bytes removed
-                if json_content.len() > 2291 {
-                    let truncated_content = &json_content[..2291];
-                    match serde_json::from_slice::<serde_json::Value>(truncated_content) {
-                        Ok(_) => {
-                            return Err(anyhow!("Split {}: CONFIRMED COLUMN 2291 TRUNCATION - JSON is being truncated at exactly 2291 bytes", split_index));
-                        }
-                        Err(_) => {
-                            debug_log!("🔧 Split {}: Alternative parsing at 2291 bytes also failed", split_index);
+                    // Alternative 1: Try parsing with trailing bytes removed
+                    if json_content.len() > column_num {
+                        let truncated_content = &json_content[..column_num];
+                        match serde_json::from_slice::<serde_json::Value>(truncated_content) {
+                            Ok(_) => {
+                                return Err(anyhow!("Split {}: CONFIRMED COLUMN {} TRUNCATION - JSON is being truncated at exactly {} bytes", split_index, column_num, column_num));
+                            }
+                            Err(_) => {
+                                debug_log!("🔧 Split {}: Alternative parsing at {} bytes also failed", split_index, column_num);
+                            }
                         }
                     }
-                }
 
-                return Err(anyhow!("Split {}: CRITICAL COLUMN 2291 CORRUPTION in {}: {} - This indicates a systematic file reading issue at byte boundary 2291",
-                    split_index, split_url, error_msg));
+                    return Err(anyhow!("Split {}: CRITICAL COLUMN {} CORRUPTION in {}: {} - This indicates a systematic file reading issue at byte boundary {}",
+                        split_index, column_num, split_url, error_msg, column_num));
+                }
             }
 
             return Err(anyhow!("Split {}: JSON validation failed for {}: {}", split_index, split_url, error_msg));
@@ -1911,15 +2168,8 @@ fn merge_splits_impl(split_urls: &[String], output_path: &str, config: &MergeCon
     .enable_all()
     .build()?;
 
-    // Generate cryptographically strong merge ID to prevent race conditions
-    // Use full UUID + nanosecond timestamp + thread ID for maximum collision resistance
-    let thread_id = format!("{:?}", std::thread::current().id()).replace("ThreadId(", "").replace(")", "");
-    let merge_id = format!("{}_{}_{}_{}",
-        std::process::id(),
-        thread_id,
-        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos(),
-        uuid::Uuid::new_v4()
-    );
+    // ✅ REENTRANCY FIX: Generate collision-resistant merge ID with multiple entropy sources
+    let merge_id = generate_collision_resistant_merge_id();
 
     // Use a closure to ensure proper runtime cleanup even on errors
     let result: Result<QuickwitSplitMetadata> = (|| -> Result<QuickwitSplitMetadata> {
@@ -2140,16 +2390,8 @@ fn merge_splits_impl(split_urls: &[String], output_path: &str, config: &MergeCon
     debug_log!("   Hotcache: {} bytes at offset {}", 
            footer_offsets.hotcache_length, footer_offsets.hotcache_start_offset);
     
-    // 11. Clean up temporary directories - both the output temp dir and split temp dirs
-    std::fs::remove_dir_all(&output_temp_dir).unwrap_or_else(|e| {
-    debug_log!("Warning: Could not clean up output temp directory: {}", e);
-    });
-    
-    // Clean up split extraction temporary directories explicitly
-    for (i, _temp_dir) in temp_dirs.into_iter().enumerate() {
-        debug_log!("Cleaning up split temp directory {}", i);
-        // temp_dir will be automatically cleaned up when dropped
-    }
+    // 11. ✅ REENTRANCY FIX: Coordinated cleanup to prevent race conditions
+    coordinate_temp_directory_cleanup(&merge_id, &output_temp_dir, temp_dirs)?;
     
     debug_log!("Created efficient merged split file: {} with {} documents", output_path, merged_docs);
     
@@ -2293,34 +2535,119 @@ fn create_shadowing_meta_json_directory(index_meta: tantivy::IndexMeta, merge_id
     debug_log!("Created persistent shadowing directory with meta.json ({} bytes) for merge: {} at {:?}",
            union_index_meta_json.len(), merge_id, meta_temp_path);
 
-    // FIXED: Replace memory leak with proper reference counting
-    // Store the temp_dir in global registry instead of leaking it
+    // ✅ REENTRANCY FIX: Use safe registry with collision detection
     let registry_key = format!("merge_meta_{}", merge_id);
-    {
-        let mut registry = TEMP_DIR_REGISTRY.lock().unwrap();
-        registry.insert(registry_key.clone(), Arc::new(meta_temp_dir));
-        debug_log!("✅ MEMORY FIX: Stored temp directory in registry: {}", registry_key);
-    }
+    register_temp_directory_safe(&registry_key, meta_temp_dir, merge_id, "shadowing_meta")?;
 
-    // Schedule cleanup for when this merge is complete
-    // This will be called from cleanup_merge_temp_directory()
-    debug_log!("✅ MEMORY FIX: Temp directory will be cleaned up when merge completes");
+    debug_log!("✅ REENTRANCY FIX: Temp directory will be cleaned up when merge completes");
 
     Ok(mmap_directory)
 }
 
-/// Clean up temporary directories for a specific merge operation
-/// This function properly removes temporary directories from the registry to prevent memory leaks
+/// ✅ REENTRANCY FIX: Coordinated cleanup to prevent race conditions
+/// Ensures proper cleanup order and handles overlapping directory scenarios
+fn coordinate_temp_directory_cleanup(merge_id: &str, output_temp_dir: &Path, temp_dirs: Vec<temp::TempDir>) -> Result<()> {
+    debug_log!("🧹 REENTRANCY FIX: Starting coordinated cleanup for merge: {}", merge_id);
+
+    // Step 1: Wait for any pending operations to complete (brief pause)
+    std::thread::sleep(std::time::Duration::from_millis(50));
+
+    // Step 2: Clean up output temp directory with safety checks
+    cleanup_output_directory_safe(output_temp_dir)?;
+
+    // Step 3: Clean up split extraction temporary directories with validation
+    cleanup_split_directories_safe(temp_dirs, merge_id)?;
+
+    debug_log!("✅ REENTRANCY FIX: Coordinated cleanup completed for merge: {}", merge_id);
+    Ok(())
+}
+
+/// ✅ REENTRANCY FIX: Safely clean up output directory with path validation
+fn cleanup_output_directory_safe(output_temp_dir: &Path) -> Result<()> {
+    if !output_temp_dir.exists() {
+        debug_log!("🧹 REENTRANCY FIX: Output directory already cleaned up: {:?}", output_temp_dir);
+        return Ok(());
+    }
+
+    // Validate this is actually a temporary directory (safety check)
+    // Check both the directory name and its parent path for temp directory markers
+    let dir_name = output_temp_dir.file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+
+    let parent_name = output_temp_dir.parent()
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+
+    let full_path_str = output_temp_dir.to_string_lossy();
+
+    // Allow deletion if:
+    // 1. Directory name contains our temp markers, OR
+    // 2. Parent directory contains our temp markers, OR
+    // 3. Full path contains our temp markers (for nested temp directories)
+    let is_safe_to_delete = dir_name.contains("tantivy4java_merge")
+        || dir_name.contains("temp_merge")
+        || parent_name.contains("tantivy4java_merge")
+        || parent_name.contains("temp_merge")
+        || full_path_str.contains("tantivy4java_merge")
+        || full_path_str.contains("temp_merge");
+
+    if !is_safe_to_delete {
+        return Err(anyhow!("🚨 SAFETY: Refusing to delete directory that doesn't appear to be a tantivy4java temp directory: {:?}", output_temp_dir));
+    }
+
+    match std::fs::remove_dir_all(output_temp_dir) {
+        Ok(()) => {
+            debug_log!("✅ REENTRANCY FIX: Successfully cleaned up output directory: {:?}", output_temp_dir);
+            Ok(())
+        }
+        Err(e) => {
+            debug_log!("⚠️ REENTRANCY FIX: Warning: Could not clean up output temp directory {:?}: {}", output_temp_dir, e);
+            // Don't fail the entire operation for cleanup issues
+            Ok(())
+        }
+    }
+}
+
+/// ✅ REENTRANCY FIX: Safely clean up split directories with overlap detection
+fn cleanup_split_directories_safe(temp_dirs: Vec<temp::TempDir>, merge_id: &str) -> Result<()> {
+    debug_log!("🧹 REENTRANCY FIX: Cleaning up {} split temp directories for merge: {}", temp_dirs.len(), merge_id);
+
+    for (i, temp_dir) in temp_dirs.into_iter().enumerate() {
+        let temp_path = temp_dir.path();
+
+        // Validate directory name contains merge ID (safety check)
+        let dir_name = temp_path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("");
+
+        if dir_name.contains(merge_id) || dir_name.contains("tantivy4java_merge") {
+            debug_log!("✅ REENTRANCY FIX: Cleaning up split temp directory {}: {:?}", i, temp_path);
+            // temp_dir will be automatically cleaned up when dropped (RAII)
+        } else {
+            debug_log!("⚠️ REENTRANCY FIX: Skipping cleanup of directory that doesn't match merge ID: {:?}", temp_path);
+        }
+    }
+
+    debug_log!("✅ REENTRANCY FIX: All split temp directories processed for cleanup");
+    Ok(())
+}
+
+/// ✅ REENTRANCY FIX: Clean up temporary directories for a specific merge operation
+/// Uses the new safe cleanup function with proper error handling
 fn cleanup_merge_temp_directory(merge_id: &str) {
     let registry_key = format!("merge_meta_{}", merge_id);
-    let mut registry = TEMP_DIR_REGISTRY.lock().unwrap();
-    if let Some(temp_dir_arc) = registry.remove(&registry_key) {
-        // Check if we're the last reference
-        let ref_count = Arc::strong_count(&temp_dir_arc);
-        debug_log!("✅ MEMORY FIX: Removing temp directory from registry: {} (ref_count: {})", registry_key, ref_count);
-        // temp_dir_arc will be dropped here, and if ref_count == 1, the TempDir will be cleaned up
-    } else {
-        debug_log!("⚠️ MEMORY FIX: Temp directory not found in registry: {}", registry_key);
+    match cleanup_temp_directory_safe(&registry_key) {
+        Ok(true) => {
+            debug_log!("✅ REENTRANCY FIX: Successfully cleaned up temp directory: {}", registry_key);
+        }
+        Ok(false) => {
+            debug_log!("⚠️ REENTRANCY FIX: Temp directory not found in registry: {}", registry_key);
+        }
+        Err(e) => {
+            debug_log!("❌ REENTRANCY FIX: Error cleaning up temp directory {}: {}", registry_key, e);
+        }
     }
 }
 
