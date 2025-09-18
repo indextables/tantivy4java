@@ -50,6 +50,11 @@ public class QuickwitSplit {
         private final Set<String> tags;
         private final Map<String, Object> metadata;
 
+        // New streaming configuration fields
+        private final long streamingChunkSize;        // 64MB default for optimal I/O
+        private final boolean enableProgressTracking;  // Enable detailed progress logging
+        private final boolean enableStreamingIO;       // Use streaming I/O instead of read_all()
+
         /**
          * Create a new split configuration.
          * 
@@ -66,6 +71,17 @@ public class QuickwitSplit {
         public SplitConfig(String indexUid, String sourceId, String nodeId, String docMappingUid,
                           long partitionId, Instant timeRangeStart, Instant timeRangeEnd,
                           Set<String> tags, Map<String, Object> metadata) {
+            this(indexUid, sourceId, nodeId, docMappingUid, partitionId, timeRangeStart, timeRangeEnd,
+                 tags, metadata, 64_000_000L, false, true); // Default: 64MB chunks, no progress tracking, streaming enabled
+        }
+
+        /**
+         * Create a new split configuration with streaming options.
+         */
+        public SplitConfig(String indexUid, String sourceId, String nodeId, String docMappingUid,
+                          long partitionId, Instant timeRangeStart, Instant timeRangeEnd,
+                          Set<String> tags, Map<String, Object> metadata,
+                          long streamingChunkSize, boolean enableProgressTracking, boolean enableStreamingIO) {
             this.indexUid = indexUid;
             this.sourceId = sourceId;
             this.nodeId = nodeId;
@@ -75,6 +91,9 @@ public class QuickwitSplit {
             this.timeRangeEnd = timeRangeEnd;
             this.tags = tags;
             this.metadata = metadata;
+            this.streamingChunkSize = streamingChunkSize;
+            this.enableProgressTracking = enableProgressTracking;
+            this.enableStreamingIO = enableStreamingIO;
         }
 
         /**
@@ -85,7 +104,8 @@ public class QuickwitSplit {
          * @param nodeId Node identifier that created the split
          */
         public SplitConfig(String indexUid, String sourceId, String nodeId) {
-            this(indexUid, sourceId, nodeId, "default", 0L, null, null, null, null);
+            this(indexUid, sourceId, nodeId, "default", 0L, null, null, null, null,
+                 64_000_000L, false, true); // Default: 64MB chunks, no progress tracking, streaming enabled
         }
 
         // Getters
@@ -98,6 +118,11 @@ public class QuickwitSplit {
         public Instant getTimeRangeEnd() { return timeRangeEnd; }
         public Set<String> getTags() { return tags; }
         public Map<String, Object> getMetadata() { return metadata; }
+
+        // New streaming configuration getters
+        public long getStreamingChunkSize() { return streamingChunkSize; }
+        public boolean isProgressTrackingEnabled() { return enableProgressTracking; }
+        public boolean isStreamingIOEnabled() { return enableStreamingIO; }
     }
 
     /**
@@ -221,6 +246,8 @@ public class QuickwitSplit {
         if (config == null) {
             throw new IllegalArgumentException("Split configuration cannot be null");
         }
+
+        String resolvedOutputPath = FileSystemConfig.hasGlobalRoot() ? FileSystemConfig.resolvePath(outputPath) : outputPath;
         if (config.getIndexUid() == null || config.getIndexUid().trim().isEmpty()) {
             throw new IllegalArgumentException("Index UID cannot be null or empty");
         }
@@ -235,7 +262,7 @@ public class QuickwitSplit {
         String indexPath = index.getIndexPath();
         if (indexPath != null) {
             // Delegate to the working convertIndexFromPath method
-            return convertIndexFromPath(indexPath, outputPath, config);
+            return convertIndexFromPath(indexPath, resolvedOutputPath, config);
         } else {
             // This is an in-memory index - cannot be converted directly
             throw new IllegalArgumentException(
@@ -267,7 +294,10 @@ public class QuickwitSplit {
             throw new IllegalArgumentException("Split configuration cannot be null");
         }
 
-        return nativeConvertIndexFromPath(indexPath, outputPath, config);
+        String resolvedIndexPath = FileSystemConfig.hasGlobalRoot() ? FileSystemConfig.resolvePath(indexPath) : indexPath;
+        String resolvedOutputPath = FileSystemConfig.hasGlobalRoot() ? FileSystemConfig.resolvePath(outputPath) : outputPath;
+
+        return nativeConvertIndexFromPath(resolvedIndexPath, resolvedOutputPath, config);
     }
 
     /**
@@ -286,7 +316,8 @@ public class QuickwitSplit {
             throw new IllegalArgumentException("Split path must end with .split");
         }
 
-        return nativeReadSplitMetadata(splitPath);
+        String resolvedSplitPath = FileSystemConfig.hasGlobalRoot() ? FileSystemConfig.resolvePath(splitPath) : splitPath;
+        return nativeReadSplitMetadata(resolvedSplitPath);
     }
 
     /**
@@ -305,7 +336,8 @@ public class QuickwitSplit {
             throw new IllegalArgumentException("Split path must end with .split");
         }
 
-        return nativeListSplitFiles(splitPath);
+        String resolvedSplitPath = FileSystemConfig.hasGlobalRoot() ? FileSystemConfig.resolvePath(splitPath) : splitPath;
+        return nativeListSplitFiles(resolvedSplitPath);
     }
 
     /**
@@ -328,7 +360,9 @@ public class QuickwitSplit {
             throw new IllegalArgumentException("Output directory cannot be null or empty");
         }
 
-        return nativeExtractSplit(splitPath, outputDir);
+        String resolvedSplitPath = FileSystemConfig.hasGlobalRoot() ? FileSystemConfig.resolvePath(splitPath) : splitPath;
+        String resolvedOutputDir = FileSystemConfig.hasGlobalRoot() ? FileSystemConfig.resolvePath(outputDir) : outputDir;
+        return nativeExtractSplit(resolvedSplitPath, resolvedOutputDir);
     }
 
     /**
@@ -343,7 +377,8 @@ public class QuickwitSplit {
         }
 
         try {
-            return nativeValidateSplit(splitPath);
+            String resolvedSplitPath = FileSystemConfig.hasGlobalRoot() ? FileSystemConfig.resolvePath(splitPath) : splitPath;
+            return nativeValidateSplit(resolvedSplitPath);
         } catch (Exception e) {
             return false;
         }
@@ -688,7 +723,25 @@ public class QuickwitSplit {
             // For URLs (s3://, file://), we'll validate format in native layer
         }
 
-        return nativeMergeSplits(splitUrls, outputPath, config);
+        // Resolve output path through file system root if it's a local path
+        String resolvedOutputPath = outputPath;
+        if (!outputPath.contains("://")) {
+            resolvedOutputPath = FileSystemConfig.hasGlobalRoot() ? FileSystemConfig.resolvePath(outputPath) : outputPath;
+        }
+
+        // Resolve local file paths in split URLs through file system root
+        List<String> resolvedSplitUrls = new java.util.ArrayList<>();
+        for (String splitUrl : splitUrls) {
+            if (!splitUrl.contains("://")) {
+                // Local file path - resolve through file system root
+                resolvedSplitUrls.add(FileSystemConfig.hasGlobalRoot() ? FileSystemConfig.resolvePath(splitUrl) : splitUrl);
+            } else {
+                // URL (s3://, file://) - keep as is
+                resolvedSplitUrls.add(splitUrl);
+            }
+        }
+
+        return nativeMergeSplits(resolvedSplitUrls, resolvedOutputPath, config);
     }
 
     // Native method declarations

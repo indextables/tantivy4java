@@ -505,9 +505,15 @@ public class SplitCacheManager implements AutoCloseable {
         // Pass the entire metadata object to the native layer
         splitConfig.put("split_metadata", metadata);
         
+        // Resolve split path through file system root if it's a local path
+        String resolvedSplitPath = splitPath;
+        if (!splitPath.contains("://")) {
+            resolvedSplitPath = FileSystemConfig.hasGlobalRoot() ? FileSystemConfig.resolvePath(splitPath) : splitPath;
+        }
+
         // Create searcher with optimized configuration
-        SplitSearcher searcher = new SplitSearcher(splitPath, this, splitConfig);
-        managedSearchers.put(splitPath, searcher);
+        SplitSearcher searcher = new SplitSearcher(resolvedSplitPath, this, splitConfig);
+        managedSearchers.put(resolvedSplitPath, searcher);
         return searcher;
     }
     

@@ -140,6 +140,8 @@
                     <forkCount>1</forkCount>
                     <!-- Set test execution order to be predictable -->
                     <runOrder>filesystem</runOrder>
+                    <!-- Enable native access for JNI operations -->
+                    <argLine>--enable-native-access=ALL-UNNAMED</argLine>
                 </configuration>
             </plugin>
 

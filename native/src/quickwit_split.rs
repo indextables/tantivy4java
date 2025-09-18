@@ -6,7 +6,7 @@ use crate::debug_println;
 // Debug logging macro - controlled by TANTIVY4JAVA_DEBUG environment variable
 macro_rules! debug_log {
     ($($arg:tt)*) => {
-        debug_println!("DEBUG: {}", format!($($arg)*));
+    debug_println!("DEBUG: {}", format!($($arg)*));
     };
 }
 use std::collections::{BTreeSet, HashMap};
@@ -25,6 +25,7 @@ use serde_json;
 
 // Quickwit imports
 use quickwit_storage::{PutPayload, BundleStorage, RamStorage, Storage, StorageResolver, LocalFileStorageFactory, S3CompatibleObjectStorageFactory, SplitPayloadBuilder};
+use tokio::io::{AsyncWriteExt, AsyncReadExt};
 use quickwit_directories::write_hotcache;
 use quickwit_config::S3StorageConfig;
 use quickwit_common::uri::{Uri, Protocol};
@@ -45,113 +46,113 @@ fn extract_doc_mapping_from_index(tantivy_index: &tantivy::Index) -> Result<Stri
     let mut field_mappings = Vec::new();
     
     for (field, field_entry) in schema.fields() {
-        let field_name = field_entry.name();
-        debug_log!("  Processing field: {} with type: {:?}", field_name, field_entry.field_type());
-        
-        // Map Tantivy field types to Quickwit field mapping types
-        let field_mapping = match field_entry.field_type() {
-            tantivy::schema::FieldType::Str(_) => {
-                // Text field
-                serde_json::json!({
-                    "name": field_name,
-                    "type": "text",
-                    "stored": field_entry.is_stored(),
-                    "indexed": field_entry.is_indexed(),
-                    "fast": field_entry.is_fast()
-                })
-            },
-            tantivy::schema::FieldType::U64(_) => {
-                // Unsigned integer field
-                serde_json::json!({
-                    "name": field_name,
-                    "type": "u64",
-                    "stored": field_entry.is_stored(),
-                    "indexed": field_entry.is_indexed(),
-                    "fast": field_entry.is_fast()
-                })
-            },
-            tantivy::schema::FieldType::I64(_) => {
-                // Signed integer field
-                serde_json::json!({
-                    "name": field_name,
-                    "type": "i64",
-                    "stored": field_entry.is_stored(),
-                    "indexed": field_entry.is_indexed(),
-                    "fast": field_entry.is_fast()
-                })
-            },
-            tantivy::schema::FieldType::F64(_) => {
-                // Float field
-                serde_json::json!({
-                    "name": field_name,
-                    "type": "f64",
-                    "stored": field_entry.is_stored(),
-                    "indexed": field_entry.is_indexed(),
-                    "fast": field_entry.is_fast()
-                })
-            },
-            tantivy::schema::FieldType::Bool(_) => {
-                // Boolean field
-                serde_json::json!({
-                    "name": field_name,
-                    "type": "bool",
-                    "stored": field_entry.is_stored(),
-                    "indexed": field_entry.is_indexed(),
-                    "fast": field_entry.is_fast()
-                })
-            },
-            tantivy::schema::FieldType::Date(_) => {
-                // Date field
-                serde_json::json!({
-                    "name": field_name,
-                    "type": "datetime",
-                    "stored": field_entry.is_stored(),
-                    "indexed": field_entry.is_indexed(),
-                    "fast": field_entry.is_fast()
-                })
-            },
-            tantivy::schema::FieldType::Facet(_) => {
-                // Facet field
-                serde_json::json!({
-                    "name": field_name,
-                    "type": "text",
-                    "tokenizer": "raw",
-                    "stored": field_entry.is_stored(),
-                    "indexed": field_entry.is_indexed(),
-                    "fast": field_entry.is_fast()
-                })
-            },
-            tantivy::schema::FieldType::Bytes(_) => {
-                // Bytes field
-                serde_json::json!({
-                    "name": field_name,
-                    "type": "bytes",
-                    "stored": field_entry.is_stored(),
-                    "indexed": field_entry.is_indexed(),
-                    "fast": field_entry.is_fast()
-                })
-            },
-            tantivy::schema::FieldType::JsonObject(_) => {
-                // JSON object field
-                serde_json::json!({
-                    "name": field_name,
-                    "type": "object",
-                    "stored": field_entry.is_stored()
-                })
-            },
-            tantivy::schema::FieldType::IpAddr(_) => {
-                // IP address field
-                serde_json::json!({
-                    "name": field_name,
-                    "type": "ip",
-                    "stored": field_entry.is_stored(),
-                    "indexed": field_entry.is_indexed(),
-                    "fast": field_entry.is_fast()
-                })
-            }
-        };
-        
-        field_mappings.push(field_mapping);
+    let field_name = field_entry.name();
+    debug_log!("  Processing field: {} with type: {:?}", field_name, field_entry.field_type());
+    
+    // Map Tantivy field types to Quickwit field mapping types
+    let field_mapping = match field_entry.field_type() {
+        tantivy::schema::FieldType::Str(_) => {
+            // Text field
+            serde_json::json!({
+                "name": field_name,
+                "type": "text",
+                "stored": field_entry.is_stored(),
+                "indexed": field_entry.is_indexed(),
+                "fast": field_entry.is_fast()
+            })
+        },
+        tantivy::schema::FieldType::U64(_) => {
+            // Unsigned integer field
+            serde_json::json!({
+                "name": field_name,
+                "type": "u64",
+                "stored": field_entry.is_stored(),
+                "indexed": field_entry.is_indexed(),
+                "fast": field_entry.is_fast()
+            })
+        },
+        tantivy::schema::FieldType::I64(_) => {
+            // Signed integer field
+            serde_json::json!({
+                "name": field_name,
+                "type": "i64",
+                "stored": field_entry.is_stored(),
+                "indexed": field_entry.is_indexed(),
+                "fast": field_entry.is_fast()
+            })
+        },
+        tantivy::schema::FieldType::F64(_) => {
+            // Float field
+            serde_json::json!({
+                "name": field_name,
+                "type": "f64",
+                "stored": field_entry.is_stored(),
+                "indexed": field_entry.is_indexed(),
+                "fast": field_entry.is_fast()
+            })
+        },
+        tantivy::schema::FieldType::Bool(_) => {
+            // Boolean field
+            serde_json::json!({
+                "name": field_name,
+                "type": "bool",
+                "stored": field_entry.is_stored(),
+                "indexed": field_entry.is_indexed(),
+                "fast": field_entry.is_fast()
+            })
+        },
+        tantivy::schema::FieldType::Date(_) => {
+            // Date field
+            serde_json::json!({
+                "name": field_name,
+                "type": "datetime",
+                "stored": field_entry.is_stored(),
+                "indexed": field_entry.is_indexed(),
+                "fast": field_entry.is_fast()
+            })
+        },
+        tantivy::schema::FieldType::Facet(_) => {
+            // Facet field
+            serde_json::json!({
+                "name": field_name,
+                "type": "text",
+                "tokenizer": "raw",
+                "stored": field_entry.is_stored(),
+                "indexed": field_entry.is_indexed(),
+                "fast": field_entry.is_fast()
+            })
+        },
+        tantivy::schema::FieldType::Bytes(_) => {
+            // Bytes field
+            serde_json::json!({
+                "name": field_name,
+                "type": "bytes",
+                "stored": field_entry.is_stored(),
+                "indexed": field_entry.is_indexed(),
+                "fast": field_entry.is_fast()
+            })
+        },
+        tantivy::schema::FieldType::JsonObject(_) => {
+            // JSON object field
+            serde_json::json!({
+                "name": field_name,
+                "type": "object",
+                "stored": field_entry.is_stored()
+            })
+        },
+        tantivy::schema::FieldType::IpAddr(_) => {
+            // IP address field
+            serde_json::json!({
+                "name": field_name,
+                "type": "ip",
+                "stored": field_entry.is_stored(),
+                "indexed": field_entry.is_indexed(),
+                "fast": field_entry.is_fast()
+            })
+        }
+    };
+    
+    field_mappings.push(field_mapping);
     }
     
     // Create the doc mapping JSON structure as just the field_mappings array
@@ -159,7 +160,7 @@ fn extract_doc_mapping_from_index(tantivy_index: &tantivy::Index) -> Result<Stri
     let doc_mapping_json = serde_json::json!(field_mappings);
     
     let doc_mapping_str = serde_json::to_string(&doc_mapping_json)
-        .map_err(|e| anyhow!("Failed to serialize DocMapping to JSON: {}", e))?;
+    .map_err(|e| anyhow!("Failed to serialize DocMapping to JSON: {}", e))?;
     
     debug_log!("Successfully created doc mapping JSON from actual Tantivy schema ({} bytes)", doc_mapping_str.len());
     
@@ -178,6 +179,10 @@ struct SplitConfig {
     time_range_end: Option<DateTime<Utc>>,
     tags: BTreeSet<String>,
     metadata: HashMap<String, String>,
+    // New streaming configuration fields
+    streaming_chunk_size: u64,        // 64MB default for optimal I/O
+    enable_progress_tracking: bool,   // Enable detailed progress logging
+    enable_streaming_io: bool,        // Use streaming I/O instead of read_all()
 }
 
 /// Split metadata structure compatible with Quickwit format
@@ -209,50 +214,61 @@ struct QuickwitSplitMetadata {
 
 impl SplitConfig {
     fn from_java_object(env: &mut JNIEnv, config_obj: &JObject) -> Result<Self> {
-        let index_uid = {
-            let jstr = env.call_method(config_obj, "getIndexUid", "()Ljava/lang/String;", &[])?
-                .l()?;
-            jstring_to_string(env, &jstr.into())?
-        };
+    let index_uid = {
+        let jstr = env.call_method(config_obj, "getIndexUid", "()Ljava/lang/String;", &[])?
+            .l()?;
+        jstring_to_string(env, &jstr.into())?
+    };
 
-        let source_id = {
-            let jstr = env.call_method(config_obj, "getSourceId", "()Ljava/lang/String;", &[])?
-                .l()?;
-            jstring_to_string(env, &jstr.into())?
-        };
+    let source_id = {
+        let jstr = env.call_method(config_obj, "getSourceId", "()Ljava/lang/String;", &[])?
+            .l()?;
+        jstring_to_string(env, &jstr.into())?
+    };
 
-        let node_id = {
-            let jstr = env.call_method(config_obj, "getNodeId", "()Ljava/lang/String;", &[])?
-                .l()?;
-            jstring_to_string(env, &jstr.into())?
-        };
+    let node_id = {
+        let jstr = env.call_method(config_obj, "getNodeId", "()Ljava/lang/String;", &[])?
+            .l()?;
+        jstring_to_string(env, &jstr.into())?
+    };
 
-        let doc_mapping_uid = {
-            let jstr = env.call_method(config_obj, "getDocMappingUid", "()Ljava/lang/String;", &[])?
-                .l()?;
-            jstring_to_string(env, &jstr.into())?
-        };
+    let doc_mapping_uid = {
+        let jstr = env.call_method(config_obj, "getDocMappingUid", "()Ljava/lang/String;", &[])?
+            .l()?;
+        jstring_to_string(env, &jstr.into())?
+    };
 
-        let partition_id = env.call_method(config_obj, "getPartitionId", "()J", &[])?
-            .j()? as u64;
+    let partition_id = env.call_method(config_obj, "getPartitionId", "()J", &[])?
+        .j()? as u64;
 
-        // TODO: Full Java object parsing for time ranges, tags, and metadata
-        let time_range_start = None;
-        let time_range_end = None;
-        let tags = BTreeSet::new();
-        let metadata = HashMap::new();
+    // TODO: Full Java object parsing for time ranges, tags, and metadata
+    let time_range_start = None;
+    let time_range_end = None;
+    let tags = BTreeSet::new();
+    let metadata = HashMap::new();
 
-        Ok(SplitConfig {
-            index_uid,
-            source_id,
-            node_id,
-            doc_mapping_uid,
-            partition_id,
-            time_range_start,
-            time_range_end,
-            tags,
-            metadata,
-        })
+    // Extract new streaming configuration fields
+    let streaming_chunk_size = env.call_method(config_obj, "getStreamingChunkSize", "()J", &[])?
+        .j()? as u64;
+    let enable_progress_tracking = env.call_method(config_obj, "isProgressTrackingEnabled", "()Z", &[])?
+        .z()?;
+    let enable_streaming_io = env.call_method(config_obj, "isStreamingIOEnabled", "()Z", &[])?
+        .z()?;
+
+    Ok(SplitConfig {
+        index_uid,
+        source_id,
+        node_id,
+        doc_mapping_uid,
+        partition_id,
+        time_range_start,
+        time_range_end,
+        tags,
+        metadata,
+        streaming_chunk_size,
+        enable_progress_tracking,
+        enable_streaming_io,
+    })
     }
 }
 
@@ -261,31 +277,31 @@ fn create_split_metadata(config: &SplitConfig, num_docs: usize, uncompressed_doc
     let current_timestamp = Utc::now().timestamp();
     
     QuickwitSplitMetadata {
-        split_id,
-        index_uid: config.index_uid.clone(),
-        source_id: config.source_id.clone(),
-        node_id: config.node_id.clone(),
-        doc_mapping_uid: config.doc_mapping_uid.clone(),
-        partition_id: config.partition_id,
-        num_docs,
-        uncompressed_docs_size_in_bytes: uncompressed_docs_size,
-        time_range: match (config.time_range_start, config.time_range_end) {
-            (Some(start), Some(end)) => Some(start.timestamp()..=end.timestamp()),
-            _ => None,
-        },
-        create_timestamp: current_timestamp,
-        tags: config.tags.clone(),
-        delete_opstamp: 0,
-        num_merge_ops: 0,
-        
-        // Footer offset fields initialized as None, will be set after split creation
-        footer_start_offset: None,
-        footer_end_offset: None,
-        hotcache_start_offset: None,
-        hotcache_length: None,
-        
-        // Doc mapping JSON initialized as None, will be set during extraction
-        doc_mapping_json: None,
+    split_id,
+    index_uid: config.index_uid.clone(),
+    source_id: config.source_id.clone(),
+    node_id: config.node_id.clone(),
+    doc_mapping_uid: config.doc_mapping_uid.clone(),
+    partition_id: config.partition_id,
+    num_docs,
+    uncompressed_docs_size_in_bytes: uncompressed_docs_size,
+    time_range: match (config.time_range_start, config.time_range_end) {
+        (Some(start), Some(end)) => Some(start.timestamp()..=end.timestamp()),
+        _ => None,
+    },
+    create_timestamp: current_timestamp,
+    tags: config.tags.clone(),
+    delete_opstamp: 0,
+    num_merge_ops: 0,
+    
+    // Footer offset fields initialized as None, will be set after split creation
+    footer_start_offset: None,
+    footer_end_offset: None,
+    hotcache_start_offset: None,
+    hotcache_length: None,
+    
+    // Doc mapping JSON initialized as None, will be set during extraction
+    doc_mapping_json: None,
     }
 }
 
@@ -302,44 +318,44 @@ fn create_java_split_metadata<'a>(env: &mut JNIEnv<'a>, split_metadata: &Quickwi
     
     // Add tags to the set if any exist
     for tag in &split_metadata.tags {
-        let tag_jstring = string_to_jstring(env, tag)?;
-        env.call_method(
-            &tags_set,
-            "add",
-            "(Ljava/lang/Object;)Z",
-            &[JValue::Object(&tag_jstring.into())],
-        )?;
+    let tag_jstring = string_to_jstring(env, tag)?;
+    env.call_method(
+        &tags_set,
+        "add",
+        "(Ljava/lang/Object;)Z",
+        &[JValue::Object(&tag_jstring.into())],
+    )?;
     }
     
     let split_id_jstring = string_to_jstring(env, &split_metadata.split_id)?;
     
     // Convert doc mapping JSON to Java string or null if not available
     let doc_mapping_jstring = match &split_metadata.doc_mapping_json {
-        Some(json) => string_to_jstring(env, json)?,
-        None => JString::from(JObject::null()),
+    Some(json) => string_to_jstring(env, json)?,
+    None => JString::from(JObject::null()),
     };
     
     // Use the new constructor that includes footer offset parameters and doc mapping JSON
     let metadata_obj = env.new_object(
-        &split_metadata_class,
-        "(Ljava/lang/String;JJLjava/time/Instant;Ljava/time/Instant;Ljava/util/Set;JIJJJJLjava/lang/String;)V",
-        &[
-            JValue::Object(&split_id_jstring.into()),
-            JValue::Long(split_metadata.num_docs as i64),
-            JValue::Long(split_metadata.uncompressed_docs_size_in_bytes as i64),
-            JValue::Object(&time_start_obj),
-            JValue::Object(&time_end_obj),
-            JValue::Object(&tags_set),
-            JValue::Long(split_metadata.delete_opstamp as i64),
-            JValue::Int(split_metadata.num_merge_ops as i32),
-            // Footer offset parameters (use -1 to indicate missing values)
-            JValue::Long(split_metadata.footer_start_offset.map(|v| v as i64).unwrap_or(-1)),
-            JValue::Long(split_metadata.footer_end_offset.map(|v| v as i64).unwrap_or(-1)),
-            JValue::Long(split_metadata.hotcache_start_offset.map(|v| v as i64).unwrap_or(-1)),
-            JValue::Long(split_metadata.hotcache_length.map(|v| v as i64).unwrap_or(-1)),
-            // Doc mapping JSON parameter
-            JValue::Object(&doc_mapping_jstring.into()),
-        ]
+    &split_metadata_class,
+    "(Ljava/lang/String;JJLjava/time/Instant;Ljava/time/Instant;Ljava/util/Set;JIJJJJLjava/lang/String;)V",
+    &[
+        JValue::Object(&split_id_jstring.into()),
+        JValue::Long(split_metadata.num_docs as i64),
+        JValue::Long(split_metadata.uncompressed_docs_size_in_bytes as i64),
+        JValue::Object(&time_start_obj),
+        JValue::Object(&time_end_obj),
+        JValue::Object(&tags_set),
+        JValue::Long(split_metadata.delete_opstamp as i64),
+        JValue::Int(split_metadata.num_merge_ops as i32),
+        // Footer offset parameters (use -1 to indicate missing values)
+        JValue::Long(split_metadata.footer_start_offset.map(|v| v as i64).unwrap_or(-1)),
+        JValue::Long(split_metadata.footer_end_offset.map(|v| v as i64).unwrap_or(-1)),
+        JValue::Long(split_metadata.hotcache_start_offset.map(|v| v as i64).unwrap_or(-1)),
+        JValue::Long(split_metadata.hotcache_length.map(|v| v as i64).unwrap_or(-1)),
+        // Doc mapping JSON parameter
+        JValue::Object(&doc_mapping_jstring.into()),
+    ]
     )?;
     
     Ok(metadata_obj)
@@ -380,8 +396,8 @@ fn convert_tantivy_to_split(
     // Add index info section
     split_content.extend_from_slice(b"INDEX_INFO_START\n");
     let index_info = format!(
-        "num_docs: {}\nuncompressed_size: {}\n",
-        num_docs, uncompressed_docs_size
+    "num_docs: {}\nuncompressed_size: {}\n",
+    num_docs, uncompressed_docs_size
     );
     split_content.extend_from_slice(index_info.as_bytes());
     split_content.extend_from_slice(b"INDEX_INFO_END\n");
@@ -389,9 +405,9 @@ fn convert_tantivy_to_split(
     // Use Quickwit's SplitPayloadBuilder to create a real split bundle
     // Use a current-thread runtime to avoid conflicts with other runtimes
     let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| anyhow::anyhow!("Failed to create tokio runtime: {}", e))?;
+    .enable_all()
+    .build()
+    .map_err(|e| anyhow::anyhow!("Failed to create tokio runtime: {}", e))?;
     
     // Unfortunately, we cannot reliably extract the directory path from a Tantivy Index object
     // because MmapDirectory's path field is private and there's no public accessor.
@@ -400,51 +416,106 @@ fn convert_tantivy_to_split(
     debug_log!("Cannot extract directory path from Index object - path is not publicly accessible");
     
     return Err(anyhow::anyhow!(
-        "Converting from Index object is not currently supported due to Tantivy API limitations. \
-        The directory path cannot be extracted from the Index object. \
-        Please use QuickwitSplit.convertIndexFromPath(indexPath, outputPath, config) instead, \
-        where you provide the directory path directly. \
-        \
-        Example: \
-        QuickwitSplit.convertIndexFromPath(\"/path/to/index\", \"/path/to/output.split\", config) \
-        \
-        This method works correctly and creates proper Quickwit split files."
+    "Converting from Index object is not currently supported due to Tantivy API limitations. \
+    The directory path cannot be extracted from the Index object. \
+    Please use QuickwitSplit.convertIndexFromPath(indexPath, outputPath, config) instead, \
+    where you provide the directory path directly. \
+    \
+    Example: \
+    QuickwitSplit.convertIndexFromPath(\"/path/to/index\", \"/path/to/output.split\", config) \
+    \
+    This method works correctly and creates proper Quickwit split files."
     ));
 }
 
+/// Advanced streaming function with chunked I/O and progress tracking
+/// This provides optimal memory usage for large splits while maintaining performance
+async fn write_split_payload_streaming(
+    split_payload: &impl PutPayload,
+    output_path: &Path,
+    chunk_size: Option<u64>
+) -> anyhow::Result<u64> {
+    const DEFAULT_CHUNK_SIZE: u64 = 64 * 1024 * 1024; // 64MB chunks for optimal I/O performance
+    let chunk_size = chunk_size.unwrap_or(DEFAULT_CHUNK_SIZE);
+
+    let total_size = split_payload.len();
+    debug_log!("✅ CHUNKED STREAMING: Starting chunked write of {} bytes with {:.1}MB chunks",
+          total_size, chunk_size as f64 / 1024.0 / 1024.0);
+
+    let mut output_file = tokio::fs::File::create(output_path).await?;
+    let mut written = 0u64;
+
+    while written < total_size {
+    let chunk_end = (written + chunk_size).min(total_size);
+    let chunk_range = written..chunk_end;
+    let chunk_len = chunk_end - written;
+
+    debug_log!("✅ CHUNKED STREAMING: Processing chunk {}-{} ({:.1}MB, {:.1}% complete)",
+              written, chunk_end, chunk_len as f64 / 1024.0 / 1024.0,
+              (written as f64 / total_size as f64) * 100.0);
+
+    // Stream just this chunk
+    let chunk_stream = split_payload.range_byte_stream(chunk_range).await?;
+    let mut chunk_reader = chunk_stream.into_async_read();
+
+    // Copy chunk to output file
+    let chunk_bytes = tokio::io::copy(&mut chunk_reader, &mut output_file).await?;
+    written += chunk_bytes;
+
+    if chunk_bytes != chunk_len {
+        return Err(anyhow::anyhow!("Chunk size mismatch: expected {}, got {}", chunk_len, chunk_bytes));
+    }
+    }
+
+    // Ensure all data is flushed to disk
+    output_file.flush().await?;
+    output_file.sync_all().await?;
+
+    debug_log!("✅ CHUNKED STREAMING: Successfully completed streaming write of {} bytes", written);
+    Ok(written)
+}
+
 fn convert_index_from_path_impl(index_path: &str, output_path: &str, config: &SplitConfig) -> Result<QuickwitSplitMetadata, anyhow::Error> {
+    // Create a Tokio runtime for async operations
+    let runtime = tokio::runtime::Runtime::new()
+    .map_err(|e| anyhow::anyhow!("Failed to create async runtime: {}", e))?;
+
+    runtime.block_on(convert_index_from_path_impl_async(index_path, output_path, config))
+}
+
+async fn convert_index_from_path_impl_async(index_path: &str, output_path: &str, config: &SplitConfig) -> Result<QuickwitSplitMetadata, anyhow::Error> {
     use tantivy::directory::MmapDirectory;
     use tantivy::Index as TantivyIndex;
     
     // Open the Tantivy index using the actual Quickwit/Tantivy libraries
     let mmap_directory = MmapDirectory::open(index_path)
-        .map_err(|e| anyhow!("Failed to open index directory {}: {}", index_path, e))?;
+    .map_err(|e| anyhow!("Failed to open index directory {}: {}", index_path, e))?;
     let tantivy_index = TantivyIndex::open(mmap_directory)
-        .map_err(|e| anyhow!("Failed to open Tantivy index: {}", e))?;
+    .map_err(|e| anyhow!("Failed to open Tantivy index: {}", e))?;
     
     // Get actual document count from the index
     let searcher = tantivy_index.reader()
-        .map_err(|e| anyhow!("Failed to create index reader: {}", e))?
-        .searcher();
+    .map_err(|e| anyhow!("Failed to create index reader: {}", e))?
+    .searcher();
     let doc_count = searcher.num_docs() as i32;
     
     // Calculate actual index size
     let index_dir = PathBuf::from(index_path);
     let mut total_size = 0u64;
     if let Ok(entries) = std::fs::read_dir(&index_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_file() && !path.file_name().unwrap().to_str().unwrap().starts_with('.') {
-                if let Ok(metadata) = std::fs::metadata(&path) {
-                    total_size += metadata.len();
-                }
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_file() && !path.file_name().unwrap().to_str().unwrap().starts_with('.') {
+            if let Ok(metadata) = std::fs::metadata(&path) {
+                total_size += metadata.len();
             }
         }
+    }
     }
     
     // Extract doc mapping from the index schema
     let doc_mapping_json = extract_doc_mapping_from_index(&tantivy_index)
-        .map_err(|e| anyhow!("Failed to extract doc mapping from index: {}", e))?;
+    .map_err(|e| anyhow!("Failed to extract doc mapping from index: {}", e))?;
     
     // Create split metadata with actual values from the index
     let mut split_metadata = create_split_metadata(config, doc_count as usize, total_size);
@@ -453,7 +524,7 @@ fn convert_index_from_path_impl(index_path: &str, output_path: &str, config: &Sp
     split_metadata.doc_mapping_json = Some(doc_mapping_json);
     
     // Use Quickwit's split creation functionality and get footer offsets
-    let footer_offsets = create_quickwit_split(&tantivy_index, &index_dir, &PathBuf::from(output_path), &split_metadata)?;
+    let footer_offsets = create_quickwit_split(&tantivy_index, &index_dir, &PathBuf::from(output_path), &split_metadata, config).await?;
     
     // Update split metadata with footer offsets for lazy loading optimization
     split_metadata.footer_start_offset = Some(footer_offsets.footer_start_offset);
@@ -473,11 +544,12 @@ struct FooterOffsets {
     hotcache_length: u64,        // Size of hotcache
 }
 
-fn create_quickwit_split(
-    tantivy_index: &tantivy::Index, 
-    index_dir: &PathBuf, 
-    output_path: &PathBuf, 
-    _split_metadata: &QuickwitSplitMetadata
+async fn create_quickwit_split(
+    tantivy_index: &tantivy::Index,
+    index_dir: &PathBuf,
+    output_path: &PathBuf,
+    _split_metadata: &QuickwitSplitMetadata,
+    config: &SplitConfig
 ) -> Result<FooterOffsets, anyhow::Error> {
     use tantivy::directory::MmapDirectory;
     
@@ -487,155 +559,160 @@ fn create_quickwit_split(
     
     debug_log!("🔧 OFFICIAL API: Using Quickwit's SplitPayloadBuilder for proper split creation");
     debug_log!("create_quickwit_split called with output_path: {:?}", output_path);
+
+    // ✅ Function is already called from async context, no need for separate runtime
+    // ✅ STEP 1: Collect all Tantivy index files first
+    let split_id = Uuid::new_v4().to_string();
+    debug_log!("✅ OFFICIAL API: Creating split with split_id: {}", split_id);
     
-    // Create async runtime for Quickwit operations
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| anyhow::anyhow!("Failed to create tokio runtime: {}", e))?;
-    
-    runtime.block_on(async {
-        // ✅ STEP 1: Collect all Tantivy index files first
-        let split_id = Uuid::new_v4().to_string();
-        debug_log!("✅ OFFICIAL API: Creating split with split_id: {}", split_id);
-        
-        // Get files from the directory by reading the filesystem
-        let file_entries: Vec<_> = std::fs::read_dir(index_dir)?
-            .filter_map(|entry| entry.ok())
-            .filter(|entry| {
-                let path = entry.path();
-                if !path.is_file() {
-                    return false;
-                }
-                
-                let filename = path.file_name().unwrap().to_string_lossy();
-                // Skip lock files and split files, include only Tantivy index files
-                !filename.starts_with(".tantivy") && !filename.ends_with(".split")
-            })
-            .map(|entry| entry.path())
-            .collect();
-        
-        debug_log!("✅ OFFICIAL API: Found {} files in index directory", file_entries.len());
-        for file_path in &file_entries {
-            debug_log!("✅ OFFICIAL API: Will include file: {}", file_path.display());
-        }
-        
-        // ✅ STEP 2: Generate hotcache using Quickwit's official function
-        let mmap_directory = MmapDirectory::open(index_dir)?;
-        let hotcache = {
-            let mut hotcache_buffer = Vec::new();
-            
-            debug_log!("✅ OFFICIAL API: Generating hotcache using Quickwit's write_hotcache");
-            write_hotcache(mmap_directory, &mut hotcache_buffer)
-                .map_err(|e| anyhow::anyhow!("Failed to generate hotcache: {}", e))?;
-            
-            debug_log!("✅ OFFICIAL API: Generated {} bytes of hotcache", hotcache_buffer.len());
-            hotcache_buffer
-        };
-        
-        // ✅ STEP 3: Create empty serialized split fields (for now)
-        let serialized_split_fields = Vec::new();
-        debug_log!("✅ OFFICIAL API: Using empty serialized split fields");
-        
-        // ✅ STEP 4: Create split payload using official API
-        debug_log!("✅ OFFICIAL API: Creating split payload with official get_split_payload()");
-        let split_payload = SplitPayloadBuilder::get_split_payload(
-            &file_entries,
-            &serialized_split_fields,
-            &hotcache
-        )?;
-        
-        // ✅ STEP 5: Write payload to output file
-        let payload_bytes = split_payload.read_all().await?;
-        std::fs::write(output_path, &payload_bytes)?;
-        
-        debug_log!("✅ OFFICIAL API: Successfully wrote split file: {:?} ({} bytes)", output_path, payload_bytes.len());
-        
-        // ✅ STEP 6: Extract actual footer information from the created split
-        // Instead of manual calculation, read the actual format Quickwit created
-        let file_len = payload_bytes.len() as u64;
-        
-        // Read the last 4 bytes to get hotcache length (Quickwit uses u32, not u64)
-        if file_len < 8 {
-            return Err(anyhow::anyhow!("Split file too small: {} bytes", file_len));
-        }
-        
-        let hotcache_len_bytes = &payload_bytes[file_len as usize - 4..];
-        let hotcache_length = u32::from_le_bytes(
-            hotcache_len_bytes.try_into()
-                .map_err(|_| anyhow::anyhow!("Failed to read hotcache length"))?
-        ) as u64;
-        
-        debug_log!("✅ OFFICIAL API: Read hotcache length from split: {} bytes", hotcache_length);
-        
-        // Calculate hotcache start (4 bytes before hotcache for length field)
-        let hotcache_start_offset = file_len - 4 - hotcache_length;
-        
-        // Read metadata length from 4 bytes before hotcache
-        if hotcache_start_offset < 4 {
-            return Err(anyhow::anyhow!("Invalid hotcache start offset: {}", hotcache_start_offset));
-        }
-        
-        let metadata_len_start = hotcache_start_offset as usize - 4;
-        let metadata_len_bytes = &payload_bytes[metadata_len_start..metadata_len_start + 4];
-        let metadata_length = u32::from_le_bytes(
-            metadata_len_bytes.try_into()
-                .map_err(|_| anyhow::anyhow!("Failed to read metadata length"))?
-        ) as u64;
-        
-        debug_log!("✅ OFFICIAL API: Read metadata length from split: {} bytes", metadata_length);
-        
-        // Calculate footer start (where BundleStorageFileOffsets JSON begins)
-        let footer_start_offset = hotcache_start_offset - 4 - metadata_length;
-        
-        debug_log!("✅ OFFICIAL API: Calculated footer offsets from actual split structure:");
-        debug_log!("   footer_start_offset = {} (where BundleStorageFileOffsets begins)", footer_start_offset);
-        debug_log!("   hotcache_start_offset = {} (where hotcache begins)", hotcache_start_offset);
-        debug_log!("   file_len = {} (total file size)", file_len);
-        debug_log!("   metadata_length = {} bytes", metadata_length);
-        debug_log!("   hotcache_length = {} bytes", hotcache_length);
-        
-        // Validate footer structure
-        if footer_start_offset >= hotcache_start_offset {
-            return Err(anyhow::anyhow!(
-                "Invalid footer structure: footer_start({}) >= hotcache_start({})", 
-                footer_start_offset, hotcache_start_offset
-            ));
-        }
-        
-        // Verify we can read the metadata section
-        let metadata_start = footer_start_offset as usize;
-        let metadata_end = (footer_start_offset + metadata_length) as usize;
-        if metadata_end > payload_bytes.len() {
-            return Err(anyhow::anyhow!(
-                "Metadata section extends beyond file: {}..{} > {}", 
-                metadata_start, metadata_end, payload_bytes.len()
-            ));
-        }
-        
-        // Debug: Verify we can parse the metadata section
-        let metadata_bytes = &payload_bytes[metadata_start..metadata_end];
-        match std::str::from_utf8(metadata_bytes) {
-            Ok(metadata_str) => {
-                debug_log!("✅ OFFICIAL API: Successfully extracted metadata section ({} bytes)", metadata_str.len());
-                debug_log!("✅ OFFICIAL API: Metadata preview: {}", 
-                    &metadata_str[..std::cmp::min(200, metadata_str.len())]);
-            },
-            Err(e) => {
-                debug_log!("⚠️  OFFICIAL API: Metadata section is not UTF-8 (binary format): {}", e);
+    // Get files from the directory by reading the filesystem
+    let file_entries: Vec<_> = std::fs::read_dir(index_dir)?
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            let path = entry.path();
+            if !path.is_file() {
+                return false;
             }
+            
+            let filename = path.file_name().unwrap().to_string_lossy();
+            // Skip lock files and split files, include only Tantivy index files
+            !filename.starts_with(".tantivy") && !filename.ends_with(".split")
+        })
+        .map(|entry| entry.path())
+        .collect();
+    
+    debug_log!("✅ OFFICIAL API: Found {} files in index directory", file_entries.len());
+    for file_path in &file_entries {
+        debug_log!("✅ OFFICIAL API: Will include file: {}", file_path.display());
+    }
+    
+    // ✅ STEP 2: Generate hotcache using Quickwit's official function
+    let mmap_directory = MmapDirectory::open(index_dir)?;
+    let hotcache = {
+        let mut hotcache_buffer = Vec::new();
+        
+        debug_log!("✅ OFFICIAL API: Generating hotcache using Quickwit's write_hotcache");
+        write_hotcache(mmap_directory, &mut hotcache_buffer)
+            .map_err(|e| anyhow::anyhow!("Failed to generate hotcache: {}", e))?;
+        
+        debug_log!("✅ OFFICIAL API: Generated {} bytes of hotcache", hotcache_buffer.len());
+        hotcache_buffer
+    };
+    
+    // ✅ STEP 3: Create empty serialized split fields (for now)
+    let serialized_split_fields = Vec::new();
+    debug_log!("✅ OFFICIAL API: Using empty serialized split fields");
+    
+    // ✅ STEP 4: Create split payload using official API
+    debug_log!("✅ OFFICIAL API: Creating split payload with official get_split_payload()");
+    let split_payload = SplitPayloadBuilder::get_split_payload(
+        &file_entries,
+        &serialized_split_fields,
+        &hotcache
+    )?;
+    
+    // ✅ STEP 5: Write payload to output file
+    // Note: Streaming functionality available but using simple approach for now
+    debug_log!("✅ STREAMING CONFIG: chunk_size={}MB, progress_tracking={}, streaming_io={}",
+              config.streaming_chunk_size / 1024 / 1024,
+              config.enable_progress_tracking,
+              config.enable_streaming_io);
+    let total_size = split_payload.len();
+    let payload_bytes = split_payload.read_all().await?;
+    std::fs::write(output_path, &payload_bytes)?;
+    let bytes_written = payload_bytes.len() as u64;
+
+    debug_log!("✅ PAYLOAD WRITTEN: Successfully wrote split file: {:?} ({} bytes total, {} written)",
+              output_path, total_size, bytes_written);
+    
+    // ✅ STEP 6: Extract actual footer information from the created split
+    // Read footer from the created file instead of keeping entire payload in memory
+    let file_len = total_size;
+    
+    // Read the last 4 bytes to get hotcache length (Quickwit uses u32, not u64)
+    if file_len < 8 {
+        return Err(anyhow::anyhow!("Split file too small: {} bytes", file_len));
+    }
+    
+    // Read hotcache length from last 4 bytes of file
+    let mut split_file = std::fs::File::open(output_path)?;
+    use std::io::{Seek, SeekFrom, Read};
+    split_file.seek(SeekFrom::End(-4))?;
+    let mut hotcache_len_bytes = [0u8; 4];
+    split_file.read_exact(&mut hotcache_len_bytes)?;
+    let hotcache_length = u32::from_le_bytes(hotcache_len_bytes) as u64;
+    
+    debug_log!("✅ OFFICIAL API: Read hotcache length from split: {} bytes", hotcache_length);
+    
+    // Calculate hotcache start (4 bytes before hotcache for length field)
+    let hotcache_start_offset = file_len - 4 - hotcache_length;
+    
+    // Read metadata length from 4 bytes before hotcache
+    if hotcache_start_offset < 4 {
+        return Err(anyhow::anyhow!("Invalid hotcache start offset: {}", hotcache_start_offset));
+    }
+    
+    // Read metadata length from 4 bytes before hotcache
+    let metadata_len_start = hotcache_start_offset - 4;
+    split_file.seek(SeekFrom::Start(metadata_len_start))?;
+    let mut metadata_len_bytes = [0u8; 4];
+    split_file.read_exact(&mut metadata_len_bytes)?;
+    let metadata_length = u32::from_le_bytes(metadata_len_bytes) as u64;
+    
+    debug_log!("✅ OFFICIAL API: Read metadata length from split: {} bytes", metadata_length);
+    
+    // Calculate footer start (where BundleStorageFileOffsets JSON begins)
+    let footer_start_offset = hotcache_start_offset - 4 - metadata_length;
+    
+    debug_log!("✅ OFFICIAL API: Calculated footer offsets from actual split structure:");
+    debug_log!("   footer_start_offset = {} (where BundleStorageFileOffsets begins)", footer_start_offset);
+    debug_log!("   hotcache_start_offset = {} (where hotcache begins)", hotcache_start_offset);
+    debug_log!("   file_len = {} (total file size)", file_len);
+    debug_log!("   metadata_length = {} bytes", metadata_length);
+    debug_log!("   hotcache_length = {} bytes", hotcache_length);
+    
+    // Validate footer structure
+    if footer_start_offset >= hotcache_start_offset {
+        return Err(anyhow::anyhow!(
+            "Invalid footer structure: footer_start({}) >= hotcache_start({})", 
+            footer_start_offset, hotcache_start_offset
+        ));
+    }
+    
+    // Verify we can read the metadata section
+    let metadata_start = footer_start_offset;
+    let metadata_end = footer_start_offset + metadata_length;
+    if metadata_end > total_size {
+        return Err(anyhow::anyhow!(
+            "Metadata section extends beyond file: {}..{} > {}",
+            metadata_start, metadata_end, total_size
+        ));
+    }
+
+    // Debug: Read and verify we can parse the metadata section
+    split_file.seek(SeekFrom::Start(metadata_start))?;
+    let mut metadata_bytes = vec![0u8; metadata_length as usize];
+    split_file.read_exact(&mut metadata_bytes)?;
+    match std::str::from_utf8(&metadata_bytes) {
+        Ok(metadata_str) => {
+            debug_log!("✅ OFFICIAL API: Successfully extracted metadata section ({} bytes)", metadata_str.len());
+            debug_log!("✅ OFFICIAL API: Metadata preview: {}", 
+                &metadata_str[..std::cmp::min(200, metadata_str.len())]);
+        },
+        Err(e) => {
+            debug_log!("⚠️  OFFICIAL API: Metadata section is not UTF-8 (binary format): {}", e);
         }
-        
-        let footer_offsets = FooterOffsets {
-            footer_start_offset,
-            footer_end_offset: file_len,
-            hotcache_start_offset,
-            hotcache_length,
-        };
-        
-        debug_log!("✅ OFFICIAL API: Split creation completed successfully with proper Quickwit format");
-        Ok::<FooterOffsets, anyhow::Error>(footer_offsets)
-    })
+    }
+    
+    let footer_offsets = FooterOffsets {
+        footer_start_offset,
+        footer_end_offset: file_len,
+        hotcache_start_offset,
+        hotcache_length,
+    };
+    
+    debug_log!("✅ OFFICIAL API: Split creation completed successfully with proper Quickwit format");
+    Ok(footer_offsets)
 }
 
 #[no_mangle]
@@ -650,7 +727,7 @@ pub extern "system" fn Java_com_tantivy4java_QuickwitSplit_nativeConvertIndex(
     // The Java convertIndex method now delegates to convertIndexFromPath 
     // after checking the stored index path, which is much cleaner.
     convert_throwable(&mut env, |_env| {
-        Err(anyhow!("This native method should not be called. The Java convertIndex method handles the logic."))
+    Err(anyhow!("This native method should not be called. The Java convertIndex method handles the logic."))
     }).unwrap_or(std::ptr::null_mut())
 }
 
@@ -663,15 +740,15 @@ pub extern "system" fn Java_com_tantivy4java_QuickwitSplit_nativeConvertIndexFro
     config_obj: JObject,
 ) -> jobject {
     convert_throwable(&mut env, |env| {
-        let index_path_str = jstring_to_string(env, &index_path)?;
-        let output_path_str = jstring_to_string(env, &output_path)?;
-        let config = SplitConfig::from_java_object(env, &config_obj)?;
-        
-        // Use the real implementation that reads actual index data
-        let split_metadata = convert_index_from_path_impl(&index_path_str, &output_path_str, &config)?;
-        
-        let metadata_obj = create_java_split_metadata(env, &split_metadata)?;
-        Ok(metadata_obj.into_raw())
+    let index_path_str = jstring_to_string(env, &index_path)?;
+    let output_path_str = jstring_to_string(env, &output_path)?;
+    let config = SplitConfig::from_java_object(env, &config_obj)?;
+    
+    // Use the real implementation that reads actual index data
+    let split_metadata = convert_index_from_path_impl(&index_path_str, &output_path_str, &config)?;
+    
+    let metadata_obj = create_java_split_metadata(env, &split_metadata)?;
+    Ok(metadata_obj.into_raw())
     }).unwrap_or(std::ptr::null_mut())
 }
 
@@ -682,71 +759,71 @@ pub extern "system" fn Java_com_tantivy4java_QuickwitSplit_nativeReadSplitMetada
     split_path: JString,
 ) -> jobject {
     convert_throwable(&mut env, |env| {
-        let split_path_str = jstring_to_string(env, &split_path)?;
-        let path = Path::new(&split_path_str);
+    let split_path_str = jstring_to_string(env, &split_path)?;
+    let path = Path::new(&split_path_str);
+    
+    if !path.exists() {
+        return Err(anyhow!("Split file does not exist: {}", split_path_str));
+    }
+    
+    // Read the binary split file
+    let split_data = std::fs::read(path)?;
+    let owned_bytes = OwnedBytes::new(split_data);
+    
+    // Create BundleDirectory directly from the split data to extract Tantivy index
+    let split_file_slice = tantivy::directory::FileSlice::new(std::sync::Arc::new(owned_bytes.clone()));
+    let bundle_directory = quickwit_directories::BundleDirectory::open_split(split_file_slice)
+        .map_err(|e| anyhow!("Failed to open bundle directory: {}", e))?;
+    
+    // Open the Tantivy index from the bundle directory
+    let tantivy_index = tantivy::Index::open(bundle_directory)
+        .map_err(|e| anyhow!("Failed to open Tantivy index from bundle: {}", e))?;
+    
+    // Extract doc mapping JSON from the Tantivy index schema
+    let doc_mapping_json = extract_doc_mapping_from_index(&tantivy_index)
+        .map_err(|e| anyhow!("Failed to extract doc mapping from split index: {}", e))?;
+    
+    debug_log!("Successfully extracted doc mapping from split ({} bytes)", doc_mapping_json.len());
+    
+    // Parse the split using Quickwit's BundleStorage for file count (keeping for metadata)
+    let ram_storage = std::sync::Arc::new(RamStorage::default());
+    let bundle_path = std::path::PathBuf::from("temp.split");
+    let (_hotcache, bundle_storage) = BundleStorage::open_from_split_data_with_owned_bytes(
+        ram_storage, bundle_path, owned_bytes
+    ).map_err(|e| anyhow!("Failed to parse Quickwit split file: {}", e))?;
+    
+    // Since we don't have the original metadata that was stored during creation,
+    // we'll create a minimal metadata object with the file count information
+    let file_count = bundle_storage.iter_files().count();
+    let split_metadata = QuickwitSplitMetadata {
+        split_id: uuid::Uuid::new_v4().to_string(), // Generate a new UUID since we can't recover the original
+        index_uid: "unknown".to_string(),
+        source_id: "unknown".to_string(),
+        node_id: "unknown".to_string(),
+        doc_mapping_uid: "unknown".to_string(),
+        partition_id: 0,
+        num_docs: 0, // Can't determine from split file alone
+        uncompressed_docs_size_in_bytes: std::fs::metadata(path)?.len(),
+        time_range: None,
+        create_timestamp: Utc::now().timestamp(),
+        tags: BTreeSet::new(),
+        delete_opstamp: 0,
+        num_merge_ops: 0,
         
-        if !path.exists() {
-            return Err(anyhow!("Split file does not exist: {}", split_path_str));
-        }
+        // Footer offset fields not available for existing split files
+        footer_start_offset: None,
+        footer_end_offset: None,
+        hotcache_start_offset: None,
+        hotcache_length: None,
         
-        // Read the binary split file
-        let split_data = std::fs::read(path)?;
-        let owned_bytes = OwnedBytes::new(split_data);
-        
-        // Create BundleDirectory directly from the split data to extract Tantivy index
-        let split_file_slice = tantivy::directory::FileSlice::new(std::sync::Arc::new(owned_bytes.clone()));
-        let bundle_directory = quickwit_directories::BundleDirectory::open_split(split_file_slice)
-            .map_err(|e| anyhow!("Failed to open bundle directory: {}", e))?;
-        
-        // Open the Tantivy index from the bundle directory
-        let tantivy_index = tantivy::Index::open(bundle_directory)
-            .map_err(|e| anyhow!("Failed to open Tantivy index from bundle: {}", e))?;
-        
-        // Extract doc mapping JSON from the Tantivy index schema
-        let doc_mapping_json = extract_doc_mapping_from_index(&tantivy_index)
-            .map_err(|e| anyhow!("Failed to extract doc mapping from split index: {}", e))?;
-        
-        debug_log!("Successfully extracted doc mapping from split ({} bytes)", doc_mapping_json.len());
-        
-        // Parse the split using Quickwit's BundleStorage for file count (keeping for metadata)
-        let ram_storage = std::sync::Arc::new(RamStorage::default());
-        let bundle_path = std::path::PathBuf::from("temp.split");
-        let (_hotcache, bundle_storage) = BundleStorage::open_from_split_data_with_owned_bytes(
-            ram_storage, bundle_path, owned_bytes
-        ).map_err(|e| anyhow!("Failed to parse Quickwit split file: {}", e))?;
-        
-        // Since we don't have the original metadata that was stored during creation,
-        // we'll create a minimal metadata object with the file count information
-        let file_count = bundle_storage.iter_files().count();
-        let split_metadata = QuickwitSplitMetadata {
-            split_id: uuid::Uuid::new_v4().to_string(), // Generate a new UUID since we can't recover the original
-            index_uid: "unknown".to_string(),
-            source_id: "unknown".to_string(),
-            node_id: "unknown".to_string(),
-            doc_mapping_uid: "unknown".to_string(),
-            partition_id: 0,
-            num_docs: 0, // Can't determine from split file alone
-            uncompressed_docs_size_in_bytes: std::fs::metadata(path)?.len(),
-            time_range: None,
-            create_timestamp: Utc::now().timestamp(),
-            tags: BTreeSet::new(),
-            delete_opstamp: 0,
-            num_merge_ops: 0,
-            
-            // Footer offset fields not available for existing split files
-            footer_start_offset: None,
-            footer_end_offset: None,
-            hotcache_start_offset: None,
-            hotcache_length: None,
-            
-            // Extract doc mapping JSON from the split's Tantivy index
-            doc_mapping_json: Some(doc_mapping_json),
-        };
-        
-        debug_log!("Successfully read Quickwit split with {} files", file_count);
-        
-        let metadata_obj = create_java_split_metadata(env, &split_metadata)?;
-        Ok(metadata_obj.into_raw())
+        // Extract doc mapping JSON from the split's Tantivy index
+        doc_mapping_json: Some(doc_mapping_json),
+    };
+    
+    debug_log!("Successfully read Quickwit split with {} files", file_count);
+    
+    let metadata_obj = create_java_split_metadata(env, &split_metadata)?;
+    Ok(metadata_obj.into_raw())
     }).unwrap_or(std::ptr::null_mut())
 }
 
@@ -757,45 +834,45 @@ pub extern "system" fn Java_com_tantivy4java_QuickwitSplit_nativeListSplitFiles(
     split_path: JString,
 ) -> jobject {
     convert_throwable(&mut env, |env| {
-        let split_path_str = jstring_to_string(env, &split_path)?;
-        let path = Path::new(&split_path_str);
-        
-        if !path.exists() {
-            return Err(anyhow!("Split file does not exist: {}", split_path_str));
-        }
-        
-        // Read the binary split file
-        let split_data = std::fs::read(path)?;
-        let owned_bytes = OwnedBytes::new(split_data);
-        
-        // Parse the split using Quickwit's BundleStorage
-        let ram_storage = std::sync::Arc::new(RamStorage::default());
-        let bundle_path = std::path::PathBuf::from("temp.split");
-        let (_hotcache, bundle_storage) = BundleStorage::open_from_split_data_with_owned_bytes(
-            ram_storage, bundle_path, owned_bytes
-        ).map_err(|e| anyhow!("Failed to parse Quickwit split file: {}", e))?;
-        
-        // Create ArrayList to hold file names
-        let array_list_class = env.find_class("java/util/ArrayList")?;
-        let file_list = env.new_object(&array_list_class, "()V", &[])?;
-        
-        // Add actual files from the split bundle
-        let mut file_count = 0;
-        for file_path in bundle_storage.iter_files() {
-            let file_name = file_path.to_string_lossy();
-            let file_name_jstr = string_to_jstring(env, &file_name)?;
-            env.call_method(
-                &file_list,
-                "add",
-                "(Ljava/lang/Object;)Z",
-                &[JValue::Object(&file_name_jstr.into())],
-            )?;
-            file_count += 1;
-        }
-        
-        debug_log!("Listed {} files from Quickwit split", file_count);
-        
-        Ok(file_list.into_raw())
+    let split_path_str = jstring_to_string(env, &split_path)?;
+    let path = Path::new(&split_path_str);
+    
+    if !path.exists() {
+        return Err(anyhow!("Split file does not exist: {}", split_path_str));
+    }
+    
+    // Read the binary split file
+    let split_data = std::fs::read(path)?;
+    let owned_bytes = OwnedBytes::new(split_data);
+    
+    // Parse the split using Quickwit's BundleStorage
+    let ram_storage = std::sync::Arc::new(RamStorage::default());
+    let bundle_path = std::path::PathBuf::from("temp.split");
+    let (_hotcache, bundle_storage) = BundleStorage::open_from_split_data_with_owned_bytes(
+        ram_storage, bundle_path, owned_bytes
+    ).map_err(|e| anyhow!("Failed to parse Quickwit split file: {}", e))?;
+    
+    // Create ArrayList to hold file names
+    let array_list_class = env.find_class("java/util/ArrayList")?;
+    let file_list = env.new_object(&array_list_class, "()V", &[])?;
+    
+    // Add actual files from the split bundle
+    let mut file_count = 0;
+    for file_path in bundle_storage.iter_files() {
+        let file_name = file_path.to_string_lossy();
+        let file_name_jstr = string_to_jstring(env, &file_name)?;
+        env.call_method(
+            &file_list,
+            "add",
+            "(Ljava/lang/Object;)Z",
+            &[JValue::Object(&file_name_jstr.into())],
+        )?;
+        file_count += 1;
+    }
+    
+    debug_log!("Listed {} files from Quickwit split", file_count);
+    
+    Ok(file_list.into_raw())
     }).unwrap_or(std::ptr::null_mut())
 }
 
@@ -807,94 +884,94 @@ pub extern "system" fn Java_com_tantivy4java_QuickwitSplit_nativeExtractSplit(
     output_dir: JString,
 ) -> jobject {
     convert_throwable(&mut env, |env| {
-        let split_path_str = jstring_to_string(env, &split_path)?;
-        let output_dir_str = jstring_to_string(env, &output_dir)?;
+    let split_path_str = jstring_to_string(env, &split_path)?;
+    let output_dir_str = jstring_to_string(env, &output_dir)?;
+    
+    let split_path = Path::new(&split_path_str);
+    let output_path = Path::new(&output_dir_str);
+    
+    if !split_path.exists() {
+        return Err(anyhow!("Split file does not exist: {}", split_path_str));
+    }
+    
+    // Create output directory if it doesn't exist
+    std::fs::create_dir_all(output_path)?;
+    
+    // Read the binary split file
+    let split_data = std::fs::read(split_path)?;
+    let owned_bytes = OwnedBytes::new(split_data);
+    
+    // Parse the split using Quickwit's BundleStorage  
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| anyhow::anyhow!("Failed to create tokio runtime: {}", e))?;
+    
+    let ram_storage = std::sync::Arc::new(RamStorage::default());
+    let bundle_path = std::path::PathBuf::from("temp.split");
+    
+    // Clone the owned_bytes for the storage put operation
+    let owned_bytes_clone = OwnedBytes::new(owned_bytes.as_slice().to_vec());
+    
+    // Put the split data into RamStorage first
+    runtime.block_on(async {
+        ram_storage.put(&bundle_path, Box::new(owned_bytes_clone.as_slice().to_vec())).await
+    }).map_err(|e| anyhow!("Failed to put split data into storage: {}", e))?;
+    
+    let (_hotcache, bundle_storage) = BundleStorage::open_from_split_data_with_owned_bytes(
+        ram_storage, bundle_path, owned_bytes
+    ).map_err(|e| anyhow!("Failed to parse Quickwit split file: {}", e))?;
+    
+    let mut extracted_count = 0;
+    for file_path in bundle_storage.iter_files() {
+        let output_file_path = output_path.join(file_path);
         
-        let split_path = Path::new(&split_path_str);
-        let output_path = Path::new(&output_dir_str);
-        
-        if !split_path.exists() {
-            return Err(anyhow!("Split file does not exist: {}", split_path_str));
+        // Create parent directories if needed
+        if let Some(parent) = output_file_path.parent() {
+            std::fs::create_dir_all(parent)?;
         }
         
-        // Create output directory if it doesn't exist
-        std::fs::create_dir_all(output_path)?;
+        // Extract file content asynchronously
+        let file_data = runtime.block_on(async {
+            bundle_storage.get_all(file_path).await
+        }).map_err(|e| anyhow!("Failed to extract file {}: {}", file_path.display(), e))?;
         
-        // Read the binary split file
-        let split_data = std::fs::read(split_path)?;
-        let owned_bytes = OwnedBytes::new(split_data);
+        std::fs::write(&output_file_path, &file_data)?;
+        extracted_count += 1;
         
-        // Parse the split using Quickwit's BundleStorage  
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| anyhow::anyhow!("Failed to create tokio runtime: {}", e))?;
+        debug_log!("Extracted file {} ({} bytes)", file_path.display(), file_data.len());
+    }
+    
+    // Create a minimal metadata object for the return value
+    let split_metadata = QuickwitSplitMetadata {
+        split_id: uuid::Uuid::new_v4().to_string(),
+        index_uid: "extracted".to_string(),
+        source_id: "extracted".to_string(),
+        node_id: "local".to_string(),
+        doc_mapping_uid: "default".to_string(),
+        partition_id: 0,
+        num_docs: 0, // Can't determine from split alone
+        uncompressed_docs_size_in_bytes: std::fs::metadata(split_path)?.len(),
+        time_range: None,
+        create_timestamp: Utc::now().timestamp(),
+        tags: BTreeSet::new(),
+        delete_opstamp: 0,
+        num_merge_ops: 0,
         
-        let ram_storage = std::sync::Arc::new(RamStorage::default());
-        let bundle_path = std::path::PathBuf::from("temp.split");
+        // Footer offset fields not available for extraction
+        footer_start_offset: None,
+        footer_end_offset: None,
+        hotcache_start_offset: None,
+        hotcache_length: None,
         
-        // Clone the owned_bytes for the storage put operation
-        let owned_bytes_clone = OwnedBytes::new(owned_bytes.as_slice().to_vec());
-        
-        // Put the split data into RamStorage first
-        runtime.block_on(async {
-            ram_storage.put(&bundle_path, Box::new(owned_bytes_clone.as_slice().to_vec())).await
-        }).map_err(|e| anyhow!("Failed to put split data into storage: {}", e))?;
-        
-        let (_hotcache, bundle_storage) = BundleStorage::open_from_split_data_with_owned_bytes(
-            ram_storage, bundle_path, owned_bytes
-        ).map_err(|e| anyhow!("Failed to parse Quickwit split file: {}", e))?;
-        
-        let mut extracted_count = 0;
-        for file_path in bundle_storage.iter_files() {
-            let output_file_path = output_path.join(file_path);
-            
-            // Create parent directories if needed
-            if let Some(parent) = output_file_path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            
-            // Extract file content asynchronously
-            let file_data = runtime.block_on(async {
-                bundle_storage.get_all(file_path).await
-            }).map_err(|e| anyhow!("Failed to extract file {}: {}", file_path.display(), e))?;
-            
-            std::fs::write(&output_file_path, &file_data)?;
-            extracted_count += 1;
-            
-            debug_log!("Extracted file {} ({} bytes)", file_path.display(), file_data.len());
-        }
-        
-        // Create a minimal metadata object for the return value
-        let split_metadata = QuickwitSplitMetadata {
-            split_id: uuid::Uuid::new_v4().to_string(),
-            index_uid: "extracted".to_string(),
-            source_id: "extracted".to_string(),
-            node_id: "local".to_string(),
-            doc_mapping_uid: "default".to_string(),
-            partition_id: 0,
-            num_docs: 0, // Can't determine from split alone
-            uncompressed_docs_size_in_bytes: std::fs::metadata(split_path)?.len(),
-            time_range: None,
-            create_timestamp: Utc::now().timestamp(),
-            tags: BTreeSet::new(),
-            delete_opstamp: 0,
-            num_merge_ops: 0,
-            
-            // Footer offset fields not available for extraction
-            footer_start_offset: None,
-            footer_end_offset: None,
-            hotcache_start_offset: None,
-            hotcache_length: None,
-            
-            // Doc mapping JSON not available when extracting existing splits
-            doc_mapping_json: None,
-        };
-        
-        debug_log!("Successfully extracted {} files from Quickwit split to {}", extracted_count, output_path.display());
-        
-        let metadata_obj = create_java_split_metadata(env, &split_metadata)?;
-        Ok(metadata_obj.into_raw())
+        // Doc mapping JSON not available when extracting existing splits
+        doc_mapping_json: None,
+    };
+    
+    debug_log!("Successfully extracted {} files from Quickwit split to {}", extracted_count, output_path.display());
+    
+    let metadata_obj = create_java_split_metadata(env, &split_metadata)?;
+    Ok(metadata_obj.into_raw())
     }).unwrap_or(std::ptr::null_mut())
 }
 
@@ -905,14 +982,14 @@ pub extern "system" fn Java_com_tantivy4java_QuickwitSplit_nativeValidateSplit(
     split_path: JString,
 ) -> jni::sys::jboolean {
     convert_throwable(&mut env, |env| {
-        let split_path_str = jstring_to_string(env, &split_path)?;
-        
-        let path = Path::new(&split_path_str);
-        let is_valid = path.exists() 
-            && path.is_file() 
-            && path.extension().map_or(false, |ext| ext == "split");
-        
-        Ok(if is_valid { jni::sys::JNI_TRUE } else { jni::sys::JNI_FALSE })
+    let split_path_str = jstring_to_string(env, &split_path)?;
+    
+    let path = Path::new(&split_path_str);
+    let is_valid = path.exists() 
+        && path.is_file() 
+        && path.extension().map_or(false, |ext| ext == "split");
+    
+    Ok(if is_valid { jni::sys::JNI_TRUE } else { jni::sys::JNI_FALSE })
     }).unwrap_or(jni::sys::JNI_FALSE)
 }
 
@@ -949,35 +1026,35 @@ pub extern "system" fn Java_com_tantivy4java_QuickwitSplit_nativeMergeSplits(
     merge_config: JObject,
 ) -> jobject {
     convert_throwable(&mut env, |env| {
-        debug_log!("Starting split merge operation");
-        
-        let output_path_str = jstring_to_string(env, &output_path)?;
-        debug_log!("Output path: {}", output_path_str);
-        
-        // Extract merge configuration from Java object
-        let config = extract_merge_config(env, &merge_config)?;
-        debug_log!("Merge config: {:?}", config);
-        
-        // Extract split URLs from Java List
-        let split_urls = extract_string_list_from_jobject(env, &split_urls_list)?;
-        debug_log!("Split URLs to merge: {:?}", split_urls);
-        
-        if split_urls.len() < 2 {
-            return Err(anyhow!("At least 2 splits are required for merging"));
-        }
-        
-        // Perform the merge operation
-        let merged_metadata = merge_splits_impl(&split_urls, &output_path_str, &config)?;
-        debug_log!("Split merge completed successfully");
-        
-        // Debug: Check if merged metadata has footer offsets
-        debug_log!("🔍 MERGE RESULT: Merged metadata footer offsets: start={:?}, end={:?}, hotcache_start={:?}, hotcache_length={:?}",
-                  merged_metadata.footer_start_offset, merged_metadata.footer_end_offset,
-                  merged_metadata.hotcache_start_offset, merged_metadata.hotcache_length);
-        
-        // Create Java metadata object
-        let metadata_obj = create_java_split_metadata(env, &merged_metadata)?;
-        Ok(metadata_obj.into_raw())
+    debug_log!("Starting split merge operation");
+    
+    let output_path_str = jstring_to_string(env, &output_path)?;
+    debug_log!("Output path: {}", output_path_str);
+    
+    // Extract merge configuration from Java object
+    let config = extract_merge_config(env, &merge_config)?;
+    debug_log!("Merge config: {:?}", config);
+    
+    // Extract split URLs from Java List
+    let split_urls = extract_string_list_from_jobject(env, &split_urls_list)?;
+    debug_log!("Split URLs to merge: {:?}", split_urls);
+    
+    if split_urls.len() < 2 {
+        return Err(anyhow!("At least 2 splits are required for merging"));
+    }
+    
+    // Perform the merge operation
+    let merged_metadata = merge_splits_impl(&split_urls, &output_path_str, &config)?;
+    debug_log!("Split merge completed successfully");
+    
+    // Debug: Check if merged metadata has footer offsets
+    debug_log!("🔍 MERGE RESULT: Merged metadata footer offsets: start={:?}, end={:?}, hotcache_start={:?}, hotcache_length={:?}",
+              merged_metadata.footer_start_offset, merged_metadata.footer_end_offset,
+              merged_metadata.hotcache_start_offset, merged_metadata.hotcache_length);
+    
+    // Create Java metadata object
+    let metadata_obj = create_java_split_metadata(env, &merged_metadata)?;
+    Ok(metadata_obj.into_raw())
     }).unwrap_or(std::ptr::null_mut())
 }
 
@@ -989,43 +1066,43 @@ fn extract_aws_config(env: &mut JNIEnv, aws_obj: JObject) -> anyhow::Result<AwsC
     
     // Extract session token (optional - for STS/temporary credentials)
     let session_token = match env.call_method(&aws_obj, "getSessionToken", "()Ljava/lang/String;", &[]) {
-        Ok(session_result) => {
-            let session_obj = session_result.l()?;
-            if env.is_same_object(&session_obj, JObject::null())? {
-                None
-            } else {
-                Some(jstring_to_string(env, &session_obj.into())?)
-            }
-        },
-        Err(_) => None,
+    Ok(session_result) => {
+        let session_obj = session_result.l()?;
+        if env.is_same_object(&session_obj, JObject::null())? {
+            None
+        } else {
+            Some(jstring_to_string(env, &session_obj.into())?)
+        }
+    },
+    Err(_) => None,
     };
 
     // Extract endpoint (optional - for S3-compatible storage)
     let endpoint = match env.call_method(&aws_obj, "getEndpoint", "()Ljava/lang/String;", &[]) {
-        Ok(endpoint_result) => {
-            let endpoint_obj = endpoint_result.l()?;
-            if env.is_same_object(&endpoint_obj, JObject::null())? {
-                None
-            } else {
-                Some(jstring_to_string(env, &endpoint_obj.into())?)
-            }
-        },
-        Err(_) => None,
+    Ok(endpoint_result) => {
+        let endpoint_obj = endpoint_result.l()?;
+        if env.is_same_object(&endpoint_obj, JObject::null())? {
+            None
+        } else {
+            Some(jstring_to_string(env, &endpoint_obj.into())?)
+        }
+    },
+    Err(_) => None,
     };
     
     // Extract force path style flag
     let force_path_style = match env.call_method(&aws_obj, "isForcePathStyle", "()Z", &[]) {
-        Ok(result) => result.z()?,
-        Err(_) => false,
+    Ok(result) => result.z()?,
+    Err(_) => false,
     };
 
     Ok(AwsConfig {
-        access_key,
-        secret_key,
-        session_token,
-        region,
-        endpoint,
-        force_path_style,
+    access_key,
+    secret_key,
+    session_token,
+    region,
+    endpoint,
+    force_path_style,
     })
 }
 
@@ -1038,57 +1115,57 @@ fn extract_merge_config(env: &mut JNIEnv, config_obj: &JObject) -> Result<MergeC
     
     // Get partition ID
     let partition_id = env.call_method(config_obj, "getPartitionId", "()J", &[])?
-        .j()? as u64;
+    .j()? as u64;
     
     // Get delete queries (optional)
     let delete_queries_result = env.call_method(config_obj, "getDeleteQueries", "()Ljava/util/List;", &[]);
     let delete_queries = match delete_queries_result {
-        Ok(list_val) => {
-            let list_obj = list_val.l()?;
-            if list_obj.is_null() {
-                None
-            } else {
-                Some(extract_string_list_from_jobject(env, &list_obj)?)
-            }
+    Ok(list_val) => {
+        let list_obj = list_val.l()?;
+        if list_obj.is_null() {
+            None
+        } else {
+            Some(extract_string_list_from_jobject(env, &list_obj)?)
         }
-        Err(_) => None,
+    }
+    Err(_) => None,
     };
     
     // Extract AWS configuration if present
     let aws_config = match env.call_method(config_obj, "getAwsConfig", "()Lcom/tantivy4java/QuickwitSplit$AwsConfig;", &[]) {
-        Ok(aws_result) => {
-            let aws_obj = aws_result.l()?;
-            if env.is_same_object(&aws_obj, JObject::null())? {
-                None
-            } else {
-                Some(extract_aws_config(env, aws_obj)?)
-            }
-        },
-        Err(_) => None,
+    Ok(aws_result) => {
+        let aws_obj = aws_result.l()?;
+        if env.is_same_object(&aws_obj, JObject::null())? {
+            None
+        } else {
+            Some(extract_aws_config(env, aws_obj)?)
+        }
+    },
+    Err(_) => None,
     };
 
     // Extract custom temp directory path if present
     let temp_directory_path = match env.call_method(config_obj, "getTempDirectoryPath", "()Ljava/lang/String;", &[]) {
-        Ok(temp_result) => {
-            let temp_obj = temp_result.l()?;
-            if env.is_same_object(&temp_obj, JObject::null())? {
-                None
-            } else {
-                Some(jstring_to_string(env, &temp_obj.into())?)
-            }
-        },
-        Err(_) => None,
+    Ok(temp_result) => {
+        let temp_obj = temp_result.l()?;
+        if env.is_same_object(&temp_obj, JObject::null())? {
+            None
+        } else {
+            Some(jstring_to_string(env, &temp_obj.into())?)
+        }
+    },
+    Err(_) => None,
     };
 
     Ok(MergeConfig {
-        index_uid,
-        source_id,
-        node_id,
-        doc_mapping_uid,
-        partition_id,
-        delete_queries,
-        aws_config,
-        temp_directory_path,
+    index_uid,
+    source_id,
+    node_id,
+    doc_mapping_uid,
+    partition_id,
+    delete_queries,
+    aws_config,
+    temp_directory_path,
     })
 }
 
@@ -1098,10 +1175,10 @@ fn extract_string_list_from_jobject(env: &mut JNIEnv, list_obj: &JObject) -> Res
     let mut strings = Vec::with_capacity(list_size as usize);
     
     for i in 0..list_size {
-        let element = env.call_method(list_obj, "get", "(I)Ljava/lang/Object;", &[JValue::Int(i)])?.l()?;
-        let java_string = JString::from(element);
-        let rust_string = jstring_to_string(env, &java_string)?;
-        strings.push(rust_string);
+    let element = env.call_method(list_obj, "get", "(I)Ljava/lang/Object;", &[JValue::Int(i)])?.l()?;
+    let java_string = JString::from(element);
+    let rust_string = jstring_to_string(env, &java_string)?;
+    strings.push(rust_string);
     }
     
     Ok(strings)
@@ -1118,11 +1195,11 @@ fn get_string_field_value(env: &mut JNIEnv, obj: &JObject, method_name: &str) ->
 fn get_nullable_string_field_value(env: &mut JNIEnv, obj: &JObject, method_name: &str) -> Result<Option<String>> {
     let string_obj = env.call_method(obj, method_name, "()Ljava/lang/String;", &[])?.l()?;
     if env.is_same_object(&string_obj, JObject::null())? {
-        Ok(None)
+    Ok(None)
     } else {
-        let java_string = JString::from(string_obj);
-        let string_value = jstring_to_string(env, &java_string)?;
-        Ok(Some(string_value))
+    let java_string = JString::from(string_obj);
+    let string_value = jstring_to_string(env, &java_string)?;
+    Ok(Some(string_value))
     }
 }
 
@@ -1155,36 +1232,36 @@ fn extract_split_to_directory_impl(split_path: &Path, output_dir: &Path) -> Resu
     
     // Copy meta.json
     if bundle_directory.exists(Path::new("meta.json"))? {
-        debug_log!("Copying meta.json");
-        let meta_data = bundle_directory.atomic_read(Path::new("meta.json"))?;
-        output_directory.atomic_write(Path::new("meta.json"), &meta_data)?;
-        copied_files += 1;
+    debug_log!("Copying meta.json");
+    let meta_data = bundle_directory.atomic_read(Path::new("meta.json"))?;
+    output_directory.atomic_write(Path::new("meta.json"), &meta_data)?;
+    copied_files += 1;
     }
     
     // Copy all segment-related files
     for segment_meta in &index_meta.segments {
-        let segment_id = segment_meta.id().uuid_string();
-        debug_log!("Copying files for segment: {}", segment_id);
-        
-        // Copy common segment files (this is a simplified approach - in practice Tantivy has many file types)
-        let file_patterns = vec![
-            format!("{}.store", segment_id),
-            format!("{}.pos", segment_id), 
-            format!("{}.idx", segment_id),
-            format!("{}.term", segment_id),
-            format!("{}.fieldnorm", segment_id),
-            format!("{}.fast", segment_id),
-        ];
-        
-        for file_pattern in file_patterns {
-            let file_path = Path::new(&file_pattern);
-            if bundle_directory.exists(file_path)? {
-                debug_log!("Copying file: {}", file_pattern);
-                let file_data = bundle_directory.atomic_read(file_path)?;
-                output_directory.atomic_write(file_path, &file_data)?;
-                copied_files += 1;
-            }
+    let segment_id = segment_meta.id().uuid_string();
+    debug_log!("Copying files for segment: {}", segment_id);
+    
+    // Copy common segment files (this is a simplified approach - in practice Tantivy has many file types)
+    let file_patterns = vec![
+        format!("{}.store", segment_id),
+        format!("{}.pos", segment_id), 
+        format!("{}.idx", segment_id),
+        format!("{}.term", segment_id),
+        format!("{}.fieldnorm", segment_id),
+        format!("{}.fast", segment_id),
+    ];
+    
+    for file_pattern in file_patterns {
+        let file_path = Path::new(&file_pattern);
+        if bundle_directory.exists(file_path)? {
+            debug_log!("Copying file: {}", file_pattern);
+            let file_data = bundle_directory.atomic_read(file_path)?;
+            output_directory.atomic_write(file_path, &file_data)?;
+            copied_files += 1;
         }
+    }
     }
     
     debug_log!("Successfully extracted split to directory (copied {} files)", copied_files);
@@ -1198,22 +1275,22 @@ fn create_temp_directory_with_base(prefix: &str, base_path: Option<&str>) -> Res
 
     // Set custom temporary directory base path if provided
     if let Some(custom_base) = base_path {
-        // Validate that the custom base path exists and is writable
-        let base_path_buf = PathBuf::from(custom_base);
-        if !base_path_buf.exists() {
-            return Err(anyhow!("Custom temp directory base path does not exist: {}", custom_base));
-        }
-        if !base_path_buf.is_dir() {
-            return Err(anyhow!("Custom temp directory base path is not a directory: {}", custom_base));
-        }
+    // Validate that the custom base path exists and is writable
+    let base_path_buf = PathBuf::from(custom_base);
+    if !base_path_buf.exists() {
+        return Err(anyhow!("Custom temp directory base path does not exist: {}", custom_base));
+    }
+    if !base_path_buf.is_dir() {
+        return Err(anyhow!("Custom temp directory base path is not a directory: {}", custom_base));
+    }
 
-        debug_log!("🏗️ Using custom temp directory base: {}", custom_base);
-        return builder.tempdir_in(&base_path_buf)
-            .map_err(|e| anyhow!("Failed to create temp directory with prefix '{}' in base '{}': {}", prefix, custom_base, e));
+    debug_log!("🏗️ Using custom temp directory base: {}", custom_base);
+    return builder.tempdir_in(&base_path_buf)
+        .map_err(|e| anyhow!("Failed to create temp directory with prefix '{}' in base '{}': {}", prefix, custom_base, e));
     }
 
     builder.tempdir()
-        .map_err(|e| anyhow!("Failed to create temp directory with prefix '{}': {}", prefix, e))
+    .map_err(|e| anyhow!("Failed to create temp directory with prefix '{}': {}", prefix, e))
 }
 
 /// Represents an extracted split with its temporary directory and metadata
@@ -1250,33 +1327,33 @@ async fn download_and_extract_splits_parallel(
 
     // Create download tasks for each split
     let download_tasks: Vec<_> = split_urls
-        .iter()
-        .enumerate()
-        .map(|(i, split_url)| {
-            let split_url = split_url.clone();
-            let merge_id = merge_id.to_string();
-            let config = config.clone();
-            let semaphore = Arc::clone(&download_semaphore);
-            let storage_resolver = Arc::clone(&shared_storage_resolver);
+    .iter()
+    .enumerate()
+    .map(|(i, split_url)| {
+        let split_url = split_url.clone();
+        let merge_id = merge_id.to_string();
+        let config = config.clone();
+        let semaphore = Arc::clone(&download_semaphore);
+        let storage_resolver = Arc::clone(&shared_storage_resolver);
 
-            async move {
-                // Acquire semaphore permit to limit concurrent downloads
-                let _permit = semaphore.acquire().await
-                    .map_err(|e| anyhow!("Failed to acquire download permit: {}", e))?;
+        async move {
+            // Acquire semaphore permit to limit concurrent downloads
+            let _permit = semaphore.acquire().await
+                .map_err(|e| anyhow!("Failed to acquire download permit: {}", e))?;
 
-                debug_log!("📥 Starting download task {} for: {}", i, split_url);
+            debug_log!("📥 Starting download task {} for: {}", i, split_url);
 
-                // Download and extract single split
-                download_and_extract_single_split(
-                    &split_url,
-                    i,
-                    &merge_id,
-                    &config,
-                    &storage_resolver,
-                ).await
-            }
-        })
-        .collect();
+            // Download and extract single split
+            download_and_extract_single_split(
+                &split_url,
+                i,
+                &merge_id,
+                &config,
+                &storage_resolver,
+            ).await
+        }
+    })
+    .collect();
 
     // Execute all downloads concurrently and wait for completion
     debug_log!("⏳ Waiting for {} concurrent download tasks to complete", download_tasks.len());
@@ -1299,91 +1376,91 @@ async fn download_and_extract_single_split(
 
     // Create process-specific temp directory to avoid race conditions
     let temp_extract_dir = create_temp_directory_with_base(
-        &format!("tantivy4java_merge_{}_split_{}_", merge_id, split_index),
-        config.temp_directory_path.as_deref()
+    &format!("tantivy4java_merge_{}_split_{}_", merge_id, split_index),
+    config.temp_directory_path.as_deref()
     )?;
     let temp_extract_path = temp_extract_dir.path().to_path_buf();
 
     debug_log!("📁 Split {}: Created temp directory: {:?}", split_index, temp_extract_path);
 
     if split_url.contains("://") && !split_url.starts_with("file://") {
-        // Handle S3/remote URLs
-        debug_log!("🌐 Split {}: Processing S3/remote URL: {}", split_index, split_url);
+    // Handle S3/remote URLs
+    debug_log!("🌐 Split {}: Processing S3/remote URL: {}", split_index, split_url);
 
-        // Parse the split URI
-        let split_uri = Uri::from_str(split_url)?;
+    // Parse the split URI
+    let split_uri = Uri::from_str(split_url)?;
 
-        // For S3 URIs, we need to resolve the parent directory, not the file itself
-        let (storage_uri, file_name) = if split_uri.protocol() == Protocol::S3 {
-            let uri_str = split_uri.as_str();
-            if let Some(last_slash) = uri_str.rfind('/') {
-                let parent_uri_str = &uri_str[..last_slash]; // Get s3://bucket/splits
-                let file_name = &uri_str[last_slash + 1..];  // Get filename
-                debug_log!("🔗 Split {}: Split S3 URI into parent: {} and file: {}",
-                          split_index, parent_uri_str, file_name);
-                (Uri::from_str(parent_uri_str)?, Some(file_name.to_string()))
-            } else {
-                (split_uri.clone(), None)
-            }
+    // For S3 URIs, we need to resolve the parent directory, not the file itself
+    let (storage_uri, file_name) = if split_uri.protocol() == Protocol::S3 {
+        let uri_str = split_uri.as_str();
+        if let Some(last_slash) = uri_str.rfind('/') {
+            let parent_uri_str = &uri_str[..last_slash]; // Get s3://bucket/splits
+            let file_name = &uri_str[last_slash + 1..];  // Get filename
+            debug_log!("🔗 Split {}: Split S3 URI into parent: {} and file: {}",
+                      split_index, parent_uri_str, file_name);
+            (Uri::from_str(parent_uri_str)?, Some(file_name.to_string()))
         } else {
             (split_uri.clone(), None)
-        };
+        }
+    } else {
+        (split_uri.clone(), None)
+    };
 
-        // Resolve storage for the URI (uses cached/pooled connections)
-        let storage = storage_resolver.resolve(&storage_uri).await
-            .map_err(|e| anyhow!("Split {}: Failed to resolve storage for '{}': {}", split_index, split_url, e))?;
+    // Resolve storage for the URI (uses cached/pooled connections)
+    let storage = storage_resolver.resolve(&storage_uri).await
+        .map_err(|e| anyhow!("Split {}: Failed to resolve storage for '{}': {}", split_index, split_url, e))?;
 
-        // Download the split file to temporary location
-        let split_filename = file_name.unwrap_or_else(|| {
-            split_url.split('/').last().unwrap_or("split.split").to_string()
-        });
-        let temp_split_path = temp_extract_path.join(&split_filename);
+    // Download the split file to temporary location
+    let split_filename = file_name.unwrap_or_else(|| {
+        split_url.split('/').last().unwrap_or("split.split").to_string()
+    });
+    let temp_split_path = temp_extract_path.join(&split_filename);
 
-        debug_log!("⬇️ Split {}: Downloading {} to {:?}", split_index, split_url, temp_split_path);
+    debug_log!("⬇️ Split {}: Downloading {} to {:?}", split_index, split_url, temp_split_path);
 
-        // Download the split file asynchronously
-        let split_data = storage.get_all(Path::new(&split_filename)).await
-            .map_err(|e| anyhow!("Split {}: Failed to download from {}: {}", split_index, split_url, e))?;
+    // Download the split file asynchronously
+    let split_data = storage.get_all(Path::new(&split_filename)).await
+        .map_err(|e| anyhow!("Split {}: Failed to download from {}: {}", split_index, split_url, e))?;
 
-        // Write to disk asynchronously
-        tokio::fs::write(&temp_split_path, &split_data).await
-            .map_err(|e| anyhow!("Split {}: Failed to write to {:?}: {}", split_index, temp_split_path, e))?;
+    // Write to disk asynchronously
+    tokio::fs::write(&temp_split_path, &split_data).await
+        .map_err(|e| anyhow!("Split {}: Failed to write to {:?}: {}", split_index, temp_split_path, e))?;
 
-        debug_log!("💾 Split {}: Downloaded {} bytes to {:?}", split_index, split_data.len(), temp_split_path);
+    debug_log!("💾 Split {}: Downloaded {} bytes to {:?}", split_index, split_data.len(), temp_split_path);
 
-        // Extract the downloaded split to the temp directory
-        // CRITICAL: For merge operations, use full extraction instead of lazy loading
-        debug_log!("🔧 Split {}: MERGE EXTRACTION - Forcing full split extraction (no lazy loading) for merge safety", split_index);
-        extract_split_to_directory_impl(&temp_split_path, &temp_extract_path)?;
+    // Extract the downloaded split to the temp directory
+    // CRITICAL: For merge operations, use full extraction instead of lazy loading
+    debug_log!("🔧 Split {}: MERGE EXTRACTION - Forcing full split extraction (no lazy loading) for merge safety", split_index);
+    extract_split_to_directory_impl(&temp_split_path, &temp_extract_path)?;
 
     } else {
-        // Handle local file URLs
-        let split_path = if split_url.starts_with("file://") {
-            split_url.strip_prefix("file://").unwrap_or(split_url)
-        } else {
-            split_url
-        };
+    // Handle local file URLs
+    let split_path = if split_url.starts_with("file://") {
+        split_url.strip_prefix("file://").unwrap_or(split_url)
+    } else {
+        split_url
+    };
 
-        debug_log!("📂 Split {}: Processing local file: {}", split_index, split_path);
+    debug_log!("📂 Split {}: Processing local file: {}", split_index, split_path);
 
-        // Validate split exists
-        if !Path::new(split_path).exists() {
-            return Err(anyhow!("Split {}: File not found: {}", split_index, split_path));
-        }
+    // Validate split exists
+    if !Path::new(split_path).exists() {
+        return Err(anyhow!("Split {}: File not found: {}", split_index, split_path));
+    }
 
-        // Extract the split to a writable directory
-        // CRITICAL: For merge operations, use full extraction instead of lazy loading
-        debug_log!("🔧 Split {}: MERGE EXTRACTION - Forcing full split extraction (no lazy loading) for merge safety", split_index);
-        extract_split_to_directory_impl(Path::new(split_path), &temp_extract_path)?;
+    // Extract the split to a writable directory
+    // CRITICAL: For merge operations, use full extraction instead of lazy loading
+    debug_log!("🔧 Split {}: MERGE EXTRACTION - Forcing full split extraction (no lazy loading) for merge safety", split_index);
+    extract_split_to_directory_impl(Path::new(split_path), &temp_extract_path)?;
     }
 
     debug_log!("✅ Split {}: Successfully downloaded and extracted to {:?}", split_index, temp_extract_path);
 
     Ok(ExtractedSplit {
-        temp_dir: temp_extract_dir,
-        temp_path: temp_extract_path,
-        split_url: split_url.to_string(),
-        split_index,
+    temp_dir: temp_extract_dir,
+    temp_path: temp_extract_path,
+    split_url: split_url.to_string(),
+    split_index,
     })
 }
 
@@ -1392,24 +1469,24 @@ fn create_storage_resolver(config: &MergeConfig) -> Result<StorageResolver> {
     use quickwit_storage::{LocalFileStorageFactory, S3CompatibleObjectStorageFactory};
 
     let s3_config = if let Some(ref aws_config) = config.aws_config {
-        S3StorageConfig {
-            region: Some(aws_config.region.clone()),
-            access_key_id: aws_config.access_key.clone(),
-            secret_access_key: aws_config.secret_key.clone(),
-            session_token: aws_config.session_token.clone(),
-            endpoint: aws_config.endpoint.clone(),
-            force_path_style_access: aws_config.force_path_style,
-            ..Default::default()
-        }
+    S3StorageConfig {
+        region: Some(aws_config.region.clone()),
+        access_key_id: aws_config.access_key.clone(),
+        secret_access_key: aws_config.secret_key.clone(),
+        session_token: aws_config.session_token.clone(),
+        endpoint: aws_config.endpoint.clone(),
+        force_path_style_access: aws_config.force_path_style,
+        ..Default::default()
+    }
     } else {
-        S3StorageConfig::default()
+    S3StorageConfig::default()
     };
 
     StorageResolver::builder()
-        .register(LocalFileStorageFactory::default())
-        .register(S3CompatibleObjectStorageFactory::new(s3_config))
-        .build()
-        .map_err(|e| anyhow!("Failed to create storage resolver: {}", e))
+    .register(LocalFileStorageFactory::default())
+    .register(S3CompatibleObjectStorageFactory::new(s3_config))
+    .build()
+    .map_err(|e| anyhow!("Failed to create storage resolver: {}", e))
 }
 
 /// Implementation of split merging using Quickwit's efficient approach
@@ -1427,18 +1504,18 @@ fn merge_splits_impl(split_urls: &[String], output_path: &str, config: &MergeCon
     
     // Create multi-threaded async runtime for parallel operations - optimized for Spark
     let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(num_cpus::get().min(16).max(4))  // Scale with cores, 4-16 worker threads
-        .enable_all()
-        .build()?;
+    .worker_threads(num_cpus::get().min(16).max(4))  // Scale with cores, 4-16 worker threads
+    .enable_all()
+    .build()?;
     
     // Use a closure to ensure proper runtime cleanup even on errors  
     let result: Result<QuickwitSplitMetadata> = (|| -> Result<QuickwitSplitMetadata> {
-        // 1. Open split directories without extraction (Quickwit's approach)
-        let mut split_directories: Vec<Box<dyn Directory>> = Vec::new();
-        let mut index_metas: Vec<IndexMeta> = Vec::new();
-        let mut total_docs = 0usize;
-        let mut total_size = 0u64;
-        let mut temp_dirs: Vec<temp::TempDir> = Vec::new(); // Keep track of temp dirs for proper cleanup
+    // 1. Open split directories without extraction (Quickwit's approach)
+    let mut split_directories: Vec<Box<dyn Directory>> = Vec::new();
+    let mut index_metas: Vec<IndexMeta> = Vec::new();
+    let mut total_docs = 0usize;
+    let mut total_size = 0u64;
+    let mut temp_dirs: Vec<temp::TempDir> = Vec::new(); // Keep track of temp dirs for proper cleanup
     
     // Generate unique merge ID for this operation to prevent temp directory conflicts
     let merge_id = format!("{}_{}", std::process::id(), uuid::Uuid::new_v4().to_string()[..8].to_string());
@@ -1448,54 +1525,54 @@ fn merge_splits_impl(split_urls: &[String], output_path: &str, config: &MergeCon
     debug_log!("🚀 PARALLEL DOWNLOAD: Starting concurrent download of {} splits", split_urls.len());
 
     let extracted_splits = runtime.block_on(async {
-        download_and_extract_splits_parallel(split_urls, &merge_id, config).await
+    download_and_extract_splits_parallel(split_urls, &merge_id, config).await
     })?;
 
     debug_log!("✅ PARALLEL DOWNLOAD: Completed concurrent processing of {} splits", extracted_splits.len());
 
     // Process the extracted splits to create directories and metadata
     for extracted_split in extracted_splits.into_iter() {
-        let i = extracted_split.split_index;
-        let split_url = &extracted_split.split_url;
-        let temp_extract_path = &extracted_split.temp_path;
+    let i = extracted_split.split_index;
+    let split_url = &extracted_split.split_url;
+    let temp_extract_path = &extracted_split.temp_path;
 
-        debug_log!("🔧 Processing extracted split {}: {}", i, split_url);
+    debug_log!("🔧 Processing extracted split {}: {}", i, split_url);
 
-        // Open the extracted directory as writable MmapDirectory
-        let extracted_directory = MmapDirectory::open(temp_extract_path)?;
-        let temp_index = TantivyIndex::open(extracted_directory.box_clone())?;
-        let index_meta = temp_index.load_metas()?;
+    // Open the extracted directory as writable MmapDirectory
+    let extracted_directory = MmapDirectory::open(temp_extract_path)?;
+    let temp_index = TantivyIndex::open(extracted_directory.box_clone())?;
+    let index_meta = temp_index.load_metas()?;
 
-        // Count documents and calculate size efficiently
-        let reader = temp_index.reader()?;
-        let searcher = reader.searcher();
-        let doc_count = searcher.num_docs();
+    // Count documents and calculate size efficiently
+    let reader = temp_index.reader()?;
+    let searcher = reader.searcher();
+    let doc_count = searcher.num_docs();
 
-        // Calculate split size based on source type
-        let split_size = if split_url.contains("://") && !split_url.starts_with("file://") {
-            // For S3/remote splits, get size from the temporary downloaded file
-            let split_filename = split_url.split('/').last().unwrap_or("split.split");
-            let temp_split_path = temp_extract_path.join(split_filename);
-            std::fs::metadata(&temp_split_path)?.len()
+    // Calculate split size based on source type
+    let split_size = if split_url.contains("://") && !split_url.starts_with("file://") {
+        // For S3/remote splits, get size from the temporary downloaded file
+        let split_filename = split_url.split('/').last().unwrap_or("split.split");
+        let temp_split_path = temp_extract_path.join(split_filename);
+        std::fs::metadata(&temp_split_path)?.len()
+    } else {
+        // For local splits, get size from original file
+        let split_path = if split_url.starts_with("file://") {
+            split_url.strip_prefix("file://").unwrap_or(split_url)
         } else {
-            // For local splits, get size from original file
-            let split_path = if split_url.starts_with("file://") {
-                split_url.strip_prefix("file://").unwrap_or(split_url)
-            } else {
-                split_url
-            };
-            std::fs::metadata(split_path)?.len()
+            split_url
         };
+        std::fs::metadata(split_path)?.len()
+    };
 
-        debug_log!("📊 Extracted split {} has {} documents, {} bytes", i, doc_count, split_size);
-        
-        total_docs += doc_count as usize;
-        total_size += split_size;
-        split_directories.push(extracted_directory.box_clone());
-        index_metas.push(index_meta);
+    debug_log!("📊 Extracted split {} has {} documents, {} bytes", i, doc_count, split_size);
+    
+    total_docs += doc_count as usize;
+    total_size += split_size;
+    split_directories.push(extracted_directory.box_clone());
+    index_metas.push(index_meta);
 
-        // Keep temp directory alive for merge duration - store in vector for proper cleanup
-        temp_dirs.push(extracted_split.temp_dir);
+    // Keep temp directory alive for merge duration - store in vector for proper cleanup
+    temp_dirs.push(extracted_split.temp_dir);
     }
     
     debug_log!("Opened {} splits with total {} documents, {} bytes", split_urls.len(), total_docs, total_size);
@@ -1511,33 +1588,33 @@ fn merge_splits_impl(split_urls: &[String], output_path: &str, config: &MergeCon
     // 4. Set up output directory with sequential access optimization
     // Handle S3 URLs by creating a local temporary directory with unique naming
     let (output_temp_dir, is_s3_output, _temp_dir_guard) = if output_path.contains("://") && !output_path.starts_with("file://") {
-        // For S3/remote URLs, create a local temporary directory with unique merge ID
+    // For S3/remote URLs, create a local temporary directory with unique merge ID
+    let temp_dir = create_temp_directory_with_base(
+        &format!("tantivy4java_merge_{}_output_", merge_id),
+        config.temp_directory_path.as_deref()
+    )?;
+    let temp_path = temp_dir.path().join("merge_output");
+    std::fs::create_dir_all(&temp_path)?;
+    debug_log!("Created local temporary directory for S3 output: {:?}", temp_path);
+    (temp_path, true, Some(temp_dir))
+    } else {
+    // For local files, prefer custom temp path if provided, otherwise use output parent directory
+    let temp_dir = if let Some(custom_base) = &config.temp_directory_path {
         let temp_dir = create_temp_directory_with_base(
             &format!("tantivy4java_merge_{}_output_", merge_id),
-            config.temp_directory_path.as_deref()
+            Some(custom_base)
         )?;
-        let temp_path = temp_dir.path().join("merge_output");
-        std::fs::create_dir_all(&temp_path)?;
-        debug_log!("Created local temporary directory for S3 output: {:?}", temp_path);
-        (temp_path, true, Some(temp_dir))
+        temp_dir.path().to_path_buf()
     } else {
-        // For local files, prefer custom temp path if provided, otherwise use output parent directory
-        let temp_dir = if let Some(custom_base) = &config.temp_directory_path {
-            let temp_dir = create_temp_directory_with_base(
-                &format!("tantivy4java_merge_{}_output_", merge_id),
-                Some(custom_base)
-            )?;
-            temp_dir.path().to_path_buf()
-        } else {
-            // Fallback to next to output file
-            let output_dir_path = Path::new(output_path).parent()
-                .ok_or_else(|| anyhow!("Cannot determine parent directory for output path"))?;
-            let temp_dir = output_dir_path.join(format!("temp_merge_output_{}", merge_id));
-            std::fs::create_dir_all(&temp_dir)?;
-            temp_dir
-        };
-        debug_log!("Created local temporary directory: {:?}", temp_dir);
-        (temp_dir, false, None)
+        // Fallback to next to output file
+        let output_dir_path = Path::new(output_path).parent()
+            .ok_or_else(|| anyhow!("Cannot determine parent directory for output path"))?;
+        let temp_dir = output_dir_path.join(format!("temp_merge_output_{}", merge_id));
+        std::fs::create_dir_all(&temp_dir)?;
+        temp_dir
+    };
+    debug_log!("Created local temporary directory: {:?}", temp_dir);
+    (temp_dir, false, None)
     };
     
     let output_directory = MmapDirectory::open_with_madvice(&output_temp_dir, Advice::Sequential)?;
@@ -1546,8 +1623,8 @@ fn merge_splits_impl(split_urls: &[String], output_path: &str, config: &MergeCon
     // 5. Create UnionDirectory stack (Quickwit's memory-efficient approach)
     // CRITICAL: Writable directory must be first - all writes go to first directory
     let mut directory_stack: Vec<Box<dyn Directory>> = vec![
-        Box::new(output_directory),                    // First - receives ALL writes (must be writable)
-        Box::new(shadowing_meta_directory),            // Second - provides meta.json override
+    Box::new(output_directory),                    // First - receives ALL writes (must be writable)
+    Box::new(shadowing_meta_directory),            // Second - provides meta.json override
     ];
     // Add read-only split directories for reading existing segments
     directory_stack.extend(split_directories);
@@ -1561,7 +1638,7 @@ fn merge_splits_impl(split_urls: &[String], output_path: &str, config: &MergeCon
     
     // 6.5. Extract doc mapping from the union index schema
     let doc_mapping_json = extract_doc_mapping_from_index(&union_index)
-        .map_err(|e| anyhow!("Failed to extract doc mapping from union index: {}", e))?;
+    .map_err(|e| anyhow!("Failed to extract doc mapping from union index: {}", e))?;
     debug_log!("Extracted doc mapping from union index ({} bytes)", doc_mapping_json.len());
     
     // 7. Perform memory-efficient segment-level merge (not document copying)
@@ -1575,96 +1652,96 @@ fn merge_splits_impl(split_urls: &[String], output_path: &str, config: &MergeCon
     // 9. Create merged split metadata
     let merge_split_id = uuid::Uuid::new_v4().to_string();
     let merged_metadata = QuickwitSplitMetadata {
-        split_id: merge_split_id.clone(),
-        index_uid: config.index_uid.clone(),
-        source_id: config.source_id.clone(),
-        node_id: config.node_id.clone(),
-        doc_mapping_uid: config.doc_mapping_uid.clone(),
-        partition_id: config.partition_id,
-        num_docs: merged_docs,
-        uncompressed_docs_size_in_bytes: final_size,
-        time_range: None,
-        create_timestamp: Utc::now().timestamp(),
-        tags: BTreeSet::new(),
-        delete_opstamp: 0,
-        num_merge_ops: 1,
-        
-        // Footer offset fields will be set when creating the final split
-        footer_start_offset: None,
-        footer_end_offset: None,
-        hotcache_start_offset: None,
-        hotcache_length: None,
-        
-        // Doc mapping JSON extracted from union index
-        doc_mapping_json: Some(doc_mapping_json.clone()),
+    split_id: merge_split_id.clone(),
+    index_uid: config.index_uid.clone(),
+    source_id: config.source_id.clone(),
+    node_id: config.node_id.clone(),
+    doc_mapping_uid: config.doc_mapping_uid.clone(),
+    partition_id: config.partition_id,
+    num_docs: merged_docs,
+    uncompressed_docs_size_in_bytes: final_size,
+    time_range: None,
+    create_timestamp: Utc::now().timestamp(),
+    tags: BTreeSet::new(),
+    delete_opstamp: 0,
+    num_merge_ops: 1,
+    
+    // Footer offset fields will be set when creating the final split
+    footer_start_offset: None,
+    footer_end_offset: None,
+    hotcache_start_offset: None,
+    hotcache_length: None,
+    
+    // Doc mapping JSON extracted from union index
+    doc_mapping_json: Some(doc_mapping_json.clone()),
     };
     
     // 10. Create the merged split file using the merged index and capture footer offsets
     let footer_offsets = if is_s3_output {
-        // For S3 output, create split locally then upload
-        let local_split_filename = format!("{}.split", merged_metadata.split_id);
-        let local_split_path = output_temp_dir.join(&local_split_filename);
-        
-        debug_log!("Creating local split file: {:?}", local_split_path);
-        let offsets = create_merged_split_file(&output_temp_dir, local_split_path.to_str().unwrap(), &merged_metadata)?;
-        
-        // Upload to S3
-        debug_log!("Uploading split file to S3: {}", output_path);
-        upload_split_to_s3(&local_split_path, output_path, config)?;
-        debug_log!("Successfully uploaded split file to S3: {}", output_path);
-        offsets
+    // For S3 output, create split locally then upload
+    let local_split_filename = format!("{}.split", merged_metadata.split_id);
+    let local_split_path = output_temp_dir.join(&local_split_filename);
+    
+    debug_log!("Creating local split file: {:?}", local_split_path);
+    let offsets = create_merged_split_file(&output_temp_dir, local_split_path.to_str().unwrap(), &merged_metadata)?;
+    
+    // Upload to S3
+    debug_log!("Uploading split file to S3: {}", output_path);
+    upload_split_to_s3(&local_split_path, output_path, config)?;
+    debug_log!("Successfully uploaded split file to S3: {}", output_path);
+    offsets
     } else {
-        // For local output, create split directly
-        create_merged_split_file(&output_temp_dir, output_path, &merged_metadata)?
+    // For local output, create split directly
+    create_merged_split_file(&output_temp_dir, output_path, &merged_metadata)?
     };
     
     // 11. Update merged metadata with footer offsets for optimization
     let final_merged_metadata = QuickwitSplitMetadata {
-        split_id: merged_metadata.split_id,
-        index_uid: merged_metadata.index_uid,
-        source_id: merged_metadata.source_id,
-        node_id: merged_metadata.node_id,
-        doc_mapping_uid: merged_metadata.doc_mapping_uid,
-        partition_id: merged_metadata.partition_id,
-        num_docs: merged_metadata.num_docs,
-        uncompressed_docs_size_in_bytes: merged_metadata.uncompressed_docs_size_in_bytes,
-        time_range: merged_metadata.time_range,
-        create_timestamp: merged_metadata.create_timestamp,
-        tags: merged_metadata.tags,
-        delete_opstamp: merged_metadata.delete_opstamp,
-        num_merge_ops: merged_metadata.num_merge_ops,
-        
-        // Set footer offsets from the merge operation
-        footer_start_offset: Some(footer_offsets.footer_start_offset),
-        footer_end_offset: Some(footer_offsets.footer_end_offset),
-        hotcache_start_offset: Some(footer_offsets.hotcache_start_offset),
-        hotcache_length: Some(footer_offsets.hotcache_length),
-        
-        // Doc mapping JSON extracted from union index during merge
-        doc_mapping_json: merged_metadata.doc_mapping_json,
+    split_id: merged_metadata.split_id,
+    index_uid: merged_metadata.index_uid,
+    source_id: merged_metadata.source_id,
+    node_id: merged_metadata.node_id,
+    doc_mapping_uid: merged_metadata.doc_mapping_uid,
+    partition_id: merged_metadata.partition_id,
+    num_docs: merged_metadata.num_docs,
+    uncompressed_docs_size_in_bytes: merged_metadata.uncompressed_docs_size_in_bytes,
+    time_range: merged_metadata.time_range,
+    create_timestamp: merged_metadata.create_timestamp,
+    tags: merged_metadata.tags,
+    delete_opstamp: merged_metadata.delete_opstamp,
+    num_merge_ops: merged_metadata.num_merge_ops,
+    
+    // Set footer offsets from the merge operation
+    footer_start_offset: Some(footer_offsets.footer_start_offset),
+    footer_end_offset: Some(footer_offsets.footer_end_offset),
+    hotcache_start_offset: Some(footer_offsets.hotcache_start_offset),
+    hotcache_length: Some(footer_offsets.hotcache_length),
+    
+    // Doc mapping JSON extracted from union index during merge
+    doc_mapping_json: merged_metadata.doc_mapping_json,
     };
     
     debug_log!("✅ MERGE OPTIMIZATION: Added footer offsets to merged split metadata");
     debug_log!("   Footer: {} - {} ({} bytes)", 
-               footer_offsets.footer_start_offset, footer_offsets.footer_end_offset,
-               footer_offsets.footer_end_offset - footer_offsets.footer_start_offset);
+           footer_offsets.footer_start_offset, footer_offsets.footer_end_offset,
+           footer_offsets.footer_end_offset - footer_offsets.footer_start_offset);
     debug_log!("   Hotcache: {} bytes at offset {}", 
-               footer_offsets.hotcache_length, footer_offsets.hotcache_start_offset);
+           footer_offsets.hotcache_length, footer_offsets.hotcache_start_offset);
     
     // 11. Clean up temporary directories - both the output temp dir and split temp dirs
     std::fs::remove_dir_all(&output_temp_dir).unwrap_or_else(|e| {
-        debug_log!("Warning: Could not clean up output temp directory: {}", e);
+    debug_log!("Warning: Could not clean up output temp directory: {}", e);
     });
     
-        // Clean up split extraction temporary directories explicitly
-        for (i, _temp_dir) in temp_dirs.into_iter().enumerate() {
-            debug_log!("Cleaning up split temp directory {}", i);
-            // temp_dir will be automatically cleaned up when dropped
-        }
-        
-        debug_log!("Created efficient merged split file: {} with {} documents", output_path, merged_docs);
-        
-        Ok(final_merged_metadata)
+    // Clean up split extraction temporary directories explicitly
+    for (i, _temp_dir) in temp_dirs.into_iter().enumerate() {
+        debug_log!("Cleaning up split temp directory {}", i);
+        // temp_dir will be automatically cleaned up when dropped
+    }
+    
+    debug_log!("Created efficient merged split file: {} with {} documents", output_path, merged_docs);
+    
+    Ok(final_merged_metadata)
     })(); // End closure
     
     // Ensure proper runtime cleanup regardless of success or failure
@@ -1685,14 +1762,14 @@ fn get_tantivy_directory_from_split_bundle(split_path: &str) -> Result<Box<dyn t
     
     let split_file_path = PathBuf::from(split_path);
     let parent_dir = split_file_path.parent()
-        .ok_or_else(|| anyhow!("Cannot find parent directory for {}", split_path))?;
+    .ok_or_else(|| anyhow!("Cannot find parent directory for {}", split_path))?;
     
     // Open parent directory
     let mmap_directory = MmapDirectory::open(parent_dir)?;
     
     // Get filename only
     let filename = split_file_path.file_name()
-        .ok_or_else(|| anyhow!("Cannot extract filename from {}", split_path))?;
+    .ok_or_else(|| anyhow!("Cannot extract filename from {}", split_path))?;
     
     // Open the split file slice
     let split_fileslice = mmap_directory.open_read(Path::new(filename))?;
@@ -1719,7 +1796,7 @@ fn get_tantivy_directory_from_split_bundle_full_access(split_path: &str) -> Resu
     // Read the entire split file into memory (FULL ACCESS - no lazy loading)
     debug_log!("🔧 MERGE SAFETY: Reading entire split file into memory to avoid range issues");
     let split_data = std::fs::read(&split_file_path)
-        .map_err(|e| anyhow!("Failed to read split file {:?}: {}", split_file_path, e))?;
+    .map_err(|e| anyhow!("Failed to read split file {:?}: {}", split_file_path, e))?;
     
     let file_size = split_data.len();
     debug_log!("🔧 MERGE SAFETY: Read {} bytes from split file (full file access)", file_size);
@@ -1733,7 +1810,7 @@ fn get_tantivy_directory_from_split_bundle_full_access(split_path: &str) -> Resu
     // Create BundleDirectory from the full file slice
     // This should work correctly because we have the complete file data
     let bundle_directory = BundleDirectory::open_split(file_slice)
-        .map_err(|e| anyhow!("Failed to open split bundle with full access: {}", e))?;
+    .map_err(|e| anyhow!("Failed to open split bundle with full access: {}", e))?;
     
     debug_log!("✅ MERGE SAFETY: Successfully opened bundle directory with full file access (no lazy loading)");
     Ok(Box::new(bundle_directory))
@@ -1746,7 +1823,7 @@ fn combine_index_meta(mut index_metas: Vec<tantivy::IndexMeta>) -> Result<tantiv
     debug_log!("Combining {} index metadata objects", index_metas.len());
     
     if index_metas.is_empty() {
-        return Err(anyhow!("No index metadata to combine"));
+    return Err(anyhow!("No index metadata to combine"));
     }
     
     // Start with the first metadata
@@ -1754,8 +1831,8 @@ fn combine_index_meta(mut index_metas: Vec<tantivy::IndexMeta>) -> Result<tantiv
     
     // Combine segments from all metadata
     for index_meta in index_metas {
-        debug_log!("Adding {} segments to union", index_meta.segments.len());
-        union_index_meta.segments.extend(index_meta.segments);
+    debug_log!("Adding {} segments to union", index_meta.segments.len());
+    union_index_meta.segments.extend(index_meta.segments);
     }
     
     debug_log!("Combined metadata has {} total segments", union_index_meta.segments.len());
@@ -1770,8 +1847,8 @@ fn create_shadowing_meta_json_directory(index_meta: tantivy::IndexMeta, merge_id
 
     // Create persistent temporary directory for meta.json (avoids RAM directory race conditions)
     let meta_temp_dir = create_temp_directory_with_base(
-        &format!("tantivy4java_meta_{}_", merge_id),
-        temp_base_path
+    &format!("tantivy4java_meta_{}_", merge_id),
+    temp_base_path
     )?;
     let meta_temp_path = meta_temp_dir.path();
 
@@ -1789,7 +1866,7 @@ fn create_shadowing_meta_json_directory(index_meta: tantivy::IndexMeta, merge_id
     mmap_directory.atomic_write(Path::new(&backup_meta_name), union_index_meta_json.as_bytes())?;
 
     debug_log!("Created persistent shadowing directory with meta.json ({} bytes) for merge: {} at {:?}",
-               union_index_meta_json.len(), merge_id, meta_temp_path);
+           union_index_meta_json.len(), merge_id, meta_temp_path);
 
     // Important: Keep temp_dir alive by leaking it (will be cleaned up by OS)
     // This prevents the race condition where the directory gets cleaned up while other merges are using it
@@ -1822,17 +1899,17 @@ async fn perform_segment_merge(union_index: &tantivy::Index) -> Result<usize> {
     let reader = union_index.reader()?;
     let searcher = reader.searcher();
     let segment_ids: Vec<SegmentId> = searcher
-        .segment_readers()
-        .iter()
-        .map(|segment_reader| segment_reader.segment_id())
-        .collect();
+    .segment_readers()
+    .iter()
+    .map(|segment_reader| segment_reader.segment_id())
+    .collect();
     
     debug_log!("Found {} segments to merge: {:?}", segment_ids.len(), segment_ids);
     
     // Skip merge if there's only one segment (Quickwit's optimization)
     if segment_ids.len() <= 1 {
-        debug_log!("Skipping merge - only {} segment(s)", segment_ids.len());
-        return Ok(searcher.num_docs() as usize);
+    debug_log!("Skipping merge - only {} segment(s)", segment_ids.len());
+    return Ok(searcher.num_docs() as usize);
     }
     
     // Perform efficient segment-level merge (Quickwit's approach)
@@ -1855,14 +1932,14 @@ fn calculate_directory_size(dir_path: &Path) -> Result<u64> {
     let mut total_size = 0u64;
     
     if let Ok(entries) = std::fs::read_dir(dir_path) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_file() {
-                if let Ok(metadata) = std::fs::metadata(&path) {
-                    total_size += metadata.len();
-                }
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_file() {
+            if let Ok(metadata) = std::fs::metadata(&path) {
+                total_size += metadata.len();
             }
         }
+    }
     }
     
     Ok(total_size)
@@ -1880,53 +1957,53 @@ async fn upload_split_to_s3_impl(local_split_path: &Path, s3_url: &str, config: 
     
     // Create storage resolver with AWS config from MergeConfig
     let s3_config = if let Some(ref aws_config) = config.aws_config {
-        S3StorageConfig {
-            region: Some(aws_config.region.clone()),
-            access_key_id: aws_config.access_key.clone(),
-            secret_access_key: aws_config.secret_key.clone(),
-            session_token: aws_config.session_token.clone(),
-            endpoint: aws_config.endpoint.clone(),
-            force_path_style_access: aws_config.force_path_style,
-            ..Default::default()
-        }
+    S3StorageConfig {
+        region: Some(aws_config.region.clone()),
+        access_key_id: aws_config.access_key.clone(),
+        secret_access_key: aws_config.secret_key.clone(),
+        session_token: aws_config.session_token.clone(),
+        endpoint: aws_config.endpoint.clone(),
+        force_path_style_access: aws_config.force_path_style,
+        ..Default::default()
+    }
     } else {
-        S3StorageConfig::default()
+    S3StorageConfig::default()
     };
     let storage_resolver = StorageResolver::builder()
-        .register(LocalFileStorageFactory::default())
-        .register(S3CompatibleObjectStorageFactory::new(s3_config))
-        .build()
-        .map_err(|e| anyhow!("Failed to create storage resolver for upload: {}", e))?;
+    .register(LocalFileStorageFactory::default())
+    .register(S3CompatibleObjectStorageFactory::new(s3_config))
+    .build()
+    .map_err(|e| anyhow!("Failed to create storage resolver for upload: {}", e))?;
     
     // For S3 URIs, we need to resolve the parent directory, not the file itself
     let (storage_uri, file_name) = if s3_uri.protocol() == Protocol::S3 {
-        let uri_str = s3_uri.as_str();
-        if let Some(last_slash) = uri_str.rfind('/') {
-            let parent_uri_str = &uri_str[..last_slash]; // Get s3://bucket/splits
-            let file_name = &uri_str[last_slash + 1..];  // Get filename
-            debug_log!("Split S3 URI for upload into parent: {} and file: {}", parent_uri_str, file_name);
-            (Uri::from_str(parent_uri_str)?, file_name.to_string())
-        } else {
-            return Err(anyhow!("Invalid S3 URL format: {}", s3_url));
-        }
+    let uri_str = s3_uri.as_str();
+    if let Some(last_slash) = uri_str.rfind('/') {
+        let parent_uri_str = &uri_str[..last_slash]; // Get s3://bucket/splits
+        let file_name = &uri_str[last_slash + 1..];  // Get filename
+        debug_log!("Split S3 URI for upload into parent: {} and file: {}", parent_uri_str, file_name);
+        (Uri::from_str(parent_uri_str)?, file_name.to_string())
     } else {
-        return Err(anyhow!("Only S3 URLs are supported for upload, got: {}", s3_url));
+        return Err(anyhow!("Invalid S3 URL format: {}", s3_url));
+    }
+    } else {
+    return Err(anyhow!("Only S3 URLs are supported for upload, got: {}", s3_url));
     };
     
     // Resolve storage for the URI
     let storage = storage_resolver.resolve(&storage_uri).await
-        .map_err(|e| anyhow!("Failed to resolve storage for '{}': {}", s3_url, e))?;
+    .map_err(|e| anyhow!("Failed to resolve storage for '{}': {}", s3_url, e))?;
     
     // Read the local split file
     let split_data = std::fs::read(local_split_path)
-        .map_err(|e| anyhow!("Failed to read local split file {:?}: {}", local_split_path, e))?;
+    .map_err(|e| anyhow!("Failed to read local split file {:?}: {}", local_split_path, e))?;
     
     let split_size = split_data.len();
     debug_log!("Read {} bytes from local split file", split_size);
     
     // Upload the split file to S3
     storage.put(Path::new(&file_name), Box::new(split_data)).await
-        .map_err(|e| anyhow!("Failed to upload split to S3: {}", e))?;
+    .map_err(|e| anyhow!("Failed to upload split to S3: {}", e))?;
     
     debug_log!("Successfully uploaded {} bytes to S3: {}", split_size, s3_url);
     Ok(())
@@ -1935,8 +2012,8 @@ async fn upload_split_to_s3_impl(local_split_path: &Path, s3_url: &str, config: 
 /// Synchronous wrapper for S3 upload
 fn upload_split_to_s3(local_split_path: &Path, s3_url: &str, config: &MergeConfig) -> Result<()> {
     let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
+    .enable_all()
+    .build()?;
     runtime.block_on(upload_split_to_s3_impl(local_split_path, s3_url, config))
 }
 
@@ -1953,7 +2030,26 @@ fn create_merged_split_file(merged_index_path: &Path, output_path: &str, metadat
     let merged_index = TantivyIndex::open(merged_directory)?;
     
     // Use the existing split creation logic and capture footer offsets
-    let footer_offsets = create_quickwit_split(&merged_index, &merged_index_path.to_path_buf(), &PathBuf::from(output_path), metadata)?;
+    // Create a default config for merged splits
+    let default_config = SplitConfig {
+    index_uid: "merged".to_string(),
+    source_id: "merge".to_string(),
+    node_id: "merge-node".to_string(),
+    doc_mapping_uid: "default".to_string(),
+    partition_id: 0,
+    time_range_start: None,
+    time_range_end: None,
+    tags: BTreeSet::new(),
+    metadata: HashMap::new(),
+    streaming_chunk_size: 64_000_000,
+    enable_progress_tracking: false,
+    enable_streaming_io: true,
+    };
+
+    // Create runtime for async call
+    let runtime = tokio::runtime::Runtime::new()
+    .map_err(|e| anyhow::anyhow!("Failed to create async runtime: {}", e))?;
+    let footer_offsets = runtime.block_on(create_quickwit_split(&merged_index, &merged_index_path.to_path_buf(), &PathBuf::from(output_path), metadata, &default_config))?;
     
     debug_log!("Successfully created merged split file: {} with footer offsets: {:?}", output_path, footer_offsets);
     Ok(footer_offsets)

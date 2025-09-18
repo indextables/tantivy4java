@@ -62,8 +62,19 @@ public class Index implements AutoCloseable {
      * @param reuse Whether to reuse existing index at path
      */
     public Index(Schema schema, String path, boolean reuse) {
-        this.nativePtr = nativeNew(schema.getNativePtr(), path, reuse);
-        this.indexPath = (path != null && !path.isEmpty()) ? path : null;
+        String resolvedPath;
+        if (path == null || path.isEmpty()) {
+            // For null or empty paths, pass them through unchanged to maintain compatibility
+            resolvedPath = path;
+        } else if (FileSystemConfig.hasGlobalRoot()) {
+            // Only apply FileSystemConfig when there's actually a root configured
+            resolvedPath = FileSystemConfig.resolvePath(path);
+        } else {
+            // No root configured, pass path unchanged
+            resolvedPath = path;
+        }
+        this.nativePtr = nativeNew(schema.getNativePtr(), resolvedPath, reuse);
+        this.indexPath = resolvedPath;
     }
 
     /**
@@ -89,9 +100,10 @@ public class Index implements AutoCloseable {
      * @return Index instance
      */
     public static Index open(String path) {
-        long ptr = nativeOpen(path);
+        String resolvedPath = FileSystemConfig.hasGlobalRoot() ? FileSystemConfig.resolvePath(path) : path;
+        long ptr = nativeOpen(resolvedPath);
         Index index = new Index(ptr);
-        index.indexPath = path; // Store the path for opened indices
+        index.indexPath = resolvedPath; // Store the resolved path for opened indices
         return index;
     }
 
@@ -101,7 +113,8 @@ public class Index implements AutoCloseable {
      * @return true if index exists, false otherwise
      */
     public static boolean exists(String path) {
-        return nativeExists(path);
+        String resolvedPath = FileSystemConfig.hasGlobalRoot() ? FileSystemConfig.resolvePath(path) : path;
+        return nativeExists(resolvedPath);
     }
 
     Index(long nativePtr) {
