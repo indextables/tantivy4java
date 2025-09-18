@@ -483,10 +483,35 @@ public class QuickwitSplit {
         private final long partitionId;
         private final List<String> deleteQueries;
         private final AwsConfig awsConfig;
+        private final String tempDirectoryPath;
 
         /**
          * Create a new merge configuration.
-         * 
+         *
+         * @param indexUid Unique identifier for the index
+         * @param sourceId Source identifier
+         * @param nodeId Node identifier that will create the merged split
+         * @param docMappingUid Document mapping unique identifier (must match across all splits)
+         * @param partitionId Partition identifier (default: 0)
+         * @param deleteQueries Optional list of delete queries to apply during merge
+         * @param awsConfig AWS configuration for S3 access (optional)
+         * @param tempDirectoryPath Custom path for temporary directories (optional, platform-specific)
+         */
+        public MergeConfig(String indexUid, String sourceId, String nodeId, String docMappingUid,
+                          long partitionId, List<String> deleteQueries, AwsConfig awsConfig, String tempDirectoryPath) {
+            this.indexUid = indexUid;
+            this.sourceId = sourceId;
+            this.nodeId = nodeId;
+            this.docMappingUid = docMappingUid;
+            this.partitionId = partitionId;
+            this.deleteQueries = deleteQueries;
+            this.awsConfig = awsConfig;
+            this.tempDirectoryPath = tempDirectoryPath;
+        }
+
+        /**
+         * Create a new merge configuration without temp directory customization.
+         *
          * @param indexUid Unique identifier for the index
          * @param sourceId Source identifier
          * @param nodeId Node identifier that will create the merged split
@@ -497,13 +522,7 @@ public class QuickwitSplit {
          */
         public MergeConfig(String indexUid, String sourceId, String nodeId, String docMappingUid,
                           long partitionId, List<String> deleteQueries, AwsConfig awsConfig) {
-            this.indexUid = indexUid;
-            this.sourceId = sourceId;
-            this.nodeId = nodeId;
-            this.docMappingUid = docMappingUid;
-            this.partitionId = partitionId;
-            this.deleteQueries = deleteQueries;
-            this.awsConfig = awsConfig;
+            this(indexUid, sourceId, nodeId, docMappingUid, partitionId, deleteQueries, awsConfig, null);
         }
         
         /**
@@ -544,6 +563,19 @@ public class QuickwitSplit {
             this(indexUid, sourceId, nodeId, "default", 0L, null, awsConfig);
         }
 
+        /**
+         * Create a merge configuration with custom temp directory for platforms like Databricks.
+         *
+         * @param indexUid Unique identifier for the index
+         * @param sourceId Source identifier
+         * @param nodeId Node identifier that will create the merged split
+         * @param awsConfig AWS configuration for S3 access
+         * @param tempDirectoryPath Custom temp directory path (e.g., "/local_disk0" for Databricks)
+         */
+        public MergeConfig(String indexUid, String sourceId, String nodeId, AwsConfig awsConfig, String tempDirectoryPath) {
+            this(indexUid, sourceId, nodeId, "default", 0L, null, awsConfig, tempDirectoryPath);
+        }
+
         // Getters
         public String getIndexUid() { return indexUid; }
         public String getSourceId() { return sourceId; }
@@ -552,6 +584,7 @@ public class QuickwitSplit {
         public long getPartitionId() { return partitionId; }
         public List<String> getDeleteQueries() { return deleteQueries; }
         public AwsConfig getAwsConfig() { return awsConfig; }
+        public String getTempDirectoryPath() { return tempDirectoryPath; }
     }
 
     /**

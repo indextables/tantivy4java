@@ -47,6 +47,8 @@ uuid = { version = "1.0", features = ["v4", "serde"] }
 tokio = { version = "1.45", features = ["full"] }
 lazy_static = "1.4"
 tempfile = "3"
+postcard = { version = "1.1", features = ["heapless"] }
+num_cpus = "1.0"
 
 [build-dependencies]
 jni = "0.21.1"

@@ -917,7 +917,7 @@ pub extern "system" fn Java_com_tantivy4java_QuickwitSplit_nativeValidateSplit(
 }
 
 /// Configuration for split merging operations
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct MergeConfig {
     index_uid: String,
     source_id: String,
@@ -926,6 +926,7 @@ struct MergeConfig {
     partition_id: u64,
     delete_queries: Option<Vec<String>>,
     aws_config: Option<AwsConfig>,
+    temp_directory_path: Option<String>,
 }
 
 /// AWS configuration for S3-compatible storage (copy from split_searcher.rs)
@@ -1065,7 +1066,20 @@ fn extract_merge_config(env: &mut JNIEnv, config_obj: &JObject) -> Result<MergeC
         },
         Err(_) => None,
     };
-    
+
+    // Extract custom temp directory path if present
+    let temp_directory_path = match env.call_method(config_obj, "getTempDirectoryPath", "()Ljava/lang/String;", &[]) {
+        Ok(temp_result) => {
+            let temp_obj = temp_result.l()?;
+            if env.is_same_object(&temp_obj, JObject::null())? {
+                None
+            } else {
+                Some(jstring_to_string(env, &temp_obj.into())?)
+            }
+        },
+        Err(_) => None,
+    };
+
     Ok(MergeConfig {
         index_uid,
         source_id,
@@ -1074,6 +1088,7 @@ fn extract_merge_config(env: &mut JNIEnv, config_obj: &JObject) -> Result<MergeC
         partition_id,
         delete_queries,
         aws_config,
+        temp_directory_path,
     })
 }
 
@@ -1176,6 +1191,227 @@ fn extract_split_to_directory_impl(split_path: &Path, output_dir: &Path) -> Resu
     Ok(())
 }
 
+/// Create a temporary directory with custom base path for platform-specific storage
+fn create_temp_directory_with_base(prefix: &str, base_path: Option<&str>) -> Result<temp::TempDir> {
+    let mut builder = temp::Builder::new();
+    builder.prefix(prefix);
+
+    // Set custom temporary directory base path if provided
+    if let Some(custom_base) = base_path {
+        // Validate that the custom base path exists and is writable
+        let base_path_buf = PathBuf::from(custom_base);
+        if !base_path_buf.exists() {
+            return Err(anyhow!("Custom temp directory base path does not exist: {}", custom_base));
+        }
+        if !base_path_buf.is_dir() {
+            return Err(anyhow!("Custom temp directory base path is not a directory: {}", custom_base));
+        }
+
+        debug_log!("🏗️ Using custom temp directory base: {}", custom_base);
+        return builder.tempdir_in(&base_path_buf)
+            .map_err(|e| anyhow!("Failed to create temp directory with prefix '{}' in base '{}': {}", prefix, custom_base, e));
+    }
+
+    builder.tempdir()
+        .map_err(|e| anyhow!("Failed to create temp directory with prefix '{}': {}", prefix, e))
+}
+
+/// Represents an extracted split with its temporary directory and metadata
+#[derive(Debug)]
+struct ExtractedSplit {
+    temp_dir: temp::TempDir,
+    temp_path: PathBuf,
+    split_url: String,
+    split_index: usize,
+}
+
+/// ⚡ PARALLEL SPLIT DOWNLOADING AND EXTRACTION
+/// Downloads and extracts multiple splits concurrently for maximum performance
+/// Uses connection pooling and resource management to prevent overwhelming
+async fn download_and_extract_splits_parallel(
+    split_urls: &[String],
+    merge_id: &str,
+    config: &MergeConfig,
+) -> Result<Vec<ExtractedSplit>> {
+    use futures::future::try_join_all;
+    use std::sync::Arc;
+
+    debug_log!("🚀 Starting parallel download of {} splits with merge_id: {}", split_urls.len(), merge_id);
+
+    // Create semaphore to limit concurrent downloads - optimized for Spark on high-performance EC2
+    // Scale aggressively: at least 1 download per CPU core, up to 64 for very large instances
+    let concurrent_downloads = num_cpus::get().min(64).max(4);
+
+    let download_semaphore = Arc::new(tokio::sync::Semaphore::new(concurrent_downloads));
+    debug_log!("🚀 Configured {} concurrent downloads for {}-core system (1:1 CPU scaling, max 64)", concurrent_downloads, num_cpus::get());
+
+    // Create shared storage resolver for connection pooling
+    let shared_storage_resolver = Arc::new(create_storage_resolver(config)?);
+
+    // Create download tasks for each split
+    let download_tasks: Vec<_> = split_urls
+        .iter()
+        .enumerate()
+        .map(|(i, split_url)| {
+            let split_url = split_url.clone();
+            let merge_id = merge_id.to_string();
+            let config = config.clone();
+            let semaphore = Arc::clone(&download_semaphore);
+            let storage_resolver = Arc::clone(&shared_storage_resolver);
+
+            async move {
+                // Acquire semaphore permit to limit concurrent downloads
+                let _permit = semaphore.acquire().await
+                    .map_err(|e| anyhow!("Failed to acquire download permit: {}", e))?;
+
+                debug_log!("📥 Starting download task {} for: {}", i, split_url);
+
+                // Download and extract single split
+                download_and_extract_single_split(
+                    &split_url,
+                    i,
+                    &merge_id,
+                    &config,
+                    &storage_resolver,
+                ).await
+            }
+        })
+        .collect();
+
+    // Execute all downloads concurrently and wait for completion
+    debug_log!("⏳ Waiting for {} concurrent download tasks to complete", download_tasks.len());
+    let results = try_join_all(download_tasks).await?;
+
+    debug_log!("✅ All {} download tasks completed successfully", results.len());
+    Ok(results)
+}
+
+/// Downloads and extracts a single split (used by parallel download function)
+async fn download_and_extract_single_split(
+    split_url: &str,
+    split_index: usize,
+    merge_id: &str,
+    config: &MergeConfig,
+    storage_resolver: &StorageResolver,
+) -> Result<ExtractedSplit> {
+    use quickwit_storage::Storage;
+    use std::path::Path;
+
+    // Create process-specific temp directory to avoid race conditions
+    let temp_extract_dir = create_temp_directory_with_base(
+        &format!("tantivy4java_merge_{}_split_{}_", merge_id, split_index),
+        config.temp_directory_path.as_deref()
+    )?;
+    let temp_extract_path = temp_extract_dir.path().to_path_buf();
+
+    debug_log!("📁 Split {}: Created temp directory: {:?}", split_index, temp_extract_path);
+
+    if split_url.contains("://") && !split_url.starts_with("file://") {
+        // Handle S3/remote URLs
+        debug_log!("🌐 Split {}: Processing S3/remote URL: {}", split_index, split_url);
+
+        // Parse the split URI
+        let split_uri = Uri::from_str(split_url)?;
+
+        // For S3 URIs, we need to resolve the parent directory, not the file itself
+        let (storage_uri, file_name) = if split_uri.protocol() == Protocol::S3 {
+            let uri_str = split_uri.as_str();
+            if let Some(last_slash) = uri_str.rfind('/') {
+                let parent_uri_str = &uri_str[..last_slash]; // Get s3://bucket/splits
+                let file_name = &uri_str[last_slash + 1..];  // Get filename
+                debug_log!("🔗 Split {}: Split S3 URI into parent: {} and file: {}",
+                          split_index, parent_uri_str, file_name);
+                (Uri::from_str(parent_uri_str)?, Some(file_name.to_string()))
+            } else {
+                (split_uri.clone(), None)
+            }
+        } else {
+            (split_uri.clone(), None)
+        };
+
+        // Resolve storage for the URI (uses cached/pooled connections)
+        let storage = storage_resolver.resolve(&storage_uri).await
+            .map_err(|e| anyhow!("Split {}: Failed to resolve storage for '{}': {}", split_index, split_url, e))?;
+
+        // Download the split file to temporary location
+        let split_filename = file_name.unwrap_or_else(|| {
+            split_url.split('/').last().unwrap_or("split.split").to_string()
+        });
+        let temp_split_path = temp_extract_path.join(&split_filename);
+
+        debug_log!("⬇️ Split {}: Downloading {} to {:?}", split_index, split_url, temp_split_path);
+
+        // Download the split file asynchronously
+        let split_data = storage.get_all(Path::new(&split_filename)).await
+            .map_err(|e| anyhow!("Split {}: Failed to download from {}: {}", split_index, split_url, e))?;
+
+        // Write to disk asynchronously
+        tokio::fs::write(&temp_split_path, &split_data).await
+            .map_err(|e| anyhow!("Split {}: Failed to write to {:?}: {}", split_index, temp_split_path, e))?;
+
+        debug_log!("💾 Split {}: Downloaded {} bytes to {:?}", split_index, split_data.len(), temp_split_path);
+
+        // Extract the downloaded split to the temp directory
+        // CRITICAL: For merge operations, use full extraction instead of lazy loading
+        debug_log!("🔧 Split {}: MERGE EXTRACTION - Forcing full split extraction (no lazy loading) for merge safety", split_index);
+        extract_split_to_directory_impl(&temp_split_path, &temp_extract_path)?;
+
+    } else {
+        // Handle local file URLs
+        let split_path = if split_url.starts_with("file://") {
+            split_url.strip_prefix("file://").unwrap_or(split_url)
+        } else {
+            split_url
+        };
+
+        debug_log!("📂 Split {}: Processing local file: {}", split_index, split_path);
+
+        // Validate split exists
+        if !Path::new(split_path).exists() {
+            return Err(anyhow!("Split {}: File not found: {}", split_index, split_path));
+        }
+
+        // Extract the split to a writable directory
+        // CRITICAL: For merge operations, use full extraction instead of lazy loading
+        debug_log!("🔧 Split {}: MERGE EXTRACTION - Forcing full split extraction (no lazy loading) for merge safety", split_index);
+        extract_split_to_directory_impl(Path::new(split_path), &temp_extract_path)?;
+    }
+
+    debug_log!("✅ Split {}: Successfully downloaded and extracted to {:?}", split_index, temp_extract_path);
+
+    Ok(ExtractedSplit {
+        temp_dir: temp_extract_dir,
+        temp_path: temp_extract_path,
+        split_url: split_url.to_string(),
+        split_index,
+    })
+}
+
+/// Creates a shared storage resolver for connection pooling across downloads
+fn create_storage_resolver(config: &MergeConfig) -> Result<StorageResolver> {
+    use quickwit_storage::{LocalFileStorageFactory, S3CompatibleObjectStorageFactory};
+
+    let s3_config = if let Some(ref aws_config) = config.aws_config {
+        S3StorageConfig {
+            region: Some(aws_config.region.clone()),
+            access_key_id: aws_config.access_key.clone(),
+            secret_access_key: aws_config.secret_key.clone(),
+            session_token: aws_config.session_token.clone(),
+            endpoint: aws_config.endpoint.clone(),
+            force_path_style_access: aws_config.force_path_style,
+            ..Default::default()
+        }
+    } else {
+        S3StorageConfig::default()
+    };
+
+    StorageResolver::builder()
+        .register(LocalFileStorageFactory::default())
+        .register(S3CompatibleObjectStorageFactory::new(s3_config))
+        .build()
+        .map_err(|e| anyhow!("Failed to create storage resolver: {}", e))
+}
+
 /// Implementation of split merging using Quickwit's efficient approach
 /// This follows Quickwit's MergeExecutor pattern for memory-efficient large-scale merges
 /// CRITICAL: For merge operations, we disable lazy loading and force full file downloads
@@ -1189,8 +1425,9 @@ fn merge_splits_impl(split_urls: &[String], output_path: &str, config: &MergeCon
     debug_log!("🔧 MERGE OPERATION: Implementing split merge using Quickwit's efficient approach for {} splits", split_urls.len());
     debug_log!("🚨 MERGE SAFETY: Lazy loading DISABLED for merge operations to prevent range assertion failures");
     
-    // Create async runtime for async operations with proper cleanup
-    let runtime = tokio::runtime::Builder::new_current_thread()
+    // Create multi-threaded async runtime for parallel operations - optimized for Spark
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(num_cpus::get().min(16).max(4))  // Scale with cores, 4-16 worker threads
         .enable_all()
         .build()?;
     
@@ -1203,112 +1440,37 @@ fn merge_splits_impl(split_urls: &[String], output_path: &str, config: &MergeCon
         let mut total_size = 0u64;
         let mut temp_dirs: Vec<temp::TempDir> = Vec::new(); // Keep track of temp dirs for proper cleanup
     
-    for (i, split_url) in split_urls.iter().enumerate() {
-        debug_log!("Opening split directory {}: {}", i, split_url);
-        
-        // Support both file-based and S3/remote splits
-        let temp_extract_dir = temp::TempDir::new()?;
-        let temp_extract_path = temp_extract_dir.path();
-        
-        debug_log!("Extracting split {} to temporary directory: {:?}", i, temp_extract_path);
-        
-        if split_url.contains("://") && !split_url.starts_with("file://") {
-            // Handle S3/remote URLs
-            debug_log!("Processing S3/remote split URL: {}", split_url);
-            
-            // Parse the split URI
-            let split_uri = Uri::from_str(split_url)?;
-            
-            // Create storage resolver with AWS config from MergeConfig
-            let s3_config = if let Some(ref aws_config) = config.aws_config {
-                S3StorageConfig {
-                    region: Some(aws_config.region.clone()),
-                    access_key_id: aws_config.access_key.clone(),
-                    secret_access_key: aws_config.secret_key.clone(),
-                    session_token: aws_config.session_token.clone(),
-                    endpoint: aws_config.endpoint.clone(),
-                    force_path_style_access: aws_config.force_path_style,
-                    ..Default::default()
-                }
-            } else {
-                S3StorageConfig::default()
-            };
-            let storage_resolver = StorageResolver::builder()
-                .register(LocalFileStorageFactory::default())
-                .register(S3CompatibleObjectStorageFactory::new(s3_config))
-                .build()
-                .map_err(|e| anyhow!("Failed to create storage resolver: {}", e))?;
-            
-            // For S3 URIs, we need to resolve the parent directory, not the file itself
-            let (storage_uri, file_name) = if split_uri.protocol() == Protocol::S3 {
-                let uri_str = split_uri.as_str();
-                if let Some(last_slash) = uri_str.rfind('/') {
-                    let parent_uri_str = &uri_str[..last_slash]; // Get s3://bucket/splits
-                    let file_name = &uri_str[last_slash + 1..];  // Get filename
-                    debug_log!("Split S3 URI into parent: {} and file: {}", parent_uri_str, file_name);
-                    (Uri::from_str(parent_uri_str)?, Some(file_name.to_string()))
-                } else {
-                    (split_uri.clone(), None)
-                }
-            } else {
-                (split_uri.clone(), None)
-            };
-            
-            // Resolve storage for the URI
-            let storage = runtime.block_on(async {
-                storage_resolver.resolve(&storage_uri).await
-            }).map_err(|e| anyhow!("Failed to resolve storage for '{}': {}", split_url, e))?;
-            
-            // Download the split file to temporary location
-            let split_filename = file_name.unwrap_or_else(|| {
-                split_url.split('/').last().unwrap_or("split.split").to_string()
-            });
-            let temp_split_path = temp_extract_path.join(&split_filename);
-            
-            debug_log!("Downloading split {} to {:?}", split_url, temp_split_path);
-            
-            // Download the split file
-            let split_data = runtime.block_on(async {
-                storage.get_all(Path::new(&split_filename)).await
-            }).map_err(|e| anyhow!("Failed to download split from {}: {}", split_url, e))?;
-            
-            std::fs::write(&temp_split_path, &split_data)?;
-            debug_log!("Downloaded {} bytes to {:?}", split_data.len(), temp_split_path);
-            
-            // Extract the downloaded split to the temp directory
-            // CRITICAL: For merge operations, use full extraction instead of lazy loading
-            debug_log!("🔧 MERGE EXTRACTION: Forcing full split extraction (no lazy loading) for merge safety");
-            extract_split_to_directory_impl(&temp_split_path, temp_extract_path)?;
-            
-        } else {
-            // Handle local file URLs
-            let split_path = if split_url.starts_with("file://") {
-                split_url.strip_prefix("file://").unwrap_or(split_url)
-            } else {
-                split_url
-            };
-            
-            // Validate split exists
-            if !Path::new(split_path).exists() {
-                return Err(anyhow!("Split file not found: {}", split_path));
-            }
-            
-            // Extract the split to a writable directory
-            // CRITICAL: For merge operations, use full extraction instead of lazy loading
-            debug_log!("🔧 MERGE EXTRACTION: Forcing full split extraction (no lazy loading) for merge safety");
-            extract_split_to_directory_impl(Path::new(split_path), temp_extract_path)?;
-        }
-        
+    // Generate unique merge ID for this operation to prevent temp directory conflicts
+    let merge_id = format!("{}_{}", std::process::id(), uuid::Uuid::new_v4().to_string()[..8].to_string());
+    debug_log!("🔧 MERGE ID: {} (process-scoped to prevent concurrency conflicts)", merge_id);
+
+    // ⚡ PARALLEL SPLIT DOWNLOAD AND EXTRACTION OPTIMIZATION
+    debug_log!("🚀 PARALLEL DOWNLOAD: Starting concurrent download of {} splits", split_urls.len());
+
+    let extracted_splits = runtime.block_on(async {
+        download_and_extract_splits_parallel(split_urls, &merge_id, config).await
+    })?;
+
+    debug_log!("✅ PARALLEL DOWNLOAD: Completed concurrent processing of {} splits", extracted_splits.len());
+
+    // Process the extracted splits to create directories and metadata
+    for extracted_split in extracted_splits.into_iter() {
+        let i = extracted_split.split_index;
+        let split_url = &extracted_split.split_url;
+        let temp_extract_path = &extracted_split.temp_path;
+
+        debug_log!("🔧 Processing extracted split {}: {}", i, split_url);
+
         // Open the extracted directory as writable MmapDirectory
         let extracted_directory = MmapDirectory::open(temp_extract_path)?;
         let temp_index = TantivyIndex::open(extracted_directory.box_clone())?;
         let index_meta = temp_index.load_metas()?;
-        
+
         // Count documents and calculate size efficiently
         let reader = temp_index.reader()?;
         let searcher = reader.searcher();
         let doc_count = searcher.num_docs();
-        
+
         // Calculate split size based on source type
         let split_size = if split_url.contains("://") && !split_url.starts_with("file://") {
             // For S3/remote splits, get size from the temporary downloaded file
@@ -1324,16 +1486,16 @@ fn merge_splits_impl(split_urls: &[String], output_path: &str, config: &MergeCon
             };
             std::fs::metadata(split_path)?.len()
         };
-        
-        debug_log!("Extracted split {} has {} documents, {} bytes", i, doc_count, split_size);
+
+        debug_log!("📊 Extracted split {} has {} documents, {} bytes", i, doc_count, split_size);
         
         total_docs += doc_count as usize;
         total_size += split_size;
         split_directories.push(extracted_directory.box_clone());
         index_metas.push(index_meta);
-        
+
         // Keep temp directory alive for merge duration - store in vector for proper cleanup
-        temp_dirs.push(temp_extract_dir);
+        temp_dirs.push(extracted_split.temp_dir);
     }
     
     debug_log!("Opened {} splits with total {} documents, {} bytes", split_urls.len(), total_docs, total_size);
@@ -1342,25 +1504,38 @@ fn merge_splits_impl(split_urls: &[String], output_path: &str, config: &MergeCon
     let union_index_meta = combine_index_meta(index_metas)?;
     debug_log!("Combined metadata from {} splits", split_urls.len());
     
-    // 3. Create shadowing meta.json directory (Quickwit's metadata pattern)
-    let shadowing_meta_directory = create_shadowing_meta_json_directory(union_index_meta)?;
-    debug_log!("Created shadowing metadata directory");
+    // 3. Create merge-specific shadowing meta.json directory (Quickwit's metadata pattern)
+    let shadowing_meta_directory = create_shadowing_meta_json_directory(union_index_meta, &merge_id, config.temp_directory_path.as_deref())?;
+    debug_log!("Created merge-specific shadowing metadata directory for merge ID: {}", merge_id);
     
     // 4. Set up output directory with sequential access optimization
-    // Handle S3 URLs by creating a local temporary directory
+    // Handle S3 URLs by creating a local temporary directory with unique naming
     let (output_temp_dir, is_s3_output, _temp_dir_guard) = if output_path.contains("://") && !output_path.starts_with("file://") {
-        // For S3/remote URLs, create a local temporary directory
-        let temp_dir = temp::TempDir::new()?;
-        let temp_path = temp_dir.path().join("temp_merge_output");
+        // For S3/remote URLs, create a local temporary directory with unique merge ID
+        let temp_dir = create_temp_directory_with_base(
+            &format!("tantivy4java_merge_{}_output_", merge_id),
+            config.temp_directory_path.as_deref()
+        )?;
+        let temp_path = temp_dir.path().join("merge_output");
         std::fs::create_dir_all(&temp_path)?;
         debug_log!("Created local temporary directory for S3 output: {:?}", temp_path);
         (temp_path, true, Some(temp_dir))
     } else {
-        // For local files, create temp directory next to output file
-        let output_dir_path = Path::new(output_path).parent()
-            .ok_or_else(|| anyhow!("Cannot determine parent directory for output path"))?;
-        let temp_dir = output_dir_path.join("temp_merge_output");
-        std::fs::create_dir_all(&temp_dir)?;
+        // For local files, prefer custom temp path if provided, otherwise use output parent directory
+        let temp_dir = if let Some(custom_base) = &config.temp_directory_path {
+            let temp_dir = create_temp_directory_with_base(
+                &format!("tantivy4java_merge_{}_output_", merge_id),
+                Some(custom_base)
+            )?;
+            temp_dir.path().to_path_buf()
+        } else {
+            // Fallback to next to output file
+            let output_dir_path = Path::new(output_path).parent()
+                .ok_or_else(|| anyhow!("Cannot determine parent directory for output path"))?;
+            let temp_dir = output_dir_path.join(format!("temp_merge_output_{}", merge_id));
+            std::fs::create_dir_all(&temp_dir)?;
+            temp_dir
+        };
         debug_log!("Created local temporary directory: {:?}", temp_dir);
         (temp_dir, false, None)
     };
@@ -1587,21 +1762,40 @@ fn combine_index_meta(mut index_metas: Vec<tantivy::IndexMeta>) -> Result<tantiv
     Ok(union_index_meta)
 }
 
-/// Create shadowing meta.json directory using Quickwit's metadata pattern
-fn create_shadowing_meta_json_directory(index_meta: tantivy::IndexMeta) -> Result<tantivy::directory::RamDirectory> {
-    use tantivy::directory::RamDirectory;
-    
-    debug_log!("Creating shadowing meta.json directory");
-    
+/// Create merge-specific shadowing meta.json directory using persistent file approach
+fn create_shadowing_meta_json_directory(index_meta: tantivy::IndexMeta, merge_id: &str, temp_base_path: Option<&str>) -> Result<tantivy::directory::MmapDirectory> {
+    use tantivy::directory::MmapDirectory;
+
+    debug_log!("Creating merge-specific persistent shadowing meta.json directory for merge ID: {}", merge_id);
+
+    // Create persistent temporary directory for meta.json (avoids RAM directory race conditions)
+    let meta_temp_dir = create_temp_directory_with_base(
+        &format!("tantivy4java_meta_{}_", merge_id),
+        temp_base_path
+    )?;
+    let meta_temp_path = meta_temp_dir.path();
+
+    debug_log!("Created persistent meta directory: {:?}", meta_temp_path);
+
     // Serialize the combined metadata
     let union_index_meta_json = serde_json::to_string_pretty(&index_meta)?;
-    
-    // Create RAM directory with the meta.json file
-    let ram_directory = RamDirectory::default();
-    ram_directory.atomic_write(Path::new("meta.json"), union_index_meta_json.as_bytes())?;
-    
-    debug_log!("Created shadowing directory with meta.json ({} bytes)", union_index_meta_json.len());
-    Ok(ram_directory)
+
+    // Create MmapDirectory with the meta.json file (persistent, not RAM-based)
+    let mmap_directory = MmapDirectory::open(meta_temp_path)?;
+    mmap_directory.atomic_write(Path::new("meta.json"), union_index_meta_json.as_bytes())?;
+
+    // Also create merge-specific backup with unique name for debugging
+    let backup_meta_name = format!("meta_{}.json", merge_id);
+    mmap_directory.atomic_write(Path::new(&backup_meta_name), union_index_meta_json.as_bytes())?;
+
+    debug_log!("Created persistent shadowing directory with meta.json ({} bytes) for merge: {} at {:?}",
+               union_index_meta_json.len(), merge_id, meta_temp_path);
+
+    // Important: Keep temp_dir alive by leaking it (will be cleaned up by OS)
+    // This prevents the race condition where the directory gets cleaned up while other merges are using it
+    std::mem::forget(meta_temp_dir);
+
+    Ok(mmap_directory)
 }
 
 /// Perform segment-level merge using Quickwit/Tantivy's efficient approach
@@ -1612,8 +1806,13 @@ async fn perform_segment_merge(union_index: &tantivy::Index) -> Result<usize> {
     
     debug_log!("Performing segment-level merge");
     
-    // Create writer with memory limit (15MB like Quickwit)
-    let mut index_writer: IndexWriter = union_index.writer_with_num_threads(1, 15_000_000)?;
+    // Create writer with more threads and memory for better concurrency - optimized for Spark
+    // Scale IndexWriter threads aggressively: use 50% of cores, up to 16 threads max
+    let num_threads = (num_cpus::get() / 2).max(1).min(16);
+    let memory_per_thread = 20_000_000;  // 20MB per thread for better performance on large instances
+    let memory_limit = num_threads * memory_per_thread;  // Ensure sufficient memory per thread
+    let mut index_writer: IndexWriter = union_index.writer_with_num_threads(num_threads, memory_limit)?;
+    debug_log!("Created IndexWriter with {} threads and {}MB memory", num_threads, memory_limit / 1_000_000);
     
     // CRITICAL: Use NoMergePolicy to prevent garbage collection during merge
     // This prevents delete operations on read-only BundleDirectories
