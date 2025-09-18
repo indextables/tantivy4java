@@ -492,7 +492,16 @@ public class SplitCacheManager implements AutoCloseable {
         if (!this.awsConfig.isEmpty()) {
             splitConfig.put("aws_config", this.awsConfig);
         }
-        
+
+        // Extract specific values for native layer compatibility (based on commit b53bf9d)
+        splitConfig.put("footer_start_offset", metadata.getFooterStartOffset());
+        splitConfig.put("footer_end_offset", metadata.getFooterEndOffset());
+
+        // CRITICAL: Extract docMappingJson and pass as "doc_mapping" key for native optimization
+        if (metadata.getDocMappingJson() != null && !metadata.getDocMappingJson().trim().isEmpty()) {
+            splitConfig.put("doc_mapping", metadata.getDocMappingJson());
+        }
+
         // Pass the entire metadata object to the native layer
         splitConfig.put("split_metadata", metadata);
         

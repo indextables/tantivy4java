@@ -2633,7 +2633,6 @@ fn create_token_list(env: &mut JNIEnv, tokens: Vec<String>) -> Result<jobject, a
     Ok(array_list.into_raw())
 }
 
-<<<<<<< HEAD
 // ============================================================================
 // QUICKWIT AGGREGATION INTEGRATION (USING PROVEN SYSTEM)
 // ============================================================================
@@ -3088,5 +3087,3 @@ fn perform_unified_search_result_creation(
 
 // REMOVED: perform_search_with_query_ast_and_aggregations - redundant function eliminated
 
-=======
->>>>>>> eb664a74270cf5abbc62a73eb05b3c17d74d0b4d
