@@ -59,8 +59,8 @@ static GLOBAL_DOWNLOAD_SEMAPHORE: LazyLock<tokio::sync::Semaphore> = LazyLock::n
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or_else(|| {
-            // Default to min(16, cpu_count * 2) for reasonable parallelism across the process
-            num_cpus::get().min(8).max(4) * 2
+            // Default to reasonable parallelism across the process (4-16 permits)
+            num_cpus::get().clamp(4, 8) * 2
         });
 
     tokio::sync::Semaphore::new(max_global_downloads)
@@ -2164,7 +2164,7 @@ fn merge_splits_impl(split_urls: &[String], output_path: &str, config: &MergeCon
     
     // Create multi-threaded async runtime for parallel operations - optimized for Spark
     let runtime = tokio::runtime::Builder::new_multi_thread()
-    .worker_threads(num_cpus::get().min(16).max(4))  // Scale with cores, 4-16 worker threads
+    .worker_threads(num_cpus::get().clamp(4, 16))  // Scale with cores, 4-16 worker threads
     .enable_all()
     .build()?;
 
