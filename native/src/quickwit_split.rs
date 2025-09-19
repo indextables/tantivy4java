@@ -29,6 +29,13 @@ use serde_json;
 
 // Quickwit imports
 use quickwit_storage::{PutPayload, BundleStorage, RamStorage, Storage, StorageResolver, LocalFileStorageFactory, S3CompatibleObjectStorageFactory, SplitPayloadBuilder};
+use quickwit_indexing::{
+    open_split_directories,
+    merge_split_directories_standalone,
+    open_index,
+};
+use quickwit_common::io::IoControls;
+use quickwit_query::get_quickwit_fastfield_normalizer_manager;
 
 // ✅ REENTRANCY FIX: Enhanced merge ID generation system to prevent collisions
 // Global atomic counter for merge operations (process-wide uniqueness)
@@ -2390,15 +2397,7 @@ fn merge_splits_impl(split_urls: &[String], output_path: &str, config: &MergeCon
         debug_log!("⚠️ PARTIAL MERGE WARNING: Proceeding with {} valid splits, {} skipped due to corruption: {:?}", valid_splits, skipped_splits.len(), skipped_splits);
     }
 
-    // 2. Combine index metadata (Quickwit's approach)
-    let union_index_meta = combine_index_meta(index_metas)?;
-    debug_log!("Combined metadata from {} splits", split_urls.len());
-    
-    // 3. Create merge-specific shadowing meta.json directory (Quickwit's metadata pattern)
-    let shadowing_meta_directory = create_shadowing_meta_json_directory(union_index_meta, &merge_id, config.temp_directory_path.as_deref())?;
-    debug_log!("Created merge-specific shadowing metadata directory for merge ID: {}", merge_id);
-    
-    // 4. Set up output directory with sequential access optimization
+    // 2. Set up output directory with sequential access optimization
     // Handle S3 URLs by creating a local temporary directory with unique naming
     let (output_temp_dir, is_s3_output, _temp_dir_guard) = if output_path.contains("://") && !output_path.starts_with("file://") {
     // For S3/remote URLs, create a local temporary directory with unique merge ID
@@ -2430,52 +2429,21 @@ fn merge_splits_impl(split_urls: &[String], output_path: &str, config: &MergeCon
     (temp_dir, false, None)
     };
     
-    let output_directory = MmapDirectory::open_with_madvice(&output_temp_dir, Advice::Sequential)?;
-    debug_log!("Created output directory: {:?}", output_temp_dir);
-    
-    // 5. Create UnionDirectory stack (Quickwit's memory-efficient approach)
-    // CRITICAL: Writable directory must be first - all writes go to first directory
-    let mut directory_stack: Vec<Box<dyn Directory>> = vec![
-    Box::new(output_directory),                    // First - receives ALL writes (must be writable)
-    Box::new(shadowing_meta_directory),            // Second - provides meta.json override
-    ];
-    // Add read-only split directories for reading existing segments
-    directory_stack.extend(split_directories);
-    
-    debug_log!("Created directory stack with {} directories", directory_stack.len());
-    
-    // 6. Create union directory for unified access without copying data
-    let union_directory = UnionDirectory::union_of(directory_stack);
-
-    // ✅ RESILIENT UNION INDEX CREATION: Handle remaining corruption gracefully
-    let union_index = match resilient_ops::resilient_index_open(Box::new(union_directory)) {
-        Ok(index) => {
-            debug_log!("Created union index successfully");
-            index
-        }
-        Err(e) => {
-            let error_msg = e.to_string();
-            debug_log!("🚨 UNION INDEX CREATION ERROR: {}", error_msg);
-
-            // Check if this is data corruption that slipped through individual split validation
-            if is_data_corruption_error(&error_msg) {
-                return Err(anyhow!("Union index creation failed due to data corruption in remaining splits. Consider checking individual split integrity. Error: {}", error_msg));
-            } else {
-                return Err(anyhow!("Union index creation failed: {}", error_msg));
-            }
-        }
-    };
-    
-    // 6.5. Extract doc mapping from the union index schema
-    let doc_mapping_json = extract_doc_mapping_from_index(&union_index)
-    .map_err(|e| anyhow!("Failed to extract doc mapping from union index: {}", e))?;
-    debug_log!("Extracted doc mapping from union index ({} bytes)", doc_mapping_json.len());
-    
-    // 7. Perform memory-efficient segment-level merge (not document copying)
-    let merged_docs = runtime.block_on(perform_segment_merge(&union_index))?;
+    // 3. Perform memory-efficient segment-level merge using Quickwit's implementation
+    let merged_docs = runtime.block_on(perform_quickwit_merge(
+        split_directories,
+        &output_temp_dir,
+    ))?;
     debug_log!("Segment merge completed with {} documents", merged_docs);
-    
-    // 8. Calculate final index size
+
+    // 4. Extract doc mapping from the merged index
+    let merged_directory = MmapDirectory::open(&output_temp_dir)?;
+    let tokenizer_manager = get_quickwit_fastfield_normalizer_manager().tantivy_manager();
+    let merged_index = open_index(merged_directory, tokenizer_manager)?;
+    let doc_mapping_json = extract_doc_mapping_from_index(&merged_index)?;
+    debug_log!("Extracted doc mapping from merged index ({} bytes)", doc_mapping_json.len());
+
+    // 5. Calculate final index size
     let final_size = calculate_directory_size(&output_temp_dir)?;
     debug_log!("Final merged index size: {} bytes", final_size);
     
@@ -2665,66 +2633,7 @@ fn get_tantivy_directory_from_split_bundle_full_access(split_path: &str) -> Resu
     Ok(Box::new(bundle_directory))
 }
 
-/// Combine multiple index metadata using Quickwit's approach
-fn combine_index_meta(mut index_metas: Vec<tantivy::IndexMeta>) -> Result<tantivy::IndexMeta> {
-    
-    
-    debug_log!("Combining {} index metadata objects", index_metas.len());
-    
-    if index_metas.is_empty() {
-    return Err(anyhow!("No index metadata to combine"));
-    }
-    
-    // Start with the first metadata
-    let mut union_index_meta = index_metas.remove(0);
-    
-    // Combine segments from all metadata
-    for index_meta in index_metas {
-    debug_log!("Adding {} segments to union", index_meta.segments.len());
-    union_index_meta.segments.extend(index_meta.segments);
-    }
-    
-    debug_log!("Combined metadata has {} total segments", union_index_meta.segments.len());
-    Ok(union_index_meta)
-}
 
-/// Create merge-specific shadowing meta.json directory using persistent file approach
-fn create_shadowing_meta_json_directory(index_meta: tantivy::IndexMeta, merge_id: &str, temp_base_path: Option<&str>) -> Result<tantivy::directory::MmapDirectory> {
-    use tantivy::directory::MmapDirectory;
-
-    debug_log!("Creating merge-specific persistent shadowing meta.json directory for merge ID: {}", merge_id);
-
-    // Create persistent temporary directory for meta.json (avoids RAM directory race conditions)
-    let meta_temp_dir = create_temp_directory_with_base(
-    &format!("tantivy4java_meta_{}_", merge_id),
-    temp_base_path
-    )?;
-    let meta_temp_path = meta_temp_dir.path();
-
-    debug_log!("Created persistent meta directory: {:?}", meta_temp_path);
-
-    // Serialize the combined metadata
-    let union_index_meta_json = serde_json::to_string_pretty(&index_meta)?;
-
-    // Create MmapDirectory with the meta.json file (persistent, not RAM-based)
-    let mmap_directory = MmapDirectory::open(meta_temp_path)?;
-    mmap_directory.atomic_write(Path::new("meta.json"), union_index_meta_json.as_bytes())?;
-
-    // Also create merge-specific backup with unique name for debugging
-    let backup_meta_name = format!("meta_{}.json", merge_id);
-    mmap_directory.atomic_write(Path::new(&backup_meta_name), union_index_meta_json.as_bytes())?;
-
-    debug_log!("Created persistent shadowing directory with meta.json ({} bytes) for merge: {} at {:?}",
-           union_index_meta_json.len(), merge_id, meta_temp_path);
-
-    // ✅ REENTRANCY FIX: Use safe registry with collision detection
-    let registry_key = format!("merge_meta_{}", merge_id);
-    register_temp_directory_safe(&registry_key, meta_temp_dir, merge_id, "shadowing_meta")?;
-
-    debug_log!("✅ REENTRANCY FIX: Temp directory will be cleaned up when merge completes");
-
-    Ok(mmap_directory)
-}
 
 /// ✅ REENTRANCY FIX: Coordinated cleanup to prevent race conditions
 /// Ensures proper cleanup order and handles overlapping directory scenarios
@@ -2834,55 +2743,39 @@ fn cleanup_merge_temp_directory(merge_id: &str) {
 }
 
 /// Perform segment-level merge using Quickwit/Tantivy's efficient approach
-async fn perform_segment_merge(union_index: &tantivy::Index) -> Result<usize> {
-    use tantivy::IndexWriter;
-    use tantivy::index::SegmentId;
-    use tantivy::merge_policy::NoMergePolicy;
-    
-    debug_log!("Performing segment-level merge");
-    
-    // Create writer with more threads and memory for better concurrency - optimized for Spark
-    // Scale IndexWriter threads aggressively: use 50% of cores, up to 16 threads max
-    let num_threads = (num_cpus::get() / 2).max(1).min(16);
-    let memory_per_thread = 20_000_000;  // 20MB per thread for better performance on large instances
-    let memory_limit = num_threads * memory_per_thread;  // Ensure sufficient memory per thread
-    let mut index_writer: IndexWriter = union_index.writer_with_num_threads(num_threads, memory_limit)?;
-    debug_log!("Created IndexWriter with {} threads and {}MB memory", num_threads, memory_limit / 1_000_000);
-    
-    // CRITICAL: Use NoMergePolicy to prevent garbage collection during merge
-    // This prevents delete operations on read-only BundleDirectories
-    index_writer.set_merge_policy(Box::new(NoMergePolicy));
-    
-    // Get all segment IDs from the union index using reader
-    let reader = union_index.reader()?;
+async fn perform_quickwit_merge(
+    split_directories: Vec<Box<dyn Directory>>,
+    output_path: &Path,
+) -> Result<usize> {
+    debug_log!("Performing Quickwit merge with {} directories", split_directories.len());
+
+    // Step 1: Use Quickwit's helper to combine metadata
+    let tokenizer_manager = get_quickwit_fastfield_normalizer_manager().tantivy_manager();
+    let (union_index_meta, directories) = open_split_directories(&split_directories, tokenizer_manager)?;
+    debug_log!("Combined metadata from {} splits", directories.len());
+
+    // Step 2: Create IO controls for the merge operation
+    let io_controls = IoControls::default();
+
+    // Step 3: Use Quickwit's exact merge implementation
+    let controlled_directory = merge_split_directories_standalone(
+        union_index_meta,
+        directories,
+        Vec::new(), // No delete tasks for split merging
+        None,       // No doc mapper needed for split merging
+        output_path,
+        io_controls,
+        tokenizer_manager,
+    ).await?;
+
+    // Step 4: Open the merged index to get document count
+    let merged_index = open_index(controlled_directory.clone(), tokenizer_manager)?;
+    let reader = merged_index.reader()?;
     let searcher = reader.searcher();
-    let segment_ids: Vec<SegmentId> = searcher
-    .segment_readers()
-    .iter()
-    .map(|segment_reader| segment_reader.segment_id())
-    .collect();
-    
-    debug_log!("Found {} segments to merge: {:?}", segment_ids.len(), segment_ids);
-    
-    // Skip merge if there's only one segment (Quickwit's optimization)
-    if segment_ids.len() <= 1 {
-    debug_log!("Skipping merge - only {} segment(s)", segment_ids.len());
-    return Ok(searcher.num_docs() as usize);
-    }
-    
-    // Perform efficient segment-level merge (Quickwit's approach)
-    debug_log!("Starting segment merge of {} segments", segment_ids.len());
-    index_writer.merge(&segment_ids).await?;
-    debug_log!("Segment merge completed");
-    
-    // Get final document count (with resilient retry logic)
-    resilient_ops::resilient_load_metas(&union_index)?;
-    let reader = union_index.reader()?;
-    let searcher = reader.searcher();
-    let final_doc_count = searcher.num_docs();
-    
-    debug_log!("Merged index contains {} documents", final_doc_count);
-    Ok(final_doc_count as usize)
+    let doc_count = searcher.num_docs();
+
+    debug_log!("Quickwit merge completed with {} documents", doc_count);
+    Ok(doc_count as usize)
 }
 
 /// Calculate the total size of all files in a directory
