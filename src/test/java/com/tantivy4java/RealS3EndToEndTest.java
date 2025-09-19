@@ -1842,7 +1842,8 @@ public class RealS3EndToEndTest {
                 splitId, numDocs, uncompressedSizeBytes,
                 java.time.Instant.now().minus(1, java.time.temporal.ChronoUnit.HOURS), java.time.Instant.now(),
                 new java.util.HashSet<>(java.util.Arrays.asList("performance-test")),
-                0L, 0, footerStartOffset, footerEndOffset, hotcacheStartOffset, hotcacheLength, docMappingJson
+                0L, 0, footerStartOffset, footerEndOffset, hotcacheStartOffset, hotcacheLength, docMappingJson,
+                new java.util.ArrayList<>()  // Skipped splits (empty for test)
             );
         } catch (Exception e) {
             throw new RuntimeException("Failed to parse stored metadata: " + e.getMessage(), e);

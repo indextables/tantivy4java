@@ -20,6 +20,7 @@
 package com.tantivy4java;
 
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -137,21 +138,25 @@ public class QuickwitSplit {
         private final Set<String> tags;
         private final long deleteOpstamp;
         private final int numMergeOps;
-        
+
         // Footer offset information for lazy loading optimization
         private final long footerStartOffset;    // Where metadata begins (excludes hotcache)
         private final long footerEndOffset;      // End of file
-        private final long hotcacheStartOffset;  // Where hotcache begins  
+        private final long hotcacheStartOffset;  // Where hotcache begins
         private final long hotcacheLength;       // Size of hotcache
-        
+
         // Doc mapping JSON for SplitSearcher integration
         private final String docMappingJson;     // JSON representation of the doc mapping
+
+        // Skipped splits information (for merge operations with parsing failures)
+        private final List<String> skippedSplits;  // URLs/paths of splits that failed to parse
 
         public SplitMetadata(String splitId, long numDocs, long uncompressedSizeBytes,
                            Instant timeRangeStart, Instant timeRangeEnd, Set<String> tags,
                            long deleteOpstamp, int numMergeOps,
-                           long footerStartOffset, long footerEndOffset, 
-                           long hotcacheStartOffset, long hotcacheLength, String docMappingJson) {
+                           long footerStartOffset, long footerEndOffset,
+                           long hotcacheStartOffset, long hotcacheLength, String docMappingJson,
+                           List<String> skippedSplits) {
             this.splitId = splitId;
             this.numDocs = numDocs;
             this.uncompressedSizeBytes = uncompressedSizeBytes;
@@ -165,21 +170,22 @@ public class QuickwitSplit {
             this.hotcacheStartOffset = hotcacheStartOffset;
             this.hotcacheLength = hotcacheLength;
             this.docMappingJson = docMappingJson;
+            this.skippedSplits = skippedSplits != null ? new ArrayList<>(skippedSplits) : new ArrayList<>();
         }
         
         // Backward compatibility constructor (for existing code)
         public SplitMetadata(String splitId, long numDocs, long uncompressedSizeBytes,
                            Instant timeRangeStart, Instant timeRangeEnd, Set<String> tags,
                            long deleteOpstamp, int numMergeOps) {
-            this(splitId, numDocs, uncompressedSizeBytes, timeRangeStart, timeRangeEnd, 
-                 tags, deleteOpstamp, numMergeOps, -1L, -1L, -1L, -1L, null);
+            this(splitId, numDocs, uncompressedSizeBytes, timeRangeStart, timeRangeEnd,
+                 tags, deleteOpstamp, numMergeOps, -1L, -1L, -1L, -1L, null, null);
         }
         
         // Constructor with only footer offset information (as requested)
-        public SplitMetadata(long footerStartOffset, long footerEndOffset, 
+        public SplitMetadata(long footerStartOffset, long footerEndOffset,
                            long hotcacheStartOffset, long hotcacheLength) {
             this("", 0L, 0L, null, null, new java.util.HashSet<>(), 0L, 0,
-                 footerStartOffset, footerEndOffset, hotcacheStartOffset, hotcacheLength, null);
+                 footerStartOffset, footerEndOffset, hotcacheStartOffset, hotcacheLength, null, null);
         }
 
         // Getters
@@ -200,32 +206,47 @@ public class QuickwitSplit {
         
         // Doc mapping getter
         public String getDocMappingJson() { return docMappingJson; }
-        
+
+        // Skipped splits getter (for merge operations)
+        public List<String> getSkippedSplits() { return new ArrayList<>(skippedSplits); }
+
         // Convenience methods
-        public boolean hasFooterOffsets() { 
-            return footerStartOffset >= 0 && footerEndOffset >= 0; 
+        public boolean hasFooterOffsets() {
+            return footerStartOffset >= 0 && footerEndOffset >= 0;
         }
-        
+
         public boolean hasDocMapping() {
             return docMappingJson != null && !docMappingJson.trim().isEmpty();
         }
-        
+
+        /**
+         * Returns true if any splits were skipped during merge operations due to parsing failures.
+         */
+        public boolean hasSkippedSplits() {
+            return !skippedSplits.isEmpty();
+        }
+
         public long getMetadataSize() {
             return hasFooterOffsets() ? (footerEndOffset - footerStartOffset) : -1;
         }
 
         @Override
         public String toString() {
-            return "SplitMetadata{" +
-                    "splitId='" + splitId + '\'' +
-                    ", numDocs=" + numDocs +
-                    ", uncompressedSizeBytes=" + uncompressedSizeBytes +
-                    ", timeRangeStart=" + timeRangeStart +
-                    ", timeRangeEnd=" + timeRangeEnd +
-                    ", tags=" + tags +
-                    ", deleteOpstamp=" + deleteOpstamp +
-                    ", numMergeOps=" + numMergeOps +
-                    '}';
+            StringBuilder sb = new StringBuilder("SplitMetadata{")
+                    .append("splitId='").append(splitId).append('\'')
+                    .append(", numDocs=").append(numDocs)
+                    .append(", uncompressedSizeBytes=").append(uncompressedSizeBytes)
+                    .append(", timeRangeStart=").append(timeRangeStart)
+                    .append(", timeRangeEnd=").append(timeRangeEnd)
+                    .append(", tags=").append(tags)
+                    .append(", deleteOpstamp=").append(deleteOpstamp)
+                    .append(", numMergeOps=").append(numMergeOps);
+
+            if (hasSkippedSplits()) {
+                sb.append(", skippedSplits=").append(skippedSplits.size()).append(" splits");
+            }
+
+            return sb.append('}').toString();
         }
     }
 

@@ -22,10 +22,11 @@ public class MissingSplitFileTest {
         
         // Create metadata with footer offsets for the missing file (API requirement)
         QuickwitSplit.SplitMetadata metadata = new QuickwitSplit.SplitMetadata(
-            "missing-split", 1000L, 0L, 
-            java.time.Instant.now(), java.time.Instant.now(), 
+            "missing-split", 1000L, 0L,
+            java.time.Instant.now(), java.time.Instant.now(),
             new java.util.HashSet<>(), 0L, 0,
-            100L, 200L, 50L, 50L, null  // Add footer and hotcache offsets
+            100L, 200L, 50L, 50L, null,  // Add footer and hotcache offsets
+            new java.util.ArrayList<>()  // Skipped splits (empty for test)
         );
         
         // Try to access a split file that doesn't exist locally
@@ -69,10 +70,11 @@ public class MissingSplitFileTest {
         
         // Create metadata with footer offsets for the missing file (API requirement)
         QuickwitSplit.SplitMetadata metadata = new QuickwitSplit.SplitMetadata(
-            "missing-s3-split", 1000L, 0L, 
-            java.time.Instant.now(), java.time.Instant.now(), 
+            "missing-s3-split", 1000L, 0L,
+            java.time.Instant.now(), java.time.Instant.now(),
             new java.util.HashSet<>(), 0L, 0,
-            100L, 200L, 50L, 50L, null  // Add footer and hotcache offsets
+            100L, 200L, 50L, 50L, null,  // Add footer and hotcache offsets
+            new java.util.ArrayList<>()  // Skipped splits (empty for test)
         );
         
         // Try to access a split file that doesn't exist in S3
@@ -111,10 +113,11 @@ public class MissingSplitFileTest {
         
         // Create metadata with footer offsets for the invalid path (API requirement)
         QuickwitSplit.SplitMetadata metadata = new QuickwitSplit.SplitMetadata(
-            "invalid-s3-split", 1000L, 0L, 
-            java.time.Instant.now(), java.time.Instant.now(), 
+            "invalid-s3-split", 1000L, 0L,
+            java.time.Instant.now(), java.time.Instant.now(),
             new java.util.HashSet<>(), 0L, 0,
-            100L, 200L, 50L, 50L, null  // Add footer and hotcache offsets
+            100L, 200L, 50L, 50L, null,  // Add footer and hotcache offsets
+            new java.util.ArrayList<>()  // Skipped splits (empty for test)
         );
         
         // Try to access an invalid S3 path

@@ -6,6 +6,7 @@ import static org.junit.jupiter.api.Assertions.*;
 
 import java.time.Instant;
 import java.util.HashSet;
+import java.util.ArrayList;
 
 /**
  * Test for the defensive offset validation in SplitCacheManager
@@ -24,7 +25,8 @@ public class OffsetValidationTest {
             1L, 1,
             1000L, 5000L,  // Valid footer range: 1000 to 5000
             500L, 200L,    // Valid hotcache: start=500, length=200
-            null           // No doc mapping for test
+            null,          // No doc mapping for test
+            new ArrayList<>()  // No skipped splits for test
         );
         
         // Create cache manager
@@ -70,7 +72,8 @@ public class OffsetValidationTest {
             1L, 1,
             1000L, 0L,     // INVALID: footer end = 0
             500L, 200L,
-            null           // No doc mapping for test
+            null,          // No doc mapping for test
+            new ArrayList<>()  // No skipped splits for test
         );
         
         // Create cache manager
@@ -102,7 +105,8 @@ public class OffsetValidationTest {
             1L, 1,
             5000L, 3000L,  // INVALID: footer start > footer end
             500L, 200L,
-            null           // No doc mapping for test
+            null,          // No doc mapping for test
+            new ArrayList<>()  // No skipped splits for test
         );
         
         // Create cache manager
@@ -136,7 +140,8 @@ public class OffsetValidationTest {
             1L, 1,
             1000L, tooLarge,  // INVALID: 200GB footer end offset
             500L, 200L,
-            null              // No doc mapping for test
+            null,             // No doc mapping for test
+            new ArrayList<>() // No skipped splits for test
         );
         
         // Create cache manager
@@ -167,7 +172,8 @@ public class OffsetValidationTest {
             1L, 1,
             1000L, 5000L,
             Long.MAX_VALUE - 100L, 200L,  // INVALID: would overflow when added
-            null                          // No doc mapping for test
+            null,                         // No doc mapping for test
+            new ArrayList<>()             // No skipped splits for test
         );
         
         // Create cache manager

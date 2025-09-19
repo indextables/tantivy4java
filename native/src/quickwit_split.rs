@@ -587,6 +587,9 @@ struct QuickwitSplitMetadata {
     
     // Doc mapping JSON for SplitSearcher integration
     doc_mapping_json: Option<String>,    // JSON representation of the doc mapping
+
+    // Skipped splits for merge operations with parsing failures
+    skipped_splits: Vec<String>,         // URLs/paths of splits that failed to parse
 }
 
 impl SplitConfig {
@@ -679,6 +682,9 @@ fn create_split_metadata(config: &SplitConfig, num_docs: usize, uncompressed_doc
     
     // Doc mapping JSON initialized as None, will be set during extraction
     doc_mapping_json: None,
+
+    // Skipped splits initialized as empty
+    skipped_splits: Vec::new(),
     }
 }
 
@@ -711,11 +717,26 @@ fn create_java_split_metadata<'a>(env: &mut JNIEnv<'a>, split_metadata: &Quickwi
     Some(json) => string_to_jstring(env, json)?,
     None => JString::from(JObject::null()),
     };
-    
-    // Use the new constructor that includes footer offset parameters and doc mapping JSON
+
+    // Create ArrayList for skipped splits
+    let array_list_class = env.find_class("java/util/ArrayList")?;
+    let skipped_splits_list = env.new_object(&array_list_class, "()V", &[])?;
+
+    // Add skipped splits to the list
+    for skipped_split in &split_metadata.skipped_splits {
+        let skipped_split_jstring = string_to_jstring(env, skipped_split)?;
+        env.call_method(
+            &skipped_splits_list,
+            "add",
+            "(Ljava/lang/Object;)Z",
+            &[JValue::Object(&skipped_split_jstring.into())],
+        )?;
+    }
+
+    // Use the new constructor that includes footer offset parameters, doc mapping JSON, and skipped splits
     let metadata_obj = env.new_object(
     &split_metadata_class,
-    "(Ljava/lang/String;JJLjava/time/Instant;Ljava/time/Instant;Ljava/util/Set;JIJJJJLjava/lang/String;)V",
+    "(Ljava/lang/String;JJLjava/time/Instant;Ljava/time/Instant;Ljava/util/Set;JIJJJJLjava/lang/String;Ljava/util/List;)V",
     &[
         JValue::Object(&split_id_jstring.into()),
         JValue::Long(split_metadata.num_docs as i64),
@@ -732,6 +753,8 @@ fn create_java_split_metadata<'a>(env: &mut JNIEnv<'a>, split_metadata: &Quickwi
         JValue::Long(split_metadata.hotcache_length.map(|v| v as i64).unwrap_or(-1)),
         // Doc mapping JSON parameter
         JValue::Object(&doc_mapping_jstring.into()),
+        // Skipped splits parameter
+        JValue::Object(&skipped_splits_list),
     ]
     )?;
     
@@ -1223,15 +1246,18 @@ pub extern "system" fn Java_com_tantivy4java_QuickwitSplit_nativeReadSplitMetada
         tags: BTreeSet::new(),
         delete_opstamp: 0,
         num_merge_ops: 0,
-        
+
         // Footer offset fields not available for existing split files
         footer_start_offset: None,
         footer_end_offset: None,
         hotcache_start_offset: None,
         hotcache_length: None,
-        
+
         // Extract doc mapping JSON from the split's Tantivy index
         doc_mapping_json: Some(doc_mapping_json),
+
+        // Skipped splits not applicable for single split validation
+        skipped_splits: Vec::new(),
     };
     
     debug_log!("Successfully read Quickwit split with {} files", file_count);
@@ -1399,15 +1425,18 @@ pub extern "system" fn Java_com_tantivy4java_QuickwitSplit_nativeExtractSplit(
         tags: BTreeSet::new(),
         delete_opstamp: 0,
         num_merge_ops: 0,
-        
+
         // Footer offset fields not available for extraction
         footer_start_offset: None,
         footer_end_offset: None,
         hotcache_start_offset: None,
         hotcache_length: None,
-        
+
         // Doc mapping JSON not available when extracting existing splits
         doc_mapping_json: None,
+
+        // Skipped splits not applicable for single split extraction
+        skipped_splits: Vec::new(),
     };
     
     debug_log!("Successfully extracted {} files from Quickwit split to {}", extracted_count, output_path.display());
@@ -2193,6 +2222,7 @@ fn merge_splits_impl(split_urls: &[String], output_path: &str, config: &MergeCon
     debug_log!("✅ PARALLEL DOWNLOAD: Completed concurrent processing of {} splits", extracted_splits.len());
 
     // Process the extracted splits to create directories and metadata
+    let mut skipped_splits = Vec::new();
     for extracted_split in extracted_splits.into_iter() {
     let i = extracted_split.split_index;
     let split_url = &extracted_split.split_url;
@@ -2200,10 +2230,32 @@ fn merge_splits_impl(split_urls: &[String], output_path: &str, config: &MergeCon
 
     debug_log!("🔧 Processing extracted split {}: {}", i, split_url);
 
-    // Open the extracted directory as writable MmapDirectory (with resilient retry logic)
-    let extracted_directory = MmapDirectory::open(temp_extract_path)?;
-    let temp_index = resilient_ops::resilient_index_open(extracted_directory.box_clone())?;
-    let index_meta = resilient_ops::resilient_load_metas(&temp_index)?;
+    // ✅ RESILIENT METADATA PARSING: Handle metadata failures gracefully with warnings
+    let (extracted_directory, temp_index, index_meta) = match (|| -> Result<_> {
+        let extracted_directory = MmapDirectory::open(temp_extract_path)?;
+        let temp_index = resilient_ops::resilient_index_open(extracted_directory.box_clone())?;
+        let index_meta = resilient_ops::resilient_load_metas(&temp_index)?;
+        Ok((extracted_directory, temp_index, index_meta))
+    })() {
+        Ok((dir, index, meta)) => (dir, index, meta),
+        Err(e) => {
+            let error_msg = e.to_string();
+            debug_log!("⚠️ METADATA PARSE WARNING: Skipping split {} due to metadata parsing failure: {}", split_url, error_msg);
+
+            // Check if this is a known metadata parsing error
+            if error_msg.contains("EOF while parsing") ||
+               error_msg.contains("Data corrupted") ||
+               error_msg.contains("Managed file cannot be deserialized") ||
+               error_msg.contains("column 2291") {
+                debug_log!("🔧 METADATA SKIP: Split {} has known metadata corruption - continuing with remaining splits", split_url);
+            } else {
+                debug_log!("🔧 METADATA SKIP: Split {} has unexpected error - continuing with remaining splits", split_url);
+            }
+
+            skipped_splits.push(split_url.clone());
+            continue; // Skip this split and continue with others
+        }
+    };
 
     // Count documents and calculate size efficiently
     let reader = temp_index.reader()?;
@@ -2327,15 +2379,18 @@ fn merge_splits_impl(split_urls: &[String], output_path: &str, config: &MergeCon
     tags: BTreeSet::new(),
     delete_opstamp: 0,
     num_merge_ops: 1,
-    
+
     // Footer offset fields will be set when creating the final split
     footer_start_offset: None,
     footer_end_offset: None,
     hotcache_start_offset: None,
     hotcache_length: None,
-    
+
     // Doc mapping JSON extracted from union index
     doc_mapping_json: Some(doc_mapping_json.clone()),
+
+    // Skipped splits information
+    skipped_splits: skipped_splits.clone(),
     };
     
     // 10. Create the merged split file using the merged index and capture footer offsets
@@ -2372,15 +2427,18 @@ fn merge_splits_impl(split_urls: &[String], output_path: &str, config: &MergeCon
     tags: merged_metadata.tags,
     delete_opstamp: merged_metadata.delete_opstamp,
     num_merge_ops: merged_metadata.num_merge_ops,
-    
+
     // Set footer offsets from the merge operation
     footer_start_offset: Some(footer_offsets.footer_start_offset),
     footer_end_offset: Some(footer_offsets.footer_end_offset),
     hotcache_start_offset: Some(footer_offsets.hotcache_start_offset),
     hotcache_length: Some(footer_offsets.hotcache_length),
-    
+
     // Doc mapping JSON extracted from union index during merge
     doc_mapping_json: merged_metadata.doc_mapping_json,
+
+    // Skipped splits information
+    skipped_splits: merged_metadata.skipped_splits,
     };
     
     debug_log!("✅ MERGE OPTIMIZATION: Added footer offsets to merged split metadata");
@@ -2394,7 +2452,15 @@ fn merge_splits_impl(split_urls: &[String], output_path: &str, config: &MergeCon
     coordinate_temp_directory_cleanup(&merge_id, &output_temp_dir, temp_dirs)?;
     
     debug_log!("Created efficient merged split file: {} with {} documents", output_path, merged_docs);
-    
+
+    // Report skipped splits if any
+    if !skipped_splits.is_empty() {
+        debug_log!("⚠️ MERGE WARNING: {} splits were skipped due to metadata parsing failures:", skipped_splits.len());
+        for (i, skipped_url) in skipped_splits.iter().enumerate() {
+            debug_log!("   {}. {}", i + 1, skipped_url);
+        }
+    }
+
     Ok(final_merged_metadata)
     })(); // End closure
 
