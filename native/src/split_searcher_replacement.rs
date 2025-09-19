@@ -2,7 +2,7 @@
 // This replaces the old convoluted SplitSearcher implementation with clean StandaloneSearcher calls
 
 use std::sync::{Arc, OnceLock};
-use jni::objects::{JClass, JString, JObject, ReleaseMode};
+use jni::objects::{JClass, JString, JObject};
 use jni::sys::{jlong, jobject, jstring, jint, jboolean};
 use jni::JNIEnv;
 
@@ -21,12 +21,9 @@ use quickwit_common::thread_pool::ThreadPool;
 use serde_json::{Value, Map};
 
 use quickwit_proto::search::{SearchRequest, SplitIdAndFooterOffsets};
-use quickwit_config::{S3StorageConfig, SearcherConfig};
-use quickwit_storage::{StorageResolver, ByteRangeCache, SplitCache, wrap_storage_with_cache, STORAGE_METRICS, MemorySizedCache};
-use bytesize::ByteSize;
-use quickwit_search::leaf::{open_index_with_caches, open_split_bundle};
-use quickwit_directories::{StorageDirectory, HotDirectory, CachingDirectory};
-use tantivy::schema::Document as DocumentTrait; // For to_named_doc method
+use quickwit_config::S3StorageConfig;
+use quickwit_storage::{StorageResolver, ByteRangeCache, STORAGE_METRICS, MemorySizedCache};
+use quickwit_search::leaf::open_index_with_caches;
 
 /// Thread pool for search operations (matches Quickwit's pattern exactly)
 fn search_thread_pool() -> &'static ThreadPool {
@@ -1502,7 +1499,7 @@ fn retrieve_documents_batch_from_split_optimized(
                 let searcher_cache = get_searcher_cache();
                 let cached_searcher_option = {
                     let cache = searcher_cache.lock().unwrap();
-                    cache.get(split_uri).cloned()
+                    cache.get(split_uri as &str).cloned()
                 };
 
                 // If we have a cached searcher, use it for concurrent batch processing

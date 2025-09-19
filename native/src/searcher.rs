@@ -17,7 +17,7 @@
  * under the License.
  */
 
-use jni::objects::{JClass, JString, JObject, JByteBuffer, ReleaseMode};
+use jni::objects::{JClass, JString, JObject, JByteBuffer};
 use jni::sys::{jlong, jboolean, jint, jobject};
 use jni::JNIEnv;
 use jni::sys::jlongArray as JLongArray;
@@ -25,7 +25,6 @@ use tantivy::{IndexWriter as TantivyIndexWriter, Searcher as TantivySearcher, Do
 use tantivy::schema::{TantivyDocument, Field, Schema, Facet};
 use tantivy::query::Query as TantivyQuery;
 use tantivy::index::SegmentId;
-use tantivy::aggregation::intermediate_agg_result::IntermediateAggregationResults;
 use std::net::IpAddr;
 use crate::utils::{handle_error, with_arc_safe, arc_to_jlong, release_arc};
 use std::sync::{Arc, Mutex};
@@ -1726,58 +1725,4 @@ fn add_unsigned_value_safely(document: &mut TantivyDocument, schema: &Schema, fi
             document.add_u64(field, uint_val);
         }
     }
-}
-
-/// Create a TermsResult Java object from intermediate aggregation results
-fn create_terms_aggregation_result(
-    env: &mut JNIEnv,
-    aggregation_name: &str,
-    _intermediate_results: &tantivy::aggregation::intermediate_agg_result::IntermediateAggregationResults,
-) -> anyhow::Result<jobject> {
-    // For now, create a simple TermsResult with mock data to prove the pipeline works
-    // TODO: Extract actual aggregation data from intermediate_results
-
-    // Create TermsResult class
-    let terms_result_class = env.find_class("com/tantivy4java/TermsResult")
-        .map_err(|e| anyhow::anyhow!("Failed to find TermsResult class: {}", e))?;
-
-    // Create ArrayList for buckets
-    let arraylist_class = env.find_class("java/util/ArrayList")
-        .map_err(|e| anyhow::anyhow!("Failed to find ArrayList class: {}", e))?;
-    let buckets_list = env.new_object(&arraylist_class, "()V", &[])
-        .map_err(|e| anyhow::anyhow!("Failed to create ArrayList: {}", e))?;
-
-    // Create a mock bucket for testing - this proves the pipeline works
-    // TODO: Extract real bucket data from intermediate_results
-    let bucket_class = env.find_class("com/tantivy4java/TermsResult$TermsBucket")
-        .map_err(|e| anyhow::anyhow!("Failed to find TermsBucket class: {}", e))?;
-
-    // Create a TermsBucket with key="electronics" and doc_count=3 (matching test data)
-    let key_str = env.new_string("electronics")
-        .map_err(|e| anyhow::anyhow!("Failed to create key string: {}", e))?;
-    let bucket = env.new_object(
-        &bucket_class,
-        "(Ljava/lang/Object;J)V",
-        &[(&key_str).into(), (3i64).into()]
-    ).map_err(|e| anyhow::anyhow!("Failed to create TermsBucket: {}", e))?;
-
-    // Add bucket to list
-    env.call_method(
-        &buckets_list,
-        "add",
-        "(Ljava/lang/Object;)Z",
-        &[(&bucket).into()]
-    ).map_err(|e| anyhow::anyhow!("Failed to add bucket to list: {}", e))?;
-
-    // Create TermsResult with the buckets
-    // TermsResult constructor: (String name, List<TermsBucket> buckets, long docCountErrorUpperBound, long sumOtherDocCount)
-    let aggregation_name_str = env.new_string(aggregation_name)
-        .map_err(|e| anyhow::anyhow!("Failed to create aggregation name string: {}", e))?;
-    let terms_result = env.new_object(
-        &terms_result_class,
-        "(Ljava/lang/String;Ljava/util/List;JJ)V",
-        &[(&aggregation_name_str).into(), (&buckets_list).into(), (0i64).into(), (0i64).into()]
-    ).map_err(|e| anyhow::anyhow!("Failed to create TermsResult: {}", e))?;
-
-    Ok(terms_result.into_raw())
 }

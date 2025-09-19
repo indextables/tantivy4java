@@ -28,7 +28,7 @@ use serde::{Serialize, Deserialize};
 use serde_json;
 
 // Quickwit imports
-use quickwit_storage::{PutPayload, BundleStorage, RamStorage, Storage, StorageResolver, LocalFileStorageFactory, S3CompatibleObjectStorageFactory, SplitPayloadBuilder};
+use quickwit_storage::{PutPayload, BundleStorage, RamStorage, Storage, StorageResolver, SplitPayloadBuilder};
 use quickwit_indexing::{
     open_split_directories,
     merge_split_directories_standalone,
@@ -115,37 +115,6 @@ fn generate_collision_resistant_merge_id() -> String {
 }
 
 /// ✅ REENTRANCY FIX: Safely register temporary directory with collision detection
-fn register_temp_directory_safe(registry_key: &str, temp_dir: temp::TempDir, merge_id: &str, operation_type: &str) -> Result<()> {
-    let entry = RegistryEntry {
-        temp_dir: Arc::new(temp_dir),
-        created_at: std::time::Instant::now(),
-        merge_id: merge_id.to_string(),
-        operation_type: operation_type.to_string(),
-    };
-
-    let mut registry = TEMP_DIR_REGISTRY.lock().map_err(|e| {
-        anyhow!("Failed to acquire registry lock: {}", e)
-    })?;
-
-    // ✅ COLLISION DETECTION: Check for existing entries with same key
-    if let Some(existing_entry) = registry.get(registry_key) {
-        let age = existing_entry.created_at.elapsed();
-        return Err(anyhow!(
-            "🚨 REGISTRY COLLISION DETECTED: Key '{}' already exists!\n\
-             Existing: merge_id={}, operation={}, age={:?}\n\
-             New: merge_id={}, operation={}\n\
-             This indicates a merge ID collision - implementing additional collision resistance.",
-            registry_key, existing_entry.merge_id, existing_entry.operation_type, age,
-            merge_id, operation_type
-        ));
-    }
-
-    registry.insert(registry_key.to_string(), entry);
-    debug_log!("✅ REGISTRY SAFE: Registered temp directory: {} (merge_id: {}, operation: {})",
-               registry_key, merge_id, operation_type);
-
-    Ok(())
-}
 
 /// ✅ REENTRANCY FIX: Safely cleanup temporary directory with state validation
 fn cleanup_temp_directory_safe(registry_key: &str) -> Result<bool> {
@@ -177,7 +146,6 @@ use tantivy::directory::OwnedBytes;
 use std::str::FromStr;
 
 use crate::utils::{convert_throwable, jstring_to_string, string_to_jstring};
-use std::thread::ThreadId;
 
 /// Resilient operations for Tantivy index operations that may encounter transient file corruption
 /// This addresses issues like "EOF while parsing a string" in .managed.json during concurrent operations
@@ -768,119 +736,7 @@ fn create_java_split_metadata<'a>(env: &mut JNIEnv<'a>, split_metadata: &Quickwi
     Ok(metadata_obj)
 }
 
-fn convert_tantivy_to_split(
-    tantivy_index: tantivy::Index,
-    output_path: &Path,
-    config: SplitConfig,
-) -> Result<QuickwitSplitMetadata> {
-    
-    // Get index statistics
-    let searcher = tantivy_index.reader()?.searcher();
-    let num_docs = searcher.num_docs();
-    
-    // Calculate actual uncompressed size by examining index files
-    let uncompressed_docs_size = (num_docs as u64) * 1024; // Basic estimate based on doc count
-    
-    // Create split metadata  
-    let split_metadata = create_split_metadata(&config, num_docs as usize, uncompressed_docs_size);
-    
-    // Create a working split file that contains:
-    // 1. Split metadata in JSON format
-    // 2. Index directory structure information
-    // 3. Placeholder for actual Tantivy index data
-    
-    let mut split_content = Vec::new();
-    
-    // Header with version
-    split_content.extend_from_slice(b"QUICKWIT_SPLIT_V1\n");
-    
-    // Add metadata section
-    let metadata_json = serde_json::to_string_pretty(&split_metadata)?;
-    split_content.extend_from_slice(b"METADATA_START\n");
-    split_content.extend_from_slice(metadata_json.as_bytes());
-    split_content.extend_from_slice(b"\nMETADATA_END\n");
-    
-    // Add index info section
-    split_content.extend_from_slice(b"INDEX_INFO_START\n");
-    let index_info = format!(
-    "num_docs: {}\nuncompressed_size: {}\n",
-    num_docs, uncompressed_docs_size
-    );
-    split_content.extend_from_slice(index_info.as_bytes());
-    split_content.extend_from_slice(b"INDEX_INFO_END\n");
-    
-    // Use Quickwit's SplitPayloadBuilder to create a real split bundle
-    // Use a current-thread runtime to avoid conflicts with other runtimes
-    let runtime = tokio::runtime::Builder::new_current_thread()
-    .enable_all()
-    .build()
-    .map_err(|e| anyhow::anyhow!("Failed to create tokio runtime: {}", e))?;
-    
-    // Unfortunately, we cannot reliably extract the directory path from a Tantivy Index object
-    // because MmapDirectory's path field is private and there's no public accessor.
-    // The Index object abstracts away the underlying directory implementation details.
-    
-    debug_log!("Cannot extract directory path from Index object - path is not publicly accessible");
-    
-    return Err(anyhow::anyhow!(
-    "Converting from Index object is not currently supported due to Tantivy API limitations. \
-    The directory path cannot be extracted from the Index object. \
-    Please use QuickwitSplit.convertIndexFromPath(indexPath, outputPath, config) instead, \
-    where you provide the directory path directly. \
-    \
-    Example: \
-    QuickwitSplit.convertIndexFromPath(\"/path/to/index\", \"/path/to/output.split\", config) \
-    \
-    This method works correctly and creates proper Quickwit split files."
-    ));
-}
 
-/// Advanced streaming function with chunked I/O and progress tracking
-/// This provides optimal memory usage for large splits while maintaining performance
-async fn write_split_payload_streaming(
-    split_payload: &impl PutPayload,
-    output_path: &Path,
-    chunk_size: Option<u64>
-) -> anyhow::Result<u64> {
-    const DEFAULT_CHUNK_SIZE: u64 = 64 * 1024 * 1024; // 64MB chunks for optimal I/O performance
-    let chunk_size = chunk_size.unwrap_or(DEFAULT_CHUNK_SIZE);
-
-    let total_size = split_payload.len();
-    debug_log!("✅ CHUNKED STREAMING: Starting chunked write of {} bytes with {:.1}MB chunks",
-          total_size, chunk_size as f64 / 1024.0 / 1024.0);
-
-    let mut output_file = tokio::fs::File::create(output_path).await?;
-    let mut written = 0u64;
-
-    while written < total_size {
-    let chunk_end = (written + chunk_size).min(total_size);
-    let chunk_range = written..chunk_end;
-    let chunk_len = chunk_end - written;
-
-    debug_log!("✅ CHUNKED STREAMING: Processing chunk {}-{} ({:.1}MB, {:.1}% complete)",
-              written, chunk_end, chunk_len as f64 / 1024.0 / 1024.0,
-              (written as f64 / total_size as f64) * 100.0);
-
-    // Stream just this chunk
-    let chunk_stream = split_payload.range_byte_stream(chunk_range).await?;
-    let mut chunk_reader = chunk_stream.into_async_read();
-
-    // Copy chunk to output file
-    let chunk_bytes = tokio::io::copy(&mut chunk_reader, &mut output_file).await?;
-    written += chunk_bytes;
-
-    if chunk_bytes != chunk_len {
-        return Err(anyhow::anyhow!("Chunk size mismatch: expected {}, got {}", chunk_len, chunk_bytes));
-    }
-    }
-
-    // Ensure all data is flushed to disk
-    output_file.flush().await?;
-    output_file.sync_all().await?;
-
-    debug_log!("✅ CHUNKED STREAMING: Successfully completed streaming write of {} bytes", written);
-    Ok(written)
-}
 
 fn convert_index_from_path_impl(index_path: &str, output_path: &str, config: &SplitConfig) -> Result<QuickwitSplitMetadata, anyhow::Error> {
     // Create a Tokio runtime for async operations

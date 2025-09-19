@@ -862,11 +862,6 @@ fn create_single_wildcard_query_with_tokenizer(field: Field, pattern: &str, uses
     }
 }
 
-/// Legacy function - kept for backward compatibility but should use tokenizer-aware version
-fn create_single_wildcard_query(field: Field, pattern: &str) -> Result<Box<dyn TantivyQuery>, String> {
-    // Default to using default tokenizer behavior (lowercase)
-    create_single_wildcard_query_with_tokenizer(field, &pattern.to_lowercase(), true)
-}
 
 /// Create regex pattern preserving original case
 fn wildcard_to_regex_preserve_case(pattern: &str) -> String {
