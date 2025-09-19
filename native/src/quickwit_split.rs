@@ -883,6 +883,27 @@ fn convert_index_from_path_impl(index_path: &str, output_path: &str, config: &Sp
     runtime.block_on(convert_index_from_path_impl_async(index_path, output_path, config))
 }
 
+/// Helper function to check if an error message indicates data corruption that should be skipped
+/// rather than failing the entire merge operation.
+fn is_data_corruption_error(error_msg: &str) -> bool {
+    let error_lower = error_msg.to_lowercase();
+    error_msg.contains("INDEX_CORRUPTION:") ||
+    error_lower.contains("eof while parsing") ||
+    error_lower.contains("data corrupted") ||
+    error_lower.contains("data corruption") ||
+    error_lower.contains("managed file cannot be deserialized") ||
+    error_lower.contains("managed file can not be deserialized") ||
+    error_lower.contains(".managed.json") ||
+    error_lower.contains("column 2291") ||
+    error_lower.contains("linke:") ||  // Typo in some Tantivy error messages
+    error_lower.contains("indes::open failed") ||  // Index open failures
+    error_lower.contains("index::open failed") ||
+    error_lower.contains("failed after") && error_lower.contains("attempts") ||
+    error_lower.contains("magic number does not match") ||  // Bundle corruption
+    error_lower.contains("failed to open split bundle") ||  // Bundle access failures
+    error_lower.contains("hot directory metadata")  // Hot directory corruption
+}
+
 async fn convert_index_from_path_impl_async(index_path: &str, output_path: &str, config: &SplitConfig) -> Result<QuickwitSplitMetadata, anyhow::Error> {
     use tantivy::directory::MmapDirectory;
     use tantivy::Index as TantivyIndex;
@@ -1816,8 +1837,8 @@ async fn download_and_extract_splits_parallel(
     split_urls: &[String],
     merge_id: &str,
     config: &MergeConfig,
-) -> Result<Vec<ExtractedSplit>> {
-    use futures::future::try_join_all;
+) -> Result<(Vec<ExtractedSplit>, Vec<String>)> {
+    use futures::future::join_all;
     use std::sync::Arc;
 
     debug_log!("🚀 Starting parallel download of {} splits with merge_id: {}", split_urls.len(), merge_id);
@@ -1848,8 +1869,8 @@ async fn download_and_extract_splits_parallel(
 
             debug_log!("📥 Starting download task {} for: {}", i, split_url);
 
-            // Download and extract single split
-            download_and_extract_single_split(
+            // Download and extract single split - gracefully handle failures
+            download_and_extract_single_split_resilient(
                 &split_url,
                 i,
                 &merge_id,
@@ -1860,12 +1881,63 @@ async fn download_and_extract_splits_parallel(
     })
     .collect();
 
-    // Execute all downloads concurrently and wait for completion
+    // Execute all downloads concurrently and wait for completion - handle failures gracefully
     debug_log!("⏳ Waiting for {} concurrent download tasks to complete", download_tasks.len());
-    let results = try_join_all(download_tasks).await?;
+    let results = join_all(download_tasks).await;
 
-    debug_log!("✅ All {} download tasks completed successfully", results.len());
-    Ok(results)
+    // Separate successful downloads from failed ones
+    let mut successful_splits = Vec::new();
+    let mut skipped_splits = Vec::new();
+
+    for (i, result) in results.into_iter().enumerate() {
+        match result {
+            Ok(Some(extracted_split)) => {
+                successful_splits.push(extracted_split);
+            }
+            Ok(None) => {
+                let split_url = &split_urls[i];
+                debug_log!("⚠️ Split {} skipped: {}", i, split_url);
+                skipped_splits.push(split_url.clone());
+            }
+            Err(e) => {
+                let split_url = &split_urls[i];
+                debug_log!("🚨 Split {} failed: {} (Error: {})", i, split_url, e);
+                skipped_splits.push(split_url.clone());
+            }
+        }
+    }
+
+    debug_log!("✅ Download completed: {} successful, {} skipped", successful_splits.len(), skipped_splits.len());
+    Ok((successful_splits, skipped_splits))
+}
+
+/// Downloads and extracts a single split with resilient error handling
+async fn download_and_extract_single_split_resilient(
+    split_url: &str,
+    split_index: usize,
+    merge_id: &str,
+    config: &MergeConfig,
+    storage_resolver: &StorageResolver,
+) -> Result<Option<ExtractedSplit>> {
+    match download_and_extract_single_split(
+        split_url,
+        split_index,
+        merge_id,
+        config,
+        storage_resolver,
+    ).await {
+        Ok(extracted_split) => Ok(Some(extracted_split)),
+        Err(e) => {
+            let error_msg = e.to_string();
+            if is_data_corruption_error(&error_msg) {
+                debug_log!("⚠️ Split {} corrupted/invalid, adding to skip list: {} (Error: {})", split_index, split_url, error_msg);
+                Ok(None) // Skip this split gracefully
+            } else {
+                debug_log!("🚨 Split {} failed with non-corruption error: {} (Error: {})", split_index, split_url, error_msg);
+                Ok(None) // For now, skip all errors gracefully - could be made more strict later
+            }
+        }
+    }
 }
 
 /// Downloads and extracts a single split (used by parallel download function)
@@ -2215,14 +2287,13 @@ fn merge_splits_impl(split_urls: &[String], output_path: &str, config: &MergeCon
     // ⚡ PARALLEL SPLIT DOWNLOAD AND EXTRACTION OPTIMIZATION
     debug_log!("🚀 PARALLEL DOWNLOAD: Starting concurrent download of {} splits", split_urls.len());
 
-    let extracted_splits = runtime.block_on(async {
+    let (extracted_splits, mut skipped_splits) = runtime.block_on(async {
     download_and_extract_splits_parallel(split_urls, &merge_id, config).await
     })?;
 
-    debug_log!("✅ PARALLEL DOWNLOAD: Completed concurrent processing of {} splits", extracted_splits.len());
+    debug_log!("✅ PARALLEL DOWNLOAD: Completed concurrent processing of {} successful splits, {} skipped", extracted_splits.len(), skipped_splits.len());
 
     // Process the extracted splits to create directories and metadata
-    let mut skipped_splits = Vec::new();
     for extracted_split in extracted_splits.into_iter() {
     let i = extracted_split.split_index;
     let split_url = &extracted_split.split_url;
@@ -2230,26 +2301,43 @@ fn merge_splits_impl(split_urls: &[String], output_path: &str, config: &MergeCon
 
     debug_log!("🔧 Processing extracted split {}: {}", i, split_url);
 
-    // ✅ RESILIENT METADATA PARSING: Handle metadata failures gracefully with warnings
+    // ✅ RESILIENT METADATA PARSING: Handle all corruption gracefully with warnings
     let (extracted_directory, temp_index, index_meta) = match (|| -> Result<_> {
         let extracted_directory = MmapDirectory::open(temp_extract_path)?;
-        let temp_index = resilient_ops::resilient_index_open(extracted_directory.box_clone())?;
+
+        // ✅ RESILIENT INDEX OPEN: Handle Index::open corruption gracefully
+        let temp_index = match resilient_ops::resilient_index_open(extracted_directory.box_clone()) {
+            Ok(index) => index,
+            Err(index_error) => {
+                let index_error_msg = index_error.to_string();
+                debug_log!("⚠️ INDEX OPEN ERROR: Split {} failed Index::open with: {}", split_url, index_error_msg);
+
+                // Check if this is a data corruption error that should be skipped
+                if is_data_corruption_error(&index_error_msg) {
+                    debug_log!("🔧 INDEX CORRUPTION DETECTED: Split {} has corrupted index data - adding to skip list", split_url);
+                    return Err(anyhow!("INDEX_CORRUPTION: {}", index_error_msg));
+                } else {
+                    // Re-throw non-corruption errors
+                    return Err(index_error);
+                }
+            }
+        };
+
         let index_meta = resilient_ops::resilient_load_metas(&temp_index)?;
         Ok((extracted_directory, temp_index, index_meta))
     })() {
         Ok((dir, index, meta)) => (dir, index, meta),
         Err(e) => {
             let error_msg = e.to_string();
-            debug_log!("⚠️ METADATA PARSE WARNING: Skipping split {} due to metadata parsing failure: {}", split_url, error_msg);
+            debug_log!("⚠️ SPLIT PROCESSING ERROR: Skipping split {} due to error: {}", split_url, error_msg);
 
-            // Check if this is a known metadata parsing error
-            if error_msg.contains("EOF while parsing") ||
-               error_msg.contains("Data corrupted") ||
-               error_msg.contains("Managed file cannot be deserialized") ||
-               error_msg.contains("column 2291") {
-                debug_log!("🔧 METADATA SKIP: Split {} has known metadata corruption - continuing with remaining splits", split_url);
+            // Check if this is a known data corruption or metadata parsing error
+            if is_data_corruption_error(&error_msg) {
+                debug_log!("🔧 DATA CORRUPTION SKIP: Split {} has known data corruption or metadata error - continuing with remaining splits", split_url);
+                debug_log!("🔧 ERROR DETAILS: {}", error_msg);
             } else {
-                debug_log!("🔧 METADATA SKIP: Split {} has unexpected error - continuing with remaining splits", split_url);
+                debug_log!("🔧 GENERAL ERROR SKIP: Split {} has unexpected error - continuing with remaining splits", split_url);
+                debug_log!("🔧 ERROR DETAILS: {}", error_msg);
             }
 
             skipped_splits.push(split_url.clone());
@@ -2288,9 +2376,20 @@ fn merge_splits_impl(split_urls: &[String], output_path: &str, config: &MergeCon
     // Keep temp directory alive for merge duration - store in vector for proper cleanup
     temp_dirs.push(extracted_split.temp_dir);
     }
-    
-    debug_log!("Opened {} splits with total {} documents, {} bytes", split_urls.len(), total_docs, total_size);
-    
+
+    // Check if we have any valid splits after processing
+    let valid_splits = split_directories.len();
+    let total_requested = split_urls.len();
+    debug_log!("Opened {} valid splits out of {} requested with total {} documents, {} bytes", valid_splits, total_requested, total_docs, total_size);
+
+    if valid_splits == 0 {
+        return Err(anyhow!("All splits failed to parse due to data corruption or metadata errors. Skipped splits: {:?}", skipped_splits));
+    }
+
+    if !skipped_splits.is_empty() {
+        debug_log!("⚠️ PARTIAL MERGE WARNING: Proceeding with {} valid splits, {} skipped due to corruption: {:?}", valid_splits, skipped_splits.len(), skipped_splits);
+    }
+
     // 2. Combine index metadata (Quickwit's approach)
     let union_index_meta = combine_index_meta(index_metas)?;
     debug_log!("Combined metadata from {} splits", split_urls.len());
@@ -2347,8 +2446,25 @@ fn merge_splits_impl(split_urls: &[String], output_path: &str, config: &MergeCon
     
     // 6. Create union directory for unified access without copying data
     let union_directory = UnionDirectory::union_of(directory_stack);
-    let union_index = resilient_ops::resilient_index_open(Box::new(union_directory))?;
-    debug_log!("Created union index");
+
+    // ✅ RESILIENT UNION INDEX CREATION: Handle remaining corruption gracefully
+    let union_index = match resilient_ops::resilient_index_open(Box::new(union_directory)) {
+        Ok(index) => {
+            debug_log!("Created union index successfully");
+            index
+        }
+        Err(e) => {
+            let error_msg = e.to_string();
+            debug_log!("🚨 UNION INDEX CREATION ERROR: {}", error_msg);
+
+            // Check if this is data corruption that slipped through individual split validation
+            if is_data_corruption_error(&error_msg) {
+                return Err(anyhow!("Union index creation failed due to data corruption in remaining splits. Consider checking individual split integrity. Error: {}", error_msg));
+            } else {
+                return Err(anyhow!("Union index creation failed: {}", error_msg));
+            }
+        }
+    };
     
     // 6.5. Extract doc mapping from the union index schema
     let doc_mapping_json = extract_doc_mapping_from_index(&union_index)
@@ -2880,7 +2996,15 @@ fn create_merged_split_file(merged_index_path: &Path, output_path: &str, metadat
     
     // Open the merged Tantivy index
     let merged_directory = MmapDirectory::open(merged_index_path)?;
-    let merged_index = resilient_ops::resilient_index_open(Box::new(merged_directory))?;
+    let merged_index = resilient_ops::resilient_index_open(Box::new(merged_directory))
+        .map_err(|e| {
+            let error_msg = e.to_string();
+            if is_data_corruption_error(&error_msg) {
+                anyhow!("Merged index file appears to be corrupted during split creation. This may indicate a problem with the merge process. Error: {}", error_msg)
+            } else {
+                anyhow!("Failed to open merged index for split creation: {}", error_msg)
+            }
+        })?;
     
     // Use the existing split creation logic and capture footer offsets
     // Create a default config for merged splits

@@ -78,22 +78,24 @@ public class SplitWarmupPerformanceTest {
         
         QuickwitSplit.SplitMetadata metadata;
         try {
-            java.lang.reflect.Constructor<QuickwitSplit.SplitMetadata> constructor = 
+            java.lang.reflect.Constructor<QuickwitSplit.SplitMetadata> constructor =
                 QuickwitSplit.SplitMetadata.class.getDeclaredConstructor(
-                    String.class, long.class, long.class, 
+                    String.class, long.class, long.class,
                     java.time.Instant.class, java.time.Instant.class,
                     java.util.Set.class, long.class, int.class,
-                    long.class, long.class, long.class, long.class, String.class
+                    long.class, long.class, long.class, long.class, String.class,
+                    java.util.List.class  // Added skippedSplits parameter
                 );
             constructor.setAccessible(true);
-            
+
             metadata = constructor.newInstance(
                 "merged-consolidated.split", 600L, 105000000L, // 105MB instead of 500KB
-                java.time.Instant.now().minus(1, java.time.temporal.ChronoUnit.HOURS), 
+                java.time.Instant.now().minus(1, java.time.temporal.ChronoUnit.HOURS),
                 java.time.Instant.now(),
                 new java.util.HashSet<>(java.util.Arrays.asList("test")),
                 0L, 0, 104500000L, 105000000L, 104600000L, 400000L, // Adjust footer offsets for 105MB size
-                "[{\"field_name\":\"title\",\"mapping_type\":\"text\",\"indexed\":true,\"stored\":true,\"fast\":false,\"expand_dots\":false},{\"field_name\":\"content\",\"mapping_type\":\"text\",\"indexed\":true,\"stored\":true,\"fast\":false,\"expand_dots\":false},{\"field_name\":\"id\",\"mapping_type\":\"i64\",\"indexed\":true,\"stored\":true,\"fast\":true,\"expand_dots\":false},{\"field_name\":\"count\",\"mapping_type\":\"i64\",\"indexed\":true,\"stored\":true,\"fast\":false,\"expand_dots\":false}]"
+                "[{\"field_name\":\"title\",\"mapping_type\":\"text\",\"indexed\":true,\"stored\":true,\"fast\":false,\"expand_dots\":false},{\"field_name\":\"content\",\"mapping_type\":\"text\",\"indexed\":true,\"stored\":true,\"fast\":false,\"expand_dots\":false},{\"field_name\":\"id\",\"mapping_type\":\"i64\",\"indexed\":true,\"stored\":true,\"fast\":true,\"expand_dots\":false},{\"field_name\":\"count\",\"mapping_type\":\"i64\",\"indexed\":true,\"stored\":true,\"fast\":false,\"expand_dots\":false}]",
+                new java.util.ArrayList<String>()  // Empty skipped splits list
             );
         } catch (Exception e) {
             throw new RuntimeException("Failed to create split metadata: " + e.getMessage(), e);
