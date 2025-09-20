@@ -20,7 +20,7 @@ use tempfile as temp;
 
 // Directory trait import (only once)
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Result, Context};
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 use serde::{Serialize, Deserialize};
@@ -32,12 +32,18 @@ use quickwit_indexing::{
     open_split_directories,
     merge_split_directories_standalone,
     open_index,
+    ControlledDirectory,
+    create_shadowing_meta_json_directory,
 };
+use quickwit_directories::UnionDirectory;
 use quickwit_common::io::IoControls;
 use quickwit_common::retry::Retryable;
 use quickwit_query::get_quickwit_fastfield_normalizer_manager;
+use quickwit_proto::metastore::DeleteTask;
+use quickwit_doc_mapper::DocMapper;
 use tantivy::tokenizer::TokenizerManager;
 use tantivy::directory::{Directory, FileHandle};
+use tantivy::IndexMeta;
 use std::io::{self, Cursor, Read, Seek, SeekFrom};
 
 // ✅ REENTRANCY FIX: Enhanced merge ID generation system to prevent collisions
@@ -816,19 +822,27 @@ fn is_data_corruption_error(error_msg: &str) -> bool {
 
 async fn convert_index_from_path_impl_async(index_path: &str, output_path: &str, config: &SplitConfig) -> Result<QuickwitSplitMetadata, anyhow::Error> {
     use tantivy::directory::MmapDirectory;
-    
+
+    debug_log!("🔍 CONVERT: Starting conversion from {} to {}", index_path, output_path);
+
     // Open the Tantivy index using the actual Quickwit/Tantivy libraries
     let mmap_directory = MmapDirectory::open(index_path)
         .map_err(|e| anyhow!("Failed to open index directory {}: {}", index_path, e))?;
+    debug_log!("🔍 CONVERT: Opened MmapDirectory successfully");
     let tokenizer_manager = create_quickwit_tokenizer_manager();
     let tantivy_index = open_index(mmap_directory, &tokenizer_manager)
         .map_err(|e| anyhow!("Failed to open Tantivy index: {}", e))?;
     
     // Get actual document count from the index
-    let searcher = tantivy_index.reader()
-    .map_err(|e| anyhow!("Failed to create index reader: {}", e))?
-    .searcher();
+    // Important: We need to reload the reader to see any committed changes
+    let reader = tantivy_index.reader()
+        .map_err(|e| anyhow!("Failed to create index reader: {}", e))?;
+    reader.reload()
+        .map_err(|e| anyhow!("Failed to reload index reader: {}", e))?;
+    let searcher = reader.searcher();
     let doc_count = searcher.num_docs() as i32;
+
+    debug_log!("🔍 CONVERT INDEX: Found {} documents in index at {}", doc_count, index_path);
     
     // Calculate actual index size
     let index_dir = PathBuf::from(index_path);
@@ -1102,11 +1116,21 @@ pub extern "system" fn Java_com_tantivy4java_QuickwitSplit_nativeReadSplitMetada
     // ✅ QUICKWIT NATIVE: Use Quickwit's native functions to open the split
     // This replaces all custom memory mapping and index opening logic
     let (tantivy_index, bundle_directory) = open_split_with_quickwit_native(&split_path_str)?;
-    
+
+    // Get actual document count from the split
+    let reader = tantivy_index.reader()
+        .map_err(|e| anyhow!("Failed to create index reader: {}", e))?;
+    reader.reload()
+        .map_err(|e| anyhow!("Failed to reload index reader: {}", e))?;
+    let searcher = reader.searcher();
+    let doc_count = searcher.num_docs() as usize;
+
+    debug_log!("🔍 READ SPLIT: Found {} documents in split {}", doc_count, split_path_str);
+
     // Extract doc mapping JSON from the Tantivy index schema
     let doc_mapping_json = extract_doc_mapping_from_index(&tantivy_index)
         .map_err(|e| anyhow!("Failed to extract doc mapping from split index: {}", e))?;
-    
+
     debug_log!("Successfully extracted doc mapping from split ({} bytes)", doc_mapping_json.len());
     
     // ✅ QUICKWIT NATIVE: Since we can't get file count from BundleDirectory API,
@@ -1122,7 +1146,7 @@ pub extern "system" fn Java_com_tantivy4java_QuickwitSplit_nativeReadSplitMetada
         node_id: "unknown".to_string(),
         doc_mapping_uid: "unknown".to_string(),
         partition_id: 0,
-        num_docs: 0, // Can't determine from split file alone
+        num_docs: doc_count, // ✅ FIXED: Get actual document count from split
         uncompressed_docs_size_in_bytes: std::fs::metadata(&split_path_str)?.len(),
         time_range: None,
         create_timestamp: Utc::now().timestamp(),
@@ -2559,6 +2583,202 @@ fn cleanup_merge_temp_directory(merge_id: &str) {
     }
 }
 
+/// Optimization settings for merge operations detected automatically
+#[derive(Debug, Clone)]
+struct MergeOptimization {
+    heap_size_bytes: u64,
+    num_threads: u32,
+    use_random_io: bool,
+    enable_compression: bool,
+    memory_map_threshold: u64,
+}
+
+/// Detect optimal merge settings based on input size - AGGRESSIVE performance mode
+fn detect_merge_optimization_settings(total_input_size: u64) -> MergeOptimization {
+    // Detect if running in parallel execution context by checking temp directories
+    let parallel_execution = detect_parallel_execution_context();
+
+    // 🚀 AGGRESSIVE heap sizing - use much more memory for better performance
+    let base_heap_size = if total_input_size < 100_000_000 {
+        128_000_000  // 128MB for small merges (was 50MB)
+    } else if total_input_size < 1_000_000_000 {
+        512_000_000  // 512MB for medium merges (was 128MB)
+    } else if total_input_size < 5_000_000_000 {
+        1_000_000_000 // 1GB for large merges (was 256MB)
+    } else {
+        2_000_000_000 // 2GB for very large merges
+    };
+
+    // Use full heap size regardless of parallel execution - grab what we need
+    let heap_size_bytes = base_heap_size;
+
+    // 🚀 AGGRESSIVE threading - use all available CPUs
+    let available_cpus = std::thread::available_parallelism()
+        .map(|p| p.get() as u32)
+        .unwrap_or(2);
+
+    let num_threads = if parallel_execution {
+        // Still use good thread count for parallel execution - don't be too conservative
+        std::cmp::max(2, available_cpus / 2) // Use half available CPUs (was 1/4)
+    } else {
+        // Use all available CPUs for single execution
+        available_cpus
+    };
+
+    // Use Random I/O for parallel execution to reduce disk contention
+    let use_random_io = parallel_execution;
+
+    // Higher memory map threshold for better performance
+    let memory_map_threshold = if total_input_size > 500_000_000 {
+        500_000_000 // 500MB threshold for large files (was 200MB)
+    } else {
+        200_000_000 // 200MB threshold (was 100MB)
+    };
+
+    MergeOptimization {
+        heap_size_bytes,
+        num_threads: std::cmp::max(2, num_threads), // Ensure at least 2 threads for parallelism
+        use_random_io,
+        enable_compression: true,
+        memory_map_threshold,
+    }
+}
+
+/// Detect if we're running in a parallel execution context (like Spark)
+fn detect_parallel_execution_context() -> bool {
+    // Check environment variables that indicate parallel execution
+    if std::env::var("SPARK_HOME").is_ok()
+        || std::env::var("HADOOP_HOME").is_ok()
+        || std::env::var("YARN_CONF_DIR").is_ok() {
+        return true;
+    }
+
+    // Check for temp directories that suggest parallel processing
+    let temp_dir = std::env::temp_dir();
+    let temp_str = temp_dir.to_string_lossy();
+
+    // Look for patterns that indicate Databricks, Spark, or other parallel systems
+    if temp_str.contains("local_disk")
+        || temp_str.contains("spark")
+        || temp_str.contains("databricks")
+        || temp_str.contains("executor") {
+        return true;
+    }
+
+    // For now, assume we're NOT in parallel execution context to be aggressive
+    // This means we'll always use full resources unless explicitly detected
+    false
+}
+
+/// Optimized merge implementation that bypasses Quickwit's hardcoded limits
+async fn merge_split_directories_with_optimization(
+    union_index_meta: IndexMeta,
+    split_directories: Vec<Box<dyn Directory>>,
+    delete_tasks: Vec<DeleteTask>,
+    doc_mapper_opt: Option<Arc<DocMapper>>,
+    output_path: &Path,
+    io_controls: IoControls,
+    tokenizer_manager: &tantivy::tokenizer::TokenizerManager,
+    optimization: MergeOptimization,
+) -> anyhow::Result<ControlledDirectory> {
+    use tantivy::directory::MmapDirectory;
+    use tantivy::IndexWriter;
+    use memmap2::Advice;
+
+    debug_log!("🚀 STARTING OPTIMIZED MERGE: heap={}MB, threads={}, io={:?}",
+               optimization.heap_size_bytes / 1_000_000,
+               optimization.num_threads,
+               if optimization.use_random_io { "Random" } else { "Sequential" });
+
+    // Create the shadowing meta JSON directory
+    let shadowing_meta_json_directory = create_shadowing_meta_json_directory(union_index_meta)?;
+
+    // Create output directory with optimized I/O advice
+    let output_directory = ControlledDirectory::new(
+        if optimization.use_random_io {
+            // Use Random access for parallel operations to reduce disk contention
+            Box::new(MmapDirectory::open_with_madvice(output_path, Advice::Random)?)
+        } else {
+            // Use Sequential access for single operations (default Quickwit behavior)
+            Box::new(MmapDirectory::open_with_madvice(output_path, Advice::Sequential)?)
+        },
+        io_controls,
+    );
+
+    // Build directory stack (same as Quickwit)
+    let mut directory_stack: Vec<Box<dyn Directory>> = vec![
+        Box::new(output_directory.clone()),
+        Box::new(shadowing_meta_json_directory),
+    ];
+    directory_stack.extend(split_directories.into_iter());
+
+    // Create union directory and open index
+    let union_directory = UnionDirectory::union_of(directory_stack);
+    let union_index = open_index(union_directory, tokenizer_manager)?;
+
+    // 🚀 KEY OPTIMIZATION: Use dynamic heap size and thread count instead of hardcoded values
+    let mut index_writer: IndexWriter = union_index.writer_with_num_threads(
+        optimization.num_threads as usize,      // Dynamic threads (was hardcoded to 1)
+        optimization.heap_size_bytes as usize   // Dynamic heap size (was hardcoded to 15MB)
+    )?;
+
+    // Apply delete tasks if any (same logic as Quickwit)
+    let num_delete_tasks = delete_tasks.len();
+    if num_delete_tasks > 0 {
+        let doc_mapper = doc_mapper_opt
+            .ok_or_else(|| anyhow::anyhow!("doc mapper must be present if there are delete tasks"))?;
+        for delete_task in delete_tasks {
+            let delete_query = delete_task
+                .delete_query
+                .expect("A delete task must have a delete query.");
+            let query_ast: quickwit_query::query_ast::QueryAst = serde_json::from_str(&delete_query.query_ast)
+                .context("invalid query_ast json")?;
+            let (query, _warmup_info) = doc_mapper
+                .query(doc_mapper.schema(), &query_ast, true)
+                .context("Failed to build query")?;
+            index_writer.delete_query(query)?;
+        }
+        // If there were delete tasks, commit them first
+        if num_delete_tasks > 0 {
+            debug_log!("🚀 OPTIMIZATION: Committing delete operations");
+            index_writer.commit()?;
+        }
+    }
+
+    // 🚀 KEY MERGE OPERATION: Get segment IDs and merge them (this was missing!)
+    let segment_ids: Vec<_> = union_index
+        .searchable_segment_metas()?
+        .into_iter()
+        .map(|segment_meta| segment_meta.id())
+        .collect();
+
+    debug_log!("🚀 OPTIMIZATION: Found {} segments to merge: {:?}", segment_ids.len(), segment_ids);
+
+    // Check if merge is needed (same logic as Quickwit)
+    if num_delete_tasks == 0 && segment_ids.len() <= 1 {
+        debug_log!("🚀 OPTIMIZATION: No merge needed (0 deletes, ≤1 segment)");
+        return Ok(output_directory);
+    }
+
+    // If after deletion there are no segments, don't try to merge
+    if num_delete_tasks != 0 && segment_ids.is_empty() {
+        debug_log!("🚀 OPTIMIZATION: No segments remaining after deletion");
+        return Ok(output_directory);
+    }
+
+    // 🚀 THE ACTUAL MERGE: This is what was missing!
+    debug_log!("🚀 OPTIMIZATION: Starting segment merge with {} threads, {}MB heap",
+               optimization.num_threads, optimization.heap_size_bytes / 1_000_000);
+    index_writer.merge(&segment_ids).await?;
+
+    debug_log!("🚀 OPTIMIZED MERGE COMPLETE: Used {}MB heap, {} threads, {:?} I/O",
+               optimization.heap_size_bytes / 1_000_000,
+               optimization.num_threads,
+               if optimization.use_random_io { "Random" } else { "Sequential" });
+
+    Ok(output_directory)
+}
+
 /// Perform segment-level merge using Quickwit/Tantivy's efficient approach
 async fn perform_quickwit_merge(
     split_directories: Vec<Box<dyn Directory>>,
@@ -2571,11 +2791,23 @@ async fn perform_quickwit_merge(
     let (union_index_meta, directories) = open_split_directories(&split_directories, tokenizer_manager)?;
     debug_log!("Combined metadata from {} splits", directories.len());
 
-    // Step 2: Create IO controls for the merge operation
+    // Step 2: Estimate total input size for smart optimization
+    // Since we have Directory objects, not paths, estimate based on number of splits
+    let total_input_size = (split_directories.len() as u64) * 50_000_000; // Assume 50MB per split average
+    debug_log!("Total input size: {} bytes ({:.1} MB)", total_input_size, total_input_size as f64 / 1_000_000.0);
+
+    // Step 3: Detect parallel execution context and optimize accordingly
+    let merge_optimization = detect_merge_optimization_settings(total_input_size);
+    debug_log!("🚀 MERGE OPTIMIZATION: heap={}MB, threads={}, io={:?}",
+               merge_optimization.heap_size_bytes / 1_000_000,
+               merge_optimization.num_threads,
+               if merge_optimization.use_random_io { "Random" } else { "Sequential" });
+
+    // Step 4: Create optimized IO controls (IoControls doesn't have num_threads field)
     let io_controls = IoControls::default();
 
-    // Step 3: Use Quickwit's exact merge implementation
-    let controlled_directory = merge_split_directories_standalone(
+    // Step 5: Use our optimized merge implementation that bypasses Quickwit's hardcoded limits
+    let controlled_directory = merge_split_directories_with_optimization(
         union_index_meta,
         directories,
         Vec::new(), // No delete tasks for split merging
@@ -2583,6 +2815,7 @@ async fn perform_quickwit_merge(
         output_path,
         io_controls,
         tokenizer_manager,
+        merge_optimization,
     ).await?;
 
     // Step 4: Open the merged index to get document count
