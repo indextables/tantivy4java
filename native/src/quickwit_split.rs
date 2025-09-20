@@ -221,8 +221,7 @@ mod resilient_ops {
 
     impl Retryable for RetryableAnyhowError {
         fn is_retryable(&self) -> bool {
-            let error_msg = self.0.to_string();
-            is_data_corruption_error(&error_msg)
+            true  // Retry ALL errors - let the retry logic handle all failure cases
         }
     }
 
@@ -799,25 +798,112 @@ fn convert_index_from_path_impl(index_path: &str, output_path: &str, config: &Sp
     runtime.block_on(convert_index_from_path_impl_async(index_path, output_path, config))
 }
 
-/// Helper function to check if an error message indicates data corruption that should be skipped
-/// rather than failing the entire merge operation.
-fn is_data_corruption_error(error_msg: &str) -> bool {
-    let error_lower = error_msg.to_lowercase();
-    error_msg.contains("INDEX_CORRUPTION:") ||
-    error_lower.contains("eof while parsing") ||
-    error_lower.contains("data corrupted") ||
-    error_lower.contains("data corruption") ||
-    error_lower.contains("managed file cannot be deserialized") ||
-    error_lower.contains("managed file can not be deserialized") ||
-    error_lower.contains(".managed.json") ||
-    error_lower.contains("column 2291") ||
-    error_lower.contains("linke:") ||  // Typo in some Tantivy error messages
-    error_lower.contains("indes::open failed") ||  // Index open failures
-    error_lower.contains("index::open failed") ||
-    error_lower.contains("failed after") && error_lower.contains("attempts") ||
-    error_lower.contains("magic number does not match") ||  // Bundle corruption
-    error_lower.contains("failed to open split bundle") ||  // Bundle access failures
-    error_lower.contains("hot directory metadata")  // Hot directory corruption
+/// Determines if an error is a configuration/system error that should not be bypassed
+/// Configuration errors indicate problems with credentials, region settings, network connectivity, etc.
+/// These should fail the operation rather than being treated as "skipped splits"
+fn is_configuration_error(error_msg: &str) -> bool {
+    let msg_lower = error_msg.to_lowercase();
+
+    // AWS/S3 configuration errors that should not be bypassed
+    if msg_lower.contains("credential") && (msg_lower.contains("missing") || msg_lower.contains("invalid") || msg_lower.contains("expired")) {
+        return true;
+    }
+
+    if msg_lower.contains("access key") && (msg_lower.contains("missing") || msg_lower.contains("invalid")) {
+        return true;
+    }
+
+    if msg_lower.contains("secret key") && (msg_lower.contains("missing") || msg_lower.contains("invalid")) {
+        return true;
+    }
+
+    if msg_lower.contains("region") && (msg_lower.contains("invalid") || msg_lower.contains("unsupported")) {
+        return true;
+    }
+
+    if msg_lower.contains("endpoint") && msg_lower.contains("invalid") {
+        return true;
+    }
+
+    // AWS authorization/authentication errors
+    if msg_lower.contains("unauthorized") || msg_lower.contains("forbidden") || msg_lower.contains("access denied") {
+        return true;
+    }
+
+    // Storage resolver creation errors
+    if msg_lower.contains("storage resolver") && msg_lower.contains("creation failed") {
+        return true;
+    }
+
+    // Invalid URL/parameter errors
+    if msg_lower.contains("invalid url") || msg_lower.contains("malformed") {
+        return true;
+    }
+
+    // Network/DNS configuration errors - these indicate system-level issues
+    if msg_lower.contains("dns error") || msg_lower.contains("failed to lookup address") {
+        return true;
+    }
+
+    if msg_lower.contains("hostname not extractable") || msg_lower.contains("nodename nor servname provided") {
+        return true;
+    }
+
+    if msg_lower.contains("connection refused") || msg_lower.contains("network unreachable") {
+        return true;
+    }
+
+    // General connection/network errors that indicate configuration issues
+    if msg_lower.contains("dispatch failure") || msg_lower.contains("connecterror") {
+        return true;
+    }
+
+    // Timeout errors often indicate configuration or network issues
+    if msg_lower.contains("timeout") || msg_lower.contains("timed out") {
+        return true;
+    }
+
+    // Bucket-level errors that indicate configuration problems
+    if msg_lower.contains("bucket") && (msg_lower.contains("does not exist") || msg_lower.contains("not found")) {
+        return true;
+    }
+
+    // S3 redirect and endpoint errors - these are configuration issues
+    if msg_lower.contains("permanentredirect") {
+        return true;
+    }
+
+    if msg_lower.contains("must be addressed using the specified endpoint") {
+        return true;
+    }
+
+    // S3 region mismatch and endpoint configuration errors
+    if msg_lower.contains("the bucket you are attempting to access") {
+        return true;
+    }
+
+    // AWS SDK authentication/configuration errors that appear without credentials
+    if msg_lower.contains("service error") && (msg_lower.contains("unhandled") || msg_lower.contains("permanentredirect")) {
+        return true;
+    }
+
+    // Storage errors - these indicate storage backend configuration issues
+    if msg_lower.contains("storage error") {
+        return true;
+    }
+
+    // Local file system errors that indicate path/configuration issues
+    if msg_lower.contains("not found") || msg_lower.contains("no such file") {
+        return true;
+    }
+
+    false  // All other errors are treated as individual split issues and bypassed gracefully
+}
+
+/// Legacy function kept for compatibility - now only used for individual split file errors
+/// This function is used for split-level error handling decisions
+fn is_data_corruption_error(_error_msg: &str) -> bool {
+    true  // Individual split file errors are treated as recoverable - bypass gracefully
 }
 
 async fn convert_index_from_path_impl_async(index_path: &str, output_path: &str, config: &SplitConfig) -> Result<QuickwitSplitMetadata, anyhow::Error> {
@@ -1583,8 +1669,8 @@ fn extract_split_to_directory_impl(split_path: &Path, output_dir: &Path) -> Resu
     // Open bundle as index to get list of files (with resilient retry logic)
     let tokenizer_manager = create_quickwit_tokenizer_manager();
     let temp_bundle_index = open_index(bundle_directory.box_clone(), &tokenizer_manager)?;
-    let index_meta = temp_bundle_index.load_metas()
-        .map_err(|e| anyhow!("Failed to load index metadata: {}", e))?;
+    let index_meta = resilient_ops::resilient_load_metas(&temp_bundle_index)
+        .map_err(|e| anyhow!("Failed to load index metadata with resilient retry: {}", e))?;
     
     // Copy all segment files and meta.json
     let mut copied_files = 0;
@@ -1768,6 +1854,14 @@ async fn download_and_extract_splits_parallel(
             }
             Err(e) => {
                 let split_url = &split_urls[i];
+                let error_msg = e.to_string();
+
+                // Check if this is a configuration error that should not be bypassed
+                if is_configuration_error(&error_msg) {
+                    debug_log!("🚨 CONFIGURATION ERROR in split {}: This is a system configuration issue, not a split corruption issue", i);
+                    return Err(e);  // Bubble up configuration errors - these should fail the entire operation
+                }
+
                 debug_log!("🚨 Split {} failed: {} (Error: {})", i, split_url, e);
                 skipped_splits.push(split_url.clone());
             }
@@ -1796,13 +1890,15 @@ async fn download_and_extract_single_split_resilient(
         Ok(extracted_split) => Ok(Some(extracted_split)),
         Err(e) => {
             let error_msg = e.to_string();
-            if is_data_corruption_error(&error_msg) {
-                debug_log!("⚠️ Split {} corrupted/invalid, adding to skip list: {} (Error: {})", split_index, split_url, error_msg);
-                Ok(None) // Skip this split gracefully
-            } else {
-                debug_log!("🚨 Split {} failed with non-corruption error: {} (Error: {})", split_index, split_url, error_msg);
-                Ok(None) // For now, skip all errors gracefully - could be made more strict later
+
+            // Check if this is a configuration error that should not be bypassed
+            if is_configuration_error(&error_msg) {
+                debug_log!("🚨 CONFIGURATION ERROR in split {}: This is a system configuration issue, not a split corruption issue", split_index);
+                return Err(e);  // Preserve configuration errors - these should fail the operation
             }
+
+            debug_log!("⚠️ Split {} failed, adding to skip list: {} (Error: {})", split_index, split_url, error_msg);
+            Ok(None) // Skip this split gracefully for non-configuration errors
         }
     }
 }
@@ -2044,9 +2140,28 @@ fn merge_splits_impl(split_urls: &[String], output_path: &str, config: &MergeCon
     // ⚡ PARALLEL SPLIT DOWNLOAD AND EXTRACTION OPTIMIZATION
     debug_log!("🚀 PARALLEL DOWNLOAD: Starting concurrent download of {} splits", split_urls.len());
 
-    let (extracted_splits, mut skipped_splits) = runtime.block_on(async {
-    download_and_extract_splits_parallel(split_urls, &merge_id, config).await
-    })?;
+    // ✅ RESILIENT DOWNLOAD: Handle split-level failures gracefully, but preserve configuration errors
+    let (extracted_splits, mut skipped_splits) = match runtime.block_on(async {
+        download_and_extract_splits_parallel(split_urls, &merge_id, config).await
+    }) {
+        Ok((splits, skipped)) => (splits, skipped),
+        Err(e) => {
+            let error_msg = e.to_string();
+            debug_log!("⚠️ PARALLEL DOWNLOAD FAILURE: Complete download operation failed: {}", error_msg);
+
+            // Check if this is a configuration error that should not be bypassed
+            if is_configuration_error(&error_msg) {
+                debug_log!("🚨 CONFIGURATION ERROR: This is a system configuration issue, not a split corruption issue");
+                return Err(e);  // Preserve configuration errors - these should fail the operation
+            }
+
+            // If it's not a configuration error, treat all splits as skipped
+            debug_log!("🔧 DOWNLOAD FAILURE RECOVERY: Treating all {} splits as skipped due to non-configuration system failure", split_urls.len());
+
+            let all_skipped: Vec<String> = split_urls.iter().cloned().collect();
+            (Vec::new(), all_skipped)
+        }
+    };
 
     debug_log!("✅ PARALLEL DOWNLOAD: Completed concurrent processing of {} successful splits, {} skipped", extracted_splits.len(), skipped_splits.len());
 
@@ -2058,75 +2173,81 @@ fn merge_splits_impl(split_urls: &[String], output_path: &str, config: &MergeCon
 
     debug_log!("🔧 Processing extracted split {}: {}", i, split_url);
 
-    // ✅ RESILIENT METADATA PARSING: Handle all corruption gracefully with warnings
+    // ✅ RESILIENT METADATA PARSING: Handle ANY error gracefully with warnings
     let (extracted_directory, temp_index, index_meta) = match (|| -> Result<_> {
         let extracted_directory = MmapDirectory::open(temp_extract_path)?;
 
-        // ✅ RESILIENT INDEX OPEN: Handle Index::open corruption gracefully
+        // ✅ RESILIENT INDEX OPEN: Handle ANY Index::open error gracefully
         let tokenizer_manager = create_quickwit_tokenizer_manager();
         let temp_index = match open_index(extracted_directory.box_clone(), &tokenizer_manager) {
             Ok(index) => index,
             Err(index_error) => {
                 let index_error_msg = index_error.to_string();
                 debug_log!("⚠️ INDEX OPEN ERROR: Split {} failed Index::open with: {}", split_url, index_error_msg);
-
-                // Check if this is a data corruption error that should be skipped
-                if is_data_corruption_error(&index_error_msg) {
-                    debug_log!("🔧 INDEX CORRUPTION DETECTED: Split {} has corrupted index data - adding to skip list", split_url);
-                    return Err(anyhow!("INDEX_CORRUPTION: {}", index_error_msg));
-                } else {
-                    // Re-throw non-corruption errors converted to anyhow::Error
-                    return Err(anyhow!("Index open failed: {}", index_error));
-                }
+                debug_log!("🔧 INDEX ERROR SKIP: Split {} has index error - adding to skip list", split_url);
+                return Err(anyhow!("INDEX_ERROR: {}", index_error_msg));
             }
         };
 
-        let index_meta = temp_index.load_metas()
-            .map_err(|e| anyhow!("Failed to load index metadata: {}", e))?;
+        let index_meta = resilient_ops::resilient_load_metas(&temp_index)
+            .map_err(|e| anyhow!("Failed to load index metadata with resilient retry: {}", e))?;
         Ok((extracted_directory, temp_index, index_meta))
     })() {
         Ok((dir, index, meta)) => (dir, index, meta),
         Err(e) => {
             let error_msg = e.to_string();
             debug_log!("⚠️ SPLIT PROCESSING ERROR: Skipping split {} due to error: {}", split_url, error_msg);
+            debug_log!("🔧 ERROR SKIP: Split {} has processing error - continuing with remaining splits", split_url);
+            debug_log!("🔧 ERROR DETAILS: {}", error_msg);
 
-            // Check if this is a known data corruption or metadata parsing error
-            if is_data_corruption_error(&error_msg) {
-                debug_log!("🔧 DATA CORRUPTION SKIP: Split {} has known data corruption or metadata error - continuing with remaining splits", split_url);
-                debug_log!("🔧 ERROR DETAILS: {}", error_msg);
+            skipped_splits.push(split_url.clone());
+            continue; // Skip this split and continue with others for ANY error
+        }
+    };
+
+    // ✅ RESILIENT SPLIT FINALIZATION: Handle ANY remaining failure gracefully
+    let (doc_count, split_size) = match (|| -> Result<(u64, u64)> {
+        // Count documents and calculate size efficiently
+        let reader = temp_index.reader()
+            .map_err(|e| anyhow!("Failed to create index reader: {}", e))?;
+        let searcher = reader.searcher();
+        let doc_count = searcher.num_docs();
+
+        // Calculate split size based on source type
+        let split_size = if split_url.contains("://") && !split_url.starts_with("file://") {
+            // For S3/remote splits, get size from the temporary downloaded file
+            let split_filename = split_url.split('/').last().unwrap_or("split.split");
+            let temp_split_path = temp_extract_path.join(split_filename);
+            std::fs::metadata(&temp_split_path)
+                .map_err(|e| anyhow!("Failed to get metadata for temporary split file: {}", e))?
+                .len()
+        } else {
+            // For local splits, get size from original file
+            let split_path = if split_url.starts_with("file://") {
+                split_url.strip_prefix("file://").unwrap_or(split_url)
             } else {
-                debug_log!("🔧 GENERAL ERROR SKIP: Split {} has unexpected error - continuing with remaining splits", split_url);
-                debug_log!("🔧 ERROR DETAILS: {}", error_msg);
-            }
+                split_url
+            };
+            std::fs::metadata(split_path)
+                .map_err(|e| anyhow!("Failed to get metadata for split file: {}", e))?
+                .len()
+        };
+
+        Ok((doc_count, split_size))
+    })() {
+        Ok((docs, size)) => (docs, size),
+        Err(e) => {
+            let error_msg = e.to_string();
+            debug_log!("⚠️ SPLIT FINALIZATION ERROR: Skipping split {} due to finalization error: {}", split_url, error_msg);
+            debug_log!("🔧 FINALIZATION ERROR DETAILS: {}", error_msg);
 
             skipped_splits.push(split_url.clone());
             continue; // Skip this split and continue with others
         }
     };
 
-    // Count documents and calculate size efficiently
-    let reader = temp_index.reader()?;
-    let searcher = reader.searcher();
-    let doc_count = searcher.num_docs();
-
-    // Calculate split size based on source type
-    let split_size = if split_url.contains("://") && !split_url.starts_with("file://") {
-        // For S3/remote splits, get size from the temporary downloaded file
-        let split_filename = split_url.split('/').last().unwrap_or("split.split");
-        let temp_split_path = temp_extract_path.join(split_filename);
-        std::fs::metadata(&temp_split_path)?.len()
-    } else {
-        // For local splits, get size from original file
-        let split_path = if split_url.starts_with("file://") {
-            split_url.strip_prefix("file://").unwrap_or(split_url)
-        } else {
-            split_url
-        };
-        std::fs::metadata(split_path)?.len()
-    };
-
     debug_log!("📊 Extracted split {} has {} documents, {} bytes", i, doc_count, split_size);
-    
+
     total_docs += doc_count as usize;
     total_size += split_size;
     split_directories.push(extracted_directory.box_clone());
@@ -2141,14 +2262,47 @@ fn merge_splits_impl(split_urls: &[String], output_path: &str, config: &MergeCon
     let total_requested = split_urls.len();
     debug_log!("Opened {} valid splits out of {} requested with total {} documents, {} bytes", valid_splits, total_requested, total_docs, total_size);
 
-    if valid_splits == 0 {
-        // ✅ CRITICAL FIX: Clean up temp directories before returning error
-        debug_log!("🧹 CLEANUP: Cleaning up {} temp directories before error return", temp_dirs.len());
+    // ✅ RESILIENT MERGE: Handle insufficient valid splits according to user requirements
+    if valid_splits <= 1 {
+        // ✅ CRITICAL FIX: Clean up temp directories before returning
+        debug_log!("🧹 CLEANUP: Cleaning up {} temp directories before insufficient splits return", temp_dirs.len());
         for (i, temp_dir) in temp_dirs.into_iter().enumerate() {
             debug_log!("🧹 CLEANUP: Cleaning up temp directory {}: {:?}", i, temp_dir.path());
             // temp_dir will be automatically cleaned up when dropped (RAII)
         }
-        return Err(anyhow!("All splits failed to parse due to data corruption or metadata errors. Skipped splits: {:?}", skipped_splits));
+
+        if valid_splits == 0 {
+            debug_log!("⚠️ RESILIENT MERGE: All {} splits failed to parse due to corruption. Returning null indexUid with skipped splits list.", split_urls.len());
+        } else {
+            debug_log!("⚠️ RESILIENT MERGE: Only 1 valid split remaining after {} corrupted splits. Cannot merge single split. Returning null indexUid.", skipped_splits.len());
+        }
+
+        // Return a special metadata object with null indexUid indicating no merge was performed
+        // but include the skipped splits for tracking purposes
+        let no_merge_metadata = QuickwitSplitMetadata {
+            split_id: "".to_string(),  // Empty split ID
+            index_uid: "".to_string(), // Empty index UID indicates no split was created
+            source_id: config.source_id.clone(),
+            node_id: config.node_id.clone(),
+            doc_mapping_uid: config.doc_mapping_uid.clone(),
+            partition_id: config.partition_id,
+            num_docs: 0,  // No documents since no merge happened
+            uncompressed_docs_size_in_bytes: 0,
+            time_range: None,
+            create_timestamp: chrono::Utc::now().timestamp(),
+            maturity: "Immature".to_string(),
+            tags: std::collections::BTreeSet::new(),
+            delete_opstamp: 0,
+            num_merge_ops: 0,  // No merge operations performed
+            footer_start_offset: None,
+            footer_end_offset: None,
+            hotcache_start_offset: None,
+            hotcache_length: None,
+            doc_mapping_json: None,  // No doc mapping for failed merges
+            skipped_splits: skipped_splits,  // Include all skipped splits for tracking
+        };
+
+        return Ok(no_merge_metadata);
     }
 
     if !skipped_splits.is_empty() {
@@ -2978,11 +3132,7 @@ fn create_merged_split_file(merged_index_path: &Path, output_path: &str, metadat
     let merged_index = open_index(merged_directory, &tokenizer_manager)
         .map_err(|e| {
             let error_msg = e.to_string();
-            if is_data_corruption_error(&error_msg) {
-                anyhow!("Merged index file appears to be corrupted during split creation. This may indicate a problem with the merge process. Error: {}", error_msg)
-            } else {
-                anyhow!("Failed to open merged index for split creation: {}", error_msg)
-            }
+            anyhow!("Failed to open merged index for split creation: {}", error_msg)
         })?;
     
     // Use the existing split creation logic and capture footer offsets
