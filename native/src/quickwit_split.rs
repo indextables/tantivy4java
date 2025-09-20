@@ -6,7 +6,7 @@ use crate::debug_println;
 // Debug logging macro - controlled by TANTIVY4JAVA_DEBUG environment variable
 macro_rules! debug_log {
     ($($arg:tt)*) => {
-    debug_println!("DEBUG: {}", format!($($arg)*));
+    debug_println!("DEBUG: {}", format!($($arg)*))
     };
 }
 use std::collections::{BTreeSet, HashMap};
@@ -208,6 +208,20 @@ mod resilient_ops {
     }
 
     /// Extract column number from serde_json error messages like "line 1, column: 2291"
+    pub fn extract_column_number(error_msg: &str) -> Option<usize> {
+        // Simple string parsing approach to avoid regex dependency complexity
+        // Look for patterns like "line 1, column: 2291" or "line 1, column 2291"
+        if let Some(column_start) = error_msg.find("column") {
+            let after_column = &error_msg[column_start + 6..]; // Skip "column"
+            // Skip any whitespace and optional colon
+            let trimmed = after_column.trim_start_matches(|c: char| c.is_whitespace() || c == ':');
+            // Extract the number
+            let number_str = trimmed.split_whitespace().next()?;
+            number_str.parse::<usize>().ok()
+        } else {
+            None
+        }
+    }
 
     /// Special resilient operation wrapper for JSON column truncation errors
     /// This provides enhanced debugging and potential recovery for consistent JSON truncation issues
