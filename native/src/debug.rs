@@ -9,11 +9,12 @@ pub static DEBUG_ENABLED: Lazy<bool> = Lazy::new(|| {
 });
 
 /// Macro for conditional debug printing
+/// Uses stdout instead of stderr for better Databricks compatibility
 #[macro_export]
 macro_rules! debug_println {
     ($($arg:tt)*) => {
         if *crate::debug::DEBUG_ENABLED {
-            eprintln!($($arg)*);
+            println!($($arg)*);
         }
     };
 }

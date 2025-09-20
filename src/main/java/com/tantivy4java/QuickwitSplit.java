@@ -20,6 +20,7 @@
 package com.tantivy4java;
 
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -50,6 +51,11 @@ public class QuickwitSplit {
         private final Set<String> tags;
         private final Map<String, Object> metadata;
 
+        // New streaming configuration fields
+        private final long streamingChunkSize;        // 64MB default for optimal I/O
+        private final boolean enableProgressTracking;  // Enable detailed progress logging
+        private final boolean enableStreamingIO;       // Use streaming I/O instead of read_all()
+
         /**
          * Create a new split configuration.
          * 
@@ -66,6 +72,17 @@ public class QuickwitSplit {
         public SplitConfig(String indexUid, String sourceId, String nodeId, String docMappingUid,
                           long partitionId, Instant timeRangeStart, Instant timeRangeEnd,
                           Set<String> tags, Map<String, Object> metadata) {
+            this(indexUid, sourceId, nodeId, docMappingUid, partitionId, timeRangeStart, timeRangeEnd,
+                 tags, metadata, 64_000_000L, false, true); // Default: 64MB chunks, no progress tracking, streaming enabled
+        }
+
+        /**
+         * Create a new split configuration with streaming options.
+         */
+        public SplitConfig(String indexUid, String sourceId, String nodeId, String docMappingUid,
+                          long partitionId, Instant timeRangeStart, Instant timeRangeEnd,
+                          Set<String> tags, Map<String, Object> metadata,
+                          long streamingChunkSize, boolean enableProgressTracking, boolean enableStreamingIO) {
             this.indexUid = indexUid;
             this.sourceId = sourceId;
             this.nodeId = nodeId;
@@ -75,6 +92,9 @@ public class QuickwitSplit {
             this.timeRangeEnd = timeRangeEnd;
             this.tags = tags;
             this.metadata = metadata;
+            this.streamingChunkSize = streamingChunkSize;
+            this.enableProgressTracking = enableProgressTracking;
+            this.enableStreamingIO = enableStreamingIO;
         }
 
         /**
@@ -85,7 +105,8 @@ public class QuickwitSplit {
          * @param nodeId Node identifier that created the split
          */
         public SplitConfig(String indexUid, String sourceId, String nodeId) {
-            this(indexUid, sourceId, nodeId, "default", 0L, null, null, null, null);
+            this(indexUid, sourceId, nodeId, "default", 0L, null, null, null, null,
+                 64_000_000L, false, true); // Default: 64MB chunks, no progress tracking, streaming enabled
         }
 
         // Getters
@@ -98,109 +119,226 @@ public class QuickwitSplit {
         public Instant getTimeRangeEnd() { return timeRangeEnd; }
         public Set<String> getTags() { return tags; }
         public Map<String, Object> getMetadata() { return metadata; }
+
+        // New streaming configuration getters
+        public long getStreamingChunkSize() { return streamingChunkSize; }
+        public boolean isProgressTrackingEnabled() { return enableProgressTracking; }
+        public boolean isStreamingIOEnabled() { return enableStreamingIO; }
     }
 
     /**
      * Metadata about a created split.
      */
     public static class SplitMetadata {
+        // Core Quickwit fields (matching quickwit_metastore::SplitMetadata)
         private final String splitId;
+        private final String indexUid;          // NEW: Required by Quickwit
+        private final long partitionId;         // NEW: Required by Quickwit
+        private final String sourceId;          // NEW: Required by Quickwit
+        private final String nodeId;            // NEW: Required by Quickwit
         private final long numDocs;
         private final long uncompressedSizeBytes;
-        private final Instant timeRangeStart;
-        private final Instant timeRangeEnd;
+        private final Instant timeRangeStart;   // Extracted from Quickwit's Range<i64>
+        private final Instant timeRangeEnd;     // Extracted from Quickwit's Range<i64>
+        private final long createTimestamp;     // NEW: Required by Quickwit
+        private final String maturity;          // NEW: Required by Quickwit ("Mature" or "Immature")
         private final Set<String> tags;
+        private final long footerStartOffset;   // From Quickwit's footer_offsets.start
+        private final long footerEndOffset;     // From Quickwit's footer_offsets.end
         private final long deleteOpstamp;
         private final int numMergeOps;
-        
-        // Footer offset information for lazy loading optimization
-        private final long footerStartOffset;    // Where metadata begins (excludes hotcache)
-        private final long footerEndOffset;      // End of file
-        private final long hotcacheStartOffset;  // Where hotcache begins  
-        private final long hotcacheLength;       // Size of hotcache
-        
-        // Doc mapping JSON for SplitSearcher integration
-        private final String docMappingJson;     // JSON representation of the doc mapping
+        private final String docMappingUid;     // NEW: Required by Quickwit
 
-        public SplitMetadata(String splitId, long numDocs, long uncompressedSizeBytes,
-                           Instant timeRangeStart, Instant timeRangeEnd, Set<String> tags,
-                           long deleteOpstamp, int numMergeOps,
-                           long footerStartOffset, long footerEndOffset, 
-                           long hotcacheStartOffset, long hotcacheLength, String docMappingJson) {
+        // Legacy fields (for backward compatibility and custom features)
+        @Deprecated
+        private final long hotcacheStartOffset;  // DEPRECATED: Not in Quickwit format
+        @Deprecated
+        private final long hotcacheLength;       // DEPRECATED: Not in Quickwit format
+        @Deprecated
+        private final String docMappingJson;     // DEPRECATED: Use docMappingUid instead
+
+        // Custom fields (for merge operations with parsing failures)
+        private final List<String> skippedSplits;  // URLs/paths of splits that failed to parse
+
+        /**
+         * Full constructor with all Quickwit-compatible fields.
+         */
+        public SplitMetadata(String splitId, String indexUid, long partitionId, String sourceId,
+                           String nodeId, long numDocs, long uncompressedSizeBytes,
+                           Instant timeRangeStart, Instant timeRangeEnd, long createTimestamp,
+                           String maturity, Set<String> tags, long footerStartOffset, long footerEndOffset,
+                           long deleteOpstamp, int numMergeOps, String docMappingUid, String docMappingJson,
+                           List<String> skippedSplits) {
+            // Core Quickwit fields
             this.splitId = splitId;
+            this.indexUid = indexUid;
+            this.partitionId = partitionId;
+            this.sourceId = sourceId;
+            this.nodeId = nodeId;
             this.numDocs = numDocs;
             this.uncompressedSizeBytes = uncompressedSizeBytes;
             this.timeRangeStart = timeRangeStart;
             this.timeRangeEnd = timeRangeEnd;
-            this.tags = tags;
-            this.deleteOpstamp = deleteOpstamp;
-            this.numMergeOps = numMergeOps;
+            this.createTimestamp = createTimestamp;
+            this.maturity = maturity;
+            this.tags = tags != null ? new java.util.HashSet<>(tags) : new java.util.HashSet<>();
             this.footerStartOffset = footerStartOffset;
             this.footerEndOffset = footerEndOffset;
-            this.hotcacheStartOffset = hotcacheStartOffset;
-            this.hotcacheLength = hotcacheLength;
-            this.docMappingJson = docMappingJson;
+            this.deleteOpstamp = deleteOpstamp;
+            this.numMergeOps = numMergeOps;
+            this.docMappingUid = docMappingUid;
+
+            // Legacy fields (deprecated)
+            this.hotcacheStartOffset = -1L;  // Not supported in Quickwit format
+            this.hotcacheLength = -1L;       // Not supported in Quickwit format
+            this.docMappingJson = docMappingJson;  // Store for tokenization performance
+
+            // Custom fields
+            this.skippedSplits = skippedSplits != null ? new ArrayList<>(skippedSplits) : new ArrayList<>();
+        }
+
+        /**
+         * Constructor with legacy hotcache fields (for backward compatibility).
+         * @deprecated Use the full Quickwit-compatible constructor instead.
+         */
+        @Deprecated
+        public SplitMetadata(String splitId, long numDocs, long uncompressedSizeBytes,
+                           Instant timeRangeStart, Instant timeRangeEnd, Set<String> tags,
+                           long deleteOpstamp, int numMergeOps,
+                           long footerStartOffset, long footerEndOffset,
+                           long hotcacheStartOffset, long hotcacheLength, String docMappingJson,
+                           List<String> skippedSplits) {
+            // Call new constructor with default Quickwit values
+            this(splitId, "unknown-index", 0L, "unknown-source", "unknown-node",
+                 numDocs, uncompressedSizeBytes, timeRangeStart, timeRangeEnd,
+                 System.currentTimeMillis() / 1000, "Mature", tags,
+                 footerStartOffset, footerEndOffset, deleteOpstamp, numMergeOps,
+                 "unknown-doc-mapping", docMappingJson, skippedSplits);
         }
         
-        // Backward compatibility constructor (for existing code)
+        /**
+         * Backward compatibility constructor (for existing code).
+         * @deprecated Use the full Quickwit-compatible constructor instead.
+         */
+        @Deprecated
         public SplitMetadata(String splitId, long numDocs, long uncompressedSizeBytes,
                            Instant timeRangeStart, Instant timeRangeEnd, Set<String> tags,
                            long deleteOpstamp, int numMergeOps) {
-            this(splitId, numDocs, uncompressedSizeBytes, timeRangeStart, timeRangeEnd, 
-                 tags, deleteOpstamp, numMergeOps, -1L, -1L, -1L, -1L, null);
-        }
-        
-        // Constructor with only footer offset information (as requested)
-        public SplitMetadata(long footerStartOffset, long footerEndOffset, 
-                           long hotcacheStartOffset, long hotcacheLength) {
-            this("", 0L, 0L, null, null, new java.util.HashSet<>(), 0L, 0,
-                 footerStartOffset, footerEndOffset, hotcacheStartOffset, hotcacheLength, null);
+            this(splitId, "unknown-index", 0L, "unknown-source", "unknown-node",
+                 numDocs, uncompressedSizeBytes, timeRangeStart, timeRangeEnd,
+                 System.currentTimeMillis() / 1000, "Mature", tags,
+                 -1L, -1L, deleteOpstamp, numMergeOps, "unknown-doc-mapping", null, null);
         }
 
-        // Getters
+        /**
+         * Constructor with only footer offset information (for testing).
+         * @deprecated Use the full Quickwit-compatible constructor instead.
+         */
+        @Deprecated
+        public SplitMetadata(long footerStartOffset, long footerEndOffset,
+                           long hotcacheStartOffset, long hotcacheLength) {
+            this("", "test-index", 0L, "test-source", "test-node", 0L, 0L, null, null,
+                 System.currentTimeMillis() / 1000, "Mature", new java.util.HashSet<>(),
+                 footerStartOffset, footerEndOffset, 0L, 0, "test-doc-mapping", null, null);
+        }
+
+        // Core Quickwit field getters
         public String getSplitId() { return splitId; }
+        public String getIndexUid() { return indexUid; }
+        public long getPartitionId() { return partitionId; }
+        public String getSourceId() { return sourceId; }
+        public String getNodeId() { return nodeId; }
         public long getNumDocs() { return numDocs; }
         public long getUncompressedSizeBytes() { return uncompressedSizeBytes; }
         public Instant getTimeRangeStart() { return timeRangeStart; }
         public Instant getTimeRangeEnd() { return timeRangeEnd; }
-        public Set<String> getTags() { return tags; }
-        public long getDeleteOpstamp() { return deleteOpstamp; }
-        public int getNumMergeOps() { return numMergeOps; }
-        
-        // Footer offset getters for lazy loading optimization
+        public long getCreateTimestamp() { return createTimestamp; }
+        public String getMaturity() { return maturity; }
+        public Set<String> getTags() { return new java.util.HashSet<>(tags); }
         public long getFooterStartOffset() { return footerStartOffset; }
         public long getFooterEndOffset() { return footerEndOffset; }
-        public long getHotcacheStartOffset() { return hotcacheStartOffset; }
-        public long getHotcacheLength() { return hotcacheLength; }
-        
-        // Doc mapping getter
-        public String getDocMappingJson() { return docMappingJson; }
-        
+        public long getDeleteOpstamp() { return deleteOpstamp; }
+        public int getNumMergeOps() { return numMergeOps; }
+        public String getDocMappingUid() { return docMappingUid; }
+
+        // Legacy getters (deprecated)
+        @Deprecated
+        public long getHotcacheStartOffset() {
+            throw new UnsupportedOperationException("Hotcache offsets not supported in Quickwit format. Use footer offsets instead.");
+        }
+
+        @Deprecated
+        public long getHotcacheLength() {
+            throw new UnsupportedOperationException("Hotcache length not supported in Quickwit format. Use footer offsets instead.");
+        }
+
+        @Deprecated
+        public String getDocMappingJson() {
+            return docMappingJson;  // Return for tokenization performance needs
+        }
+
+        // Skipped splits getter (for merge operations)
+        public List<String> getSkippedSplits() { return new ArrayList<>(skippedSplits); }
+
         // Convenience methods
-        public boolean hasFooterOffsets() { 
-            return footerStartOffset >= 0 && footerEndOffset >= 0; 
+        public boolean hasFooterOffsets() {
+            return footerStartOffset >= 0 && footerEndOffset >= 0;
         }
-        
+
+        public boolean hasTimeRange() {
+            return timeRangeStart != null && timeRangeEnd != null;
+        }
+
+        public boolean isImmature() {
+            return "Immature".equals(maturity);
+        }
+
+        public boolean isMature() {
+            return "Mature".equals(maturity);
+        }
+
+        @Deprecated
         public boolean hasDocMapping() {
-            return docMappingJson != null && !docMappingJson.trim().isEmpty();
+            // Always return false since we no longer store JSON doc mapping
+            return false;
         }
-        
+
+        /**
+         * Returns true if any splits were skipped during merge operations due to parsing failures.
+         */
+        public boolean hasSkippedSplits() {
+            return !skippedSplits.isEmpty();
+        }
+
         public long getMetadataSize() {
             return hasFooterOffsets() ? (footerEndOffset - footerStartOffset) : -1;
         }
 
         @Override
         public String toString() {
-            return "SplitMetadata{" +
-                    "splitId='" + splitId + '\'' +
-                    ", numDocs=" + numDocs +
-                    ", uncompressedSizeBytes=" + uncompressedSizeBytes +
-                    ", timeRangeStart=" + timeRangeStart +
-                    ", timeRangeEnd=" + timeRangeEnd +
-                    ", tags=" + tags +
-                    ", deleteOpstamp=" + deleteOpstamp +
-                    ", numMergeOps=" + numMergeOps +
-                    '}';
+            StringBuilder sb = new StringBuilder("SplitMetadata{")
+                    .append("splitId='").append(splitId).append('\'')
+                    .append(", indexUid='").append(indexUid).append('\'')
+                    .append(", sourceId='").append(sourceId).append('\'')
+                    .append(", nodeId='").append(nodeId).append('\'')
+                    .append(", partitionId=").append(partitionId)
+                    .append(", numDocs=").append(numDocs)
+                    .append(", uncompressedSizeBytes=").append(uncompressedSizeBytes)
+                    .append(", timeRangeStart=").append(timeRangeStart)
+                    .append(", timeRangeEnd=").append(timeRangeEnd)
+                    .append(", createTimestamp=").append(createTimestamp)
+                    .append(", maturity='").append(maturity).append('\'')
+                    .append(", tags=").append(tags)
+                    .append(", deleteOpstamp=").append(deleteOpstamp)
+                    .append(", numMergeOps=").append(numMergeOps)
+                    .append(", docMappingUid='").append(docMappingUid).append('\'')
+                    .append(", footerOffsets=").append(footerStartOffset).append("-").append(footerEndOffset);
+
+            if (hasSkippedSplits()) {
+                sb.append(", skippedSplits=").append(skippedSplits.size()).append(" splits");
+            }
+
+            return sb.append('}').toString();
         }
     }
 
@@ -221,6 +359,8 @@ public class QuickwitSplit {
         if (config == null) {
             throw new IllegalArgumentException("Split configuration cannot be null");
         }
+
+        String resolvedOutputPath = FileSystemConfig.hasGlobalRoot() ? FileSystemConfig.resolvePath(outputPath) : outputPath;
         if (config.getIndexUid() == null || config.getIndexUid().trim().isEmpty()) {
             throw new IllegalArgumentException("Index UID cannot be null or empty");
         }
@@ -235,7 +375,7 @@ public class QuickwitSplit {
         String indexPath = index.getIndexPath();
         if (indexPath != null) {
             // Delegate to the working convertIndexFromPath method
-            return convertIndexFromPath(indexPath, outputPath, config);
+            return convertIndexFromPath(indexPath, resolvedOutputPath, config);
         } else {
             // This is an in-memory index - cannot be converted directly
             throw new IllegalArgumentException(
@@ -267,7 +407,10 @@ public class QuickwitSplit {
             throw new IllegalArgumentException("Split configuration cannot be null");
         }
 
-        return nativeConvertIndexFromPath(indexPath, outputPath, config);
+        String resolvedIndexPath = FileSystemConfig.hasGlobalRoot() ? FileSystemConfig.resolvePath(indexPath) : indexPath;
+        String resolvedOutputPath = FileSystemConfig.hasGlobalRoot() ? FileSystemConfig.resolvePath(outputPath) : outputPath;
+
+        return nativeConvertIndexFromPath(resolvedIndexPath, resolvedOutputPath, config);
     }
 
     /**
@@ -286,7 +429,8 @@ public class QuickwitSplit {
             throw new IllegalArgumentException("Split path must end with .split");
         }
 
-        return nativeReadSplitMetadata(splitPath);
+        String resolvedSplitPath = FileSystemConfig.hasGlobalRoot() ? FileSystemConfig.resolvePath(splitPath) : splitPath;
+        return nativeReadSplitMetadata(resolvedSplitPath);
     }
 
     /**
@@ -305,7 +449,8 @@ public class QuickwitSplit {
             throw new IllegalArgumentException("Split path must end with .split");
         }
 
-        return nativeListSplitFiles(splitPath);
+        String resolvedSplitPath = FileSystemConfig.hasGlobalRoot() ? FileSystemConfig.resolvePath(splitPath) : splitPath;
+        return nativeListSplitFiles(resolvedSplitPath);
     }
 
     /**
@@ -328,7 +473,9 @@ public class QuickwitSplit {
             throw new IllegalArgumentException("Output directory cannot be null or empty");
         }
 
-        return nativeExtractSplit(splitPath, outputDir);
+        String resolvedSplitPath = FileSystemConfig.hasGlobalRoot() ? FileSystemConfig.resolvePath(splitPath) : splitPath;
+        String resolvedOutputDir = FileSystemConfig.hasGlobalRoot() ? FileSystemConfig.resolvePath(outputDir) : outputDir;
+        return nativeExtractSplit(resolvedSplitPath, resolvedOutputDir);
     }
 
     /**
@@ -343,7 +490,8 @@ public class QuickwitSplit {
         }
 
         try {
-            return nativeValidateSplit(splitPath);
+            String resolvedSplitPath = FileSystemConfig.hasGlobalRoot() ? FileSystemConfig.resolvePath(splitPath) : splitPath;
+            return nativeValidateSplit(resolvedSplitPath);
         } catch (Exception e) {
             return false;
         }
@@ -483,10 +631,35 @@ public class QuickwitSplit {
         private final long partitionId;
         private final List<String> deleteQueries;
         private final AwsConfig awsConfig;
+        private final String tempDirectoryPath;
 
         /**
          * Create a new merge configuration.
-         * 
+         *
+         * @param indexUid Unique identifier for the index
+         * @param sourceId Source identifier
+         * @param nodeId Node identifier that will create the merged split
+         * @param docMappingUid Document mapping unique identifier (must match across all splits)
+         * @param partitionId Partition identifier (default: 0)
+         * @param deleteQueries Optional list of delete queries to apply during merge
+         * @param awsConfig AWS configuration for S3 access (optional)
+         * @param tempDirectoryPath Custom path for temporary directories (optional, platform-specific)
+         */
+        public MergeConfig(String indexUid, String sourceId, String nodeId, String docMappingUid,
+                          long partitionId, List<String> deleteQueries, AwsConfig awsConfig, String tempDirectoryPath) {
+            this.indexUid = indexUid;
+            this.sourceId = sourceId;
+            this.nodeId = nodeId;
+            this.docMappingUid = docMappingUid;
+            this.partitionId = partitionId;
+            this.deleteQueries = deleteQueries;
+            this.awsConfig = awsConfig;
+            this.tempDirectoryPath = tempDirectoryPath;
+        }
+
+        /**
+         * Create a new merge configuration without temp directory customization.
+         *
          * @param indexUid Unique identifier for the index
          * @param sourceId Source identifier
          * @param nodeId Node identifier that will create the merged split
@@ -497,13 +670,7 @@ public class QuickwitSplit {
          */
         public MergeConfig(String indexUid, String sourceId, String nodeId, String docMappingUid,
                           long partitionId, List<String> deleteQueries, AwsConfig awsConfig) {
-            this.indexUid = indexUid;
-            this.sourceId = sourceId;
-            this.nodeId = nodeId;
-            this.docMappingUid = docMappingUid;
-            this.partitionId = partitionId;
-            this.deleteQueries = deleteQueries;
-            this.awsConfig = awsConfig;
+            this(indexUid, sourceId, nodeId, docMappingUid, partitionId, deleteQueries, awsConfig, null);
         }
         
         /**
@@ -544,6 +711,19 @@ public class QuickwitSplit {
             this(indexUid, sourceId, nodeId, "default", 0L, null, awsConfig);
         }
 
+        /**
+         * Create a merge configuration with custom temp directory for platforms like Databricks.
+         *
+         * @param indexUid Unique identifier for the index
+         * @param sourceId Source identifier
+         * @param nodeId Node identifier that will create the merged split
+         * @param awsConfig AWS configuration for S3 access
+         * @param tempDirectoryPath Custom temp directory path (e.g., "/local_disk0" for Databricks)
+         */
+        public MergeConfig(String indexUid, String sourceId, String nodeId, AwsConfig awsConfig, String tempDirectoryPath) {
+            this(indexUid, sourceId, nodeId, "default", 0L, null, awsConfig, tempDirectoryPath);
+        }
+
         // Getters
         public String getIndexUid() { return indexUid; }
         public String getSourceId() { return sourceId; }
@@ -552,6 +732,7 @@ public class QuickwitSplit {
         public long getPartitionId() { return partitionId; }
         public List<String> getDeleteQueries() { return deleteQueries; }
         public AwsConfig getAwsConfig() { return awsConfig; }
+        public String getTempDirectoryPath() { return tempDirectoryPath; }
     }
 
     /**
@@ -655,7 +836,25 @@ public class QuickwitSplit {
             // For URLs (s3://, file://), we'll validate format in native layer
         }
 
-        return nativeMergeSplits(splitUrls, outputPath, config);
+        // Resolve output path through file system root if it's a local path
+        String resolvedOutputPath = outputPath;
+        if (!outputPath.contains("://")) {
+            resolvedOutputPath = FileSystemConfig.hasGlobalRoot() ? FileSystemConfig.resolvePath(outputPath) : outputPath;
+        }
+
+        // Resolve local file paths in split URLs through file system root
+        List<String> resolvedSplitUrls = new java.util.ArrayList<>();
+        for (String splitUrl : splitUrls) {
+            if (!splitUrl.contains("://")) {
+                // Local file path - resolve through file system root
+                resolvedSplitUrls.add(FileSystemConfig.hasGlobalRoot() ? FileSystemConfig.resolvePath(splitUrl) : splitUrl);
+            } else {
+                // URL (s3://, file://) - keep as is
+                resolvedSplitUrls.add(splitUrl);
+            }
+        }
+
+        return nativeMergeSplits(resolvedSplitUrls, resolvedOutputPath, config);
     }
 
     // Native method declarations

@@ -2,7 +2,7 @@
 // This replaces the old convoluted SplitSearcher implementation with clean StandaloneSearcher calls
 
 use std::sync::{Arc, OnceLock};
-use jni::objects::{JClass, JString, JObject, ReleaseMode};
+use jni::objects::{JClass, JString, JObject};
 use jni::sys::{jlong, jobject, jstring, jint, jboolean};
 use jni::JNIEnv;
 
@@ -21,12 +21,12 @@ use quickwit_common::thread_pool::ThreadPool;
 use serde_json::{Value, Map};
 
 use quickwit_proto::search::{SearchRequest, SplitIdAndFooterOffsets};
-use quickwit_config::{S3StorageConfig, SearcherConfig};
-use quickwit_storage::{StorageResolver, ByteRangeCache, SplitCache, wrap_storage_with_cache, STORAGE_METRICS, MemorySizedCache};
-use bytesize::ByteSize;
-use quickwit_search::leaf::{open_index_with_caches, open_split_bundle};
-use quickwit_directories::{StorageDirectory, HotDirectory, CachingDirectory};
-use tantivy::schema::Document as DocumentTrait; // For to_named_doc method
+use quickwit_config::S3StorageConfig;
+use quickwit_storage::{StorageResolver, ByteRangeCache, STORAGE_METRICS, MemorySizedCache};
+use quickwit_search::leaf::open_index_with_caches;
+use quickwit_indexing::open_index;
+use quickwit_query::get_quickwit_fastfield_normalizer_manager;
+use tantivy::directory::DirectoryClone;
 
 /// Thread pool for search operations (matches Quickwit's pattern exactly)
 fn search_thread_pool() -> &'static ThreadPool {
@@ -130,6 +130,13 @@ pub struct SearchHit {
     pub score: f32,
     pub segment_ord: u32,
     pub doc_id: u32,
+}
+
+/// Enhanced SearchResult data structure that includes both hits and aggregations
+#[derive(Debug)]
+pub struct EnhancedSearchResult {
+    pub hits: Vec<(f32, tantivy::DocAddress)>,
+    pub aggregation_results: Option<Vec<u8>>, // Postcard-serialized aggregation results
 }
 
 /// Replacement for Java_com_tantivy4java_SplitSearcher_createNativeWithSharedCache
@@ -520,9 +527,7 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_searchWithQueryAst(
         
         use quickwit_common::uri::Uri;
         use quickwit_config::StorageConfigs;
-        use quickwit_directories::BundleDirectory;
-        use tantivy::directory::FileSlice;
-        
+
         // Run async code synchronously within the runtime context
         let async_block_start = std::time::Instant::now();
         debug_println!("RUST DEBUG: ⏱️ Starting async block for search [TIMING: {}ms]", method_start_time.elapsed().as_millis());
@@ -719,6 +724,7 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_searchWithQueryAst(
                 debug_println!("RUST DEBUG: Successfully created DocMapper from actual index schema");
                 
                 // Create a SearchRequest with the QueryAst
+                // Note: Regular searchWithQueryAst doesn't support aggregations - only searchWithAggregations does
                 let search_request = SearchRequest {
                     index_id_patterns: vec![],
                     query_ast: query_json.clone(),
@@ -726,7 +732,7 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_searchWithQueryAst(
                     start_offset: 0,
                     start_timestamp: None,
                     end_timestamp: None,
-                    aggregation_request: None,
+                    aggregation_request: None, // Regular search has no aggregations
                     snippet_fields: vec![],
                     sort_fields: vec![],
                     search_after: None,
@@ -762,51 +768,14 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_searchWithQueryAst(
                 };
                 
                 debug_println!("RUST DEBUG: ⏱️ 🔍 SEARCH EXECUTION completed [TIMING: {}ms] - Found {} hits", search_exec_start.elapsed().as_millis(), leaf_search_response.num_hits);
-                
-                // Convert LeafSearchResponse to SearchResult format
-                let mut search_results: Vec<(f32, tantivy::DocAddress)> = Vec::new();
-                
-                for partial_hit in leaf_search_response.partial_hits {
-                    let doc_address = tantivy::DocAddress::new(
-                        partial_hit.segment_ord as tantivy::SegmentOrdinal,
-                        partial_hit.doc_id as tantivy::DocId,
-                    );
-                    
-                    // Extract the actual score from the partial hit
-                    let score = if let Some(sort_value) = partial_hit.sort_value() {
-                        // If there's a sort value, use it as the score
-                        match sort_value {
-                            quickwit_proto::search::SortValue::F64(f) => f as f32,
-                            quickwit_proto::search::SortValue::U64(u) => u as f32,
-                            quickwit_proto::search::SortValue::I64(i) => i as f32,
-                            _ => 1.0_f32,
-                        }
-                    } else {
-                        1.0_f32 // Default score if no sort value
-                    };
-                    
-                    search_results.push((score, doc_address));
-                }
-                
-                debug_println!("RUST DEBUG: Converted {} hits to SearchResult format", search_results.len());
-                
-                // Register the search results using Arc registry
-                let search_results_arc = Arc::new(search_results);
-                let search_result_ptr = arc_to_jlong(search_results_arc);
-                
-                // Create SearchResult Java object
-                let search_result_class = env.find_class("com/tantivy4java/SearchResult")
-                    .map_err(|e| anyhow::anyhow!("Failed to find SearchResult class: {}", e))?;
-                
-                let search_result = env.new_object(
-                    &search_result_class,
-                    "(J)V",
-                    &[(search_result_ptr).into()]
-                ).map_err(|e| anyhow::anyhow!("Failed to create SearchResult: {}", e))?;
-                
-                debug_println!("RUST DEBUG: Successfully created SearchResult with {} hits", leaf_search_response.num_hits);
-                
-                Ok(search_result.into_raw())
+
+                // Use the unified search result creation logic
+                let search_result_ptr = perform_unified_search_result_creation(
+                    leaf_search_response,
+                    &mut env
+                )?;
+
+                Ok(search_result_ptr)
         })
     });
     
@@ -833,6 +802,68 @@ fn perform_search_with_query_ast(searcher_ptr: jlong, query_ast: quickwit_query:
     
     // Return the JSON string for use with existing searchWithQueryAst logic
     Ok(query_json)
+}
+
+/// New method that handles aggregations using Quickwit's proven aggregation system
+#[no_mangle]
+pub extern "system" fn Java_com_tantivy4java_SplitSearcher_searchWithAggregations<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    searcher_ptr: jlong,
+    split_query: JObject<'local>,
+    limit: jint,
+    aggregations_map: JObject<'local>,
+) -> jobject {
+    debug_println!("🚀 NATIVE DEBUG: searchWithAggregations ENTRY - Real tantivy aggregation computation");
+    let method_start_time = std::time::Instant::now();
+
+    if searcher_ptr == 0 {
+        debug_println!("RUST DEBUG: ⏱️ searchWithAggregations ERROR: Invalid searcher pointer [TIMING: {}ms]", method_start_time.elapsed().as_millis());
+        to_java_exception(&mut env, &anyhow::anyhow!("Invalid searcher pointer"));
+        return std::ptr::null_mut();
+    }
+
+    // Convert SplitQuery to QueryAst
+    let query_ast = match convert_split_query_to_ast(&mut env, &split_query) {
+        Ok(ast) => ast,
+        Err(e) => {
+            debug_println!("RUST DEBUG: ⏱️ searchWithAggregations ERROR: Failed to convert SplitQuery [TIMING: {}ms]", method_start_time.elapsed().as_millis());
+            to_java_exception(&mut env, &anyhow::anyhow!("Failed to convert SplitQuery to QueryAst: {}", e));
+            return std::ptr::null_mut();
+        }
+    };
+
+    // Convert Java aggregations map to JSON for Quickwit's SearchRequest system
+    let aggregation_request_json = match convert_java_aggregations_to_json(&mut env, &aggregations_map) {
+        Ok(json) => json,
+        Err(e) => {
+            debug_println!("RUST DEBUG: ⏱️ searchWithAggregations ERROR: Failed to convert aggregations to JSON [TIMING: {}ms]", method_start_time.elapsed().as_millis());
+            to_java_exception(&mut env, &anyhow::anyhow!("Failed to convert aggregations to JSON: {}", e));
+            return std::ptr::null_mut();
+        }
+    };
+
+    // Perform search using Quickwit's aggregation system (reuses existing infrastructure)
+    match perform_search_with_quickwit_aggregations(searcher_ptr, query_ast, limit as usize, aggregation_request_json) {
+        Ok(leaf_search_response) => {
+            // Use the same result creation logic as the working search
+            match perform_unified_search_result_creation(leaf_search_response, &mut env) {
+                Ok(search_result) => {
+                    debug_println!("RUST DEBUG: ⏱️ searchWithAggregations SUCCESS [TIMING: {}ms]", method_start_time.elapsed().as_millis());
+                    search_result
+                }
+                Err(e) => {
+                    to_java_exception(&mut env, &anyhow::anyhow!("Failed to create SearchResult: {}", e));
+                    std::ptr::null_mut()
+                }
+            }
+        }
+        Err(e) => {
+            debug_println!("RUST DEBUG: ⏱️ searchWithAggregations ERROR: Search failed [TIMING: {}ms]: {}", method_start_time.elapsed().as_millis(), e);
+            to_java_exception(&mut env, &e);
+            std::ptr::null_mut()
+        }
+    }
 }
 
 /// Optimized method that takes SplitQuery directly without JSON round-trip
@@ -1099,13 +1130,13 @@ fn retrieve_document_from_split_optimized(
         // Use the same Quickwit caching pattern as our batch method
         tokio::task::block_in_place(|| {
             runtime.block_on(async {
-                use quickwit_common::uri::Uri;
+                
                 use quickwit_config::{StorageConfigs, S3StorageConfig};
                 use quickwit_proto::search::SplitIdAndFooterOffsets;
                 use quickwit_storage::StorageResolver;
-                use quickwit_search::leaf::open_index_with_caches;
-                use quickwit_search::SearcherContext;
-                use quickwit_storage::ByteRangeCache;
+                
+                
+                
                 use std::sync::Arc;
                 
                 // Create split metadata for Quickwit's open_index_with_caches with correct field names
@@ -1115,9 +1146,17 @@ fn retrieve_document_from_split_optimized(
                 } else {
                     split_uri
                 };
-                
+
+                // For split_id, use the filename without .split extension if present
+                // This is what Quickwit expects for the split identifier
+                let split_id = if split_filename.ends_with(".split") {
+                    &split_filename[..split_filename.len() - 6] // Remove ".split"
+                } else {
+                    split_filename
+                };
+
                 let split_metadata = SplitIdAndFooterOffsets {
-                    split_id: split_filename.to_string(),
+                    split_id: split_id.to_string(),
                     split_footer_start: *footer_start,
                     split_footer_end: *footer_end,
                     timestamp_start: Some(0), // Not used for our purposes
@@ -1222,9 +1261,10 @@ fn retrieve_document_from_split_optimized(
                         .map_err(|e| anyhow::anyhow!("Failed to open bundle directory {}: {}", split_uri, e))?;
                         
                     let index_creation_start = std::time::Instant::now();
-                    let mut index = tantivy::Index::open(bundle_directory)
+                    // ✅ QUICKWIT NATIVE: Use Quickwit's native index opening instead of direct tantivy
+                    let index = open_index(bundle_directory.box_clone(), get_quickwit_fastfield_normalizer_manager().tantivy_manager())
                         .map_err(|e| anyhow::anyhow!("Failed to open index from bundle {}: {}", split_uri, e))?;
-                    debug_println!("RUST DEBUG: ⏱️ 📖 BundleDirectory fallback index creation completed [TIMING: {}ms]", index_creation_start.elapsed().as_millis());
+                    debug_println!("RUST DEBUG: ⏱️ 📖 QUICKWIT NATIVE: BundleDirectory index creation completed [TIMING: {}ms]", index_creation_start.elapsed().as_millis());
                     index
                 };
                 
@@ -1397,8 +1437,8 @@ fn retrieve_document_from_split(
                 let bundle_directory = BundleDirectory::open_split(split_file_slice)
                     .map_err(|e| anyhow::anyhow!("Failed to open bundle directory {}: {}", split_uri, e))?;
                     
-                // Extract the index from the bundle directory
-                tantivy::Index::open(bundle_directory)
+                // ✅ QUICKWIT NATIVE: Extract the index from the bundle directory using Quickwit's native function
+                open_index(bundle_directory.box_clone(), get_quickwit_fastfield_normalizer_manager().tantivy_manager())
                     .map_err(|e| anyhow::anyhow!("Failed to open index from bundle {}: {}", split_uri, e))?
             };
             
@@ -1443,7 +1483,7 @@ fn retrieve_documents_batch_from_split_optimized(
     mut doc_addresses: Vec<tantivy::DocAddress>,
 ) -> Result<Vec<jobject>, anyhow::Error> {
     use crate::utils::with_arc_safe;
-    use quickwit_storage::StorageResolver;
+    
     use std::sync::Arc;
     
     // Sort by DocAddress for cache locality (following Quickwit pattern)
@@ -1461,7 +1501,7 @@ fn retrieve_documents_batch_from_split_optimized(
                 let searcher_cache = get_searcher_cache();
                 let cached_searcher_option = {
                     let cache = searcher_cache.lock().unwrap();
-                    cache.get(split_uri).cloned()
+                    cache.get(split_uri as &str).cloned()
                 };
 
                 // If we have a cached searcher, use it for concurrent batch processing
@@ -1505,15 +1545,15 @@ fn retrieve_documents_batch_from_split_optimized(
 
                 debug_println!("RUST DEBUG: ⚠️ BATCH CACHE MISS: Creating new searcher for batch processing");
 
-                use quickwit_common::uri::Uri;
+                
                 use quickwit_config::{StorageConfigs, S3StorageConfig};
                 use quickwit_proto::search::SplitIdAndFooterOffsets;
                 use quickwit_storage::StorageResolver;
                 use quickwit_search::leaf::open_index_with_caches;
-                use quickwit_search::SearcherContext;
-                use quickwit_storage::ByteRangeCache;
-                use std::path::Path;
-                use std::sync::Arc;
+                
+                
+                
+                
                 
                 // Use the same storage resolution approach as individual document retrieval
                 // Create S3 storage configuration
@@ -1594,7 +1634,8 @@ fn retrieve_documents_batch_from_split_optimized(
                     let bundle_directory = quickwit_directories::BundleDirectory::open_split(split_file_slice)
                         .map_err(|e| anyhow::anyhow!("Failed to open bundle directory {}: {}", split_uri, e))?;
                         
-                    tantivy::Index::open(bundle_directory)
+                    // ✅ QUICKWIT NATIVE: Use Quickwit's native index opening
+                    open_index(bundle_directory.box_clone(), get_quickwit_fastfield_normalizer_manager().tantivy_manager())
                         .map_err(|e| anyhow::anyhow!("Failed to open index from bundle {}: {}", split_uri, e))?
                 };
                 
@@ -1674,7 +1715,7 @@ fn retrieve_documents_batch_from_split_optimized(
 /// Legacy method - kept for compatibility but not optimized
 fn retrieve_documents_batch_from_split(
     searcher_ptr: jlong,
-    mut doc_addresses: Vec<tantivy::DocAddress>,
+    doc_addresses: Vec<tantivy::DocAddress>,
 ) -> Result<Vec<(tantivy::DocAddress, tantivy::schema::TantivyDocument, tantivy::schema::Schema)>, anyhow::Error> {
     // Fallback to single document retrieval for now
     let mut results = Vec::new();
@@ -2238,8 +2279,8 @@ fn get_schema_from_split(searcher_ptr: jlong) -> anyhow::Result<tantivy::schema:
                 let bundle_directory = BundleDirectory::open_split(split_file_slice)
                     .map_err(|e| anyhow::anyhow!("Failed to open bundle directory {}: {}", split_uri, e))?;
                     
-                // Extract schema from the bundle directory by opening the index
-                let index = tantivy::Index::open(bundle_directory)
+                // ✅ QUICKWIT NATIVE: Extract schema from the bundle directory using Quickwit's native index opening
+                let index = open_index(bundle_directory.box_clone(), get_quickwit_fastfield_normalizer_manager().tantivy_manager())
                     .map_err(|e| anyhow::anyhow!("Failed to open index from bundle {}: {}", split_uri, e))?;
                 
                 Ok(index.schema())
@@ -2599,4 +2640,458 @@ fn create_token_list(env: &mut JNIEnv, tokens: Vec<String>) -> Result<jobject, a
 
     Ok(array_list.into_raw())
 }
+
+// ============================================================================
+// QUICKWIT AGGREGATION INTEGRATION (USING PROVEN SYSTEM)
+// ============================================================================
+
+/// Convert Java aggregations map to JSON for Quickwit's SearchRequest.aggregation_request field
+fn convert_java_aggregations_to_json<'a>(
+    env: &mut JNIEnv<'a>,
+    aggregations_map: &JObject<'a>,
+) -> anyhow::Result<Option<String>> {
+    use serde_json::json;
+
+    debug_println!("RUST DEBUG: Converting Java aggregations to JSON for Quickwit system");
+
+    // Check if aggregations map is empty
+    let is_empty_method = env.call_method(aggregations_map, "isEmpty", "()Z", &[])?;
+    let is_empty: bool = is_empty_method.z()?;
+
+    if is_empty {
+        debug_println!("RUST DEBUG: Aggregations map is empty, returning None");
+        return Ok(None);
+    }
+
+    // Extract Map entries from Java HashMap
+    let map_entries = extract_map_entries(env, aggregations_map)?;
+    let mut aggregations_json = serde_json::Map::new();
+
+    for (name, java_aggregation) in map_entries {
+        debug_println!("RUST DEBUG: Processing aggregation: {}", name);
+
+        // Convert each Java SplitAggregation to JSON
+        let agg_json = convert_java_aggregation_to_json(env, &java_aggregation)?;
+        aggregations_json.insert(name, agg_json);
+    }
+
+    // Wrap in a JSON object as expected by Quickwit's aggregation system
+    let final_json = json!(aggregations_json);
+    let json_string = serde_json::to_string(&final_json)?;
+
+    debug_println!("RUST DEBUG: Generated aggregation JSON: {}", json_string);
+    Ok(Some(json_string))
+}
+
+/// Convert a single Java SplitAggregation to JSON format
+fn convert_java_aggregation_to_json<'a>(
+    env: &mut JNIEnv<'a>,
+    java_aggregation: &JObject<'a>,
+) -> anyhow::Result<serde_json::Value> {
+    
+
+    debug_println!("RUST DEBUG: Converting Java aggregation to JSON");
+
+    // Use the existing toAggregationJson method from the Java class
+    let json_result = env.call_method(java_aggregation, "toAggregationJson", "()Ljava/lang/String;", &[])?;
+    let json_string: String = env.get_string(&json_result.l()?.into())?.into();
+
+    debug_println!("RUST DEBUG: Java aggregation produced JSON: {}", json_string);
+
+    // Parse the JSON string to validate it and convert to serde_json::Value
+    let json_value: serde_json::Value = serde_json::from_str(&json_string)
+        .map_err(|e| anyhow::anyhow!("Failed to parse aggregation JSON from Java: {}", e))?;
+
+    Ok(json_value)
+}
+
+/// Extract entries from a Java HashMap
+fn extract_map_entries<'a>(
+    env: &mut JNIEnv<'a>,
+    map: &JObject<'a>,
+) -> anyhow::Result<Vec<(String, JObject<'a>)>> {
+    let mut entries = Vec::new();
+
+    // Get entrySet from HashMap
+    let entry_set = env.call_method(map, "entrySet", "()Ljava/util/Set;", &[])?.l()?;
+
+    // Get iterator from Set
+    let iterator = env.call_method(&entry_set, "iterator", "()Ljava/util/Iterator;", &[])?.l()?;
+
+    // Iterate through entries
+    loop {
+        let has_next = env.call_method(&iterator, "hasNext", "()Z", &[])?;
+        if !has_next.z()? {
+            break;
+        }
+
+        let entry = env.call_method(&iterator, "next", "()Ljava/lang/Object;", &[])?.l()?;
+
+        // Get key and value from Map.Entry
+        let key = env.call_method(&entry, "getKey", "()Ljava/lang/Object;", &[])?;
+        let value = env.call_method(&entry, "getValue", "()Ljava/lang/Object;", &[])?.l()?;
+
+        // Convert key to String
+        let key_string: String = env.get_string(&key.l()?.into())?.into();
+
+        entries.push((key_string, value.into()));
+    }
+
+    Ok(entries)
+}
+
+/// Perform search using Quickwit's proven aggregation system with JSON
+fn perform_search_with_quickwit_aggregations(
+    searcher_ptr: jlong,
+    query_ast: quickwit_query::query_ast::QueryAst,
+    limit: usize,
+    aggregation_request_json: Option<String>,
+) -> anyhow::Result<quickwit_proto::search::LeafSearchResponse> {
+    debug_println!("RUST DEBUG: 🚀 Starting aggregation search with Quickwit integration");
+    if let Some(ref agg_json) = aggregation_request_json {
+        debug_println!("RUST DEBUG: 📊 Aggregation JSON: {}", agg_json);
+    }
+
+    // Convert QueryAst to JSON and use the WORKING searchWithQueryAst infrastructure
+    // This ensures we use exactly the same storage setup, index opening, and DocMapper creation
+    let query_json = serde_json::to_string(&query_ast)
+        .map_err(|e| anyhow::anyhow!("Failed to serialize QueryAst to JSON: {}", e))?;
+
+    debug_println!("RUST DEBUG: 📊 Performing aggregation search using proven searchWithQueryAst infrastructure");
+
+    // Call the working searchWithQueryAst implementation directly
+    let leaf_search_response = perform_search_with_query_ast_and_aggregations_using_working_infrastructure(searcher_ptr, query_json, limit, aggregation_request_json)?;
+    Ok(leaf_search_response)
+}
+
+/// Use the exact same infrastructure as the working regular search but add aggregation support
+fn perform_search_with_query_ast_and_aggregations_using_working_infrastructure(
+    searcher_ptr: jlong,
+    query_json: String,
+    limit: usize,
+    aggregation_request_json: Option<String>,
+) -> anyhow::Result<quickwit_proto::search::LeafSearchResponse> {
+    // This function reuses the EXACT same approach as the working searchWithQueryAst
+    // but adds aggregation support to the SearchRequest
+
+    let result = with_arc_safe(searcher_ptr, |searcher_context: &Arc<(StandaloneSearcher, tokio::runtime::Runtime, String, std::collections::HashMap<String, String>, u64, u64, Option<String>)>| {
+        let (searcher, runtime, split_uri, aws_config, footer_start, footer_end, doc_mapping_json) = searcher_context.as_ref();
+
+        // Enter the runtime context for async operations
+        let _guard = runtime.enter();
+
+        // Run the EXACT same async code as the working search
+        runtime.block_on(async {
+            // Parse the QueryAst JSON using Quickwit's libraries - IDENTICAL TO WORKING SEARCH
+            use quickwit_query::query_ast::QueryAst;
+            use quickwit_common::uri::Uri;
+            use quickwit_config::StorageConfigs;
+
+            let query_ast: QueryAst = serde_json::from_str(&query_json)
+                .map_err(|e| anyhow::anyhow!("Failed to parse QueryAst JSON: {}", e))?;
+
+            debug_println!("RUST DEBUG: Successfully parsed QueryAst: {:?}", query_ast);
+
+            // STORAGE SETUP - IDENTICAL TO WORKING SEARCH
+            let storage_setup_start = std::time::Instant::now();
+            debug_println!("RUST DEBUG: ⏱️ 🔧 SEARCH STORAGE SETUP - Starting storage resolution for: {}", split_uri);
+
+            let uri: Uri = split_uri.parse()
+                .map_err(|e| anyhow::anyhow!("Failed to parse split URI {}: {}", split_uri, e))?;
+
+            // Create S3 storage configuration with credentials from Java config
+            let mut storage_configs = StorageConfigs::default();
+
+            debug_println!("RUST DEBUG: ⏱️ 🔧 Creating S3 config with credentials from Java configuration");
+            let s3_config = S3StorageConfig {
+                flavor: None,
+                access_key_id: aws_config.get("access_key").cloned(),
+                secret_access_key: aws_config.get("secret_key").cloned(),
+                session_token: aws_config.get("session_token").cloned(),
+                region: aws_config.get("region").cloned(),
+                endpoint: aws_config.get("endpoint").cloned(),
+                force_path_style_access: aws_config.get("path_style_access").map_or(false, |v| v == "true"),
+                disable_multi_object_delete: false,
+                disable_multipart_upload: false,
+            };
+
+            let storage_configs_vec = StorageConfigs::new(vec![quickwit_config::StorageConfig::S3(s3_config.clone())]);
+            storage_configs = storage_configs_vec;
+
+            let storage_resolver = StorageResolver::configured(&storage_configs);
+
+            // Use the helper function to resolve storage correctly for S3 URIs
+            let storage = resolve_storage_for_split(&storage_resolver, split_uri).await?;
+            debug_println!("RUST DEBUG: ⏱️ 🔧 SEARCH STORAGE SETUP completed [TIMING: {}ms]", storage_setup_start.elapsed().as_millis());
+
+            // Extract relative path - IDENTICAL TO WORKING SEARCH
+            let relative_path = if split_uri.contains("://") {
+                // This is a URI, extract just the filename
+                if let Some(last_slash_pos) = split_uri.rfind('/') {
+                    std::path::Path::new(&split_uri[last_slash_pos + 1..])
+                } else {
+                    std::path::Path::new(split_uri)
+                }
+            } else {
+                // This is a direct file path, extract just the filename
+                std::path::Path::new(split_uri)
+                    .file_name()
+                    .map(|name| std::path::Path::new(name))
+                    .unwrap_or_else(|| std::path::Path::new(split_uri))
+            };
+
+            debug_println!("RUST DEBUG: Reading split file metadata from: '{}'", relative_path.display());
+
+            // Use footer offsets from Java configuration for optimized access
+            let split_footer_start = *footer_start;
+            let split_footer_end = *footer_end;
+
+            debug_println!("RUST DEBUG: 🚀 Using Quickwit optimized path with open_index_with_caches - NO full file download");
+            debug_println!("RUST DEBUG: Footer offsets from Java config: start={}, end={}", split_footer_start, split_footer_end);
+
+            // Create SplitIdAndFooterOffsets for Quickwit optimization
+            let split_id = relative_path.file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("unknown");
+
+            let split_and_footer_offsets = quickwit_proto::search::SplitIdAndFooterOffsets {
+                split_id: split_id.to_string(),
+                split_footer_start,
+                split_footer_end,
+                num_docs: 0, // Not used for opening, will be filled later
+                timestamp_start: None,
+                timestamp_end: None,
+            };
+
+            // Create proper SearcherContext for Quickwit functions
+            let quickwit_searcher_context = crate::global_cache::get_global_searcher_context();
+
+            // Use Quickwit's complete optimized index opening (does all the work!) - IDENTICAL TO WORKING SEARCH
+            let (index, _hot_directory) = quickwit_search::leaf::open_index_with_caches(
+                &quickwit_searcher_context,
+                storage.clone(),
+                &split_and_footer_offsets,
+                None, // tokenizer_manager
+                None, // ephemeral_unbounded_cache
+            ).await.map_err(|e| anyhow::anyhow!("Failed to open index with caches {}: {}", split_uri, e))?;
+
+            debug_println!("RUST DEBUG: ✅ Quickwit optimized index opening completed successfully");
+
+            // Get the actual number of documents from the index
+            let reader = index.reader().map_err(|e| anyhow::anyhow!("Failed to create index reader: {}", e))?;
+            let searcher_tantivy = reader.searcher();
+            let num_docs = searcher_tantivy.num_docs();
+
+            debug_println!("RUST DEBUG: Extracted actual num_docs from index: {}", num_docs);
+
+            // Extract the split ID from the URI (last component before .split extension)
+            let split_id = relative_path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("unknown")
+                .to_string();
+
+            debug_println!("RUST DEBUG: Split ID: {}", split_id);
+
+            // Create the proper split metadata with REAL values
+            let split_metadata = SplitSearchMetadata {
+                split_id: split_id.clone(),
+                split_footer_start,
+                split_footer_end,
+                file_size: split_footer_end, // Footer end is effectively the file size
+                time_range: None, // TODO: Extract from split metadata if available
+                delete_opstamp: 0,
+                num_docs,
+            };
+
+            // Build DocMapper from ACTUAL index schema - IDENTICAL TO WORKING SEARCH
+            let schema = index.schema();
+
+            // Build a DocMapping from the tantivy schema
+            // This is the proper way to create a DocMapper that matches the actual index
+            let mut field_mappings = Vec::new();
+
+            for (field, field_entry) in schema.fields() {
+                let field_name = schema.get_field_name(field);
+                let field_type = field_entry.field_type();
+
+                use tantivy::schema::FieldType;
+                let (mapping_type, tokenizer) = match field_type {
+                    FieldType::Str(text_options) => {
+                        if let Some(indexing_options) = text_options.get_indexing_options() {
+                            let tokenizer_name = indexing_options.tokenizer();
+                            ("text", Some(tokenizer_name.to_string()))
+                        } else {
+                            // Store-only text fields should still be "text" type, not "keyword"
+                            // Quickwit's DocMapper only supports "text" type for Str fields
+                            ("text", None)
+                        }
+                    },
+                    FieldType::U64(_) => ("u64", None),
+                    FieldType::I64(_) => ("i64", None),
+                    FieldType::F64(_) => ("f64", None),
+                    FieldType::Bool(_) => ("bool", None),
+                    FieldType::Date(_) => ("datetime", None),
+                    FieldType::Bytes(_) => ("bytes", None),
+                    FieldType::IpAddr(_) => ("ip", None),
+                    FieldType::JsonObject(_) => ("json", None),
+                    FieldType::Facet(_) => ("keyword", None), // Facets are similar to keywords
+                };
+
+                let mut field_mapping = serde_json::json!({
+                    "name": field_name,
+                    "type": mapping_type,
+                });
+
+                // Add tokenizer information for text fields
+                if let Some(tokenizer_name) = tokenizer {
+                    field_mapping["tokenizer"] = serde_json::Value::String(tokenizer_name);
+                    debug_println!("RUST DEBUG: Field '{}' has tokenizer '{}'", field_name, field_mapping["tokenizer"]);
+                }
+
+                field_mappings.push(field_mapping);
+            }
+
+            debug_println!("RUST DEBUG: Extracted {} field mappings from index schema", field_mappings.len());
+
+            let doc_mapping_json = serde_json::json!({
+                "field_mappings": field_mappings,
+                "mode": "lenient",
+                "store_source": true,
+            });
+
+            // Create DocMapperBuilder from the JSON
+            let doc_mapper_builder: quickwit_doc_mapper::DocMapperBuilder = serde_json::from_value(doc_mapping_json)
+                .map_err(|e| anyhow::anyhow!("Failed to create DocMapperBuilder: {}", e))?;
+
+            // Build the DocMapper
+            let doc_mapper = doc_mapper_builder.try_build()
+                .map_err(|e| anyhow::anyhow!("Failed to build DocMapper: {}", e))?;
+
+            let doc_mapper_arc = Arc::new(doc_mapper);
+
+            debug_println!("RUST DEBUG: Successfully created DocMapper from actual index schema");
+
+            // Create a SearchRequest with the QueryAst - THE KEY DIFFERENCE: INCLUDE AGGREGATION!
+            let search_request = SearchRequest {
+                index_id_patterns: vec![],
+                query_ast: query_json.clone(), // SearchRequest.query_ast expects String, not QueryAst object
+                max_hits: limit as u64,
+                start_offset: 0,
+                start_timestamp: None,
+                end_timestamp: None,
+                aggregation_request: aggregation_request_json.clone(), // THIS IS THE KEY ADDITION!
+                snippet_fields: vec![],
+                sort_fields: vec![],
+                search_after: None,
+                scroll_ttl_secs: None,
+                count_hits: quickwit_proto::search::CountHits::CountAll as i32,
+            };
+
+            debug_println!("RUST DEBUG: ⏱️ 🔍 SEARCH EXECUTION - Calling StandaloneSearcher.search_split with parameters:");
+            debug_println!("  - Split URI: {}", split_uri);
+            debug_println!("  - Split ID: {}", split_metadata.split_id);
+            debug_println!("  - Num docs: {}", split_metadata.num_docs);
+            debug_println!("  - Footer offsets: {}-{}", split_metadata.split_footer_start, split_metadata.split_footer_end);
+            debug_println!("  - Has aggregations: {}", aggregation_request_json.is_some());
+
+            // PERFORM THE ACTUAL REAL SEARCH WITH AGGREGATIONS - SAME METHOD AS WORKING SEARCH!
+            let search_exec_start = std::time::Instant::now();
+            debug_println!("RUST DEBUG: ⏱️ 🔍 Starting actual search execution via searcher.search_split()");
+
+            // We're already in an async context, so use the async method directly
+            let split_id_for_error = split_metadata.split_id.clone();
+            let leaf_search_response = match searcher.search_split(
+                split_uri,
+                split_metadata,
+                search_request,
+                doc_mapper_arc,
+            ).await {
+                Ok(response) => response,
+                Err(e) => {
+                    debug_println!("RUST DEBUG: ⏱️ 🔍 ERROR in searcher.search_split [TIMING: {}ms]: {}", search_exec_start.elapsed().as_millis(), e);
+                    debug_println!("RUST DEBUG: Full error chain: {:#}", e);
+                    // Propagate the full error chain to Java
+                    return Err(anyhow::anyhow!("{:#}", e));
+                }
+            };
+
+            debug_println!("RUST DEBUG: ⏱️ 🔍 SEARCH EXECUTION completed [TIMING: {}ms] - Found {} hits", search_exec_start.elapsed().as_millis(), leaf_search_response.num_hits);
+            debug_println!("RUST DEBUG: 🔍 Search response has aggregations: {}", leaf_search_response.intermediate_aggregation_result.is_some());
+
+            // Return the LeafSearchResponse directly
+            Ok(leaf_search_response)
+        })
+    });
+
+    // Return the LeafSearchResponse directly
+    match result {
+        Some(Ok(leaf_search_response)) => Ok(leaf_search_response),
+        Some(Err(e)) => Err(e),
+        None => Err(anyhow::anyhow!("Invalid searcher pointer")),
+    }
+}
+
+// REMOVED: perform_unified_search - was broken and unused
+
+/// Unified function to create SearchResult Java object from LeafSearchResponse
+fn perform_unified_search_result_creation(
+    leaf_search_response: quickwit_proto::search::LeafSearchResponse,
+    env: &mut JNIEnv,
+) -> anyhow::Result<jobject> {
+    // Convert results to enhanced format
+    let mut search_results = Vec::new();
+    for partial_hit in leaf_search_response.partial_hits {
+        let doc_address = tantivy::DocAddress::new(
+            partial_hit.segment_ord as tantivy::SegmentOrdinal,
+            partial_hit.doc_id as tantivy::DocId,
+        );
+
+        let score = if let Some(sort_value) = partial_hit.sort_value() {
+            match sort_value {
+                quickwit_proto::search::SortValue::F64(f) => f as f32,
+                quickwit_proto::search::SortValue::U64(u) => u as f32,
+                quickwit_proto::search::SortValue::I64(i) => i as f32,
+                _ => 1.0_f32,
+            }
+        } else {
+            1.0_f32
+        };
+
+        search_results.push((score, doc_address));
+    }
+
+    debug_println!("RUST DEBUG: Converted {} hits to SearchResult format", search_results.len());
+
+    // Extract aggregation results
+    let aggregation_results = leaf_search_response.intermediate_aggregation_result.clone();
+    if aggregation_results.is_some() {
+        debug_println!("RUST DEBUG: 📊 Found aggregation results in LeafSearchResponse");
+    }
+
+    // Create enhanced result
+    let enhanced_result = EnhancedSearchResult {
+        hits: search_results,
+        aggregation_results,
+    };
+
+    let search_results_arc = Arc::new(enhanced_result);
+    let search_result_ptr = arc_to_jlong(search_results_arc);
+
+    // Create SearchResult Java object
+    let search_result_class = env.find_class("com/tantivy4java/SearchResult")
+        .map_err(|e| anyhow::anyhow!("Failed to find SearchResult class: {}", e))?;
+
+    let search_result = env.new_object(
+        &search_result_class,
+        "(J)V",
+        &[(search_result_ptr).into()]
+    ).map_err(|e| anyhow::anyhow!("Failed to create SearchResult: {}", e))?;
+
+    debug_println!("RUST DEBUG: Successfully created SearchResult with {} hits", leaf_search_response.num_hits);
+
+    Ok(search_result.into_raw())
+}
+
+// REMOVED: perform_search_with_query_ast_and_aggregations - redundant function eliminated
 

@@ -20,10 +20,11 @@
 package com.tantivy4java;
 
 import java.util.List;
+import java.util.Map;
 
 /**
  * Represents the result of a search operation.
- * Contains the matching documents and their scores.
+ * Contains the matching documents and their scores, and optionally aggregation results.
  */
 public class SearchResult implements AutoCloseable {
     static {
@@ -46,6 +47,40 @@ public class SearchResult implements AutoCloseable {
             throw new IllegalStateException("SearchResult has been closed");
         }
         return nativeGetHits(nativePtr);
+    }
+
+    /**
+     * Check if this search result contains aggregations.
+     * @return true if aggregations are present, false otherwise
+     */
+    public boolean hasAggregations() {
+        if (closed) {
+            throw new IllegalStateException("SearchResult has been closed");
+        }
+        return nativeHasAggregations(nativePtr);
+    }
+
+    /**
+     * Get all aggregation results as a map.
+     * @return Map of aggregation name to result, or empty map if no aggregations
+     */
+    public Map<String, AggregationResult> getAggregations() {
+        if (closed) {
+            throw new IllegalStateException("SearchResult has been closed");
+        }
+        return nativeGetAggregations(nativePtr);
+    }
+
+    /**
+     * Get a specific aggregation result by name.
+     * @param name The name of the aggregation
+     * @return The aggregation result, or null if not found
+     */
+    public AggregationResult getAggregation(String name) {
+        if (closed) {
+            throw new IllegalStateException("SearchResult has been closed");
+        }
+        return nativeGetAggregation(nativePtr, name);
     }
 
     @Override
@@ -85,5 +120,8 @@ public class SearchResult implements AutoCloseable {
 
     // Native method declarations
     private static native List<Hit> nativeGetHits(long ptr);
+    private static native boolean nativeHasAggregations(long ptr);
+    private static native Map<String, AggregationResult> nativeGetAggregations(long ptr);
+    private static native AggregationResult nativeGetAggregation(long ptr, String name);
     private static native void nativeClose(long ptr);
 }

@@ -6,10 +6,7 @@ use std::time::Duration;
 use bytesize::ByteSize;
 use anyhow::{Result, Context as AnyhowContext};
 
-use quickwit_storage::{
-    Storage, StorageResolver, LocalFileStorageFactory, 
-    S3CompatibleObjectStorageFactory
-};
+use quickwit_storage::{Storage, StorageResolver};
 use quickwit_config::S3StorageConfig;
 use crate::global_cache::{get_configured_storage_resolver, get_global_searcher_context};
 use quickwit_proto::search::{SearchRequest, LeafSearchResponse, SplitIdAndFooterOffsets};
@@ -496,19 +493,4 @@ impl Default for StandaloneSearcherBuilder {
     fn default() -> Self {
         Self::new()
     }
-}
-
-/// Create storage resolver with default S3 config - moved from split_searcher.rs
-pub fn create_storage_resolver() -> StorageResolver {
-    let s3_config = S3StorageConfig::default();
-    create_storage_resolver_with_config(s3_config)
-}
-
-/// Create storage resolver with specific S3 config - moved from split_searcher.rs
-pub fn create_storage_resolver_with_config(s3_config: S3StorageConfig) -> StorageResolver {
-    StorageResolver::builder()
-        .register(LocalFileStorageFactory::default())
-        .register(S3CompatibleObjectStorageFactory::new(s3_config))
-        .build()
-        .expect("Failed to create storage resolver")
 }

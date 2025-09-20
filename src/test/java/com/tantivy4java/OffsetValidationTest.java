@@ -6,6 +6,7 @@ import static org.junit.jupiter.api.Assertions.*;
 
 import java.time.Instant;
 import java.util.HashSet;
+import java.util.ArrayList;
 
 /**
  * Test for the defensive offset validation in SplitCacheManager
@@ -24,7 +25,8 @@ public class OffsetValidationTest {
             1L, 1,
             1000L, 5000L,  // Valid footer range: 1000 to 5000
             500L, 200L,    // Valid hotcache: start=500, length=200
-            null           // No doc mapping for test
+            null,          // No doc mapping for test
+            new ArrayList<>()  // No skipped splits for test
         );
         
         // Create cache manager
@@ -70,7 +72,8 @@ public class OffsetValidationTest {
             1L, 1,
             1000L, 0L,     // INVALID: footer end = 0
             500L, 200L,
-            null           // No doc mapping for test
+            null,          // No doc mapping for test
+            new ArrayList<>()  // No skipped splits for test
         );
         
         // Create cache manager
@@ -97,12 +100,25 @@ public class OffsetValidationTest {
         
         // Create metadata with invalid footer range (end <= start)
         QuickwitSplit.SplitMetadata invalidMetadata = new QuickwitSplit.SplitMetadata(
-            "invalid-range-split", 100L, 1000000L,
-            Instant.now(), Instant.now(), new HashSet<>(),
-            1L, 1,
-            5000L, 3000L,  // INVALID: footer start > footer end
-            500L, 200L,
-            null           // No doc mapping for test
+            "invalid-range-split",              // splitId
+            "test-index",                       // indexUid
+            0L,                                 // partitionId
+            "test-source",                      // sourceId
+            "test-node",                        // nodeId
+            100L,                               // numDocs
+            1000000L,                           // uncompressedSizeBytes
+            Instant.now(),                      // timeRangeStart
+            Instant.now(),                      // timeRangeEnd
+            System.currentTimeMillis() / 1000,  // createTimestamp
+            "Mature",                           // maturity
+            new HashSet<>(),                    // tags
+            5000L,                              // footerStartOffset
+            3000L,                              // footerEndOffset - INVALID: end < start
+            1L,                                 // deleteOpstamp
+            1,                                  // numMergeOps
+            "test-doc-mapping",                 // docMappingUid
+            null,                               // docMappingJson
+            new ArrayList<>()                   // skippedSplits
         );
         
         // Create cache manager
@@ -118,7 +134,7 @@ public class OffsetValidationTest {
         assertTrue(exception.getMessage().contains("footer_end_offset") && 
                   exception.getMessage().contains("must be > footer_start_offset"), 
                   "Should get specific error about footer range");
-        assertTrue(exception.getMessage().contains("footerStart=5000, footerEnd=3000"), 
+        assertTrue(exception.getMessage().contains("footerOffsets=5000-3000"),
                   "Should include actual offset values in error message");
         System.out.println("✅ Caught invalid footer range: " + exception.getMessage());
     }
@@ -136,7 +152,8 @@ public class OffsetValidationTest {
             1L, 1,
             1000L, tooLarge,  // INVALID: 200GB footer end offset
             500L, 200L,
-            null              // No doc mapping for test
+            null,             // No doc mapping for test
+            new ArrayList<>() // No skipped splits for test
         );
         
         // Create cache manager
@@ -156,36 +173,48 @@ public class OffsetValidationTest {
     }
     
     @Test
-    @DisplayName("Test hotcache overflow is caught")
-    public void testHotcacheOverflow() {
-        System.out.println("=== Testing Hotcache Overflow ===");
-        
-        // Create metadata with hotcache that would overflow
+    @DisplayName("Test footer overflow is caught")
+    public void testFooterOverflow() {
+        System.out.println("=== Testing Footer Overflow ===");
+
+        // Create metadata with footer offsets that are unreasonably large (> 100GB)
         QuickwitSplit.SplitMetadata invalidMetadata = new QuickwitSplit.SplitMetadata(
-            "overflow-split", 100L, 1000000L,
-            Instant.now(), Instant.now(), new HashSet<>(),
-            1L, 1,
-            1000L, 5000L,
-            Long.MAX_VALUE - 100L, 200L,  // INVALID: would overflow when added
-            null                          // No doc mapping for test
+            "overflow-split",                    // splitId
+            "test-index",                       // indexUid
+            0L,                                 // partitionId
+            "test-source",                      // sourceId
+            "test-node",                        // nodeId
+            100L,                               // numDocs
+            1000000L,                           // uncompressedSizeBytes
+            Instant.now(),                      // timeRangeStart
+            Instant.now(),                      // timeRangeEnd
+            System.currentTimeMillis() / 1000,  // createTimestamp
+            "Mature",                           // maturity
+            new HashSet<>(),                    // tags
+            1000L,                              // footerStartOffset
+            Long.MAX_VALUE - 100L,              // footerEndOffset - unreasonably large (> 100GB)
+            1L,                                 // deleteOpstamp
+            1,                                  // numMergeOps
+            "test-doc-mapping",                 // docMappingUid
+            null,                               // docMappingJson
+            new ArrayList<>()                   // skippedSplits
         );
-        
+
         // Create cache manager
         SplitCacheManager.CacheConfig config = new SplitCacheManager.CacheConfig("validation-test")
             .withMaxCacheSize(10_000_000);
         SplitCacheManager cacheManager = SplitCacheManager.getInstance(config);
-        
-        // This should throw IllegalArgumentException about overflow
+
+        // This should throw IllegalArgumentException about unreasonably large offset
         IllegalArgumentException exception = assertThrows(IllegalArgumentException.class, () -> {
             cacheManager.createSplitSearcher("/tmp/test.split", invalidMetadata);
         });
-        
+
         // Print the actual message to see what we got
         System.out.println("Actual exception message: " + exception.getMessage());
-        
-        assertTrue(exception.getMessage().contains("would overflow") || 
-                  exception.getMessage().contains("unreasonably large"), 
-                  "Should get specific error about overflow or unreasonably large offset");
-        System.out.println("✅ Caught hotcache overflow: " + exception.getMessage());
+
+        assertTrue(exception.getMessage().contains("unreasonably large"),
+                  "Should get specific error about unreasonably large footer offset");
+        System.out.println("✅ Caught footer overflow: " + exception.getMessage());
     }
 }

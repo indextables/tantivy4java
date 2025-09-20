@@ -504,8 +504,8 @@ public class RealS3EndToEndTest {
             System.out.println("🔍 METADATA DEBUG:");
             System.out.println("   Footer start offset: " + mergedSplitMetadata.getFooterStartOffset());
             System.out.println("   Footer end offset: " + mergedSplitMetadata.getFooterEndOffset());
-            System.out.println("   Hotcache start offset: " + mergedSplitMetadata.getHotcacheStartOffset());
-            System.out.println("   Hotcache length: " + mergedSplitMetadata.getHotcacheLength());
+            System.out.println("   Doc mapping UID: " + mergedSplitMetadata.getDocMappingUid());
+            System.out.println("   Create timestamp: " + mergedSplitMetadata.getCreateTimestamp());
             System.out.println("   hasFooterOffsets(): " + mergedSplitMetadata.hasFooterOffsets());
             System.out.println("   getMetadataSize(): " + mergedSplitMetadata.getMetadataSize());
             
@@ -1358,12 +1358,12 @@ public class RealS3EndToEndTest {
                     largeSplitMetadata = parseStoredSplitMetadata(metadataJson);
                     splitExists = true;
                     System.out.println("✅ Reusing existing large split with correct metadata (>50MB)");
-                    System.out.printf("📊 Split metadata: docs=%d, footer=%d..%d, hotcache=%d+%d%n", 
+                    System.out.printf("📊 Split metadata: docs=%d, footer=%d..%d, docMapping=%s, timestamp=%d%n",
                         largeSplitMetadata.getNumDocs(),
                         largeSplitMetadata.getFooterStartOffset(),
-                        largeSplitMetadata.getFooterEndOffset(), 
-                        largeSplitMetadata.getHotcacheStartOffset(),
-                        largeSplitMetadata.getHotcacheLength());
+                        largeSplitMetadata.getFooterEndOffset(),
+                        largeSplitMetadata.getDocMappingUid(),
+                        largeSplitMetadata.getCreateTimestamp());
                 } catch (Exception metaE) {
                     System.out.println("⚠️ Could not load stored metadata, will recreate split: " + metaE.getMessage());
                 }
@@ -1664,27 +1664,26 @@ public class RealS3EndToEndTest {
                          largeSplitMetadata.getFooterStartOffset(),
                          largeSplitMetadata.getFooterEndOffset(),
                          largeSplitMetadata.getFooterEndOffset() - largeSplitMetadata.getFooterStartOffset());
-        System.out.printf("  🔥 Hotcache: offset=%d, length=%d bytes%n",
-                         largeSplitMetadata.getHotcacheStartOffset(),
-                         largeSplitMetadata.getHotcacheLength());
+        System.out.printf("  📄 Doc mapping: %s%n", largeSplitMetadata.getDocMappingUid());
+        System.out.printf("  🕒 Created: %d%n", largeSplitMetadata.getCreateTimestamp());
 
-        // Calculate theoretical network savings
+        // Calculate footer efficiency
         long totalSplitSize = largeSplitMetadata.getUncompressedSizeBytes();
-        long hotcacheSize = largeSplitMetadata.getHotcacheLength();
-        double networkSavings = hotcacheSize > 0 ? ((double)(totalSplitSize - hotcacheSize) / totalSplitSize) * 100 : 0;
+        long footerSize = largeSplitMetadata.getFooterEndOffset() - largeSplitMetadata.getFooterStartOffset();
+        double footerEfficiency = footerSize > 0 ? ((double)footerSize / totalSplitSize) * 100 : 0;
 
-        System.out.printf("Network optimization potential:%n");
+        System.out.printf("Split structure analysis:%n");
         System.out.printf("  📦 Total split size: %.2f MB%n", totalSplitSize / 1024.0 / 1024.0);
-        System.out.printf("  🔥 Hotcache size: %.2f MB%n", hotcacheSize / 1024.0 / 1024.0);
-        System.out.printf("  💾 Network savings: %.1f%% (%.2f MB avoided)%n",
-                         networkSavings, (totalSplitSize - hotcacheSize) / 1024.0 / 1024.0);
+        System.out.printf("  📋 Footer size: %.2f MB%n", footerSize / 1024.0 / 1024.0);
+        System.out.printf("  📊 Footer ratio: %.1f%% (%.2f MB of metadata)%n",
+                         footerEfficiency, footerSize / 1024.0 / 1024.0);
 
-        if (networkSavings > 80) {
-            System.out.println("  ✅ EXCELLENT: High network savings with hotcache optimization");
-        } else if (networkSavings > 50) {
-            System.out.println("  ✅ GOOD: Significant network savings with hotcache optimization");
+        if (footerEfficiency < 10) {
+            System.out.println("  ✅ EXCELLENT: Efficient footer structure (low metadata overhead)");
+        } else if (footerEfficiency < 20) {
+            System.out.println("  ✅ GOOD: Reasonable footer structure (acceptable metadata overhead)");
         } else {
-            System.out.println("  ⚠️  LIMITED: Lower than expected network savings");
+            System.out.println("  ⚠️  HIGH: Footer overhead may impact performance");
         }
 
         // Debug logging analysis
@@ -1709,13 +1708,13 @@ public class RealS3EndToEndTest {
         }
 
         // Performance-based validation
-        System.out.println("📈 Performance-based validation of network optimization:");
-        if (speedupFactor > 1.5 && networkSavings > 70) {
-            System.out.println("  ✅ CONFIRMED: Both performance improvement and theoretical network savings suggest hotcache is working");
-        } else if (speedupFactor > 1.2 || networkSavings > 50) {
-            System.out.println("  ✅ LIKELY: Performance or theoretical analysis suggests hotcache optimization");
+        System.out.println("📈 Performance-based validation of split structure:");
+        if (speedupFactor > 1.5 && footerEfficiency < 10) {
+            System.out.println("  ✅ CONFIRMED: Both performance improvement and efficient footer structure suggest optimization is working");
+        } else if (speedupFactor > 1.2 || footerEfficiency < 20) {
+            System.out.println("  ✅ LIKELY: Performance or structural analysis suggests good optimization");
         } else {
-            System.out.println("  ⚠️  UNCERTAIN: Limited evidence of hotcache optimization effectiveness");
+            System.out.println("  ⚠️  UNCERTAIN: Limited evidence of optimization effectiveness");
         }
         
         System.out.println("✅ Large split performance test completed successfully!");
@@ -1805,18 +1804,18 @@ public class RealS3EndToEndTest {
                 "    \"uncompressedSizeBytes\": %d,\n" +
                 "    \"footerStartOffset\": %d,\n" +
                 "    \"footerEndOffset\": %d,\n" +
-                "    \"hotcacheStartOffset\": %d,\n" +
-                "    \"hotcacheLength\": %d,\n" +
-                "    \"docMappingJson\": %s\n" +
+                "    \"docMappingUid\": \"%s\",\n" +
+                "    \"createTimestamp\": %d,\n" +
+                "    \"maturity\": \"%s\"\n" +
                 "}",
             metadata.getSplitId(),
             metadata.getNumDocs(),
             metadata.getUncompressedSizeBytes(),
             metadata.getFooterStartOffset(),
             metadata.getFooterEndOffset(),
-            metadata.getHotcacheStartOffset(),
-            metadata.getHotcacheLength(),
-            metadata.getDocMappingJson() != null ? "\"" + metadata.getDocMappingJson().replace("\"", "\\\"") + "\"" : "null"
+            metadata.getDocMappingUid(),
+            metadata.getCreateTimestamp(),
+            metadata.getMaturity()
         );
     }
     
@@ -1842,7 +1841,8 @@ public class RealS3EndToEndTest {
                 splitId, numDocs, uncompressedSizeBytes,
                 java.time.Instant.now().minus(1, java.time.temporal.ChronoUnit.HOURS), java.time.Instant.now(),
                 new java.util.HashSet<>(java.util.Arrays.asList("performance-test")),
-                0L, 0, footerStartOffset, footerEndOffset, hotcacheStartOffset, hotcacheLength, docMappingJson
+                0L, 0, footerStartOffset, footerEndOffset, hotcacheStartOffset, hotcacheLength, docMappingJson,
+                new java.util.ArrayList<>()  // Skipped splits (empty for test)
             );
         } catch (Exception e) {
             throw new RuntimeException("Failed to parse stored metadata: " + e.getMessage(), e);

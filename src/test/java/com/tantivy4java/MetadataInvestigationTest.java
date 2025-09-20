@@ -78,8 +78,8 @@ public class MetadataInvestigationTest {
             System.out.println("   Size: " + mergedMetadata.getUncompressedSizeBytes());
             System.out.println("   Footer start offset: " + mergedMetadata.getFooterStartOffset());
             System.out.println("   Footer end offset: " + mergedMetadata.getFooterEndOffset());
-            System.out.println("   Hotcache start offset: " + mergedMetadata.getHotcacheStartOffset());
-            System.out.println("   Hotcache length: " + mergedMetadata.getHotcacheLength());
+            System.out.println("   Doc mapping UID: " + mergedMetadata.getDocMappingUid());
+            System.out.println("   Create timestamp: " + mergedMetadata.getCreateTimestamp());
             System.out.println("   hasFooterOffsets(): " + mergedMetadata.hasFooterOffsets());
             System.out.println("   getMetadataSize(): " + mergedMetadata.getMetadataSize());
             

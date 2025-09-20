@@ -492,13 +492,33 @@ public class SplitCacheManager implements AutoCloseable {
         if (!this.awsConfig.isEmpty()) {
             splitConfig.put("aws_config", this.awsConfig);
         }
-        
+
+        // Extract specific values for native layer compatibility (based on commit b53bf9d)
+        splitConfig.put("footer_start_offset", metadata.getFooterStartOffset());
+        splitConfig.put("footer_end_offset", metadata.getFooterEndOffset());
+
+        // CRITICAL: Extract docMappingUid and pass as "doc_mapping_uid" key for Quickwit compatibility
+        if (metadata.getDocMappingUid() != null && !metadata.getDocMappingUid().trim().isEmpty()) {
+            splitConfig.put("doc_mapping_uid", metadata.getDocMappingUid());
+        }
+
+        // CRITICAL: Extract docMappingJson and pass as "doc_mapping" key for tokenization performance
+        if (metadata.getDocMappingJson() != null && !metadata.getDocMappingJson().trim().isEmpty()) {
+            splitConfig.put("doc_mapping", metadata.getDocMappingJson());
+        }
+
         // Pass the entire metadata object to the native layer
         splitConfig.put("split_metadata", metadata);
         
+        // Resolve split path through file system root if it's a local path
+        String resolvedSplitPath = splitPath;
+        if (!splitPath.contains("://")) {
+            resolvedSplitPath = FileSystemConfig.hasGlobalRoot() ? FileSystemConfig.resolvePath(splitPath) : splitPath;
+        }
+
         // Create searcher with optimized configuration
-        SplitSearcher searcher = new SplitSearcher(splitPath, this, splitConfig);
-        managedSearchers.put(splitPath, searcher);
+        SplitSearcher searcher = new SplitSearcher(resolvedSplitPath, this, splitConfig);
+        managedSearchers.put(resolvedSplitPath, searcher);
         return searcher;
     }
     
@@ -783,103 +803,60 @@ public class SplitCacheManager implements AutoCloseable {
     private void validateSplitOffsets(String splitPath, QuickwitSplit.SplitMetadata metadata) {
         long footerStart = metadata.getFooterStartOffset();
         long footerEnd = metadata.getFooterEndOffset();
-        long hotcacheStart = metadata.getHotcacheStartOffset();
-        long hotcacheLength = metadata.getHotcacheLength();
-        
+
         // Check for invalid footer range
         if (footerEnd <= 0) {
             throw new IllegalArgumentException(String.format(
                 "Invalid split metadata for '%s': footer_end_offset must be > 0, got %d. " +
-                "Split metadata: splitId='%s', numDocs=%d, footerStart=%d, footerEnd=%d, hotcacheStart=%d, hotcacheLength=%d",
-                splitPath, footerEnd, metadata.getSplitId(), metadata.getNumDocs(), 
-                footerStart, footerEnd, hotcacheStart, hotcacheLength
+                "Split metadata: splitId='%s', numDocs=%d, footerOffsets=%d-%d",
+                splitPath, footerEnd, metadata.getSplitId(), metadata.getNumDocs(),
+                footerStart, footerEnd
             ));
         }
-        
+
         if (footerEnd <= footerStart) {
             throw new IllegalArgumentException(String.format(
                 "Invalid split metadata for '%s': footer_end_offset (%d) must be > footer_start_offset (%d). " +
-                "Split metadata: splitId='%s', numDocs=%d, footerStart=%d, footerEnd=%d, hotcacheStart=%d, hotcacheLength=%d",
+                "Split metadata: splitId='%s', numDocs=%d, footerOffsets=%d-%d",
                 splitPath, footerEnd, footerStart, metadata.getSplitId(), metadata.getNumDocs(),
-                footerStart, footerEnd, hotcacheStart, hotcacheLength
+                footerStart, footerEnd
             ));
         }
-        
+
         // Check for negative values (which shouldn't be possible with long, but can indicate overflow)
         if (footerStart < 0) {
             throw new IllegalArgumentException(String.format(
                 "Invalid split metadata for '%s': footer_start_offset cannot be negative, got %d. " +
-                "Split metadata: splitId='%s', numDocs=%d, footerStart=%d, footerEnd=%d, hotcacheStart=%d, hotcacheLength=%d",
+                "Split metadata: splitId='%s', numDocs=%d, footerOffsets=%d-%d",
                 splitPath, footerStart, metadata.getSplitId(), metadata.getNumDocs(),
-                footerStart, footerEnd, hotcacheStart, hotcacheLength
+                footerStart, footerEnd
             ));
         }
-        
-        if (hotcacheStart < 0) {
-            throw new IllegalArgumentException(String.format(
-                "Invalid split metadata for '%s': hotcache_start_offset cannot be negative, got %d. " +
-                "Split metadata: splitId='%s', numDocs=%d, footerStart=%d, footerEnd=%d, hotcacheStart=%d, hotcacheLength=%d",
-                splitPath, hotcacheStart, metadata.getSplitId(), metadata.getNumDocs(),
-                footerStart, footerEnd, hotcacheStart, hotcacheLength
-            ));
-        }
-        
-        if (hotcacheLength < 0) {
-            throw new IllegalArgumentException(String.format(
-                "Invalid split metadata for '%s': hotcache_length cannot be negative, got %d. " +
-                "Split metadata: splitId='%s', numDocs=%d, footerStart=%d, footerEnd=%d, hotcacheStart=%d, hotcacheLength=%d",
-                splitPath, hotcacheLength, metadata.getSplitId(), metadata.getNumDocs(),
-                footerStart, footerEnd, hotcacheStart, hotcacheLength
-            ));
-        }
-        
+
         // Check for unreasonably large values (> 100GB) that might indicate corrupted metadata
         final long MAX_REASONABLE_SIZE = 100L * 1024 * 1024 * 1024; // 100GB
-        
+
         if (footerEnd > MAX_REASONABLE_SIZE) {
             throw new IllegalArgumentException(String.format(
                 "Invalid split metadata for '%s': footer_end_offset (%d) is unreasonably large (> 100GB), likely corrupted metadata. " +
-                "Split metadata: splitId='%s', numDocs=%d, footerStart=%d, footerEnd=%d, hotcacheStart=%d, hotcacheLength=%d",
+                "Split metadata: splitId='%s', numDocs=%d, footerOffsets=%d-%d",
                 splitPath, footerEnd, metadata.getSplitId(), metadata.getNumDocs(),
-                footerStart, footerEnd, hotcacheStart, hotcacheLength
+                footerStart, footerEnd
             ));
         }
-        
-        if (hotcacheStart > MAX_REASONABLE_SIZE) {
+
+        if (footerStart > MAX_REASONABLE_SIZE) {
             throw new IllegalArgumentException(String.format(
-                "Invalid split metadata for '%s': hotcache_start_offset (%d) is unreasonably large (> 100GB), likely corrupted metadata. " +
-                "Split metadata: splitId='%s', numDocs=%d, footerStart=%d, footerEnd=%d, hotcacheStart=%d, hotcacheLength=%d",
-                splitPath, hotcacheStart, metadata.getSplitId(), metadata.getNumDocs(),
-                footerStart, footerEnd, hotcacheStart, hotcacheLength
+                "Invalid split metadata for '%s': footer_start_offset (%d) is unreasonably large (> 100GB), likely corrupted metadata. " +
+                "Split metadata: splitId='%s', numDocs=%d, footerOffsets=%d-%d",
+                splitPath, footerStart, metadata.getSplitId(), metadata.getNumDocs(),
+                footerStart, footerEnd
             ));
         }
-        
-        if (hotcacheLength > MAX_REASONABLE_SIZE) {
-            throw new IllegalArgumentException(String.format(
-                "Invalid split metadata for '%s': hotcache_length (%d) is unreasonably large (> 100GB), likely corrupted metadata. " +
-                "Split metadata: splitId='%s', numDocs=%d, footerStart=%d, footerEnd=%d, hotcacheStart=%d, hotcacheLength=%d",
-                splitPath, hotcacheLength, metadata.getSplitId(), metadata.getNumDocs(),
-                footerStart, footerEnd, hotcacheStart, hotcacheLength
-            ));
-        }
-        
-        // Check for potential overflow in hotcache range calculation
-        if (hotcacheLength > 0) {
-            try {
-                Math.addExact(hotcacheStart, hotcacheLength);
-            } catch (ArithmeticException e) {
-                throw new IllegalArgumentException(String.format(
-                    "Invalid split metadata for '%s': hotcache range would overflow (start=%d + length=%d). " +
-                    "Split metadata: splitId='%s', numDocs=%d, footerStart=%d, footerEnd=%d, hotcacheStart=%d, hotcacheLength=%d",
-                    splitPath, hotcacheStart, hotcacheLength, metadata.getSplitId(), metadata.getNumDocs(),
-                    footerStart, footerEnd, hotcacheStart, hotcacheLength
-                ));
-            }
-        }
-        
+
         // All validations passed - log success for debugging
-        System.out.printf("✅ Split metadata validation passed for '%s': footer=%d..%d, hotcache=%d+%d%n", 
-                         splitPath, footerStart, footerEnd, hotcacheStart, hotcacheLength);
+        System.out.printf("✅ Split metadata validation passed for '%s': footerOffsets=%d-%d%n",
+                         splitPath, footerStart, footerEnd);
     }
     
     // Native method declarations

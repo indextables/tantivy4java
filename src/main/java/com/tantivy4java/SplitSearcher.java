@@ -248,7 +248,7 @@ public class SplitSearcher implements AutoCloseable {
      * Search the split using a SplitQuery with efficient QueryAst conversion.
      * This method converts the SplitQuery to Quickwit's QueryAst format and uses
      * Quickwit's proven search algorithms for optimal performance.
-     * 
+     *
      * @param splitQuery The query to execute (use parseQuery() to create from string)
      * @param limit Maximum number of results to return
      * @return SearchResult containing matching documents and their scores
@@ -260,13 +260,79 @@ public class SplitSearcher implements AutoCloseable {
         if (splitQuery == null) {
             throw new IllegalArgumentException("SplitQuery cannot be null");
         }
-        
+
         try {
             // Pass SplitQuery object directly to native layer for efficient QueryAst conversion
             return searchWithSplitQuery(nativePtr, splitQuery, limit);
         } catch (Exception e) {
             throw new RuntimeException("Search failed: " + e.getMessage(), e);
         }
+    }
+
+    /**
+     * Search with a single aggregation using real tantivy computation.
+     *
+     * @param splitQuery The query to execute
+     * @param limit Maximum number of document hits to return
+     * @param aggregationName Name for the aggregation in results
+     * @param aggregation The aggregation to compute
+     * @return SearchResult containing both hits and aggregation results
+     */
+    public SearchResult search(SplitQuery splitQuery, int limit, String aggregationName, SplitAggregation aggregation) {
+        Map<String, SplitAggregation> aggregations = Map.of(aggregationName, aggregation);
+        return search(splitQuery, limit, aggregations);
+    }
+
+    /**
+     * Search with multiple aggregations using real tantivy computation.
+     * This uses Quickwit's proven aggregation framework for accurate results.
+     *
+     * @param splitQuery The query to execute
+     * @param limit Maximum number of document hits to return
+     * @param aggregations Map of aggregation name to aggregation specification
+     * @return SearchResult containing both hits and aggregation results
+     */
+    public SearchResult search(SplitQuery splitQuery, int limit, Map<String, SplitAggregation> aggregations) {
+        if (nativePtr == 0) {
+            throw new IllegalStateException("SplitSearcher has been closed or not properly initialized");
+        }
+        if (splitQuery == null) {
+            throw new IllegalArgumentException("SplitQuery cannot be null");
+        }
+        if (aggregations == null) {
+            aggregations = Map.of();
+        }
+
+        try {
+            return searchWithAggregations(nativePtr, splitQuery, limit, aggregations);
+        } catch (Exception e) {
+            throw new RuntimeException("Search with aggregations failed: " + e.getMessage(), e);
+        }
+    }
+
+    /**
+     * Perform aggregation-only search (no document hits returned).
+     * This is more efficient when you only need aggregation results.
+     *
+     * @param splitQuery The query to execute
+     * @param aggregationName Name for the aggregation in results
+     * @param aggregation The aggregation to compute
+     * @return SearchResult with no hits but containing aggregation results
+     */
+    public SearchResult aggregate(SplitQuery splitQuery, String aggregationName, SplitAggregation aggregation) {
+        Map<String, SplitAggregation> aggregations = Map.of(aggregationName, aggregation);
+        return search(splitQuery, 0, aggregations); // 0 hits for aggregation-only
+    }
+
+    /**
+     * Perform aggregation-only search with multiple aggregations.
+     *
+     * @param splitQuery The query to execute
+     * @param aggregations Map of aggregation name to aggregation specification
+     * @return SearchResult with no hits but containing aggregation results
+     */
+    public SearchResult aggregate(SplitQuery splitQuery, Map<String, SplitAggregation> aggregations) {
+        return search(splitQuery, 0, aggregations); // 0 hits for aggregation-only
     }
     
     /**
@@ -556,6 +622,7 @@ public class SplitSearcher implements AutoCloseable {
     private static native long getSchemaFromNative(long nativePtr);
     private static native SearchResult searchWithQueryAst(long nativePtr, String queryAstJson, int limit);
     private static native SearchResult searchWithSplitQuery(long nativePtr, SplitQuery splitQuery, int limit);
+    private static native SearchResult searchWithAggregations(long nativePtr, SplitQuery splitQuery, int limit, Map<String, SplitAggregation> aggregations);
     private static native Document docNative(long nativePtr, int segment, int docId);
     private static native Document[] docBatchNative(long nativePtr, int[] segments, int[] docIds);
     private static native byte[] docsBulkNative(long nativePtr, int[] segments, int[] docIds);
