@@ -34,6 +34,7 @@ use quickwit_indexing::{
     open_index,
 };
 use quickwit_common::io::IoControls;
+use quickwit_common::retry::{RetryParams, Retryable, retry};
 use quickwit_query::get_quickwit_fastfield_normalizer_manager;
 use tantivy::tokenizer::TokenizerManager;
 use tantivy::directory::Directory;
@@ -165,29 +166,60 @@ mod resilient_ops {
     /// Base delay between retries in milliseconds (exponential backoff)
     const BASE_RETRY_DELAY_MS: u64 = 100;
 
-    /// Resilient wrapper for tantivy::Index::open with retry logic for transient corruption
-    pub fn resilient_index_open(directory: Box<dyn tantivy::Directory>) -> Result<tantivy::Index> {
-        // Check if we're in Databricks environment for enhanced debugging
-        let is_databricks = std::env::var("DATABRICKS_RUNTIME_VERSION").is_ok();
+    // ✅ QUICKWIT NATIVE MIGRATION: Removed resilient_index_open function
+    // All index opening now uses Quickwit's native open_index from quickwit_indexing
 
-        if is_databricks {
-            debug_log!("🏢 DATABRICKS DETECTED: Using enhanced Index::open retry logic");
-            debug_log!("🏢 DATABRICKS DEBUG: Directory type: {}", std::any::type_name_of_val(&*directory));
+    /// Wrapper to make anyhow::Error implement Retryable for Quickwit's retry system
+    #[derive(Debug)]
+    struct RetryableAnyhowError(anyhow::Error);
+
+    impl std::fmt::Display for RetryableAnyhowError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            self.0.fmt(f)
         }
+    }
 
-        resilient_operation_with_column_2291_fix("Index::open", || {
-            if is_databricks {
-                debug_log!("🏢 DATABRICKS DEBUG: Attempting tantivy::Index::open...");
+    impl std::error::Error for RetryableAnyhowError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            self.0.source()
+        }
+    }
+
+    impl Retryable for RetryableAnyhowError {
+        fn is_retryable(&self) -> bool {
+            let error_msg = self.0.to_string();
+            is_data_corruption_error(&error_msg)
+        }
+    }
+
+    /// ✅ QUICKWIT NATIVE: Resilient operation using Quickwit's native retry system
+    async fn quickwit_resilient_operation<T, F, Fut>(
+        operation_name: &str,
+        operation: F,
+    ) -> Result<T>
+    where
+        F: Fn() -> Fut,
+        Fut: std::future::Future<Output = Result<T>>,
+    {
+        // Use Quickwit's aggressive retry params for operations that need resilience
+        let retry_params = RetryParams::aggressive();
+
+        debug_log!("🔄 QUICKWIT NATIVE: Starting resilient operation: {}", operation_name);
+
+        let result = retry(&retry_params, || async {
+            operation().await.map_err(|e| RetryableAnyhowError(e))
+        }).await;
+
+        match result {
+            Ok(value) => {
+                debug_log!("✅ QUICKWIT NATIVE: Operation {} succeeded", operation_name);
+                Ok(value)
             }
-            let result = tantivy::Index::open(directory.box_clone());
-            if is_databricks {
-                match &result {
-                    Ok(_) => debug_log!("🏢 DATABRICKS DEBUG: tantivy::Index::open succeeded"),
-                    Err(e) => debug_log!("🏢 DATABRICKS DEBUG: tantivy::Index::open failed: {}", e),
-                }
+            Err(err) => {
+                debug_log!("❌ QUICKWIT NATIVE: Operation {} failed after retries: {}", operation_name, err);
+                Err(err.0)
             }
-            result
-        })
+        }
     }
 
     /// Resilient wrapper for index.load_metas() with retry logic for transient corruption
@@ -1797,11 +1829,9 @@ async fn download_and_extract_single_split(
     };
 
     // Resolve storage for the URI (uses cached/pooled connections)
-    let base_storage = storage_resolver.resolve(&storage_uri).await
+    // ✅ QUICKWIT NATIVE: Storage resolver already includes timeout and retry policies
+    let storage = storage_resolver.resolve(&storage_uri).await
         .map_err(|e| anyhow!("Split {}: Failed to resolve storage for '{}': {}", split_index, split_url, e))?;
-
-    // ✅ TIMEOUT FIX: Apply optimized timeout policy to prevent .managed.json corruption
-    let storage = apply_timeout_policy_to_storage(base_storage);
 
     // Download the split file to temporary location
     let split_filename = file_name.unwrap_or_else(|| {
@@ -1857,70 +1887,58 @@ async fn download_and_extract_single_split(
 }
 
 /// Creates a shared storage resolver for connection pooling across downloads
+/// ✅ QUICKWIT NATIVE: Create storage resolver using Quickwit's native configuration system
+/// This replaces custom storage configuration with Quickwit's proven patterns
 fn create_storage_resolver(config: &MergeConfig) -> Result<StorageResolver> {
-    use quickwit_storage::{LocalFileStorageFactory, S3CompatibleObjectStorageFactory, TimeoutAndRetryStorage};
-    use quickwit_config::StorageTimeoutPolicy;
+    use quickwit_config::{StorageConfigs, StorageConfig, S3StorageConfig};
 
-    // ✅ TIMEOUT FIX: Configure production-ready timeouts for large split operations
-    let mut s3_config = if let Some(ref aws_config) = config.aws_config {
-        S3StorageConfig {
-            region: Some(aws_config.region.clone()),
+    debug_log!("🔧 QUICKWIT NATIVE: Creating storage resolver using Quickwit's native configuration");
+
+    // Convert our AWS config to Quickwit's native S3StorageConfig
+    let mut storage_configs = Vec::new();
+
+    if let Some(ref aws_config) = config.aws_config {
+        let s3_config = S3StorageConfig {
             access_key_id: aws_config.access_key.clone(),
             secret_access_key: aws_config.secret_key.clone(),
             session_token: aws_config.session_token.clone(),
+            region: Some(aws_config.region.clone()),
             endpoint: aws_config.endpoint.clone(),
             force_path_style_access: aws_config.force_path_style,
             ..Default::default()
-        }
+        };
+
+        storage_configs.push(StorageConfig::S3(s3_config));
+        debug_log!("✅ QUICKWIT NATIVE: Added S3 configuration with region={}, endpoint={:?}",
+                  aws_config.region, aws_config.endpoint);
+    }
+
+    // Create StorageConfigs and let Quickwit handle all the timeout and retry logic
+    let quickwit_storage_configs = StorageConfigs::new(storage_configs);
+
+    // Validate that our S3 configuration is properly found by Quickwit
+    if let Some(s3_config) = quickwit_storage_configs.find_s3() {
+        debug_log!("✅ QUICKWIT NATIVE: S3 configuration found and will be used by StorageResolver");
+        debug_log!("   Region: {:?}", s3_config.region);
+        debug_log!("   Endpoint: {:?}", s3_config.endpoint);
+        debug_log!("   Force path style: {}", s3_config.force_path_style_access);
+        debug_log!("   Has access key: {}", s3_config.access_key_id.is_some());
+        debug_log!("   Has secret key: {}", s3_config.secret_access_key.is_some());
+        debug_log!("   Has session token: {}", s3_config.session_token.is_some());
     } else {
-        S3StorageConfig::default()
-    };
+        debug_log!("ℹ️ QUICKWIT NATIVE: No S3 configuration provided, using default credentials/config");
+    }
 
-    // ✅ TIMEOUT FIX: Configure realistic timeout policy for large split merge operations
-    // Addresses problematic default timeouts that cause .managed.json corruption issues
-    debug_log!("✅ TIMEOUT FIX: Configuring production-ready timeouts for large split operations");
+    let storage_resolver = StorageResolver::configured(&quickwit_storage_configs);
 
-    // Custom timeout policy optimized for split merging:
-    // - Base timeout: 10 seconds (was 2 seconds) - More reasonable for connection establishment
-    // - Minimum throughput: 50KB/s (was 100KB/s) - More forgiving for slow connections
-    // - Max retries: 5 (was 2) - Better resilience against transient issues
-    let timeout_policy = StorageTimeoutPolicy {
-        timeout_millis: 10_000,                    // 10 seconds base timeout (vs 2 seconds)
-        min_throughtput_bytes_per_secs: 50_000,    // 50KB/s minimum (vs 100KB/s)
-        max_num_retries: 5,                        // 5 retries (vs 2)
-    };
-
-    debug_log!("✅ TIMEOUT POLICY: base={}ms, min_throughput={}KB/s, retries={}",
-        timeout_policy.timeout_millis,
-        timeout_policy.min_throughtput_bytes_per_secs / 1000,
-        timeout_policy.max_num_retries
-    );
-
-    let storage_resolver = StorageResolver::builder()
-        .register(LocalFileStorageFactory::default())
-        .register(S3CompatibleObjectStorageFactory::new(s3_config))
-        .build()
-        .map_err(|e| anyhow!("Failed to create storage resolver: {}", e))?;
-
-    debug_log!("✅ TIMEOUT FIX: Storage resolver created with optimized timeout policy configuration");
+    debug_log!("✅ QUICKWIT NATIVE: Storage resolver created using Quickwit's native configuration system");
+    debug_log!("✅ QUICKWIT NATIVE: Timeout and retry policies handled by Quickwit's proven implementation");
 
     Ok(storage_resolver)
 }
 
-/// Helper function to apply timeout and retry policy to storage for resilient operations
-fn apply_timeout_policy_to_storage(storage: Arc<dyn Storage>) -> Arc<dyn Storage> {
-    use quickwit_storage::TimeoutAndRetryStorage;
-    use quickwit_config::StorageTimeoutPolicy;
-
-    // ✅ TIMEOUT FIX: Apply optimized timeout policy to prevent .managed.json corruption
-    let timeout_policy = StorageTimeoutPolicy {
-        timeout_millis: 10_000,                    // 10 seconds base timeout (vs 2 seconds)
-        min_throughtput_bytes_per_secs: 50_000,    // 50KB/s minimum (vs 100KB/s)
-        max_num_retries: 5,                        // 5 retries (vs 2)
-    };
-
-    Arc::new(TimeoutAndRetryStorage::new(storage, timeout_policy))
-}
+// ✅ QUICKWIT NATIVE: Custom timeout policy function removed
+// Quickwit's StorageResolver::configured() now handles all timeout and retry policies automatically
 
 /// ✅ CORRUPTION FIX: Download split file directly to temp file to avoid memory/network slice issues
 /// This eliminates the "line 1, column 2291" errors by using reliable local file operations
@@ -2728,12 +2746,9 @@ async fn upload_split_to_s3_impl(local_split_path: &Path, s3_url: &str, config: 
     return Err(anyhow!("Only S3 URLs are supported for upload, got: {}", s3_url));
     };
     
-    // Resolve storage for the URI
-    let base_storage = storage_resolver.resolve(&storage_uri).await
-    .map_err(|e| anyhow!("Failed to resolve storage for '{}': {}", s3_url, e))?;
-
-    // ✅ TIMEOUT FIX: Apply optimized timeout policy to prevent upload timeouts
-    let storage = apply_timeout_policy_to_storage(base_storage);
+    // ✅ QUICKWIT NATIVE: Storage resolver already includes timeout and retry policies
+    let storage = storage_resolver.resolve(&storage_uri).await
+        .map_err(|e| anyhow!("Failed to resolve storage for '{}': {}", s3_url, e))?;
     
     // FIXED: Use memory mapping for file upload instead of loading entire file into RAM
     let file = std::fs::File::open(local_split_path)

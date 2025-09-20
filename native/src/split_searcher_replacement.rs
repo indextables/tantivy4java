@@ -24,6 +24,10 @@ use quickwit_proto::search::{SearchRequest, SplitIdAndFooterOffsets};
 use quickwit_config::S3StorageConfig;
 use quickwit_storage::{StorageResolver, ByteRangeCache, STORAGE_METRICS, MemorySizedCache};
 use quickwit_search::leaf::open_index_with_caches;
+use quickwit_indexing::open_index;
+use quickwit_query::get_quickwit_fastfield_normalizer_manager;
+use tantivy::tokenizer::TokenizerManager;
+use tantivy::directory::{Directory, DirectoryClone};
 
 /// Thread pool for search operations (matches Quickwit's pattern exactly)
 fn search_thread_pool() -> &'static ThreadPool {
@@ -1260,9 +1264,10 @@ fn retrieve_document_from_split_optimized(
                         .map_err(|e| anyhow::anyhow!("Failed to open bundle directory {}: {}", split_uri, e))?;
                         
                     let index_creation_start = std::time::Instant::now();
-                    let mut index = tantivy::Index::open(bundle_directory)
+                    // ✅ QUICKWIT NATIVE: Use Quickwit's native index opening instead of direct tantivy
+                    let mut index = open_index(bundle_directory.box_clone(), get_quickwit_fastfield_normalizer_manager().tantivy_manager())
                         .map_err(|e| anyhow::anyhow!("Failed to open index from bundle {}: {}", split_uri, e))?;
-                    debug_println!("RUST DEBUG: ⏱️ 📖 BundleDirectory fallback index creation completed [TIMING: {}ms]", index_creation_start.elapsed().as_millis());
+                    debug_println!("RUST DEBUG: ⏱️ 📖 QUICKWIT NATIVE: BundleDirectory index creation completed [TIMING: {}ms]", index_creation_start.elapsed().as_millis());
                     index
                 };
                 
@@ -1435,8 +1440,8 @@ fn retrieve_document_from_split(
                 let bundle_directory = BundleDirectory::open_split(split_file_slice)
                     .map_err(|e| anyhow::anyhow!("Failed to open bundle directory {}: {}", split_uri, e))?;
                     
-                // Extract the index from the bundle directory
-                tantivy::Index::open(bundle_directory)
+                // ✅ QUICKWIT NATIVE: Extract the index from the bundle directory using Quickwit's native function
+                open_index(bundle_directory.box_clone(), get_quickwit_fastfield_normalizer_manager().tantivy_manager())
                     .map_err(|e| anyhow::anyhow!("Failed to open index from bundle {}: {}", split_uri, e))?
             };
             
@@ -1632,7 +1637,8 @@ fn retrieve_documents_batch_from_split_optimized(
                     let bundle_directory = quickwit_directories::BundleDirectory::open_split(split_file_slice)
                         .map_err(|e| anyhow::anyhow!("Failed to open bundle directory {}: {}", split_uri, e))?;
                         
-                    tantivy::Index::open(bundle_directory)
+                    // ✅ QUICKWIT NATIVE: Use Quickwit's native index opening
+                    open_index(bundle_directory.box_clone(), get_quickwit_fastfield_normalizer_manager().tantivy_manager())
                         .map_err(|e| anyhow::anyhow!("Failed to open index from bundle {}: {}", split_uri, e))?
                 };
                 
@@ -2276,8 +2282,8 @@ fn get_schema_from_split(searcher_ptr: jlong) -> anyhow::Result<tantivy::schema:
                 let bundle_directory = BundleDirectory::open_split(split_file_slice)
                     .map_err(|e| anyhow::anyhow!("Failed to open bundle directory {}: {}", split_uri, e))?;
                     
-                // Extract schema from the bundle directory by opening the index
-                let index = tantivy::Index::open(bundle_directory)
+                // ✅ QUICKWIT NATIVE: Extract schema from the bundle directory using Quickwit's native index opening
+                let index = open_index(bundle_directory.box_clone(), get_quickwit_fastfield_normalizer_manager().tantivy_manager())
                     .map_err(|e| anyhow::anyhow!("Failed to open index from bundle {}: {}", split_uri, e))?;
                 
                 Ok(index.schema())
