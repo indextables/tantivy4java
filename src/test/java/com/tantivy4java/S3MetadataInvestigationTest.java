@@ -75,8 +75,8 @@ public class S3MetadataInvestigationTest {
             System.out.println("   Size: " + localMergedMetadata.getUncompressedSizeBytes());
             System.out.println("   Footer start offset: " + localMergedMetadata.getFooterStartOffset());
             System.out.println("   Footer end offset: " + localMergedMetadata.getFooterEndOffset());
-            System.out.println("   Hotcache start offset: " + localMergedMetadata.getHotcacheStartOffset());
-            System.out.println("   Hotcache length: " + localMergedMetadata.getHotcacheLength());
+            System.out.println("   Doc mapping UID: " + localMergedMetadata.getDocMappingUid());
+            System.out.println("   Create timestamp: " + localMergedMetadata.getCreateTimestamp());
             System.out.println("   hasFooterOffsets(): " + localMergedMetadata.hasFooterOffsets());
             System.out.println("   getMetadataSize(): " + localMergedMetadata.getMetadataSize());
             
@@ -111,8 +111,8 @@ public class S3MetadataInvestigationTest {
                 System.out.println("   Size: " + s3MergedMetadata.getUncompressedSizeBytes());
                 System.out.println("   Footer start offset: " + s3MergedMetadata.getFooterStartOffset());
                 System.out.println("   Footer end offset: " + s3MergedMetadata.getFooterEndOffset());
-                System.out.println("   Hotcache start offset: " + s3MergedMetadata.getHotcacheStartOffset());
-                System.out.println("   Hotcache length: " + s3MergedMetadata.getHotcacheLength());
+                System.out.println("   Doc mapping UID: " + s3MergedMetadata.getDocMappingUid());
+                System.out.println("   Create timestamp: " + s3MergedMetadata.getCreateTimestamp());
                 System.out.println("   hasFooterOffsets(): " + s3MergedMetadata.hasFooterOffsets());
                 System.out.println("   getMetadataSize(): " + s3MergedMetadata.getMetadataSize());
                 

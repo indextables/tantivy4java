@@ -550,6 +550,7 @@ struct QuickwitSplitMetadata {
     uncompressed_docs_size_in_bytes: u64,
     time_range: Option<RangeInclusive<i64>>,
     create_timestamp: i64,
+    maturity: String,  // "Mature" or "Immature"
     tags: BTreeSet<String>,
     delete_opstamp: u64,
     num_merge_ops: usize,
@@ -645,6 +646,7 @@ fn create_split_metadata(config: &SplitConfig, num_docs: usize, uncompressed_doc
         _ => None,
     },
     create_timestamp: current_timestamp,
+    maturity: "Mature".to_string(),  // Default to mature for created splits
     tags: config.tags.clone(),
     delete_opstamp: 0,
     num_merge_ops: 0,
@@ -665,32 +667,39 @@ fn create_split_metadata(config: &SplitConfig, num_docs: usize, uncompressed_doc
 
 fn create_java_split_metadata<'a>(env: &mut JNIEnv<'a>, split_metadata: &QuickwitSplitMetadata) -> Result<JObject<'a>> {
     let split_metadata_class = env.find_class("com/tantivy4java/QuickwitSplit$SplitMetadata")?;
-    
+
     // Create null Instant objects for time ranges (these are optional)
     let time_start_obj = JObject::null();
     let time_end_obj = JObject::null();
-    
+
     // Create empty HashSet for tags
     let hash_set_class = env.find_class("java/util/HashSet")?;
     let tags_set = env.new_object(&hash_set_class, "()V", &[])?;
-    
+
     // Add tags to the set if any exist
     for tag in &split_metadata.tags {
-    let tag_jstring = string_to_jstring(env, tag)?;
-    env.call_method(
-        &tags_set,
-        "add",
-        "(Ljava/lang/Object;)Z",
-        &[JValue::Object(&tag_jstring.into())],
-    )?;
+        let tag_jstring = string_to_jstring(env, tag)?;
+        env.call_method(
+            &tags_set,
+            "add",
+            "(Ljava/lang/Object;)Z",
+            &[JValue::Object(&tag_jstring.into())],
+        )?;
     }
-    
+
+    // Convert all string fields to JString
     let split_id_jstring = string_to_jstring(env, &split_metadata.split_id)?;
-    
-    // Convert doc mapping JSON to Java string or null if not available
-    let doc_mapping_jstring = match &split_metadata.doc_mapping_json {
-    Some(json) => string_to_jstring(env, json)?,
-    None => JString::from(JObject::null()),
+    let index_uid_jstring = string_to_jstring(env, &split_metadata.index_uid)?;
+    let source_id_jstring = string_to_jstring(env, &split_metadata.source_id)?;
+    let node_id_jstring = string_to_jstring(env, &split_metadata.node_id)?;
+    let doc_mapping_uid_jstring = string_to_jstring(env, &split_metadata.doc_mapping_uid)?;
+    let maturity_jstring = string_to_jstring(env, &split_metadata.maturity)?;
+
+    // Convert doc_mapping_json to JString (null if not present)
+    let doc_mapping_json_jstring = if let Some(ref json) = split_metadata.doc_mapping_json {
+        string_to_jstring(env, json)?
+    } else {
+        JObject::null().into()
     };
 
     // Create ArrayList for skipped splits
@@ -708,31 +717,37 @@ fn create_java_split_metadata<'a>(env: &mut JNIEnv<'a>, split_metadata: &Quickwi
         )?;
     }
 
-    // Use the new constructor that includes footer offset parameters, doc mapping JSON, and skipped splits
+    // Use the new Quickwit-compatible constructor
+    // (String splitId, String indexUid, long partitionId, String sourceId, String nodeId,
+    //  long numDocs, long uncompressedSizeBytes, Instant timeRangeStart, Instant timeRangeEnd,
+    //  long createTimestamp, String maturity, Set<String> tags, long footerStartOffset,
+    //  long footerEndOffset, long deleteOpstamp, int numMergeOps, String docMappingUid, String docMappingJson, List<String> skippedSplits)
     let metadata_obj = env.new_object(
-    &split_metadata_class,
-    "(Ljava/lang/String;JJLjava/time/Instant;Ljava/time/Instant;Ljava/util/Set;JIJJJJLjava/lang/String;Ljava/util/List;)V",
-    &[
-        JValue::Object(&split_id_jstring.into()),
-        JValue::Long(split_metadata.num_docs as i64),
-        JValue::Long(split_metadata.uncompressed_docs_size_in_bytes as i64),
-        JValue::Object(&time_start_obj),
-        JValue::Object(&time_end_obj),
-        JValue::Object(&tags_set),
-        JValue::Long(split_metadata.delete_opstamp as i64),
-        JValue::Int(split_metadata.num_merge_ops as i32),
-        // Footer offset parameters (use -1 to indicate missing values)
-        JValue::Long(split_metadata.footer_start_offset.map(|v| v as i64).unwrap_or(-1)),
-        JValue::Long(split_metadata.footer_end_offset.map(|v| v as i64).unwrap_or(-1)),
-        JValue::Long(split_metadata.hotcache_start_offset.map(|v| v as i64).unwrap_or(-1)),
-        JValue::Long(split_metadata.hotcache_length.map(|v| v as i64).unwrap_or(-1)),
-        // Doc mapping JSON parameter
-        JValue::Object(&doc_mapping_jstring.into()),
-        // Skipped splits parameter
-        JValue::Object(&skipped_splits_list),
-    ]
+        &split_metadata_class,
+        "(Ljava/lang/String;Ljava/lang/String;JLjava/lang/String;Ljava/lang/String;JJLjava/time/Instant;Ljava/time/Instant;JLjava/lang/String;Ljava/util/Set;JJJILjava/lang/String;Ljava/lang/String;Ljava/util/List;)V",
+        &[
+            JValue::Object(&split_id_jstring.into()),           // splitId
+            JValue::Object(&index_uid_jstring.into()),          // indexUid
+            JValue::Long(split_metadata.partition_id as i64),   // partitionId
+            JValue::Object(&source_id_jstring.into()),          // sourceId
+            JValue::Object(&node_id_jstring.into()),            // nodeId
+            JValue::Long(split_metadata.num_docs as i64),       // numDocs
+            JValue::Long(split_metadata.uncompressed_docs_size_in_bytes as i64), // uncompressedSizeBytes
+            JValue::Object(&time_start_obj),                    // timeRangeStart
+            JValue::Object(&time_end_obj),                      // timeRangeEnd
+            JValue::Long(split_metadata.create_timestamp),     // createTimestamp
+            JValue::Object(&maturity_jstring.into()),          // maturity
+            JValue::Object(&tags_set),                          // tags
+            JValue::Long(split_metadata.footer_start_offset.map(|v| v as i64).unwrap_or(-1)), // footerStartOffset
+            JValue::Long(split_metadata.footer_end_offset.map(|v| v as i64).unwrap_or(-1)),   // footerEndOffset
+            JValue::Long(split_metadata.delete_opstamp as i64), // deleteOpstamp
+            JValue::Int(split_metadata.num_merge_ops as i32),   // numMergeOps
+            JValue::Object(&doc_mapping_uid_jstring.into()),    // docMappingUid
+            JValue::Object(&doc_mapping_json_jstring.into()),   // docMappingJson
+            JValue::Object(&skipped_splits_list),               // skippedSplits
+        ]
     )?;
-    
+
     Ok(metadata_obj)
 }
 
@@ -1127,6 +1142,7 @@ pub extern "system" fn Java_com_tantivy4java_QuickwitSplit_nativeReadSplitMetada
         uncompressed_docs_size_in_bytes: std::fs::metadata(path)?.len(),
         time_range: None,
         create_timestamp: Utc::now().timestamp(),
+        maturity: "Mature".to_string(),
         tags: BTreeSet::new(),
         delete_opstamp: 0,
         num_merge_ops: 0,
@@ -1306,6 +1322,7 @@ pub extern "system" fn Java_com_tantivy4java_QuickwitSplit_nativeExtractSplit(
         uncompressed_docs_size_in_bytes: std::fs::metadata(split_path)?.len(),
         time_range: None,
         create_timestamp: Utc::now().timestamp(),
+        maturity: "Mature".to_string(),
         tags: BTreeSet::new(),
         delete_opstamp: 0,
         num_merge_ops: 0,
@@ -2316,6 +2333,7 @@ fn merge_splits_impl(split_urls: &[String], output_path: &str, config: &MergeCon
     uncompressed_docs_size_in_bytes: final_size,
     time_range: None,
     create_timestamp: Utc::now().timestamp(),
+    maturity: "Mature".to_string(),
     tags: BTreeSet::new(),
     delete_opstamp: 0,
     num_merge_ops: 1,
@@ -2364,6 +2382,7 @@ fn merge_splits_impl(split_urls: &[String], output_path: &str, config: &MergeCon
     uncompressed_docs_size_in_bytes: merged_metadata.uncompressed_docs_size_in_bytes,
     time_range: merged_metadata.time_range,
     create_timestamp: merged_metadata.create_timestamp,
+    maturity: merged_metadata.maturity,
     tags: merged_metadata.tags,
     delete_opstamp: merged_metadata.delete_opstamp,
     num_merge_ops: merged_metadata.num_merge_ops,
