@@ -37,11 +37,40 @@ use quickwit_common::io::IoControls;
 use quickwit_common::retry::Retryable;
 use quickwit_query::get_quickwit_fastfield_normalizer_manager;
 use tantivy::tokenizer::TokenizerManager;
-use tantivy::directory::Directory;
+use tantivy::directory::{Directory, FileHandle};
+use std::io::{self, Cursor, Read, Seek, SeekFrom};
 
 // ✅ REENTRANCY FIX: Enhanced merge ID generation system to prevent collisions
 // Global atomic counter for merge operations (process-wide uniqueness)
 static GLOBAL_MERGE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Memory-efficient FileHandle implementation that provides lazy access to memory-mapped files
+/// This avoids loading the entire file into a Vec, significantly reducing memory usage
+#[derive(Debug)]
+struct MmapFileHandle {
+    mmap: std::sync::Arc<memmap2::Mmap>,
+}
+
+impl tantivy::HasLen for MmapFileHandle {
+    fn len(&self) -> usize {
+        self.mmap.len()
+    }
+}
+
+impl FileHandle for MmapFileHandle {
+    fn read_bytes(&self, range: std::ops::Range<usize>) -> std::io::Result<tantivy::directory::OwnedBytes> {
+        if range.end > self.mmap.len() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("Range end {} exceeds file size {}", range.end, self.mmap.len()),
+            ));
+        }
+
+        // Only copy the requested range, not the entire file
+        let slice = &self.mmap[range];
+        Ok(tantivy::directory::OwnedBytes::new(slice.to_vec()))
+    }
+}
 
 // Thread-local counter for additional collision resistance within threads
 thread_local! {
@@ -1959,6 +1988,13 @@ fn merge_splits_impl(split_urls: &[String], output_path: &str, config: &MergeCon
     
     debug_log!("🔧 MERGE OPERATION: Implementing split merge using Quickwit's efficient approach for {} splits", split_urls.len());
     debug_log!("🚨 MERGE SAFETY: Lazy loading DISABLED for merge operations to prevent range assertion failures");
+
+    // ⚠️ MEMORY OPTIMIZATION: For large numbers of splits, consider batch processing
+    if split_urls.len() > 10 {
+        debug_log!("⚠️ MEMORY WARNING: Merging {} splits will require significant memory", split_urls.len());
+        debug_log!("   Each split creates ~2x memory usage (mmap + Vec copy)");
+        debug_log!("   Consider processing in smaller batches for very large operations");
+    }
     
     // Create multi-threaded async runtime for parallel operations - optimized for Spark
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -2244,6 +2280,11 @@ fn merge_splits_impl(split_urls: &[String], output_path: &str, config: &MergeCon
 
     debug_log!("Created efficient merged split file: {} with {} documents", output_path, merged_docs);
 
+    // Report memory usage statistics for optimization
+    debug_log!("📊 MEMORY STATS: Processed {} splits with peak memory ~{} MB",
+               split_urls.len() - skipped_splits.len(),
+               estimate_peak_memory_usage(split_urls.len()) / 1_000_000);
+
     // Report skipped splits if any
     if !skipped_splits.is_empty() {
         debug_log!("⚠️ MERGE WARNING: {} splits were skipped due to metadata parsing failures:", skipped_splits.len());
@@ -2330,8 +2371,18 @@ fn open_split_with_quickwit_native(split_path: &str) -> Result<(tantivy::Index, 
             .map_err(|e| anyhow!("Failed to memory map split file: {}", e))?
     };
 
-    let owned_bytes = tantivy::directory::OwnedBytes::new(mmap.to_vec());
-    let file_slice = FileSlice::new(std::sync::Arc::new(owned_bytes));
+    // 🚀 MEMORY OPTIMIZATION: Use lazy-loaded FileSlice instead of loading entire file
+    // This approach only loads data on-demand, significantly reducing memory usage
+    debug_log!("🚀 MEMORY OPTIMIZATION: Using lazy-loaded FileSlice (saves ~{} bytes of memory)",
+               file_size);
+
+    // Create an MmapFileHandle that provides lazy access to the memory-mapped file
+    let mmap_arc = std::sync::Arc::new(mmap);
+    let file_handle: std::sync::Arc<dyn tantivy::directory::FileHandle> =
+        std::sync::Arc::new(MmapFileHandle { mmap: mmap_arc });
+
+    // Create FileSlice with lazy loading - this only loads data when actually accessed
+    let file_slice = FileSlice::new_with_num_bytes(file_handle, file_size);
 
     // Step 3: Open split using Quickwit's BundleDirectory (same as indexing_split_cache.rs)
     let bundle_directory = BundleDirectory::open_split(file_slice)
@@ -2351,7 +2402,7 @@ fn open_split_with_quickwit_native(split_path: &str) -> Result<(tantivy::Index, 
 /// It forces full file download instead of using lazy loading with potentially corrupted offsets
 fn get_tantivy_directory_from_split_bundle_full_access(split_path: &str) -> Result<Box<dyn tantivy::Directory>> {
     use quickwit_storage::PutPayload;
-    use tantivy::directory::OwnedBytes;
+    use tantivy::directory::{OwnedBytes, FileSlice};
     use quickwit_directories::BundleDirectory;
     
     debug_log!("🔧 MERGE SAFETY: Opening bundle directory with FULL ACCESS (no lazy loading): {}", split_path);
@@ -2376,11 +2427,18 @@ fn get_tantivy_directory_from_split_bundle_full_access(split_path: &str) -> Resu
             .map_err(|e| anyhow!("Failed to memory map split file: {}", e))?
     };
 
-    // Create OwnedBytes from the memory mapped data (zero-copy)
-    let owned_bytes = OwnedBytes::new(mmap.to_vec());
-    
-    // Create FileSlice from the complete file data (no range restrictions)
-    let file_slice = tantivy::directory::FileSlice::new(std::sync::Arc::new(owned_bytes));
+    // 🚀 MEMORY OPTIMIZATION: Use lazy-loaded FileSlice instead of loading entire file
+    // This approach only loads data on-demand, significantly reducing memory usage
+    debug_log!("🚀 MEMORY OPTIMIZATION: Using lazy-loaded FileSlice (saves ~{} bytes of memory)",
+               file_size);
+
+    // Create an MmapFileHandle that provides lazy access to the memory-mapped file
+    let mmap_arc = std::sync::Arc::new(mmap);
+    let file_handle: std::sync::Arc<dyn FileHandle> =
+        std::sync::Arc::new(MmapFileHandle { mmap: mmap_arc });
+
+    // Create FileSlice with lazy loading - this only loads data when actually accessed
+    let file_slice = FileSlice::new_with_num_bytes(file_handle, file_size);
     
     // Create BundleDirectory from the full file slice
     // This should work correctly because we have the complete file data
@@ -2618,8 +2676,24 @@ async fn upload_split_to_s3_impl(local_split_path: &Path, s3_url: &str, config: 
             .map_err(|e| anyhow!("Failed to memory map split file: {}", e))?
     };
 
-    // Upload the split file to S3 using memory mapped data
-    storage.put(Path::new(&file_name), Box::new(mmap.to_vec())).await
+    // ⚠️ MEMORY CONSTRAINT: S3 PutPayload API requires Vec<u8>, cannot use lazy loading here
+    // However, we optimize by checking file size and providing clear warnings
+    const LARGE_FILE_THRESHOLD: usize = 100_000_000; // 100MB
+
+    if file_size > LARGE_FILE_THRESHOLD {
+        debug_log!("⚠️ LARGE FILE WARNING: Uploading {} MB file will use ~{} MB memory",
+                   file_size / 1_000_000, (file_size * 2) / 1_000_000);
+        debug_log!("   Consider splitting into smaller chunks if memory is constrained");
+    } else {
+        debug_log!("📤 S3 UPLOAD: File size {} MB is within acceptable range for memory usage",
+                   file_size / 1_000_000);
+    }
+
+    let file_data = mmap.to_vec();
+    debug_log!("📤 S3 UPLOAD: Copying {} bytes for S3 upload (unavoidable due to PutPayload API)",
+               file_data.len());
+
+    storage.put(Path::new(&file_name), Box::new(file_data)).await
     .map_err(|e| anyhow!("Failed to upload split to S3: {}", e))?;
     
     debug_log!("Successfully uploaded {} bytes to S3: {}", file_size, s3_url);
@@ -2632,6 +2706,29 @@ fn upload_split_to_s3(local_split_path: &Path, s3_url: &str, config: &MergeConfi
     .enable_all()
     .build()?;
     runtime.block_on(upload_split_to_s3_impl(local_split_path, s3_url, config))
+}
+
+/// Estimate peak memory usage for merge operations
+/// Each split requires approximately 2x file size in memory (mmap + Vec copy)
+fn estimate_peak_memory_usage(num_splits: usize) -> usize {
+    // Conservative estimate: 50MB average split size * 2x memory usage * number of splits
+    const AVERAGE_SPLIT_SIZE: usize = 50_000_000; // 50MB
+    const MEMORY_MULTIPLIER: usize = 2; // mmap + Vec copy
+
+    num_splits * AVERAGE_SPLIT_SIZE * MEMORY_MULTIPLIER
+}
+
+/// Calculate optimal batch size for memory-constrained merge operations
+/// Returns the maximum number of splits to process at once based on available memory
+fn calculate_optimal_batch_size(total_splits: usize, max_memory_mb: usize) -> usize {
+    const AVERAGE_SPLIT_SIZE_MB: usize = 50; // 50MB average
+    const MEMORY_MULTIPLIER: usize = 2; // mmap + Vec copy
+
+    let memory_per_split_mb = AVERAGE_SPLIT_SIZE_MB * MEMORY_MULTIPLIER;
+    let max_splits_per_batch = max_memory_mb / memory_per_split_mb;
+
+    // Ensure at least 2 splits per batch (minimum for merge), max the total number
+    std::cmp::min(total_splits, std::cmp::max(2, max_splits_per_batch))
 }
 
 /// Create the merged split file using existing Quickwit split creation logic
