@@ -157,6 +157,10 @@ mod resilient_ops {
     /// Maximum number of retry attempts for resilient operations
     const MAX_RETRIES: usize = 3;
 
+    /// Get the maximum retry count based on environment (Databricks gets more retries)
+    fn get_max_retries() -> usize {
+        if std::env::var("DATABRICKS_RUNTIME_VERSION").is_ok() { 8 } else { MAX_RETRIES }
+    }
 
     /// Base delay between retries in milliseconds (exponential backoff)
     const BASE_RETRY_DELAY_MS: u64 = 100;
@@ -2064,6 +2068,12 @@ fn merge_splits_impl(split_urls: &[String], output_path: &str, config: &MergeCon
     debug_log!("Opened {} valid splits out of {} requested with total {} documents, {} bytes", valid_splits, total_requested, total_docs, total_size);
 
     if valid_splits == 0 {
+        // ✅ CRITICAL FIX: Clean up temp directories before returning error
+        debug_log!("🧹 CLEANUP: Cleaning up {} temp directories before error return", temp_dirs.len());
+        for (i, temp_dir) in temp_dirs.into_iter().enumerate() {
+            debug_log!("🧹 CLEANUP: Cleaning up temp directory {}: {:?}", i, temp_dir.path());
+            // temp_dir will be automatically cleaned up when dropped (RAII)
+        }
         return Err(anyhow!("All splits failed to parse due to data corruption or metadata errors. Skipped splits: {:?}", skipped_splits));
     }
 
@@ -2209,8 +2219,15 @@ fn merge_splits_impl(split_urls: &[String], output_path: &str, config: &MergeCon
            footer_offsets.hotcache_length, footer_offsets.hotcache_start_offset);
     
     // 11. ✅ REENTRANCY FIX: Coordinated cleanup to prevent race conditions
-    coordinate_temp_directory_cleanup(&merge_id, &output_temp_dir, temp_dirs)?;
-    
+    // Use match to ensure cleanup doesn't fail the entire merge operation
+    match coordinate_temp_directory_cleanup(&merge_id, &output_temp_dir, temp_dirs) {
+        Ok(_) => debug_log!("✅ CLEANUP: Temporary directories cleaned up successfully"),
+        Err(e) => {
+            debug_log!("⚠️ CLEANUP WARNING: Cleanup failed but merge succeeded: {}", e);
+            // Continue with merge completion - don't fail the operation due to cleanup issues
+        }
+    }
+
     debug_log!("Created efficient merged split file: {} with {} documents", output_path, merged_docs);
 
     // Report skipped splits if any
@@ -2224,14 +2241,15 @@ fn merge_splits_impl(split_urls: &[String], output_path: &str, config: &MergeCon
     Ok(final_merged_metadata)
     })(); // End closure
 
-    // FIXED: Clean up temporary directories from registry to prevent memory leaks
+    // ✅ CRITICAL FIX: Clean up temporary directories regardless of success/failure
+    // This ensures no file system leaks even if the merge operation failed
     cleanup_merge_temp_directory(&merge_id);
 
     // Ensure proper runtime cleanup regardless of success or failure
     runtime.shutdown_background();
     debug_log!("Tokio runtime shutdown completed");
 
-    // Return the result
+    // Return the result (preserving any errors)
     result
 }
 
