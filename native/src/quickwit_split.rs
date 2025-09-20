@@ -2145,22 +2145,23 @@ fn merge_splits_impl(split_urls: &[String], output_path: &str, config: &MergeCon
     (temp_path, true, Some(temp_dir))
     } else {
     // For local files, prefer custom temp path if provided, otherwise use output parent directory
-    let temp_dir = if let Some(custom_base) = &config.temp_directory_path {
-        let temp_dir = create_temp_directory_with_base(
+    let (temp_dir, temp_dir_guard) = if let Some(custom_base) = &config.temp_directory_path {
+        let temp_dir_obj = create_temp_directory_with_base(
             &format!("tantivy4java_merge_{}_output_", merge_id),
             Some(custom_base)
         )?;
-        temp_dir.path().to_path_buf()
+        let temp_path = temp_dir_obj.path().to_path_buf();
+        (temp_path, Some(temp_dir_obj))
     } else {
         // Fallback to next to output file
         let output_dir_path = Path::new(output_path).parent()
             .ok_or_else(|| anyhow!("Cannot determine parent directory for output path"))?;
         let temp_dir = output_dir_path.join(format!("temp_merge_output_{}", merge_id));
         std::fs::create_dir_all(&temp_dir)?;
-        temp_dir
+        (temp_dir, None)
     };
     debug_log!("Created local temporary directory: {:?}", temp_dir);
-    (temp_dir, false, None)
+    (temp_dir, false, temp_dir_guard)
     };
     
     // 3. Perform memory-efficient segment-level merge using Quickwit's implementation
