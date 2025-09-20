@@ -26,8 +26,7 @@ use quickwit_storage::{StorageResolver, ByteRangeCache, STORAGE_METRICS, MemoryS
 use quickwit_search::leaf::open_index_with_caches;
 use quickwit_indexing::open_index;
 use quickwit_query::get_quickwit_fastfield_normalizer_manager;
-use tantivy::tokenizer::TokenizerManager;
-use tantivy::directory::{Directory, DirectoryClone};
+use tantivy::directory::DirectoryClone;
 
 /// Thread pool for search operations (matches Quickwit's pattern exactly)
 fn search_thread_pool() -> &'static ThreadPool {
@@ -528,9 +527,7 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_searchWithQueryAst(
         
         use quickwit_common::uri::Uri;
         use quickwit_config::StorageConfigs;
-        use quickwit_directories::BundleDirectory;
-        use tantivy::directory::FileSlice;
-        
+
         // Run async code synchronously within the runtime context
         let async_block_start = std::time::Instant::now();
         debug_println!("RUST DEBUG: ⏱️ Starting async block for search [TIMING: {}ms]", method_start_time.elapsed().as_millis());
@@ -1133,13 +1130,13 @@ fn retrieve_document_from_split_optimized(
         // Use the same Quickwit caching pattern as our batch method
         tokio::task::block_in_place(|| {
             runtime.block_on(async {
-                use quickwit_common::uri::Uri;
+                
                 use quickwit_config::{StorageConfigs, S3StorageConfig};
                 use quickwit_proto::search::SplitIdAndFooterOffsets;
                 use quickwit_storage::StorageResolver;
-                use quickwit_search::leaf::open_index_with_caches;
-                use quickwit_search::SearcherContext;
-                use quickwit_storage::ByteRangeCache;
+                
+                
+                
                 use std::sync::Arc;
                 
                 // Create split metadata for Quickwit's open_index_with_caches with correct field names
@@ -1265,7 +1262,7 @@ fn retrieve_document_from_split_optimized(
                         
                     let index_creation_start = std::time::Instant::now();
                     // ✅ QUICKWIT NATIVE: Use Quickwit's native index opening instead of direct tantivy
-                    let mut index = open_index(bundle_directory.box_clone(), get_quickwit_fastfield_normalizer_manager().tantivy_manager())
+                    let index = open_index(bundle_directory.box_clone(), get_quickwit_fastfield_normalizer_manager().tantivy_manager())
                         .map_err(|e| anyhow::anyhow!("Failed to open index from bundle {}: {}", split_uri, e))?;
                     debug_println!("RUST DEBUG: ⏱️ 📖 QUICKWIT NATIVE: BundleDirectory index creation completed [TIMING: {}ms]", index_creation_start.elapsed().as_millis());
                     index
@@ -1486,7 +1483,7 @@ fn retrieve_documents_batch_from_split_optimized(
     mut doc_addresses: Vec<tantivy::DocAddress>,
 ) -> Result<Vec<jobject>, anyhow::Error> {
     use crate::utils::with_arc_safe;
-    use quickwit_storage::StorageResolver;
+    
     use std::sync::Arc;
     
     // Sort by DocAddress for cache locality (following Quickwit pattern)
@@ -1548,15 +1545,15 @@ fn retrieve_documents_batch_from_split_optimized(
 
                 debug_println!("RUST DEBUG: ⚠️ BATCH CACHE MISS: Creating new searcher for batch processing");
 
-                use quickwit_common::uri::Uri;
+                
                 use quickwit_config::{StorageConfigs, S3StorageConfig};
                 use quickwit_proto::search::SplitIdAndFooterOffsets;
                 use quickwit_storage::StorageResolver;
                 use quickwit_search::leaf::open_index_with_caches;
-                use quickwit_search::SearcherContext;
-                use quickwit_storage::ByteRangeCache;
-                use std::path::Path;
-                use std::sync::Arc;
+                
+                
+                
+                
                 
                 // Use the same storage resolution approach as individual document retrieval
                 // Create S3 storage configuration
@@ -1718,7 +1715,7 @@ fn retrieve_documents_batch_from_split_optimized(
 /// Legacy method - kept for compatibility but not optimized
 fn retrieve_documents_batch_from_split(
     searcher_ptr: jlong,
-    mut doc_addresses: Vec<tantivy::DocAddress>,
+    doc_addresses: Vec<tantivy::DocAddress>,
 ) -> Result<Vec<(tantivy::DocAddress, tantivy::schema::TantivyDocument, tantivy::schema::Schema)>, anyhow::Error> {
     // Fallback to single document retrieval for now
     let mut results = Vec::new();
@@ -2691,7 +2688,7 @@ fn convert_java_aggregation_to_json<'a>(
     env: &mut JNIEnv<'a>,
     java_aggregation: &JObject<'a>,
 ) -> anyhow::Result<serde_json::Value> {
-    use serde_json::json;
+    
 
     debug_println!("RUST DEBUG: Converting Java aggregation to JSON");
 

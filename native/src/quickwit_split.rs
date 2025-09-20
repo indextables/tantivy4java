@@ -27,14 +27,14 @@ use serde::{Serialize, Deserialize};
 use serde_json;
 
 // Quickwit imports
-use quickwit_storage::{PutPayload, BundleStorage, RamStorage, Storage, StorageResolver, SplitPayloadBuilder};
+use quickwit_storage::{PutPayload, Storage, StorageResolver, SplitPayloadBuilder};
 use quickwit_indexing::{
     open_split_directories,
     merge_split_directories_standalone,
     open_index,
 };
 use quickwit_common::io::IoControls;
-use quickwit_common::retry::{RetryParams, Retryable, retry};
+use quickwit_common::retry::Retryable;
 use quickwit_query::get_quickwit_fastfield_normalizer_manager;
 use tantivy::tokenizer::TokenizerManager;
 use tantivy::directory::Directory;
@@ -144,7 +144,6 @@ use quickwit_directories::write_hotcache;
 use quickwit_config::S3StorageConfig;
 use quickwit_common::uri::{Uri, Protocol};
 // Removed: use quickwit_doc_mapper::default_doc_mapper_for_test; - now creating real doc mapping from schema
-use tantivy::directory::OwnedBytes;
 use std::str::FromStr;
 
 use crate::utils::{convert_throwable, jstring_to_string, string_to_jstring};
@@ -158,10 +157,6 @@ mod resilient_ops {
     /// Maximum number of retry attempts for resilient operations
     const MAX_RETRIES: usize = 3;
 
-    /// Get the maximum retry count based on environment (Databricks gets more retries)
-    fn get_max_retries() -> usize {
-        if std::env::var("DATABRICKS_RUNTIME_VERSION").is_ok() { 8 } else { MAX_RETRIES }
-    }
 
     /// Base delay between retries in milliseconds (exponential backoff)
     const BASE_RETRY_DELAY_MS: u64 = 100;
@@ -192,35 +187,6 @@ mod resilient_ops {
         }
     }
 
-    /// ✅ QUICKWIT NATIVE: Resilient operation using Quickwit's native retry system
-    async fn quickwit_resilient_operation<T, F, Fut>(
-        operation_name: &str,
-        operation: F,
-    ) -> Result<T>
-    where
-        F: Fn() -> Fut,
-        Fut: std::future::Future<Output = Result<T>>,
-    {
-        // Use Quickwit's aggressive retry params for operations that need resilience
-        let retry_params = RetryParams::aggressive();
-
-        debug_log!("🔄 QUICKWIT NATIVE: Starting resilient operation: {}", operation_name);
-
-        let result = retry(&retry_params, || async {
-            operation().await.map_err(|e| RetryableAnyhowError(e))
-        }).await;
-
-        match result {
-            Ok(value) => {
-                debug_log!("✅ QUICKWIT NATIVE: Operation {} succeeded", operation_name);
-                Ok(value)
-            }
-            Err(err) => {
-                debug_log!("❌ QUICKWIT NATIVE: Operation {} failed after retries: {}", operation_name, err);
-                Err(err.0)
-            }
-        }
-    }
 
     /// Resilient wrapper for index.load_metas() with retry logic for transient corruption
     pub fn resilient_load_metas(index: &tantivy::Index) -> Result<tantivy::IndexMeta> {
@@ -238,20 +204,6 @@ mod resilient_ops {
     }
 
     /// Extract column number from serde_json error messages like "line 1, column: 2291"
-    pub fn extract_column_number(error_msg: &str) -> Option<usize> {
-        // Simple string parsing approach to avoid regex dependency complexity
-        // Look for patterns like "line 1, column: 2291" or "line 1, column 2291"
-        if let Some(column_start) = error_msg.find("column") {
-            let after_column = &error_msg[column_start + 6..]; // Skip "column"
-            // Skip any whitespace and optional colon
-            let trimmed = after_column.trim_start_matches(|c: char| c.is_whitespace() || c == ':');
-            // Extract the number
-            let number_str = trimmed.split_whitespace().next()?;
-            number_str.parse::<usize>().ok()
-        } else {
-            None
-        }
-    }
 
     /// Special resilient operation wrapper for JSON column truncation errors
     /// This provides enhanced debugging and potential recovery for consistent JSON truncation issues
@@ -817,7 +769,6 @@ fn is_data_corruption_error(error_msg: &str) -> bool {
 
 async fn convert_index_from_path_impl_async(index_path: &str, output_path: &str, config: &SplitConfig) -> Result<QuickwitSplitMetadata, anyhow::Error> {
     use tantivy::directory::MmapDirectory;
-    use tantivy::Index as TantivyIndex;
     
     // Open the Tantivy index using the actual Quickwit/Tantivy libraries
     let mmap_directory = MmapDirectory::open(index_path)
@@ -1978,117 +1929,14 @@ async fn download_split_to_temp_file(
 
 
 /// ✅ CORRUPTION FIX: Verify split file structure to prevent ".managed.json" corruption
-/// This specifically checks for the truncation that causes "line 1, column 2291" errors
-fn verify_split_file_structure(data: &[u8], split_index: usize, split_url: &str) -> Result<()> {
-    if data.len() < 12 {
-        return Err(anyhow!("Split {}: File too small: {} bytes (minimum 12 required)", split_index, data.len()));
-    }
-
-    // Check that we can read the hotcache length from the last 4 bytes
-    let hotcache_len_bytes = &data[data.len() - 4..];
-    let hotcache_len = u32::from_le_bytes([
-        hotcache_len_bytes[0], hotcache_len_bytes[1],
-        hotcache_len_bytes[2], hotcache_len_bytes[3]
-    ]) as usize;
-
-    debug_log!("🔧 Split {}: Hotcache length from footer: {} bytes", split_index, hotcache_len);
-
-    if hotcache_len > data.len() - 8 {
-        return Err(anyhow!("Split {}: Invalid hotcache length: {} bytes (file size: {})",
-            split_index, hotcache_len, data.len()));
-    }
-
-    // Check that we can read the metadata length
-    let metadata_len_start = data.len() - 4 - hotcache_len - 4;
-    if metadata_len_start < 8 {
-        return Err(anyhow!("Split {}: Invalid file structure: metadata start at {}", split_index, metadata_len_start));
-    }
-
-    let metadata_len_bytes = &data[metadata_len_start..metadata_len_start + 4];
-    let metadata_len = u32::from_le_bytes([
-        metadata_len_bytes[0], metadata_len_bytes[1],
-        metadata_len_bytes[2], metadata_len_bytes[3]
-    ]) as usize;
-
-    debug_log!("🔧 Split {}: Metadata length: {} bytes", split_index, metadata_len);
-
-    // This is where the column 2291 error occurs - let's verify the JSON is valid
-    let json_start = metadata_len_start - metadata_len;
-    if json_start < 8 {
-        return Err(anyhow!("Split {}: Invalid JSON start position: {}", split_index, json_start));
-    }
-
-    // Extract the JSON metadata and verify it's complete
-    let json_data = &data[json_start..metadata_len_start];
-
-    // Skip the 8-byte header (magic number + version) and parse the JSON
-    if json_data.len() < 8 {
-        return Err(anyhow!("Split {}: JSON metadata too small: {} bytes", split_index, json_data.len()));
-    }
-
-    let json_content = &json_data[8..];
-    debug_log!("🔧 Split {}: JSON content size: {} bytes", split_index, json_content.len());
-
-    // ✅ CORRUPTION FIX: The "line 1, column 2291" error suggests the JSON is being read with
-    // incorrect boundaries. Let's try to detect and fix common boundary issues.
-
-    debug_log!("🔧 Split {}: JSON starts at position {} in file (relative), size {} bytes",
-        split_index, json_start, json_content.len());
-
-    // Try parsing the JSON and provide detailed diagnostics if it fails
-    match serde_json::from_slice::<serde_json::Value>(json_content) {
-        Ok(_) => {
-            debug_log!("✅ Split {}: JSON metadata is valid and complete", split_index);
-            Ok(())
-        }
-        Err(e) => {
-            let error_msg = e.to_string();
-
-            // Log detailed information about the JSON corruption for debugging
-            debug_log!("🚨 Split {}: JSON parsing failed for {}: {}", split_index, split_url, error_msg);
-            debug_log!("🚨 Split {}: File size: {} bytes", split_index, data.len());
-            debug_log!("🚨 Split {}: JSON content size: {} bytes", split_index, json_content.len());
-            debug_log!("🚨 Split {}: JSON start position: {}", split_index, json_start);
-            debug_log!("🚨 Split {}: Metadata length: {} bytes", split_index, metadata_len);
-            debug_log!("🚨 Split {}: Hotcache length: {} bytes", split_index, hotcache_len);
-
-            // Check if this is a JSON column truncation error
-            if error_msg.contains("EOF while parsing") {
-                if let Some(column_num) = resilient_ops::extract_column_number(&error_msg) {
-                    // This is the consistent truncation issue - let's try alternative parsing approaches
-                    debug_log!("🔧 Split {}: Attempting alternative JSON parsing for column {} corruption", split_index, column_num);
-
-                    // Alternative 1: Try parsing with trailing bytes removed
-                    if json_content.len() > column_num {
-                        let truncated_content = &json_content[..column_num];
-                        match serde_json::from_slice::<serde_json::Value>(truncated_content) {
-                            Ok(_) => {
-                                return Err(anyhow!("Split {}: CONFIRMED COLUMN {} TRUNCATION - JSON is being truncated at exactly {} bytes", split_index, column_num, column_num));
-                            }
-                            Err(_) => {
-                                debug_log!("🔧 Split {}: Alternative parsing at {} bytes also failed", split_index, column_num);
-                            }
-                        }
-                    }
-
-                    return Err(anyhow!("Split {}: CRITICAL COLUMN {} CORRUPTION in {}: {} - This indicates a systematic file reading issue at byte boundary {}",
-                        split_index, column_num, split_url, error_msg, column_num));
-                }
-            }
-
-            return Err(anyhow!("Split {}: JSON validation failed for {}: {}", split_index, split_url, error_msg));
-        }
-    }
-}
 
 /// Implementation of split merging using Quickwit's efficient approach
 /// This follows Quickwit's MergeExecutor pattern for memory-efficient large-scale merges
 /// CRITICAL: For merge operations, we disable lazy loading and force full file downloads
 /// to avoid the range assertion failures that occur when accessing corrupted/invalid metadata
 fn merge_splits_impl(split_urls: &[String], output_path: &str, config: &MergeConfig) -> Result<QuickwitSplitMetadata> {
-    use quickwit_directories::UnionDirectory;
-    use tantivy::directory::{MmapDirectory, Directory, Advice, DirectoryClone};
-    use tantivy::{Index as TantivyIndex, IndexMeta};
+    use tantivy::directory::{MmapDirectory, Directory, DirectoryClone};
+    use tantivy::IndexMeta;
     
     
     debug_log!("🔧 MERGE OPERATION: Implementing split merge using Quickwit's efficient approach for {} splits", split_urls.len());
@@ -2388,33 +2236,6 @@ fn merge_splits_impl(split_urls: &[String], output_path: &str, config: &MergeCon
 }
 
 /// Get Tantivy directory from split bundle using Quickwit's BundleDirectory
-/// This is memory-efficient as it doesn't extract files
-fn get_tantivy_directory_from_split_bundle(split_path: &str) -> Result<Box<dyn tantivy::Directory>> {
-    use quickwit_directories::BundleDirectory;
-    use tantivy::directory::MmapDirectory;
-    
-    debug_log!("Opening bundle directory for split: {}", split_path);
-    
-    let split_file_path = PathBuf::from(split_path);
-    let parent_dir = split_file_path.parent()
-    .ok_or_else(|| anyhow!("Cannot find parent directory for {}", split_path))?;
-    
-    // Open parent directory
-    let mmap_directory = MmapDirectory::open(parent_dir)?;
-    
-    // Get filename only
-    let filename = split_file_path.file_name()
-    .ok_or_else(|| anyhow!("Cannot extract filename from {}", split_path))?;
-    
-    // Open the split file slice
-    let split_fileslice = mmap_directory.open_read(Path::new(filename))?;
-    
-    // Create BundleDirectory - this provides direct access without extraction
-    let bundle_directory = BundleDirectory::open_split(split_fileslice)?;
-    
-    debug_log!("Successfully opened bundle directory for split: {}", split_path);
-    Ok(Box::new(bundle_directory))
-}
 
 /// Create Quickwit-compatible tokenizer manager for proper index operations
 fn create_quickwit_tokenizer_manager() -> TokenizerManager {
@@ -2429,7 +2250,7 @@ fn create_quickwit_tokenizer_manager() -> TokenizerManager {
 /// Note: hotcache is metadata added by get_stats_split but not accessible via BundleDirectory::open_read()
 fn get_split_file_list(split_path: &str) -> Result<Vec<PathBuf>> {
     use quickwit_directories::BundleDirectory;
-    use tantivy::directory::{FileSlice, OwnedBytes};
+    use tantivy::directory::OwnedBytes;
 
     debug_log!("🔧 QUICKWIT NATIVE: Getting file list from split: {}", split_path);
 
@@ -2785,7 +2606,6 @@ fn upload_split_to_s3(local_split_path: &Path, s3_url: &str, config: &MergeConfi
 /// Returns the footer offsets for the merged split
 fn create_merged_split_file(merged_index_path: &Path, output_path: &str, metadata: &QuickwitSplitMetadata) -> Result<FooterOffsets> {
     use tantivy::directory::MmapDirectory;
-    use tantivy::Index as TantivyIndex;
     
     debug_log!("Creating merged split file at {} from index {:?}", output_path, merged_index_path);
     

@@ -1,5 +1,4 @@
 use jni::JNIEnv;
-use anyhow::Result;
 
 /// Helper function for consistent JNI error handling
 
