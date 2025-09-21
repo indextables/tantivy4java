@@ -10,7 +10,7 @@ use crate::standalone_searcher::{StandaloneSearcher, StandaloneSearchConfig, Spl
 use crate::utils::{arc_to_jlong, with_arc_safe, release_arc};
 use crate::common::to_java_exception;
 use crate::debug_println;
-use crate::global_cache::get_configured_storage_resolver;
+use crate::global_cache::{get_configured_storage_resolver, get_configured_storage_resolver_async};
 use crate::split_query::{store_split_schema, get_split_schema, convert_split_query_to_ast};
 use quickwit_search::{SearcherContext, search_permit_provider::SearchPermitProvider};
 use quickwit_search::leaf_cache::LeafSearchCache;
@@ -557,7 +557,7 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_searchWithQueryAst(
                 eprintln!("✅ BYPASS_FIXED: Using get_configured_storage_resolver() for cache sharing [FIX #1]");
                 eprintln!("   📍 Location: split_searcher_replacement.rs:558 (createNativeWithSharedCache S3 path)");
                 eprintln!("   🎯 Fix: Now using centralized function instead of direct StorageResolver::configured()");
-                let storage_resolver = get_configured_storage_resolver(Some(s3_config.clone()));
+                let storage_resolver = get_configured_storage_resolver_async(Some(s3_config.clone())).await;
                 eprintln!("✅ CENTRALIZED_RESOLVER_USED: Resolver from centralized function at address {:p} [FIX #1]", &storage_resolver);
 
                 // Use the helper function to resolve storage correctly for S3 URIs
@@ -1176,9 +1176,11 @@ fn retrieve_document_from_split_optimized(
                     split_uri // If no slash, use the full URI as directory
                 };
                 debug_println!("RUST DEBUG: ⏱️ 🔧 STORAGE RESOLUTION - Creating S3 storage configuration");
-                
-                let storage_configs = StorageConfigs::new(vec![quickwit_config::StorageConfig::S3(s3_config.clone())]);
-                let storage_resolver = StorageResolver::configured(&storage_configs);
+
+                // ✅ BYPASS FIX #2: Use centralized storage resolver function
+                eprintln!("✅ BYPASS_FIXED: Using get_configured_storage_resolver() for cache sharing [FIX #2]");
+                eprintln!("   📍 Location: split_searcher_replacement.rs:1181 (S3 index storage path)");
+                let storage_resolver = get_configured_storage_resolver_async(Some(s3_config.clone())).await;
                 let index_storage = resolve_storage_for_split(&storage_resolver, split_dir_uri).await?;
                 debug_println!("RUST DEBUG: ⏱️ 🔧 STORAGE RESOLUTION completed [TIMING: {}ms]", storage_resolution_start.elapsed().as_millis());
                 
@@ -1358,9 +1360,11 @@ fn retrieve_document_from_split(
                 disable_multi_object_delete: false,
                 disable_multipart_upload: false,
             };
-            
-            let storage_configs = StorageConfigs::new(vec![quickwit_config::StorageConfig::S3(s3_config.clone())]);
-            let storage_resolver = StorageResolver::configured(&storage_configs);
+
+            // ✅ BYPASS FIX #3: Use centralized storage resolver function
+            eprintln!("✅ BYPASS_FIXED: Using get_configured_storage_resolver() for cache sharing [FIX #3]");
+            eprintln!("   📍 Location: split_searcher_replacement.rs:1365 (actual storage path)");
+            let storage_resolver = get_configured_storage_resolver(Some(s3_config.clone()));
             let actual_storage = resolve_storage_for_split(&storage_resolver, split_uri).await?;
             
             // Extract relative path - for direct file paths, use just the filename
@@ -1565,9 +1569,11 @@ fn retrieve_documents_batch_from_split_optimized(
                 } else {
                     split_uri // If no slash, use the full URI as directory
                 };
-                
-                let storage_configs = StorageConfigs::new(vec![quickwit_config::StorageConfig::S3(s3_config.clone())]);
-                let storage_resolver = StorageResolver::configured(&storage_configs);
+
+                // ✅ BYPASS FIX #4: Use centralized storage resolver function
+                eprintln!("✅ BYPASS_FIXED: Using get_configured_storage_resolver() for cache sharing [FIX #4]");
+                eprintln!("   📍 Location: split_searcher_replacement.rs:1574 (batch documents split directory)");
+                let storage_resolver = get_configured_storage_resolver_async(Some(s3_config.clone())).await;
                 let index_storage = resolve_storage_for_split(&storage_resolver, split_dir_uri).await?;
                 
                 // Extract just the filename as the relative path (same as individual retrieval)
@@ -2026,10 +2032,10 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_getSchemaFromNative(
                          s3_config.access_key_id.as_ref().map(|k| &k[..std::cmp::min(8, k.len())]).unwrap_or("None"),
                          s3_config.region.as_ref().unwrap_or(&"None".to_string()));
                 
-                let storage_configs_vec = StorageConfigs::new(vec![quickwit_config::StorageConfig::S3(s3_config.clone())]);
-                storage_configs = storage_configs_vec;
-                
-                let storage_resolver = StorageResolver::configured(&storage_configs);
+                // ✅ BYPASS FIX #5: Use centralized storage resolver function
+                eprintln!("✅ BYPASS_FIXED: Using get_configured_storage_resolver() for cache sharing [FIX #5]");
+                eprintln!("   📍 Location: split_searcher_replacement.rs:2038 (S3 storage config creation)");
+                let storage_resolver = get_configured_storage_resolver_async(Some(s3_config.clone())).await;
                 debug_println!("RUST DEBUG: ⏱️ Storage config creation completed [TIMING: {}ms]", storage_config_start.elapsed().as_millis());
                 
                 // Use the helper function to resolve storage correctly for S3 URIs
@@ -2238,9 +2244,11 @@ fn get_schema_from_split(searcher_ptr: jlong) -> anyhow::Result<tantivy::schema:
                     disable_multi_object_delete: false,
                     disable_multipart_upload: false,
                 };
-                
-                let storage_configs = StorageConfigs::new(vec![quickwit_config::StorageConfig::S3(s3_config.clone())]);
-                let storage_resolver = StorageResolver::configured(&storage_configs);
+
+                // ✅ BYPASS FIX #6: Use centralized storage resolver function
+                eprintln!("✅ BYPASS_FIXED: Using get_configured_storage_resolver() for cache sharing [FIX #6]");
+                eprintln!("   📍 Location: split_searcher_replacement.rs:2249 (document retrieval storage)");
+                let storage_resolver = get_configured_storage_resolver_async(Some(s3_config.clone())).await;
                 
                 // Use the helper function to resolve storage correctly for S3 URIs
                 let actual_storage = resolve_storage_for_split(&storage_resolver, split_uri).await?;
@@ -2805,10 +2813,10 @@ fn perform_search_with_query_ast_and_aggregations_using_working_infrastructure(
                 disable_multipart_upload: false,
             };
 
-            let storage_configs_vec = StorageConfigs::new(vec![quickwit_config::StorageConfig::S3(s3_config.clone())]);
-            storage_configs = storage_configs_vec;
-
-            let storage_resolver = StorageResolver::configured(&storage_configs);
+            // ✅ BYPASS FIX #7: Use centralized storage resolver function
+            eprintln!("✅ BYPASS_FIXED: Using get_configured_storage_resolver() for cache sharing [FIX #7]");
+            eprintln!("   📍 Location: split_searcher_replacement.rs:2819 (final storage search setup)");
+            let storage_resolver = get_configured_storage_resolver(Some(s3_config.clone()));
 
             // Use the helper function to resolve storage correctly for S3 URIs
             let storage = resolve_storage_for_split(&storage_resolver, split_uri).await?;

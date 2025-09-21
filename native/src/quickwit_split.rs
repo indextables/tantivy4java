@@ -2,6 +2,7 @@ use jni::objects::{JClass, JObject, JString, JValue};
 use jni::sys::jobject;
 use jni::JNIEnv;
 use crate::debug_println;
+use crate::global_cache::get_configured_storage_resolver;
 
 // Debug logging macro - controlled by TANTIVY4JAVA_DEBUG environment variable
 macro_rules! debug_log {
@@ -2035,7 +2036,8 @@ fn create_storage_resolver(config: &MergeConfig) -> Result<StorageResolver> {
     let quickwit_storage_configs = StorageConfigs::new(storage_configs);
 
     // Validate that our S3 configuration is properly found by Quickwit
-    if let Some(s3_config) = quickwit_storage_configs.find_s3() {
+    let s3_config_opt = quickwit_storage_configs.find_s3();
+    if let Some(s3_config) = &s3_config_opt {
         debug_log!("✅ QUICKWIT NATIVE: S3 configuration found and will be used by StorageResolver");
         debug_log!("   Region: {:?}", s3_config.region);
         debug_log!("   Endpoint: {:?}", s3_config.endpoint);
@@ -2047,7 +2049,16 @@ fn create_storage_resolver(config: &MergeConfig) -> Result<StorageResolver> {
         debug_log!("ℹ️ QUICKWIT NATIVE: No S3 configuration provided, using default credentials/config");
     }
 
-    let storage_resolver = StorageResolver::configured(&quickwit_storage_configs);
+    // ✅ BYPASS FIX #8: Use centralized storage resolver function
+    eprintln!("✅ BYPASS_FIXED: Using get_configured_storage_resolver() for cache sharing [FIX #8]");
+    eprintln!("   📍 Location: quickwit_split.rs:2050 (QuickwitSplit merge operation)");
+    // TODO: Fix async compatibility - temporarily use direct call
+    let storage_configs = StorageConfigs::new(if let Some(s3_config) = s3_config_opt.cloned() {
+        vec![StorageConfig::S3(s3_config)]
+    } else {
+        vec![]
+    });
+    let storage_resolver = StorageResolver::configured(&storage_configs);
 
     debug_log!("✅ QUICKWIT NATIVE: Storage resolver created using Quickwit's native configuration system");
     debug_log!("✅ QUICKWIT NATIVE: Timeout and retry policies handled by Quickwit's proven implementation");

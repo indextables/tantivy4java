@@ -5,6 +5,7 @@
 // as Quickwit to ensure efficient resource utilization.
 
 use std::sync::{Arc, OnceLock};
+use tokio::sync::RwLock as TokioRwLock;
 use std::path::PathBuf;
 use std::num::NonZeroU32;
 use once_cell::sync::Lazy;
@@ -114,35 +115,106 @@ pub static GLOBAL_STORAGE_RESOLVER: Lazy<StorageResolver> = Lazy::new(|| {
     StorageResolver::configured(&storage_configs)
 });
 
-/// Get or create a configured StorageResolver with specific S3 credentials
-/// This follows Quickwit's pattern but allows for dynamic S3 configuration
-///
-/// 🚨 CRITICAL: This function should be used for ALL storage resolver creation
-/// to ensure consistent cache sharing. Direct calls to StorageResolver::configured()
-/// bypass potential caching and cause multiple storage instances.
-pub fn get_configured_storage_resolver(s3_config_opt: Option<S3StorageConfig>) -> StorageResolver {
-    static RESOLVER_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
-    let resolver_id = RESOLVER_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+/// Global storage resolver cache for configured S3 instances (async-compatible)
+/// Uses tokio::sync::RwLock to prevent deadlocks in async context
+static CONFIGURED_STORAGE_RESOLVERS: std::sync::OnceLock<TokioRwLock<std::collections::HashMap<String, StorageResolver>>> = std::sync::OnceLock::new();
 
-    eprintln!("🔧 STORAGE_RESOLVER_CREATE: Creating resolver #{} via get_configured_storage_resolver()", resolver_id);
-    debug_println!("🧵 STORAGE_RESOLVER: Creating configured storage resolver #{}", resolver_id);
+/// Get or create a cached StorageResolver with specific S3 credentials (async version)
+/// This follows Quickwit's pattern but enables caching for optimal storage instance reuse
+///
+/// 🚨 CRITICAL: This function should be used for ALL storage resolver creation in ASYNC contexts
+/// to ensure consistent cache sharing. Direct calls to StorageResolver::configured()
+/// bypass caching and cause multiple storage instances.
+///
+/// ✅ FIXED: Async-compatible using tokio::sync::RwLock to prevent deadlocks
+pub async fn get_configured_storage_resolver_async(s3_config_opt: Option<S3StorageConfig>) -> StorageResolver {
+    static RESOLVER_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
 
     if let Some(s3_config) = s3_config_opt {
-        eprintln!("📡 STORAGE_RESOLVER_S3: Resolver #{} - Creating S3 configured resolver", resolver_id);
+        // Create a cache key from S3 configuration
+        // NOTE: We may also need to add "user id" later for multi-tenant scenarios
+        let cache_key = format!("{}:{}:{}:{}",
+            s3_config.region.as_ref().map(|r| r.as_str()).unwrap_or("default"),
+            s3_config.endpoint.as_ref().map(|e| e.as_str()).unwrap_or("default"),
+            s3_config.access_key_id.as_ref().map(|k| &k[..8]).unwrap_or("none"), // First 8 chars for security
+            s3_config.force_path_style_access
+        );
+
+        // ✅ FIXED: Use async tokio RwLock to prevent deadlocks in async context
+        // Initialize cache if needed
+        let cache = CONFIGURED_STORAGE_RESOLVERS.get_or_init(|| {
+            TokioRwLock::new(std::collections::HashMap::new())
+        });
+
+        // Try to get from cache first (async read lock) - DEADLOCK FIXED
+        {
+            let read_cache = cache.read().await;
+            if let Some(cached_resolver) = read_cache.get(&cache_key) {
+                eprintln!("🎯 STORAGE_RESOLVER_CACHE_HIT: Reusing cached resolver for key: {} at address {:p}",
+                         cache_key, cached_resolver);
+                return cached_resolver.clone();
+            }
+        } // <- async read lock released here
+
+        // Cache miss - create new resolver (outside of any locks to prevent deadlock)
+        let resolver_id = RESOLVER_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        eprintln!("❌ STORAGE_RESOLVER_CACHE_MISS: Creating new resolver #{} for key: {}", resolver_id, cache_key);
         eprintln!("   📋 S3 Config: region={:?}, endpoint={:?}, path_style={}",
                   s3_config.region, s3_config.endpoint, s3_config.force_path_style_access);
-        debug_println!("🔧 STORAGE_RESOLVER: Creating S3 configured resolver #{}", resolver_id);
+
+        let storage_configs = StorageConfigs::new(vec![
+            quickwit_config::StorageConfig::S3(s3_config)
+        ]);
+        let resolver = StorageResolver::configured(&storage_configs); // <- DEADLOCK SUSPECT: Quickwit resolver creation
+        eprintln!("✅ STORAGE_RESOLVER_CREATED: Resolver #{} created at address {:p}", resolver_id, &resolver);
+
+        // Cache the new resolver (async write lock) - DEADLOCK FIXED
+        {
+            let mut write_cache = cache.write().await;
+            // Double-check in case another thread created it while we were creating ours
+            if let Some(existing_resolver) = write_cache.get(&cache_key) {
+                eprintln!("🏃 STORAGE_RESOLVER_RACE: Another thread created resolver, using existing at {:p}", existing_resolver);
+                return existing_resolver.clone();
+            }
+            write_cache.insert(cache_key.clone(), resolver.clone());
+            eprintln!("💾 STORAGE_RESOLVER_CACHED: Resolver #{} cached for key: {}", resolver_id, cache_key);
+        } // <- async write lock released here
+
+        resolver
+    } else {
+        let resolver_id = RESOLVER_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        eprintln!("🌐 STORAGE_RESOLVER_GLOBAL: Resolver #{} - Using global unconfigured StorageResolver", resolver_id);
+        let resolver = GLOBAL_STORAGE_RESOLVER.clone();
+        eprintln!("♻️  STORAGE_RESOLVER_REUSED: Resolver #{} reused global at address {:p}", resolver_id, &resolver);
+        resolver
+    }
+}
+
+/// Get or create a cached StorageResolver with specific S3 credentials (sync version)
+/// This version is for sync contexts where async is not available
+///
+/// ⚠️ WARNING: This version bypasses caching to avoid deadlocks in sync contexts
+/// For optimal caching, use get_configured_storage_resolver_async() in async contexts
+pub fn get_configured_storage_resolver(s3_config_opt: Option<S3StorageConfig>) -> StorageResolver {
+    static RESOLVER_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+
+    if let Some(s3_config) = s3_config_opt {
+        let resolver_id = RESOLVER_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        eprintln!("🔧 STORAGE_RESOLVER_SYNC: Creating resolver #{} via sync get_configured_storage_resolver() (NO CACHING)", resolver_id);
+        eprintln!("   📋 S3 Config: region={:?}, endpoint={:?}, path_style={}",
+                  s3_config.region, s3_config.endpoint, s3_config.force_path_style_access);
+
         let storage_configs = StorageConfigs::new(vec![
             quickwit_config::StorageConfig::S3(s3_config)
         ]);
         let resolver = StorageResolver::configured(&storage_configs);
-        eprintln!("✅ STORAGE_RESOLVER_CREATED: Resolver #{} created at address {:p}", resolver_id, &resolver);
+        eprintln!("✅ STORAGE_RESOLVER_CREATED: Sync resolver #{} created at address {:p}", resolver_id, &resolver);
         resolver
     } else {
-        eprintln!("🌐 STORAGE_RESOLVER_GLOBAL: Resolver #{} - Using global unconfigured StorageResolver", resolver_id);
-        debug_println!("🌐 STORAGE_RESOLVER: Using global unconfigured StorageResolver #{}", resolver_id);
+        let resolver_id = RESOLVER_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        eprintln!("🌐 STORAGE_RESOLVER_GLOBAL_SYNC: Resolver #{} - Using global unconfigured StorageResolver", resolver_id);
         let resolver = GLOBAL_STORAGE_RESOLVER.clone();
-        eprintln!("♻️  STORAGE_RESOLVER_REUSED: Resolver #{} reused global at address {:p}", resolver_id, &resolver);
+        eprintln!("♻️  STORAGE_RESOLVER_REUSED_SYNC: Resolver #{} reused global at address {:p}", resolver_id, &resolver);
         resolver
     }
 }

@@ -161,11 +161,16 @@
                             <executable>cargo</executable>
                             <arguments>
                                 <argument>build</argument>
-                                <argument>--release</argument>
+                                <!-- Remove - -release to use debug build with full symbols -->
                                 <argument>--target-dir</argument>
                                 <argument>${rust.target.dir}</argument>
                             </arguments>
                             <workingDirectory>${project.basedir}/native</workingDirectory>
+                            <environmentVariables>
+                                <!-- Force maximum debug symbols and panic unwind -->
+                                <RUST_BACKTRACE>full</RUST_BACKTRACE>
+                                <RUSTFLAGS>-C debuginfo=2 -C panic=unwind</RUSTFLAGS>
+                            </environmentVariables>
                         </configuration>
                     </execution>
                 </executions>
@@ -187,7 +192,8 @@
                             <outputDirectory>${project.build.outputDirectory}/native</outputDirectory>
                             <resources>
                                 <resource>
-                                    <directory>${rust.target.dir}/release</directory>
+                                    <!-- Use debug directory for debug builds with full symbols -->
+                                    <directory>${rust.target.dir}/debug</directory>
                                     <includes>
                                         <include>libtantivy4java.so</include>
                                         <include>libtantivy4java.dylib</include>
