@@ -22,6 +22,7 @@ use jni::sys::jstring;
 use jni::JNIEnv;
 
 mod debug;  // Debug utilities and conditional logging
+mod cache_debug;  // Enhanced cache debugging and monitoring utilities
 mod schema;
 mod document;
 mod query;

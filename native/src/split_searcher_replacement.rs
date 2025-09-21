@@ -65,45 +65,14 @@ fn extract_split_id_from_uri(split_uri: &str) -> String {
     }
 }
 
-/// Create SearcherContext using the global cache system
-/// This ensures proper SplitCache is used to avoid repeated index opening
-fn create_minimal_searcher_context() -> anyhow::Result<SearcherContext> {
-    // Use the global cache system which includes proper SplitCache configuration
-    debug_println!("RUST DEBUG: Creating SearcherContext from global components");
-    use crate::global_cache::get_global_components;
-    let global_components = get_global_components();
-    
-    // Create new SearcherContext using the global components which include the SplitCache
-    let searcher_config = quickwit_config::SearcherConfig::default();
-    let arc_context = global_components.create_searcher_context(searcher_config);
-    
-    // Extract the SearcherContext from the Arc by recreating it
-    // This ensures we have the SplitCache configured properly
-    let context = &*arc_context;
-    Ok(SearcherContext {
-        searcher_config: context.searcher_config.clone(),
-        fast_fields_cache: context.fast_fields_cache.clone(),
-        search_permit_provider: SearchPermitProvider::new(
-            context.searcher_config.max_num_concurrent_split_searches,
-            context.searcher_config.warmup_memory_budget,
-        ),
-        split_footer_cache: MemorySizedCache::with_capacity_in_bytes(
-            context.searcher_config.split_footer_cache_capacity.as_u64() as usize,
-            &quickwit_storage::STORAGE_METRICS.split_footer_cache,
-        ),
-        split_stream_semaphore: Semaphore::new(context.searcher_config.max_num_concurrent_split_streams),
-        leaf_search_cache: LeafSearchCache::new(
-            context.searcher_config.partial_request_cache_capacity.as_u64() as usize
-        ),
-        list_fields_cache: ListFieldsCache::new(
-            context.searcher_config.partial_request_cache_capacity.as_u64() as usize
-        ),
-        split_cache_opt: context.split_cache_opt.clone(),
-        aggregation_limit: AggregationLimitsGuard::new(
-            Some(context.searcher_config.aggregation_memory_limit.as_u64()),
-            Some(context.searcher_config.aggregation_bucket_limit),
-        ),
-    })
+/// Get Arc<SearcherContext> using the global cache system
+/// CRITICAL FIX: Use shared caches by returning the Arc directly
+fn get_shared_searcher_context() -> anyhow::Result<Arc<SearcherContext>> {
+    debug_println!("RUST DEBUG: Getting SHARED SearcherContext with global caches");
+    use crate::global_cache::get_global_searcher_context;
+
+    // Use the convenience function that returns Arc<SearcherContext> with shared caches
+    Ok(get_global_searcher_context())
 }
 
 /// Cached Tantivy searcher for efficient single document retrieval
@@ -1229,7 +1198,7 @@ fn retrieve_document_from_split_optimized(
                     };
                     
                     // Create minimal SearcherContext for Quickwit functions
-                    let searcher_context = create_minimal_searcher_context()
+                    let searcher_context = get_shared_searcher_context()
                         .map_err(|e| anyhow::anyhow!("Failed to create searcher context: {}", e))?;
                     
                     // ✅ Use Quickwit's proven function with hotcache optimization
@@ -1406,7 +1375,7 @@ fn retrieve_document_from_split(
                 };
                 
                 // Create minimal SearcherContext for Quickwit functions
-                let searcher_context = create_minimal_searcher_context()
+                let searcher_context = get_shared_searcher_context()
                     .map_err(|e| anyhow::anyhow!("Failed to create searcher context: {}", e))?;
                 
                 // ✅ Use Quickwit's proven function with hotcache optimization
@@ -1604,7 +1573,7 @@ fn retrieve_documents_batch_from_split_optimized(
                     };
                     
                     // Create minimal SearcherContext for Quickwit functions
-                    let searcher_context = create_minimal_searcher_context()
+                    let searcher_context = get_shared_searcher_context()
                         .map_err(|e| anyhow::anyhow!("Failed to create searcher context: {}", e))?;
                     
                     // ✅ Use Quickwit's proven function with hotcache optimization for batch operations

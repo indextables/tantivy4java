@@ -3,6 +3,8 @@ package com.tantivy4java;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 /**
  * Global cache manager for Quickwit splits following Quickwit's multi-level caching strategy.
@@ -56,12 +58,32 @@ import java.util.concurrent.atomic.AtomicLong;
  * configurations to prevent conflicting cache settings.
  */
 public class SplitCacheManager implements AutoCloseable {
-    
+
+    // Stronger thread-safety with explicit synchronization for Spark environments
+    private static final Map<String, SplitCacheManager> instances = new ConcurrentHashMap<>();
+    private static final ReentrantReadWriteLock instancesLock = new ReentrantReadWriteLock();
+
+    // Global singleton for primary cache manager (used when no specific config is needed)
+    private static final AtomicReference<SplitCacheManager> GLOBAL_INSTANCE = new AtomicReference<>();
+
     static {
         Tantivy.initialize();
+        // Add shutdown hook to gracefully cleanup all cache instances
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            System.out.println("🔧 CACHE CLEANUP: Shutting down all SplitCacheManager instances...");
+            synchronized (instances) {
+                for (SplitCacheManager manager : instances.values()) {
+                    try {
+                        manager.close();
+                    } catch (Exception e) {
+                        System.err.println("Warning: Failed to close cache manager: " + e.getMessage());
+                    }
+                }
+                instances.clear();
+            }
+            System.out.println("🔧 CACHE CLEANUP: All cache instances cleaned up successfully");
+        }, "SplitCacheManager-Shutdown"));
     }
-    
-    private static final Map<String, SplitCacheManager> instances = new ConcurrentHashMap<>();
     
     private final String cacheName;
     private final String cacheKey; // Full cache key used for storage/retrieval
@@ -406,14 +428,62 @@ public class SplitCacheManager implements AutoCloseable {
     }
     
     /**
-     * Get or create a shared cache manager instance
+     * Get or create a shared cache manager instance with stronger Spark-safe singleton guarantees
      */
     public static SplitCacheManager getInstance(CacheConfig config) {
-        return instances.computeIfAbsent(config.getCacheKey(), 
-            cacheKey -> {
-                validateCacheConfig(config);
-                return new SplitCacheManager(config);
-            });
+        String cacheKey = config.getCacheKey();
+
+        // First, try fast read path (most common case - instance already exists)
+        instancesLock.readLock().lock();
+        try {
+            SplitCacheManager existing = instances.get(cacheKey);
+            if (existing != null) {
+                System.out.println("🔧 CACHE REUSE: Using existing cache instance: " + config.getCacheName());
+                return existing;
+            }
+        } finally {
+            instancesLock.readLock().unlock();
+        }
+
+        // Instance doesn't exist, acquire write lock for creation
+        instancesLock.writeLock().lock();
+        try {
+            // Double-check pattern - another thread might have created it while we were waiting
+            SplitCacheManager existing = instances.get(cacheKey);
+            if (existing != null) {
+                System.out.println("🔧 CACHE REUSE: Cache created by another thread: " + config.getCacheName());
+                return existing;
+            }
+
+            // Create new instance with validation
+            System.out.println("🔧 CACHE CREATE: Creating NEW cache instance: " + config.getCacheName());
+            validateCacheConfig(config);
+            SplitCacheManager newInstance = new SplitCacheManager(config);
+            instances.put(cacheKey, newInstance);
+
+            // Set as global instance if this is the first one
+            GLOBAL_INSTANCE.compareAndSet(null, newInstance);
+
+            return newInstance;
+        } finally {
+            instancesLock.writeLock().unlock();
+        }
+    }
+
+    /**
+     * Get the global cache manager instance, creating a default one if needed
+     * This is useful for simple use cases that don't need specific configuration
+     */
+    public static SplitCacheManager getGlobalInstance() {
+        SplitCacheManager existing = GLOBAL_INSTANCE.get();
+        if (existing != null) {
+            return existing;
+        }
+
+        // Create default instance if none exists
+        CacheConfig defaultConfig = new CacheConfig("global-default")
+            .withMaxCacheSize(500_000_000); // 500MB default
+        return getInstance(defaultConfig);
     }
     
     /**
