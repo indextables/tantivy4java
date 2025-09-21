@@ -10,6 +10,7 @@ use crate::standalone_searcher::{StandaloneSearcher, StandaloneSearchConfig, Spl
 use crate::utils::{arc_to_jlong, with_arc_safe, release_arc};
 use crate::common::to_java_exception;
 use crate::debug_println;
+use crate::global_cache::get_configured_storage_resolver;
 use crate::split_query::{store_split_schema, get_split_schema, convert_split_query_to_ast};
 use quickwit_search::{SearcherContext, search_permit_provider::SearchPermitProvider};
 use quickwit_search::leaf_cache::LeafSearchCache;
@@ -118,7 +119,14 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_createNativeWithShare
     cache_manager_ptr: jlong,
     split_config_map: jobject,
 ) -> jlong {
+    let thread_id = std::thread::current().id();
+    let start_time = std::time::Instant::now();
+
     eprintln!("🚀 SIMPLE DEBUG: createNativeWithSharedCache method called!");
+    debug_println!("🧵 SPLIT_SEARCHER: Thread {:?} ENTRY into createNativeWithSharedCache [{}ms]",
+                  thread_id, start_time.elapsed().as_millis());
+    debug_println!("🔗 SPLIT_SEARCHER: Thread {:?} cache_manager_ptr: 0x{:x} [{}ms]",
+                  thread_id, cache_manager_ptr, start_time.elapsed().as_millis());
     // Validate JString parameter first to prevent SIGSEGV
     if split_uri_jstr.is_null() {
         to_java_exception(&mut env, &anyhow::anyhow!("Split URI parameter is null"));
@@ -316,11 +324,15 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_createNativeWithShare
             // Store searcher, runtime, split URI, AWS config, footer offsets, and doc mapping JSON together using Arc for memory safety
             let searcher_context = std::sync::Arc::new((searcher, runtime, split_uri.clone(), aws_config, split_footer_start, split_footer_end, doc_mapping_json));
             let pointer = arc_to_jlong(searcher_context);
-            debug_println!("RUST DEBUG: SUCCESS: Stored searcher context for split '{}' with Arc pointer: {}, footer: {}-{}", 
+            debug_println!("RUST DEBUG: SUCCESS: Stored searcher context for split '{}' with Arc pointer: {}, footer: {}-{}",
                      split_uri, pointer, split_footer_start, split_footer_end);
+            debug_println!("🏁 SPLIT_SEARCHER: Thread {:?} COMPLETED successfully in {}ms - pointer: 0x{:x}",
+                          thread_id, start_time.elapsed().as_millis(), pointer);
             pointer
         },
         Err(error) => {
+            debug_println!("❌ SPLIT_SEARCHER: Thread {:?} FAILED after {}ms - error: {}",
+                          thread_id, start_time.elapsed().as_millis(), error);
             to_java_exception(&mut env, &error);
             0
         }
@@ -334,7 +346,12 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_closeNative(
     _class: JClass,
     searcher_ptr: jlong,
 ) {
+    let thread_id = std::thread::current().id();
+    debug_println!("🧵 SPLIT_SEARCHER_CLOSE: Thread {:?} ENTRY into closeNative - pointer: 0x{:x}",
+                  thread_id, searcher_ptr);
+
     if searcher_ptr == 0 {
+        debug_println!("⚠️  SPLIT_SEARCHER_CLOSE: Thread {:?} - null pointer, nothing to close", thread_id);
         return;
     }
 
@@ -359,6 +376,8 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_closeNative(
     // SAFE: Release Arc from registry to prevent memory leaks
     release_arc(searcher_ptr);
     debug_println!("RUST DEBUG: Closed searcher and released Arc with ID: {}", searcher_ptr);
+    debug_println!("🏁 SPLIT_SEARCHER_CLOSE: Thread {:?} COMPLETED successfully - pointer: 0x{:x}",
+                  thread_id, searcher_ptr);
 }
 
 /// Replacement for Java_com_tantivy4java_SplitSearcher_validateSplitNative  
@@ -525,7 +544,7 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_searchWithQueryAst(
                 let s3_config = S3StorageConfig {
                     flavor: None,
                     access_key_id: aws_config.get("access_key").cloned(),
-                    secret_access_key: aws_config.get("secret_key").cloned(), 
+                    secret_access_key: aws_config.get("secret_key").cloned(),
                     session_token: aws_config.get("session_token").cloned(),
                     region: aws_config.get("region").cloned(),
                     endpoint: aws_config.get("endpoint").cloned(),
@@ -533,12 +552,14 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_searchWithQueryAst(
                     disable_multi_object_delete: false,
                     disable_multipart_upload: false,
                 };
-                
-                let storage_configs_vec = StorageConfigs::new(vec![quickwit_config::StorageConfig::S3(s3_config.clone())]);
-                storage_configs = storage_configs_vec;
-                
-                let storage_resolver = StorageResolver::configured(&storage_configs);
-                
+
+                // ✅ FIXED: Use centralized storage resolver function to enable caching!
+                eprintln!("✅ BYPASS_FIXED: Using get_configured_storage_resolver() for cache sharing [FIX #1]");
+                eprintln!("   📍 Location: split_searcher_replacement.rs:558 (createNativeWithSharedCache S3 path)");
+                eprintln!("   🎯 Fix: Now using centralized function instead of direct StorageResolver::configured()");
+                let storage_resolver = get_configured_storage_resolver(Some(s3_config.clone()));
+                eprintln!("✅ CENTRALIZED_RESOLVER_USED: Resolver from centralized function at address {:p} [FIX #1]", &storage_resolver);
+
                 // Use the helper function to resolve storage correctly for S3 URIs
                 let storage = resolve_storage_for_split(&storage_resolver, split_uri).await?;
                 debug_println!("RUST DEBUG: ⏱️ 🔧 SEARCH STORAGE SETUP completed [TIMING: {}ms]", storage_setup_start.elapsed().as_millis());

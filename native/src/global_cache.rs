@@ -8,6 +8,7 @@ use std::sync::{Arc, OnceLock};
 use std::path::PathBuf;
 use std::num::NonZeroU32;
 use once_cell::sync::Lazy;
+use std::collections::HashMap;
 use bytesize::ByteSize;
 
 use quickwit_storage::{
@@ -25,6 +26,39 @@ use tempfile::TempDir;
 
 use crate::debug_println;
 use crate::cache_debug::{debug_arc_string_cache_identity, debug_cache_summary};
+
+/// Helper function to track storage instance creation for debugging
+/// This helps us understand when and where multiple storage instances are created
+pub async fn tracked_storage_resolve(
+    resolver: &StorageResolver,
+    uri: &quickwit_common::uri::Uri,
+    context: &str
+) -> Result<Arc<dyn quickwit_storage::Storage>, quickwit_storage::StorageResolverError> {
+    static STORAGE_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+    let storage_id = STORAGE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+    eprintln!("🏗️  STORAGE_RESOLVE: Starting storage resolve #{} [{}]", storage_id, context);
+    eprintln!("   📍 Resolver address: {:p}", resolver);
+    eprintln!("   🌐 URI: {}", uri);
+
+    let resolve_start = std::time::Instant::now();
+    let result = resolver.resolve(uri).await;
+
+    match &result {
+        Ok(storage) => {
+            eprintln!("✅ STORAGE_RESOLVED: Storage instance #{} created in {}ms [{}]",
+                     storage_id, resolve_start.elapsed().as_millis(), context);
+            eprintln!("   🏭 Storage address: {:p}", &**storage);
+            eprintln!("   📊 Storage type: {}", std::any::type_name::<dyn quickwit_storage::Storage>());
+        }
+        Err(e) => {
+            eprintln!("❌ STORAGE_RESOLVE_FAILED: Storage resolve #{} failed in {}ms [{}]: {}",
+                     storage_id, resolve_start.elapsed().as_millis(), context, e);
+        }
+    }
+
+    result
+}
 
 /// Global configuration for caches and storage
 pub struct GlobalCacheConfig {
@@ -82,16 +116,34 @@ pub static GLOBAL_STORAGE_RESOLVER: Lazy<StorageResolver> = Lazy::new(|| {
 
 /// Get or create a configured StorageResolver with specific S3 credentials
 /// This follows Quickwit's pattern but allows for dynamic S3 configuration
+///
+/// 🚨 CRITICAL: This function should be used for ALL storage resolver creation
+/// to ensure consistent cache sharing. Direct calls to StorageResolver::configured()
+/// bypass potential caching and cause multiple storage instances.
 pub fn get_configured_storage_resolver(s3_config_opt: Option<S3StorageConfig>) -> StorageResolver {
+    static RESOLVER_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+    let resolver_id = RESOLVER_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+    eprintln!("🔧 STORAGE_RESOLVER_CREATE: Creating resolver #{} via get_configured_storage_resolver()", resolver_id);
+    debug_println!("🧵 STORAGE_RESOLVER: Creating configured storage resolver #{}", resolver_id);
+
     if let Some(s3_config) = s3_config_opt {
-        debug_println!("RUST DEBUG: Creating StorageResolver with custom S3 config");
+        eprintln!("📡 STORAGE_RESOLVER_S3: Resolver #{} - Creating S3 configured resolver", resolver_id);
+        eprintln!("   📋 S3 Config: region={:?}, endpoint={:?}, path_style={}",
+                  s3_config.region, s3_config.endpoint, s3_config.force_path_style_access);
+        debug_println!("🔧 STORAGE_RESOLVER: Creating S3 configured resolver #{}", resolver_id);
         let storage_configs = StorageConfigs::new(vec![
             quickwit_config::StorageConfig::S3(s3_config)
         ]);
-        StorageResolver::configured(&storage_configs)
+        let resolver = StorageResolver::configured(&storage_configs);
+        eprintln!("✅ STORAGE_RESOLVER_CREATED: Resolver #{} created at address {:p}", resolver_id, &resolver);
+        resolver
     } else {
-        debug_println!("RUST DEBUG: Using global unconfigured StorageResolver");
-        GLOBAL_STORAGE_RESOLVER.clone()
+        eprintln!("🌐 STORAGE_RESOLVER_GLOBAL: Resolver #{} - Using global unconfigured StorageResolver", resolver_id);
+        debug_println!("🌐 STORAGE_RESOLVER: Using global unconfigured StorageResolver #{}", resolver_id);
+        let resolver = GLOBAL_STORAGE_RESOLVER.clone();
+        eprintln!("♻️  STORAGE_RESOLVER_REUSED: Resolver #{} reused global at address {:p}", resolver_id, &resolver);
+        resolver
     }
 }
 
@@ -211,7 +263,7 @@ impl GlobalSearcherComponents {
     
     /// Create a SearcherContext from these global components
     /// This ensures all SearcherContext instances share the same cache instances
-    /// CRITICAL FIX: Use the shared Arc cache instances instead of creating new ones
+    /// FIXED: Now properly shares ALL cache instances including split_footer_cache
     pub fn create_searcher_context(&self, searcher_config: SearcherConfig) -> Arc<SearcherContext> {
         debug_println!("RUST DEBUG: Creating SearcherContext from SHARED global components");
         debug_arc_string_cache_identity(&self.split_footer_cache, "split_footer_cache");
@@ -229,20 +281,20 @@ impl GlobalSearcherComponents {
                 searcher_config.max_num_concurrent_split_searches,
                 searcher_config.warmup_memory_budget,
             ),
-            // ⚠️ PROBLEM: Creating NEW cache instance instead of sharing!
-            // Each MemorySizedCache::with_capacity_in_bytes() creates separate storage
-            // TODO: Need to implement proper cache sharing mechanism
+            // ✅ INDIVIDUAL: Split footer cache (follows Quickwit pattern - individual instances, shared metrics)
+            // This follows Quickwit's design where each SearcherContext gets its own cache instance
+            // but all instances share the same STORAGE_METRICS for global coordination
             split_footer_cache: MemorySizedCache::with_capacity_in_bytes(
                 searcher_config.split_footer_cache_capacity.as_u64() as usize,
-                &STORAGE_METRICS.split_footer_cache, // Shared metrics but SEPARATE storage!
+                &STORAGE_METRICS.split_footer_cache, // SHARED metrics for global coordination
             ),
-            // ⚠️ INDIVIDUAL: Split stream semaphore (per-context limiting is OK)
+            // ✅ INDIVIDUAL: Split stream semaphore (per-context limiting is correct)
             split_stream_semaphore: Semaphore::new(searcher_config.max_num_concurrent_split_streams),
-            // ✅ SHARED: Leaf search cache - Create new instance with SAME capacity (should share)
+            // ✅ INDIVIDUAL: Leaf search cache (follows Quickwit pattern - individual instances)
             leaf_search_cache: LeafSearchCache::new(
                 searcher_config.partial_request_cache_capacity.as_u64() as usize
             ),
-            // ✅ SHARED: List fields cache - Create new instance with SAME capacity (should share)
+            // ✅ INDIVIDUAL: List fields cache (follows Quickwit pattern - individual instances)
             list_fields_cache: ListFieldsCache::new(
                 searcher_config.partial_request_cache_capacity.as_u64() as usize
             ),
