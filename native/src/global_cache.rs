@@ -191,16 +191,40 @@ pub async fn get_configured_storage_resolver_async(s3_config_opt: Option<S3Stora
 }
 
 /// Get or create a cached StorageResolver with specific S3 credentials (sync version)
-/// This version is for sync contexts where async is not available
+/// This version uses a simple sync-safe caching approach for sync contexts
 ///
-/// ⚠️ WARNING: This version bypasses caching to avoid deadlocks in sync contexts
-/// For optimal caching, use get_configured_storage_resolver_async() in async contexts
+/// ✅ FIXED: Now uses deadlock-safe sync caching approach
 pub fn get_configured_storage_resolver(s3_config_opt: Option<S3StorageConfig>) -> StorageResolver {
+    use std::sync::{Mutex, Arc};
+    use once_cell::sync::Lazy;
+
+    static SYNC_STORAGE_RESOLVERS: Lazy<Arc<Mutex<std::collections::HashMap<String, StorageResolver>>>> =
+        Lazy::new(|| Arc::new(Mutex::new(std::collections::HashMap::new())));
     static RESOLVER_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
 
     if let Some(s3_config) = s3_config_opt {
+        // Create a cache key from S3 configuration
+        // NOTE: We may also need to add "user id" later for multi-tenant scenarios
+        let cache_key = format!("{}:{}:{}:{}",
+            s3_config.region.as_ref().map(|r| r.as_str()).unwrap_or("default"),
+            s3_config.endpoint.as_ref().map(|e| e.as_str()).unwrap_or("default"),
+            s3_config.access_key_id.as_ref().map(|k| &k[..8]).unwrap_or("none"), // First 8 chars for security
+            s3_config.force_path_style_access
+        );
+
+        // Try to get from sync cache (simple mutex approach)
+        {
+            let cache = SYNC_STORAGE_RESOLVERS.lock().unwrap();
+            if let Some(cached_resolver) = cache.get(&cache_key) {
+                eprintln!("🎯 STORAGE_RESOLVER_SYNC_CACHE_HIT: Reusing cached sync resolver for key: {} at address {:p}",
+                         cache_key, cached_resolver);
+                return cached_resolver.clone();
+            }
+        }
+
+        // Cache miss - create new resolver
         let resolver_id = RESOLVER_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        eprintln!("🔧 STORAGE_RESOLVER_SYNC: Creating resolver #{} via sync get_configured_storage_resolver() (NO CACHING)", resolver_id);
+        eprintln!("❌ STORAGE_RESOLVER_SYNC_CACHE_MISS: Creating new sync resolver #{} for key: {}", resolver_id, cache_key);
         eprintln!("   📋 S3 Config: region={:?}, endpoint={:?}, path_style={}",
                   s3_config.region, s3_config.endpoint, s3_config.force_path_style_access);
 
@@ -209,6 +233,19 @@ pub fn get_configured_storage_resolver(s3_config_opt: Option<S3StorageConfig>) -
         ]);
         let resolver = StorageResolver::configured(&storage_configs);
         eprintln!("✅ STORAGE_RESOLVER_CREATED: Sync resolver #{} created at address {:p}", resolver_id, &resolver);
+
+        // Cache the new resolver
+        {
+            let mut cache = SYNC_STORAGE_RESOLVERS.lock().unwrap();
+            // Double-check in case another thread created it while we were creating ours
+            if let Some(existing_resolver) = cache.get(&cache_key) {
+                eprintln!("🏃 STORAGE_RESOLVER_SYNC_RACE: Another thread created sync resolver, using existing at {:p}", existing_resolver);
+                return existing_resolver.clone();
+            }
+            cache.insert(cache_key.clone(), resolver.clone());
+            eprintln!("💾 STORAGE_RESOLVER_SYNC_CACHED: Resolver #{} cached for key: {}", resolver_id, cache_key);
+        }
+
         resolver
     } else {
         let resolver_id = RESOLVER_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);

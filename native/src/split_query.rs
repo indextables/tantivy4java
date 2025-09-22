@@ -467,6 +467,22 @@ fn convert_parsed_query_to_query_ast(env: &mut JNIEnv, obj: &JObject) -> Result<
     Ok(query_ast)
 }
 
+// Convert SplitQuery to JSON string for async operations
+pub fn convert_split_query_to_json(env: &mut JNIEnv, query_obj: &JObject) -> Result<String, String> {
+    debug_println!("🔄 CONVERT: Converting SplitQuery to JSON");
+
+    // First convert to QueryAst
+    let query_ast = convert_split_query_to_ast(env, query_obj)
+        .map_err(|e| format!("Failed to convert SplitQuery to QueryAst: {}", e))?;
+
+    // Then serialize QueryAst to JSON
+    let json_str = serde_json::to_string(&query_ast)
+        .map_err(|e| format!("Failed to serialize QueryAst to JSON: {}", e))?;
+
+    debug_println!("✅ CONVERT: Successfully converted SplitQuery to JSON: {}", json_str);
+    Ok(json_str)
+}
+
 
 fn parse_query_string(env: &mut JNIEnv, query_string: JString, schema_ptr: jlong, default_search_fields: jobject) -> Result<jobject> {
     debug_println!("RUST DEBUG: *** parse_query_string CALLED ***");
