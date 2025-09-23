@@ -198,6 +198,8 @@
                                         <include>libtantivy4java.so</include>
                                         <include>libtantivy4java.dylib</include>
                                         <include>tantivy4java.dll</include>
+                                        <include>tantivy4java-merge</include>
+                                        <include>tantivy4java-merge.exe</include>
                                     </includes>
                                 </resource>
                             </resources>

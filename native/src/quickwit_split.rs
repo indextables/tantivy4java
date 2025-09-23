@@ -4,6 +4,9 @@ use jni::JNIEnv;
 use crate::debug_println;
 use crate::global_cache::get_configured_storage_resolver;
 
+// Re-export types for standalone usage
+pub use crate::merge_types::{MergeSplitConfig, SplitMetadata, MergeAwsConfig};
+
 // Debug logging macro - controlled by TANTIVY4JAVA_DEBUG environment variable
 macro_rules! debug_log {
     ($($arg:tt)*) => {
@@ -1453,26 +1456,26 @@ pub extern "system" fn Java_com_tantivy4java_QuickwitSplit_nativeValidateSplit(
 
 /// Configuration for split merging operations
 #[derive(Debug, Clone)]
-struct MergeConfig {
-    index_uid: String,
-    source_id: String,
-    node_id: String,
-    doc_mapping_uid: String,
-    partition_id: u64,
-    delete_queries: Option<Vec<String>>,
-    aws_config: Option<AwsConfig>,
-    temp_directory_path: Option<String>,
+pub struct InternalMergeConfig {
+    pub index_uid: String,
+    pub source_id: String,
+    pub node_id: String,
+    pub doc_mapping_uid: String,
+    pub partition_id: u64,
+    pub delete_queries: Option<Vec<String>>,
+    pub aws_config: Option<InternalAwsConfig>,
+    pub temp_directory_path: Option<String>,
 }
 
 /// AWS configuration for S3-compatible storage (copy from split_searcher.rs)
 #[derive(Clone, Debug)]
-struct AwsConfig {
-    access_key: Option<String>,  // Made optional to support default credential chain
-    secret_key: Option<String>,  // Made optional to support default credential chain
-    session_token: Option<String>,
-    region: String,
-    endpoint: Option<String>,
-    force_path_style: bool,
+pub struct InternalAwsConfig {
+    pub access_key: Option<String>,  // Made optional to support default credential chain
+    pub secret_key: Option<String>,  // Made optional to support default credential chain
+    pub session_token: Option<String>,
+    pub region: String,
+    pub endpoint: Option<String>,
+    pub force_path_style: bool,
 }
 
 #[no_mangle]
@@ -1517,7 +1520,7 @@ pub extern "system" fn Java_com_tantivy4java_QuickwitSplit_nativeMergeSplits(
 }
 
 /// Extract AWS configuration from Java AwsConfig object
-fn extract_aws_config(env: &mut JNIEnv, aws_obj: JObject) -> anyhow::Result<AwsConfig> {
+fn extract_aws_config(env: &mut JNIEnv, aws_obj: JObject) -> anyhow::Result<InternalAwsConfig> {
     let access_key = get_nullable_string_field_value(env, &aws_obj, "getAccessKey")?;
     let secret_key = get_nullable_string_field_value(env, &aws_obj, "getSecretKey")?;
     let region = get_string_field_value(env, &aws_obj, "getRegion")?;
@@ -1554,7 +1557,7 @@ fn extract_aws_config(env: &mut JNIEnv, aws_obj: JObject) -> anyhow::Result<AwsC
     Err(_) => false,
     };
 
-    Ok(AwsConfig {
+    Ok(InternalAwsConfig {
     access_key,
     secret_key,
     session_token,
@@ -1565,7 +1568,7 @@ fn extract_aws_config(env: &mut JNIEnv, aws_obj: JObject) -> anyhow::Result<AwsC
 }
 
 /// Extract merge configuration from Java MergeConfig object
-fn extract_merge_config(env: &mut JNIEnv, config_obj: &JObject) -> Result<MergeConfig> {
+fn extract_merge_config(env: &mut JNIEnv, config_obj: &JObject) -> Result<InternalMergeConfig> {
     let index_uid = get_string_field_value(env, config_obj, "getIndexUid")?;
     let source_id = get_string_field_value(env, config_obj, "getSourceId")?;
     let node_id = get_string_field_value(env, config_obj, "getNodeId")?;
@@ -1615,7 +1618,7 @@ fn extract_merge_config(env: &mut JNIEnv, config_obj: &JObject) -> Result<MergeC
     Err(_) => None,
     };
 
-    Ok(MergeConfig {
+    Ok(InternalMergeConfig {
     index_uid,
     source_id,
     node_id,
@@ -1804,7 +1807,7 @@ struct ExtractedSplit {
 async fn download_and_extract_splits_parallel(
     split_urls: &[String],
     merge_id: &str,
-    config: &MergeConfig,
+    config: &InternalMergeConfig,
 ) -> Result<(Vec<ExtractedSplit>, Vec<String>)> {
     use futures::future::join_all;
     use std::sync::Arc;
@@ -1892,7 +1895,7 @@ async fn download_and_extract_single_split_resilient(
     split_url: &str,
     split_index: usize,
     merge_id: &str,
-    config: &MergeConfig,
+    config: &InternalMergeConfig,
     storage_resolver: &StorageResolver,
 ) -> Result<Option<ExtractedSplit>> {
     match download_and_extract_single_split(
@@ -1923,7 +1926,7 @@ async fn download_and_extract_single_split(
     split_url: &str,
     split_index: usize,
     merge_id: &str,
-    config: &MergeConfig,
+    config: &InternalMergeConfig,
     storage_resolver: &StorageResolver,
 ) -> Result<ExtractedSplit> {
     use quickwit_storage::Storage;
@@ -2022,7 +2025,7 @@ async fn download_and_extract_single_split(
 /// Creates a shared storage resolver for connection pooling across downloads
 /// ✅ QUICKWIT NATIVE: Create storage resolver using Quickwit's native configuration system
 /// This replaces custom storage configuration with Quickwit's proven patterns
-fn create_storage_resolver(config: &MergeConfig) -> Result<StorageResolver> {
+fn create_storage_resolver(config: &InternalMergeConfig) -> Result<StorageResolver> {
     use quickwit_config::{StorageConfigs, StorageConfig, S3StorageConfig};
 
     debug_log!("🔧 QUICKWIT NATIVE: Creating storage resolver using Quickwit's native configuration");
@@ -2126,7 +2129,7 @@ async fn download_split_to_temp_file(
 /// This follows Quickwit's MergeExecutor pattern for memory-efficient large-scale merges
 /// CRITICAL: For merge operations, we disable lazy loading and force full file downloads
 /// to avoid the range assertion failures that occur when accessing corrupted/invalid metadata
-fn merge_splits_impl(split_urls: &[String], output_path: &str, config: &MergeConfig) -> Result<QuickwitSplitMetadata> {
+pub fn merge_splits_impl(split_urls: &[String], output_path: &str, config: &InternalMergeConfig) -> Result<QuickwitSplitMetadata> {
     use tantivy::directory::{MmapDirectory, Directory, DirectoryClone};
     use tantivy::IndexMeta;
     
@@ -3045,7 +3048,7 @@ fn calculate_directory_size(dir_path: &Path) -> Result<u64> {
 }
 
 /// Upload a local split file to S3 using the storage resolver with AWS credentials
-async fn upload_split_to_s3_impl(local_split_path: &Path, s3_url: &str, config: &MergeConfig) -> Result<()> {
+async fn upload_split_to_s3_impl(local_split_path: &Path, s3_url: &str, config: &InternalMergeConfig) -> Result<()> {
     use quickwit_storage::{Storage, StorageResolver, LocalFileStorageFactory, S3CompatibleObjectStorageFactory};
     use std::str::FromStr;
     
@@ -3133,7 +3136,7 @@ async fn upload_split_to_s3_impl(local_split_path: &Path, s3_url: &str, config: 
 }
 
 /// Synchronous wrapper for S3 upload
-fn upload_split_to_s3(local_split_path: &Path, s3_url: &str, config: &MergeConfig) -> Result<()> {
+fn upload_split_to_s3(local_split_path: &Path, s3_url: &str, config: &InternalMergeConfig) -> Result<()> {
     // ✅ PERFORMANCE FIX: Use shared Tokio runtime (was creating single-threaded runtime)
     let runtime = &*SHARED_MERGE_RUNTIME;
     runtime.block_on(upload_split_to_s3_impl(local_split_path, s3_url, config))
@@ -3221,4 +3224,61 @@ fn create_merged_split_file(merged_index_path: &Path, output_path: &str, metadat
     
     debug_log!("Successfully created merged split file: {} with footer offsets: {:?}", output_path, footer_offsets);
     Ok(footer_offsets)
+}
+
+/// Standalone merge function for use by the Rust binary (no JNI required)
+pub fn perform_quickwit_merge_standalone(
+    split_paths: Vec<String>,
+    output_path: &str,
+    config: MergeSplitConfig,
+) -> Result<SplitMetadata> {
+    // Convert MergeSplitConfig to InternalMergeConfig
+    let merge_config = InternalMergeConfig {
+        index_uid: config.index_uid,
+        source_id: config.source_id,
+        node_id: config.node_id,
+        doc_mapping_uid: "standalone-merge".to_string(), // Default for process merging
+        partition_id: 0, // Default for process merging
+        delete_queries: None, // No delete queries for simple merging
+        aws_config: config.aws_config.map(|aws| InternalAwsConfig {
+            access_key: Some(aws.access_key),
+            secret_key: Some(aws.secret_key),
+            session_token: aws.session_token,
+            region: aws.region,
+            endpoint: aws.endpoint_url,
+            force_path_style: aws.force_path_style,
+        }),
+        temp_directory_path: None, // Use system temp for process merging
+    };
+
+    // Perform the merge operation
+    let metadata = merge_splits_impl(&split_paths, output_path, &merge_config)?;
+
+    // Convert result to public SplitMetadata type
+    let (time_range_start, time_range_end) = if let Some(range) = metadata.time_range {
+        (Some(*range.start()), Some(*range.end()))
+    } else {
+        (None, None)
+    };
+
+    Ok(SplitMetadata {
+        split_id: metadata.split_id,
+        num_docs: metadata.num_docs,
+        uncompressed_size_bytes: metadata.uncompressed_docs_size_in_bytes,
+        time_range_start,
+        time_range_end,
+        create_timestamp: metadata.create_timestamp as u64,
+        footer_offsets: metadata.footer_start_offset.zip(metadata.footer_end_offset),
+        skipped_splits: metadata.skipped_splits,  // Include skip information
+    })
+}
+
+/// Public function for standalone merge binary to call the actual merge logic
+/// This function is specifically designed to be called from the standalone binary
+pub fn perform_standalone_merge(
+    split_paths: Vec<String>,
+    output_path: String,
+    config: MergeSplitConfig,
+) -> Result<SplitMetadata> {
+    perform_quickwit_merge_standalone(split_paths, &output_path, config)
 }
