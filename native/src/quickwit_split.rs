@@ -51,6 +51,21 @@ use std::io::{self, Cursor, Read, Seek, SeekFrom};
 // Global atomic counter for merge operations (process-wide uniqueness)
 static GLOBAL_MERGE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+// ✅ PERFORMANCE FIX: Shared Tokio runtime to eliminate thread contention
+// Creates a single optimized runtime shared across all merge operations
+static SHARED_MERGE_RUNTIME: once_cell::sync::Lazy<tokio::runtime::Runtime> = once_cell::sync::Lazy::new(|| {
+    let worker_threads = std::cmp::max(2, num_cpus::get().clamp(2, 8)); // Conservative thread count: 2-8 threads
+    debug_log!("🚀 PERFORMANCE: Creating shared Tokio runtime with {} worker threads", worker_threads);
+
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(worker_threads)
+        .max_blocking_threads(8)  // Limit blocking thread pool to prevent resource exhaustion
+        .thread_name("tantivy4java-merge")
+        .enable_all()
+        .build()
+        .expect("Failed to create shared merge runtime")
+});
+
 /// Memory-efficient FileHandle implementation that provides lazy access to memory-mapped files
 /// This avoids loading the entire file into a Vec, significantly reducing memory usage
 #[derive(Debug)]
@@ -558,7 +573,7 @@ fn extract_doc_mapping_from_index(tantivy_index: &tantivy::Index) -> Result<Stri
 }
 
 /// Configuration for split conversion passed from Java
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct SplitConfig {
     index_uid: String,
     source_id: String,
@@ -792,9 +807,8 @@ fn create_java_split_metadata<'a>(env: &mut JNIEnv<'a>, split_metadata: &Quickwi
 
 
 fn convert_index_from_path_impl(index_path: &str, output_path: &str, config: &SplitConfig) -> Result<QuickwitSplitMetadata, anyhow::Error> {
-    // Create a Tokio runtime for async operations
-    let runtime = tokio::runtime::Runtime::new()
-    .map_err(|e| anyhow::anyhow!("Failed to create async runtime: {}", e))?;
+    // ✅ PERFORMANCE FIX: Use shared Tokio runtime
+    let runtime = &*SHARED_MERGE_RUNTIME;
 
     runtime.block_on(convert_index_from_path_impl_async(index_path, output_path, config))
 }
@@ -2127,11 +2141,9 @@ fn merge_splits_impl(split_urls: &[String], output_path: &str, config: &MergeCon
         debug_log!("   Consider processing in smaller batches for very large operations");
     }
     
-    // Create multi-threaded async runtime for parallel operations - optimized for Spark
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-    .worker_threads(num_cpus::get().clamp(4, 16))  // Scale with cores, 4-16 worker threads
-    .enable_all()
-    .build()?;
+    // ✅ PERFORMANCE FIX: Use shared Tokio runtime to eliminate thread contention
+    // This prevents creating multiple competing thread pools (was causing negative scaling)
+    let runtime = &*SHARED_MERGE_RUNTIME;
 
     // ✅ REENTRANCY FIX: Generate collision-resistant merge ID with multiple entropy sources
     let merge_id = generate_collision_resistant_merge_id();
@@ -2152,13 +2164,27 @@ fn merge_splits_impl(split_urls: &[String], output_path: &str, config: &MergeCon
     debug_log!("🚀 PARALLEL DOWNLOAD: Starting concurrent download of {} splits", split_urls.len());
 
     // ✅ RESILIENT DOWNLOAD: Handle split-level failures gracefully, but preserve configuration errors
-    let (extracted_splits, mut skipped_splits) = match runtime.block_on(async {
-        download_and_extract_splits_parallel(split_urls, &merge_id, config).await
-    }) {
-        Ok((splits, skipped)) => (splits, skipped),
-        Err(e) => {
-            let error_msg = e.to_string();
-            debug_log!("⚠️ PARALLEL DOWNLOAD FAILURE: Complete download operation failed: {}", error_msg);
+    // PERFORMANCE FIX: Use blocking async on the current thread to prevent runtime deadlock
+    let (extracted_splits, mut skipped_splits) = {
+        let split_urls_vec = split_urls.to_vec(); // Clone to avoid reference lifetime issues
+        let merge_id_clone = merge_id.clone();
+        let config_clone = config.clone();
+
+        match std::thread::spawn(move || {
+            let blocking_runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| anyhow!("Failed to create blocking runtime: {}", e))?;
+
+            blocking_runtime.block_on(
+                download_and_extract_splits_parallel(&split_urls_vec, &merge_id_clone, &config_clone)
+            )
+        }).join() {
+        Ok(result) => match result {
+            Ok((splits, skipped)) => (splits, skipped),
+            Err(e) => {
+                let error_msg = e.to_string();
+                debug_log!("⚠️ PARALLEL DOWNLOAD FAILURE: Complete download operation failed: {}", error_msg);
 
             // Check if this is a configuration error that should not be bypassed
             if is_configuration_error(&error_msg) {
@@ -2169,10 +2195,16 @@ fn merge_splits_impl(split_urls: &[String], output_path: &str, config: &MergeCon
             // If it's not a configuration error, treat all splits as skipped
             debug_log!("🔧 DOWNLOAD FAILURE RECOVERY: Treating all {} splits as skipped due to non-configuration system failure", split_urls.len());
 
+                let all_skipped: Vec<String> = split_urls.iter().cloned().collect();
+                (Vec::new(), all_skipped)
+            }
+        },
+        Err(_panic) => {
+            debug_log!("🚨 THREAD PANIC: Download thread panicked, treating all splits as failed");
             let all_skipped: Vec<String> = split_urls.iter().cloned().collect();
             (Vec::new(), all_skipped)
         }
-    };
+    }}; // Close the `let (extracted_splits, mut skipped_splits) = {` block
 
     debug_log!("✅ PARALLEL DOWNLOAD: Completed concurrent processing of {} successful splits, {} skipped", extracted_splits.len(), skipped_splits.len());
 
@@ -2354,7 +2386,8 @@ fn merge_splits_impl(split_urls: &[String], output_path: &str, config: &MergeCon
     };
     
     // 3. Perform memory-efficient segment-level merge using Quickwit's implementation
-    let merged_docs = runtime.block_on(perform_quickwit_merge(
+    // PERFORMANCE FIX: Use shared runtime instead of creating per-merge runtime
+    let merged_docs = SHARED_MERGE_RUNTIME.block_on(perform_quickwit_merge(
         split_directories,
         &output_temp_dir,
     ))?;
@@ -2490,9 +2523,9 @@ fn merge_splits_impl(split_urls: &[String], output_path: &str, config: &MergeCon
     // This ensures no file system leaks even if the merge operation failed
     cleanup_merge_temp_directory(&merge_id);
 
-    // Ensure proper runtime cleanup regardless of success or failure
-    runtime.shutdown_background();
-    debug_log!("Tokio runtime shutdown completed");
+    // ✅ PERFORMANCE FIX: No runtime shutdown needed - using shared runtime
+    // Shared runtime is managed globally and should not be shut down per operation
+    debug_log!("Merge operation completed, shared runtime remains active");
 
     // Return the result (preserving any errors)
     result
@@ -3101,9 +3134,8 @@ async fn upload_split_to_s3_impl(local_split_path: &Path, s3_url: &str, config: 
 
 /// Synchronous wrapper for S3 upload
 fn upload_split_to_s3(local_split_path: &Path, s3_url: &str, config: &MergeConfig) -> Result<()> {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-    .enable_all()
-    .build()?;
+    // ✅ PERFORMANCE FIX: Use shared Tokio runtime (was creating single-threaded runtime)
+    let runtime = &*SHARED_MERGE_RUNTIME;
     runtime.block_on(upload_split_to_s3_impl(local_split_path, s3_url, config))
 }
 
@@ -3163,10 +3195,29 @@ fn create_merged_split_file(merged_index_path: &Path, output_path: &str, metadat
     enable_streaming_io: true,
     };
 
-    // Create runtime for async call
-    let runtime = tokio::runtime::Runtime::new()
-    .map_err(|e| anyhow::anyhow!("Failed to create async runtime: {}", e))?;
-    let footer_offsets = runtime.block_on(create_quickwit_split(&merged_index, &merged_index_path.to_path_buf(), &PathBuf::from(output_path), metadata, &default_config))?;
+    // ✅ PERFORMANCE FIX: Use separate thread to prevent runtime deadlock
+    let footer_offsets = {
+        let merged_index_clone = merged_index.clone();
+        let merged_index_path_clone = merged_index_path.to_path_buf();
+        let output_path_clone = PathBuf::from(output_path);
+        let metadata_clone = metadata.clone();
+        let config_clone = default_config.clone();
+
+        std::thread::spawn(move || {
+            let blocking_runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| anyhow!("Failed to create blocking runtime for split creation: {}", e))?;
+
+            blocking_runtime.block_on(create_quickwit_split(
+                &merged_index_clone,
+                &merged_index_path_clone,
+                &output_path_clone,
+                &metadata_clone,
+                &config_clone
+            ))
+        }).join().map_err(|_| anyhow!("Split creation thread panicked"))??
+    };
     
     debug_log!("Successfully created merged split file: {} with footer offsets: {:?}", output_path, footer_offsets);
     Ok(footer_offsets)
