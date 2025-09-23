@@ -38,22 +38,22 @@ pub async fn tracked_storage_resolve(
     static STORAGE_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
     let storage_id = STORAGE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-    eprintln!("🏗️  STORAGE_RESOLVE: Starting storage resolve #{} [{}]", storage_id, context);
-    eprintln!("   📍 Resolver address: {:p}", resolver);
-    eprintln!("   🌐 URI: {}", uri);
+    debug_println!("🏗️  STORAGE_RESOLVE: Starting storage resolve #{} [{}]", storage_id, context);
+    debug_println!("   📍 Resolver address: {:p}", resolver);
+    debug_println!("   🌐 URI: {}", uri);
 
     let resolve_start = std::time::Instant::now();
     let result = resolver.resolve(uri).await;
 
     match &result {
         Ok(storage) => {
-            eprintln!("✅ STORAGE_RESOLVED: Storage instance #{} created in {}ms [{}]",
+            debug_println!("✅ STORAGE_RESOLVED: Storage instance #{} created in {}ms [{}]",
                      storage_id, resolve_start.elapsed().as_millis(), context);
-            eprintln!("   🏭 Storage address: {:p}", &**storage);
-            eprintln!("   📊 Storage type: {}", std::any::type_name::<dyn quickwit_storage::Storage>());
+            debug_println!("   🏭 Storage address: {:p}", &**storage);
+            debug_println!("   📊 Storage type: {}", std::any::type_name::<dyn quickwit_storage::Storage>());
         }
         Err(e) => {
-            eprintln!("❌ STORAGE_RESOLVE_FAILED: Storage resolve #{} failed in {}ms [{}]: {}",
+            debug_println!("❌ STORAGE_RESOLVE_FAILED: Storage resolve #{} failed in {}ms [{}]: {}",
                      storage_id, resolve_start.elapsed().as_millis(), context, e);
         }
     }
@@ -150,7 +150,7 @@ pub async fn get_configured_storage_resolver_async(s3_config_opt: Option<S3Stora
         {
             let read_cache = cache.read().await;
             if let Some(cached_resolver) = read_cache.get(&cache_key) {
-                eprintln!("🎯 STORAGE_RESOLVER_CACHE_HIT: Reusing cached resolver for key: {} at address {:p}",
+                debug_println!("🎯 STORAGE_RESOLVER_CACHE_HIT: Reusing cached resolver for key: {} at address {:p}",
                          cache_key, cached_resolver);
                 return cached_resolver.clone();
             }
@@ -158,34 +158,34 @@ pub async fn get_configured_storage_resolver_async(s3_config_opt: Option<S3Stora
 
         // Cache miss - create new resolver (outside of any locks to prevent deadlock)
         let resolver_id = RESOLVER_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        eprintln!("❌ STORAGE_RESOLVER_CACHE_MISS: Creating new resolver #{} for key: {}", resolver_id, cache_key);
-        eprintln!("   📋 S3 Config: region={:?}, endpoint={:?}, path_style={}",
+        debug_println!("❌ STORAGE_RESOLVER_CACHE_MISS: Creating new resolver #{} for key: {}", resolver_id, cache_key);
+        debug_println!("   📋 S3 Config: region={:?}, endpoint={:?}, path_style={}",
                   s3_config.region, s3_config.endpoint, s3_config.force_path_style_access);
 
         let storage_configs = StorageConfigs::new(vec![
             quickwit_config::StorageConfig::S3(s3_config)
         ]);
         let resolver = StorageResolver::configured(&storage_configs); // <- DEADLOCK SUSPECT: Quickwit resolver creation
-        eprintln!("✅ STORAGE_RESOLVER_CREATED: Resolver #{} created at address {:p}", resolver_id, &resolver);
+        debug_println!("✅ STORAGE_RESOLVER_CREATED: Resolver #{} created at address {:p}", resolver_id, &resolver);
 
         // Cache the new resolver (async write lock) - DEADLOCK FIXED
         {
             let mut write_cache = cache.write().await;
             // Double-check in case another thread created it while we were creating ours
             if let Some(existing_resolver) = write_cache.get(&cache_key) {
-                eprintln!("🏃 STORAGE_RESOLVER_RACE: Another thread created resolver, using existing at {:p}", existing_resolver);
+                debug_println!("🏃 STORAGE_RESOLVER_RACE: Another thread created resolver, using existing at {:p}", existing_resolver);
                 return existing_resolver.clone();
             }
             write_cache.insert(cache_key.clone(), resolver.clone());
-            eprintln!("💾 STORAGE_RESOLVER_CACHED: Resolver #{} cached for key: {}", resolver_id, cache_key);
+            debug_println!("💾 STORAGE_RESOLVER_CACHED: Resolver #{} cached for key: {}", resolver_id, cache_key);
         } // <- async write lock released here
 
         resolver
     } else {
         let resolver_id = RESOLVER_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        eprintln!("🌐 STORAGE_RESOLVER_GLOBAL: Resolver #{} - Using global unconfigured StorageResolver", resolver_id);
+        debug_println!("🌐 STORAGE_RESOLVER_GLOBAL: Resolver #{} - Using global unconfigured StorageResolver", resolver_id);
         let resolver = GLOBAL_STORAGE_RESOLVER.clone();
-        eprintln!("♻️  STORAGE_RESOLVER_REUSED: Resolver #{} reused global at address {:p}", resolver_id, &resolver);
+        debug_println!("♻️  STORAGE_RESOLVER_REUSED: Resolver #{} reused global at address {:p}", resolver_id, &resolver);
         resolver
     }
 }
@@ -216,7 +216,7 @@ pub fn get_configured_storage_resolver(s3_config_opt: Option<S3StorageConfig>) -
         {
             let cache = SYNC_STORAGE_RESOLVERS.lock().unwrap();
             if let Some(cached_resolver) = cache.get(&cache_key) {
-                eprintln!("🎯 STORAGE_RESOLVER_SYNC_CACHE_HIT: Reusing cached sync resolver for key: {} at address {:p}",
+                debug_println!("🎯 STORAGE_RESOLVER_SYNC_CACHE_HIT: Reusing cached sync resolver for key: {} at address {:p}",
                          cache_key, cached_resolver);
                 return cached_resolver.clone();
             }
@@ -224,34 +224,34 @@ pub fn get_configured_storage_resolver(s3_config_opt: Option<S3StorageConfig>) -
 
         // Cache miss - create new resolver
         let resolver_id = RESOLVER_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        eprintln!("❌ STORAGE_RESOLVER_SYNC_CACHE_MISS: Creating new sync resolver #{} for key: {}", resolver_id, cache_key);
-        eprintln!("   📋 S3 Config: region={:?}, endpoint={:?}, path_style={}",
+        debug_println!("❌ STORAGE_RESOLVER_SYNC_CACHE_MISS: Creating new sync resolver #{} for key: {}", resolver_id, cache_key);
+        debug_println!("   📋 S3 Config: region={:?}, endpoint={:?}, path_style={}",
                   s3_config.region, s3_config.endpoint, s3_config.force_path_style_access);
 
         let storage_configs = StorageConfigs::new(vec![
             quickwit_config::StorageConfig::S3(s3_config)
         ]);
         let resolver = StorageResolver::configured(&storage_configs);
-        eprintln!("✅ STORAGE_RESOLVER_CREATED: Sync resolver #{} created at address {:p}", resolver_id, &resolver);
+        debug_println!("✅ STORAGE_RESOLVER_CREATED: Sync resolver #{} created at address {:p}", resolver_id, &resolver);
 
         // Cache the new resolver
         {
             let mut cache = SYNC_STORAGE_RESOLVERS.lock().unwrap();
             // Double-check in case another thread created it while we were creating ours
             if let Some(existing_resolver) = cache.get(&cache_key) {
-                eprintln!("🏃 STORAGE_RESOLVER_SYNC_RACE: Another thread created sync resolver, using existing at {:p}", existing_resolver);
+                debug_println!("🏃 STORAGE_RESOLVER_SYNC_RACE: Another thread created sync resolver, using existing at {:p}", existing_resolver);
                 return existing_resolver.clone();
             }
             cache.insert(cache_key.clone(), resolver.clone());
-            eprintln!("💾 STORAGE_RESOLVER_SYNC_CACHED: Resolver #{} cached for key: {}", resolver_id, cache_key);
+            debug_println!("💾 STORAGE_RESOLVER_SYNC_CACHED: Resolver #{} cached for key: {}", resolver_id, cache_key);
         }
 
         resolver
     } else {
         let resolver_id = RESOLVER_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        eprintln!("🌐 STORAGE_RESOLVER_GLOBAL_SYNC: Resolver #{} - Using global unconfigured StorageResolver", resolver_id);
+        debug_println!("🌐 STORAGE_RESOLVER_GLOBAL_SYNC: Resolver #{} - Using global unconfigured StorageResolver", resolver_id);
         let resolver = GLOBAL_STORAGE_RESOLVER.clone();
-        eprintln!("♻️  STORAGE_RESOLVER_REUSED_SYNC: Resolver #{} reused global at address {:p}", resolver_id, &resolver);
+        debug_println!("♻️  STORAGE_RESOLVER_REUSED_SYNC: Resolver #{} reused global at address {:p}", resolver_id, &resolver);
         resolver
     }
 }
@@ -448,21 +448,21 @@ pub fn get_global_components() -> &'static Arc<GlobalSearcherComponents> {
 /// Get the global SearcherContext
 /// CRITICAL FIX: Return the SAME SearcherContext instance every time for true cache sharing
 pub fn get_global_searcher_context() -> Arc<SearcherContext> {
-    eprintln!("🔍 CACHE ENTRY: get_global_searcher_context() called - using SHARED global caches");
+    debug_println!("🔍 CACHE ENTRY: get_global_searcher_context() called - using SHARED global caches");
     debug_println!("🔍 CACHE ENTRY: get_global_searcher_context() called - using SHARED global caches");
 
     let context = GLOBAL_SEARCHER_CONTEXT.get_or_init(|| {
-        eprintln!("🔍 CACHE INIT: Creating THE SINGLE SHARED SearcherContext instance");
+        debug_println!("🔍 CACHE INIT: Creating THE SINGLE SHARED SearcherContext instance");
         let components = get_global_components();
         let context = components.create_searcher_context(SearcherConfig::default());
-        eprintln!("🔍 CACHE CREATED: THE SHARED SearcherContext created at {:p}", Arc::as_ptr(&context));
-        eprintln!("🔍 CACHE IDENTITY: Split footer cache instance at: {:p}", &context.split_footer_cache as *const _);
+        debug_println!("🔍 CACHE CREATED: THE SHARED SearcherContext created at {:p}", Arc::as_ptr(&context));
+        debug_println!("🔍 CACHE IDENTITY: Split footer cache instance at: {:p}", &context.split_footer_cache as *const _);
         context
     });
 
     let ref_count = Arc::strong_count(context);
-    eprintln!("🔍 CACHE REUSE: Returning SHARED SearcherContext at {:p}, ref_count: {}", Arc::as_ptr(context), ref_count);
-    eprintln!("🔍 CACHE IDENTITY: Reusing split footer cache instance at: {:p}", &context.split_footer_cache as *const _);
+    debug_println!("🔍 CACHE REUSE: Returning SHARED SearcherContext at {:p}, ref_count: {}", Arc::as_ptr(context), ref_count);
+    debug_println!("🔍 CACHE IDENTITY: Reusing split footer cache instance at: {:p}", &context.split_footer_cache as *const _);
     context.clone()
 }
 
