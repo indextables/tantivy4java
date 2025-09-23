@@ -911,7 +911,9 @@ fn is_configuration_error(error_msg: &str) -> bool {
     }
 
     // Local file system errors that indicate path/configuration issues
-    if msg_lower.contains("not found") || msg_lower.contains("no such file") {
+    // BUT NOT individual split file missing - that should be treated as graceful skip
+    if (msg_lower.contains("not found") || msg_lower.contains("no such file")) &&
+       !msg_lower.contains("split") && !msg_lower.contains(".split") {
         return true;
     }
 
@@ -1669,26 +1671,53 @@ fn get_nullable_string_field_value(env: &mut JNIEnv, obj: &JObject, method_name:
 /// to prevent range assertion failures in the native layer
 fn extract_split_to_directory_impl(split_path: &Path, output_dir: &Path) -> Result<()> {
     use tantivy::directory::{MmapDirectory, DirectoryClone};
-    
+
     debug_log!("🔧 MERGE EXTRACTION: Extracting split {:?} to directory {:?}", split_path, output_dir);
     debug_log!("🚨 MERGE SAFETY: Using full file access (NO lazy loading) to prevent native crashes");
-    
+
     // Create output directory
     std::fs::create_dir_all(output_dir)?;
-    
+
     // Open the bundle directory (read-only) - MERGE OPERATIONS MUST USE FULL ACCESS
     let split_path_str = split_path.to_string_lossy().to_string();
     debug_log!("🔧 MERGE EXTRACTION: Opening bundle directory with full file access (no lazy loading)");
-    let bundle_directory = get_tantivy_directory_from_split_bundle_full_access(&split_path_str)?;
+
+    // ✅ CORRUPTION RESILIENCE: Catch panics from corrupted split files during directory access
+    let bundle_directory = match std::panic::catch_unwind(|| {
+        get_tantivy_directory_from_split_bundle_full_access(&split_path_str)
+    }) {
+        Ok(Ok(directory)) => directory,
+        Ok(Err(e)) => {
+            debug_log!("🚨 SPLIT ACCESS ERROR: Failed to open split directory for '{}': {}", split_path_str, e);
+            return Err(anyhow!("Failed to open split directory: {}", e));
+        },
+        Err(_panic_info) => {
+            debug_log!("🚨 PANIC CAUGHT: Split file '{}' caused panic during directory access - file is corrupted", split_path_str);
+            return Err(anyhow!("Split file is corrupted and caused panic during access"));
+        }
+    };
     
-    // Open the output directory (writable)  
+    // Open the output directory (writable)
     let output_directory = MmapDirectory::open(output_dir)?;
-    
-    // Open bundle as index to get list of files (with resilient retry logic)
+
+    // ✅ CORRUPTION RESILIENCE: Try to open index and load metadata with error handling
+    // Note: We can't use catch_unwind here due to interior mutability in Directory types
     let tokenizer_manager = create_quickwit_tokenizer_manager();
-    let temp_bundle_index = open_index(bundle_directory.box_clone(), &tokenizer_manager)?;
-    let index_meta = resilient_ops::resilient_load_metas(&temp_bundle_index)
-        .map_err(|e| anyhow!("Failed to load index metadata with resilient retry: {}", e))?;
+    let temp_bundle_index = match open_index(bundle_directory.box_clone(), &tokenizer_manager) {
+        Ok(index) => index,
+        Err(e) => {
+            debug_log!("🚨 INDEX OPEN ERROR: Failed to open index for '{}': {}", split_path_str, e);
+            return Err(anyhow!("Failed to open index: {}", e));
+        }
+    };
+
+    let index_meta = match resilient_ops::resilient_load_metas(&temp_bundle_index) {
+        Ok(meta) => meta,
+        Err(e) => {
+            debug_log!("🚨 METADATA LOAD ERROR: Failed to load metadata for '{}': {}", split_path_str, e);
+            return Err(anyhow!("Failed to load index metadata: {}", e));
+        }
+    };
     
     // Copy all segment files and meta.json
     let mut copied_files = 0;
@@ -1898,6 +1927,8 @@ async fn download_and_extract_single_split_resilient(
     config: &InternalMergeConfig,
     storage_resolver: &StorageResolver,
 ) -> Result<Option<ExtractedSplit>> {
+    // ✅ PANIC HANDLING: Handle error gracefully without spawn for now
+    // Note: StorageResolver doesn't implement Clone, so we handle errors instead of panics
     match download_and_extract_single_split(
         split_url,
         split_index,
@@ -1908,6 +1939,16 @@ async fn download_and_extract_single_split_resilient(
         Ok(extracted_split) => Ok(Some(extracted_split)),
         Err(e) => {
             let error_msg = e.to_string();
+
+            // Check if this is a panic-like error (overflow, underflow, etc.)
+            if error_msg.contains("attempt to subtract with overflow") ||
+               error_msg.contains("arithmetic overflow") ||
+               error_msg.contains("arithmetic underflow") ||
+               error_msg.contains("index out of bounds") ||
+               error_msg.contains("slice index") {
+                debug_log!("🚨 ARITHMETIC ERROR: Split {} caused arithmetic error - skipping gracefully: {} (Error: {})", split_index, split_url, error_msg);
+                return Ok(None); // Skip this split gracefully for arithmetic errors
+            }
 
             // Check if this is a configuration error that should not be bypassed
             if is_configuration_error(&error_msg) {
@@ -2219,8 +2260,8 @@ pub fn merge_splits_impl(split_urls: &[String], output_path: &str, config: &Inte
 
     debug_log!("🔧 Processing extracted split {}: {}", i, split_url);
 
-    // ✅ RESILIENT METADATA PARSING: Handle ANY error gracefully with warnings
-    let (extracted_directory, temp_index, index_meta) = match (|| -> Result<_> {
+    // ✅ RESILIENT METADATA PARSING: Handle ANY error AND panic gracefully with warnings
+    let (extracted_directory, temp_index, index_meta) = match std::panic::catch_unwind(|| -> Result<_> {
         let extracted_directory = MmapDirectory::open(temp_extract_path)?;
 
         // ✅ RESILIENT INDEX OPEN: Handle ANY Index::open error gracefully
@@ -2238,16 +2279,21 @@ pub fn merge_splits_impl(split_urls: &[String], output_path: &str, config: &Inte
         let index_meta = resilient_ops::resilient_load_metas(&temp_index)
             .map_err(|e| anyhow!("Failed to load index metadata with resilient retry: {}", e))?;
         Ok((extracted_directory, temp_index, index_meta))
-    })() {
-        Ok((dir, index, meta)) => (dir, index, meta),
-        Err(e) => {
+    }) {
+        Ok(Ok((dir, index, meta))) => (dir, index, meta),
+        Ok(Err(e)) => {
             let error_msg = e.to_string();
             debug_log!("⚠️ SPLIT PROCESSING ERROR: Skipping split {} due to error: {}", split_url, error_msg);
             debug_log!("🔧 ERROR SKIP: Split {} has processing error - continuing with remaining splits", split_url);
             debug_log!("🔧 ERROR DETAILS: {}", error_msg);
-
             skipped_splits.push(split_url.clone());
-            continue; // Skip this split and continue with others for ANY error
+            continue;
+        },
+        Err(_panic_info) => {
+            debug_log!("🚨 PANIC CAUGHT: Split {} caused panic during processing - skipping gracefully", split_url);
+            debug_log!("🔧 PANIC SKIP: Split {} has panic error - continuing with remaining splits", split_url);
+            skipped_splits.push(split_url.clone());
+            continue;
         }
     };
 

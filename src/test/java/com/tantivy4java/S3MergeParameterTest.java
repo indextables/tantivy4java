@@ -131,24 +131,32 @@ public class S3MergeParameterTest {
     public void testLocalFilesWithoutCredentials() {
         // This test validates that local files work without AWS credentials
         List<String> localSplits = Arrays.asList(
-            "/nonexistent/split1.split",  // These files don't exist, but that's a different error
+            "/nonexistent/split1.split",  // These files don't exist, but are bypassed
             "/nonexistent/split2.split"
         );
-        
+
         QuickwitSplit.MergeConfig localConfig = new QuickwitSplit.MergeConfig(
             "test-index", "test-source", "test-node");
-        
-        // This should fail with file not found, not credentials error
-        RuntimeException exception = assertThrows(RuntimeException.class, () -> {
-            QuickwitSplit.mergeSplits(localSplits, "/tmp/test-merge.split", localConfig);
-        });
-        
-        // Should be a file processing error with new Quickwit merge behavior
-        String message = exception.getMessage().toLowerCase();
-        // With Quickwit merge integration, non-existent files get added to skipped splits
-        // This proves local file handling worked and reached the processing stage
-        assertTrue(message.contains("skipped") || message.contains("failed") || message.contains("not found") || message.contains("file") || message.contains("path"),
-            "Exception should be about file processing with new Quickwit merge behavior: " + exception.getMessage());
+
+        // With new Quickwit merge behavior, non-existent files are bypassed and included in skip list
+        // When all splits are skipped, the metadata should have a null or empty UID
+        QuickwitSplit.SplitMetadata result = QuickwitSplit.mergeSplits(
+            localSplits, "/tmp/test-merge.split", localConfig);
+
+        // Verify that split ID is null or empty when no valid splits are available
+        String splitId = result.getSplitId();
+        assertTrue(splitId == null || splitId.trim().isEmpty(),
+            "Split ID should be null or empty when no valid splits are merged, but was: " + splitId);
+
+        // Verify that the skipped splits list contains our non-existent files
+        List<String> skippedSplits = result.getSkippedSplits();
+        assertEquals(2, skippedSplits.size(), "Should have 2 skipped splits");
+        assertTrue(skippedSplits.contains("/nonexistent/split1.split") ||
+                  skippedSplits.stream().anyMatch(s -> s.contains("split1.split")),
+                  "Skipped splits should contain split1.split: " + skippedSplits);
+        assertTrue(skippedSplits.contains("/nonexistent/split2.split") ||
+                  skippedSplits.stream().anyMatch(s -> s.contains("split2.split")),
+                  "Skipped splits should contain split2.split: " + skippedSplits);
     }
 
     @Test

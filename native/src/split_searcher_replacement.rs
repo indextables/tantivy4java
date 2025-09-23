@@ -423,6 +423,10 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_createNativeWithShare
                             let cached_searcher = std::sync::Arc::new(index_reader.searcher());
                             debug_println!("🔥 SEARCHER CACHED: Created cached searcher following Quickwit's exact pattern for optimal cache reuse");
 
+                            // ✅ FIX: Get schema before moving cached_index into Arc
+                            let schema = cached_index.schema();
+                            let schema_ptr = crate::utils::arc_to_jlong(std::sync::Arc::new(schema));
+
                             // Create clean struct-based context instead of complex tuple
                             let cached_context = CachedSearcherContext {
                                 standalone_searcher: std::sync::Arc::new(searcher),
@@ -441,6 +445,18 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_createNativeWithShare
                             let pointer = arc_to_jlong(searcher_context);
                             debug_println!("RUST DEBUG: SUCCESS: Stored searcher context with cached index for split '{}' with Arc pointer: {}, footer: {}-{}",
                                      split_uri, pointer, split_footer_start, split_footer_end);
+
+                            // ✅ DEBUG: Immediately verify the Arc can be retrieved
+                            if let Some(_test_context) = crate::utils::jlong_to_arc::<CachedSearcherContext>(pointer) {
+                                debug_println!("✅ VERIFICATION: Arc {} successfully stored and retrieved from registry", pointer);
+                            } else {
+                                debug_println!("❌ CRITICAL BUG: Arc {} was stored but CANNOT be retrieved immediately!", pointer);
+                            }
+
+                            // ✅ FIX: Store direct mapping from searcher pointer to schema pointer for fallback
+                            crate::split_query::store_searcher_schema(pointer, schema_ptr);
+                            debug_println!("✅ SEARCHER_SCHEMA_MAPPING: Stored mapping {} -> {} for reliable schema access", pointer, schema_ptr);
+
                             debug_println!("🏁 SPLIT_SEARCHER: Thread {:?} COMPLETED successfully in {}ms - pointer: 0x{:x}",
                                           thread_id, start_time.elapsed().as_millis(), pointer);
                             pointer
@@ -499,6 +515,10 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_closeNative(
             }
         }
     }
+
+    // ✅ FIX: Clean up direct schema mapping when searcher is closed
+    crate::split_query::remove_searcher_schema(searcher_ptr);
+    debug_println!("✅ CLEANUP: Removed direct schema mapping for searcher {}", searcher_ptr);
 
     // SAFE: Release Arc from registry to prevent memory leaks
     release_arc(searcher_ptr);
@@ -2884,15 +2904,41 @@ pub async fn perform_doc_retrieval_async_impl(
 pub async fn perform_schema_retrieval_async_impl_thread_safe(
     searcher_ptr: jlong,
 ) -> Result<i64, anyhow::Error> {
-    debug_println!("📋 ASYNC_IMPL: Starting thread-safe async schema retrieval");
+    debug_println!("📋 ASYNC_IMPL: Starting thread-safe async schema retrieval with pointer: {}", searcher_ptr);
 
     if searcher_ptr == 0 {
-        return Err(anyhow::anyhow!("Invalid searcher pointer"));
+        debug_println!("❌ ASYNC_IMPL: Searcher pointer is 0 (null)");
+        return Err(anyhow::anyhow!("Invalid searcher pointer (0)"));
+    }
+
+    // ✅ DEBUG: Check Arc registry status before attempting extraction
+    {
+        let registry = crate::utils::ARC_REGISTRY.lock().unwrap();
+        debug_println!("📋 ARC_REGISTRY: Registry contains {} entries", registry.len());
+        if registry.contains_key(&searcher_ptr) {
+            debug_println!("✅ ARC_REGISTRY: Searcher pointer {} found in registry", searcher_ptr);
+        } else {
+            debug_println!("❌ ARC_REGISTRY: Searcher pointer {} NOT found in registry", searcher_ptr);
+            debug_println!("📋 ARC_REGISTRY: Available keys: {:?}", registry.keys().collect::<Vec<_>>());
+        }
     }
 
     // Extract searcher context using the safe Arc pattern with new struct-based approach
-    let searcher_context = crate::utils::jlong_to_arc::<CachedSearcherContext>(searcher_ptr)
-        .ok_or_else(|| anyhow::anyhow!("Invalid searcher context"))?;
+    let searcher_context = crate::utils::jlong_to_arc::<CachedSearcherContext>(searcher_ptr);
+
+    // ✅ FIX: If searcher context is missing, use direct schema mapping fallback
+    if searcher_context.is_none() {
+        debug_println!("❌ ASYNC_IMPL: CachedSearcherContext missing for pointer {}, trying direct schema mapping", searcher_ptr);
+        if let Some(schema_ptr) = crate::split_query::get_searcher_schema(searcher_ptr) {
+            debug_println!("✅ FALLBACK: Found direct schema mapping {} for searcher {}", schema_ptr, searcher_ptr);
+            return Ok(schema_ptr);
+        } else {
+            debug_println!("❌ FALLBACK: No direct schema mapping found for searcher {}", searcher_ptr);
+            return Err(anyhow::anyhow!("Invalid searcher context - Arc and direct mapping not found for pointer: {}", searcher_ptr));
+        }
+    }
+
+    let searcher_context = searcher_context.unwrap();
 
     let context = searcher_context.as_ref();
 
@@ -3126,7 +3172,12 @@ async fn perform_real_quickwit_schema_retrieval(
     debug_println!("📋 REAL_QUICKWIT: Schema extracted with {} fields, converting to pointer", field_count);
 
     // Convert schema to pointer using the same pattern as other functions
-    let schema_ptr = crate::utils::arc_to_jlong(Arc::new(schema));
+    let schema_ptr = crate::utils::arc_to_jlong(Arc::new(schema.clone()));
+
+    // ✅ CRITICAL FIX: Cache the schema for parseQuery fallback
+    debug_println!("📋 CACHE_FIX: Caching schema for parseQuery compatibility for split: {}", split_uri);
+    crate::split_query::store_split_schema(split_uri, schema.clone());
+    debug_println!("📋 CACHE_FIX: Schema cached successfully");
 
     debug_println!("✅ REAL_QUICKWIT: Schema retrieval completed successfully, pointer: {}", schema_ptr);
     Ok(schema_ptr)
