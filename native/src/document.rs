@@ -27,6 +27,7 @@ use std::net::IpAddr;
 use std::collections::BTreeMap;
 use chrono::{self, Datelike, Timelike};
 use crate::utils::{handle_error, with_arc_safe, arc_to_jlong, release_arc};
+use crate::debug_println;
 use std::sync::{Arc, Mutex};
 use serde_json;
 
@@ -271,12 +272,12 @@ pub extern "system" fn Java_com_tantivy4java_Document_nativeGet(
         }
     };
 
-    eprintln!("🔍 DOCUMENT_GET: nativeGet called with ptr={}, field_name={}", ptr, field_name_str);
+    debug_println!("🔍 DOCUMENT_GET: nativeGet called with ptr={}, field_name={}", ptr, field_name_str);
 
     let result = with_arc_safe::<Mutex<DocumentWrapper>, Result<jobject, String>>(ptr, |wrapper_mutex| {
-        eprintln!("🔍 DOCUMENT_GET: Arc found in registry, accessing DocumentWrapper");
+        debug_println!("🔍 DOCUMENT_GET: Arc found in registry, accessing DocumentWrapper");
         let doc_wrapper = wrapper_mutex.lock().unwrap();
-        eprintln!("🔍 DOCUMENT_GET: Got lock on DocumentWrapper, attempting to get field: {}", field_name_str);
+        debug_println!("🔍 DOCUMENT_GET: Got lock on DocumentWrapper, attempting to get field: {}", field_name_str);
         match doc_wrapper.get_field_values(&field_name_str) {
             Some(values) => {
                 // Create ArrayList to return the values

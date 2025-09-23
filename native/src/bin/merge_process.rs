@@ -224,7 +224,26 @@ fn perform_file_based_merge(request: &MergeRequest) -> Result<SplitMetadata> {
         }
     }
 
-    Ok(real_metadata)
+    // Convert from tantivy4java::SplitMetadata to our local SplitMetadata
+    let converted_metadata = SplitMetadata {
+        split_id: real_metadata.split_id,
+        num_docs: real_metadata.num_docs as u64,
+        uncompressed_size_bytes: real_metadata.uncompressed_size_bytes,
+        time_range_start: real_metadata.time_range_start,
+        time_range_end: real_metadata.time_range_end,
+        create_timestamp: real_metadata.create_timestamp,
+        footer_offsets: {
+            let mut map = std::collections::HashMap::new();
+            if let Some((start, end)) = real_metadata.footer_offsets {
+                map.insert("start".to_string(), start);
+                map.insert("end".to_string(), end);
+            }
+            map
+        },
+        skipped_splits: real_metadata.skipped_splits,
+    };
+
+    Ok(converted_metadata)
 }
 
 /// Information about a validated split file

@@ -2067,8 +2067,8 @@ fn create_storage_resolver(config: &InternalMergeConfig) -> Result<StorageResolv
     }
 
     // ✅ BYPASS FIX #8: Use centralized storage resolver function
-    eprintln!("✅ BYPASS_FIXED: Using get_configured_storage_resolver() for cache sharing [FIX #8]");
-    eprintln!("   📍 Location: quickwit_split.rs:2050 (QuickwitSplit merge operation)");
+    debug_println!("✅ BYPASS_FIXED: Using get_configured_storage_resolver() for cache sharing [FIX #8]");
+    debug_println!("   📍 Location: quickwit_split.rs:2050 (QuickwitSplit merge operation)");
     // TODO: Fix async compatibility - temporarily use direct call
     let storage_configs = StorageConfigs::new(if let Some(s3_config) = s3_config_opt.cloned() {
         vec![StorageConfig::S3(s3_config)]

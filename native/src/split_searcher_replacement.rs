@@ -124,7 +124,7 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_createNativeWithShare
     let thread_id = std::thread::current().id();
     let start_time = std::time::Instant::now();
 
-    eprintln!("🚀 SIMPLE DEBUG: createNativeWithSharedCache method called!");
+    debug_println!("🚀 SIMPLE DEBUG: createNativeWithSharedCache method called!");
     debug_println!("🧵 SPLIT_SEARCHER: Thread {:?} ENTRY into createNativeWithSharedCache [{}ms]",
                   thread_id, start_time.elapsed().as_millis());
     debug_println!("🔗 SPLIT_SEARCHER: Thread {:?} cache_manager_ptr: 0x{:x} [{}ms]",
@@ -258,19 +258,19 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_createNativeWithShare
                 debug_println!("RUST DEBUG: doc_mapping_jobject is not null, attempting to extract string");
                 if let Ok(doc_mapping_str) = env.get_string((&doc_mapping_jobject).into()) {
                     let doc_mapping_string: String = doc_mapping_str.into();
-                    eprintln!("🔥 NATIVE DEBUG: RAW doc_mapping from Java ({} chars): '{}'", doc_mapping_string.len(), doc_mapping_string);
+                    debug_println!("🔥 NATIVE DEBUG: RAW doc_mapping from Java ({} chars): '{}'", doc_mapping_string.len(), doc_mapping_string);
                     doc_mapping_json = Some(doc_mapping_string);
                     debug_println!("RUST DEBUG: ✅ SUCCESS - Extracted doc mapping JSON from Java config ({} chars)", doc_mapping_json.as_ref().unwrap().len());
                 } else {
-                    eprintln!("🔥 NATIVE DEBUG: ⚠️ Failed to convert doc_mapping_jobject to string");
+                    debug_println!("🔥 NATIVE DEBUG: ⚠️ Failed to convert doc_mapping_jobject to string");
                     debug_println!("RUST DEBUG: ⚠️ Failed to convert doc_mapping_jobject to string");
                 }
             } else {
-                eprintln!("🔥 NATIVE DEBUG: ⚠️ doc_mapping_jobject is null - no doc mapping provided by Java");
+                debug_println!("🔥 NATIVE DEBUG: ⚠️ doc_mapping_jobject is null - no doc mapping provided by Java");
                 debug_println!("RUST DEBUG: ⚠️ doc_mapping_jobject is null");
             }
         } else {
-            eprintln!("🔥 NATIVE DEBUG: ⚠️ Failed to call get method on HashMap for 'doc_mapping' key");
+            debug_println!("🔥 NATIVE DEBUG: ⚠️ Failed to call get method on HashMap for 'doc_mapping' key");
             debug_println!("RUST DEBUG: ⚠️ Failed to call get method on HashMap for 'doc_mapping' key");
         }
     }
@@ -366,7 +366,7 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_createNativeWithShare
 
             match storage {
                 Ok(resolved_storage) => {
-                    eprintln!("🔥 STORAGE RESOLVED: Storage resolved once for reuse, instance: {:p}", Arc::as_ptr(&resolved_storage));
+                    debug_println!("🔥 STORAGE RESOLVED: Storage resolved once for reuse, instance: {:p}", Arc::as_ptr(&resolved_storage));
 
                     // Follow Quickwit pattern: open index once and cache it
                     let opened_index = runtime.block_on(async {
@@ -405,7 +405,7 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_createNativeWithShare
 
                     match opened_index {
                         Ok((cached_index, _hot_directory)) => {
-                            eprintln!("🔥 INDEX CACHED: Index opened once for reuse, cached for all operations");
+                            debug_println!("🔥 INDEX CACHED: Index opened once for reuse, cached for all operations");
 
                             // Follow Quickwit's exact pattern: create index reader and cached searcher
                             let index_reader = match cached_index
@@ -421,7 +421,7 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_createNativeWithShare
                             };
 
                             let cached_searcher = std::sync::Arc::new(index_reader.searcher());
-                            eprintln!("🔥 SEARCHER CACHED: Created cached searcher following Quickwit's exact pattern for optimal cache reuse");
+                            debug_println!("🔥 SEARCHER CACHED: Created cached searcher following Quickwit's exact pattern for optimal cache reuse");
 
                             // Create clean struct-based context instead of complex tuple
                             let cached_context = CachedSearcherContext {
@@ -636,18 +636,18 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_searchWithSplitQuery(
     split_query_obj: JObject,
     limit: jint,
 ) -> jobject {
-    eprintln!("🔥 NATIVE DEBUG: searchWithSplitQuery called with pointer {} and limit {}", searcher_ptr, limit);
+    debug_println!("🔥 NATIVE DEBUG: searchWithSplitQuery called with pointer {} and limit {}", searcher_ptr, limit);
     debug_println!("🚀 ASYNC_JNI: searchWithSplitQuery called with async-first architecture");
 
     // Extract all JNI data at entry point - no JNI types should go into core functions
-    eprintln!("🔥 NATIVE DEBUG: Converting SplitQuery to JSON");
+    debug_println!("🔥 NATIVE DEBUG: Converting SplitQuery to JSON");
     let query_json_str = match convert_split_query_to_json(&mut env, &split_query_obj) {
         Ok(json_str) => {
-            eprintln!("🔥 NATIVE DEBUG: Successfully converted SplitQuery to JSON: {}", json_str);
+            debug_println!("🔥 NATIVE DEBUG: Successfully converted SplitQuery to JSON: {}", json_str);
             json_str
         },
         Err(e) => {
-            eprintln!("🔥 NATIVE DEBUG: Failed to convert SplitQuery to JSON: {}", e);
+            debug_println!("🔥 NATIVE DEBUG: Failed to convert SplitQuery to JSON: {}", e);
             debug_println!("❌ ASYNC_JNI: Failed to convert SplitQuery to JSON: {}", e);
             to_java_exception(&mut env, &anyhow::anyhow!("Failed to convert SplitQuery to JSON: {}", e));
             return std::ptr::null_mut();
@@ -656,30 +656,30 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_searchWithSplitQuery(
 
     // Use async pattern that returns LeafSearchResponse directly (avoid unnecessary JSON marshalling)
     // No JNI types passed to core functions - all data extracted at entry point
-    eprintln!("🔥 NATIVE DEBUG: About to call block_on_operation with JSON: {}", query_json_str);
+    debug_println!("🔥 NATIVE DEBUG: About to call block_on_operation with JSON: {}", query_json_str);
     debug_println!("🔍 ASYNC_JNI: About to call perform_search_async_impl_leaf_response (SplitQuery version)");
     match block_on_operation(async move {
         perform_search_async_impl_leaf_response(searcher_ptr, query_json_str, limit).await
     }) {
         Ok(leaf_search_response) => {
-            eprintln!("🔥 NATIVE DEBUG: block_on_operation SUCCESS - Got LeafSearchResponse from SplitQuery");
+            debug_println!("🔥 NATIVE DEBUG: block_on_operation SUCCESS - Got LeafSearchResponse from SplitQuery");
             debug_println!("✅ ASYNC_JNI: Got LeafSearchResponse from SplitQuery, creating SearchResult object");
             // Create proper SearchResult object directly from LeafSearchResponse (no JSON marshalling)
             match perform_unified_search_result_creation(leaf_search_response, &mut env) {
                 Ok(search_result_obj) => {
-                    eprintln!("🔥 NATIVE DEBUG: Successfully created SearchResult object from SplitQuery");
+                    debug_println!("🔥 NATIVE DEBUG: Successfully created SearchResult object from SplitQuery");
                     debug_println!("✅ ASYNC_JNI: Successfully created SearchResult object from SplitQuery");
                     search_result_obj
                 },
                 Err(e) => {
-                    eprintln!("🔥 NATIVE DEBUG: Failed to create SearchResult object from SplitQuery: {}", e);
+                    debug_println!("🔥 NATIVE DEBUG: Failed to create SearchResult object from SplitQuery: {}", e);
                     debug_println!("❌ ASYNC_JNI: Failed to create SearchResult object from SplitQuery: {}", e);
                     std::ptr::null_mut()
                 }
             }
         },
         Err(e) => {
-            eprintln!("🔥 NATIVE DEBUG: block_on_operation FAILED: {}", e);
+            debug_println!("🔥 NATIVE DEBUG: block_on_operation FAILED: {}", e);
             debug_println!("❌ ASYNC_JNI: SplitQuery search operation failed: {}", e);
             std::ptr::null_mut()
         }
@@ -955,9 +955,9 @@ fn retrieve_document_from_split_optimized(
                 debug_println!("RUST DEBUG: ⏱️ 🔧 STORAGE RESOLUTION - Creating S3 storage configuration");
 
                 // ✅ DEADLOCK FIX #2: Use pre-created storage resolver from searcher context
-                eprintln!("✅ QUICKWIT_LIFECYCLE: Using cached storage from searcher context (Quickwit pattern)");
-                eprintln!("   📍 Location: split_searcher_replacement.rs:878 (S3 index storage path)");
-                eprintln!("✅ CACHED_STORAGE_USED: Storage at address {:p} (Quickwit lifecycle)", Arc::as_ptr(storage_resolver));
+                debug_println!("✅ QUICKWIT_LIFECYCLE: Using cached storage from searcher context (Quickwit pattern)");
+                debug_println!("   📍 Location: split_searcher_replacement.rs:878 (S3 index storage path)");
+                debug_println!("✅ CACHED_STORAGE_USED: Storage at address {:p} (Quickwit lifecycle)", Arc::as_ptr(storage_resolver));
                 let index_storage = storage_resolver.clone();
                 debug_println!("RUST DEBUG: ⏱️ 🔧 STORAGE RESOLUTION completed [TIMING: {}ms]", storage_resolution_start.elapsed().as_millis());
                 
@@ -1004,7 +1004,7 @@ fn retrieve_document_from_split_optimized(
                     // ✅ Use cached index to eliminate repeated open_index_with_caches calls
                     let index_creation_start = std::time::Instant::now();
                     let index = cached_index.as_ref().clone();
-                    eprintln!("🔥 INDEX CACHED: Reusing cached index instead of expensive open_index_with_caches call");
+                    debug_println!("🔥 INDEX CACHED: Reusing cached index instead of expensive open_index_with_caches call");
                     
                     debug_println!("RUST DEBUG: ⏱️ 📖 Quickwit hotcache index creation completed [TIMING: {}ms]", index_creation_start.elapsed().as_millis());
                     debug_println!("RUST DEBUG: ✅ Successfully opened index with Quickwit hotcache optimization for individual document retrieval");
@@ -1143,8 +1143,8 @@ fn retrieve_document_from_split(
             };
 
             // ✅ BYPASS FIX #3: Use centralized storage resolver function
-            eprintln!("✅ BYPASS_FIXED: Using get_configured_storage_resolver() for cache sharing [FIX #3]");
-            eprintln!("   📍 Location: split_searcher_replacement.rs:1365 (actual storage path)");
+            debug_println!("✅ BYPASS_FIXED: Using get_configured_storage_resolver() for cache sharing [FIX #3]");
+            debug_println!("   📍 Location: split_searcher_replacement.rs:1365 (actual storage path)");
             let storage_resolver = get_configured_storage_resolver(Some(s3_config.clone()));
             let actual_storage = resolve_storage_for_split(&storage_resolver, split_uri).await?;
             
@@ -1356,9 +1356,9 @@ fn retrieve_documents_batch_from_split_optimized(
                 };
 
                 // ✅ DEADLOCK FIX #4: Use pre-created storage resolver from searcher context
-                eprintln!("✅ QUICKWIT_LIFECYCLE: Using cached storage from searcher context (Quickwit pattern)");
-                eprintln!("   📍 Location: split_searcher_replacement.rs:1271 (batch documents split directory)");
-                eprintln!("✅ CACHED_STORAGE_USED: Storage at address {:p} (Quickwit lifecycle)", Arc::as_ptr(storage_resolver));
+                debug_println!("✅ QUICKWIT_LIFECYCLE: Using cached storage from searcher context (Quickwit pattern)");
+                debug_println!("   📍 Location: split_searcher_replacement.rs:1271 (batch documents split directory)");
+                debug_println!("✅ CACHED_STORAGE_USED: Storage at address {:p} (Quickwit lifecycle)", Arc::as_ptr(storage_resolver));
                 let index_storage = storage_resolver.clone();
                 
                 // Extract just the filename as the relative path (same as individual retrieval)
@@ -1390,7 +1390,7 @@ fn retrieve_documents_batch_from_split_optimized(
                     
                     // ✅ Use cached index to eliminate repeated open_index_with_caches calls
                     let index = cached_index.as_ref().clone();
-                    eprintln!("🔥 INDEX CACHED: Reusing cached index for batch operations instead of expensive open_index_with_caches call");
+                    debug_println!("🔥 INDEX CACHED: Reusing cached index for batch operations instead of expensive open_index_with_caches call");
 
                     debug_println!("RUST DEBUG: ✅ Successfully reused cached index for batch retrieval");
                     index
@@ -1516,7 +1516,7 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_docNative(
     segment_ord: jint,
     doc_id: jint,
 ) -> jobject {
-    eprintln!("🔥🔥🔥 JNI DEBUG: docNative called - ptr:{}, seg:{}, doc:{}", searcher_ptr, segment_ord, doc_id);
+    debug_println!("🔥🔥🔥 JNI DEBUG: docNative called - ptr:{}, seg:{}, doc:{}", searcher_ptr, segment_ord, doc_id);
     debug_println!("🚀 ASYNC_JNI: docNative called with async-first architecture");
 
     // Add this line to verify the method is actually being called
@@ -1528,25 +1528,25 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_docNative(
         perform_doc_retrieval_async_impl_thread_safe(searcher_ptr, segment_ord as u32, doc_id as u32).await
     }) {
         Ok(document_ptr) => {
-            eprintln!("🔥 JNI DEBUG: Document retrieval successful, creating Java Document object from pointer: {}", document_ptr);
+            debug_println!("🔥 JNI DEBUG: Document retrieval successful, creating Java Document object from pointer: {}", document_ptr);
 
             // Check if the pointer is valid (non-zero)
             if document_ptr == 0 {
-                eprintln!("🔥 JNI DEBUG: ERROR - Document pointer is null/zero!");
+                debug_println!("🔥 JNI DEBUG: ERROR - Document pointer is null/zero!");
                 std::ptr::null_mut()
             } else {
-                eprintln!("🔥 JNI DEBUG: Document pointer is valid ({}), proceeding with Java object creation", document_ptr);
+                debug_println!("🔥 JNI DEBUG: Document pointer is valid ({}), proceeding with Java object creation", document_ptr);
 
                 // Create Java Document object properly using JNI
                 let mut env_mut = env;
-                eprintln!("🔥 JNI DEBUG: About to call create_java_document_object...");
+                debug_println!("🔥 JNI DEBUG: About to call create_java_document_object...");
                 match create_java_document_object(&mut env_mut, document_ptr) {
                     Ok(java_doc_obj) => {
-                        eprintln!("🔥 JNI DEBUG: Successfully created Java Document object, returning: {:?}", java_doc_obj);
+                        debug_println!("🔥 JNI DEBUG: Successfully created Java Document object, returning: {:?}", java_doc_obj);
                         java_doc_obj
                     },
                     Err(e) => {
-                        eprintln!("🔥 JNI DEBUG: Failed to create Java Document object: {}", e);
+                        debug_println!("🔥 JNI DEBUG: Failed to create Java Document object: {}", e);
                         crate::common::to_java_exception(&mut env_mut, &e);
                         std::ptr::null_mut()
                     }
@@ -1554,7 +1554,7 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_docNative(
             }
         },
         Err(e) => {
-            eprintln!("🔥 JNI DEBUG: Document retrieval failed: {}", e);
+            debug_println!("🔥 JNI DEBUG: Document retrieval failed: {}", e);
             debug_println!("❌ ASYNC_JNI: Document retrieval operation failed: {}", e);
             std::ptr::null_mut()
         }
@@ -1564,7 +1564,7 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_docNative(
 /// Create a Java Document object from a native document pointer
 /// This properly converts the Rust DocumentWrapper pointer to a Java Document object
 fn create_java_document_object(env: &mut JNIEnv, document_ptr: jlong) -> anyhow::Result<jobject> {
-    eprintln!("🔧 JNI_CONVERT: Creating Java Document object from pointer: {}", document_ptr);
+    debug_println!("🔧 JNI_CONVERT: Creating Java Document object from pointer: {}", document_ptr);
 
     // Find the Document class
     let document_class = env.find_class("com/tantivy4java/Document")
@@ -1577,7 +1577,7 @@ fn create_java_document_object(env: &mut JNIEnv, document_ptr: jlong) -> anyhow:
         &[jni::objects::JValue::Long(document_ptr)]
     ).map_err(|e| anyhow::anyhow!("Failed to create Document object: {}", e))?;
 
-    eprintln!("🔧 JNI_CONVERT: Successfully created Java Document object");
+    debug_println!("🔧 JNI_CONVERT: Successfully created Java Document object");
     Ok(document_obj.into_raw())
 }
 
@@ -1711,16 +1711,16 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_getSchemaFromNative(
     _class: JClass,
     searcher_ptr: jlong,
 ) -> jlong {
-    eprintln!("🔥 SIMPLE DEBUG: getSchemaFromNative called with pointer: {}", searcher_ptr);
+    debug_println!("🔥 SIMPLE DEBUG: getSchemaFromNative called with pointer: {}", searcher_ptr);
     debug_println!("🚀 ASYNC_JNI: getSchemaFromNative called with async-first architecture");
 
     if searcher_ptr == 0 {
-        eprintln!("🔥 SIMPLE DEBUG: Invalid searcher pointer (0)");
+        debug_println!("🔥 SIMPLE DEBUG: Invalid searcher pointer (0)");
         debug_println!("❌ ASYNC_JNI: Invalid searcher pointer");
         return 0;
     }
 
-    eprintln!("🔥 SIMPLE DEBUG: About to call block_on_operation");
+    debug_println!("🔥 SIMPLE DEBUG: About to call block_on_operation");
 
     // Use simplified async pattern that returns thread-safe types
     // Note: env cannot be moved into async block due to thread safety
@@ -1728,11 +1728,11 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_getSchemaFromNative(
         perform_schema_retrieval_async_impl_thread_safe(searcher_ptr).await
     }) {
         Ok(result) => {
-            eprintln!("🔥 SIMPLE DEBUG: block_on_operation succeeded, result: {}", result);
+            debug_println!("🔥 SIMPLE DEBUG: block_on_operation succeeded, result: {}", result);
             result
         },
         Err(e) => {
-            eprintln!("🔥 SIMPLE DEBUG: block_on_operation FAILED: {}", e);
+            debug_println!("🔥 SIMPLE DEBUG: block_on_operation FAILED: {}", e);
             debug_println!("❌ ASYNC_JNI: Schema retrieval operation failed: {}", e);
             0
         }
@@ -1805,9 +1805,9 @@ fn get_schema_from_split(searcher_ptr: jlong) -> anyhow::Result<tantivy::schema:
                 };
 
                 // ✅ DEADLOCK FIX #6: Use pre-created storage resolver from searcher context
-                eprintln!("✅ DEADLOCK_FIXED: Using pre-created StorageResolver from searcher context [FIX #6]");
-                eprintln!("   📍 Location: split_searcher_replacement.rs:2249 (document retrieval storage)");
-                eprintln!("✅ CACHED_STORAGE_USED: Storage at address {:p} (Quickwit lifecycle)", Arc::as_ptr(&context.cached_storage));
+                debug_println!("✅ DEADLOCK_FIXED: Using pre-created StorageResolver from searcher context [FIX #6]");
+                debug_println!("   📍 Location: split_searcher_replacement.rs:2249 (document retrieval storage)");
+                debug_println!("✅ CACHED_STORAGE_USED: Storage at address {:p} (Quickwit lifecycle)", Arc::as_ptr(&context.cached_storage));
 
                 // Use cached storage directly (Quickwit pattern)
                 let actual_storage = context.cached_storage.clone();
@@ -2420,8 +2420,8 @@ fn perform_search_with_query_ast_and_aggregations_using_working_infrastructure(
             };
 
             // ✅ BYPASS FIX #7: Use centralized storage resolver function
-            eprintln!("✅ BYPASS_FIXED: Using get_configured_storage_resolver() for cache sharing [FIX #7]");
-            eprintln!("   📍 Location: split_searcher_replacement.rs:2819 (final storage search setup)");
+            debug_println!("✅ BYPASS_FIXED: Using get_configured_storage_resolver() for cache sharing [FIX #7]");
+            debug_println!("   📍 Location: split_searcher_replacement.rs:2819 (final storage search setup)");
             let storage_resolver = get_configured_storage_resolver(Some(s3_config.clone()));
 
             // Use the helper function to resolve storage correctly for S3 URIs
@@ -2472,7 +2472,7 @@ fn perform_search_with_query_ast_and_aggregations_using_working_infrastructure(
 
             // Use cached index to eliminate repeated open_index_with_caches calls - OPTIMAL PERFORMANCE
             let index = cached_index.as_ref().clone();
-            eprintln!("🔥 INDEX CACHED: Reusing cached index for aggregation search instead of expensive open_index_with_caches call");
+            debug_println!("🔥 INDEX CACHED: Reusing cached index for aggregation search instead of expensive open_index_with_caches call");
 
             debug_println!("RUST DEBUG: ✅ Quickwit optimized index opening completed successfully");
 
@@ -2769,7 +2769,7 @@ async fn perform_quickwit_async_doc_retrieval(
     searcher_ptr: jlong,
     doc_address: tantivy::DocAddress,
 ) -> Result<(tantivy::schema::TantivyDocument, tantivy::schema::Schema), anyhow::Error> {
-    eprintln!("🔥 QUICKWIT_DOC: Starting Quickwit-style async document retrieval");
+    debug_println!("🔥 QUICKWIT_DOC: Starting Quickwit-style async document retrieval");
     debug_println!("📄 QUICKWIT_DOC: Following fetch_docs.rs pattern for async document retrieval");
 
     // Extract clean struct-based searcher context
@@ -2778,11 +2778,11 @@ async fn perform_quickwit_async_doc_retrieval(
 
     let context = searcher_context.as_ref();
 
-    eprintln!("🔥 QUICKWIT_DOC: Got searcher context for split: {}", context.split_uri);
+    debug_println!("🔥 QUICKWIT_DOC: Got searcher context for split: {}", context.split_uri);
 
     // Follow Quickwit's pattern: reuse cached storage instead of resolving again
     let storage = context.cached_storage.clone();
-    eprintln!("🔥 QUICKWIT_DOC: Reusing cached storage instance: {:p}", Arc::as_ptr(&storage));
+    debug_println!("🔥 QUICKWIT_DOC: Reusing cached storage instance: {:p}", Arc::as_ptr(&storage));
 
     // Extract split ID from file path (same pattern as working search implementation)
     let split_filename = if let Some(last_slash_pos) = context.split_uri.rfind('/') {
@@ -2798,7 +2798,7 @@ async fn perform_quickwit_async_doc_retrieval(
         split_filename
     };
 
-    eprintln!("🔥 QUICKWIT_DOC: Extracted split_id: {} from split_uri: {}", split_id, context.split_uri);
+    debug_println!("🔥 QUICKWIT_DOC: Extracted split_id: {} from split_uri: {}", split_id, context.split_uri);
 
     // Create split metadata (same pattern as search implementation)
     let split_metadata = quickwit_proto::search::SplitIdAndFooterOffsets {
@@ -2812,17 +2812,17 @@ async fn perform_quickwit_async_doc_retrieval(
 
     // Use cached searcher to eliminate repeated searcher creation and ensure cache reuse
     let searcher = context.cached_searcher.clone(); // Follow Quickwit's exact pattern: reuse the same Arc<Searcher>
-    eprintln!("🔥 SEARCHER CACHED: Reusing cached searcher following Quickwit's exact pattern for optimal cache performance");
-    eprintln!("🔥 QUICKWIT_DOC: Using cached Tantivy searcher with preserved cache state");
+    debug_println!("🔥 SEARCHER CACHED: Reusing cached searcher following Quickwit's exact pattern for optimal cache performance");
+    debug_println!("🔥 QUICKWIT_DOC: Using cached Tantivy searcher with preserved cache state");
 
     // Use Quickwit's exact async document retrieval pattern: searcher.doc_async(doc_addr).await
     let tantivy_doc = searcher.doc_async(doc_address).await
         .map_err(|e| anyhow::anyhow!("Failed to retrieve document using Quickwit's async pattern: {}", e))?;
-    eprintln!("🔥 QUICKWIT_DOC: Successfully retrieved document using searcher.doc_async()");
+    debug_println!("🔥 QUICKWIT_DOC: Successfully retrieved document using searcher.doc_async()");
 
     // Get schema from searcher (same as Quickwit does)
     let schema = searcher.schema().clone();
-    eprintln!("🔥 QUICKWIT_DOC: Got schema from searcher");
+    debug_println!("🔥 QUICKWIT_DOC: Got schema from searcher");
 
     debug_println!("📄 QUICKWIT_DOC: Document retrieval completed using Quickwit's async pattern");
 
@@ -2835,7 +2835,7 @@ pub async fn perform_doc_retrieval_async_impl_thread_safe(
     segment_ord: u32,
     doc_id: u32,
 ) -> Result<jlong, anyhow::Error> {
-    eprintln!("🔥 DOC DEBUG: perform_doc_retrieval_async_impl_thread_safe called - ptr:{}, seg:{}, doc:{}", searcher_ptr, segment_ord, doc_id);
+    debug_println!("🔥 DOC DEBUG: perform_doc_retrieval_async_impl_thread_safe called - ptr:{}, seg:{}, doc:{}", searcher_ptr, segment_ord, doc_id);
     debug_println!("📄 ASYNC_IMPL: Starting thread-safe async document retrieval");
 
     if searcher_ptr == 0 {
@@ -2854,9 +2854,9 @@ pub async fn perform_doc_retrieval_async_impl_thread_safe(
     let doc_address = tantivy::DocAddress::new(segment_ord, doc_id);
 
     // Use Quickwit's async document retrieval pattern directly
-    eprintln!("🔥 DOC DEBUG: About to use Quickwit's async document retrieval pattern");
+    debug_println!("🔥 DOC DEBUG: About to use Quickwit's async document retrieval pattern");
     let (tantivy_doc, schema) = perform_quickwit_async_doc_retrieval(searcher_ptr, doc_address).await?;
-    eprintln!("🔥 DOC DEBUG: Quickwit async document retrieval completed successfully");
+    debug_println!("🔥 DOC DEBUG: Quickwit async document retrieval completed successfully");
 
     // Convert TantivyDocument to RetrievedDocument for proper object integration
     use crate::document::{DocumentWrapper, RetrievedDocument};
@@ -2866,7 +2866,7 @@ pub async fn perform_doc_retrieval_async_impl_thread_safe(
 
     debug_println!("✅ ASYNC_IMPL: Document retrieval completed successfully using real objects");
     let document_ptr = crate::utils::arc_to_jlong(wrapper_arc);
-    eprintln!("🔍 ARC_REGISTRY: Stored DocumentWrapper Arc in registry with ID: {}", document_ptr);
+    debug_println!("🔍 ARC_REGISTRY: Stored DocumentWrapper Arc in registry with ID: {}", document_ptr);
     Ok(document_ptr)
 }
 
@@ -3075,7 +3075,7 @@ async fn perform_real_quickwit_schema_retrieval(
         .ok_or_else(|| anyhow::anyhow!("❌ CRITICAL: No doc mapping available! Doc mapping must be provided when creating SplitSearcher."))?;
 
     debug_println!("📋 REAL_QUICKWIT: Doc mapping found ({} chars), parsing JSON format", doc_mapping_str.len());
-    eprintln!("🔥 RAW DOC MAPPING: {}", doc_mapping_str);
+    debug_println!("🔥 RAW DOC MAPPING: {}", doc_mapping_str);
 
     // Parse the field mappings array directly from source - no cleanup logic
     let doc_mapper: quickwit_doc_mapper::DocMapper = {
@@ -3085,14 +3085,14 @@ async fn perform_real_quickwit_schema_retrieval(
         let field_mappings: Vec<serde_json::Value> = serde_json::from_str(doc_mapping_str)
             .or_else(|_e| {
                 // If direct parsing fails, try unescaping first (for escaped JSON from some sources)
-                eprintln!("🔥 SCHEMA DEBUG: Direct parsing failed, trying unescaped version");
+                debug_println!("🔥 SCHEMA DEBUG: Direct parsing failed, trying unescaped version");
                 let unescaped = doc_mapping_str.replace("\\\"", "\"").replace("\\\\", "\\");
-                eprintln!("🔥 SCHEMA DEBUG: Unescaped JSON: '{}'", unescaped);
+                debug_println!("🔥 SCHEMA DEBUG: Unescaped JSON: '{}'", unescaped);
                 serde_json::from_str(&unescaped)
             })
             .map_err(|e| {
-                eprintln!("🔥 SCHEMA DEBUG: Both direct and unescaped parsing failed: {}", e);
-                eprintln!("🔥 SCHEMA DEBUG: Raw JSON was: '{}'", doc_mapping_str);
+                debug_println!("🔥 SCHEMA DEBUG: Both direct and unescaped parsing failed: {}", e);
+                debug_println!("🔥 SCHEMA DEBUG: Raw JSON was: '{}'", doc_mapping_str);
                 anyhow::anyhow!("Failed to parse field mappings array (tried both direct and unescaped): {} - JSON was: '{}'", e, doc_mapping_str)
             })?;
 
