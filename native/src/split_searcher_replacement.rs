@@ -1055,11 +1055,21 @@ fn retrieve_document_from_split_optimized(
                     
                     // Fallback: Get the full file data using Quickwit's storage abstraction for document retrieval
                     // (We need BundleDirectory for synchronous document access, not StorageDirectory)
-                    let file_size = index_storage.file_num_bytes(relative_path).await
-                        .map_err(|e| anyhow::anyhow!("Failed to get file size for {}: {}", split_uri, e))?;
+                    let file_size = tokio::time::timeout(
+                        std::time::Duration::from_secs(3),
+                        index_storage.file_num_bytes(relative_path)
+                    )
+                    .await
+                    .map_err(|_| anyhow::anyhow!("Timeout getting file size for {}", split_uri))?
+                    .map_err(|e| anyhow::anyhow!("Failed to get file size for {}: {}", split_uri, e))?;
 
-                    let split_data = index_storage.get_slice(relative_path, 0..file_size as usize).await
-                        .map_err(|e| anyhow::anyhow!("Failed to get split data from {}: {}", split_uri, e))?;
+                    let split_data = tokio::time::timeout(
+                        std::time::Duration::from_secs(10),
+                        index_storage.get_slice(relative_path, 0..file_size as usize)
+                    )
+                    .await
+                    .map_err(|_| anyhow::anyhow!("Timeout getting split data from {}", split_uri))?
+                    .map_err(|e| anyhow::anyhow!("Failed to get split data from {}: {}", split_uri, e))?;
 
                     let split_file_slice = tantivy::directory::FileSlice::new(std::sync::Arc::new(split_data));
                     let bundle_directory = quickwit_directories::BundleDirectory::open_split(split_file_slice)
@@ -1239,11 +1249,21 @@ fn retrieve_document_from_split(
                 debug_println!("RUST DEBUG: ⚠️ Footer metadata not available, falling back to full download");
                 
                 // Fallback: Get the full file data (original behavior for missing metadata)
-                let file_size = actual_storage.file_num_bytes(relative_path).await
-                    .map_err(|e| anyhow::anyhow!("Failed to get file size for {}: {}", split_uri, e))?;
-                
-                let split_data = actual_storage.get_slice(relative_path, 0..file_size as usize).await
-                    .map_err(|e| anyhow::anyhow!("Failed to get split data from {}: {}", split_uri, e))?;
+                let file_size = tokio::time::timeout(
+                    std::time::Duration::from_secs(3),
+                    actual_storage.file_num_bytes(relative_path)
+                )
+                .await
+                .map_err(|_| anyhow::anyhow!("Timeout getting file size for {}", split_uri))?
+                .map_err(|e| anyhow::anyhow!("Failed to get file size for {}: {}", split_uri, e))?;
+
+                let split_data = tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    actual_storage.get_slice(relative_path, 0..file_size as usize)
+                )
+                .await
+                .map_err(|_| anyhow::anyhow!("Timeout getting split data from {}", split_uri))?
+                .map_err(|e| anyhow::anyhow!("Failed to get split data from {}: {}", split_uri, e))?;
                 
                 debug_println!("RUST DEBUG: ⚠️ Downloaded full split file: {} bytes", split_data.len());
                 
@@ -1269,10 +1289,13 @@ fn retrieve_document_from_split(
             let tantivy_searcher = index_reader.searcher();
             
             // Use doc_async like Quickwit does (fetch_docs.rs line 205-207) - QUICKWIT OPTIMIZATION
-            let doc: tantivy::schema::TantivyDocument = tantivy_searcher
-                .doc_async(doc_address)
-                .await
-                .map_err(|e| anyhow::anyhow!("Failed to retrieve document at address {:?}: {}", doc_address, e))?;
+            let doc: tantivy::schema::TantivyDocument = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                tantivy_searcher.doc_async(doc_address)
+            )
+            .await
+            .map_err(|_| anyhow::anyhow!("Document retrieval timed out for {:?}", doc_address))?
+            .map_err(|e| anyhow::anyhow!("Failed to retrieve document at address {:?}: {}", doc_address, e))?;
             
             // Return the document and schema for processing
             Ok::<(tantivy::schema::TantivyDocument, tantivy::schema::Schema), anyhow::Error>((doc, index.schema()))
@@ -1321,7 +1344,7 @@ fn retrieve_documents_batch_from_split_optimized(
         // Use block_in_place to run async code synchronously (Quickwit pattern) with timeout
         tokio::task::block_in_place(|| {
             // Add timeout to prevent hanging during runtime shutdown
-            let timeout_duration = std::time::Duration::from_secs(10);
+            let timeout_duration = std::time::Duration::from_secs(5);
             runtime.block_on(tokio::time::timeout(timeout_duration, async {
                 // ✅ OPTIMIZATION: Check searcher cache first (like individual retrieval)
                 let searcher_cache = get_searcher_cache();
@@ -2872,8 +2895,13 @@ async fn perform_quickwit_async_doc_retrieval(
     debug_println!("🔥 QUICKWIT_DOC: Using cached Tantivy searcher with preserved cache state");
 
     // Use Quickwit's exact async document retrieval pattern: searcher.doc_async(doc_addr).await
-    let tantivy_doc = searcher.doc_async(doc_address).await
-        .map_err(|e| anyhow::anyhow!("Failed to retrieve document using Quickwit's async pattern: {}", e))?;
+    let tantivy_doc = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        searcher.doc_async(doc_address)
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("Document retrieval timed out for {:?}", doc_address))?
+    .map_err(|e| anyhow::anyhow!("Failed to retrieve document using Quickwit's async pattern: {}", e))?;
     debug_println!("🔥 QUICKWIT_DOC: Successfully retrieved document using searcher.doc_async()");
 
     // Get schema from searcher (same as Quickwit does)

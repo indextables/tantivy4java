@@ -108,8 +108,7 @@ impl QuickwitRuntimeManager {
 
         // Check if runtime is shutting down
         if self.is_shutting_down.load(Ordering::Acquire) {
-            debug_println!("⚠️ RUNTIME_MANAGER: block_on called during shutdown, but proceeding to avoid blocking normal operations");
-            // Don't panic - let the operation proceed even during shutdown to avoid breaking functionality
+            debug_println!("⚠️ RUNTIME_MANAGER: Runtime is shutting down, but proceeding with caution");
         }
 
         // Check if we're already in a tokio context
@@ -117,9 +116,19 @@ impl QuickwitRuntimeManager {
             panic!("block_on called from within async context - this indicates an architectural problem");
         }
 
-        let result = self.runtime.block_on(future);
-        debug_println!("✅ RUNTIME_MANAGER: Generic block_on operation completed");
-        result
+        // Try to use the runtime, but catch if it's been dropped/shutdown externally
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.runtime.block_on(future)
+        })) {
+            Ok(result) => {
+                debug_println!("✅ RUNTIME_MANAGER: Generic block_on operation completed");
+                result
+            }
+            Err(_panic_info) => {
+                debug_println!("❌ RUNTIME_MANAGER: Runtime panicked or was dropped externally - this suggests a runtime lifecycle issue");
+                panic!("Runtime was dropped externally while operation was in progress - this indicates the runtime shutdown coordination is not working properly");
+            }
+        }
     }
 
     /// Check if we're currently in the runtime context
@@ -192,8 +201,7 @@ where
 {
     let manager = QuickwitRuntimeManager::global();
 
-    // Just proceed with operation - the actual runtime shutdown coordination
-    // happens at the shutdown_with_timeout level, not at individual operation level
+    // Execute the operation with runtime failure detection
     manager.block_on(future)
 }
 
