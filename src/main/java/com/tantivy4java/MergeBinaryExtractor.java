@@ -174,7 +174,22 @@ public class MergeBinaryExtractor {
         sb.append("\"index_uid\":\"").append(escapeJson(mergeConfig.getIndexUid())).append("\",");
         sb.append("\"source_id\":\"").append(escapeJson(mergeConfig.getSourceId())).append("\",");
         sb.append("\"node_id\":\"").append(escapeJson(mergeConfig.getNodeId())).append("\",");
-        sb.append("\"aws_config\":null");  // For local testing, no AWS config needed
+        // ✅ CRITICAL FIX: Properly serialize AWS credentials for child process
+        QuickwitSplit.AwsConfig awsConfig = mergeConfig.getAwsConfig();
+        if (awsConfig != null) {
+            sb.append("\"aws_config\":{");
+            sb.append("\"access_key\":\"").append(escapeJson(awsConfig.getAccessKey())).append("\",");
+            sb.append("\"secret_key\":\"").append(escapeJson(awsConfig.getSecretKey())).append("\",");
+            sb.append("\"session_token\":").append(awsConfig.getSessionToken() != null ?
+                "\"" + escapeJson(awsConfig.getSessionToken()) + "\"" : "null").append(",");
+            sb.append("\"region\":\"").append(escapeJson(awsConfig.getRegion())).append("\",");
+            sb.append("\"endpoint_url\":").append(awsConfig.getEndpoint() != null ?
+                "\"" + escapeJson(awsConfig.getEndpoint()) + "\"" : "null").append(",");
+            sb.append("\"force_path_style\":").append(awsConfig.isForcePathStyle());
+            sb.append("}");
+        } else {
+            sb.append("\"aws_config\":null");  // For local file operations
+        }
         sb.append("},");
         if (mergeConfig.getHeapSizeBytes() != null) {
             sb.append("\"heap_size\":").append(mergeConfig.getHeapSizeBytes()).append(",");
