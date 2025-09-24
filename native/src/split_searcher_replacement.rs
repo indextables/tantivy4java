@@ -129,8 +129,14 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_createNativeWithShare
                   thread_id, start_time.elapsed().as_millis());
     debug_println!("🔗 SPLIT_SEARCHER: Thread {:?} cache_manager_ptr: 0x{:x} [{}ms]",
                   thread_id, cache_manager_ptr, start_time.elapsed().as_millis());
+
+    // Register searcher with runtime manager for lifecycle tracking
+    let runtime = crate::runtime_manager::QuickwitRuntimeManager::global();
+    runtime.register_searcher();
+    debug_println!("✅ RUNTIME_MANAGER: Searcher registered with runtime manager");
     // Validate JString parameter first to prevent SIGSEGV
     if split_uri_jstr.is_null() {
+        runtime.unregister_searcher(); // Cleanup registration on error
         to_java_exception(&mut env, &anyhow::anyhow!("Split URI parameter is null"));
         return 0;
     }
@@ -139,6 +145,7 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_createNativeWithShare
     let split_uri: String = match env.get_string(&split_uri_jstr) {
         Ok(java_str) => java_str.into(),
         Err(e) => {
+            runtime.unregister_searcher(); // Cleanup registration on error
             to_java_exception(&mut env, &anyhow::anyhow!("Failed to extract split URI: {}", e));
             return 0;
         }
@@ -146,12 +153,14 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_createNativeWithShare
     
     // Validate that the extracted string is not empty
     if split_uri.is_empty() {
+        runtime.unregister_searcher(); // Cleanup registration on error
         to_java_exception(&mut env, &anyhow::anyhow!("Split URI cannot be empty"));
         return 0;
     }
     
     // Validate cache manager pointer (though we're not using it in this implementation)
     if cache_manager_ptr == 0 {
+        runtime.unregister_searcher(); // Cleanup registration on error
         to_java_exception(&mut env, &anyhow::anyhow!("Cache manager pointer is null"));
         return 0;
     }
@@ -280,9 +289,9 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_createNativeWithShare
                 doc_mapping_json.as_ref().map(|s| format!("{}chars", s.len())).unwrap_or_else(|| "None".to_string()));
 
     // Create Tokio runtime for async operations
-    let runtime = match tokio::runtime::Builder::new_current_thread()
+    let local_runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
-        .build() 
+        .build()
     {
         Ok(rt) => rt,
         Err(e) => {
@@ -292,7 +301,7 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_createNativeWithShare
     };
     
     // Enter the runtime context and create the searcher
-    let _guard = runtime.enter();
+    let _guard = local_runtime.enter();
     
     // Create StandaloneSearcher using global caches
     // If AWS credentials are provided, use with_s3_config, otherwise use default
@@ -359,7 +368,7 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_createNativeWithShare
     match result {
         Ok(searcher) => {
             // Follow Quickwit pattern: resolve storage once and cache it for reuse
-            let storage = runtime.block_on(async {
+            let storage = local_runtime.block_on(async {
                 use crate::standalone_searcher::resolve_storage_for_split;
                 resolve_storage_for_split(&storage_resolver, &split_uri).await
             });
@@ -369,7 +378,7 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_createNativeWithShare
                     debug_println!("🔥 STORAGE RESOLVED: Storage resolved once for reuse, instance: {:p}", Arc::as_ptr(&resolved_storage));
 
                     // Follow Quickwit pattern: open index once and cache it
-                    let opened_index = runtime.block_on(async {
+                    let opened_index = local_runtime.block_on(async {
                         use quickwit_proto::search::SplitIdAndFooterOffsets;
                         use crate::global_cache::get_global_searcher_context;
 
@@ -430,7 +439,7 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_createNativeWithShare
                             // Create clean struct-based context instead of complex tuple
                             let cached_context = CachedSearcherContext {
                                 standalone_searcher: std::sync::Arc::new(searcher),
-                                runtime: std::sync::Arc::new(runtime),
+                                runtime: std::sync::Arc::new(local_runtime),
                                 split_uri: split_uri.clone(),
                                 aws_config,
                                 footer_start: split_footer_start,
@@ -462,12 +471,14 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_createNativeWithShare
                             pointer
                         },
                         Err(e) => {
+                            runtime.unregister_searcher(); // Cleanup registration on error
                             to_java_exception(&mut env, &anyhow::anyhow!("Failed to open index for split '{}': {}", split_uri, e));
                             0
                         }
                     }
                 },
                 Err(e) => {
+                    runtime.unregister_searcher(); // Cleanup registration on error
                     to_java_exception(&mut env, &anyhow::anyhow!("Failed to resolve storage for split '{}': {}", split_uri, e));
                     0
                 }
@@ -476,6 +487,7 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_createNativeWithShare
         Err(error) => {
             debug_println!("❌ SPLIT_SEARCHER: Thread {:?} FAILED after {}ms - error: {}",
                           thread_id, start_time.elapsed().as_millis(), error);
+            runtime.unregister_searcher(); // Cleanup registration on error
             to_java_exception(&mut env, &error);
             0
         }
@@ -519,6 +531,11 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_closeNative(
     // ✅ FIX: Clean up direct schema mapping when searcher is closed
     crate::split_query::remove_searcher_schema(searcher_ptr);
     debug_println!("✅ CLEANUP: Removed direct schema mapping for searcher {}", searcher_ptr);
+
+    // Unregister searcher from runtime manager
+    let runtime = crate::runtime_manager::QuickwitRuntimeManager::global();
+    runtime.unregister_searcher();
+    debug_println!("✅ RUNTIME_MANAGER: Unregistered searcher from runtime manager");
 
     // SAFE: Release Arc from registry to prevent memory leaks
     release_arc(searcher_ptr);
@@ -878,9 +895,13 @@ fn retrieve_document_from_split_optimized(
             let _guard = context.runtime.enter();
             tokio::task::block_in_place(|| {
                 context.runtime.block_on(async {
-                    let doc = searcher.doc_async(doc_address)
-                        .await
-                        .map_err(|e| anyhow::anyhow!("Failed to retrieve document: {}", e))?;
+                    let doc = tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        searcher.doc_async(doc_address)
+                    )
+                    .await
+                    .map_err(|_| anyhow::anyhow!("Document retrieval timed out for {:?}", doc_address))?
+                    .map_err(|e| anyhow::anyhow!("Failed to retrieve document: {}", e))?;
                     let schema = searcher.schema();
                     Ok::<(tantivy::schema::TantivyDocument, tantivy::schema::Schema), anyhow::Error>((doc, schema.clone()))
                 })
@@ -1081,11 +1102,15 @@ fn retrieve_document_from_split_optimized(
                 debug_println!("RUST DEBUG: ⏱️ 📖 Searcher caching completed [TIMING: {}ms]", caching_start.elapsed().as_millis());
                 debug_println!("RUST DEBUG: ⏱️ 📖 TOTAL INDEX OPENING completed [TIMING: {}ms]", index_opening_start.elapsed().as_millis());
                 
-                // Retrieve the document using async method (same as batch retrieval for StorageDirectory compatibility)
+                // Retrieve the document using async method with timeout (same as batch retrieval for StorageDirectory compatibility)
                 let doc_retrieval_start = std::time::Instant::now();
-                let doc = searcher.doc_async(doc_address)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("Failed to retrieve document: {}", e))?;
+                let doc = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    searcher.doc_async(doc_address)
+                )
+                .await
+                .map_err(|_| anyhow::anyhow!("Document retrieval timed out for {:?}", doc_address))?
+                .map_err(|e| anyhow::anyhow!("Failed to retrieve document: {}", e))?;
                 let schema = index.schema();
                 debug_println!("RUST DEBUG: ⏱️ 📖 Document retrieval completed [TIMING: {}ms]", doc_retrieval_start.elapsed().as_millis());
                 
@@ -1293,9 +1318,11 @@ fn retrieve_documents_batch_from_split_optimized(
 
         let _guard = runtime.enter();
         
-        // Use block_in_place to run async code synchronously (Quickwit pattern)
+        // Use block_in_place to run async code synchronously (Quickwit pattern) with timeout
         tokio::task::block_in_place(|| {
-            runtime.block_on(async {
+            // Add timeout to prevent hanging during runtime shutdown
+            let timeout_duration = std::time::Duration::from_secs(10);
+            runtime.block_on(tokio::time::timeout(timeout_duration, async {
                 // ✅ OPTIMIZATION: Check searcher cache first (like individual retrieval)
                 let searcher_cache = get_searcher_cache();
                 let cached_searcher_option = {
@@ -1315,10 +1342,14 @@ fn retrieve_documents_batch_from_split_optimized(
                         let moved_searcher = cached_searcher.clone(); // Reuse cached searcher
                         let moved_schema = schema.clone();
                         async move {
-                            let doc: tantivy::schema::TantivyDocument = moved_searcher
-                                .doc_async(doc_addr)
-                                .await
-                                .map_err(|e| anyhow::anyhow!("Failed to retrieve document at address {:?}: {}", doc_addr, e))?;
+                            // Add timeout to individual doc_async calls to prevent hanging
+                            let doc: tantivy::schema::TantivyDocument = tokio::time::timeout(
+                                std::time::Duration::from_secs(5),
+                                moved_searcher.doc_async(doc_addr)
+                            )
+                            .await
+                            .map_err(|_| anyhow::anyhow!("Document retrieval timed out for {:?}", doc_addr))?
+                            .map_err(|e| anyhow::anyhow!("Failed to retrieve document at address {:?}: {}", doc_addr, e))?;
 
                             // Create a RetrievedDocument and register it
                             use crate::document::{DocumentWrapper, RetrievedDocument};
@@ -1469,11 +1500,14 @@ fn retrieve_documents_batch_from_split_optimized(
                     let moved_searcher = tantivy_searcher.clone(); // Clone Arc for concurrent access
                     let moved_schema = schema.clone(); // Clone schema for each future
                     async move {
-                        // Use doc_async like Quickwit - QUICKWIT OPTIMIZATION (fetch_docs.rs line 205-207)
-                        let doc: tantivy::schema::TantivyDocument = moved_searcher
-                            .doc_async(doc_addr)
-                            .await
-                            .map_err(|e| anyhow::anyhow!("Failed to retrieve document at address {:?}: {}", doc_addr, e))?;
+                        // Use doc_async like Quickwit with timeout - QUICKWIT OPTIMIZATION (fetch_docs.rs line 205-207)
+                        let doc: tantivy::schema::TantivyDocument = tokio::time::timeout(
+                            std::time::Duration::from_secs(5),
+                            moved_searcher.doc_async(doc_addr)
+                        )
+                        .await
+                        .map_err(|_| anyhow::anyhow!("Document retrieval timed out for {:?}", doc_addr))?
+                        .map_err(|e| anyhow::anyhow!("Failed to retrieve document at address {:?}: {}", doc_addr, e))?;
 
                         // Create a RetrievedDocument and register it
                         use crate::document::{DocumentWrapper, RetrievedDocument};
@@ -1496,7 +1530,11 @@ fn retrieve_documents_batch_from_split_optimized(
                     .map_err(|e| anyhow::anyhow!("Concurrent document retrieval failed: {}", e))?;
                 
                 Ok::<Vec<jobject>, anyhow::Error>(doc_ptrs)
-            })
+            }))
+            .map_err(|timeout_err| {
+                debug_println!("🕐 TIMEOUT: Document retrieval timed out after 10 seconds: {}", timeout_err);
+                anyhow::anyhow!("Document retrieval timed out after 10 seconds - likely due to runtime shutdown")
+            })?
         })
     });
     
