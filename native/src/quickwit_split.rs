@@ -2202,12 +2202,9 @@ pub fn merge_splits_impl(split_urls: &[String], output_path: &str, config: &Inte
         let config_clone = config.clone();
 
         match std::thread::spawn(move || {
-            let blocking_runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|e| anyhow!("Failed to create blocking runtime: {}", e))?;
-
-            blocking_runtime.block_on(
+            // ✅ CRITICAL FIX: Use shared global runtime instead of creating separate runtime
+            // This eliminates multiple Tokio runtime conflicts that cause deadlocks
+            QuickwitRuntimeManager::global().handle().block_on(
                 download_and_extract_splits_parallel(&split_urls_vec, &merge_id_clone, &config_clone)
             )
         }).join() {
@@ -3239,12 +3236,9 @@ fn create_merged_split_file(merged_index_path: &Path, output_path: &str, metadat
         let config_clone = default_config.clone();
 
         std::thread::spawn(move || {
-            let blocking_runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|e| anyhow!("Failed to create blocking runtime for split creation: {}", e))?;
-
-            blocking_runtime.block_on(create_quickwit_split(
+            // ✅ CRITICAL FIX: Use shared global runtime instead of creating separate runtime
+            // This eliminates multiple Tokio runtime conflicts that cause deadlocks
+            QuickwitRuntimeManager::global().handle().block_on(create_quickwit_split(
                 &merged_index_clone,
                 &merged_index_path_clone,
                 &output_path_clone,
