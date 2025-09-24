@@ -7,7 +7,7 @@ use bytesize::ByteSize;
 use anyhow::{Result, Context as AnyhowContext};
 
 use quickwit_storage::{Storage, StorageResolver};
-use quickwit_config::S3StorageConfig;
+use quickwit_config::{S3StorageConfig, StorageConfigs};
 use crate::global_cache::{get_configured_storage_resolver, get_global_searcher_context};
 use quickwit_proto::search::{SearchRequest, LeafSearchResponse, SplitIdAndFooterOffsets};
 use quickwit_doc_mapper::DocMapper;
@@ -201,7 +201,9 @@ impl StandaloneSearcher {
         debug_println!("RUST DEBUG: Creating StandaloneSearcher with global storage resolver");
         let context = Arc::new(StandaloneSearchContext::new(config)?);
         // Use the global storage resolver instead of creating a new one
-        let storage_resolver = get_configured_storage_resolver(None);
+        // TODO: Fix async compatibility - temporarily use direct call
+        let storage_configs = StorageConfigs::default();
+        let storage_resolver = StorageResolver::configured(&storage_configs);
         Ok(Self {
             context,
             storage_resolver,

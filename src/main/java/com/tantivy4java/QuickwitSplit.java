@@ -632,6 +632,8 @@ public class QuickwitSplit {
         private final List<String> deleteQueries;
         private final AwsConfig awsConfig;
         private final String tempDirectoryPath;
+        private final Long heapSizeBytes;
+        private final boolean debugEnabled;
 
         /**
          * Create a new merge configuration.
@@ -644,9 +646,11 @@ public class QuickwitSplit {
          * @param deleteQueries Optional list of delete queries to apply during merge
          * @param awsConfig AWS configuration for S3 access (optional)
          * @param tempDirectoryPath Custom path for temporary directories (optional, platform-specific)
+         * @param heapSizeBytes Heap size in bytes for merge operations (optional, null for default 15MB)
+         * @param debugEnabled Enable debug logging in child merge process
          */
         public MergeConfig(String indexUid, String sourceId, String nodeId, String docMappingUid,
-                          long partitionId, List<String> deleteQueries, AwsConfig awsConfig, String tempDirectoryPath) {
+                          long partitionId, List<String> deleteQueries, AwsConfig awsConfig, String tempDirectoryPath, Long heapSizeBytes, boolean debugEnabled) {
             this.indexUid = indexUid;
             this.sourceId = sourceId;
             this.nodeId = nodeId;
@@ -655,6 +659,8 @@ public class QuickwitSplit {
             this.deleteQueries = deleteQueries;
             this.awsConfig = awsConfig;
             this.tempDirectoryPath = tempDirectoryPath;
+            this.heapSizeBytes = heapSizeBytes;
+            this.debugEnabled = debugEnabled;
         }
 
         /**
@@ -670,12 +676,12 @@ public class QuickwitSplit {
          */
         public MergeConfig(String indexUid, String sourceId, String nodeId, String docMappingUid,
                           long partitionId, List<String> deleteQueries, AwsConfig awsConfig) {
-            this(indexUid, sourceId, nodeId, docMappingUid, partitionId, deleteQueries, awsConfig, null);
+            this(indexUid, sourceId, nodeId, docMappingUid, partitionId, deleteQueries, awsConfig, null, null, false);
         }
         
         /**
          * Create a new merge configuration without AWS config.
-         * 
+         *
          * @param indexUid Unique identifier for the index
          * @param sourceId Source identifier
          * @param nodeId Node identifier that will create the merged split
@@ -685,30 +691,30 @@ public class QuickwitSplit {
          */
         public MergeConfig(String indexUid, String sourceId, String nodeId, String docMappingUid,
                           long partitionId, List<String> deleteQueries) {
-            this(indexUid, sourceId, nodeId, docMappingUid, partitionId, deleteQueries, null);
+            this(indexUid, sourceId, nodeId, docMappingUid, partitionId, deleteQueries, null, null, null, false);
         }
 
         /**
          * Create a minimal merge configuration.
-         * 
+         *
          * @param indexUid Unique identifier for the index
          * @param sourceId Source identifier
          * @param nodeId Node identifier that will create the merged split
          */
         public MergeConfig(String indexUid, String sourceId, String nodeId) {
-            this(indexUid, sourceId, nodeId, "default", 0L, null, null);
+            this(indexUid, sourceId, nodeId, "default", 0L, null, null, null, null, false);
         }
-        
+
         /**
          * Create a merge configuration with AWS config for S3 splits.
-         * 
+         *
          * @param indexUid Unique identifier for the index
          * @param sourceId Source identifier
          * @param nodeId Node identifier that will create the merged split
          * @param awsConfig AWS configuration for S3 access
          */
         public MergeConfig(String indexUid, String sourceId, String nodeId, AwsConfig awsConfig) {
-            this(indexUid, sourceId, nodeId, "default", 0L, null, awsConfig);
+            this(indexUid, sourceId, nodeId, "default", 0L, null, awsConfig, null, null, false);
         }
 
         /**
@@ -721,7 +727,32 @@ public class QuickwitSplit {
          * @param tempDirectoryPath Custom temp directory path (e.g., "/local_disk0" for Databricks)
          */
         public MergeConfig(String indexUid, String sourceId, String nodeId, AwsConfig awsConfig, String tempDirectoryPath) {
-            this(indexUid, sourceId, nodeId, "default", 0L, null, awsConfig, tempDirectoryPath);
+            this(indexUid, sourceId, nodeId, "default", 0L, null, awsConfig, tempDirectoryPath, null, false);
+        }
+
+        /**
+         * Create a merge configuration with heap size control.
+         *
+         * @param indexUid Unique identifier for the index
+         * @param sourceId Source identifier
+         * @param nodeId Node identifier that will create the merged split
+         * @param heapSizeBytes Heap size in bytes for merge operations
+         */
+        public MergeConfig(String indexUid, String sourceId, String nodeId, Long heapSizeBytes) {
+            this(indexUid, sourceId, nodeId, "default", 0L, null, null, null, heapSizeBytes, false);
+        }
+
+        /**
+         * Create a merge configuration with debug enabled.
+         *
+         * @param indexUid Unique identifier for the index
+         * @param sourceId Source identifier
+         * @param nodeId Node identifier that will create the merged split
+         * @param awsConfig AWS configuration for S3 access
+         * @param debugEnabled Enable debug logging in child merge process
+         */
+        public MergeConfig(String indexUid, String sourceId, String nodeId, AwsConfig awsConfig, boolean debugEnabled) {
+            this(indexUid, sourceId, nodeId, "default", 0L, null, awsConfig, null, null, debugEnabled);
         }
 
         // Getters
@@ -733,6 +764,8 @@ public class QuickwitSplit {
         public List<String> getDeleteQueries() { return deleteQueries; }
         public AwsConfig getAwsConfig() { return awsConfig; }
         public String getTempDirectoryPath() { return tempDirectoryPath; }
+        public Long getHeapSizeBytes() { return heapSizeBytes; }
+        public boolean isDebugEnabled() { return debugEnabled; }
     }
 
     /**

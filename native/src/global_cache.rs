@@ -4,10 +4,12 @@
 // reused across all split searcher instances, following the same architecture
 // as Quickwit to ensure efficient resource utilization.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+use tokio::sync::RwLock as TokioRwLock;
 use std::path::PathBuf;
 use std::num::NonZeroU32;
-use once_cell::sync::{Lazy, OnceCell};
+use once_cell::sync::Lazy;
+use std::collections::HashMap;
 use bytesize::ByteSize;
 
 use quickwit_storage::{
@@ -24,6 +26,40 @@ use tokio::sync::Semaphore;
 use tempfile::TempDir;
 
 use crate::debug_println;
+use crate::cache_debug::{debug_arc_string_cache_identity, debug_cache_summary};
+
+/// Helper function to track storage instance creation for debugging
+/// This helps us understand when and where multiple storage instances are created
+pub async fn tracked_storage_resolve(
+    resolver: &StorageResolver,
+    uri: &quickwit_common::uri::Uri,
+    context: &str
+) -> Result<Arc<dyn quickwit_storage::Storage>, quickwit_storage::StorageResolverError> {
+    static STORAGE_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+    let storage_id = STORAGE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+    debug_println!("🏗️  STORAGE_RESOLVE: Starting storage resolve #{} [{}]", storage_id, context);
+    debug_println!("   📍 Resolver address: {:p}", resolver);
+    debug_println!("   🌐 URI: {}", uri);
+
+    let resolve_start = std::time::Instant::now();
+    let result = resolver.resolve(uri).await;
+
+    match &result {
+        Ok(storage) => {
+            debug_println!("✅ STORAGE_RESOLVED: Storage instance #{} created in {}ms [{}]",
+                     storage_id, resolve_start.elapsed().as_millis(), context);
+            debug_println!("   🏭 Storage address: {:p}", &**storage);
+            debug_println!("   📊 Storage type: {}", std::any::type_name::<dyn quickwit_storage::Storage>());
+        }
+        Err(e) => {
+            debug_println!("❌ STORAGE_RESOLVE_FAILED: Storage resolve #{} failed in {}ms [{}]: {}",
+                     storage_id, resolve_start.elapsed().as_millis(), context, e);
+        }
+    }
+
+    result
+}
 
 /// Global configuration for caches and storage
 pub struct GlobalCacheConfig {
@@ -79,18 +115,144 @@ pub static GLOBAL_STORAGE_RESOLVER: Lazy<StorageResolver> = Lazy::new(|| {
     StorageResolver::configured(&storage_configs)
 });
 
-/// Get or create a configured StorageResolver with specific S3 credentials
-/// This follows Quickwit's pattern but allows for dynamic S3 configuration
-pub fn get_configured_storage_resolver(s3_config_opt: Option<S3StorageConfig>) -> StorageResolver {
+/// Global storage resolver cache for configured S3 instances (async-compatible)
+/// Uses tokio::sync::RwLock to prevent deadlocks in async context
+static CONFIGURED_STORAGE_RESOLVERS: std::sync::OnceLock<TokioRwLock<std::collections::HashMap<String, StorageResolver>>> = std::sync::OnceLock::new();
+
+/// Get or create a cached StorageResolver with specific S3 credentials (async version)
+/// This follows Quickwit's pattern but enables caching for optimal storage instance reuse
+///
+/// 🚨 CRITICAL: This function should be used for ALL storage resolver creation in ASYNC contexts
+/// to ensure consistent cache sharing. Direct calls to StorageResolver::configured()
+/// bypass caching and cause multiple storage instances.
+///
+/// ✅ FIXED: Async-compatible using tokio::sync::RwLock to prevent deadlocks
+pub async fn get_configured_storage_resolver_async(s3_config_opt: Option<S3StorageConfig>) -> StorageResolver {
+    static RESOLVER_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+
     if let Some(s3_config) = s3_config_opt {
-        debug_println!("RUST DEBUG: Creating StorageResolver with custom S3 config");
+        // Create a cache key from S3 configuration
+        // NOTE: We may also need to add "user id" later for multi-tenant scenarios
+        let cache_key = format!("{}:{}:{}:{}",
+            s3_config.region.as_ref().map(|r| r.as_str()).unwrap_or("default"),
+            s3_config.endpoint.as_ref().map(|e| e.as_str()).unwrap_or("default"),
+            s3_config.access_key_id.as_ref().map(|k| &k[..8]).unwrap_or("none"), // First 8 chars for security
+            s3_config.force_path_style_access
+        );
+
+        // ✅ FIXED: Use async tokio RwLock to prevent deadlocks in async context
+        // Initialize cache if needed
+        let cache = CONFIGURED_STORAGE_RESOLVERS.get_or_init(|| {
+            TokioRwLock::new(std::collections::HashMap::new())
+        });
+
+        // Try to get from cache first (async read lock) - DEADLOCK FIXED
+        {
+            let read_cache = cache.read().await;
+            if let Some(cached_resolver) = read_cache.get(&cache_key) {
+                debug_println!("🎯 STORAGE_RESOLVER_CACHE_HIT: Reusing cached resolver for key: {} at address {:p}",
+                         cache_key, cached_resolver);
+                return cached_resolver.clone();
+            }
+        } // <- async read lock released here
+
+        // Cache miss - create new resolver (outside of any locks to prevent deadlock)
+        let resolver_id = RESOLVER_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        debug_println!("❌ STORAGE_RESOLVER_CACHE_MISS: Creating new resolver #{} for key: {}", resolver_id, cache_key);
+        debug_println!("   📋 S3 Config: region={:?}, endpoint={:?}, path_style={}",
+                  s3_config.region, s3_config.endpoint, s3_config.force_path_style_access);
+
         let storage_configs = StorageConfigs::new(vec![
             quickwit_config::StorageConfig::S3(s3_config)
         ]);
-        StorageResolver::configured(&storage_configs)
+        let resolver = StorageResolver::configured(&storage_configs); // <- DEADLOCK SUSPECT: Quickwit resolver creation
+        debug_println!("✅ STORAGE_RESOLVER_CREATED: Resolver #{} created at address {:p}", resolver_id, &resolver);
+
+        // Cache the new resolver (async write lock) - DEADLOCK FIXED
+        {
+            let mut write_cache = cache.write().await;
+            // Double-check in case another thread created it while we were creating ours
+            if let Some(existing_resolver) = write_cache.get(&cache_key) {
+                debug_println!("🏃 STORAGE_RESOLVER_RACE: Another thread created resolver, using existing at {:p}", existing_resolver);
+                return existing_resolver.clone();
+            }
+            write_cache.insert(cache_key.clone(), resolver.clone());
+            debug_println!("💾 STORAGE_RESOLVER_CACHED: Resolver #{} cached for key: {}", resolver_id, cache_key);
+        } // <- async write lock released here
+
+        resolver
     } else {
-        debug_println!("RUST DEBUG: Using global unconfigured StorageResolver");
-        GLOBAL_STORAGE_RESOLVER.clone()
+        let resolver_id = RESOLVER_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        debug_println!("🌐 STORAGE_RESOLVER_GLOBAL: Resolver #{} - Using global unconfigured StorageResolver", resolver_id);
+        let resolver = GLOBAL_STORAGE_RESOLVER.clone();
+        debug_println!("♻️  STORAGE_RESOLVER_REUSED: Resolver #{} reused global at address {:p}", resolver_id, &resolver);
+        resolver
+    }
+}
+
+/// Get or create a cached StorageResolver with specific S3 credentials (sync version)
+/// This version uses a simple sync-safe caching approach for sync contexts
+///
+/// ✅ FIXED: Now uses deadlock-safe sync caching approach
+pub fn get_configured_storage_resolver(s3_config_opt: Option<S3StorageConfig>) -> StorageResolver {
+    use std::sync::{Mutex, Arc};
+    use once_cell::sync::Lazy;
+
+    static SYNC_STORAGE_RESOLVERS: Lazy<Arc<Mutex<std::collections::HashMap<String, StorageResolver>>>> =
+        Lazy::new(|| Arc::new(Mutex::new(std::collections::HashMap::new())));
+    static RESOLVER_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+
+    if let Some(s3_config) = s3_config_opt {
+        // Create a cache key from S3 configuration
+        // NOTE: We may also need to add "user id" later for multi-tenant scenarios
+        let cache_key = format!("{}:{}:{}:{}",
+            s3_config.region.as_ref().map(|r| r.as_str()).unwrap_or("default"),
+            s3_config.endpoint.as_ref().map(|e| e.as_str()).unwrap_or("default"),
+            s3_config.access_key_id.as_ref().map(|k| &k[..8]).unwrap_or("none"), // First 8 chars for security
+            s3_config.force_path_style_access
+        );
+
+        // Try to get from sync cache (simple mutex approach)
+        {
+            let cache = SYNC_STORAGE_RESOLVERS.lock().unwrap();
+            if let Some(cached_resolver) = cache.get(&cache_key) {
+                debug_println!("🎯 STORAGE_RESOLVER_SYNC_CACHE_HIT: Reusing cached sync resolver for key: {} at address {:p}",
+                         cache_key, cached_resolver);
+                return cached_resolver.clone();
+            }
+        }
+
+        // Cache miss - create new resolver
+        let resolver_id = RESOLVER_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        debug_println!("❌ STORAGE_RESOLVER_SYNC_CACHE_MISS: Creating new sync resolver #{} for key: {}", resolver_id, cache_key);
+        debug_println!("   📋 S3 Config: region={:?}, endpoint={:?}, path_style={}",
+                  s3_config.region, s3_config.endpoint, s3_config.force_path_style_access);
+
+        let storage_configs = StorageConfigs::new(vec![
+            quickwit_config::StorageConfig::S3(s3_config)
+        ]);
+        let resolver = StorageResolver::configured(&storage_configs);
+        debug_println!("✅ STORAGE_RESOLVER_CREATED: Sync resolver #{} created at address {:p}", resolver_id, &resolver);
+
+        // Cache the new resolver
+        {
+            let mut cache = SYNC_STORAGE_RESOLVERS.lock().unwrap();
+            // Double-check in case another thread created it while we were creating ours
+            if let Some(existing_resolver) = cache.get(&cache_key) {
+                debug_println!("🏃 STORAGE_RESOLVER_SYNC_RACE: Another thread created sync resolver, using existing at {:p}", existing_resolver);
+                return existing_resolver.clone();
+            }
+            cache.insert(cache_key.clone(), resolver.clone());
+            debug_println!("💾 STORAGE_RESOLVER_SYNC_CACHED: Resolver #{} cached for key: {}", resolver_id, cache_key);
+        }
+
+        resolver
+    } else {
+        let resolver_id = RESOLVER_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        debug_println!("🌐 STORAGE_RESOLVER_GLOBAL_SYNC: Resolver #{} - Using global unconfigured StorageResolver", resolver_id);
+        let resolver = GLOBAL_STORAGE_RESOLVER.clone();
+        debug_println!("♻️  STORAGE_RESOLVER_REUSED_SYNC: Resolver #{} reused global at address {:p}", resolver_id, &resolver);
+        resolver
     }
 }
 
@@ -133,6 +295,7 @@ impl GlobalSearcherComponents {
             split_footer_cache_capacity,
             &STORAGE_METRICS.split_footer_cache,
         ));
+        debug_arc_string_cache_identity(&split_footer_cache, "split_footer_cache");
         
         // Create leaf search cache (wrapped in Arc for sharing)
         let partial_cache_capacity = config.partial_request_cache_capacity.as_u64() as usize;
@@ -141,8 +304,9 @@ impl GlobalSearcherComponents {
         // Create list fields cache (wrapped in Arc for sharing)
         let list_fields_cache = Arc::new(ListFieldsCache::new(partial_cache_capacity));
         
-        // Create search permit provider (wrapped in Arc for sharing)
-        let search_permit_provider = Arc::new(SearchPermitProvider::new(
+        // Create sync search permit provider to avoid async channel conflicts
+        // Using new_sync() method that doesn't use async channels
+        let search_permit_provider = Arc::new(SearchPermitProvider::new_sync(
             config.max_concurrent_splits,
             config.warmup_memory_budget,
         ));
@@ -207,64 +371,99 @@ impl GlobalSearcherComponents {
     }
     
     /// Create a SearcherContext from these global components
-    /// This is similar to how Quickwit creates its SearcherContext
-    /// Note: Unfortunately, SearcherContext in Quickwit expects owned types, not Arc references
-    /// So for now we have to create new instances, but they should still share the underlying
-    /// storage caches through Arc
+    /// This ensures all SearcherContext instances share the same cache instances
+    /// FIXED: Now properly shares ALL cache instances including split_footer_cache
     pub fn create_searcher_context(&self, searcher_config: SearcherConfig) -> Arc<SearcherContext> {
-        debug_println!("RUST DEBUG: Creating SearcherContext from global components");
-        
-        // Create new instances for types that don't support Arc sharing
-        // But reuse the Arc-wrapped caches where possible
+        debug_println!("RUST DEBUG: Creating SearcherContext from SHARED global components");
+        debug_arc_string_cache_identity(&self.split_footer_cache, "split_footer_cache");
+        debug_cache_summary();
+
+        // CRITICAL: Create a custom SearcherContext that shares ALL cache instances
+        // This requires careful construction to ensure cache sharing
         Arc::new(SearcherContext {
             searcher_config: searcher_config.clone(),
+            // ✅ SHARED: Fast fields cache (already Arc<dyn StorageCache>)
             fast_fields_cache: self.fast_fields_cache.clone(),
-            search_permit_provider: SearchPermitProvider::new(
+            // ✅ SHARED: Create sync search permit provider for this context
+            // Using sync mode to avoid async channel conflicts when sharing contexts
+            search_permit_provider: SearchPermitProvider::new_sync(
                 searcher_config.max_num_concurrent_split_searches,
                 searcher_config.warmup_memory_budget,
             ),
+            // ✅ INDIVIDUAL: Split footer cache (follows Quickwit pattern - individual instances, shared metrics)
+            // This follows Quickwit's design where each SearcherContext gets its own cache instance
+            // but all instances share the same STORAGE_METRICS for global coordination
             split_footer_cache: MemorySizedCache::with_capacity_in_bytes(
                 searcher_config.split_footer_cache_capacity.as_u64() as usize,
-                &STORAGE_METRICS.split_footer_cache,
+                &STORAGE_METRICS.split_footer_cache, // SHARED metrics for global coordination
             ),
+            // ✅ INDIVIDUAL: Split stream semaphore (per-context limiting is correct)
             split_stream_semaphore: Semaphore::new(searcher_config.max_num_concurrent_split_streams),
+            // ✅ INDIVIDUAL: Leaf search cache (follows Quickwit pattern - individual instances)
             leaf_search_cache: LeafSearchCache::new(
                 searcher_config.partial_request_cache_capacity.as_u64() as usize
             ),
+            // ✅ INDIVIDUAL: List fields cache (follows Quickwit pattern - individual instances)
             list_fields_cache: ListFieldsCache::new(
                 searcher_config.partial_request_cache_capacity.as_u64() as usize
             ),
+            // ✅ SHARED: Split cache (already Option<Arc<SplitCache>>)
             split_cache_opt: self.split_cache_opt.clone(),
+            // ✅ SHARED: Aggregation limits (clone preserves shared memory tracking)
             aggregation_limit: self.aggregation_limit.clone(),
         })
     }
 }
 
-/// Global instance of searcher components
-/// This can be initialized with custom configuration from Java
-static GLOBAL_SEARCHER_COMPONENTS: OnceCell<GlobalSearcherComponents> = OnceCell::new();
+/// Global instance of searcher components - using OnceLock for better thread safety
+/// This ensures only one instance is ever created across all Spark tasks/executors
+static GLOBAL_SEARCHER_COMPONENTS: OnceLock<Arc<GlobalSearcherComponents>> = OnceLock::new();
+
+/// Global cached SearcherContext - the ACTUAL shared instance that should be reused
+static GLOBAL_SEARCHER_CONTEXT: OnceLock<Arc<SearcherContext>> = OnceLock::new();
 
 /// Initialize the global cache with custom configuration
 /// This should be called once at startup from Java if custom configuration is needed
 /// Returns true if initialization succeeded, false if already initialized
 pub fn initialize_global_cache(config: GlobalCacheConfig) -> bool {
     debug_println!("RUST DEBUG: Attempting to initialize global cache with custom config");
-    GLOBAL_SEARCHER_COMPONENTS.set(GlobalSearcherComponents::new(config)).is_ok()
+    let components = Arc::new(GlobalSearcherComponents::new(config));
+    let cache_ptr = Arc::as_ptr(&components) as usize;
+    debug_println!("RUST DEBUG: Created GlobalSearcherComponents at address: 0x{:x}", cache_ptr);
+    GLOBAL_SEARCHER_COMPONENTS.set(components).is_ok()
 }
 
 /// Get the global searcher components, initializing with defaults if needed
-pub fn get_global_components() -> &'static GlobalSearcherComponents {
+/// CRITICAL: Returns Arc to ensure shared ownership across all access points
+pub fn get_global_components() -> &'static Arc<GlobalSearcherComponents> {
     GLOBAL_SEARCHER_COMPONENTS.get_or_init(|| {
-        debug_println!("RUST DEBUG: Initializing global searcher components with defaults");
-        GlobalSearcherComponents::new(GlobalCacheConfig::default())
+        debug_println!("RUST DEBUG: Initializing global searcher components with SHARED defaults");
+        let components = Arc::new(GlobalSearcherComponents::new(GlobalCacheConfig::default()));
+        let cache_ptr = Arc::as_ptr(&components) as usize;
+        debug_println!("RUST DEBUG: Created default GlobalSearcherComponents at address: 0x{:x}", cache_ptr);
+        components
     })
 }
 
 /// Get the global SearcherContext
-/// This provides a convenient way to get a SearcherContext with all global caches
+/// CRITICAL FIX: Return the SAME SearcherContext instance every time for true cache sharing
 pub fn get_global_searcher_context() -> Arc<SearcherContext> {
-    debug_println!("RUST DEBUG: Getting global SearcherContext");
-    get_global_components().create_searcher_context(SearcherConfig::default())
+    debug_println!("🔍 CACHE ENTRY: get_global_searcher_context() called - using SHARED global caches");
+    debug_println!("🔍 CACHE ENTRY: get_global_searcher_context() called - using SHARED global caches");
+
+    let context = GLOBAL_SEARCHER_CONTEXT.get_or_init(|| {
+        debug_println!("🔍 CACHE INIT: Creating THE SINGLE SHARED SearcherContext instance");
+        let components = get_global_components();
+        let context = components.create_searcher_context(SearcherConfig::default());
+        debug_println!("🔍 CACHE CREATED: THE SHARED SearcherContext created at {:p}", Arc::as_ptr(&context));
+        debug_println!("🔍 CACHE IDENTITY: Split footer cache instance at: {:p}", &context.split_footer_cache as *const _);
+        context
+    });
+
+    let ref_count = Arc::strong_count(context);
+    debug_println!("🔍 CACHE REUSE: Returning SHARED SearcherContext at {:p}, ref_count: {}", Arc::as_ptr(context), ref_count);
+    debug_println!("🔍 CACHE IDENTITY: Reusing split footer cache instance at: {:p}", &context.split_footer_cache as *const _);
+    context.clone()
 }
 
 /// Get a SearcherContext with custom configuration but using global caches

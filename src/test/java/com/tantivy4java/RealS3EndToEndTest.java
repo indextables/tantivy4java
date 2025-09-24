@@ -1853,12 +1853,84 @@ public class RealS3EndToEndTest {
      * Simple JSON field extraction
      */
     private String extractJsonField(String json, String fieldName) {
-        String pattern = "\"" + fieldName + "\":\\s*\"?([^,}]*)\"?";
-        java.util.regex.Pattern regex = java.util.regex.Pattern.compile(pattern);
-        java.util.regex.Matcher matcher = regex.matcher(json);
-        if (matcher.find()) {
-            return matcher.group(1).trim();
+        try {
+            // Find the field name in the JSON
+            int fieldStart = json.indexOf("\"" + fieldName + "\":");
+            if (fieldStart == -1) {
+                throw new RuntimeException("Field '" + fieldName + "' not found in JSON");
+            }
+
+            // Find the start of the value after the colon
+            int valueStart = json.indexOf(":", fieldStart) + 1;
+            while (valueStart < json.length() && Character.isWhitespace(json.charAt(valueStart))) {
+                valueStart++;
+            }
+
+            if (valueStart >= json.length()) {
+                throw new RuntimeException("No value found for field '" + fieldName + "'");
+            }
+
+            char firstChar = json.charAt(valueStart);
+            int valueEnd;
+
+            if (firstChar == '"') {
+                // String value - find the matching closing quote, handling escapes properly
+                valueEnd = valueStart + 1;
+                while (valueEnd < json.length()) {
+                    char c = json.charAt(valueEnd);
+                    if (c == '"' && (valueEnd == valueStart + 1 || json.charAt(valueEnd - 1) != '\\')) {
+                        break;
+                    }
+                    valueEnd++;
+                }
+                // Return the string content without the surrounding quotes
+                return json.substring(valueStart + 1, valueEnd);
+            } else if (firstChar == '[') {
+                // Array value - find the matching closing bracket using proper bracket counting
+                int bracketCount = 1;
+                valueEnd = valueStart + 1;
+                boolean inString = false;
+                while (valueEnd < json.length() && bracketCount > 0) {
+                    char c = json.charAt(valueEnd);
+                    if (c == '"' && (valueEnd == 0 || json.charAt(valueEnd - 1) != '\\')) {
+                        inString = !inString;
+                    } else if (!inString) {
+                        if (c == '[') bracketCount++;
+                        else if (c == ']') bracketCount--;
+                    }
+                    valueEnd++;
+                }
+                return json.substring(valueStart, valueEnd);
+            } else if (firstChar == '{') {
+                // Object value - find the matching closing brace using proper brace counting
+                int braceCount = 1;
+                valueEnd = valueStart + 1;
+                boolean inString = false;
+                while (valueEnd < json.length() && braceCount > 0) {
+                    char c = json.charAt(valueEnd);
+                    if (c == '"' && (valueEnd == 0 || json.charAt(valueEnd - 1) != '\\')) {
+                        inString = !inString;
+                    } else if (!inString) {
+                        if (c == '{') braceCount++;
+                        else if (c == '}') braceCount--;
+                    }
+                    valueEnd++;
+                }
+                return json.substring(valueStart, valueEnd);
+            } else {
+                // Primitive value (number, boolean, null) - find next comma or closing brace
+                valueEnd = valueStart;
+                while (valueEnd < json.length()) {
+                    char c = json.charAt(valueEnd);
+                    if (c == ',' || c == '}') {
+                        break;
+                    }
+                    valueEnd++;
+                }
+                return json.substring(valueStart, valueEnd).trim();
+            }
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to extract field '" + fieldName + "' from JSON: " + e.getMessage(), e);
         }
-        throw new RuntimeException("Field '" + fieldName + "' not found in JSON");
     }
 }

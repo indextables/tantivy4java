@@ -22,6 +22,10 @@ use jni::sys::jstring;
 use jni::JNIEnv;
 
 mod debug;  // Debug utilities and conditional logging
+mod cache_debug;  // Enhanced cache debugging and monitoring utilities
+mod runtime_manager;  // Global Quickwit runtime manager for async-first architecture
+mod async_jni_bridge;  // Async-first JNI bridge utilities
+mod async_split_searcher;  // Minimal async-first wrappers using Quickwit's existing components
 mod schema;
 mod document;
 mod query;
@@ -31,7 +35,8 @@ mod doc_address;
 mod utils;
 // mod query_conversion;  // Disabled in favor of split_query approach
 mod text_analyzer;
-mod quickwit_split;
+pub mod quickwit_split;
+pub mod merge_types;  // Types for standalone merge binary
 mod standalone_searcher;  // Clean standalone searcher implementation
 mod standalone_searcher_jni;  // JNI bindings for standalone searcher
 mod split_searcher_replacement;  // Replacement SplitSearcher JNI methods using StandaloneSearcher
@@ -52,7 +57,8 @@ pub use searcher::*;
 pub use doc_address::*;
 pub use utils::*;
 pub use text_analyzer::*;
-pub use quickwit_split::*;
+pub use quickwit_split::{perform_quickwit_merge_standalone, merge_splits_impl, InternalMergeConfig, InternalAwsConfig};
+pub use merge_types::*;
 // pub use split_searcher::*;  // Disabled - now using replacement JNI methods
 // pub use split_searcher_simple::*;  // Disabled to avoid conflicts
 

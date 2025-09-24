@@ -14,7 +14,11 @@ use quickwit_query::query_ast::{QueryAst, query_ast_from_user_text};
 use quickwit_query::JsonLiteral;
 
 // Global cache mapping split URI to schema for parseQuery field extraction
-static SPLIT_SCHEMA_CACHE: Lazy<Arc<Mutex<HashMap<String, tantivy::schema::Schema>>>> = 
+static SPLIT_SCHEMA_CACHE: Lazy<Arc<Mutex<HashMap<String, tantivy::schema::Schema>>>> =
+    Lazy::new(|| Arc::new(Mutex::new(HashMap::new())));
+
+// ✅ FIX: Direct mapping from searcher pointer to schema pointer for reliable schema access
+static SEARCHER_SCHEMA_MAPPING: Lazy<Arc<Mutex<HashMap<jlong, jlong>>>> =
     Lazy::new(|| Arc::new(Mutex::new(HashMap::new())));
 
 /// Convert a QueryAst to JSON string using Quickwit's proven serialization
@@ -164,11 +168,16 @@ pub extern "system" fn Java_com_tantivy4java_SplitQuery_parseQuery(
     schema_ptr: jlong,
     default_search_fields: jobject,
 ) -> jobject {
+    debug_println!("🚀 ENTRY: Java_com_tantivy4java_SplitQuery_parseQuery called with schema_ptr={}", schema_ptr);
     let result = parse_query_string(&mut env, query_string, schema_ptr, default_search_fields);
+    debug_println!("🚀 RESULT: parse_query_string returned result type: {}", if result.is_ok() { "Ok" } else { "Err" });
     match result {
-        Ok(query_obj) => query_obj,
+        Ok(query_obj) => {
+            debug_println!("🚀 SUCCESS: Returning valid query object");
+            query_obj
+        },
         Err(e) => {
-            debug_println!("RUST DEBUG: Error parsing query string: {}", e);
+            debug_println!("🚀 ERROR: Error parsing query string: {}", e);
             // Return null on error
             std::ptr::null_mut()
         }
@@ -465,6 +474,22 @@ fn convert_parsed_query_to_query_ast(env: &mut JNIEnv, obj: &JObject) -> Result<
     
     debug_println!("RUST DEBUG: Successfully converted SplitParsedQuery to QueryAst: {:?}", query_ast);
     Ok(query_ast)
+}
+
+// Convert SplitQuery to JSON string for async operations
+pub fn convert_split_query_to_json(env: &mut JNIEnv, query_obj: &JObject) -> Result<String, String> {
+    debug_println!("🔄 CONVERT: Converting SplitQuery to JSON");
+
+    // First convert to QueryAst
+    let query_ast = convert_split_query_to_ast(env, query_obj)
+        .map_err(|e| format!("Failed to convert SplitQuery to QueryAst: {}", e))?;
+
+    // Then serialize QueryAst to JSON
+    let json_str = serde_json::to_string(&query_ast)
+        .map_err(|e| format!("Failed to serialize QueryAst to JSON: {}", e))?;
+
+    debug_println!("✅ CONVERT: Successfully converted SplitQuery to JSON: {}", json_str);
+    Ok(json_str)
 }
 
 
@@ -792,4 +817,39 @@ fn convert_phrase_query_to_query_ast(env: &mut JNIEnv, obj: &JObject) -> Result<
 
     debug_println!("RUST DEBUG: Created PhraseQuery QueryAst using FullText with Phrase mode");
     Ok(query_ast)
+}
+
+/// ✅ FIX: Store direct mapping from searcher pointer to schema pointer
+pub fn store_searcher_schema(searcher_ptr: jlong, schema_ptr: jlong) {
+    debug_println!("RUST DEBUG: Storing searcher->schema mapping: {} -> {}", searcher_ptr, schema_ptr);
+    let mut mapping = SEARCHER_SCHEMA_MAPPING.lock().unwrap();
+    mapping.insert(searcher_ptr, schema_ptr);
+    debug_println!("RUST DEBUG: Searcher schema mapping now contains {} entries", mapping.len());
+}
+
+/// ✅ FIX: Retrieve schema pointer for a searcher pointer
+pub fn get_searcher_schema(searcher_ptr: jlong) -> Option<jlong> {
+    let mapping = SEARCHER_SCHEMA_MAPPING.lock().unwrap();
+    if let Some(&schema_ptr) = mapping.get(&searcher_ptr) {
+        debug_println!("RUST DEBUG: ✅ Found schema pointer {} for searcher {}", schema_ptr, searcher_ptr);
+        Some(schema_ptr)
+    } else {
+        debug_println!("RUST DEBUG: ❌ No schema mapping found for searcher {}", searcher_ptr);
+        None
+    }
+}
+
+/// ✅ FIX: Remove schema mapping when searcher is closed
+pub fn remove_searcher_schema(searcher_ptr: jlong) -> bool {
+    let mut mapping = SEARCHER_SCHEMA_MAPPING.lock().unwrap();
+    if let Some(schema_ptr) = mapping.remove(&searcher_ptr) {
+        debug_println!("RUST DEBUG: ✅ Removed schema mapping: {} -> {}", searcher_ptr, schema_ptr);
+        // Also release the schema Arc to prevent memory leaks
+        crate::utils::release_arc(schema_ptr);
+        debug_println!("RUST DEBUG: ✅ Released schema Arc: {}", schema_ptr);
+        true
+    } else {
+        debug_println!("RUST DEBUG: ❌ No schema mapping found to remove for searcher {}", searcher_ptr);
+        false
+    }
 }
