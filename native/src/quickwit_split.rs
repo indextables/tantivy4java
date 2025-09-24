@@ -3,6 +3,7 @@ use jni::sys::jobject;
 use jni::JNIEnv;
 use crate::debug_println;
 use crate::global_cache::get_configured_storage_resolver;
+use crate::runtime_manager::QuickwitRuntimeManager;
 
 // Re-export types for standalone usage
 pub use crate::merge_types::{MergeSplitConfig, SplitMetadata, MergeAwsConfig};
@@ -54,20 +55,9 @@ use std::io::{self, Cursor, Read, Seek, SeekFrom};
 // Global atomic counter for merge operations (process-wide uniqueness)
 static GLOBAL_MERGE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-// ✅ PERFORMANCE FIX: Shared Tokio runtime to eliminate thread contention
-// Creates a single optimized runtime shared across all merge operations
-static SHARED_MERGE_RUNTIME: once_cell::sync::Lazy<tokio::runtime::Runtime> = once_cell::sync::Lazy::new(|| {
-    let worker_threads = std::cmp::max(2, num_cpus::get().clamp(2, 8)); // Conservative thread count: 2-8 threads
-    debug_log!("🚀 PERFORMANCE: Creating shared Tokio runtime with {} worker threads", worker_threads);
-
-    tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(worker_threads)
-        .max_blocking_threads(8)  // Limit blocking thread pool to prevent resource exhaustion
-        .thread_name("tantivy4java-merge")
-        .enable_all()
-        .build()
-        .expect("Failed to create shared merge runtime")
-});
+// 🚨 CRITICAL FIX: ELIMINATED SHARED_MERGE_RUNTIME to prevent multiple runtime deadlocks
+// All async operations now use the shared global QuickwitRuntimeManager runtime
+// This eliminates the deadly runtime coordination conflicts that cause production hangs
 
 /// Memory-efficient FileHandle implementation that provides lazy access to memory-mapped files
 /// This avoids loading the entire file into a Vec, significantly reducing memory usage
@@ -810,10 +800,8 @@ fn create_java_split_metadata<'a>(env: &mut JNIEnv<'a>, split_metadata: &Quickwi
 
 
 fn convert_index_from_path_impl(index_path: &str, output_path: &str, config: &SplitConfig) -> Result<QuickwitSplitMetadata, anyhow::Error> {
-    // ✅ PERFORMANCE FIX: Use shared Tokio runtime
-    let runtime = &*SHARED_MERGE_RUNTIME;
-
-    runtime.block_on(convert_index_from_path_impl_async(index_path, output_path, config))
+    // ✅ CRITICAL FIX: Use shared global runtime handle to prevent multiple runtime deadlocks
+    QuickwitRuntimeManager::global().handle().block_on(convert_index_from_path_impl_async(index_path, output_path, config))
 }
 
 /// Determines if an error is a configuration/system error that should not be bypassed
@@ -2185,9 +2173,8 @@ pub fn merge_splits_impl(split_urls: &[String], output_path: &str, config: &Inte
         debug_log!("   Consider processing in smaller batches for very large operations");
     }
     
-    // ✅ PERFORMANCE FIX: Use shared Tokio runtime to eliminate thread contention
-    // This prevents creating multiple competing thread pools (was causing negative scaling)
-    let runtime = &*SHARED_MERGE_RUNTIME;
+    // ✅ CRITICAL FIX: Use shared global runtime to prevent multiple runtime deadlocks
+    // This eliminates competing Tokio runtimes that cause production hangs
 
     // ✅ REENTRANCY FIX: Generate collision-resistant merge ID with multiple entropy sources
     let merge_id = generate_collision_resistant_merge_id();
@@ -2435,8 +2422,8 @@ pub fn merge_splits_impl(split_urls: &[String], output_path: &str, config: &Inte
     };
     
     // 3. Perform memory-efficient segment-level merge using Quickwit's implementation
-    // PERFORMANCE FIX: Use shared runtime instead of creating per-merge runtime
-    let merged_docs = SHARED_MERGE_RUNTIME.block_on(perform_quickwit_merge(
+    // ✅ CRITICAL FIX: Use shared global runtime handle to prevent multiple runtime deadlocks
+    let merged_docs = QuickwitRuntimeManager::global().handle().block_on(perform_quickwit_merge(
         split_directories,
         &output_temp_dir,
     ))?;
@@ -3183,9 +3170,8 @@ async fn upload_split_to_s3_impl(local_split_path: &Path, s3_url: &str, config: 
 
 /// Synchronous wrapper for S3 upload
 fn upload_split_to_s3(local_split_path: &Path, s3_url: &str, config: &InternalMergeConfig) -> Result<()> {
-    // ✅ PERFORMANCE FIX: Use shared Tokio runtime (was creating single-threaded runtime)
-    let runtime = &*SHARED_MERGE_RUNTIME;
-    runtime.block_on(upload_split_to_s3_impl(local_split_path, s3_url, config))
+    // ✅ CRITICAL FIX: Use shared global runtime handle to prevent multiple runtime deadlocks
+    QuickwitRuntimeManager::global().handle().block_on(upload_split_to_s3_impl(local_split_path, s3_url, config))
 }
 
 /// Estimate peak memory usage for merge operations

@@ -72,6 +72,12 @@ public class MergeBinaryExtractor {
         // Convert merge config to JSON
         String configJson = createMergeRequestJson(splitPaths, outputPath, mergeConfig);
 
+        // Show debug config if debug is enabled
+        if (mergeConfig.isDebugEnabled()) {
+            System.err.println("[DEBUG] Merge configuration JSON being sent to child process:");
+            System.err.println("[DEBUG] " + configJson);
+        }
+
         // Create secure temporary file for sensitive data
         Path tempJsonFile = Files.createTempFile("tantivy4java-merge-config", ".json");
 
@@ -97,9 +103,11 @@ public class MergeBinaryExtractor {
         // Build and execute the process with file path
         ProcessBuilder pb = new ProcessBuilder(binaryPath.toString(), tempJsonFile.toString());
 
-        // Set debug environment if enabled
-        if (System.getProperty("TANTIVY4JAVA_DEBUG") != null) {
+        // Set debug environment for child process based on MergeConfig
+        boolean debugEnabled = mergeConfig.isDebugEnabled();
+        if (debugEnabled) {
             pb.environment().put("TANTIVY4JAVA_DEBUG", "1");
+            System.err.println("[DEBUG] Debug mode enabled via MergeConfig - child process will output detailed logs");
         }
 
         // Always print fork/join debug information
@@ -131,9 +139,19 @@ public class MergeBinaryExtractor {
             String output = new String(process.getInputStream().readAllBytes());
             String stderr = new String(process.getErrorStream().readAllBytes());
 
-            // Print the child process debug output
-            if (!stderr.isEmpty()) {
-                System.err.println("[FORK-JOIN] Child process PID " + childPid + " STDERR output:\n" + stderr);
+            // Show detailed output in debug mode
+            if (mergeConfig.isDebugEnabled()) {
+                System.err.println("[DEBUG] Child process PID " + childPid + " STDOUT output:");
+                System.err.println("[DEBUG] " + output);
+                if (!stderr.isEmpty()) {
+                    System.err.println("[DEBUG] Child process PID " + childPid + " STDERR output:");
+                    System.err.println("[DEBUG] " + stderr);
+                }
+            } else {
+                // Print the child process debug output (non-debug mode)
+                if (!stderr.isEmpty()) {
+                    System.err.println("[FORK-JOIN] Child process PID " + childPid + " STDERR output:\n" + stderr);
+                }
             }
 
             System.err.println("[FORK-JOIN] Java thread " + Thread.currentThread().getName() +
@@ -154,6 +172,7 @@ public class MergeBinaryExtractor {
             }
         }
     }
+
 
     /**
      * Creates JSON request for the merge binary.

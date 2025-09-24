@@ -25,8 +25,7 @@ pub struct GlobalSplitCacheManager {
     cache_name: String,
     max_cache_size: u64,
     
-    // Runtime for async operations
-    runtime: Runtime,
+    // REMOVED: runtime field - using shared global runtime to prevent deadlocks
     
     // AWS configuration for storage resolver
     s3_config: Option<S3StorageConfig>,
@@ -45,8 +44,9 @@ impl GlobalSplitCacheManager {
     pub fn new(cache_name: String, max_cache_size: u64) -> Self {
         debug_println!("RUST DEBUG: Creating GlobalSplitCacheManager '{}' using global caches", cache_name);
         
-        // Create runtime for async operations
-        let runtime = Runtime::new().expect("Failed to create Tokio runtime for cache manager");
+        // CRITICAL FIX: DO NOT create separate Tokio runtime - causes multiple runtime deadlocks
+        // All async operations should use the shared global runtime via QuickwitRuntimeManager
+        debug_println!("🔧 RUNTIME_FIX: Eliminating separate Tokio runtime to prevent deadlocks");
         
         // Note: We're using the global caches from GLOBAL_SEARCHER_COMPONENTS
         // This ensures all split cache managers share the same underlying caches
@@ -55,7 +55,7 @@ impl GlobalSplitCacheManager {
         Self {
             cache_name,
             max_cache_size,
-            runtime,
+            // REMOVED: runtime field to prevent multiple runtime conflicts
             s3_config: None,
             total_hits: AtomicU64::new(0),
             total_misses: AtomicU64::new(0),

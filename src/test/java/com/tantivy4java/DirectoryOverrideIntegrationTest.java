@@ -152,7 +152,7 @@ public class DirectoryOverrideIntegrationTest {
 
         QuickwitSplit.MergeConfig mergeConfig = new QuickwitSplit.MergeConfig(
             "merged-index", "merged-source", "merged-node", "default",
-            0L, null, null, customTempDir.toString(), null);
+            0L, null, null, customTempDir.toString(), null, false);
 
         System.out.println("🔍 DEBUG: MergeConfig temp directory path: " + mergeConfig.getTempDirectoryPath());
 
@@ -321,7 +321,7 @@ public class DirectoryOverrideIntegrationTest {
         // Use custom temp directory for merge but validate with metadata reading
         QuickwitSplit.MergeConfig mixedMergeConfig = new QuickwitSplit.MergeConfig(
             "mixed-merged-index", "mixed-merged-source", "mixed-merged-node", "default",
-            0L, null, null, customTempDir.toString(), null);  // Custom temp directory
+            0L, null, null, customTempDir.toString(), null, false);  // Custom temp directory, debug disabled
 
         // Create a second split to have something to merge
         Path split2Path = workingDir.resolve("mixed_test2.split");

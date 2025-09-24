@@ -582,24 +582,16 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_createNativeWithShare
                 aws_config.len(), split_footer_start, split_footer_end, 
                 doc_mapping_json.as_ref().map(|s| format!("{}chars", s.len())).unwrap_or_else(|| "None".to_string()));
 
-    // Create Tokio runtime for async operations
-    let local_runtime = match tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-    {
-        Ok(rt) => rt,
-        Err(e) => {
-            to_java_exception(&mut env, &anyhow::anyhow!("Failed to create Tokio runtime: {}", e));
-            return 0;
-        }
-    };
-    
-    // Enter the runtime context and create the searcher
-    let _guard = local_runtime.enter();
-    
-    // Create StandaloneSearcher using global caches
-    // If AWS credentials are provided, use with_s3_config, otherwise use default
-    let result = if aws_config.contains_key("access_key") && aws_config.contains_key("secret_key") {
+    // ✅ CRITICAL FIX: Use shared global runtime instead of creating individual runtime
+    // This eliminates multiple Tokio runtime conflicts that cause production hangs
+
+    // ✅ CRITICAL FIX: Execute StandaloneSearcher creation in shared runtime context
+    // Quickwit's SplitCache::with_root_path spawns tasks, so we need runtime context
+    let _enter = runtime.handle().enter();
+    let result = tokio::task::block_in_place(|| {
+        // Create StandaloneSearcher using global caches
+        // If AWS credentials are provided, use with_s3_config, otherwise use default
+        if aws_config.contains_key("access_key") && aws_config.contains_key("secret_key") {
         debug_println!("RUST DEBUG: Creating StandaloneSearcher with custom S3 config and global caches");
         
         let mut s3_config = S3StorageConfig::default();
@@ -624,11 +616,14 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_createNativeWithShare
         
         // Use the new with_s3_config method that uses global caches
         StandaloneSearcher::with_s3_config(StandaloneSearchConfig::default(), s3_config.clone())
-    } else {
-        debug_println!("RUST DEBUG: Creating StandaloneSearcher with default config and global caches");
-        // Use default() which now uses global caches
-        StandaloneSearcher::default()
-    };
+        } else {
+            debug_println!("RUST DEBUG: Creating StandaloneSearcher with default config and global caches");
+            // Use default() which now uses global caches
+            StandaloneSearcher::default()
+        }
+    });
+
+    // StandaloneSearcher creation succeeded, use result directly
 
     // Pre-create StorageResolver synchronously to avoid async issues during search
     let storage_resolver = if aws_config.contains_key("access_key") && aws_config.contains_key("secret_key") {
@@ -662,7 +657,7 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_createNativeWithShare
     match result {
         Ok(searcher) => {
             // Follow Quickwit pattern: resolve storage once and cache it for reuse
-            let storage = local_runtime.block_on(async {
+            let storage = runtime.handle().block_on(async {
                 use crate::standalone_searcher::resolve_storage_for_split;
                 resolve_storage_for_split(&storage_resolver, &split_uri).await
             });
@@ -672,7 +667,7 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_createNativeWithShare
                     debug_println!("🔥 STORAGE RESOLVED: Storage resolved once for reuse, instance: {:p}", Arc::as_ptr(&resolved_storage));
 
                     // Follow Quickwit pattern: open index once and cache it
-                    let opened_index = local_runtime.block_on(async {
+                    let opened_index = runtime.handle().block_on(async {
                         use quickwit_proto::search::SplitIdAndFooterOffsets;
                         use crate::global_cache::get_global_searcher_context;
 
@@ -737,7 +732,7 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_createNativeWithShare
                             // Create clean struct-based context instead of complex tuple
                             let cached_context = CachedSearcherContext {
                                 standalone_searcher: std::sync::Arc::new(searcher),
-                                runtime: std::sync::Arc::new(local_runtime),
+                                // ✅ CRITICAL FIX: No longer storing runtime - using shared global runtime
                                 split_uri: split_uri.clone(),
                                 aws_config,
                                 footer_start: split_footer_start,
@@ -950,12 +945,17 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_searchWithQueryAst(
                 },
                 Err(e) => {
                     debug_println!("❌ ASYNC_JNI: Failed to create SearchResult object: {}", e);
+                    to_java_exception(&mut env, &anyhow::anyhow!("Failed to create SearchResult: {}", e));
                     std::ptr::null_mut()
                 }
             }
         },
         Err(e) => {
             debug_println!("❌ ASYNC_JNI: Search operation failed: {}", e);
+
+            // CRITICAL FIX: Throw proper exception instead of returning null
+            // This ensures Java code gets a meaningful error message instead of NullPointerException
+            to_java_exception(&mut env, &e);
             std::ptr::null_mut()
         }
     }
@@ -971,6 +971,9 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_searchWithSplitQuery(
     split_query_obj: JObject,
     limit: jint,
 ) -> jobject {
+    debug_println!("🚨 ENTRY_POINT: Java_com_tantivy4java_SplitSearcher_searchWithSplitQuery ENTRY");
+    debug_println!("🚨 ENTRY_POINT: Function parameters - searcher_ptr: {}, limit: {}", searcher_ptr, limit);
+    debug_println!("🚨 ENTRY_POINT: About to proceed with function body");
     debug_println!("🔥 NATIVE DEBUG: searchWithSplitQuery called with pointer {} and limit {}", searcher_ptr, limit);
     debug_println!("🚀 ASYNC_JNI: searchWithSplitQuery called with async-first architecture");
 
@@ -993,8 +996,22 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_searchWithSplitQuery(
     // No JNI types passed to core functions - all data extracted at entry point
     debug_println!("🔥 NATIVE DEBUG: About to call block_on_operation with JSON: {}", query_json_str);
     debug_println!("🔍 ASYNC_JNI: About to call perform_search_async_impl_leaf_response (SplitQuery version)");
+    debug_println!("🚨 CRITICAL: About to call block_on_operation - checking runtime context");
+
+    // Check if we're in a Tokio runtime context before calling block_on
+    if let Ok(_handle) = tokio::runtime::Handle::try_current() {
+        debug_println!("❌ CRITICAL: WE ARE IN TOKIO RUNTIME CONTEXT - this will cause deadlock!");
+        return std::ptr::null_mut();
+    } else {
+        debug_println!("✅ CRITICAL: Not in Tokio runtime context - safe to call block_on");
+    }
+
+    debug_println!("🚨 CRITICAL: Calling block_on_operation with async search operation");
     match block_on_operation(async move {
-        perform_search_async_impl_leaf_response(searcher_ptr, query_json_str, limit).await
+        debug_println!("🔍 ASYNC_START: Inside async block - about to call perform_search_async_impl_leaf_response");
+        let result = perform_search_async_impl_leaf_response(searcher_ptr, query_json_str, limit).await;
+        debug_println!("🔍 ASYNC_END: perform_search_async_impl_leaf_response completed");
+        result
     }) {
         Ok(leaf_search_response) => {
             debug_println!("🔥 NATIVE DEBUG: block_on_operation SUCCESS - Got LeafSearchResponse from SplitQuery");
@@ -1009,6 +1026,7 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_searchWithSplitQuery(
                 Err(e) => {
                     debug_println!("🔥 NATIVE DEBUG: Failed to create SearchResult object from SplitQuery: {}", e);
                     debug_println!("❌ ASYNC_JNI: Failed to create SearchResult object from SplitQuery: {}", e);
+                    to_java_exception(&mut env, &anyhow::anyhow!("Failed to create SearchResult: {}", e));
                     std::ptr::null_mut()
                 }
             }
@@ -1016,6 +1034,10 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_searchWithSplitQuery(
         Err(e) => {
             debug_println!("🔥 NATIVE DEBUG: block_on_operation FAILED: {}", e);
             debug_println!("❌ ASYNC_JNI: SplitQuery search operation failed: {}", e);
+
+            // CRITICAL FIX: Throw proper exception instead of returning null
+            // This ensures Java code gets a meaningful error message instead of NullPointerException
+            to_java_exception(&mut env, &e);
             std::ptr::null_mut()
         }
     }
@@ -1190,9 +1212,9 @@ fn retrieve_document_from_split_optimized(
         let doc_and_schema = with_arc_safe(searcher_ptr, |searcher_context: &Arc<CachedSearcherContext>| {
             let context = searcher_context.as_ref();
 
-            let _guard = context.runtime.enter();
+            // ✅ CRITICAL FIX: Use shared global runtime instead of context.runtime
             tokio::task::block_in_place(|| {
-                context.runtime.block_on(async {
+                crate::runtime_manager::QuickwitRuntimeManager::global().handle().block_on(async {
                     let doc = tokio::time::timeout(
                         std::time::Duration::from_secs(5),
                         searcher.doc_async(doc_address)
@@ -1223,7 +1245,7 @@ fn retrieve_document_from_split_optimized(
     let result = with_arc_safe(searcher_ptr, |searcher_context: &Arc<CachedSearcherContext>| {
         let context = searcher_context.as_ref();
 
-        let _guard = context.runtime.enter();
+        // ✅ CRITICAL FIX: Use shared global runtime instead of context.runtime
 
         // Extract variables from context for compatibility with existing code
         let split_uri = &context.split_uri;
@@ -1235,7 +1257,7 @@ fn retrieve_document_from_split_optimized(
 
         // Use the same Quickwit caching pattern as our batch method
         tokio::task::block_in_place(|| {
-            context.runtime.block_on(async {
+            crate::runtime_manager::QuickwitRuntimeManager::global().handle().block_on(async {
 
                 use quickwit_config::{StorageConfigs, S3StorageConfig};
                 use quickwit_proto::search::SplitIdAndFooterOffsets;
@@ -1459,7 +1481,8 @@ fn retrieve_document_from_split(
     let result = with_arc_safe(searcher_ptr, |searcher_context: &Arc<CachedSearcherContext>| {
         let context = searcher_context.as_ref();
         let searcher = &context.standalone_searcher;
-        let runtime = &context.runtime;
+        // ✅ CRITICAL FIX: Use shared global runtime handle instead of context.runtime
+        let runtime = crate::runtime_manager::QuickwitRuntimeManager::global().handle();
         let split_uri = &context.split_uri;
         let aws_config = &context.aws_config;
         let footer_start = context.footer_start;
@@ -1631,7 +1654,8 @@ fn retrieve_documents_batch_from_split_optimized(
     let result = with_arc_safe(searcher_ptr, |searcher_context: &Arc<CachedSearcherContext>| {
         let context = searcher_context.as_ref();
         let searcher = &context.standalone_searcher;
-        let runtime = &context.runtime;
+        // ✅ CRITICAL FIX: Use shared global runtime handle instead of context.runtime
+        let runtime = crate::runtime_manager::QuickwitRuntimeManager::global().handle();
         let split_uri = &context.split_uri;
         let aws_config = &context.aws_config;
         let footer_start = context.footer_start;
@@ -2157,8 +2181,7 @@ fn get_schema_from_split(searcher_ptr: jlong) -> anyhow::Result<tantivy::schema:
     with_arc_safe(searcher_ptr, |searcher_context: &Arc<CachedSearcherContext>| {
         let context = searcher_context.as_ref();
         
-        // Enter the runtime context for async operations
-        let _guard = context.runtime.enter();
+        // ✅ CRITICAL FIX: Use shared global runtime instead of context.runtime
 
         // Parse the split URI and extract schema using Quickwit's storage abstractions
         use quickwit_common::uri::Uri;
@@ -2166,7 +2189,7 @@ fn get_schema_from_split(searcher_ptr: jlong) -> anyhow::Result<tantivy::schema:
 
         // Use block_on to run async code synchronously within the runtime context
         tokio::task::block_in_place(|| {
-            context.runtime.block_on(async {
+            crate::runtime_manager::QuickwitRuntimeManager::global().handle().block_on(async {
                 // Parse URI and resolve storage
                 let uri: Uri = context.split_uri.parse()
                     .map_err(|e| anyhow::anyhow!("Failed to parse split URI {}: {}", context.split_uri, e))?;
@@ -2244,7 +2267,8 @@ fn fix_range_query_types(searcher_ptr: jlong, query_json: &str) -> anyhow::Resul
     let schema = with_arc_safe(searcher_ptr, |searcher_context: &Arc<CachedSearcherContext>| {
         let context = searcher_context.as_ref();
         let _searcher = &context.standalone_searcher;
-        let _runtime = &context.runtime;
+        // ✅ CRITICAL FIX: Use shared global runtime handle instead of context.runtime
+        let _runtime = crate::runtime_manager::QuickwitRuntimeManager::global().handle();
         let split_uri = &context.split_uri;
         let _aws_config = &context.aws_config;
         let _footer_start = context.footer_start;
@@ -2484,7 +2508,8 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_tokenizeNative(
     let result = with_arc_safe(searcher_ptr, |searcher_context: &Arc<CachedSearcherContext>| {
         let context = searcher_context.as_ref();
         let _searcher = &context.standalone_searcher;
-        let _runtime = &context.runtime;
+        // ✅ CRITICAL FIX: Use shared global runtime handle instead of context.runtime
+        let _runtime = crate::runtime_manager::QuickwitRuntimeManager::global().handle();
         let _split_uri = &context.split_uri;
         let _aws_config = &context.aws_config;
         let _footer_start = context.footer_start;
@@ -2754,7 +2779,8 @@ fn perform_search_with_query_ast_and_aggregations_using_working_infrastructure(
     let result = with_arc_safe(searcher_ptr, |searcher_context: &Arc<CachedSearcherContext>| {
         let context = searcher_context.as_ref();
         let searcher = &context.standalone_searcher;
-        let runtime = &context.runtime;
+        // ✅ CRITICAL FIX: Use shared global runtime handle instead of context.runtime
+        let runtime = crate::runtime_manager::QuickwitRuntimeManager::global().handle();
         let split_uri = &context.split_uri;
         let aws_config = &context.aws_config;
         let footer_start = context.footer_start;
@@ -3413,7 +3439,10 @@ async fn perform_real_quickwit_search(
     // Use cached storage directly (Quickwit lifecycle pattern)
     let storage = cached_storage;
 
-    // Get global searcher context (following Quickwit patterns)
+    // CRITICAL FIX: Use shared global context for cache hits but create individual permit provider
+    // This preserves cache efficiency while eliminating SearchPermitProvider permit exhaustion
+    debug_println!("🔍 PERMIT_FIX: Using global context for cache hits but individual permit provider");
+
     let searcher_context = crate::global_cache::get_global_searcher_context();
 
     // Create CanSplitDoBetter filter (following Quickwit patterns from standalone_searcher.rs)
@@ -3422,36 +3451,88 @@ async fn perform_real_quickwit_search(
     // Get aggregation limits (following Quickwit patterns)
     let aggregations_limits = searcher_context.aggregation_limit.clone();
 
-    // Get search permit (following Quickwit patterns)
+    // CRITICAL FIX: Create individual permit provider per search to eliminate contention
+    // This preserves cache hits while avoiding permit pool exhaustion
+    debug_println!("🔍 PERMIT_FIX: Creating individual SearchPermitProvider per search operation");
+
+    let individual_permit_provider = {
+        use quickwit_search::search_permit_provider::SearchPermitProvider;
+        use bytesize::ByteSize;
+
+        Arc::new(SearchPermitProvider::new_sync(
+            5, // Allow up to 5 concurrent operations per search (plenty for single search)
+            ByteSize::gb(1), // 1GB memory budget per search operation
+        ))
+    };
+
+    // Get search permit from individual provider (no contention possible)
     let memory_allocation = quickwit_search::search_permit_provider::compute_initial_memory_allocation(
         &split_metadata,
         bytesize::ByteSize(1024 * 1024 * 50), // 50MB initial allocation (same as standalone_searcher.rs)
     );
 
-    let permit_futures = searcher_context.search_permit_provider.get_permits(vec![memory_allocation]).await;
+    debug_println!("🔍 PERMIT_FIX: Requesting permit from dedicated SearchPermitProvider (guaranteed available)");
+    debug_println!("🔍 PERMIT_DEBUG: About to request search permit with memory allocation: {}", memory_allocation);
+
+    let permit_futures = individual_permit_provider.get_permits(vec![memory_allocation]).await;
+    debug_println!("✅ PERMIT_DEBUG: Got permit futures from dedicated provider, extracting first future...");
+
     let permit_future = permit_futures.into_iter().next()
         .expect("Expected one permit future");
+
+    debug_println!("🔍 PERMIT_FIX: Acquiring permit from dedicated provider - should be immediate");
     let mut search_permit = permit_future.await;
+    debug_println!("✅ PERMIT_FIX: Successfully acquired search permit from dedicated provider - no timeout needed!");
 
     debug_println!("🔥 REAL_QUICKWIT: Using leaf_search_single_split with cache injection");
+    debug_println!("🔍 SEARCH_DEBUG: About to call leaf_search_single_split - this might be where it hangs...");
 
     // SOLUTION: Use leaf_search_single_split but inject our cached components
     // This preserves the async handling while eliminating repeated downloads
 
     // Call Quickwit's actual leaf_search_single_split function
-    let result = quickwit_search::leaf_search_single_split(
-        &searcher_context,
-        search_request,
-        storage,
-        split_metadata,
-        doc_mapper,
-        split_filter,
-        aggregations_limits,
-        &mut search_permit,
-    ).await
-    .map_err(|e| anyhow::anyhow!("Quickwit leaf search failed: {}", e))?;
+    debug_println!("🔍 CRITICAL_DEBUG: About to call leaf_search_single_split - THIS IS LIKELY THE HANG POINT");
+
+    let leaf_search_result = tokio::time::timeout(
+        std::time::Duration::from_secs(15), // 15 second timeout for leaf search
+        quickwit_search::leaf_search_single_split(
+            &searcher_context,
+            search_request,
+            storage,
+            split_metadata,
+            doc_mapper,
+            split_filter,
+            aggregations_limits,
+            &mut search_permit,
+        )
+    ).await;
+
+    debug_println!("🔍 CRITICAL_DEBUG: leaf_search_single_split call completed");
+
+    let result = match leaf_search_result {
+        Ok(search_result) => {
+            debug_println!("✅ CRITICAL_DEBUG: leaf_search_single_split succeeded");
+            search_result.map_err(|e| anyhow::anyhow!("Quickwit leaf search failed: {}", e))?
+        },
+        Err(_timeout) => {
+            debug_println!("❌ CRITICAL_DEBUG: TIMEOUT in leaf_search_single_split - THIS IS THE HANG LOCATION!");
+            debug_println!("🔍 PERMIT_DEBUG: Search timed out, explicitly dropping permit to ensure release");
+
+            // CRITICAL FIX: Explicitly drop the permit to ensure it's released even on timeout
+            drop(search_permit);
+            debug_println!("✅ PERMIT_DEBUG: Permit explicitly dropped on timeout - should be available for next operation");
+
+            return Err(anyhow::anyhow!("leaf_search_single_split timeout - this is where the hang occurs in the Quickwit native layer"));
+        }
+    };
 
     debug_println!("✅ REAL_QUICKWIT: Search completed successfully with {} hits", result.num_hits);
+
+    // CRITICAL FIX: Explicitly drop the permit to ensure it's released immediately
+    debug_println!("🔍 PERMIT_DEBUG: Search completed successfully, explicitly dropping permit");
+    drop(search_permit);
+    debug_println!("✅ PERMIT_DEBUG: Permit explicitly dropped on success - capacity available for next search operation");
+
     Ok(result)
 }
 
@@ -3459,7 +3540,7 @@ async fn perform_real_quickwit_search(
 /// Uses Arc wrappers for non-Clone types to enable struct-based management
 struct CachedSearcherContext {
     standalone_searcher: std::sync::Arc<StandaloneSearcher>,
-    runtime: std::sync::Arc<tokio::runtime::Runtime>,
+    // ✅ CRITICAL FIX: Removed runtime field - using shared global runtime instead
     split_uri: String,
     aws_config: std::collections::HashMap<String, String>,
     footer_start: u64,
