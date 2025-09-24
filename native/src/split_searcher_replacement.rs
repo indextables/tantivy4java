@@ -32,36 +32,81 @@ use quickwit_query::get_quickwit_fastfield_normalizer_manager;
 use tantivy::directory::DirectoryClone;
 
 // ========================================
-// DOC STORE CACHE OPTIMIZATION (QUICKWIT PATTERN)
+// DOC STORE CACHE OPTIMIZATION (ADAPTIVE QUICKWIT PATTERN)
 // ========================================
-// Implementation of Quickwit's doc store cache optimization to prevent cache thrashing
-// during bulk document retrieval operations, improving performance by 2-5x for batch operations.
+// Implementation of Quickwit's doc store cache optimization with adaptive scaling for multi-threaded clients.
+// Prevents cache thrashing during bulk document retrieval operations, improving performance by 2-5x.
 //
 // Background:
-// - Quickwit's fetch_docs.rs implements sophisticated cache sizing based on concurrency patterns
-// - Without proper cache sizing, concurrent document retrievals cause cache eviction (thrashing)
-// - The key insight: cache blocks should match the number of concurrent operations
+// - Quickwit's fetch_docs.rs implements cache sizing based on concurrency patterns
+// - Multi-threaded Java clients (8+ threads) need proportionally more cache blocks
+// - Without proper cache sizing, concurrent operations cause cache eviction (thrashing)
+// - The key insight: cache blocks should match total concurrent operations across all client threads
+//
+// Adaptive Scaling Strategy:
+// - Base concurrency: 30 operations per thread (from Quickwit's NUM_CONCURRENT_REQUESTS)
+// - Client thread scaling: Multiply by expected Java thread count
+// - Default to CPU count for optimal resource utilization
+// - Configurable via environment variable for custom deployments
 //
 // Performance Impact:
-// - Individual retrieval: 10 cache blocks (optimized for single operations)
-// - Batch retrieval: 30 cache blocks (matches NUM_CONCURRENT_REQUESTS)
-// - Expected improvement: 2-5x faster bulk document retrieval
-// - Prevents cache eviction during concurrent access patterns
+// - Individual retrieval: 10 cache blocks (single-document access)
+// - Batch retrieval: Base(30) × JavaThreads × safety factor (multi-threaded access)
+// - Expected improvement: 2-5x faster bulk document retrieval without cache contention
 
-/// Number of concurrent document retrieval requests
+/// Base concurrent document retrieval requests per thread
 /// This is the core optimization constant from Quickwit's fetch_docs.rs
-/// Determines the concurrency level for parallel document processing
-const NUM_CONCURRENT_REQUESTS: usize = 30;
+const BASE_CONCURRENT_REQUESTS: usize = 30;
+
+/// Get the configured maximum Java thread count for cache sizing
+/// Defaults to CPU count but can be overridden via TANTIVY4JAVA_MAX_THREADS environment variable
+fn get_max_java_threads() -> usize {
+    if let Ok(env_threads) = std::env::var("TANTIVY4JAVA_MAX_THREADS") {
+        if let Ok(threads) = env_threads.parse::<usize>() {
+            if threads > 0 && threads <= 1024 { // Reasonable bounds check
+                debug_println!("⚙️  CACHE_CONFIG: Using configured max threads: {}", threads);
+                return threads;
+            }
+            debug_println!("⚠️  CACHE_CONFIG: Invalid TANTIVY4JAVA_MAX_THREADS value: {}, using CPU count", env_threads);
+        }
+    }
+
+    // Default to CPU count for optimal resource utilization
+    let cpu_count = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(8); // Fallback to 8 if detection fails
+
+    debug_println!("⚙️  CACHE_CONFIG: Using CPU count for max threads: {}", cpu_count);
+    cpu_count
+}
+
+/// Calculate adaptive cache block count for batch operations
+/// Scales cache blocks based on expected client thread concurrency to prevent cache thrashing
+fn get_adaptive_batch_cache_blocks() -> usize {
+    let max_threads = get_max_java_threads();
+    let base_blocks = BASE_CONCURRENT_REQUESTS * max_threads;
+
+    // Add 20% safety margin to handle burst concurrency and edge cases
+    let safety_factor = 1.2;
+    let adaptive_blocks = (base_blocks as f64 * safety_factor).ceil() as usize;
+
+    debug_println!("⚙️  CACHE_CONFIG: Adaptive cache sizing - threads: {}, base: {}, adaptive: {}",
+                   max_threads, base_blocks, adaptive_blocks);
+
+    adaptive_blocks
+}
 
 /// Cache block size for individual document retrieval operations
 /// Smaller cache footprint optimized for single-document access patterns
 /// Prevents excessive memory usage when only retrieving one document at a time
 const SINGLE_DOC_CACHE_BLOCKS: usize = 10;
 
-/// Cache block size for batch document retrieval operations
-/// Matches NUM_CONCURRENT_REQUESTS to prevent cache thrashing during parallel operations
-/// Key optimization: prevents cache eviction when processing multiple documents simultaneously
-const BATCH_DOC_CACHE_BLOCKS: usize = NUM_CONCURRENT_REQUESTS;
+/// Get cache block size for batch document retrieval operations
+/// Dynamically calculated based on client thread count to prevent cache thrashing
+/// For 8-thread client: 30 × 8 × 1.2 = 288 cache blocks (vs original 30)
+fn get_batch_doc_cache_blocks() -> usize {
+    get_adaptive_batch_cache_blocks()
+}
 
 /// Thread pool for search operations (matches Quickwit's pattern exactly)
 fn search_thread_pool() -> &'static ThreadPool {
@@ -449,10 +494,11 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_createNativeWithShare
                             debug_println!("🔥 INDEX CACHED: Index opened once for reuse, cached for all operations");
 
                             // Follow Quickwit's exact pattern: create index reader and cached searcher
-                            debug_println!("⚡ CACHE_OPTIMIZATION: Applying doc store cache optimization - blocks: {} (batch operations)", BATCH_DOC_CACHE_BLOCKS);
+                            let batch_cache_blocks = get_batch_doc_cache_blocks();
+                            debug_println!("⚡ CACHE_OPTIMIZATION: Applying adaptive doc store cache optimization - blocks: {} (batch operations)", batch_cache_blocks);
                             let index_reader = match cached_index
                                 .reader_builder()
-                                .doc_store_cache_num_blocks(BATCH_DOC_CACHE_BLOCKS) // Following Quickwit's NUM_CONCURRENT_REQUESTS pattern
+                                .doc_store_cache_num_blocks(batch_cache_blocks) // Adaptive cache sizing for multi-threaded clients
                                 .reload_policy(tantivy::ReloadPolicy::Manual)
                                 .try_into() {
                                 Ok(reader) => reader,
@@ -1124,11 +1170,12 @@ fn retrieve_document_from_split_optimized(
                 
                 // Same cache settings as batch method
                 let searcher_creation_start = std::time::Instant::now();
-                // Using global cache configuration constant
-                debug_println!("⚡ CACHE_OPTIMIZATION: Fallback path - applying doc store cache optimization - blocks: {} (batch operations)", BATCH_DOC_CACHE_BLOCKS);
+                // Using adaptive cache configuration
+                let batch_cache_blocks = get_batch_doc_cache_blocks();
+                debug_println!("⚡ CACHE_OPTIMIZATION: Fallback path - applying adaptive doc store cache optimization - blocks: {} (batch operations)", batch_cache_blocks);
                 let index_reader = index
                     .reader_builder()
-                    .doc_store_cache_num_blocks(BATCH_DOC_CACHE_BLOCKS) // QUICKWIT OPTIMIZATION
+                    .doc_store_cache_num_blocks(batch_cache_blocks) // ADAPTIVE CACHE OPTIMIZATION
                     .reload_policy(tantivy::ReloadPolicy::Manual)
                     .try_into()
                     .map_err(|e| anyhow::anyhow!("Failed to create index reader: {}", e))?;
@@ -1423,7 +1470,7 @@ fn retrieve_documents_batch_from_split_optimized(
                     // Execute concurrent batch retrieval with cached searcher
                     use futures::stream::{StreamExt, TryStreamExt};
                     let doc_ptrs: Vec<jobject> = futures::stream::iter(doc_futures)
-                        .buffer_unordered(NUM_CONCURRENT_REQUESTS)
+                        .buffer_unordered(BASE_CONCURRENT_REQUESTS) // Keep base concurrency for stream processing
                         .try_collect::<Vec<_>>()
                         .await
                         .map_err(|e| anyhow::anyhow!("Cached searcher batch retrieval failed: {}", e))?;
@@ -1531,11 +1578,12 @@ fn retrieve_documents_batch_from_split_optimized(
                 index.set_executor(tantivy_executor);
                 
                 // Create index reader with Quickwit optimizations (fetch_docs.rs line 187-192)
-                // Using global cache configuration for batch operations
-                debug_println!("⚡ CACHE_OPTIMIZATION: Batch retrieval fallback - applying doc store cache optimization - blocks: {} (batch operations)", BATCH_DOC_CACHE_BLOCKS);
+                // Using adaptive cache configuration for batch operations
+                let batch_cache_blocks = get_batch_doc_cache_blocks();
+                debug_println!("⚡ CACHE_OPTIMIZATION: Batch retrieval fallback - applying adaptive doc store cache optimization - blocks: {} (batch operations)", batch_cache_blocks);
                 let index_reader = index
                     .reader_builder()
-                    .doc_store_cache_num_blocks(BATCH_DOC_CACHE_BLOCKS) // QUICKWIT OPTIMIZATION
+                    .doc_store_cache_num_blocks(batch_cache_blocks) // ADAPTIVE CACHE OPTIMIZATION
                     .reload_policy(tantivy::ReloadPolicy::Manual)
                     .try_into()
                     .map_err(|e| anyhow::anyhow!("Failed to create index reader: {}", e))?;
@@ -1580,10 +1628,10 @@ fn retrieve_documents_batch_from_split_optimized(
                     }
                 });
 
-                // ✅ QUICKWIT CONCURRENT EXECUTION: Process up to NUM_CONCURRENT_REQUESTS simultaneously
+                // ✅ QUICKWIT CONCURRENT EXECUTION: Process up to BASE_CONCURRENT_REQUESTS simultaneously
                 use futures::stream::{StreamExt, TryStreamExt};
                 let doc_ptrs: Vec<jobject> = futures::stream::iter(doc_futures)
-                    .buffer_unordered(NUM_CONCURRENT_REQUESTS) // Quickwit's concurrent processing pattern
+                    .buffer_unordered(BASE_CONCURRENT_REQUESTS) // Quickwit's concurrent processing pattern
                     .try_collect::<Vec<_>>()
                     .await
                     .map_err(|e| anyhow::anyhow!("Concurrent document retrieval failed: {}", e))?;
