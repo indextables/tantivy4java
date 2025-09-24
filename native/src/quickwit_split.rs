@@ -595,33 +595,33 @@ struct SplitConfig {
 
 /// Split metadata structure compatible with Quickwit format
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct QuickwitSplitMetadata {
-    split_id: String,
-    index_uid: String,
-    source_id: String,
-    node_id: String,
-    doc_mapping_uid: String,
-    partition_id: u64,
-    num_docs: usize,
-    uncompressed_docs_size_in_bytes: u64,
-    time_range: Option<RangeInclusive<i64>>,
-    create_timestamp: i64,
-    maturity: String,  // "Mature" or "Immature"
-    tags: BTreeSet<String>,
-    delete_opstamp: u64,
-    num_merge_ops: usize,
-    
+pub struct QuickwitSplitMetadata {
+    pub split_id: String,
+    pub index_uid: String,
+    pub source_id: String,
+    pub node_id: String,
+    pub doc_mapping_uid: String,
+    pub partition_id: u64,
+    pub num_docs: usize,
+    pub uncompressed_docs_size_in_bytes: u64,
+    pub time_range: Option<RangeInclusive<i64>>,
+    pub create_timestamp: i64,
+    pub maturity: String,  // "Mature" or "Immature"
+    pub tags: BTreeSet<String>,
+    pub delete_opstamp: u64,
+    pub num_merge_ops: usize,
+
     // Footer offset information for lazy loading optimization
-    footer_start_offset: Option<u64>,    // Where metadata begins (excludes hotcache)
-    footer_end_offset: Option<u64>,      // End of file
-    hotcache_start_offset: Option<u64>,  // Where hotcache begins
-    hotcache_length: Option<u64>,        // Size of hotcache
-    
+    pub footer_start_offset: Option<u64>,    // Where metadata begins (excludes hotcache)
+    pub footer_end_offset: Option<u64>,      // End of file
+    pub hotcache_start_offset: Option<u64>,  // Where hotcache begins
+    pub hotcache_length: Option<u64>,        // Size of hotcache
+
     // Doc mapping JSON for SplitSearcher integration
-    doc_mapping_json: Option<String>,    // JSON representation of the doc mapping
+    pub doc_mapping_json: Option<String>,    // JSON representation of the doc mapping
 
     // Skipped splits for merge operations with parsing failures
-    skipped_splits: Vec<String>,         // URLs/paths of splits that failed to parse
+    pub skipped_splits: Vec<String>,         // URLs/paths of splits that failed to parse
 }
 
 impl SplitConfig {

@@ -1540,8 +1540,6 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_docNative(
     debug_println!("🚀 ASYNC_JNI: docNative called with async-first architecture");
 
     // Add this line to verify the method is actually being called
-    println!("PLAIN PRINT: docNative function is definitely being called!");
-
     // Use simplified async pattern that returns thread-safe types
     // Note: env cannot be moved into async block due to thread safety
     match block_on_operation(async move {

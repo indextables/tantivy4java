@@ -205,10 +205,100 @@ public class MergeBinaryExtractor {
         String numDocsStr = extractJsonValue(output, "num_docs");
         String sizeStr = extractJsonValue(output, "uncompressed_size_bytes");
 
+        // ✅ COMPLETE METADATA FIX: Extract all metadata fields from native merge result
+        String footerStartStr = extractJsonValue(output, "footer_start_offset");
+        String footerEndStr = extractJsonValue(output, "footer_end_offset");
+        String hotcacheStartStr = extractJsonValue(output, "hotcache_start_offset");
+        String hotcacheLengthStr = extractJsonValue(output, "hotcache_length");
+
+        // ✅ COMPLETE METADATA FIX: Extract all missing Quickwit fields
+        String indexUid = extractJsonValue(output, "index_uid");
+        String sourceId = extractJsonValue(output, "source_id");
+        String nodeId = extractJsonValue(output, "node_id");
+        String docMappingUid = extractJsonValue(output, "doc_mapping_uid");
+        String partitionIdStr = extractJsonValue(output, "partition_id");
+        String maturity = extractJsonValue(output, "maturity");
+        String deleteOpstampStr = extractJsonValue(output, "delete_opstamp");
+        String numMergeOpsStr = extractJsonValue(output, "num_merge_ops");
+        String timeRangeStartStr = extractJsonValue(output, "time_range_start");
+        String timeRangeEndStr = extractJsonValue(output, "time_range_end");
+        String createTimestampStr = extractJsonValue(output, "create_timestamp");
+
+        // ✅ DOCUMENT MAPPING FIX: Extract doc_mapping_json from native merge result
+        String docMappingJson = extractJsonString(output, "doc_mapping_json");
+        if ("null".equals(docMappingJson) || docMappingJson.isEmpty()) {
+            docMappingJson = null; // Handle JSON null values
+        }
+
         int numDocs = Integer.parseInt(numDocsStr);
         long size = Long.parseLong(sizeStr);
 
-        return new MergeResult(splitId, numDocs, size, duration);
+        // Parse footer offsets (use -1 as default for missing values)
+        long footerStartOffset = footerStartStr.isEmpty() ? -1L : Long.parseLong(footerStartStr);
+        long footerEndOffset = footerEndStr.isEmpty() ? -1L : Long.parseLong(footerEndStr);
+        long hotcacheStartOffset = hotcacheStartStr.isEmpty() ? -1L : Long.parseLong(hotcacheStartStr);
+        long hotcacheLength = hotcacheLengthStr.isEmpty() ? -1L : Long.parseLong(hotcacheLengthStr);
+
+        // Parse all additional Quickwit fields
+        long partitionId = partitionIdStr.isEmpty() ? 0L : Long.parseLong(partitionIdStr);
+        long deleteOpstamp = deleteOpstampStr.isEmpty() ? 0L : Long.parseLong(deleteOpstampStr);
+        int numMergeOps = numMergeOpsStr.isEmpty() ? 1 : Integer.parseInt(numMergeOpsStr);
+        Long timeRangeStart = timeRangeStartStr.isEmpty() ? null : Long.parseLong(timeRangeStartStr);
+        Long timeRangeEnd = timeRangeEndStr.isEmpty() ? null : Long.parseLong(timeRangeEndStr);
+        long createTimestamp = createTimestampStr.isEmpty() ? (System.currentTimeMillis() / 1000) : Long.parseLong(createTimestampStr);
+
+        return new MergeResult(splitId, numDocs, size, duration,
+                              footerStartOffset, footerEndOffset, hotcacheStartOffset, hotcacheLength,
+                              indexUid, sourceId, nodeId, docMappingUid, partitionId,
+                              maturity, deleteOpstamp, numMergeOps,
+                              timeRangeStart, timeRangeEnd, createTimestamp, docMappingJson);
+    }
+
+    /**
+     * Extract JSON string values that might contain nested JSON (like doc_mapping_json).
+     * This handles properly escaped JSON strings within JSON.
+     */
+    private static String extractJsonString(String json, String key) {
+        String pattern = "\"" + key + "\":";
+        int start = json.indexOf(pattern);
+        if (start == -1) return "";
+
+        start += pattern.length();
+        // Skip whitespace
+        while (start < json.length() && Character.isWhitespace(json.charAt(start))) {
+            start++;
+        }
+
+        if (start >= json.length()) return "";
+
+        if (json.charAt(start) == 'n' && json.substring(start).startsWith("null")) {
+            return "null";
+        }
+
+        if (json.charAt(start) == '"') {
+            start++; // Skip opening quote
+            StringBuilder result = new StringBuilder();
+            boolean escaped = false;
+
+            for (int i = start; i < json.length(); i++) {
+                char c = json.charAt(i);
+
+                if (escaped) {
+                    result.append(c);
+                    escaped = false;
+                } else if (c == '\\') {
+                    result.append(c);
+                    escaped = true;
+                } else if (c == '"') {
+                    // Found closing quote
+                    return result.toString();
+                } else {
+                    result.append(c);
+                }
+            }
+        }
+
+        return "";
     }
 
     /**
@@ -242,6 +332,7 @@ public class MergeBinaryExtractor {
 
     /**
      * Result of a merge operation.
+     * ✅ COMPLETE METADATA FIX: Include all Quickwit-compatible fields
      */
     public static class MergeResult {
         public final String splitId;
@@ -249,34 +340,98 @@ public class MergeBinaryExtractor {
         public final long sizeBytes;
         public final long durationMs;
 
+        // Footer offset information from native merge
+        public final long footerStartOffset;
+        public final long footerEndOffset;
+        public final long hotcacheStartOffset;
+        public final long hotcacheLength;
+
+        // ✅ COMPLETE METADATA FIX: Add all missing Quickwit fields
+        public final String indexUid;
+        public final String sourceId;
+        public final String nodeId;
+        public final String docMappingUid;
+        public final long partitionId;
+        public final String maturity;
+        public final long deleteOpstamp;
+        public final int numMergeOps;
+        public final Long timeRangeStart;
+        public final Long timeRangeEnd;
+        public final long createTimestamp;
+
+        // ✅ DOCUMENT MAPPING FIX: Add document mapping JSON field
+        public final String docMappingJson;
+
         public MergeResult(String splitId, int numDocs, long sizeBytes, long durationMs) {
+            this(splitId, numDocs, sizeBytes, durationMs, -1L, -1L, -1L, -1L,
+                 "", "", "", "", 0L, "immature", 0L, 1, null, null, System.currentTimeMillis() / 1000, null);
+        }
+
+        public MergeResult(String splitId, int numDocs, long sizeBytes, long durationMs,
+                          long footerStartOffset, long footerEndOffset,
+                          long hotcacheStartOffset, long hotcacheLength) {
+            this(splitId, numDocs, sizeBytes, durationMs, footerStartOffset, footerEndOffset,
+                 hotcacheStartOffset, hotcacheLength, "", "", "", "", 0L, "immature", 0L, 1,
+                 null, null, System.currentTimeMillis() / 1000, null);
+        }
+
+        public MergeResult(String splitId, int numDocs, long sizeBytes, long durationMs,
+                          long footerStartOffset, long footerEndOffset,
+                          long hotcacheStartOffset, long hotcacheLength,
+                          String indexUid, String sourceId, String nodeId, String docMappingUid,
+                          long partitionId, String maturity, long deleteOpstamp, int numMergeOps,
+                          Long timeRangeStart, Long timeRangeEnd, long createTimestamp, String docMappingJson) {
             this.splitId = splitId;
             this.numDocs = numDocs;
             this.sizeBytes = sizeBytes;
             this.durationMs = durationMs;
+            this.footerStartOffset = footerStartOffset;
+            this.footerEndOffset = footerEndOffset;
+            this.hotcacheStartOffset = hotcacheStartOffset;
+            this.hotcacheLength = hotcacheLength;
+
+            // ✅ COMPLETE METADATA FIX: Set all Quickwit fields
+            this.indexUid = indexUid != null && !indexUid.isEmpty() ? indexUid : "unknown-index";
+            this.sourceId = sourceId != null && !sourceId.isEmpty() ? sourceId : "unknown-source";
+            this.nodeId = nodeId != null && !nodeId.isEmpty() ? nodeId : "unknown-node";
+            this.docMappingUid = docMappingUid != null && !docMappingUid.isEmpty() ? docMappingUid : "default-mapping";
+            this.partitionId = partitionId;
+            this.maturity = maturity != null && !maturity.isEmpty() ? maturity : "immature";
+            this.deleteOpstamp = deleteOpstamp;
+            this.numMergeOps = numMergeOps;
+            this.timeRangeStart = timeRangeStart;
+            this.timeRangeEnd = timeRangeEnd;
+            this.createTimestamp = createTimestamp;
+
+            // ✅ DOCUMENT MAPPING FIX: Set document mapping JSON field
+            this.docMappingJson = docMappingJson;
         }
 
         public QuickwitSplit.SplitMetadata toSplitMetadata() {
+            // ✅ COMPLETE METADATA FIX: Use all actual values from native merge result
+            java.time.Instant timeStart = timeRangeStart != null ? java.time.Instant.ofEpochSecond(timeRangeStart) : null;
+            java.time.Instant timeEnd = timeRangeEnd != null ? java.time.Instant.ofEpochSecond(timeRangeEnd) : null;
+
             return new QuickwitSplit.SplitMetadata(
                 splitId,                           // splitId
-                "process-merge",                   // indexUid
-                0L,                                // partitionId
-                "process-source",                  // sourceId
-                "process-node",                    // nodeId
+                indexUid,                          // indexUid ✅ FIXED: Use actual value from native merge
+                partitionId,                       // partitionId ✅ FIXED: Use actual value from native merge
+                sourceId,                          // sourceId ✅ FIXED: Use actual value from native merge
+                nodeId,                            // nodeId ✅ FIXED: Use actual value from native merge
                 (long) numDocs,                    // numDocs
                 sizeBytes,                         // uncompressedSizeBytes
-                null,                              // timeRangeStart
-                null,                              // timeRangeEnd
-                System.currentTimeMillis() / 1000, // createTimestamp
-                "published",                       // maturity
-                new java.util.HashSet<>(),        // tags
-                0L,                                // footerStartOffset
-                sizeBytes,                         // footerEndOffset
-                0L,                                // deleteOpstamp
-                1,                                 // numMergeOps
-                "",                                // docMappingUid
-                "",                                // docMappingJson
-                new java.util.ArrayList<>()       // skippedSplits
+                timeStart,                         // timeRangeStart ✅ FIXED: Use actual value from native merge
+                timeEnd,                           // timeRangeEnd ✅ FIXED: Use actual value from native merge
+                createTimestamp,                   // createTimestamp ✅ FIXED: Use actual value from native merge
+                maturity,                          // maturity ✅ FIXED: Use actual value from native merge
+                new java.util.HashSet<>(),        // tags (empty for now, could be enhanced)
+                footerStartOffset,                 // footerStartOffset ✅ FIXED: Use actual value from native merge
+                footerEndOffset,                   // footerEndOffset ✅ FIXED: Use actual value from native merge
+                deleteOpstamp,                     // deleteOpstamp ✅ FIXED: Use actual value from native merge
+                numMergeOps,                       // numMergeOps ✅ FIXED: Use actual value from native merge
+                docMappingUid,                     // docMappingUid ✅ FIXED: Use actual value from native merge
+                docMappingJson,                    // docMappingJson ✅ FIXED: Use actual value from native merge
+                new java.util.ArrayList<>()       // skippedSplits (will be populated elsewhere)
             );
         }
     }

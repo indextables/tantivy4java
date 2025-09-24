@@ -29,6 +29,7 @@ struct MergeAwsConfig {
 }
 
 /// Split metadata for standalone binary (independent from library)
+/// ✅ COMPLETE METADATA FIX: Include all Quickwit-compatible fields
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SplitMetadata {
     split_id: String,
@@ -39,6 +40,24 @@ struct SplitMetadata {
     create_timestamp: u64,
     footer_offsets: std::collections::HashMap<String, u64>,
     skipped_splits: Vec<String>,
+
+    // ✅ COMPLETE METADATA FIX: Add ALL missing Quickwit fields for comprehensive validation
+    index_uid: String,
+    source_id: String,
+    node_id: String,
+    doc_mapping_uid: String,
+    partition_id: u64,
+    maturity: String,
+    delete_opstamp: u64,
+    num_merge_ops: u32,
+
+    // ✅ ADDITIONAL FIELDS: Previously missing fields from QuickwitSplitMetadata
+    tags: Vec<String>,                          // BTreeSet in QuickwitSplitMetadata, Vec here for simplicity
+    footer_start_offset: Option<u64>,           // Footer offset information
+    footer_end_offset: Option<u64>,             // Footer offset information
+    hotcache_start_offset: Option<u64>,         // Hotcache offset information
+    hotcache_length: Option<u64>,               // Hotcache size information
+    doc_mapping_json: Option<String>,           // Doc mapping JSON representation
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -56,6 +75,32 @@ struct MergeResponse {
     metadata: Option<SplitMetadata>,
     error: Option<String>,
     duration_ms: u64,
+
+    // ✅ COMPLETE METADATA FIX: Include ALL fields at top level for Java MergeBinaryExtractor compatibility
+    split_id: Option<String>,
+    num_docs: Option<u64>,
+    uncompressed_size_bytes: Option<u64>,
+    footer_start_offset: Option<u64>,
+    footer_end_offset: Option<u64>,
+    hotcache_start_offset: Option<u64>,
+    hotcache_length: Option<u64>,
+
+    // ✅ COMPLETE METADATA FIX: Add ALL missing Quickwit fields to top-level response
+    index_uid: Option<String>,
+    source_id: Option<String>,
+    node_id: Option<String>,
+    doc_mapping_uid: Option<String>,
+    partition_id: Option<u64>,
+    maturity: Option<String>,
+    delete_opstamp: Option<u64>,
+    num_merge_ops: Option<u32>,
+    time_range_start: Option<i64>,
+    time_range_end: Option<i64>,
+    create_timestamp: Option<u64>,
+
+    // ✅ ADDITIONAL FIELDS: Previously missing fields now included for complete validation
+    tags: Option<Vec<String>>,
+    doc_mapping_json: Option<String>,
 }
 
 fn main() {
@@ -77,11 +122,42 @@ fn main() {
         Ok(metadata) => {
             eprintln!("[MERGE-PROCESS] PID {} completed successfully in {}ms - {} docs, {} bytes",
                      process_id, duration, metadata.num_docs, metadata.uncompressed_size_bytes);
+
+            // ✅ FOOTER OFFSET FIX: Extract footer offsets from metadata for top-level response fields
+            let footer_start = metadata.footer_offsets.get("footer_start_offset").copied();
+            let footer_end = metadata.footer_offsets.get("footer_end_offset").copied();
+
             let response = MergeResponse {
                 success: true,
-                metadata: Some(metadata),
+                metadata: Some(metadata.clone()),
                 error: None,
                 duration_ms: duration,
+
+                // ✅ COMPLETE METADATA FIX: Provide all top-level fields for Java MergeBinaryExtractor compatibility
+                split_id: Some(metadata.split_id.clone()),
+                num_docs: Some(metadata.num_docs),
+                uncompressed_size_bytes: Some(metadata.uncompressed_size_bytes),
+                footer_start_offset: metadata.footer_start_offset,
+                footer_end_offset: metadata.footer_end_offset,
+                hotcache_start_offset: metadata.hotcache_start_offset,
+                hotcache_length: metadata.hotcache_length,
+
+                // ✅ COMPLETE METADATA FIX: Add ALL missing Quickwit fields for comprehensive validation
+                index_uid: Some(metadata.index_uid.clone()),
+                source_id: Some(metadata.source_id.clone()),
+                node_id: Some(metadata.node_id.clone()),
+                doc_mapping_uid: Some(metadata.doc_mapping_uid.clone()),
+                partition_id: Some(metadata.partition_id),
+                maturity: Some(metadata.maturity.clone()),
+                delete_opstamp: Some(metadata.delete_opstamp),
+                num_merge_ops: Some(metadata.num_merge_ops),
+                time_range_start: metadata.time_range_start,
+                time_range_end: metadata.time_range_end,
+                create_timestamp: Some(metadata.create_timestamp),
+
+                // ✅ ADDITIONAL FIELDS: Previously missing fields now included in response
+                tags: Some(metadata.tags.clone()),
+                doc_mapping_json: metadata.doc_mapping_json.clone(),
             };
             println!("{}", serde_json::to_string(&response).unwrap());
         }
@@ -92,6 +168,32 @@ fn main() {
                 metadata: None,
                 error: Some(e.to_string()),
                 duration_ms: duration,
+
+                // ✅ COMPLETE METADATA FIX: Include None values for all fields in error case
+                split_id: None,
+                num_docs: None,
+                uncompressed_size_bytes: None,
+                footer_start_offset: None,
+                footer_end_offset: None,
+                hotcache_start_offset: None,
+                hotcache_length: None,
+
+                // ✅ COMPLETE METADATA FIX: Add None values for ALL missing Quickwit fields
+                index_uid: None,
+                source_id: None,
+                node_id: None,
+                doc_mapping_uid: None,
+                partition_id: None,
+                maturity: None,
+                delete_opstamp: None,
+                num_merge_ops: None,
+                time_range_start: None,
+                time_range_end: None,
+                create_timestamp: None,
+
+                // ✅ ADDITIONAL FIELDS: Previously missing fields set to None in error case
+                tags: None,
+                doc_mapping_json: None,
             };
             eprintln!("Merge failed: {}", e);
             println!("{}", serde_json::to_string(&response).unwrap());
@@ -169,7 +271,25 @@ fn run_merge() -> Result<SplitMetadata> {
         time_range_end: quickwit_metadata.time_range_end,
         create_timestamp: quickwit_metadata.create_timestamp,
         footer_offsets: quickwit_metadata.footer_offsets,
-        skipped_splits: quickwit_metadata.skipped_splits,  // Include skip information
+        skipped_splits: quickwit_metadata.skipped_splits,
+
+        // ✅ COMPLETE METADATA FIX: Add ALL missing Quickwit fields for comprehensive validation
+        index_uid: quickwit_metadata.index_uid,
+        source_id: quickwit_metadata.source_id,
+        node_id: quickwit_metadata.node_id,
+        doc_mapping_uid: quickwit_metadata.doc_mapping_uid,
+        partition_id: quickwit_metadata.partition_id,
+        maturity: quickwit_metadata.maturity,
+        delete_opstamp: quickwit_metadata.delete_opstamp,
+        num_merge_ops: quickwit_metadata.num_merge_ops,
+
+        // ✅ ADDITIONAL FIELDS: Previously missing fields now populated from QuickwitSplitMetadata
+        tags: quickwit_metadata.tags,
+        footer_start_offset: quickwit_metadata.footer_start_offset,
+        footer_end_offset: quickwit_metadata.footer_end_offset,
+        hotcache_start_offset: quickwit_metadata.hotcache_start_offset,
+        hotcache_length: quickwit_metadata.hotcache_length,
+        doc_mapping_json: quickwit_metadata.doc_mapping_json,
     };
 
     if env::var("TANTIVY4JAVA_DEBUG").is_ok() {
@@ -204,17 +324,36 @@ fn perform_file_based_merge(request: &MergeRequest) -> Result<SplitMetadata> {
     eprintln!("[MERGE-PROCESS] Calling tantivy4java::perform_quickwit_merge_standalone...");
     let start_time = std::time::Instant::now();
 
-    // Call our library's merge function directly!
-    let real_metadata = tantivy4java::perform_quickwit_merge_standalone(
-        request.split_paths.clone(),
+    // ✅ COMPLETE METADATA FIX: Call merge_splits_impl directly to get complete QuickwitSplitMetadata
+    let internal_config = tantivy4java::InternalMergeConfig {
+        index_uid: config.index_uid.clone(),
+        source_id: config.source_id.clone(),
+        node_id: config.node_id.clone(),
+        doc_mapping_uid: format!("{}-merge", config.index_uid), // Generate proper doc mapping UID
+        partition_id: 0,
+        delete_queries: None,
+        aws_config: config.aws_config.map(|aws| tantivy4java::InternalAwsConfig {
+            access_key: Some(aws.access_key),
+            secret_key: Some(aws.secret_key),
+            session_token: aws.session_token,
+            region: aws.region,
+            endpoint: aws.endpoint_url,
+            force_path_style: aws.force_path_style,
+        }),
+        temp_directory_path: None,
+    };
+
+    // Call the complete merge function to get full QuickwitSplitMetadata
+    let real_metadata = tantivy4java::merge_splits_impl(
+        &request.split_paths,
         &request.output_path,
-        config,
+        &internal_config,
     )?;
 
     let merge_duration = start_time.elapsed();
     eprintln!("[MERGE-PROCESS] REAL merge completed in {:.2}s", merge_duration.as_secs_f64());
     eprintln!("[MERGE-PROCESS] Real documents merged: {}", real_metadata.num_docs);
-    eprintln!("[MERGE-PROCESS] Real uncompressed size: {} bytes", real_metadata.uncompressed_size_bytes);
+    eprintln!("[MERGE-PROCESS] Real uncompressed size: {} bytes", real_metadata.uncompressed_docs_size_in_bytes);
     eprintln!("[MERGE-PROCESS] Skipped splits: {} (corrupted/empty)", real_metadata.skipped_splits.len());
 
     if !real_metadata.skipped_splits.is_empty() {
@@ -224,23 +363,49 @@ fn perform_file_based_merge(request: &MergeRequest) -> Result<SplitMetadata> {
         }
     }
 
-    // Convert from tantivy4java::SplitMetadata to our local SplitMetadata
+    // ✅ COMPLETE METADATA FIX: Convert from QuickwitSplitMetadata to our complete local SplitMetadata
+    let (time_range_start, time_range_end) = if let Some(range) = real_metadata.time_range {
+        (Some(*range.start()), Some(*range.end()))
+    } else {
+        (None, None)
+    };
+
     let converted_metadata = SplitMetadata {
-        split_id: real_metadata.split_id,
+        split_id: real_metadata.split_id.clone(),
         num_docs: real_metadata.num_docs as u64,
-        uncompressed_size_bytes: real_metadata.uncompressed_size_bytes,
-        time_range_start: real_metadata.time_range_start,
-        time_range_end: real_metadata.time_range_end,
-        create_timestamp: real_metadata.create_timestamp,
+        uncompressed_size_bytes: real_metadata.uncompressed_docs_size_in_bytes,
+        time_range_start,
+        time_range_end,
+        create_timestamp: real_metadata.create_timestamp as u64,
         footer_offsets: {
             let mut map = std::collections::HashMap::new();
-            if let Some((start, end)) = real_metadata.footer_offsets {
-                map.insert("start".to_string(), start);
-                map.insert("end".to_string(), end);
+            if let Some(start) = real_metadata.footer_start_offset {
+                map.insert("footer_start_offset".to_string(), start);
+            }
+            if let Some(end) = real_metadata.footer_end_offset {
+                map.insert("footer_end_offset".to_string(), end);
             }
             map
         },
-        skipped_splits: real_metadata.skipped_splits,
+        skipped_splits: real_metadata.skipped_splits.clone(),
+
+        // ✅ COMPLETE METADATA FIX: Extract ALL Quickwit fields from real metadata for comprehensive validation
+        index_uid: real_metadata.index_uid.clone(),
+        source_id: real_metadata.source_id.clone(),
+        node_id: real_metadata.node_id.clone(),
+        doc_mapping_uid: real_metadata.doc_mapping_uid.clone(),
+        partition_id: real_metadata.partition_id,
+        maturity: real_metadata.maturity.clone(),
+        delete_opstamp: real_metadata.delete_opstamp,
+        num_merge_ops: real_metadata.num_merge_ops as u32,
+
+        // ✅ ADDITIONAL FIELDS: Previously missing fields now properly extracted
+        tags: real_metadata.tags.iter().cloned().collect(), // Convert BTreeSet to Vec
+        footer_start_offset: real_metadata.footer_start_offset,
+        footer_end_offset: real_metadata.footer_end_offset,
+        hotcache_start_offset: real_metadata.hotcache_start_offset,
+        hotcache_length: real_metadata.hotcache_length,
+        doc_mapping_json: real_metadata.doc_mapping_json.clone(),
     };
 
     Ok(converted_metadata)
