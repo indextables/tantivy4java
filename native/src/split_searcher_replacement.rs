@@ -403,6 +403,7 @@ pub struct SearchHit {
 pub struct EnhancedSearchResult {
     pub hits: Vec<(f32, tantivy::DocAddress)>,
     pub aggregation_results: Option<Vec<u8>>, // Postcard-serialized aggregation results
+    pub aggregation_json: Option<String>, // Original aggregation request JSON
 }
 
 /// Replacement for Java_com_tantivy4java_SplitSearcher_createNativeWithSharedCache
@@ -938,7 +939,7 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_searchWithQueryAst(
         Ok(leaf_search_response) => {
             debug_println!("✅ ASYNC_JNI: Got LeafSearchResponse, creating SearchResult object");
             // Create proper SearchResult object directly from LeafSearchResponse (no JSON marshalling)
-            match perform_unified_search_result_creation(leaf_search_response, &mut env) {
+            match perform_unified_search_result_creation(leaf_search_response, &mut env, None) {
                 Ok(search_result_obj) => {
                     debug_println!("✅ ASYNC_JNI: Successfully created SearchResult object");
                     search_result_obj
@@ -1017,7 +1018,7 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_searchWithSplitQuery(
             debug_println!("🔥 NATIVE DEBUG: block_on_operation SUCCESS - Got LeafSearchResponse from SplitQuery");
             debug_println!("✅ ASYNC_JNI: Got LeafSearchResponse from SplitQuery, creating SearchResult object");
             // Create proper SearchResult object directly from LeafSearchResponse (no JSON marshalling)
-            match perform_unified_search_result_creation(leaf_search_response, &mut env) {
+            match perform_unified_search_result_creation(leaf_search_response, &mut env, None) {
                 Ok(search_result_obj) => {
                     debug_println!("🔥 NATIVE DEBUG: Successfully created SearchResult object from SplitQuery");
                     debug_println!("✅ ASYNC_JNI: Successfully created SearchResult object from SplitQuery");
@@ -1041,6 +1042,143 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_searchWithSplitQuery(
             std::ptr::null_mut()
         }
     }
+}
+
+/// Search with aggregations support for SplitSearcher
+/// This method combines regular search with statistical aggregations
+#[no_mangle]
+pub extern "system" fn Java_com_tantivy4java_SplitSearcher_searchWithAggregations<'local>(
+    mut env: JNIEnv<'local>,
+    _obj: JObject<'local>,
+    searcher_ptr: jlong,
+    split_query: JObject<'local>,
+    limit: jint,
+    aggregations_map: JObject<'local>,
+) -> jobject {
+    let method_start_time = std::time::Instant::now();
+    eprintln!("🚀 RUST NATIVE: searchWithAggregations ENTRY - Real aggregation processing starting");
+    debug_println!("🚀 RUST NATIVE: searchWithAggregations ENTRY - Real aggregation processing starting");
+
+    if searcher_ptr == 0 {
+        eprintln!("RUST DEBUG: ⏱️ searchWithAggregations ERROR: Invalid searcher pointer");
+        debug_println!("RUST DEBUG: ⏱️ searchWithAggregations ERROR: Invalid searcher pointer [TIMING: {}ms]", method_start_time.elapsed().as_millis());
+        to_java_exception(&mut env, &anyhow::anyhow!("Invalid searcher pointer"));
+        return std::ptr::null_mut();
+    }
+    eprintln!("RUST DEBUG: searcher_ptr validation passed: {}", searcher_ptr);
+
+    // Convert SplitQuery to QueryAst JSON (using existing infrastructure)
+    let query_json_result = convert_split_query_to_json(&mut env, &split_query);
+    let query_json = match query_json_result {
+        Ok(json) => {
+            eprintln!("RUST DEBUG: Query conversion successful");
+            json
+        },
+        Err(e) => {
+            eprintln!("RUST DEBUG: ⏱️ searchWithAggregations ERROR: Failed to convert SplitQuery");
+            debug_println!("RUST DEBUG: ⏱️ searchWithAggregations ERROR: Failed to convert SplitQuery [TIMING: {}ms]", method_start_time.elapsed().as_millis());
+            to_java_exception(&mut env, &anyhow::anyhow!("Failed to convert SplitQuery to JSON: {}", e));
+            return std::ptr::null_mut();
+        }
+    };
+
+    // Convert Java aggregations map to JSON
+    eprintln!("RUST DEBUG: Starting aggregation conversion");
+    let aggregation_request_json = match convert_java_aggregations_to_json(&mut env, &aggregations_map) {
+        Ok(agg_json) => {
+            eprintln!("RUST DEBUG: Aggregation conversion successful");
+            agg_json
+        },
+        Err(e) => {
+            eprintln!("RUST DEBUG: ⏱️ searchWithAggregations ERROR: Failed to convert aggregations to JSON: {}", e);
+            debug_println!("RUST DEBUG: ⏱️ searchWithAggregations ERROR: Failed to convert aggregations to JSON [TIMING: {}ms]", method_start_time.elapsed().as_millis());
+            to_java_exception(&mut env, &anyhow::anyhow!("Failed to convert aggregations to JSON: {}", e));
+            return std::ptr::null_mut();
+        }
+    };
+
+    eprintln!("RUST DEBUG: Query JSON: {}", query_json);
+    if let Some(ref agg_json) = aggregation_request_json {
+        eprintln!("RUST DEBUG: Aggregation JSON: {}", agg_json);
+        debug_println!("RUST DEBUG: Aggregation JSON: {}", agg_json);
+    } else {
+        eprintln!("RUST DEBUG: No aggregation JSON - aggregation_request_json is None");
+    }
+    debug_println!("RUST DEBUG: Query JSON: {}", query_json);
+
+    // Use block_on_operation to perform the async search with aggregations
+    let searcher_ptr_copy = searcher_ptr;
+    let limit_copy = limit as usize;
+    let aggregation_request_json_copy = aggregation_request_json.clone();
+    match block_on_operation(async move {
+        perform_search_async_impl_leaf_response_with_aggregations(searcher_ptr_copy, query_json, limit_copy, aggregation_request_json_copy).await
+    }) {
+        Ok(leaf_search_response) => {
+            eprintln!("RUST DEBUG: ⏱️ searchWithAggregations SUCCESS [TIMING: {}ms]", method_start_time.elapsed().as_millis());
+            eprintln!("RUST DEBUG: Found {} hits, has aggregations: {}",
+                         leaf_search_response.num_hits,
+                         leaf_search_response.intermediate_aggregation_result.is_some());
+            debug_println!("RUST DEBUG: ⏱️ searchWithAggregations SUCCESS [TIMING: {}ms]", method_start_time.elapsed().as_millis());
+            debug_println!("RUST DEBUG: Found {} hits, has aggregations: {}",
+                         leaf_search_response.num_hits,
+                         leaf_search_response.intermediate_aggregation_result.is_some());
+
+            match perform_unified_search_result_creation(leaf_search_response, &mut env, aggregation_request_json.clone()) {
+                Ok(search_result_obj) => search_result_obj,
+                Err(e) => {
+                    debug_println!("RUST DEBUG: ⏱️ searchWithAggregations ERROR: Failed to create SearchResult [TIMING: {}ms]: {}", method_start_time.elapsed().as_millis(), e);
+                    to_java_exception(&mut env, &anyhow::anyhow!("Failed to create SearchResult: {}", e));
+                    std::ptr::null_mut()
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("RUST DEBUG: ⏱️ searchWithAggregations ERROR: Search failed: {}", e);
+            debug_println!("RUST DEBUG: ⏱️ searchWithAggregations ERROR: Search failed [TIMING: {}ms]: {}", method_start_time.elapsed().as_millis(), e);
+            to_java_exception(&mut env, &e);
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Async implementation for search with aggregations
+pub async fn perform_search_async_impl_leaf_response_with_aggregations(
+    searcher_ptr: jlong,
+    query_json: String,
+    limit: usize,
+    aggregation_request_json: Option<String>,
+) -> anyhow::Result<quickwit_proto::search::LeafSearchResponse> {
+    debug_println!("🔍 ASYNC_JNI: Starting search with aggregations using working pattern");
+
+    if searcher_ptr == 0 {
+        return Err(anyhow::anyhow!("Invalid searcher pointer"));
+    }
+
+    // Extract searcher context using the SAME pattern as working search
+    let searcher_context = crate::utils::jlong_to_arc::<CachedSearcherContext>(searcher_ptr)
+        .ok_or_else(|| anyhow::anyhow!("Invalid searcher context"))?;
+
+    let context = searcher_context.as_ref();
+
+    debug_println!("🔍 ASYNC_JNI: Extracted searcher context, performing search with aggregations on split: {}", context.split_uri);
+
+    // Use the SAME working search functionality but with aggregations
+    let search_result = perform_real_quickwit_search_with_aggregations(
+        &context.split_uri,
+        &context.aws_config,
+        context.footer_start,
+        context.footer_end,
+        &context.doc_mapping_json,
+        context.cached_storage.clone(),
+        context.cached_searcher.clone(),
+        context.cached_index.clone(),
+        &query_json,
+        limit,
+        aggregation_request_json,
+    ).await?;
+
+    debug_println!("✅ ASYNC_JNI: Search with aggregations completed successfully with {} hits", search_result.num_hits);
+    Ok(search_result)
 }
 
 /// Batch document retrieval for SplitSearcher using Quickwit's optimized approach
@@ -3045,6 +3183,7 @@ fn perform_search_with_query_ast_and_aggregations_using_working_infrastructure(
 fn perform_unified_search_result_creation(
     leaf_search_response: quickwit_proto::search::LeafSearchResponse,
     env: &mut JNIEnv,
+    aggregation_request_json: Option<String>,
 ) -> anyhow::Result<jobject> {
     // Convert results to enhanced format
     let mut search_results = Vec::new();
@@ -3080,6 +3219,7 @@ fn perform_unified_search_result_creation(
     let enhanced_result = EnhancedSearchResult {
         hits: search_results,
         aggregation_results,
+        aggregation_json: aggregation_request_json.clone(),
     };
 
     let search_results_arc = Arc::new(enhanced_result);
@@ -3532,6 +3672,158 @@ async fn perform_real_quickwit_search(
     debug_println!("🔍 PERMIT_DEBUG: Search completed successfully, explicitly dropping permit");
     drop(search_permit);
     debug_println!("✅ PERMIT_DEBUG: Permit explicitly dropped on success - capacity available for next search operation");
+
+    Ok(result)
+}
+
+/// Perform real Quickwit search with aggregations support
+/// Uses the SAME pattern as perform_real_quickwit_search but enables aggregation_request
+async fn perform_real_quickwit_search_with_aggregations(
+    split_uri: &str,
+    aws_config: &std::collections::HashMap<String, String>,
+    footer_start: u64,
+    footer_end: u64,
+    doc_mapping_json: &Option<String>,
+    cached_storage: Arc<dyn Storage>,
+    cached_searcher: Arc<tantivy::Searcher>,
+    cached_index: Arc<tantivy::Index>,
+    query_json: &str,
+    limit: usize,
+    aggregation_request_json: Option<String>,
+) -> anyhow::Result<quickwit_proto::search::LeafSearchResponse> {
+    debug_println!("🔍 AGGREGATION_SEARCH: Starting real Quickwit search with aggregations");
+
+    // Create DocMapper from JSON following Quickwit patterns (SAME as working search)
+    let doc_mapper = if let Some(doc_mapping_str) = doc_mapping_json {
+        // First, clean up any escaped JSON from storage layer
+        let cleaned_json = if doc_mapping_str.contains("\\\"") {
+            doc_mapping_str.replace("\\\"", "\"").replace("\\\\", "\\")
+        } else {
+            doc_mapping_str.to_string()
+        };
+
+        // Parse array of field mappings into proper DocMapperBuilder format
+        let field_mappings: Vec<serde_json::Value> = serde_json::from_str(&cleaned_json)
+            .map_err(|e| anyhow::anyhow!("Failed to parse doc mapping JSON array: {}", e))?;
+
+        // Convert to proper DocMapperBuilder format - this is what Quickwit actually expects
+        let doc_mapper_builder_json = serde_json::json!({
+            "field_mappings": field_mappings,
+            "timestamp_field": null,
+            "default_search_fields": []
+        });
+
+        // Deserialize into DocMapperBuilder first, then convert to DocMapper
+        let doc_mapper_builder: quickwit_doc_mapper::DocMapperBuilder = serde_json::from_value(doc_mapper_builder_json)
+            .map_err(|e| anyhow::anyhow!("Failed to parse DocMapperBuilder: {}", e))?;
+
+        // Convert DocMapperBuilder to DocMapper
+        let doc_mapper = quickwit_doc_mapper::DocMapper::try_from(doc_mapper_builder)
+            .map_err(|e| anyhow::anyhow!("Failed to convert DocMapperBuilder to DocMapper: {}", e))?;
+
+        Arc::new(doc_mapper)
+    } else {
+        return Err(anyhow::anyhow!("No doc mapping available for search"));
+    };
+
+    // Create SearchRequest following Quickwit patterns (KEY DIFFERENCE: enable aggregations)
+    let search_request = quickwit_proto::search::SearchRequest {
+        index_id_patterns: vec!["split_search".to_string()],
+        query_ast: query_json.to_string(),
+        start_offset: 0,
+        max_hits: limit as u64,
+        start_timestamp: None,
+        end_timestamp: None,
+        sort_fields: vec![],
+        snippet_fields: vec![],
+        count_hits: quickwit_proto::search::CountHits::CountAll.into(),
+        aggregation_request: aggregation_request_json, // ENABLE AGGREGATIONS
+        scroll_ttl_secs: None,
+        search_after: None,
+    };
+
+    debug_println!("🔍 AGGREGATION_SEARCH: SearchRequest configured with aggregations: {}",
+                   search_request.aggregation_request.is_some());
+
+    // Create SplitIdAndFooterOffsets for Quickwit (SAME as working search)
+    let split_metadata = quickwit_proto::search::SplitIdAndFooterOffsets {
+        split_id: extract_split_id_from_uri(split_uri),
+        split_footer_start: footer_start,
+        split_footer_end: footer_end,
+        num_docs: 0, // Will be filled by Quickwit
+        timestamp_start: None,
+        timestamp_end: None,
+    };
+
+    // Use cached storage directly (SAME as working search)
+    let storage = cached_storage;
+
+    // Use shared global context for cache hits but create individual permit provider (SAME as working search)
+    let searcher_context = crate::global_cache::get_global_searcher_context();
+
+    // Create CanSplitDoBetter filter (SAME as working search)
+    let split_filter = Arc::new(std::sync::RwLock::new(quickwit_search::CanSplitDoBetter::Uninformative));
+
+    // Get aggregation limits (SAME as working search)
+    let aggregations_limits = searcher_context.aggregation_limit.clone();
+
+    // Create individual permit provider per search (SAME as working search)
+    let individual_permit_provider = {
+        use quickwit_search::search_permit_provider::SearchPermitProvider;
+        use bytesize::ByteSize;
+
+        Arc::new(SearchPermitProvider::new_sync(
+            5, // Allow up to 5 concurrent operations per search
+            ByteSize::gb(1), // 1GB memory budget per search operation
+        ))
+    };
+
+    // Get search permit from individual provider (SAME as working search)
+    let memory_allocation = quickwit_search::search_permit_provider::compute_initial_memory_allocation(
+        &split_metadata,
+        bytesize::ByteSize(1024 * 1024 * 50), // 50MB initial allocation
+    );
+
+    debug_println!("🔍 AGGREGATION_SEARCH: Requesting search permit for aggregation query");
+    let permit_futures = individual_permit_provider.get_permits(vec![memory_allocation]).await;
+    let permit_future = permit_futures.into_iter().next()
+        .expect("Expected one permit future");
+
+    let mut search_permit = permit_future.await;
+    debug_println!("✅ AGGREGATION_SEARCH: Successfully acquired search permit for aggregation query");
+
+    // Call Quickwit's leaf_search_single_split with aggregation support (SAME as working search)
+    let leaf_search_result = tokio::time::timeout(
+        std::time::Duration::from_secs(15), // 15 second timeout
+        quickwit_search::leaf_search_single_split(
+            &searcher_context,
+            search_request,
+            storage,
+            split_metadata,
+            doc_mapper,
+            split_filter,
+            aggregations_limits,
+            &mut search_permit,
+        )
+    ).await;
+
+    let result = match leaf_search_result {
+        Ok(search_result) => {
+            debug_println!("✅ AGGREGATION_SEARCH: leaf_search_single_split succeeded with aggregations");
+            search_result.map_err(|e| anyhow::anyhow!("Quickwit leaf search with aggregations failed: {}", e))?
+        },
+        Err(_timeout) => {
+            debug_println!("❌ AGGREGATION_SEARCH: TIMEOUT in leaf_search_single_split with aggregations");
+            drop(search_permit);
+            return Err(anyhow::anyhow!("leaf_search_single_split with aggregations timeout"));
+        }
+    };
+
+    debug_println!("✅ AGGREGATION_SEARCH: Search completed successfully with {} hits, has aggregations: {}",
+                   result.num_hits, result.intermediate_aggregation_result.is_some());
+
+    // Drop permit immediately
+    drop(search_permit);
 
     Ok(result)
 }

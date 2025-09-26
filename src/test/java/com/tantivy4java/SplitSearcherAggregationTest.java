@@ -104,9 +104,10 @@ public class SplitSearcherAggregationTest {
             }
         }
 
-        // Create cache manager and searcher
+        // Create cache manager and searcher with unique name per test run
+        String uniqueCacheName = "aggregation-test-cache-" + System.nanoTime();
         SplitCacheManager.CacheConfig cacheConfig =
-            new SplitCacheManager.CacheConfig("aggregation-test-cache");
+            new SplitCacheManager.CacheConfig(uniqueCacheName);
         cacheManager = SplitCacheManager.getInstance(cacheConfig);
 
         // Use the metadata with proper footer offsets from convertIndexFromPath
@@ -309,7 +310,7 @@ public class SplitSearcherAggregationTest {
         assertEquals("{\"max\": {\"field\": \"score\"}}", maxAgg.toAggregationJson());
 
         CountAggregation countAgg = new CountAggregation("test_count");
-        assertEquals("{\"value_count\": {\"field\": \"_doc\"}}", countAgg.toAggregationJson());
+        assertEquals("{\"value_count\": {\"field\": \"id\"}}", countAgg.toAggregationJson());
 
         System.out.println("✅ All aggregation JSON formats validated");
     }

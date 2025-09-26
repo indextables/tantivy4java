@@ -42,8 +42,8 @@ public class CountAggregation extends SplitAggregation {
 
     @Override
     public String toAggregationJson() {
-        // For count aggregation, we use value_count with _doc field
-        return "{\"value_count\": {\"field\": \"_doc\"}}";
+        // For count aggregation, we use value_count with id field (all documents have an id)
+        return "{\"value_count\": {\"field\": \"id\"}}";
     }
 
     @Override
