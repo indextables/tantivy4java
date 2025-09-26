@@ -26,9 +26,10 @@ public class SplitSearcherAggregationTest {
 
     @BeforeEach
     public void setUp(@TempDir Path tempDir) throws Exception {
-        // Create test index with numeric data
-        String indexPath = tempDir.resolve("aggregation_test_index").toString();
-        splitPath = tempDir.resolve("aggregation_test.split").toString();
+        // Create test index with numeric data - use unique names to avoid cache conflicts
+        String uniqueId = "aggregation_test_" + System.nanoTime();
+        String indexPath = tempDir.resolve(uniqueId + "_index").toString();
+        splitPath = tempDir.resolve(uniqueId + ".split").toString();
 
         try (SchemaBuilder builder = new SchemaBuilder()) {
             builder
@@ -91,9 +92,9 @@ public class SplitSearcherAggregationTest {
                         writer.commit();
                     }
 
-                    // Convert to QuickwitSplit
+                    // Convert to QuickwitSplit - use unique ID to avoid cache conflicts
                     QuickwitSplit.SplitConfig config = new QuickwitSplit.SplitConfig(
-                        "aggregation-test", "test-source", "test-node");
+                        uniqueId, "test-source", "test-node");
 
                     // Get the metadata with footer offsets from the conversion
                     QuickwitSplit.SplitMetadata metadata = QuickwitSplit.convertIndexFromPath(indexPath, splitPath, config);
@@ -105,7 +106,7 @@ public class SplitSearcherAggregationTest {
         }
 
         // Create cache manager and searcher with unique name per test run
-        String uniqueCacheName = "aggregation-test-cache-" + System.nanoTime();
+        String uniqueCacheName = uniqueId + "-cache";
         SplitCacheManager.CacheConfig cacheConfig =
             new SplitCacheManager.CacheConfig(uniqueCacheName);
         cacheManager = SplitCacheManager.getInstance(cacheConfig);
