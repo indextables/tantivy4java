@@ -157,8 +157,8 @@ public class SplitSearcherAggregationTest {
 
         SplitQuery matchAllQuery = new SplitMatchAllQuery();
 
-        // Test Count Aggregation
-        CountAggregation countAgg = new CountAggregation("doc_count");
+        // Test Count Aggregation - using "id" field which exists in our test data
+        CountAggregation countAgg = new CountAggregation("doc_count", "id");
         SearchResult countResult = searcher.search(matchAllQuery, 10, "count", countAgg);
         CountResult count = (CountResult) countResult.getAggregation("count");
         assertNotNull(count, "Count result should not be null");
@@ -209,7 +209,7 @@ public class SplitSearcherAggregationTest {
         Map<String, SplitAggregation> aggregations = new HashMap<>();
         aggregations.put("score_stats", new StatsAggregation("score"));
         aggregations.put("response_sum", new SumAggregation("response_time"));
-        aggregations.put("doc_count", new CountAggregation());
+        aggregations.put("doc_count", new CountAggregation("id"));
 
         // Perform search with multiple aggregations
         SearchResult result = searcher.search(matchAllQuery, 10, aggregations);
@@ -310,7 +310,7 @@ public class SplitSearcherAggregationTest {
         MaxAggregation maxAgg = new MaxAggregation("test_max", "score");
         assertEquals("{\"max\": {\"field\": \"score\"}}", maxAgg.toAggregationJson());
 
-        CountAggregation countAgg = new CountAggregation("test_count");
+        CountAggregation countAgg = new CountAggregation("test_count", "id");
         assertEquals("{\"value_count\": {\"field\": \"id\"}}", countAgg.toAggregationJson());
 
         System.out.println("✅ All aggregation JSON formats validated");
