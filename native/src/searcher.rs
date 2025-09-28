@@ -942,18 +942,38 @@ pub extern "system" fn Java_com_tantivy4java_SearchResult_nativeHasAggregations(
     ptr: jlong,
 ) -> jboolean {
     // Check if the SearchResult contains aggregation results
+    debug_println!("RUST DEBUG: ========== nativeHasAggregations CALLED with ptr={} ==========", ptr);
     // First try regular search results, then try enhanced search results
+    debug_println!("RUST DEBUG: nativeHasAggregations checking ptr type...");
     let has_aggregations = if let Some(has_aggs) = with_arc_safe::<Vec<(f32, tantivy::DocAddress)>, bool>(
         ptr,
-        |_search_results_arc| false  // Regular search results don't have aggregations
+        |_search_results_arc| {
+            debug_println!("RUST DEBUG: SearchResult is regular Vec type (no aggregations)");
+            false  // Regular search results don't have aggregations
+        }
     ) {
         has_aggs
     } else if let Some(has_aggs) = with_arc_safe::<crate::split_searcher_replacement::EnhancedSearchResult, bool>(
         ptr,
-        |enhanced_result_arc| enhanced_result_arc.aggregation_results.is_some()
+        |enhanced_result_arc| {
+            let has_aggs = enhanced_result_arc.aggregation_results.is_some();
+            debug_println!("RUST DEBUG: SearchResult is EnhancedSearchResult type, has_aggregations: {}", has_aggs);
+            if has_aggs {
+                if let Some(ref agg_bytes) = enhanced_result_arc.aggregation_results {
+                    debug_println!("RUST DEBUG: Aggregation bytes length: {}", agg_bytes.len());
+                }
+                if let Some(ref agg_json) = enhanced_result_arc.aggregation_json {
+                    debug_println!("RUST DEBUG: Aggregation JSON: {}", agg_json);
+                } else {
+                    debug_println!("RUST DEBUG: No aggregation JSON stored");
+                }
+            }
+            has_aggs
+        }
     ) {
         has_aggs
     } else {
+        debug_println!("RUST DEBUG: Invalid SearchResult pointer - unknown type");
         handle_error(&mut env, "Invalid SearchResult pointer");
         return 0; // false
     };
@@ -971,20 +991,32 @@ pub extern "system" fn Java_com_tantivy4java_SearchResult_nativeGetAggregations(
     // For now, return a simple implementation that shows the method is working
     // TODO: Implement full aggregation deserialization and Java object creation
 
+    debug_println!("RUST DEBUG: ========== nativeGetAggregations CALLED with ptr={} ==========", ptr);
+    debug_println!("RUST DEBUG: nativeGetAggregations checking ptr type...");
     let has_aggregations = if let Some(has_aggs) = with_arc_safe::<Vec<(f32, tantivy::DocAddress)>, bool>(
         ptr,
-        |_search_results_arc| false  // Regular search results don't have aggregations
+        |_search_results_arc| {
+            debug_println!("RUST DEBUG: nativeGetAggregations - SearchResult is regular Vec type (no aggregations)");
+            false  // Regular search results don't have aggregations
+        }
     ) {
         has_aggs
     } else if let Some(has_aggs) = with_arc_safe::<crate::split_searcher_replacement::EnhancedSearchResult, bool>(
         ptr,
-        |enhanced_result_arc| enhanced_result_arc.aggregation_results.is_some()
+        |enhanced_result_arc| {
+            let has_aggs = enhanced_result_arc.aggregation_results.is_some();
+            debug_println!("RUST DEBUG: nativeGetAggregations - SearchResult is EnhancedSearchResult type, has_aggregations: {}", has_aggs);
+            has_aggs
+        }
     ) {
         has_aggs
     } else {
+        debug_println!("RUST DEBUG: nativeGetAggregations - Invalid SearchResult pointer - unknown type");
         handle_error(&mut env, "Invalid SearchResult pointer");
         return std::ptr::null_mut();
     };
+
+    debug_println!("RUST DEBUG: nativeGetAggregations determined has_aggregations={}", has_aggregations);
 
     if has_aggregations {
         debug_println!("RUST DEBUG: has_aggregations=true, extracting aggregation results");
@@ -1022,6 +1054,7 @@ pub extern "system" fn Java_com_tantivy4java_SearchResult_nativeGetAggregations(
             std::ptr::null_mut()
         })
     } else {
+        debug_println!("RUST DEBUG: has_aggregations=false, returning empty HashMap");
         // Return empty HashMap if no aggregations
         match env.new_object("java/util/HashMap", "()V", &[]) {
             Ok(hashmap) => hashmap.into_raw(),
@@ -1115,7 +1148,29 @@ fn deserialize_aggregation_results(
     use tantivy::aggregation::AggregationLimitsGuard;
 
     // Step 1: Parse aggregation request from JSON
-    let aggregations: Aggregations = serde_json::from_str(&aggregation_json)?;
+    // The aggregation_json contains wrapped format like {"agg_0":{"terms":{"field":"status","size":1000}}}
+    // But Tantivy expects unwrapped format like {"terms":{"field":"status","size":1000}}
+    debug_println!("RUST DEBUG: Parsing aggregation JSON: {}", aggregation_json);
+
+    let aggregations: Aggregations = if aggregation_json.starts_with('{') {
+        // Parse as a JSON object to extract the inner aggregation structures
+        let json_value: serde_json::Value = serde_json::from_str(&aggregation_json)?;
+        if let Some(obj) = json_value.as_object() {
+            // Convert the wrapped format to unwrapped format that Tantivy expects
+            let mut unwrapped = serde_json::Map::new();
+            for (key, value) in obj {
+                // Each value should be the actual aggregation definition
+                unwrapped.insert(key.clone(), value.clone());
+            }
+            let unwrapped_json = serde_json::to_string(&unwrapped)?;
+            debug_println!("RUST DEBUG: Unwrapped aggregation JSON: {}", unwrapped_json);
+            serde_json::from_str(&unwrapped_json)?
+        } else {
+            serde_json::from_str(&aggregation_json)?
+        }
+    } else {
+        serde_json::from_str(&aggregation_json)?
+    };
 
     // Step 2: Deserialize binary data to intermediate results using postcard
     let intermediate_results: IntermediateAggregationResults = postcard::from_bytes(intermediate_agg_bytes)?;
@@ -1274,14 +1329,66 @@ fn find_specific_aggregation_result(
     use tantivy::aggregation::AggregationLimitsGuard;
 
     // Step 1: Parse aggregation request from JSON
-    let aggregations: Aggregations = match serde_json::from_str(aggregation_json) {
-        Ok(aggs) => {
-            debug_println!("RUST DEBUG: Successfully parsed aggregation request JSON");
-            aggs
+    // Handle wrapped JSON format like {"agg_0":{"terms":{"field":"status","size":1000}}}
+    debug_println!("RUST DEBUG: Parsing specific aggregation JSON: {}", aggregation_json);
+
+    let aggregations: Aggregations = if aggregation_json.starts_with('{') {
+        // Parse as a JSON object to extract the inner aggregation structures
+        match serde_json::from_str::<serde_json::Value>(aggregation_json) {
+            Ok(json_value) => {
+                if let Some(obj) = json_value.as_object() {
+                    // Convert the wrapped format to unwrapped format that Tantivy expects
+                    let mut unwrapped = serde_json::Map::new();
+                    for (key, value) in obj {
+                        unwrapped.insert(key.clone(), value.clone());
+                    }
+                    match serde_json::to_string(&unwrapped) {
+                        Ok(unwrapped_json) => {
+                            debug_println!("RUST DEBUG: Unwrapped specific aggregation JSON: {}", unwrapped_json);
+                            match serde_json::from_str(&unwrapped_json) {
+                                Ok(aggs) => {
+                                    debug_println!("RUST DEBUG: Successfully parsed specific aggregation request JSON");
+                                    aggs
+                                }
+                                Err(e) => {
+                                    debug_println!("RUST DEBUG: Failed to parse unwrapped aggregation JSON: {}", e);
+                                    return Ok(std::ptr::null_mut());
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            debug_println!("RUST DEBUG: Failed to serialize unwrapped JSON: {}", e);
+                            return Ok(std::ptr::null_mut());
+                        }
+                    }
+                } else {
+                    match serde_json::from_str(aggregation_json) {
+                        Ok(aggs) => {
+                            debug_println!("RUST DEBUG: Successfully parsed direct aggregation request JSON");
+                            aggs
+                        }
+                        Err(e) => {
+                            debug_println!("RUST DEBUG: Failed to parse direct aggregation JSON: {}", e);
+                            return Ok(std::ptr::null_mut());
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                debug_println!("RUST DEBUG: Failed to parse aggregation JSON as Value: {}", e);
+                return Ok(std::ptr::null_mut());
+            }
         }
-        Err(e) => {
-            debug_println!("RUST DEBUG: Failed to parse aggregation JSON: {}", e);
-            return Ok(std::ptr::null_mut());
+    } else {
+        match serde_json::from_str(aggregation_json) {
+            Ok(aggs) => {
+                debug_println!("RUST DEBUG: Successfully parsed aggregation request JSON (fallback)");
+                aggs
+            }
+            Err(e) => {
+                debug_println!("RUST DEBUG: Failed to parse aggregation JSON (fallback): {}", e);
+                return Ok(std::ptr::null_mut());
+            }
         }
     };
 
@@ -1396,11 +1503,97 @@ fn create_java_aggregation_from_final_result(
                 }
             }
         }
-        AggregationResult::BucketResult(_bucket_result) => {
-            debug_println!("RUST DEBUG: Bucket results not yet implemented");
-            Ok(std::ptr::null_mut())
+        AggregationResult::BucketResult(bucket_result) => {
+            use tantivy::aggregation::agg_result::BucketResult;
+            debug_println!("RUST DEBUG: Processing BucketResult: {:?}", bucket_result);
+
+            match bucket_result {
+                BucketResult::Terms { buckets, .. } => {
+                    debug_println!("RUST DEBUG: Creating TermsResult with {} buckets", buckets.len());
+                    create_terms_result_object(env, aggregation_name, &buckets)
+                }
+                BucketResult::Range { .. } => {
+                    debug_println!("RUST DEBUG: Range bucket results not yet implemented");
+                    Ok(std::ptr::null_mut())
+                }
+                BucketResult::Histogram { .. } => {
+                    debug_println!("RUST DEBUG: Histogram bucket results not yet implemented");
+                    Ok(std::ptr::null_mut())
+                }
+            }
         }
     }
+}
+
+/// Helper function to create a TermsResult Java object
+fn create_terms_result_object(
+    env: &mut JNIEnv,
+    aggregation_name: &str,
+    buckets: &Vec<tantivy::aggregation::agg_result::BucketEntry>,
+) -> anyhow::Result<jobject> {
+    use jni::objects::JValue;
+    use jni::sys::jlong;
+    use tantivy::aggregation::Key;
+
+    debug_println!("RUST DEBUG: Creating TermsResult for '{}' with {} buckets",
+                   aggregation_name, buckets.len());
+
+    // Create TermsResult class
+    let terms_result_class = env.find_class("com/tantivy4java/TermsResult")?;
+    let name_string = env.new_string(aggregation_name)?;
+
+    // Create ArrayList for buckets
+    let arraylist_class = env.find_class("java/util/ArrayList")?;
+    let bucket_list = env.new_object(&arraylist_class, "()V", &[])?;
+
+    // Create TermsBucket class for individual buckets
+    let bucket_class = env.find_class("com/tantivy4java/TermsResult$TermsBucket")?;
+
+    for bucket in buckets {
+        debug_println!("RUST DEBUG: Processing bucket - key: {:?}, doc_count: {}",
+                       bucket.key, bucket.doc_count);
+
+        // Convert the bucket key to string
+        let key_string = match &bucket.key {
+            Key::Str(s) => env.new_string(s)?,
+            Key::U64(n) => env.new_string(&n.to_string())?,
+            Key::I64(n) => env.new_string(&n.to_string())?,
+            Key::F64(n) => env.new_string(&n.to_string())?,
+        };
+
+        // Create TermsBucket object
+        let bucket_obj = env.new_object(
+            &bucket_class,
+            "(Ljava/lang/Object;J)V",
+            &[
+                JValue::Object(&key_string),
+                JValue::Long(bucket.doc_count as jlong),
+            ]
+        )?;
+
+        // Add bucket to list
+        env.call_method(
+            &bucket_list,
+            "add",
+            "(Ljava/lang/Object;)Z",
+            &[JValue::Object(&bucket_obj)]
+        )?;
+    }
+
+    // Create TermsResult with name, buckets, docCountErrorUpperBound, sumOtherDocCount
+    let terms_result_obj = env.new_object(
+        &terms_result_class,
+        "(Ljava/lang/String;Ljava/util/List;JJ)V",
+        &[
+            JValue::Object(&name_string),
+            JValue::Object(&bucket_list),
+            JValue::Long(0), // docCountErrorUpperBound - using 0 for now
+            JValue::Long(0), // sumOtherDocCount - using 0 for now
+        ]
+    )?;
+
+    debug_println!("RUST DEBUG: Successfully created TermsResult object");
+    Ok(terms_result_obj.into_raw())
 }
 
 /// Helper function to create a StatsResult Java object
