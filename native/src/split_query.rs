@@ -201,16 +201,25 @@ fn convert_term_query_to_query_ast(env: &mut JNIEnv, obj: &JObject) -> Result<Qu
     let value_jstring: JString = value_obj.l()?.into();
     
     let field: String = env.get_string(&field_jstring)?.into();
-    let mut value: String = env.get_string(&value_jstring)?.into();
-    
-    // The default tokenizer in Quickwit/Tantivy lowercases all text during indexing.
-    // For text fields, we need to lowercase the search term to match.
-    // TODO: This should ideally check the field's tokenizer configuration,
-    // but for now we'll lowercase all term queries since most text fields use the default tokenizer.
-    value = value.to_lowercase();
-    
-    debug_println!("RUST DEBUG: SplitTermQuery - field: '{}', original value: '{}', lowercased: '{}'", 
-                   field, env.get_string(&value_jstring)?.to_str()?, value);
+    let value: String = env.get_string(&value_jstring)?.into();
+
+    // CRITICAL FIX: Do NOT automatically lowercase term values!
+    // Different tokenizers handle case differently:
+    // - "default" tokenizer: lowercases during indexing, so queries should be lowercased
+    // - "raw" tokenizer: preserves case exactly, so queries should preserve case
+    // - "keyword" tokenizer: preserves case exactly, so queries should preserve case
+    //
+    // The correct approach is to let Quickwit/Tantivy handle tokenization according to
+    // the field's configured tokenizer. Automatic lowercasing breaks fields that use
+    // case-preserving tokenizers like "raw" and "keyword".
+    //
+    // This was the root cause of the boolean query bug where:
+    // - Data indexed as "Sales" with raw tokenizer
+    // - Queries lowercased to "sales" by this code
+    // - No matches found because "sales" != "Sales"
+
+    debug_println!("RUST DEBUG: SplitTermQuery - field: '{}', value: '{}' (preserving original case)",
+                   field, value);
     
     // Create proper Quickwit QueryAst using official structures
     use quickwit_query::query_ast::TermQuery;
@@ -259,15 +268,27 @@ fn convert_boolean_query_to_query_ast(env: &mut JNIEnv, obj: &JObject) -> Result
     
     // Create proper Quickwit BoolQuery using official structures
     use quickwit_query::query_ast::BoolQuery;
-    
+
+    // CRITICAL FIX: Handle pure should clauses according to Lucene/tantivy semantics
+    // In Lucene/tantivy, a boolean query with only should clauses should match
+    // documents that satisfy at least one should clause. However, Quickwit
+    // requires explicit minimum_should_match for this behavior.
+    let effective_minimum_should_match = if must_clauses.is_empty() && !should_clauses.is_empty() && minimum_should_match.is_none() {
+        // Pure should clauses: automatically set minimum_should_match to 1
+        debug_println!("RUST DEBUG: 🔧 BOOLEAN QUERY FIX: Pure should clauses detected, setting minimum_should_match=1");
+        Some(1)
+    } else {
+        minimum_should_match
+    };
+
     let bool_query = BoolQuery {
         must: must_clauses,
         must_not: must_not_clauses,
         should: should_clauses,
         filter: Vec::new(), // Java SplitBooleanQuery doesn't have filter, but Quickwit BoolQuery does
-        minimum_should_match,
+        minimum_should_match: effective_minimum_should_match,
     };
-    
+
     let query_ast = QueryAst::Bool(bool_query);
     
     debug_println!("RUST DEBUG: Created BooleanQuery QueryAst using native Quickwit structures");
