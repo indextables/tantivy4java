@@ -1,6 +1,8 @@
 package com.tantivy4java;
 
 import java.util.List;
+import java.util.Map;
+import java.util.HashMap;
 
 /**
  * Result of a terms aggregation containing buckets for each term.
@@ -71,10 +73,18 @@ public class TermsResult implements AggregationResult {
     public static class TermsBucket {
         private final Object key;
         private final long docCount;
+        private final Map<String, AggregationResult> subAggregations;
 
         public TermsBucket(Object key, long docCount) {
             this.key = key;
             this.docCount = docCount;
+            this.subAggregations = new HashMap<>();
+        }
+
+        public TermsBucket(Object key, long docCount, Map<String, AggregationResult> subAggregations) {
+            this.key = key;
+            this.docCount = docCount;
+            this.subAggregations = subAggregations != null ? subAggregations : new HashMap<>();
         }
 
         /**
@@ -98,9 +108,42 @@ public class TermsResult implements AggregationResult {
             return docCount;
         }
 
+        /**
+         * Gets a sub-aggregation by name.
+         *
+         * @param name The name of the sub-aggregation
+         * @return The sub-aggregation result, or null if not found
+         */
+        public AggregationResult getSubAggregation(String name) {
+            return subAggregations.get(name);
+        }
+
+        /**
+         * Gets all sub-aggregations for this bucket.
+         *
+         * @return Map of sub-aggregation name to result
+         */
+        public Map<String, AggregationResult> getSubAggregations() {
+            return subAggregations;
+        }
+
+        /**
+         * Checks if this bucket has any sub-aggregations.
+         *
+         * @return true if sub-aggregations exist, false otherwise
+         */
+        public boolean hasSubAggregations() {
+            return !subAggregations.isEmpty();
+        }
+
         @Override
         public String toString() {
-            return String.format("TermsBucket{key='%s', docCount=%d}", key, docCount);
+            if (hasSubAggregations()) {
+                return String.format("TermsBucket{key='%s', docCount=%d, subAggs=%s}",
+                                   key, docCount, subAggregations.keySet());
+            } else {
+                return String.format("TermsBucket{key='%s', docCount=%d}", key, docCount);
+            }
         }
     }
 }

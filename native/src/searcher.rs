@@ -1550,8 +1550,8 @@ fn create_terms_result_object(
     let bucket_class = env.find_class("com/tantivy4java/TermsResult$TermsBucket")?;
 
     for bucket in buckets {
-        debug_println!("RUST DEBUG: Processing bucket - key: {:?}, doc_count: {}",
-                       bucket.key, bucket.doc_count);
+        debug_println!("RUST DEBUG: Processing bucket - key: {:?}, doc_count: {}, has_sub_aggs: {}",
+                       bucket.key, bucket.doc_count, !bucket.sub_aggregation.0.is_empty());
 
         // Convert the bucket key to string
         let key_string = match &bucket.key {
@@ -1561,13 +1561,26 @@ fn create_terms_result_object(
             Key::F64(n) => env.new_string(&n.to_string())?,
         };
 
-        // Create TermsBucket object
+        // Process sub-aggregations if any
+        let sub_agg_map = if !bucket.sub_aggregation.0.is_empty() {
+            debug_println!("RUST DEBUG: Processing {} sub-aggregations in bucket", bucket.sub_aggregation.0.len());
+            create_sub_aggregations_map(env, &bucket.sub_aggregation)?
+        } else {
+            debug_println!("RUST DEBUG: No sub-aggregations in bucket");
+            // Create empty HashMap
+            let hashmap_class = env.find_class("java/util/HashMap")?;
+            env.new_object(&hashmap_class, "()V", &[])?.into_raw()
+        };
+
+        // Create TermsBucket object with sub-aggregations
+        let sub_agg_map_obj = unsafe { JObject::from_raw(sub_agg_map) };
         let bucket_obj = env.new_object(
             &bucket_class,
-            "(Ljava/lang/Object;J)V",
+            "(Ljava/lang/Object;JLjava/util/Map;)V",
             &[
                 JValue::Object(&key_string),
                 JValue::Long(bucket.doc_count as jlong),
+                JValue::Object(&sub_agg_map_obj),
             ]
         )?;
 
@@ -1594,6 +1607,49 @@ fn create_terms_result_object(
 
     debug_println!("RUST DEBUG: Successfully created TermsResult object");
     Ok(terms_result_obj.into_raw())
+}
+
+/// Helper function to create a Java HashMap of sub-aggregations from AggregationResults
+fn create_sub_aggregations_map(
+    env: &mut JNIEnv,
+    sub_aggregations: &tantivy::aggregation::agg_result::AggregationResults,
+) -> anyhow::Result<jobject> {
+    use jni::objects::JValue;
+
+    debug_println!("RUST DEBUG: Creating sub-aggregations map with {} entries", sub_aggregations.0.len());
+
+    // Create HashMap to store sub-aggregations
+    let hashmap_class = env.find_class("java/util/HashMap")?;
+    let sub_agg_map = env.new_object(&hashmap_class, "()V", &[])?;
+
+    // Process each sub-aggregation
+    for (agg_name, agg_result) in sub_aggregations.0.iter() {
+        debug_println!("RUST DEBUG: Processing sub-aggregation: {} -> {:?}", agg_name, agg_result);
+
+        // Convert aggregation result to Java object
+        let java_agg_result = create_java_aggregation_from_final_result(env, agg_name, agg_result)?;
+
+        if !java_agg_result.is_null() {
+            // Add to HashMap - Convert jobject to JObject for JValue::Object
+            let name_string = env.new_string(agg_name)?;
+            let java_agg_obj = unsafe { JObject::from_raw(java_agg_result) };
+            env.call_method(
+                &sub_agg_map,
+                "put",
+                "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+                &[
+                    JValue::Object(&name_string),
+                    JValue::Object(&java_agg_obj),
+                ]
+            )?;
+            debug_println!("RUST DEBUG: Added sub-aggregation '{}' to map", agg_name);
+        } else {
+            debug_println!("RUST DEBUG: Skipping null sub-aggregation '{}'", agg_name);
+        }
+    }
+
+    debug_println!("RUST DEBUG: Successfully created sub-aggregations map");
+    Ok(sub_agg_map.into_raw())
 }
 
 /// Helper function to create a StatsResult Java object
