@@ -2397,17 +2397,23 @@ fn parse_single_document(schema: &Schema, buffer: &[u8], offset: usize) -> Resul
                 FieldValue::Text(text) => document.add_text(field, &text),
                 FieldValue::Integer(int_val) => {
                     // Check schema field type and convert safely
-                    add_integer_value_safely(&mut document, schema, field, int_val);
+                    add_integer_value_safely(&mut document, schema, field, &field_name, int_val)?;
                 },
                 FieldValue::Unsigned(uint_val) => {
-                    // Check schema field type and convert safely  
+                    // Check schema field type and convert safely
                     add_unsigned_value_safely(&mut document, schema, field, uint_val);
                 },
-                FieldValue::Float(float_val) => document.add_f64(field, float_val),
-                FieldValue::Boolean(bool_val) => document.add_bool(field, bool_val),
+                FieldValue::Float(float_val) => {
+                    // Check schema field type and validate
+                    add_float_value_safely(&mut document, schema, field, &field_name, float_val)?;
+                },
+                FieldValue::Boolean(bool_val) => {
+                    // Check schema field type and validate
+                    add_boolean_value_safely(&mut document, schema, field, &field_name, bool_val)?;
+                },
                 FieldValue::Date(date_millis) => {
-                    let date_time = DateTime::from_timestamp_millis(date_millis);
-                    document.add_date(field, date_time);
+                    // Check schema field type and validate
+                    add_date_value_safely(&mut document, schema, field, &field_name, date_millis)?;
                 },
                 FieldValue::Bytes(bytes) => document.add_bytes(field, &bytes),
                 FieldValue::Json(json_str) => {
@@ -2620,10 +2626,10 @@ fn parse_field_value(buffer: &[u8], mut pos: usize, field_type: u8) -> Result<(F
 }
 
 /// Safely add an integer value to document, converting based on schema field type
-fn add_integer_value_safely(document: &mut TantivyDocument, schema: &Schema, field: Field, int_val: i64) {
+fn add_integer_value_safely(document: &mut TantivyDocument, schema: &Schema, field: Field, field_name: &str, int_val: i64) -> Result<(), String> {
     let field_entry = schema.get_field_entry(field);
     let field_type = field_entry.field_type();
-    
+
     match field_type {
         tantivy::schema::FieldType::U64(_) => {
             // Schema expects unsigned, but we have signed - convert safely
@@ -2633,23 +2639,35 @@ fn add_integer_value_safely(document: &mut TantivyDocument, schema: &Schema, fie
             } else {
                 document.add_u64(field, int_val as u64);
             }
+            Ok(())
         },
         tantivy::schema::FieldType::I64(_) => {
             // Schema expects signed - direct assignment
             document.add_i64(field, int_val);
+            Ok(())
+        },
+        tantivy::schema::FieldType::Date(_) => {
+            // Schema expects Date, but we have integer - this is a type mismatch
+            Err(format!(
+                "Type mismatch for field '{}': attempting to add INTEGER value to Date field. Use addDate() instead.",
+                field_name
+            ))
         },
         _ => {
-            // For other field types, try to add as signed integer (fallback)
-            document.add_i64(field, int_val);
+            // For other field types, return error
+            Err(format!(
+                "Type mismatch for field '{}': attempting to add INTEGER value to {:?} field. Expected I64 or U64 field in schema.",
+                field_name, field_type
+            ))
         }
     }
 }
 
-/// Safely add an unsigned value to document, converting based on schema field type  
+/// Safely add an unsigned value to document, converting based on schema field type
 fn add_unsigned_value_safely(document: &mut TantivyDocument, schema: &Schema, field: Field, uint_val: u64) {
     let field_entry = schema.get_field_entry(field);
     let field_type = field_entry.field_type();
-    
+
     match field_type {
         tantivy::schema::FieldType::I64(_) => {
             // Schema expects signed, but we have unsigned - convert safely
@@ -2667,6 +2685,86 @@ fn add_unsigned_value_safely(document: &mut TantivyDocument, schema: &Schema, fi
         _ => {
             // For other field types, try to add as unsigned (fallback)
             document.add_u64(field, uint_val);
+        }
+    }
+}
+
+/// Safely add a date value to document, validating schema field type and date range
+fn add_date_value_safely(document: &mut TantivyDocument, schema: &Schema, field: Field, field_name: &str, date_millis: i64) -> Result<(), String> {
+    let field_entry = schema.get_field_entry(field);
+    let field_type = field_entry.field_type();
+
+    match field_type {
+        tantivy::schema::FieldType::Date(_) => {
+            // Schema expects date - validate range first
+            // Tantivy DateTime supports approximately years 1677-2262
+            // Safe range: -9223372036854775808 to 9223372036854775807 milliseconds
+            // But practical range is much smaller due to i64 seconds conversion
+            // Year 1677: approximately -9,223,000,000,000 ms
+            // Year 2262: approximately 9,223,000,000,000 ms
+            const MIN_SAFE_MILLIS: i64 = -9_223_000_000_000;
+            const MAX_SAFE_MILLIS: i64 = 9_223_000_000_000;
+
+            if date_millis < MIN_SAFE_MILLIS || date_millis > MAX_SAFE_MILLIS {
+                return Err(format!(
+                    "Date value out of range for field '{}': {} milliseconds. Tantivy DateTime supports approximately years 1677-2262 (range: {} to {} milliseconds).",
+                    field_name, date_millis, MIN_SAFE_MILLIS, MAX_SAFE_MILLIS
+                ));
+            }
+
+            // Convert milliseconds to DateTime
+            let date_time = DateTime::from_timestamp_millis(date_millis);
+            document.add_date(field, date_time);
+            Ok(())
+        },
+        _ => {
+            // Schema field type doesn't match - return error
+            Err(format!(
+                "Type mismatch for field '{}': attempting to add DATE value to {:?} field. Expected Date field in schema.",
+                field_name, field_type
+            ))
+        }
+    }
+}
+
+/// Safely add a float value to document, validating schema field type
+fn add_float_value_safely(document: &mut TantivyDocument, schema: &Schema, field: Field, field_name: &str, float_val: f64) -> Result<(), String> {
+    let field_entry = schema.get_field_entry(field);
+    let field_type = field_entry.field_type();
+
+    match field_type {
+        tantivy::schema::FieldType::F64(_) => {
+            // Schema expects float - direct assignment
+            document.add_f64(field, float_val);
+            Ok(())
+        },
+        _ => {
+            // Schema field type doesn't match - return error
+            Err(format!(
+                "Type mismatch for field '{}': attempting to add FLOAT value to {:?} field. Expected F64 field in schema.",
+                field_name, field_type
+            ))
+        }
+    }
+}
+
+/// Safely add a boolean value to document, validating schema field type
+fn add_boolean_value_safely(document: &mut TantivyDocument, schema: &Schema, field: Field, field_name: &str, bool_val: bool) -> Result<(), String> {
+    let field_entry = schema.get_field_entry(field);
+    let field_type = field_entry.field_type();
+
+    match field_type {
+        tantivy::schema::FieldType::Bool(_) => {
+            // Schema expects boolean - direct assignment
+            document.add_bool(field, bool_val);
+            Ok(())
+        },
+        _ => {
+            // Schema field type doesn't match - return error
+            Err(format!(
+                "Type mismatch for field '{}': attempting to add BOOLEAN value to {:?} field. Expected Bool field in schema.",
+                field_name, field_type
+            ))
         }
     }
 }

@@ -437,15 +437,16 @@ mod resilient_ops {
 fn extract_doc_mapping_from_index(tantivy_index: &tantivy::Index) -> Result<String> {
     // Get the schema from the Tantivy index
     let schema = tantivy_index.schema();
-    
+
     debug_log!("Extracting doc mapping from Tantivy schema with {} fields", schema.fields().count());
-    
+
     // Create field mappings from the actual Tantivy schema as an array (not HashMap)
     let mut field_mappings = Vec::new();
-    
+
     for (field, field_entry) in schema.fields() {
     let field_name = field_entry.name();
-    debug_log!("  Processing field: {} with type: {:?}", field_name, field_entry.field_type());
+    debug_log!("  Processing field: {} with type: {:?}, is_fast: {}, is_indexed: {}, is_stored: {}",
+               field_name, field_entry.field_type(), field_entry.is_fast(), field_entry.is_indexed(), field_entry.is_stored());
     
     // Map Tantivy field types to Quickwit field mapping types
     let field_mapping = match field_entry.field_type() {
@@ -2431,7 +2432,8 @@ pub fn merge_splits_impl(split_urls: &[String], output_path: &str, config: &Inte
     let tokenizer_manager = get_quickwit_fastfield_normalizer_manager().tantivy_manager();
     let merged_index = open_index(merged_directory, tokenizer_manager)?;
     let doc_mapping_json = extract_doc_mapping_from_index(&merged_index)?;
-    debug_log!("Extracted doc mapping from merged index ({} bytes)", doc_mapping_json.len());
+    debug_log!("✅ DOCMAPPING EXTRACT: Extracted doc mapping from merged index ({} bytes)", doc_mapping_json.len());
+    debug_log!("✅ DOCMAPPING CONTENT: {}", &doc_mapping_json);
 
     // 5. Calculate final index size
     let final_size = calculate_directory_size(&output_temp_dir)?;
