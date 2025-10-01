@@ -1047,6 +1047,9 @@ Built on top of:
 - [Tantivy](https://github.com/quickwit-oss/tantivy) - The Rust search engine
 - [Quickwit](https://github.com/quickwit-oss/quickwit) - Distributed search platform
 
+**Development Tools:**
+- Much of this codebase was generated and maintained using [Anthropic Claude Code](https://claude.ai/claude-code)
+
 ---
 
-**Made with ❤️ for Java developers who need fast, reliable full-text search**
+**Made with ❤️ for Java developers who need fast, reliable full-text search without giving up platform interoperability**
