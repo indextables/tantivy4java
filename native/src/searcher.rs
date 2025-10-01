@@ -70,7 +70,7 @@ fn extract_segment_ids(env: &mut JNIEnv, list_obj: &JObject) -> Result<Vec<Strin
 
 // Searcher native methods
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_Searcher_nativeSearch(
+pub extern "system" fn Java_io_indextables_tantivy4java_core_Searcher_nativeSearch(
     mut env: JNIEnv,
     _class: JClass,
     ptr: jlong,
@@ -116,7 +116,7 @@ pub extern "system" fn Java_com_tantivy4java_Searcher_nativeSearch(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_Searcher_nativeAggregate(
+pub extern "system" fn Java_io_indextables_tantivy4java_core_Searcher_nativeAggregate(
     mut env: JNIEnv,
     _class: JClass,
     _ptr: jlong,
@@ -128,7 +128,7 @@ pub extern "system" fn Java_com_tantivy4java_Searcher_nativeAggregate(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_Searcher_nativeGetNumDocs(
+pub extern "system" fn Java_io_indextables_tantivy4java_core_Searcher_nativeGetNumDocs(
     _env: JNIEnv,
     _class: JClass,
     ptr: jlong,
@@ -140,7 +140,7 @@ pub extern "system" fn Java_com_tantivy4java_Searcher_nativeGetNumDocs(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_Searcher_nativeGetNumSegments(
+pub extern "system" fn Java_io_indextables_tantivy4java_core_Searcher_nativeGetNumSegments(
     _env: JNIEnv,
     _class: JClass,
     ptr: jlong,
@@ -152,7 +152,7 @@ pub extern "system" fn Java_com_tantivy4java_Searcher_nativeGetNumSegments(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_Searcher_nativeDoc(
+pub extern "system" fn Java_io_indextables_tantivy4java_core_Searcher_nativeDoc(
     mut env: JNIEnv,
     _class: JClass,
     searcher_ptr: jlong,
@@ -212,7 +212,7 @@ pub extern "system" fn Java_com_tantivy4java_Searcher_nativeDoc(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_Searcher_nativeDocBatch(
+pub extern "system" fn Java_io_indextables_tantivy4java_core_Searcher_nativeDocBatch(
     mut env: JNIEnv,
     _class: JClass,
     searcher_ptr: jlong,
@@ -329,7 +329,7 @@ pub extern "system" fn Java_com_tantivy4java_Searcher_nativeDocBatch(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_Searcher_nativeDocFreq(
+pub extern "system" fn Java_io_indextables_tantivy4java_core_Searcher_nativeDocFreq(
     mut env: JNIEnv,
     _class: JClass,
     _ptr: jlong,
@@ -341,7 +341,7 @@ pub extern "system" fn Java_com_tantivy4java_Searcher_nativeDocFreq(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_Searcher_nativeGetSegmentIds(
+pub extern "system" fn Java_io_indextables_tantivy4java_core_Searcher_nativeGetSegmentIds(
     mut env: JNIEnv,
     _class: JClass,
     ptr: jlong,
@@ -394,7 +394,7 @@ pub extern "system" fn Java_com_tantivy4java_Searcher_nativeGetSegmentIds(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_Searcher_nativeClose(
+pub extern "system" fn Java_io_indextables_tantivy4java_core_Searcher_nativeClose(
     _env: JNIEnv,
     _class: JClass,
     ptr: jlong,
@@ -404,7 +404,7 @@ pub extern "system" fn Java_com_tantivy4java_Searcher_nativeClose(
 
 // IndexWriter native methods
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_IndexWriter_nativeAddDocument(
+pub extern "system" fn Java_io_indextables_tantivy4java_core_IndexWriter_nativeAddDocument(
     mut env: JNIEnv,
     _class: JClass,
     ptr: jlong,
@@ -452,7 +452,7 @@ pub extern "system" fn Java_com_tantivy4java_IndexWriter_nativeAddDocument(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_IndexWriter_nativeAddJson(
+pub extern "system" fn Java_io_indextables_tantivy4java_core_IndexWriter_nativeAddJson(
     mut env: JNIEnv,
     _class: JClass,
     ptr: jlong,
@@ -492,7 +492,7 @@ pub extern "system" fn Java_com_tantivy4java_IndexWriter_nativeAddJson(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_IndexWriter_nativeAddDocumentsByBuffer(
+pub extern "system" fn Java_io_indextables_tantivy4java_core_IndexWriter_nativeAddDocumentsByBuffer(
     mut env: JNIEnv,
     _class: JClass,
     ptr: jlong,
@@ -528,7 +528,7 @@ pub extern "system" fn Java_com_tantivy4java_IndexWriter_nativeAddDocumentsByBuf
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_IndexWriter_nativeCommit(
+pub extern "system" fn Java_io_indextables_tantivy4java_core_IndexWriter_nativeCommit(
     mut env: JNIEnv,
     _class: JClass,
     ptr: jlong,
@@ -554,7 +554,7 @@ pub extern "system" fn Java_com_tantivy4java_IndexWriter_nativeCommit(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_IndexWriter_nativeRollback(
+pub extern "system" fn Java_io_indextables_tantivy4java_core_IndexWriter_nativeRollback(
     mut env: JNIEnv,
     _class: JClass,
     ptr: jlong,
@@ -578,7 +578,7 @@ pub extern "system" fn Java_com_tantivy4java_IndexWriter_nativeRollback(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_IndexWriter_nativeGarbageCollectFiles(
+pub extern "system" fn Java_io_indextables_tantivy4java_core_IndexWriter_nativeGarbageCollectFiles(
     mut env: JNIEnv,
     _class: JClass,
     ptr: jlong,
@@ -604,7 +604,7 @@ pub extern "system" fn Java_com_tantivy4java_IndexWriter_nativeGarbageCollectFil
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_IndexWriter_nativeDeleteAllDocuments(
+pub extern "system" fn Java_io_indextables_tantivy4java_core_IndexWriter_nativeDeleteAllDocuments(
     mut env: JNIEnv,
     _class: JClass,
     ptr: jlong,
@@ -627,7 +627,7 @@ pub extern "system" fn Java_com_tantivy4java_IndexWriter_nativeDeleteAllDocument
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_IndexWriter_nativeGetCommitOpstamp(
+pub extern "system" fn Java_io_indextables_tantivy4java_core_IndexWriter_nativeGetCommitOpstamp(
     mut env: JNIEnv,
     _class: JClass,
     ptr: jlong,
@@ -647,7 +647,7 @@ pub extern "system" fn Java_com_tantivy4java_IndexWriter_nativeGetCommitOpstamp(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_IndexWriter_nativeDeleteDocuments(
+pub extern "system" fn Java_io_indextables_tantivy4java_core_IndexWriter_nativeDeleteDocuments(
     mut env: JNIEnv,
     _class: JClass,
     _ptr: jlong,
@@ -659,7 +659,7 @@ pub extern "system" fn Java_com_tantivy4java_IndexWriter_nativeDeleteDocuments(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_IndexWriter_nativeDeleteDocumentsByTerm(
+pub extern "system" fn Java_io_indextables_tantivy4java_core_IndexWriter_nativeDeleteDocumentsByTerm(
     mut env: JNIEnv,
     _class: JClass,
     ptr: jlong,
@@ -719,7 +719,7 @@ pub extern "system" fn Java_com_tantivy4java_IndexWriter_nativeDeleteDocumentsBy
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_IndexWriter_nativeDeleteDocumentsByQuery(
+pub extern "system" fn Java_io_indextables_tantivy4java_core_IndexWriter_nativeDeleteDocumentsByQuery(
     mut env: JNIEnv,
     _class: JClass,
     ptr: jlong,
@@ -756,7 +756,7 @@ pub extern "system" fn Java_com_tantivy4java_IndexWriter_nativeDeleteDocumentsBy
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_IndexWriter_nativeWaitMergingThreads(
+pub extern "system" fn Java_io_indextables_tantivy4java_core_IndexWriter_nativeWaitMergingThreads(
     mut env: JNIEnv,
     _class: JClass,
     ptr: jlong,
@@ -793,7 +793,7 @@ pub extern "system" fn Java_com_tantivy4java_IndexWriter_nativeWaitMergingThread
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_IndexWriter_nativeMerge(
+pub extern "system" fn Java_io_indextables_tantivy4java_core_IndexWriter_nativeMerge(
     mut env: JNIEnv,
     _class: JClass,
     ptr: jlong,
@@ -854,7 +854,7 @@ pub extern "system" fn Java_com_tantivy4java_IndexWriter_nativeMerge(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_IndexWriter_nativeClose(
+pub extern "system" fn Java_io_indextables_tantivy4java_core_IndexWriter_nativeClose(
     _env: JNIEnv,
     _class: JClass,
     ptr: jlong,
@@ -865,7 +865,7 @@ pub extern "system" fn Java_com_tantivy4java_IndexWriter_nativeClose(
 // Supporting classes native methods - moved to separate modules
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_SearchResult_nativeGetHits(
+pub extern "system" fn Java_io_indextables_tantivy4java_result_SearchResult_nativeGetHits(
     mut env: JNIEnv,
     _class: JClass,
     _ptr: jlong,
@@ -896,14 +896,14 @@ pub extern "system" fn Java_com_tantivy4java_SearchResult_nativeGetHits(
             // Create DocAddress object first
             let doc_address_arc = Arc::new(*doc_address);
             let doc_address_ptr = arc_to_jlong(doc_address_arc);
-            let doc_address_class = env.find_class("com/tantivy4java/DocAddress").map_err(|e| e.to_string())?;
+            let doc_address_class = env.find_class("io/indextables/tantivy4java/core/DocAddress").map_err(|e| e.to_string())?;
             let doc_address_obj = env.new_object(&doc_address_class, "(J)V", &[doc_address_ptr.into()]).map_err(|e| e.to_string())?;
             
             // Create Hit object (SearchResult$Hit is the inner class)
-            let hit_class = env.find_class("com/tantivy4java/SearchResult$Hit").map_err(|e| e.to_string())?;
+            let hit_class = env.find_class("io/indextables/tantivy4java/result/SearchResult$Hit").map_err(|e| e.to_string())?;
             let hit_obj = env.new_object(
                 &hit_class, 
-                "(DLcom/tantivy4java/DocAddress;)V", 
+                "(DLio/indextables/tantivy4java/core/DocAddress;)V", 
                 &[(*score as f64).into(), (&doc_address_obj).into()]
             ).map_err(|e| e.to_string())?;
             
@@ -927,7 +927,7 @@ pub extern "system" fn Java_com_tantivy4java_SearchResult_nativeGetHits(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_SearchResult_nativeClose(
+pub extern "system" fn Java_io_indextables_tantivy4java_result_SearchResult_nativeClose(
     _env: JNIEnv,
     _class: JClass,
     ptr: jlong,
@@ -936,7 +936,7 @@ pub extern "system" fn Java_com_tantivy4java_SearchResult_nativeClose(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_SearchResult_nativeHasAggregations(
+pub extern "system" fn Java_io_indextables_tantivy4java_result_SearchResult_nativeHasAggregations(
     mut env: JNIEnv,
     _class: JClass,
     ptr: jlong,
@@ -983,7 +983,7 @@ pub extern "system" fn Java_com_tantivy4java_SearchResult_nativeHasAggregations(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_SearchResult_nativeGetAggregations(
+pub extern "system" fn Java_io_indextables_tantivy4java_result_SearchResult_nativeGetAggregations(
     mut env: JNIEnv,
     _class: JClass,
     ptr: jlong,
@@ -1067,7 +1067,7 @@ pub extern "system" fn Java_com_tantivy4java_SearchResult_nativeGetAggregations(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_SearchResult_nativeGetAggregation(
+pub extern "system" fn Java_io_indextables_tantivy4java_result_SearchResult_nativeGetAggregation(
     mut env: JNIEnv,
     _class: JClass,
     ptr: jlong,
@@ -1229,7 +1229,7 @@ fn create_fallback_aggregation_results(
     let name_string = env.new_string("test_count")
         .map_err(|e| anyhow::anyhow!("Failed to create test name string: {}", e))?;
 
-    let count_class = env.find_class("com/tantivy4java/CountResult")
+    let count_class = env.find_class("io/indextables/tantivy4java/aggregation/CountResult")
         .map_err(|e| anyhow::anyhow!("Failed to find CountResult class: {}", e))?;
 
     let mock_count = env.new_object(
@@ -1291,7 +1291,7 @@ fn create_java_result_from_json(
     debug_println!("RUST DEBUG: create_java_result_from_json for '{}': {}", agg_name, agg_value);
 
     // For now, create a simple CountResult as fallback
-    let count_class = env.find_class("com/tantivy4java/CountResult")
+    let count_class = env.find_class("io/indextables/tantivy4java/aggregation/CountResult")
         .map_err(|e| anyhow::anyhow!("Failed to find CountResult class: {}", e))?;
 
     let name_string = env.new_string(agg_name)
@@ -1539,7 +1539,7 @@ fn create_terms_result_object(
                    aggregation_name, buckets.len());
 
     // Create TermsResult class
-    let terms_result_class = env.find_class("com/tantivy4java/TermsResult")?;
+    let terms_result_class = env.find_class("io/indextables/tantivy4java/aggregation/TermsResult")?;
     let name_string = env.new_string(aggregation_name)?;
 
     // Create ArrayList for buckets
@@ -1547,7 +1547,7 @@ fn create_terms_result_object(
     let bucket_list = env.new_object(&arraylist_class, "()V", &[])?;
 
     // Create TermsBucket class for individual buckets
-    let bucket_class = env.find_class("com/tantivy4java/TermsResult$TermsBucket")?;
+    let bucket_class = env.find_class("io/indextables/tantivy4java/aggregation/TermsResult$TermsBucket")?;
 
     for bucket in buckets {
         debug_println!("RUST DEBUG: Processing bucket - key: {:?}, doc_count: {}, has_sub_aggs: {}",
@@ -1661,7 +1661,7 @@ fn create_stats_result_object(
     min: f64,
     max: f64,
 ) -> anyhow::Result<jobject> {
-    let stats_result_class = env.find_class("com/tantivy4java/StatsResult")?;
+    let stats_result_class = env.find_class("io/indextables/tantivy4java/aggregation/StatsResult")?;
     let name_string = env.new_string(aggregation_name)?;
 
     eprintln!("RUST DEBUG: Creating StatsResult with count={}, sum={}, min={}, max={}",
@@ -1691,7 +1691,7 @@ fn create_average_result_object(
     aggregation_name: &str,
     average: f64,
 ) -> anyhow::Result<jobject> {
-    let class = env.find_class("com/tantivy4java/AverageResult")?;
+    let class = env.find_class("io/indextables/tantivy4java/aggregation/AverageResult")?;
     let name_string = env.new_string(aggregation_name)?;
 
     use jni::objects::JValue;
@@ -1710,7 +1710,7 @@ fn create_count_result_object(
     aggregation_name: &str,
     count: u64,
 ) -> anyhow::Result<jobject> {
-    let class = env.find_class("com/tantivy4java/CountResult")?;
+    let class = env.find_class("io/indextables/tantivy4java/aggregation/CountResult")?;
     let name_string = env.new_string(aggregation_name)?;
 
     use jni::objects::JValue;
@@ -1730,7 +1730,7 @@ fn create_min_result_object(
     aggregation_name: &str,
     min: f64,
 ) -> anyhow::Result<jobject> {
-    let class = env.find_class("com/tantivy4java/MinResult")?;
+    let class = env.find_class("io/indextables/tantivy4java/aggregation/MinResult")?;
     let name_string = env.new_string(aggregation_name)?;
 
     use jni::objects::JValue;
@@ -1749,7 +1749,7 @@ fn create_max_result_object(
     aggregation_name: &str,
     max: f64,
 ) -> anyhow::Result<jobject> {
-    let class = env.find_class("com/tantivy4java/MaxResult")?;
+    let class = env.find_class("io/indextables/tantivy4java/aggregation/MaxResult")?;
     let name_string = env.new_string(aggregation_name)?;
 
     use jni::objects::JValue;
@@ -1768,7 +1768,7 @@ fn create_sum_result_object(
     aggregation_name: &str,
     sum: f64,
 ) -> anyhow::Result<jobject> {
-    let class = env.find_class("com/tantivy4java/SumResult")?;
+    let class = env.find_class("io/indextables/tantivy4java/aggregation/SumResult")?;
     let name_string = env.new_string(aggregation_name)?;
 
     use jni::objects::JValue;
@@ -1818,7 +1818,7 @@ fn create_stats_result(env: &mut JNIEnv, stats_json: &serde_json::Value) -> anyh
                    count, sum, avg, min, max);
 
     // Create StatsResult Java object with name parameter
-    let stats_result_class = env.find_class("com/tantivy4java/StatsResult")?;
+    let stats_result_class = env.find_class("io/indextables/tantivy4java/aggregation/StatsResult")?;
 
     // Create name string (we don't have the original aggregation name here, so use "stats")
     let name_string = env.new_string("stats")?;
@@ -1842,7 +1842,7 @@ fn create_stats_result(env: &mut JNIEnv, stats_json: &serde_json::Value) -> anyh
 fn create_count_result(env: &mut JNIEnv, count_json: &serde_json::Value) -> anyhow::Result<jobject> {
     let count = count_json.as_u64().unwrap_or(0) as jlong;
 
-    let count_result_class = env.find_class("com/tantivy4java/CountResult")?;
+    let count_result_class = env.find_class("io/indextables/tantivy4java/aggregation/CountResult")?;
     let count_result = env.new_object(
         &count_result_class,
         "(J)V",
@@ -1941,7 +1941,7 @@ fn parse_stats_aggregation_from_bytes(
                     // Java constructor: StatsResult(String name, long count, double sum, double min, double max)
                     debug_println!("RUST DEBUG: About to create StatsResult with real aggregation data");
 
-                    let stats_result_class = env.find_class("com/tantivy4java/StatsResult")?;
+                    let stats_result_class = env.find_class("io/indextables/tantivy4java/aggregation/StatsResult")?;
                     debug_println!("RUST DEBUG: Found StatsResult class");
 
                     let name_string = env.new_string(aggregation_name)?;
@@ -1994,7 +1994,7 @@ fn create_java_aggregation_from_quickwit(
 
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_Explanation_nativeToJson(
+pub extern "system" fn Java_io_indextables_tantivy4java_query_Explanation_nativeToJson(
     mut env: JNIEnv,
     _class: JClass,
     _ptr: jlong,
@@ -2004,7 +2004,7 @@ pub extern "system" fn Java_com_tantivy4java_Explanation_nativeToJson(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_Explanation_nativeClose(
+pub extern "system" fn Java_io_indextables_tantivy4java_query_Explanation_nativeClose(
     _env: JNIEnv,
     _class: JClass,
     ptr: jlong,
@@ -2016,7 +2016,7 @@ pub extern "system" fn Java_com_tantivy4java_Explanation_nativeClose(
 
 // Facet native methods
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_Facet_nativeFromEncoded(
+pub extern "system" fn Java_io_indextables_tantivy4java_util_Facet_nativeFromEncoded(
     mut env: JNIEnv,
     _class: JClass,
     _encoded_bytes: jni::objects::JByteArray,
@@ -2026,7 +2026,7 @@ pub extern "system" fn Java_com_tantivy4java_Facet_nativeFromEncoded(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_Facet_nativeRoot(
+pub extern "system" fn Java_io_indextables_tantivy4java_util_Facet_nativeRoot(
     mut env: JNIEnv,
     _class: JClass,
 ) -> jlong {
@@ -2035,7 +2035,7 @@ pub extern "system" fn Java_com_tantivy4java_Facet_nativeRoot(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_Facet_nativeFromString(
+pub extern "system" fn Java_io_indextables_tantivy4java_util_Facet_nativeFromString(
     mut env: JNIEnv,
     _class: JClass,
     _facet_string: JString,
@@ -2045,7 +2045,7 @@ pub extern "system" fn Java_com_tantivy4java_Facet_nativeFromString(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_Facet_nativeIsRoot(
+pub extern "system" fn Java_io_indextables_tantivy4java_util_Facet_nativeIsRoot(
     mut env: JNIEnv,
     _class: JClass,
     _ptr: jlong,
@@ -2055,7 +2055,7 @@ pub extern "system" fn Java_com_tantivy4java_Facet_nativeIsRoot(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_Facet_nativeIsPrefixOf(
+pub extern "system" fn Java_io_indextables_tantivy4java_util_Facet_nativeIsPrefixOf(
     mut env: JNIEnv,
     _class: JClass,
     _ptr: jlong,
@@ -2066,7 +2066,7 @@ pub extern "system" fn Java_com_tantivy4java_Facet_nativeIsPrefixOf(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_Facet_nativeToPath(
+pub extern "system" fn Java_io_indextables_tantivy4java_util_Facet_nativeToPath(
     mut env: JNIEnv,
     _class: JClass,
     _ptr: jlong,
@@ -2076,7 +2076,7 @@ pub extern "system" fn Java_com_tantivy4java_Facet_nativeToPath(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_Facet_nativeToPathStr(
+pub extern "system" fn Java_io_indextables_tantivy4java_util_Facet_nativeToPathStr(
     mut env: JNIEnv,
     _class: JClass,
     _ptr: jlong,
@@ -2086,7 +2086,7 @@ pub extern "system" fn Java_com_tantivy4java_Facet_nativeToPathStr(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_Facet_nativeClose(
+pub extern "system" fn Java_io_indextables_tantivy4java_util_Facet_nativeClose(
     _env: JNIEnv,
     _class: JClass,
     ptr: jlong,
@@ -2180,7 +2180,7 @@ fn convert_jobject_to_term(
 
 // SegmentMeta native methods
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_SegmentMeta_nativeGetSegmentId(
+pub extern "system" fn Java_io_indextables_tantivy4java_core_SegmentMeta_nativeGetSegmentId(
     mut env: JNIEnv,
     _class: JClass,
     ptr: jlong,
@@ -2208,7 +2208,7 @@ pub extern "system" fn Java_com_tantivy4java_SegmentMeta_nativeGetSegmentId(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_SegmentMeta_nativeGetMaxDoc(
+pub extern "system" fn Java_io_indextables_tantivy4java_core_SegmentMeta_nativeGetMaxDoc(
     mut env: JNIEnv,
     _class: JClass,
     ptr: jlong,
@@ -2228,7 +2228,7 @@ pub extern "system" fn Java_com_tantivy4java_SegmentMeta_nativeGetMaxDoc(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_SegmentMeta_nativeGetNumDeletedDocs(
+pub extern "system" fn Java_io_indextables_tantivy4java_core_SegmentMeta_nativeGetNumDeletedDocs(
     mut env: JNIEnv,
     _class: JClass,
     ptr: jlong,
@@ -2248,7 +2248,7 @@ pub extern "system" fn Java_com_tantivy4java_SegmentMeta_nativeGetNumDeletedDocs
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_SegmentMeta_nativeClose(
+pub extern "system" fn Java_io_indextables_tantivy4java_core_SegmentMeta_nativeClose(
     _env: JNIEnv,
     _class: JClass,
     ptr: jlong,

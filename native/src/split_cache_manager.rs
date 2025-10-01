@@ -181,7 +181,7 @@ lazy_static::lazy_static! {
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_SplitCacheManager_createNativeCacheManager(
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_createNativeCacheManager(
     mut env: JNIEnv,
     _class: JClass,
     config: JObject,
@@ -275,7 +275,7 @@ pub extern "system" fn Java_com_tantivy4java_SplitCacheManager_createNativeCache
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_SplitCacheManager_closeNativeCacheManager(
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_closeNativeCacheManager(
     _env: JNIEnv,
     _class: JClass,
     ptr: jlong,
@@ -294,7 +294,7 @@ pub extern "system" fn Java_com_tantivy4java_SplitCacheManager_closeNativeCacheM
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_SplitCacheManager_getGlobalCacheStatsNative(
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_getGlobalCacheStatsNative(
     mut env: JNIEnv,
     _class: JClass,
     ptr: jlong,
@@ -318,7 +318,7 @@ pub extern "system" fn Java_com_tantivy4java_SplitCacheManager_getGlobalCacheSta
     let stats = manager.get_cache_stats();
     
     // Create GlobalCacheStats Java object
-    match env.find_class("com/tantivy4java/SplitCacheManager$GlobalCacheStats") {
+    match env.find_class("io/indextables/tantivy4java/split/SplitCacheManager$GlobalCacheStats") {
         Ok(stats_class) => {
             match env.new_object(
                 stats_class,
@@ -341,7 +341,7 @@ pub extern "system" fn Java_com_tantivy4java_SplitCacheManager_getGlobalCacheSta
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_SplitCacheManager_forceEvictionNative(
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_forceEvictionNative(
     _env: JNIEnv,
     _class: JClass,
     ptr: jlong,
@@ -367,7 +367,7 @@ pub extern "system" fn Java_com_tantivy4java_SplitCacheManager_forceEvictionNati
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_SplitCacheManager_getComprehensiveCacheStatsNative(
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_getComprehensiveCacheStatsNative(
     mut env: JNIEnv,
     _class: JClass,
     ptr: jlong,
@@ -447,7 +447,7 @@ pub extern "system" fn Java_com_tantivy4java_SplitCacheManager_getComprehensiveC
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_SplitCacheManager_preloadComponentsNative(
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_preloadComponentsNative(
     _env: JNIEnv,
     _class: JClass,
     ptr: jlong,
@@ -475,7 +475,7 @@ pub extern "system" fn Java_com_tantivy4java_SplitCacheManager_preloadComponents
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_SplitCacheManager_evictComponentsNative(
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_evictComponentsNative(
     _env: JNIEnv,
     _class: JClass,
     ptr: jlong,
@@ -503,7 +503,7 @@ pub extern "system" fn Java_com_tantivy4java_SplitCacheManager_evictComponentsNa
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_SplitCacheManager_searchAcrossAllSplitsNative(
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_searchAcrossAllSplitsNative(
     mut env: JNIEnv,
     _class: JClass,
     ptr: jlong,
@@ -541,7 +541,7 @@ pub extern "system" fn Java_com_tantivy4java_SplitCacheManager_searchAcrossAllSp
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_SplitCacheManager_searchAcrossSplitsNative(
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_searchAcrossSplitsNative(
     mut env: JNIEnv,
     _class: JClass,
     ptr: jlong,

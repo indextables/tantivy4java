@@ -27,7 +27,7 @@ use crate::debug_println;
 use std::sync::{Arc, Mutex};
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_SchemaBuilder_nativeNew(
+pub extern "system" fn Java_io_indextables_tantivy4java_core_SchemaBuilder_nativeNew(
     _env: JNIEnv,
     _class: JClass,
 ) -> jlong {
@@ -37,7 +37,7 @@ pub extern "system" fn Java_com_tantivy4java_SchemaBuilder_nativeNew(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_SchemaBuilder_nativeIsValidFieldName(
+pub extern "system" fn Java_io_indextables_tantivy4java_core_SchemaBuilder_nativeIsValidFieldName(
     mut env: JNIEnv,
     _class: JClass,
     name: JString,
@@ -54,7 +54,7 @@ pub extern "system" fn Java_com_tantivy4java_SchemaBuilder_nativeIsValidFieldNam
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_SchemaBuilder_nativeAddTextField(
+pub extern "system" fn Java_io_indextables_tantivy4java_core_SchemaBuilder_nativeAddTextField(
     mut env: JNIEnv,
     _class: JClass,
     ptr: jlong,
@@ -133,7 +133,7 @@ pub extern "system" fn Java_com_tantivy4java_SchemaBuilder_nativeAddTextField(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_SchemaBuilder_nativeAddIntegerField(
+pub extern "system" fn Java_io_indextables_tantivy4java_core_SchemaBuilder_nativeAddIntegerField(
     mut env: JNIEnv,
     _class: JClass,
     ptr: jlong,
@@ -182,7 +182,7 @@ pub extern "system" fn Java_com_tantivy4java_SchemaBuilder_nativeAddIntegerField
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_SchemaBuilder_nativeAddFloatField(
+pub extern "system" fn Java_io_indextables_tantivy4java_core_SchemaBuilder_nativeAddFloatField(
     mut env: JNIEnv,
     _class: JClass,
     ptr: jlong,
@@ -231,7 +231,7 @@ pub extern "system" fn Java_com_tantivy4java_SchemaBuilder_nativeAddFloatField(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_SchemaBuilder_nativeAddUnsignedField(
+pub extern "system" fn Java_io_indextables_tantivy4java_core_SchemaBuilder_nativeAddUnsignedField(
     mut env: JNIEnv,
     _class: JClass,
     ptr: jlong,
@@ -280,7 +280,7 @@ pub extern "system" fn Java_com_tantivy4java_SchemaBuilder_nativeAddUnsignedFiel
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_SchemaBuilder_nativeAddBooleanField(
+pub extern "system" fn Java_io_indextables_tantivy4java_core_SchemaBuilder_nativeAddBooleanField(
     mut env: JNIEnv,
     _class: JClass,
     ptr: jlong,
@@ -329,7 +329,7 @@ pub extern "system" fn Java_com_tantivy4java_SchemaBuilder_nativeAddBooleanField
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_SchemaBuilder_nativeAddDateField(
+pub extern "system" fn Java_io_indextables_tantivy4java_core_SchemaBuilder_nativeAddDateField(
     mut env: JNIEnv,
     _class: JClass,
     ptr: jlong,
@@ -367,7 +367,7 @@ pub extern "system" fn Java_com_tantivy4java_SchemaBuilder_nativeAddDateField(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_SchemaBuilder_nativeAddJsonField(
+pub extern "system" fn Java_io_indextables_tantivy4java_core_SchemaBuilder_nativeAddJsonField(
     mut env: JNIEnv,
     _class: JClass,
     ptr: jlong,
@@ -441,7 +441,7 @@ pub extern "system" fn Java_com_tantivy4java_SchemaBuilder_nativeAddJsonField(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_SchemaBuilder_nativeAddFacetField(
+pub extern "system" fn Java_io_indextables_tantivy4java_core_SchemaBuilder_nativeAddFacetField(
     mut env: JNIEnv,
     _class: JClass,
     _ptr: jlong,
@@ -451,7 +451,7 @@ pub extern "system" fn Java_com_tantivy4java_SchemaBuilder_nativeAddFacetField(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_SchemaBuilder_nativeAddBytesField(
+pub extern "system" fn Java_io_indextables_tantivy4java_core_SchemaBuilder_nativeAddBytesField(
     mut env: JNIEnv,
     _class: JClass,
     _ptr: jlong,
@@ -465,7 +465,7 @@ pub extern "system" fn Java_com_tantivy4java_SchemaBuilder_nativeAddBytesField(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_SchemaBuilder_nativeAddIpAddrField(
+pub extern "system" fn Java_io_indextables_tantivy4java_core_SchemaBuilder_nativeAddIpAddrField(
     mut env: JNIEnv,
     _class: JClass,
     ptr: jlong,
@@ -503,7 +503,7 @@ pub extern "system" fn Java_com_tantivy4java_SchemaBuilder_nativeAddIpAddrField(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_SchemaBuilder_nativeBuild(
+pub extern "system" fn Java_io_indextables_tantivy4java_core_SchemaBuilder_nativeBuild(
     mut env: JNIEnv,
     _class: JClass,
     ptr: jlong,
@@ -539,7 +539,7 @@ pub extern "system" fn Java_com_tantivy4java_SchemaBuilder_nativeBuild(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_SchemaBuilder_nativeClose(
+pub extern "system" fn Java_io_indextables_tantivy4java_core_SchemaBuilder_nativeClose(
     _env: JNIEnv,
     _class: JClass,
     ptr: jlong,
@@ -548,7 +548,7 @@ pub extern "system" fn Java_com_tantivy4java_SchemaBuilder_nativeClose(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_SchemaBuilder_nativeAddStringField(
+pub extern "system" fn Java_io_indextables_tantivy4java_core_SchemaBuilder_nativeAddStringField(
     mut env: JNIEnv,
     _class: JClass,
     ptr: jlong,
@@ -605,7 +605,7 @@ pub extern "system" fn Java_com_tantivy4java_SchemaBuilder_nativeAddStringField(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_Schema_nativeClose(
+pub extern "system" fn Java_io_indextables_tantivy4java_core_Schema_nativeClose(
     _env: JNIEnv,
     _class: JClass,
     ptr: jlong,
@@ -615,7 +615,7 @@ pub extern "system" fn Java_com_tantivy4java_Schema_nativeClose(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_Schema_nativeGetFieldNames(
+pub extern "system" fn Java_io_indextables_tantivy4java_core_Schema_nativeGetFieldNames(
     mut env: JNIEnv,
     _class: JClass,
     ptr: jlong,
@@ -696,7 +696,7 @@ pub extern "system" fn Java_com_tantivy4java_Schema_nativeGetFieldNames(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_Schema_nativeHasField(
+pub extern "system" fn Java_io_indextables_tantivy4java_core_Schema_nativeHasField(
     mut env: JNIEnv,
     _class: JClass,
     ptr: jlong,
@@ -724,7 +724,7 @@ pub extern "system" fn Java_com_tantivy4java_Schema_nativeHasField(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_Schema_nativeGetFieldCount(
+pub extern "system" fn Java_io_indextables_tantivy4java_core_Schema_nativeGetFieldCount(
     _env: JNIEnv,
     _class: JClass,
     ptr: jlong,
@@ -748,7 +748,7 @@ pub extern "system" fn Java_com_tantivy4java_Schema_nativeGetFieldCount(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_Schema_nativeGetFieldNamesByType(
+pub extern "system" fn Java_io_indextables_tantivy4java_core_Schema_nativeGetFieldNamesByType(
     mut env: JNIEnv,
     _class: JClass,
     ptr: jlong,
@@ -810,7 +810,7 @@ pub extern "system" fn Java_com_tantivy4java_Schema_nativeGetFieldNamesByType(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_Schema_nativeGetFieldNamesByCapabilities(
+pub extern "system" fn Java_io_indextables_tantivy4java_core_Schema_nativeGetFieldNamesByCapabilities(
     mut env: JNIEnv,
     _class: JClass,
     ptr: jlong,
@@ -906,7 +906,7 @@ pub extern "system" fn Java_com_tantivy4java_Schema_nativeGetFieldNamesByCapabil
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_Schema_nativeGetFieldInfo(
+pub extern "system" fn Java_io_indextables_tantivy4java_core_Schema_nativeGetFieldInfo(
     mut env: JNIEnv,
     _class: JClass,
     ptr: jlong,
@@ -962,7 +962,7 @@ pub extern "system" fn Java_com_tantivy4java_Schema_nativeGetFieldInfo(
         };
         
         // Create FieldType enum by getting the enum value through valueOf
-        let field_type_class = env.find_class("com/tantivy4java/FieldType").map_err(|e| e.to_string())?;
+        let field_type_class = env.find_class("io/indextables/tantivy4java/core/FieldType").map_err(|e| e.to_string())?;
         let field_type_name = match java_field_type {
             1 => "TEXT",
             2 => "UNSIGNED", 
@@ -980,12 +980,12 @@ pub extern "system" fn Java_com_tantivy4java_Schema_nativeGetFieldInfo(
         let field_type_obj = env.call_static_method(
             &field_type_class,
             "valueOf",
-            "(Ljava/lang/String;)Lcom/tantivy4java/FieldType;",
+            "(Ljava/lang/String;)Lio/indextables/tantivy4java/core/FieldType;",
             &[(&field_type_name_str).into()]
         ).map_err(|e| e.to_string())?.l().map_err(|e| e.to_string())?;
         
         // Create FieldInfo object
-        let field_info_class = env.find_class("com/tantivy4java/FieldInfo").map_err(|e| e.to_string())?;
+        let field_info_class = env.find_class("io/indextables/tantivy4java/core/FieldInfo").map_err(|e| e.to_string())?;
         
         let field_info = if let (Some(tokenizer), Some(index_opt)) = (tokenizer_name, index_option) {
             // Text field constructor with tokenizer and index option
@@ -995,7 +995,7 @@ pub extern "system" fn Java_com_tantivy4java_Schema_nativeGetFieldInfo(
             
             env.new_object(
                 &field_info_class,
-                "(Ljava/lang/String;Lcom/tantivy4java/FieldType;ZZZLjava/lang/String;Ljava/lang/String;)V",
+                "(Ljava/lang/String;Lio/indextables/tantivy4java/core/FieldType;ZZZLjava/lang/String;Ljava/lang/String;)V",
                 &[
                     (&name_str).into(),
                     (&field_type_obj).into(),
@@ -1012,7 +1012,7 @@ pub extern "system" fn Java_com_tantivy4java_Schema_nativeGetFieldInfo(
             
             env.new_object(
                 &field_info_class,
-                "(Ljava/lang/String;Lcom/tantivy4java/FieldType;ZZZ)V",
+                "(Ljava/lang/String;Lio/indextables/tantivy4java/core/FieldType;ZZZ)V",
                 &[
                     (&name_str).into(),
                     (&field_type_obj).into(),
@@ -1036,7 +1036,7 @@ pub extern "system" fn Java_com_tantivy4java_Schema_nativeGetFieldInfo(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_Schema_nativeGetAllFieldInfo(
+pub extern "system" fn Java_io_indextables_tantivy4java_core_Schema_nativeGetAllFieldInfo(
     mut env: JNIEnv,
     _class: JClass,
     ptr: jlong,
@@ -1086,7 +1086,7 @@ pub extern "system" fn Java_com_tantivy4java_Schema_nativeGetAllFieldInfo(
             };
             
             // Create FieldType enum by getting the enum value through valueOf
-            let field_type_class = env.find_class("com/tantivy4java/FieldType").map_err(|e| e.to_string())?;
+            let field_type_class = env.find_class("io/indextables/tantivy4java/core/FieldType").map_err(|e| e.to_string())?;
             let field_type_name = match java_field_type {
                 1 => "TEXT",
                 2 => "UNSIGNED", 
@@ -1104,12 +1104,12 @@ pub extern "system" fn Java_com_tantivy4java_Schema_nativeGetAllFieldInfo(
             let field_type_obj = env.call_static_method(
                 &field_type_class,
                 "valueOf",
-                "(Ljava/lang/String;)Lcom/tantivy4java/FieldType;",
+                "(Ljava/lang/String;)Lio/indextables/tantivy4java/core/FieldType;",
                 &[(&field_type_name_str).into()]
             ).map_err(|e| e.to_string())?.l().map_err(|e| e.to_string())?;
             
             // Create FieldInfo object
-            let field_info_class = env.find_class("com/tantivy4java/FieldInfo").map_err(|e| e.to_string())?;
+            let field_info_class = env.find_class("io/indextables/tantivy4java/core/FieldInfo").map_err(|e| e.to_string())?;
             
             let field_info = if let (Some(tokenizer), Some(index_opt)) = (tokenizer_name, index_option) {
                 // Text field constructor with tokenizer and index option
@@ -1119,7 +1119,7 @@ pub extern "system" fn Java_com_tantivy4java_Schema_nativeGetAllFieldInfo(
                 
                 env.new_object(
                     &field_info_class,
-                    "(Ljava/lang/String;Lcom/tantivy4java/FieldType;ZZZLjava/lang/String;Ljava/lang/String;)V",
+                    "(Ljava/lang/String;Lio/indextables/tantivy4java/core/FieldType;ZZZLjava/lang/String;Ljava/lang/String;)V",
                     &[
                         (&name_str).into(),
                         (&field_type_obj).into(),
@@ -1136,7 +1136,7 @@ pub extern "system" fn Java_com_tantivy4java_Schema_nativeGetAllFieldInfo(
                 
                 env.new_object(
                     &field_info_class,
-                    "(Ljava/lang/String;Lcom/tantivy4java/FieldType;ZZZ)V",
+                    "(Ljava/lang/String;Lio/indextables/tantivy4java/core/FieldType;ZZZ)V",
                     &[
                         (&name_str).into(),
                         (&field_type_obj).into(),
@@ -1169,7 +1169,7 @@ pub extern "system" fn Java_com_tantivy4java_Schema_nativeGetAllFieldInfo(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_Schema_nativeGetSchemaSummary(
+pub extern "system" fn Java_io_indextables_tantivy4java_core_Schema_nativeGetSchemaSummary(
     mut env: JNIEnv,
     _class: JClass,
     ptr: jlong,
@@ -1204,7 +1204,7 @@ pub extern "system" fn Java_com_tantivy4java_Schema_nativeGetSchemaSummary(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_Schema_nativeClone(
+pub extern "system" fn Java_io_indextables_tantivy4java_core_Schema_nativeClone(
     mut env: JNIEnv,
     _class: JClass,
     ptr: jlong,

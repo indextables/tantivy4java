@@ -56,7 +56,7 @@ pub extern "system" fn test_quickwit_range_query_parser() {
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_TestQueryParser_testRangeQueryParsing(
+pub extern "system" fn Java_io_indextables_tantivy4java_test_TestQueryParser_testRangeQueryParsing(
     _env: JNIEnv,
     _class: JClass,
 ) {

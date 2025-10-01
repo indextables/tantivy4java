@@ -713,7 +713,7 @@ fn create_split_metadata(config: &SplitConfig, num_docs: usize, uncompressed_doc
 }
 
 fn create_java_split_metadata<'a>(env: &mut JNIEnv<'a>, split_metadata: &QuickwitSplitMetadata) -> Result<JObject<'a>> {
-    let split_metadata_class = env.find_class("com/tantivy4java/QuickwitSplit$SplitMetadata")?;
+    let split_metadata_class = env.find_class("io/indextables/tantivy4java/split/merge/QuickwitSplit$SplitMetadata")?;
 
     // Create null Instant objects for time ranges (these are optional)
     let time_start_obj = JObject::null();
@@ -1156,7 +1156,7 @@ async fn create_quickwit_split(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_QuickwitSplit_nativeConvertIndex(
+pub extern "system" fn Java_io_indextables_tantivy4java_split_merge_QuickwitSplit_nativeConvertIndex(
     mut env: JNIEnv,
     _class: JClass,
     _index_ptr: i64,
@@ -1172,7 +1172,7 @@ pub extern "system" fn Java_com_tantivy4java_QuickwitSplit_nativeConvertIndex(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_QuickwitSplit_nativeConvertIndexFromPath(
+pub extern "system" fn Java_io_indextables_tantivy4java_split_merge_QuickwitSplit_nativeConvertIndexFromPath(
     mut env: JNIEnv,
     _class: JClass,
     index_path: JString,
@@ -1193,7 +1193,7 @@ pub extern "system" fn Java_com_tantivy4java_QuickwitSplit_nativeConvertIndexFro
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_QuickwitSplit_nativeReadSplitMetadata(
+pub extern "system" fn Java_io_indextables_tantivy4java_split_merge_QuickwitSplit_nativeReadSplitMetadata(
     mut env: JNIEnv,
     _class: JClass,
     split_path: JString,
@@ -1271,7 +1271,7 @@ pub extern "system" fn Java_com_tantivy4java_QuickwitSplit_nativeReadSplitMetada
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_QuickwitSplit_nativeListSplitFiles(
+pub extern "system" fn Java_io_indextables_tantivy4java_split_merge_QuickwitSplit_nativeListSplitFiles(
     mut env: JNIEnv,
     _class: JClass,
     split_path: JString,
@@ -1319,7 +1319,7 @@ pub extern "system" fn Java_com_tantivy4java_QuickwitSplit_nativeListSplitFiles(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_QuickwitSplit_nativeExtractSplit(
+pub extern "system" fn Java_io_indextables_tantivy4java_split_merge_QuickwitSplit_nativeExtractSplit(
     mut env: JNIEnv,
     _class: JClass,
     split_path: JString,
@@ -1428,7 +1428,7 @@ pub extern "system" fn Java_com_tantivy4java_QuickwitSplit_nativeExtractSplit(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_QuickwitSplit_nativeValidateSplit(
+pub extern "system" fn Java_io_indextables_tantivy4java_split_merge_QuickwitSplit_nativeValidateSplit(
     mut env: JNIEnv,
     _class: JClass,
     split_path: JString,
@@ -1470,7 +1470,7 @@ pub struct InternalAwsConfig {
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_QuickwitSplit_nativeMergeSplits(
+pub extern "system" fn Java_io_indextables_tantivy4java_split_merge_QuickwitSplit_nativeMergeSplits(
     mut env: JNIEnv,
     _class: JClass,
     split_urls_list: JObject,
@@ -1584,7 +1584,7 @@ fn extract_merge_config(env: &mut JNIEnv, config_obj: &JObject) -> Result<Intern
     };
     
     // Extract AWS configuration if present
-    let aws_config = match env.call_method(config_obj, "getAwsConfig", "()Lcom/tantivy4java/QuickwitSplit$AwsConfig;", &[]) {
+    let aws_config = match env.call_method(config_obj, "getAwsConfig", "()Lio/indextables/tantivy4java/split/merge/QuickwitSplit$AwsConfig;", &[]) {
     Ok(aws_result) => {
         let aws_obj = aws_result.l()?;
         if env.is_same_object(&aws_obj, JObject::null())? {

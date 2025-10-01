@@ -236,7 +236,7 @@ impl RetrievedDocument {
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_Document_nativeNew(
+pub extern "system" fn Java_io_indextables_tantivy4java_core_Document_nativeNew(
     _env: JNIEnv,
     _class: JClass,
 ) -> jlong {
@@ -247,7 +247,7 @@ pub extern "system" fn Java_com_tantivy4java_Document_nativeNew(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_Document_nativeFromMap(
+pub extern "system" fn Java_io_indextables_tantivy4java_core_Document_nativeFromMap(
     mut env: JNIEnv,
     _class: JClass,
     _fields: JObject,
@@ -258,7 +258,7 @@ pub extern "system" fn Java_com_tantivy4java_Document_nativeFromMap(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_Document_nativeGet(
+pub extern "system" fn Java_io_indextables_tantivy4java_core_Document_nativeGet(
     mut env: JNIEnv,
     _class: JClass,
     ptr: jlong,
@@ -381,7 +381,7 @@ pub extern "system" fn Java_com_tantivy4java_Document_nativeGet(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_Document_nativeToMap(
+pub extern "system" fn Java_io_indextables_tantivy4java_core_Document_nativeToMap(
     mut env: JNIEnv,
     _class: JClass,
     _ptr: jlong,
@@ -391,7 +391,7 @@ pub extern "system" fn Java_com_tantivy4java_Document_nativeToMap(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_Document_nativeExtend(
+pub extern "system" fn Java_io_indextables_tantivy4java_core_Document_nativeExtend(
     mut env: JNIEnv,
     _class: JClass,
     _ptr: jlong,
@@ -402,7 +402,7 @@ pub extern "system" fn Java_com_tantivy4java_Document_nativeExtend(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_Document_nativeAddText(
+pub extern "system" fn Java_io_indextables_tantivy4java_core_Document_nativeAddText(
     mut env: JNIEnv,
     _class: JClass,
     ptr: jlong,
@@ -450,7 +450,7 @@ pub extern "system" fn Java_com_tantivy4java_Document_nativeAddText(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_Document_nativeAddUnsigned(
+pub extern "system" fn Java_io_indextables_tantivy4java_core_Document_nativeAddUnsigned(
     mut env: JNIEnv,
     _class: JClass,
     ptr: jlong,
@@ -490,7 +490,7 @@ pub extern "system" fn Java_com_tantivy4java_Document_nativeAddUnsigned(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_Document_nativeAddInteger(
+pub extern "system" fn Java_io_indextables_tantivy4java_core_Document_nativeAddInteger(
     mut env: JNIEnv,
     _class: JClass,
     ptr: jlong,
@@ -530,7 +530,7 @@ pub extern "system" fn Java_com_tantivy4java_Document_nativeAddInteger(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_Document_nativeAddFloat(
+pub extern "system" fn Java_io_indextables_tantivy4java_core_Document_nativeAddFloat(
     mut env: JNIEnv,
     _class: JClass,
     ptr: jlong,
@@ -570,7 +570,7 @@ pub extern "system" fn Java_com_tantivy4java_Document_nativeAddFloat(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_Document_nativeAddBoolean(
+pub extern "system" fn Java_io_indextables_tantivy4java_core_Document_nativeAddBoolean(
     mut env: JNIEnv,
     _class: JClass,
     ptr: jlong,
@@ -610,7 +610,7 @@ pub extern "system" fn Java_com_tantivy4java_Document_nativeAddBoolean(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_Document_nativeAddDate(
+pub extern "system" fn Java_io_indextables_tantivy4java_core_Document_nativeAddDate(
     mut env: JNIEnv,
     _class: JClass,
     ptr: jlong,
@@ -648,7 +648,7 @@ pub extern "system" fn Java_com_tantivy4java_Document_nativeAddDate(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_Document_nativeAddFacet(
+pub extern "system" fn Java_io_indextables_tantivy4java_core_Document_nativeAddFacet(
     mut env: JNIEnv,
     _class: JClass,
     _ptr: jlong,
@@ -659,7 +659,7 @@ pub extern "system" fn Java_com_tantivy4java_Document_nativeAddFacet(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_Document_nativeAddBytes(
+pub extern "system" fn Java_io_indextables_tantivy4java_core_Document_nativeAddBytes(
     mut env: JNIEnv,
     _class: JClass,
     _ptr: jlong,
@@ -670,7 +670,7 @@ pub extern "system" fn Java_com_tantivy4java_Document_nativeAddBytes(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_Document_nativeAddJson(
+pub extern "system" fn Java_io_indextables_tantivy4java_core_Document_nativeAddJson(
     mut env: JNIEnv,
     _class: JClass,
     ptr: jlong,
@@ -726,7 +726,7 @@ pub extern "system" fn Java_com_tantivy4java_Document_nativeAddJson(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_Document_nativeAddIpAddr(
+pub extern "system" fn Java_io_indextables_tantivy4java_core_Document_nativeAddIpAddr(
     mut env: JNIEnv,
     _class: JClass,
     ptr: jlong,
@@ -772,7 +772,7 @@ pub extern "system" fn Java_com_tantivy4java_Document_nativeAddIpAddr(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_Document_nativeAddString(
+pub extern "system" fn Java_io_indextables_tantivy4java_core_Document_nativeAddString(
     mut env: JNIEnv,
     _class: JClass,
     ptr: jlong,
@@ -822,7 +822,7 @@ pub extern "system" fn Java_com_tantivy4java_Document_nativeAddString(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_Document_nativeGetNumFields(
+pub extern "system" fn Java_io_indextables_tantivy4java_core_Document_nativeGetNumFields(
     _env: JNIEnv,
     _class: JClass,
     ptr: jlong,
@@ -834,7 +834,7 @@ pub extern "system" fn Java_com_tantivy4java_Document_nativeGetNumFields(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_Document_nativeIsEmpty(
+pub extern "system" fn Java_io_indextables_tantivy4java_core_Document_nativeIsEmpty(
     _env: JNIEnv,
     _class: JClass,
     ptr: jlong,
@@ -846,7 +846,7 @@ pub extern "system" fn Java_com_tantivy4java_Document_nativeIsEmpty(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_Document_nativeClose(
+pub extern "system" fn Java_io_indextables_tantivy4java_core_Document_nativeClose(
     _env: JNIEnv,
     _class: JClass,
     ptr: jlong,

@@ -406,10 +406,10 @@ pub struct EnhancedSearchResult {
     pub aggregation_json: Option<String>, // Original aggregation request JSON
 }
 
-/// Replacement for Java_com_tantivy4java_SplitSearcher_createNativeWithSharedCache
+/// Replacement for Java_io_indextables_tantivy4java_split_SplitSearcher_createNativeWithSharedCache
 /// Now properly integrates StandaloneSearcher with runtime management and stores split URI
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_SplitSearcher_createNativeWithSharedCache(
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_createNativeWithSharedCache(
     mut env: JNIEnv,
     _class: JClass,
     split_uri_jstr: JString,
@@ -788,9 +788,9 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_createNativeWithShare
     }
 }
 
-/// Replacement for Java_com_tantivy4java_SplitSearcher_closeNative
+/// Replacement for Java_io_indextables_tantivy4java_split_SplitSearcher_closeNative
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_SplitSearcher_closeNative(
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_closeNative(
     env: JNIEnv,
     _class: JClass,
     searcher_ptr: jlong,
@@ -838,9 +838,9 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_closeNative(
                   thread_id, searcher_ptr);
 }
 
-/// Replacement for Java_com_tantivy4java_SplitSearcher_validateSplitNative  
+/// Replacement for Java_io_indextables_tantivy4java_split_SplitSearcher_validateSplitNative  
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_SplitSearcher_validateSplitNative(
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_validateSplitNative(
     env: JNIEnv,
     _class: JClass,
     searcher_ptr: jlong,
@@ -858,9 +858,9 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_validateSplitNative(
     if is_valid { 1 } else { 0 }
 }
 
-/// Replacement for Java_com_tantivy4java_SplitSearcher_getCacheStatsNative
+/// Replacement for Java_io_indextables_tantivy4java_split_SplitSearcher_getCacheStatsNative
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_SplitSearcher_getCacheStatsNative(
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_getCacheStatsNative(
     mut env: JNIEnv,
     _class: JClass,
     searcher_ptr: jlong,
@@ -870,7 +870,7 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_getCacheStatsNative(
         let stats = context.standalone_searcher.cache_stats();
         
         // Create a CacheStats Java object
-        match env.find_class("com/tantivy4java/SplitSearcher$CacheStats") {
+        match env.find_class("io/indextables/tantivy4java/split/SplitSearcher$CacheStats") {
             Ok(cache_stats_class) => {
                 match env.new_object(
                     &cache_stats_class,
@@ -910,10 +910,10 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_getCacheStatsNative(
     }
 }
 
-/// Async-first method for Java_com_tantivy4java_SplitSearcher_searchWithQueryAst
+/// Async-first method for Java_io_indextables_tantivy4java_split_SplitSearcher_searchWithQueryAst
 /// This method uses the new async-first architecture to eliminate deadlocks
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_SplitSearcher_searchWithQueryAst(
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_searchWithQueryAst(
     mut env: JNIEnv,
     _class: JClass,
     searcher_ptr: jlong,
@@ -965,14 +965,14 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_searchWithQueryAst(
 /// Method to search with SplitQuery objects using async-first pattern
 /// This method follows Quickwit's cache management lifecycle
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_SplitSearcher_searchWithSplitQuery(
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_searchWithSplitQuery(
     mut env: JNIEnv,
     _class: JClass,
     searcher_ptr: jlong,
     split_query_obj: JObject,
     limit: jint,
 ) -> jobject {
-    debug_println!("🚨 ENTRY_POINT: Java_com_tantivy4java_SplitSearcher_searchWithSplitQuery ENTRY");
+    debug_println!("🚨 ENTRY_POINT: Java_io_indextables_tantivy4java_split_SplitSearcher_searchWithSplitQuery ENTRY");
     debug_println!("🚨 ENTRY_POINT: Function parameters - searcher_ptr: {}, limit: {}", searcher_ptr, limit);
     debug_println!("🚨 ENTRY_POINT: About to proceed with function body");
     debug_println!("🔥 NATIVE DEBUG: searchWithSplitQuery called with pointer {} and limit {}", searcher_ptr, limit);
@@ -1047,7 +1047,7 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_searchWithSplitQuery(
 /// Search with aggregations support for SplitSearcher
 /// This method combines regular search with statistical aggregations
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_SplitSearcher_searchWithAggregations<'local>(
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_searchWithAggregations<'local>(
     mut env: JNIEnv<'local>,
     _obj: JObject<'local>,
     searcher_ptr: jlong,
@@ -1188,7 +1188,7 @@ pub async fn perform_search_async_impl_leaf_response_with_aggregations(
 /// 3. Use doc_async for optimal performance
 /// 4. Reuse index, reader, and searcher across all documents
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_SplitSearcher_docBatchNative(
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_docBatchNative(
     mut env: JNIEnv,
     _class: JClass,
     searcher_ptr: jlong,
@@ -1263,7 +1263,7 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_docBatchNative(
             }
             
             // Create a Java Document array
-            let document_class = match env.find_class("com/tantivy4java/Document") {
+            let document_class = match env.find_class("io/indextables/tantivy4java/core/Document") {
                 Ok(class) => class,
                 Err(e) => {
                     to_java_exception(&mut env, &anyhow::anyhow!("Failed to find Document class: {}", e));
@@ -2052,10 +2052,10 @@ fn retrieve_documents_batch_from_split(
     Ok(results)
 }
 
-/// Async-first replacement for Java_com_tantivy4java_SplitSearcher_docNative
+/// Async-first replacement for Java_io_indextables_tantivy4java_split_SplitSearcher_docNative
 /// Implements document retrieval using Quickwit's async approach without deadlocks
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_SplitSearcher_docNative(
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_docNative(
     env: JNIEnv,
     _class: JClass,
     searcher_ptr: jlong,
@@ -2111,7 +2111,7 @@ fn create_java_document_object(env: &mut JNIEnv, document_ptr: jlong) -> anyhow:
     debug_println!("🔧 JNI_CONVERT: Creating Java Document object from pointer: {}", document_ptr);
 
     // Find the Document class
-    let document_class = env.find_class("com/tantivy4java/Document")
+    let document_class = env.find_class("io/indextables/tantivy4java/core/Document")
         .map_err(|e| anyhow::anyhow!("Failed to find Document class: {}", e))?;
 
     // Create a new Document object with the pointer constructor: Document(long nativePtr)
@@ -2248,9 +2248,9 @@ pub fn create_schema_from_doc_mapping(doc_mapping_json: &str) -> anyhow::Result<
     Ok(schema)
 }
 
-/// Async-first replacement for Java_com_tantivy4java_SplitSearcher_getSchemaFromNative
+/// Async-first replacement for Java_io_indextables_tantivy4java_split_SplitSearcher_getSchemaFromNative
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_SplitSearcher_getSchemaFromNative(
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_getSchemaFromNative(
     env: JNIEnv,
     _class: JClass,
     searcher_ptr: jlong,
@@ -2284,7 +2284,7 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_getSchemaFromNative(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_SplitSearcher_preloadComponentsNative(
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_preloadComponentsNative(
     mut _env: JNIEnv,
     _class: JClass,
     _searcher_ptr: jlong,
@@ -2294,10 +2294,10 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_preloadComponentsNati
     debug_println!("RUST DEBUG: preloadComponentsNative called - returning success");
     1 // true
 }
-/// Replacement for Java_com_tantivy4java_SplitSearcher_getComponentCacheStatusNative
+/// Replacement for Java_io_indextables_tantivy4java_split_SplitSearcher_getComponentCacheStatusNative
 /// Simple implementation that returns an empty HashMap
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_SplitSearcher_getComponentCacheStatusNative(
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_getComponentCacheStatusNative(
     mut env: JNIEnv,
     _class: JClass,
     _searcher_ptr: jlong,
@@ -2563,33 +2563,33 @@ fn fix_bound_value(bound: &mut Value, target_type: &str, bound_name: &str) -> an
 
 // Stub method implementations
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_SplitSearcher_evictComponentsNative(
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_evictComponentsNative(
     _env: JNIEnv, _class: JClass, _searcher_ptr: jlong, _components: JObject
 ) -> jboolean { 0 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_SplitSearcher_parseQueryNative(
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_parseQueryNative(
     _env: JNIEnv, _class: JClass, _searcher_ptr: jlong, _query: JString
 ) -> jobject { std::ptr::null_mut() }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_SplitSearcher_getSchemaJsonNative(
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_getSchemaJsonNative(
     _env: JNIEnv, _class: JClass, _searcher_ptr: jlong
 ) -> jstring { std::ptr::null_mut() }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_SplitSearcher_getSplitMetadataNative(
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_getSplitMetadataNative(
     _env: JNIEnv, _class: JClass, _searcher_ptr: jlong
 ) -> jobject { std::ptr::null_mut() }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_SplitSearcher_getLoadingStatsNative(
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_getLoadingStatsNative(
     _env: JNIEnv, _class: JClass, _searcher_ptr: jlong
 ) -> jobject { std::ptr::null_mut() }
 /// Stub implementation for docsBulkNative - focusing on docBatchNative optimization
 /// The main performance improvement comes from the optimized docBatchNative method
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_SplitSearcher_docsBulkNative(
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_docsBulkNative(
     mut env: JNIEnv,
     _class: JClass,
     _searcher_ptr: jlong,
@@ -2603,7 +2603,7 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_docsBulkNative(
 }
 /// Stub implementation for parseBulkDocsNative - focusing on docBatch optimization
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_SplitSearcher_parseBulkDocsNative(
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_parseBulkDocsNative(
     mut env: JNIEnv,
     _class: JClass,
     _buffer_jobject: jobject,
@@ -2616,7 +2616,7 @@ pub extern "system" fn Java_com_tantivy4java_SplitSearcher_parseBulkDocsNative(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_SplitSearcher_tokenizeNative(
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_tokenizeNative(
     mut env: JNIEnv,
     _class: JClass,
     searcher_ptr: jlong,
@@ -3226,7 +3226,7 @@ fn perform_unified_search_result_creation(
     let search_result_ptr = arc_to_jlong(search_results_arc);
 
     // Create SearchResult Java object
-    let search_result_class = env.find_class("com/tantivy4java/SearchResult")
+    let search_result_class = env.find_class("io/indextables/tantivy4java/result/SearchResult")
         .map_err(|e| anyhow::anyhow!("Failed to find SearchResult class: {}", e))?;
 
     let search_result = env.new_object(
@@ -4038,7 +4038,7 @@ async fn perform_real_quickwit_schema_retrieval(
 //     // Store result and create Java object
 //     let search_result_ptr = arc_to_jlong(Arc::new(search_result_data));
 // 
-//     let search_result_class = env.find_class("com/tantivy4java/SearchResult")?;
+//     let search_result_class = env.find_class("io/indextables/tantivy4java/result/SearchResult")?;
 //     let search_result = env.new_object(
 //         &search_result_class,
 //         "(J)V",
@@ -4159,7 +4159,7 @@ async fn perform_real_quickwit_schema_retrieval(
 //     let doc_ptr = crate::utils::arc_to_jlong(wrapper_arc);
 // 
 //     // Create Java Document object
-//     let document_class = env.find_class("com/tantivy4java/Document")?;
+//     let document_class = env.find_class("io/indextables/tantivy4java/core/Document")?;
 //     let document_obj = env.new_object(&document_class, "(J)V", &[doc_ptr.into()])?;
 // 
 //     debug_println!("✅ ASYNC_IMPL: Successfully created Document Java object");

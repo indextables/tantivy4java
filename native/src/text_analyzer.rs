@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 
 /// Create a text analyzer with the specified tokenizer
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_TextAnalyzer_nativeCreateAnalyzer(
+pub extern "system" fn Java_io_indextables_tantivy4java_util_TextAnalyzer_nativeCreateAnalyzer(
     mut env: JNIEnv,
     _class: JClass,
     tokenizer_name: JString,
@@ -38,7 +38,7 @@ pub extern "system" fn Java_com_tantivy4java_TextAnalyzer_nativeCreateAnalyzer(
 
 /// Tokenize text using the specified tokenizer (static method)
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_TextAnalyzer_nativeTokenize(
+pub extern "system" fn Java_io_indextables_tantivy4java_util_TextAnalyzer_nativeTokenize(
     mut env: JNIEnv,
     _class: JClass,
     text: JString,
@@ -83,7 +83,7 @@ pub extern "system" fn Java_com_tantivy4java_TextAnalyzer_nativeTokenize(
 
 /// Analyze text using the analyzer instance
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_TextAnalyzer_nativeAnalyze(
+pub extern "system" fn Java_io_indextables_tantivy4java_util_TextAnalyzer_nativeAnalyze(
     mut env: JNIEnv,
     _class: JClass,
     analyzer_ptr: jlong,
@@ -124,7 +124,7 @@ pub extern "system" fn Java_com_tantivy4java_TextAnalyzer_nativeAnalyze(
 
 /// Close the text analyzer
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_TextAnalyzer_nativeClose(
+pub extern "system" fn Java_io_indextables_tantivy4java_util_TextAnalyzer_nativeClose(
     _env: JNIEnv,
     _class: JClass,
     analyzer_ptr: jlong,

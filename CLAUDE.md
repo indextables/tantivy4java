@@ -43,6 +43,16 @@ Tantivy4Java
 - **MillionRecordBulkRetrievalTest** - Isolated memory allocation issue not affecting core functionality
 - **Root Cause Located** - Native `with_object()` returning None in split_searcher.rs:1221-1226
 
+**📝 TODO: Feature Enhancements:**
+- **Auto-lowercase term queries for "default" tokenizer** - Currently users must manually lowercase search terms when querying fields using the "default" tokenizer (which lowercases during indexing). Future enhancement: automatically lowercase SplitTermQuery and Query.termQuery() values when the target field uses "default" tokenizer, to match Tantivy's behavior and improve developer experience.
+
+**⚠️ SplitSearcher Aggregation Implementation Status:**
+- **✅ TermsAggregation** - Fully implemented and working
+- **❌ DateHistogramAggregation** - Not implemented in native layer. Aggregation JSON is generated correctly but returns empty results.
+- **❌ HistogramAggregation** - Not implemented in native layer. Causes native panic when executed.
+- **❌ RangeAggregation** - Not implemented in native layer. Returns empty aggregation map.
+- **Note**: All aggregation types work correctly with the standard Searcher API, but SplitSearcher (for Quickwit split files) only supports TermsAggregation currently.
+
 **📊 Test Coverage Analysis:**
 - **Core Functionality**: 100% passing (20+ critical tests)
 - **Memory Management**: 100% fixed with proper constants

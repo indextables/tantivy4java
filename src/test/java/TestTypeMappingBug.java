@@ -1,4 +1,8 @@
-import com.tantivy4java.*;
+import io.indextables.tantivy4java.core.*;
+import io.indextables.tantivy4java.query.*;
+import io.indextables.tantivy4java.result.*;
+import io.indextables.tantivy4java.split.*;
+import io.indextables.tantivy4java.split.merge.*;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.LocalDateTime;
