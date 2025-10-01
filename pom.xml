@@ -6,7 +6,7 @@
 
     <groupId>io.indextables</groupId>
     <artifactId>tantivy4java</artifactId>
-    <version>0.24.1_x86_64-SNAPSHOT</version>
+    <version>0.24.1</version>
     <packaging>jar</packaging>
 
     <name>Tantivy4Java</name>
@@ -36,13 +36,9 @@
     </scm>
 
     <distributionManagement>
-        <snapshotRepository>
-            <id>ossrh</id>
-            <url>https://s01.oss.sonatype.org/content/repositories/snapshots</url>
-        </snapshotRepository>
         <repository>
-            <id>ossrh</id>
-            <url>https://s01.oss.sonatype.org/service/local/staging/deploy/maven2/</url>
+            <id>central</id>
+            <url>https://central.sonatype.com/api/v1/publisher</url>
         </repository>
     </distributionManagement>
 
@@ -241,12 +237,13 @@
                 </executions>
             </plugin>
 
-            <!-- JAR packaging with native libraries -->
+            <!-- JAR packaging with native libraries and platform classifier -->
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-jar-plugin</artifactId>
                 <version>3.3.0</version>
                 <configuration>
+                    <classifier>${platform.classifier}</classifier>
                     <archive>
                         <manifest>
                             <addDefaultImplementationEntries>true</addDefaultImplementationEntries>
@@ -259,6 +256,99 @@
 
     <!-- Build profiles -->
     <profiles>
+        <!-- Platform detection profiles - auto-activate based on OS -->
+        <!-- macOS ARM64 (Apple Silicon) -->
+        <profile>
+            <id>platform-darwin-aarch64</id>
+            <activation>
+                <os>
+                    <family>mac</family>
+                    <arch>aarch64</arch>
+                </os>
+                <property>
+                    <name>!platform.classifier</name>
+                </property>
+            </activation>
+            <properties>
+                <platform.classifier>darwin-aarch64</platform.classifier>
+                <rust.target>aarch64-apple-darwin</rust.target>
+            </properties>
+        </profile>
+
+        <!-- macOS x86_64 (Intel) -->
+        <profile>
+            <id>platform-darwin-x86_64</id>
+            <activation>
+                <os>
+                    <family>mac</family>
+                    <arch>x86_64</arch>
+                </os>
+                <property>
+                    <name>!platform.classifier</name>
+                </property>
+            </activation>
+            <properties>
+                <platform.classifier>darwin-x86_64</platform.classifier>
+                <rust.target>x86_64-apple-darwin</rust.target>
+            </properties>
+        </profile>
+
+        <!-- Linux x86_64 -->
+        <profile>
+            <id>platform-linux-x86_64</id>
+            <activation>
+                <os>
+                    <family>unix</family>
+                    <name>linux</name>
+                    <arch>amd64</arch>
+                </os>
+                <property>
+                    <name>!platform.classifier</name>
+                </property>
+            </activation>
+            <properties>
+                <platform.classifier>linux-x86_64</platform.classifier>
+                <rust.target>x86_64-unknown-linux-gnu</rust.target>
+            </properties>
+        </profile>
+
+        <!-- Linux ARM64 -->
+        <profile>
+            <id>platform-linux-aarch64</id>
+            <activation>
+                <os>
+                    <family>unix</family>
+                    <name>linux</name>
+                    <arch>aarch64</arch>
+                </os>
+                <property>
+                    <name>!platform.classifier</name>
+                </property>
+            </activation>
+            <properties>
+                <platform.classifier>linux-aarch64</platform.classifier>
+                <rust.target>aarch64-unknown-linux-gnu</rust.target>
+            </properties>
+        </profile>
+
+        <!-- Windows x86_64 -->
+        <profile>
+            <id>platform-windows-x86_64</id>
+            <activation>
+                <os>
+                    <family>windows</family>
+                    <arch>amd64</arch>
+                </os>
+                <property>
+                    <name>!platform.classifier</name>
+                </property>
+            </activation>
+            <properties>
+                <platform.classifier>windows-x86_64</platform.classifier>
+                <rust.target>x86_64-pc-windows-msvc</rust.target>
+            </properties>
+        </profile>
+
         <!-- Linux optimized build profile - automatically activates on Linux -->
         <profile>
             <id>linux-optimized</id>
@@ -407,16 +497,15 @@
                         </executions>
                     </plugin>
 
-                    <!-- Nexus Staging Plugin -->
+                    <!-- Central Publishing Plugin -->
                     <plugin>
-                        <groupId>org.sonatype.plugins</groupId>
-                        <artifactId>nexus-staging-maven-plugin</artifactId>
-                        <version>1.6.13</version>
+                        <groupId>org.sonatype.central</groupId>
+                        <artifactId>central-publishing-maven-plugin</artifactId>
+                        <version>0.4.0</version>
                         <extensions>true</extensions>
                         <configuration>
-                            <serverId>ossrh</serverId>
-                            <nexusUrl>https://s01.oss.sonatype.org/</nexusUrl>
-                            <autoReleaseAfterClose>false</autoReleaseAfterClose>
+                            <publishingServerId>central</publishingServerId>
+                            <tokenAuth>true</tokenAuth>
                         </configuration>
                     </plugin>
                 </plugins>
