@@ -26,9 +26,10 @@ public class SplitSearcherAggregationTest {
 
     @BeforeEach
     public void setUp(@TempDir Path tempDir) throws Exception {
-        // Create test index with numeric data
-        String indexPath = tempDir.resolve("aggregation_test_index").toString();
-        splitPath = tempDir.resolve("aggregation_test.split").toString();
+        // Create test index with numeric data - use unique names to avoid cache conflicts
+        String uniqueId = "aggregation_test_" + System.nanoTime();
+        String indexPath = tempDir.resolve(uniqueId + "_index").toString();
+        splitPath = tempDir.resolve(uniqueId + ".split").toString();
 
         try (SchemaBuilder builder = new SchemaBuilder()) {
             builder
@@ -91,9 +92,9 @@ public class SplitSearcherAggregationTest {
                         writer.commit();
                     }
 
-                    // Convert to QuickwitSplit
+                    // Convert to QuickwitSplit - use unique ID to avoid cache conflicts
                     QuickwitSplit.SplitConfig config = new QuickwitSplit.SplitConfig(
-                        "aggregation-test", "test-source", "test-node");
+                        uniqueId, "test-source", "test-node");
 
                     // Get the metadata with footer offsets from the conversion
                     QuickwitSplit.SplitMetadata metadata = QuickwitSplit.convertIndexFromPath(indexPath, splitPath, config);
@@ -104,9 +105,10 @@ public class SplitSearcherAggregationTest {
             }
         }
 
-        // Create cache manager and searcher
+        // Create cache manager and searcher with unique name per test run
+        String uniqueCacheName = uniqueId + "-cache";
         SplitCacheManager.CacheConfig cacheConfig =
-            new SplitCacheManager.CacheConfig("aggregation-test-cache");
+            new SplitCacheManager.CacheConfig(uniqueCacheName);
         cacheManager = SplitCacheManager.getInstance(cacheConfig);
 
         // Use the metadata with proper footer offsets from convertIndexFromPath
@@ -155,8 +157,8 @@ public class SplitSearcherAggregationTest {
 
         SplitQuery matchAllQuery = new SplitMatchAllQuery();
 
-        // Test Count Aggregation
-        CountAggregation countAgg = new CountAggregation("doc_count");
+        // Test Count Aggregation - using "id" field which exists in our test data
+        CountAggregation countAgg = new CountAggregation("doc_count", "id");
         SearchResult countResult = searcher.search(matchAllQuery, 10, "count", countAgg);
         CountResult count = (CountResult) countResult.getAggregation("count");
         assertNotNull(count, "Count result should not be null");
@@ -207,7 +209,7 @@ public class SplitSearcherAggregationTest {
         Map<String, SplitAggregation> aggregations = new HashMap<>();
         aggregations.put("score_stats", new StatsAggregation("score"));
         aggregations.put("response_sum", new SumAggregation("response_time"));
-        aggregations.put("doc_count", new CountAggregation());
+        aggregations.put("doc_count", new CountAggregation("id"));
 
         // Perform search with multiple aggregations
         SearchResult result = searcher.search(matchAllQuery, 10, aggregations);
@@ -308,8 +310,8 @@ public class SplitSearcherAggregationTest {
         MaxAggregation maxAgg = new MaxAggregation("test_max", "score");
         assertEquals("{\"max\": {\"field\": \"score\"}}", maxAgg.toAggregationJson());
 
-        CountAggregation countAgg = new CountAggregation("test_count");
-        assertEquals("{\"value_count\": {\"field\": \"_doc\"}}", countAgg.toAggregationJson());
+        CountAggregation countAgg = new CountAggregation("test_count", "id");
+        assertEquals("{\"value_count\": {\"field\": \"id\"}}", countAgg.toAggregationJson());
 
         System.out.println("✅ All aggregation JSON formats validated");
     }

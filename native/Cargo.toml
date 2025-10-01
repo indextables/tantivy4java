@@ -10,21 +10,6 @@ description = "JNI bindings for Tantivy search engine"
 name = "tantivy4java"
 crate-type = ["cdylib", "rlib"]
 
-[[bin]]
-name = "tantivy4java-merge"
-path = "src/bin/merge_process.rs"
-
-# Binary-specific dependencies (minimal - uses main library)
-[target.'cfg(target_os = "linux")'.dependencies]
-# For Linux builds - use optimized library linkage
-
-[target.'cfg(target_os = "macos")'.dependencies]
-# For macOS builds - use optimized library linkage
-
-[target.'cfg(target_os = "windows")'.dependencies]
-# For Windows builds - use optimized library linkage
-
-
 [dependencies]
 # Main library dependencies (for JNI functions and core search functionality)
 tantivy = { git = "https://github.com/quickwit-oss/tantivy/", rev = "80f5f1e", default-features = false, features = [

@@ -437,15 +437,16 @@ mod resilient_ops {
 fn extract_doc_mapping_from_index(tantivy_index: &tantivy::Index) -> Result<String> {
     // Get the schema from the Tantivy index
     let schema = tantivy_index.schema();
-    
+
     debug_log!("Extracting doc mapping from Tantivy schema with {} fields", schema.fields().count());
-    
+
     // Create field mappings from the actual Tantivy schema as an array (not HashMap)
     let mut field_mappings = Vec::new();
-    
+
     for (field, field_entry) in schema.fields() {
     let field_name = field_entry.name();
-    debug_log!("  Processing field: {} with type: {:?}", field_name, field_entry.field_type());
+    debug_log!("  Processing field: {} with type: {:?}, is_fast: {}, is_indexed: {}, is_stored: {}",
+               field_name, field_entry.field_type(), field_entry.is_fast(), field_entry.is_indexed(), field_entry.is_stored());
     
     // Map Tantivy field types to Quickwit field mapping types
     let field_mapping = match field_entry.field_type() {
@@ -2431,7 +2432,8 @@ pub fn merge_splits_impl(split_urls: &[String], output_path: &str, config: &Inte
     let tokenizer_manager = get_quickwit_fastfield_normalizer_manager().tantivy_manager();
     let merged_index = open_index(merged_directory, tokenizer_manager)?;
     let doc_mapping_json = extract_doc_mapping_from_index(&merged_index)?;
-    debug_log!("Extracted doc mapping from merged index ({} bytes)", doc_mapping_json.len());
+    debug_log!("✅ DOCMAPPING EXTRACT: Extracted doc mapping from merged index ({} bytes)", doc_mapping_json.len());
+    debug_log!("✅ DOCMAPPING CONTENT: {}", &doc_mapping_json);
 
     // 5. Calculate final index size
     let final_size = calculate_directory_size(&output_temp_dir)?;
@@ -3252,59 +3254,3 @@ fn create_merged_split_file(merged_index_path: &Path, output_path: &str, metadat
     Ok(footer_offsets)
 }
 
-/// Standalone merge function for use by the Rust binary (no JNI required)
-pub fn perform_quickwit_merge_standalone(
-    split_paths: Vec<String>,
-    output_path: &str,
-    config: MergeSplitConfig,
-) -> Result<SplitMetadata> {
-    // Convert MergeSplitConfig to InternalMergeConfig
-    let merge_config = InternalMergeConfig {
-        index_uid: config.index_uid,
-        source_id: config.source_id,
-        node_id: config.node_id,
-        doc_mapping_uid: "standalone-merge".to_string(), // Default for process merging
-        partition_id: 0, // Default for process merging
-        delete_queries: None, // No delete queries for simple merging
-        aws_config: config.aws_config.map(|aws| InternalAwsConfig {
-            access_key: Some(aws.access_key),
-            secret_key: Some(aws.secret_key),
-            session_token: aws.session_token,
-            region: aws.region,
-            endpoint: aws.endpoint_url,
-            force_path_style: aws.force_path_style,
-        }),
-        temp_directory_path: None, // Use system temp for process merging
-    };
-
-    // Perform the merge operation
-    let metadata = merge_splits_impl(&split_paths, output_path, &merge_config)?;
-
-    // Convert result to public SplitMetadata type
-    let (time_range_start, time_range_end) = if let Some(range) = metadata.time_range {
-        (Some(*range.start()), Some(*range.end()))
-    } else {
-        (None, None)
-    };
-
-    Ok(SplitMetadata {
-        split_id: metadata.split_id,
-        num_docs: metadata.num_docs,
-        uncompressed_size_bytes: metadata.uncompressed_docs_size_in_bytes,
-        time_range_start,
-        time_range_end,
-        create_timestamp: metadata.create_timestamp as u64,
-        footer_offsets: metadata.footer_start_offset.zip(metadata.footer_end_offset),
-        skipped_splits: metadata.skipped_splits,  // Include skip information
-    })
-}
-
-/// Public function for standalone merge binary to call the actual merge logic
-/// This function is specifically designed to be called from the standalone binary
-pub fn perform_standalone_merge(
-    split_paths: Vec<String>,
-    output_path: String,
-    config: MergeSplitConfig,
-) -> Result<SplitMetadata> {
-    perform_quickwit_merge_standalone(split_paths, &output_path, config)
-}

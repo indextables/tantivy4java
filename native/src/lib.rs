@@ -57,7 +57,7 @@ pub use searcher::*;
 pub use doc_address::*;
 pub use utils::*;
 pub use text_analyzer::*;
-pub use quickwit_split::{perform_quickwit_merge_standalone, merge_splits_impl, InternalMergeConfig, InternalAwsConfig};
+pub use quickwit_split::{merge_splits_impl, InternalMergeConfig, InternalAwsConfig};
 pub use merge_types::*;
 // pub use split_searcher::*;  // Disabled - now using replacement JNI methods
 // pub use split_searcher_simple::*;  // Disabled to avoid conflicts
