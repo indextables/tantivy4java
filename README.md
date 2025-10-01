@@ -1,609 +1,1052 @@
 # Tantivy4Java
 
-A high-performance Java library providing complete access to Tantivy search engine capabilities with advanced Quickwit integration for distributed search.
+**High-performance full-text search for Java applications powered by Tantivy**
 
-## Overview
+Tantivy4Java is a production-ready Java library that provides direct access to the Tantivy search engine through JNI bindings. Built for Java developers who need enterprise-grade full-text search capabilities with Rust-level performance.
 
-Tantivy4Java is a production-ready JNI wrapper for the Rust-based Tantivy search engine, offering Java developers full-text search capabilities with zero-copy operations and direct memory sharing for maximum performance. The library includes comprehensive Quickwit integration for distributed search scenarios and split-based indexing.
+## Why Tantivy4Java?
 
-## Key Features
+- **🚀 Blazing Fast** - Zero-copy operations and direct memory sharing for maximum performance
+- **🎯 Type-Safe API** - Idiomatic Java interfaces with full generic type support
+- **📦 Distributed Search** - Built-in Quickwit split support for large-scale deployments
+- **☁️ Cloud Native** - First-class S3/MinIO support for remote index storage
+- **🔧 Production Ready** - Comprehensive memory management and error handling
+- **🌍 Cross-Platform** - Supports macOS (Intel/ARM), Linux (x86_64/ARM64), and Windows
 
-### Core Search Engine
-- **Schema Building** - Complete support for all field types (text, integer, float, boolean, date, IP address)
-- **Document Management** - Creation, indexing, JSON support, multi-value fields
-- **High-Performance Batch Operations**
-  - **Batch Indexing**: Zero-copy bulk document indexing with 3x performance improvements
-  - **Bulk Document Retrieval**: **🚧 IN DEVELOPMENT** - Zero-copy bulk document retrieval for high-performance data access
-- **Index Operations** - Create, reload, commit, open, exists, schema access
-- **Query System** - All query types with complex boolean logic
-- **Search Pipeline** - Complete search with scoring and result handling
-- **Document Retrieval** - Field extraction with proper type conversion
+---
 
-### Advanced Query Types
-- **Term Queries** - Exact term matching
-- **Phrase Queries** - Position-aware matching with configurable slop
-- **Fuzzy Queries** - Edit distance, transposition costs, prefix matching
-- **Boolean Logic** - MUST/SHOULD/MUST_NOT with nested combinations
-- **Range Queries** - All field types with inclusive/exclusive bounds
-- **Wildcard Queries** - Advanced pattern matching with multi-segment expansion
-  - **Case-sensitive wildcards** - Default wildcard behavior
-  - **Case-insensitive wildcards** - With `wildcardQueryCaseInsensitive()` method
-- **Boost Queries** - Score multiplication and relevance tuning
-- **Const Score Queries** - Uniform scoring
-- **Query Debugging** - Built-in `toString()` method for query inspection and debugging
+## Table of Contents
 
-### Field Type Support
-- **Text Fields** - Full tokenization, always indexed, position tracking
-- **Numeric Fields** - Integer, Float with explicit indexed control and range queries
-- **Boolean Fields** - True/false queries and filtering
-- **Date Fields** - Temporal queries with proper date handling
-- **Multi-value Fields** - Array support in documents and queries
-- **Schema Introspection** - Runtime field discovery, type checking, and metadata access
+1. [Quick Start](#quick-start)
+2. [Core Concepts](#core-concepts)
+3. [Installation](#installation)
+4. [Basic Usage](#basic-usage)
+5. [Advanced Features](#advanced-features)
+6. [Quickwit Integration](#quickwit-integration)
+7. [Performance Guide](#performance-guide)
+8. [Developer Guide](#developer-guide)
+9. [API Reference](#api-reference)
 
-### Text Analysis and Processing
-- **TextAnalyzer API** - Complete tokenization and text processing
-- **Multiple Tokenizers** - Support for default, simple, whitespace, keyword, and raw tokenizers
-- **Static Tokenization** - `TextAnalyzer.tokenize()` for quick text processing
-- **Instance-based Analysis** - Reusable analyzer instances with `TextAnalyzer.create()`
-- **Custom Tokenizer Configuration** - Configurable tokenization strategies
+---
 
-### Index Optimization
-- **Segment Merging** - Programmatic index optimization with metadata access
-- **Index Persistence** - Complete lifecycle management
-- **Performance Tuning** - Fast fields, stored fields optimization
-- **Memory Management** - Zero-copy operations where possible
+## Quick Start
 
-### Quickwit Integration
+### Maven Dependency
 
-#### SplitSearcher Engine
-- **Split File Search** - Direct search within Quickwit split files (file:// or s3://)
-- **Advanced Caching System** - Multi-level caching with statistics and control
-- **S3 Storage Backend** - Full AWS S3/MinIO support with error handling
-- **Memory Optimization** - Component-level cache control and preloading
-- **Connection Validation** - Robust error handling for network issues
-
-#### Split Operations
-- **Split Creation** - Convert Tantivy indices to Quickwit split format
-- **Split Merging** - Efficient Quickwit-style split merging for large-scale indices with full S3 support
-- **Remote S3 Split Merging** - Merge splits directly from S3/MinIO with AWS credential authentication
-- **Mixed Protocol Support** - Merge local files, file URLs, and S3 URLs in single operation
-- **Split Validation** - Verify split file integrity and accessibility
-- **Metadata Access** - Complete split information and statistics
-
-#### Cloud Storage Support
-- **AWS S3 Integration** - Full compatibility with Amazon S3
-- **MinIO Support** - Private cloud storage backend
-- **Custom Endpoints** - Support for mock servers and development environments
-- **Credential Management** - AWS access keys, secret keys, session tokens, and IAM roles
-
-### Platform Support
-- **macOS** (Intel and Apple Silicon)
-- **Linux** (x86_64 and ARM64)
-- **Windows** (x86_64)
-
-## Building the Project
-
-### Prerequisites
-- Java 11 or higher
-- Maven 3.6+
-- Rust toolchain (installed automatically if needed)
-
-### Build for Current Platform
-```bash
-mvn clean package
+```xml
+<dependency>
+    <groupId>io.indextables</groupId>
+    <artifactId>tantivy4java</artifactId>
+    <version>0.24.1</version>
+</dependency>
 ```
 
-This builds the native library for your current platform and packages it with the JAR.
+### 30-Second Example
 
-### Linux Container Builds
+```java
+import io.indextables.tantivy4java.core.*;
+import io.indextables.tantivy4java.query.*;
 
-For consistent Linux builds across different distributions, use Docker to create optimized Linux builds:
+// Build schema
+try (SchemaBuilder builder = new SchemaBuilder()) {
+    builder.addTextField("title", true, false, "default", "position");
+    builder.addTextField("body", true, false, "default", "position");
+
+    try (Schema schema = builder.build()) {
+        // Create in-memory index
+        try (Index index = Index.createInRam(schema)) {
+            try (IndexWriter writer = index.writer(Index.Memory.DEFAULT_HEAP_SIZE, 1)) {
+                // Add document
+                Document doc = new Document();
+                doc.addText("title", "Getting Started with Search");
+                doc.addText("body", "Full-text search in Java made easy");
+                writer.addDocument(doc);
+                writer.commit();
+            }
+
+            // Search
+            index.reload();
+            try (Searcher searcher = index.searcher()) {
+                try (Query query = Query.termQuery(schema, "body", "search")) {
+                    SearchResult results = searcher.search(query, 10);
+                    System.out.println("Found: " + results.getHits().size() + " documents");
+                }
+            }
+        }
+    }
+}
+```
+
+---
+
+## Core Concepts
+
+### Schema
+
+The schema defines the structure of your index - what fields exist and how they're processed.
+
+```java
+try (SchemaBuilder builder = new SchemaBuilder()) {
+    // Text fields (always indexed, tokenized)
+    builder.addTextField("title", true, false, "default", "position");
+
+    // Numeric fields (explicit index control)
+    builder.addIntegerField("price", true, true, true);  // stored, indexed, fast
+    builder.addFloatField("rating", true, true, false);
+
+    // Date fields
+    builder.addDateField("published_date", true, true, true);
+
+    // Boolean fields
+    builder.addBooleanField("featured", true, true, false);
+
+    Schema schema = builder.build();
+}
+```
+
+**Field Options:**
+- **stored** - Can retrieve original value in search results
+- **indexed** - Can search/filter on this field (text fields always indexed)
+- **fast** - Enables fast access for sorting, aggregations, filtering
+
+### Documents
+
+Documents are collections of field values that match your schema.
+
+```java
+// Manual field addition
+Document doc = new Document();
+doc.addText("title", "Product Title");
+doc.addInteger("price", 2999);
+doc.addFloat("rating", 4.5f);
+doc.addBoolean("featured", true);
+doc.addDate("published_date", LocalDateTime.now());
+
+// From map (for JSON-like data)
+Map<String, Object> data = Map.of(
+    "title", "Product Title",
+    "price", 2999,
+    "rating", 4.5
+);
+Document doc = Document.fromMap(data, schema);
+```
+
+### Indexing
+
+Add documents to the index for searching.
+
+```java
+try (IndexWriter writer = index.writer(Index.Memory.DEFAULT_HEAP_SIZE, 1)) {
+    // Add single document
+    writer.addDocument(doc);
+
+    // Commit to make searchable
+    writer.commit();
+}
+
+// Reload index to see changes
+index.reload();
+```
+
+### Searching
+
+Execute queries and retrieve results.
+
+```java
+try (Searcher searcher = index.searcher()) {
+    Query query = Query.termQuery(schema, "title", "product");
+    SearchResult results = searcher.search(query, 10);
+
+    for (SearchResult.Hit hit : results.getHits()) {
+        try (Document doc = searcher.doc(hit.getDocAddress())) {
+            String title = (String) doc.getFirst("title");
+            Double score = hit.getScore();
+            System.out.println(title + " (score: " + score + ")");
+        }
+    }
+}
+```
+
+---
+
+## Installation
+
+### Prerequisites
+
+- **Java 11 or higher**
+- **Maven 3.6+** (for building from source)
+- **Rust toolchain** (for building from source)
+
+### Binary Distribution
+
+Download pre-built JARs from releases (includes native libraries for your platform).
+
+### Build from Source
 
 ```bash
-# Using Ubuntu with rustup (recommended)
-docker run --rm --platform linux/amd64 \
-  -v $(pwd):/workspace -w /workspace \
+# Clone repository
+git clone https://github.com/indextables/tantivy4java.git
+cd tantivy4java
+
+# Build for current platform
+mvn clean package
+
+# Run tests
+mvn test
+```
+
+### Platform-Specific Builds
+
+**Linux (Docker):**
+```bash
+docker run --rm -v $(pwd):/workspace -w /workspace \
   ubuntu:22.04 sh -c '
-    export DEBIAN_FRONTEND=noninteractive &&
-    apt-get update &&
-    apt-get install -y build-essential curl openjdk-11-jdk maven &&
+    apt-get update && apt-get install -y build-essential curl openjdk-11-jdk maven &&
     curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y &&
     export PATH="/root/.cargo/bin:${PATH}" &&
     export JAVA_HOME=/usr/lib/jvm/java-11-openjdk-amd64 &&
     mvn clean package
   '
-
-# Or use the provided Dockerfile
-docker build --platform linux/amd64 -f Dockerfile.static-build -t tantivy4java-optimized .
 ```
 
-**Container Build Benefits:**
-- ✅ **Consistent builds** - Reproducible across different development environments
-- ✅ **Broad Linux compatibility** - Works on most modern Linux distributions  
-- ✅ **Container ready** - Optimized for Docker and container deployments
-- ✅ **CI/CD friendly** - Perfect for automated build pipelines
-- ✅ **Minimal dependencies** - Only requires standard system libraries (glibc)
+---
 
-### Running Tests
-```bash
-mvn test
-```
+## Basic Usage
 
-## Basic Usage Examples
-
-### Creating an Index and Adding Documents
+### 1. Creating Your First Index
 
 ```java
-import com.tantivy4java.*;
+import io.indextables.tantivy4java.core.*;
+import io.indextables.tantivy4java.query.*;
+import io.indextables.tantivy4java.result.*;
 
-// Create schema
-SchemaBuilder schemaBuilder = new SchemaBuilder();
-schemaBuilder.addTextField("title", true, false, "default", "position");
-schemaBuilder.addTextField("content", true, false, "default", "position");
-schemaBuilder.addIntegerField("rating", true, true, false);
-Schema schema = schemaBuilder.build();
+public class SearchExample {
+    public static void main(String[] args) throws Exception {
+        // Define schema
+        try (SchemaBuilder builder = new SchemaBuilder()) {
+            builder.addTextField("title", true, false, "default", "position")
+                   .addTextField("description", true, false, "default", "position")
+                   .addIntegerField("year", true, true, true)
+                   .addFloatField("rating", true, true, true);
 
-// Create index
-Index index = Index.createInRam(schema);
-IndexWriter writer = index.writer(50_000_000);
+            try (Schema schema = builder.build()) {
+                // Create persistent index
+                try (Index index = new Index(schema, "/tmp/my_index", false)) {
+                    // Index documents
+                    try (IndexWriter writer = index.writer(Index.Memory.DEFAULT_HEAP_SIZE, 1)) {
+                        addDocument(writer, "The Shawshank Redemption",
+                            "Two imprisoned men bond...", 1994, 9.3f);
+                        addDocument(writer, "The Godfather",
+                            "The aging patriarch...", 1972, 9.2f);
+                        addDocument(writer, "The Dark Knight",
+                            "When the menace...", 2008, 9.0f);
 
-// Add documents
-writer.addDocument(Map.of(
-    "title", "Great Article",
-    "content", "This is the content of a great article about search engines.",
-    "rating", 5
-));
+                        writer.commit();
+                    }
 
-writer.addDocument(Map.of(
-    "title", "Another Article", 
-    "content", "This article discusses advanced search techniques.",
-    "rating", 4
-));
-
-writer.commit();
-```
-
-### High-Performance Batch Indexing
-
-For maximum performance when indexing large numbers of documents, use the batch indexing system with automatic flushing:
-
-```java
-import com.tantivy4java.*;
-
-// Create schema and index (same as above)
-SchemaBuilder schemaBuilder = new SchemaBuilder();
-schemaBuilder.addTextField("title", true, false, "default", "position");
-schemaBuilder.addTextField("content", true, false, "default", "position");
-schemaBuilder.addIntegerField("rating", true, true, false);
-Schema schema = schemaBuilder.build();
-
-Index index = Index.createInRam(schema);
-IndexWriter writer = index.writer(50_000_000);
-
-// Automatic batch processing with try-with-resources (recommended)
-try (BatchDocumentBuilder builder = new BatchDocumentBuilder(writer)) {
-    // Add many documents efficiently
-    for (int i = 0; i < 100_000; i++) {
-        BatchDocument doc = new BatchDocument();
-        doc.addText("title", "Article " + i);
-        doc.addText("content", "Content for article number " + i + " with search terms.");
-        doc.addInteger("rating", (i % 5) + 1);
-        
-        builder.addDocument(doc);
-        
-        // Optional: Manual flush when batch gets large
-        if (builder.getDocumentCount() >= 1000) {
-            builder.flush(); // Flush current batch and continue
+                    // Search
+                    index.reload();
+                    searchMovies(index, schema);
+                }
+            }
         }
     }
-    // Documents automatically flushed when builder is closed
-}
 
-writer.commit();
+    private static void addDocument(IndexWriter writer, String title,
+            String desc, int year, float rating) throws Exception {
+        Document doc = new Document();
+        doc.addText("title", title);
+        doc.addText("description", desc);
+        doc.addInteger("year", year);
+        doc.addFloat("rating", rating);
+        writer.addDocument(doc);
+    }
+
+    private static void searchMovies(Index index, Schema schema) throws Exception {
+        try (Searcher searcher = index.searcher()) {
+            // Simple term search
+            try (Query query = Query.termQuery(schema, "title", "godfather")) {
+                SearchResult results = searcher.search(query, 10);
+                printResults(searcher, results, "Term Search");
+            }
+        }
+    }
+
+    private static void printResults(Searcher searcher, SearchResult results,
+            String queryType) throws Exception {
+        System.out.println("\n=== " + queryType + " ===");
+        for (SearchResult.Hit hit : results.getHits()) {
+            try (Document doc = searcher.doc(hit.getDocAddress())) {
+                String title = (String) doc.getFirst("title");
+                Long year = (Long) doc.getFirst("year");
+                Double rating = (Double) doc.getFirst("rating");
+                System.out.printf("%s (%d) - Rating: %.1f [Score: %.3f]\n",
+                    title, year, rating, hit.getScore());
+            }
+        }
+    }
+}
 ```
 
-**Performance Benefits:**
-- **3x faster** than single document indexing for large batches
-- **Zero-copy operations** with direct ByteBuffer transfers  
-- **Automatic resource management** with try-with-resources support
-- **Memory efficient** with configurable batch sizes
+### 2. Query Types
 
-### Searching with Complex Queries
+#### Term Query
+Exact term matching (case-sensitive, lowercase for "default" tokenizer):
 
 ```java
-// Create searcher
-IndexReader reader = index.reader();
-Searcher searcher = reader.searcher();
+Query query = Query.termQuery(schema, "title", "godfather");
+```
 
-// Term query
-Query termQuery = Query.termQuery(schema, "title", "article");
+#### Phrase Query
+Multi-word sequences with optional slop:
 
-// Boolean query combining multiple conditions
-Query booleanQuery = Query.booleanQuery(
-    Map.of(
-        BooleanQueryType.MUST, List.of(
-            Query.termQuery(schema, "content", "search")
-        ),
-        BooleanQueryType.SHOULD, List.of(
-            Query.rangeQuery(schema, "rating", RangeQueryType.INTEGER, 4, 5, true, true)
-        )
-    )
+```java
+// Exact phrase
+Query exactPhrase = Query.phraseQuery(schema, "description",
+    List.of("imprisoned", "men"), 0);
+
+// With slop (allows 2 words between)
+Query flexiblePhrase = Query.phraseQuery(schema, "description",
+    List.of("imprisoned", "bond"), 2);
+```
+
+#### Boolean Query
+Combine queries with MUST/SHOULD/MUST_NOT:
+
+```java
+Query mustHaveGodfather = Query.termQuery(schema, "title", "godfather");
+Query shouldBeHighRated = Query.rangeQuery(schema, "rating", "f64",
+    new RangeBound("9.0", true), new RangeBound("10.0", true));
+
+Query combined = Query.booleanQuery(
+    List.of(mustHaveGodfather),  // MUST clauses
+    List.of(shouldBeHighRated),  // SHOULD clauses
+    List.of()                     // MUST_NOT clauses
 );
-
-// Phrase query with slop
-Query phraseQuery = Query.phraseQuery(schema, "content", 
-    List.of("search", "engines"), 2);
-
-// Wildcard query with advanced pattern matching
-Query wildcardQuery = Query.wildcardQuery(schema, "content", "*search*engine*");
-
-// Case-insensitive wildcard query
-Query caseInsensitiveWildcard = Query.wildcardQueryCaseInsensitive(schema, "content", "*SEARCH*ENGINE*");
-
-// Query debugging - inspect query structure
-System.out.println("Query structure: " + wildcardQuery.toString());
-System.out.println("Case-insensitive: " + caseInsensitiveWildcard.toString());
-
-// Execute search
-SearchResult result = searcher.search(booleanQuery, 10);
-for (Hit hit : result.getHits()) {
-    Document doc = searcher.doc(hit.getDocAddress());
-    System.out.println("Title: " + doc.getFirst("title"));
-    System.out.println("Rating: " + doc.getFirst("rating"));
-    System.out.println("Score: " + hit.getScore());
-}
 ```
 
-### Index Optimization with Segment Merging
+#### Range Query
+Numeric and date ranges:
 
 ```java
-// Get current segment information
-List<String> segmentIds = searcher.getSegmentIds();
-System.out.println("Current segments: " + segmentIds.size());
+// Movies from 2000-2010
+Query yearRange = Query.rangeQuery(schema, "year", "i64",
+    new RangeBound("2000", true),   // inclusive
+    new RangeBound("2010", false)); // exclusive
 
-// Merge segments for optimization
-if (segmentIds.size() > 1) {
-    List<String> toMerge = segmentIds.subList(0, 2);
-    SegmentMeta result = writer.merge(toMerge);
-    
-    System.out.println("Merged segment ID: " + result.getSegmentId());
-    System.out.println("Documents in merged segment: " + result.getMaxDoc());
-    System.out.println("Deleted documents: " + result.getNumDeletedDocs());
+// Highly rated movies
+Query ratingRange = Query.rangeQuery(schema, "rating", "f64",
+    new RangeBound("9.0", true),
+    new RangeBound("10.0", true));
+```
+
+#### Fuzzy Query
+Edit distance matching:
+
+```java
+// Find "godfather" with 1 character difference
+Query fuzzy = Query.fuzzyTermQuery(schema, "title", "godfater", 1, true);
+```
+
+#### Wildcard Query
+Pattern matching with * and ?:
+
+```java
+// Case-sensitive wildcard
+Query wildcard = Query.wildcardQuery(schema, "title", "*dark*");
+
+// Case-insensitive wildcard
+Query caseInsensitive = Query.wildcardQueryCaseInsensitive(schema, "title", "*DARK*");
+```
+
+### 3. High-Performance Batch Indexing
+
+For large-scale indexing, use batch operations for 3x better performance:
+
+```java
+try (IndexWriter writer = index.writer(Index.Memory.LARGE_HEAP_SIZE, 4)) {
+    // Automatic batch processing
+    try (BatchDocumentBuilder builder = new BatchDocumentBuilder(writer)) {
+        for (int i = 0; i < 1_000_000; i++) {
+            BatchDocument doc = new BatchDocument();
+            doc.addText("title", "Movie " + i);
+            doc.addText("description", "Description for movie number " + i);
+            doc.addInteger("year", 2000 + (i % 24));
+            doc.addFloat("rating", 5.0f + (i % 50) / 10.0f);
+
+            builder.addDocument(doc);
+
+            // Optional: Manual flush every 10K docs
+            if (builder.getDocumentCount() >= 10_000) {
+                builder.flush();
+            }
+        }
+        // Auto-flush on close
+    }
+
+    writer.commit();
 }
 ```
+
+**Performance Tips:**
+- Use `Index.Memory.LARGE_HEAP_SIZE` or `XL_HEAP_SIZE` for bulk operations
+- Increase thread count (4-8 threads) for parallel indexing
+- Flush every 5K-10K documents for memory management
+- Use try-with-resources for automatic cleanup
+
+---
+
+## Advanced Features
 
 ### Schema Introspection
 
+Discover schema structure at runtime:
+
 ```java
-// Runtime schema discovery
-List<String> fieldNames = schema.getFieldNames();
+// Get all fields
+List<String> allFields = schema.getFieldNames();
 int fieldCount = schema.getFieldCount();
+
+// Check field existence
 boolean hasTitle = schema.hasField("title");
 
-System.out.println("Schema contains " + fieldCount + " fields: " + fieldNames);
-
-// Filter fields by capabilities
+// Filter by capabilities
 List<String> storedFields = schema.getStoredFieldNames();
 List<String> indexedFields = schema.getIndexedFieldNames();
 List<String> fastFields = schema.getFastFieldNames();
 
-// Get fields by type
+// Filter by type
 List<String> textFields = schema.getFieldNamesByType("text");
 List<String> integerFields = schema.getFieldNamesByType("i64");
+List<String> floatFields = schema.getFieldNamesByType("f64");
 
-// Advanced field filtering
-List<String> searchableStoredFields = schema.getFieldNamesByCapabilities(true, true, false);
+// Advanced filtering (stored=true, indexed=true, fast=false)
+List<String> searchableStored = schema.getFieldNamesByCapabilities(true, true, false);
+
+// Get comprehensive schema info
+String summary = schema.getSchemaSummary();
+System.out.println(summary);
 ```
 
 ### Text Analysis and Tokenization
 
+Understand how text is processed:
+
 ```java
-// Static tokenization with default tokenizer
-String text = "Hello World! This is a test document.";
-List<String> tokens = TextAnalyzer.tokenize(text);
-System.out.println("Default tokens: " + tokens);
-// Output: [hello, world, this, is, a, test, document]
+import io.indextables.tantivy4java.util.TextAnalyzer;
 
-// Static tokenization with specific tokenizer
+// Static tokenization
+String text = "Hello World! This is a TEST.";
+
+List<String> defaultTokens = TextAnalyzer.tokenize(text);
+// Output: [hello, world, this, is, a, test]
+
 List<String> simpleTokens = TextAnalyzer.tokenize(text, "simple");
-List<String> whitespaceTokens = TextAnalyzer.tokenize(text, "whitespace"); 
+// Output: [hello, world, this, is, a, test]
+
+List<String> whitespaceTokens = TextAnalyzer.tokenize(text, "whitespace");
+// Output: [Hello, World!, This, is, a, TEST.]
+
 List<String> keywordTokens = TextAnalyzer.tokenize(text, "keyword");
-List<String> rawTokens = TextAnalyzer.tokenize(text, "raw");
+// Output: [Hello World! This is a TEST.]
 
-System.out.println("Simple tokens: " + simpleTokens);
-System.out.println("Whitespace tokens: " + whitespaceTokens);
-System.out.println("Keyword tokens: " + keywordTokens);  // [Hello World! This is a test document.]
-System.out.println("Raw tokens: " + rawTokens);
-
-// Instance-based analysis for reuse
+// Instance-based analysis (reusable)
 try (TextAnalyzer analyzer = TextAnalyzer.create("default")) {
-    List<String> tokens1 = analyzer.analyze("First document text");
-    List<String> tokens2 = analyzer.analyze("Second document text");
-    
-    System.out.println("Analyzed text 1: " + tokens1);
-    System.out.println("Analyzed text 2: " + tokens2);
+    List<String> tokens1 = analyzer.analyze("First document");
+    List<String> tokens2 = analyzer.analyze("Second document");
 }
-
-// Advanced text processing
-String complexText = "Don't split contractions! But do split sentences. What about URLs: https://example.com?";
-List<String> processedTokens = TextAnalyzer.tokenize(complexText, "default");
-System.out.println("Complex text tokens: " + processedTokens);
-
-// Available tokenizer types and their behavior:
-// - "default": Simple tokenizer + lowercase + stop word removal  
-// - "simple": Simple tokenizer with lowercase (splits on non-alphanumeric)
-// - "whitespace": Whitespace tokenizer with lowercase (splits only on whitespace)
-// - "keyword": Treats entire input as single token (no splitting)
-// - "raw": Raw tokenizer (no processing, minimal splitting)
 ```
 
-## Working with Quickwit Splits
+**Tokenizer Types:**
+- **default** - Lowercase + stopword removal + alphanumeric splitting
+- **simple** - Lowercase + alphanumeric splitting
+- **whitespace** - Lowercase + whitespace splitting only
+- **keyword** - Entire input as single token (no splitting)
+- **raw** - Minimal processing
 
-### Converting Index to Split
+**Important:** When searching with term queries on fields using "default" tokenizer, lowercase your search terms to match indexed tokens.
+
+### Index Optimization
+
+Merge segments for better search performance:
 
 ```java
-// Create split configuration
+try (Searcher searcher = index.searcher()) {
+    // Get current segments
+    List<String> segmentIds = searcher.getSegmentIds();
+    System.out.println("Current segments: " + segmentIds.size());
+
+    if (segmentIds.size() > 1) {
+        // Merge first two segments
+        List<String> toMerge = segmentIds.subList(0, 2);
+
+        try (IndexWriter writer = index.writer(Index.Memory.DEFAULT_HEAP_SIZE, 1)) {
+            SegmentMeta result = writer.merge(toMerge);
+
+            System.out.println("New segment ID: " + result.getSegmentId());
+            System.out.println("Documents: " + result.getMaxDoc());
+            System.out.println("Deleted docs: " + result.getNumDeletedDocs());
+
+            writer.commit();
+        }
+
+        index.reload();
+    }
+}
+```
+
+**When to merge:**
+- After large batch operations
+- When segment count exceeds 10-20
+- During off-peak hours for production systems
+
+---
+
+## Quickwit Integration
+
+Tantivy4Java includes first-class support for Quickwit splits, enabling distributed search across large datasets.
+
+### What are Splits?
+
+Splits are self-contained, immutable index segments optimized for distributed search. Key benefits:
+
+- **Distributed** - Store and search across multiple nodes
+- **Cloud-Native** - Store in S3/MinIO for scalable architectures
+- **Efficient** - Optimized footer metadata for fast opening
+- **Mergeable** - Combine splits without re-indexing
+
+### Creating Splits
+
+Convert a Tantivy index to a Quickwit split:
+
+```java
+import io.indextables.tantivy4java.split.merge.*;
+
+// Configure split metadata
 QuickwitSplit.SplitConfig config = new QuickwitSplit.SplitConfig(
-    "my-index-uid", 
-    "my-source", 
-    "my-node"
+    "movies-index-v1",    // index UID
+    "imdb-source",        // source ID
+    "indexer-node-1"      // node ID
 );
 
-// Convert Tantivy index to Quickwit split
+// Convert index to split
 QuickwitSplit.SplitMetadata metadata = QuickwitSplit.convertIndexFromPath(
-    "/path/to/tantivy/index", 
-    "/tmp/my_index.split", 
+    "/tmp/my_index",           // input index path
+    "/tmp/movies.split",       // output split path
     config
 );
 
-System.out.println("Split ID: " + metadata.getSplitId());
+System.out.println("Created split: " + metadata.getSplitId());
 System.out.println("Documents: " + metadata.getNumDocs());
-System.out.println("Size: " + metadata.getUncompressedSizeBytes());
+System.out.println("Size: " + metadata.getUncompressedSizeBytes() + " bytes");
 
 // Validate split integrity
-boolean isValid = QuickwitSplit.validateSplit("/tmp/my_index.split");
-System.out.println("Split is valid: " + isValid);
+boolean valid = QuickwitSplit.validateSplit("/tmp/movies.split");
+System.out.println("Split valid: " + valid);
 ```
 
-### Merging Multiple Splits
+### Searching Splits
+
+Use SplitSearcher for efficient split file searching:
+
+```java
+import io.indextables.tantivy4java.split.*;
+
+// Create cache manager (shared across searches)
+SplitCacheManager.CacheConfig cacheConfig =
+    new SplitCacheManager.CacheConfig("main-cache")
+        .withMaxCacheSize(500_000_000);  // 500MB cache
+
+try (SplitCacheManager cacheManager = SplitCacheManager.getInstance(cacheConfig)) {
+    // Open split searcher
+    try (SplitSearcher searcher = cacheManager.createSplitSearcher(
+            "file:///tmp/movies.split")) {
+
+        // Get schema from split
+        Schema schema = searcher.getSchema();
+
+        // Search split
+        SplitQuery query = new SplitTermQuery("title", "godfather");
+        SearchResult results = searcher.search(query, 10);
+
+        // Process results
+        for (SearchResult.Hit hit : results.getHits()) {
+            try (Document doc = searcher.doc(hit.getDocAddress())) {
+                String title = (String) doc.getFirst("title");
+                System.out.println("Found: " + title);
+            }
+        }
+    }
+}
+```
+
+### Merging Splits
 
 #### Local Split Merging
+
+Combine multiple splits efficiently:
+
 ```java
-// Merge multiple splits using Quickwit's efficient approach
 List<String> splitPaths = List.of(
-    "/path/to/split1.split",
-    "/path/to/split2.split", 
-    "/path/to/split3.split"
+    "/tmp/split-2024-01.split",
+    "/tmp/split-2024-02.split",
+    "/tmp/split-2024-03.split"
 );
 
 QuickwitSplit.MergeConfig mergeConfig = new QuickwitSplit.MergeConfig(
-    "merged-index-uid",
-    "merged-source",
+    "movies-merged",
+    "imdb-source",
     "merge-node"
 );
 
-QuickwitSplit.SplitMetadata mergedSplit = QuickwitSplit.mergeSplits(
+QuickwitSplit.SplitMetadata merged = QuickwitSplit.mergeSplits(
     splitPaths,
-    "/tmp/merged.split",
+    "/tmp/merged-2024-q1.split",
     mergeConfig
 );
 
 System.out.println("Merged " + splitPaths.size() + " splits");
-System.out.println("Total documents: " + mergedSplit.getNumDocs());
-System.out.println("Merged split size: " + mergedSplit.getUncompressedSizeBytes());
+System.out.println("Total docs: " + merged.getNumDocs());
 ```
 
 #### S3 Remote Split Merging
+
+Merge splits stored in S3 without downloading:
+
 ```java
-// Create AWS configuration for S3 access
+// Configure AWS credentials
 QuickwitSplit.AwsConfig awsConfig = new QuickwitSplit.AwsConfig(
-    "AKIA...",        // Access key
-    "secret-key",     // Secret key
-    "us-east-1"       // Region
+    "AKIA...",           // access key
+    "secret-key",        // secret key
+    "us-east-1"          // region
 );
 
-// Create merge configuration with AWS credentials
 QuickwitSplit.MergeConfig config = new QuickwitSplit.MergeConfig(
-    "distributed-index", "data-source", "worker-node", awsConfig);
+    "movies-distributed", "s3-source", "worker-1", awsConfig);
 
-// Define S3 split URLs to merge
-List<String> s3Splits = Arrays.asList(
-    "s3://my-bucket/splits/split-001.split",
-    "s3://my-bucket/splits/split-002.split",
-    "s3://my-bucket/splits/split-003.split"
+// S3 split URLs
+List<String> s3Splits = List.of(
+    "s3://my-bucket/splits/movies-01.split",
+    "s3://my-bucket/splits/movies-02.split",
+    "s3://my-bucket/splits/movies-03.split"
 );
 
-// Merge remote S3 splits
-QuickwitSplit.SplitMetadata result = QuickwitSplit.mergeSplits(
-    s3Splits, "/tmp/merged-split.split", config);
+// Merge remote splits
+QuickwitSplit.SplitMetadata merged = QuickwitSplit.mergeSplits(
+    s3Splits,
+    "/tmp/merged-movies.split",  // local output
+    config
+);
 
-System.out.println("✅ Successfully merged " + s3Splits.size() + " S3 splits");
-System.out.println("   Merged split ID: " + result.getSplitId());
-System.out.println("   Total documents: " + result.getNumDocs());
+System.out.println("Merged " + s3Splits.size() + " S3 splits");
+System.out.println("Total documents: " + merged.getNumDocs());
 ```
 
-#### Advanced S3 Configuration (Session Tokens + Custom Endpoints)
+#### Advanced S3 Configuration
+
 ```java
-// For temporary credentials or custom S3-compatible storage
+// Temporary credentials with session token
 QuickwitSplit.AwsConfig sessionConfig = new QuickwitSplit.AwsConfig(
-    "temp-access-key",     // Temporary access key
-    "temp-secret-key",     // Temporary secret key
-    "session-token",       // STS session token
-    "us-west-2",          // AWS region
-    "https://minio.example.com", // Custom endpoint (MinIO)
-    true                   // Force path style
+    "ASIA...",              // temp access key
+    "temp-secret",          // temp secret key
+    "session-token",        // STS token
+    "us-west-2",            // region
+    "https://minio.example.com",  // custom endpoint
+    true                    // force path style (for MinIO)
+);
+
+// Mix local and remote splits
+List<String> mixedSplits = List.of(
+    "/local/split-01.split",                    // local file
+    "file:///shared/storage/split-02.split",    // file URL
+    "s3://bucket-a/split-03.split",             // S3 URL
+    "s3://bucket-b/split-04.split"              // different bucket
 );
 
 QuickwitSplit.MergeConfig config = new QuickwitSplit.MergeConfig(
-    "index-uid", "source-id", "node-id", sessionConfig);
+    "mixed-index", "multi-source", "worker-2", sessionConfig);
 
-// Mix local and remote splits in single operation
-List<String> mixedSplits = Arrays.asList(
-    "/local/path/split-001.split",           // Local file
-    "file:///shared/storage/split-002.split", // File URL
-    "s3://bucket-a/split-003.split",         // S3 URL
-    "s3://bucket-b/remote/split-004.split"   // Different bucket
-);
-
-QuickwitSplit.SplitMetadata result = QuickwitSplit.mergeSplits(
-    mixedSplits, "/tmp/merged.split", config);
+QuickwitSplit.SplitMetadata merged = QuickwitSplit.mergeSplits(
+    mixedSplits, "/tmp/final-merged.split", config);
 ```
 
-### Searching Split Files
+### Searching S3 Splits
+
+Search splits directly from S3:
 
 ```java
-// Create shared cache manager for efficient split searching
-SplitCacheManager.CacheConfig cacheConfig = new SplitCacheManager.CacheConfig("main-cache")
-    .withMaxCacheSize(200_000_000)  // 200MB shared cache
-    .withAwsCredentials("access-key", "secret-key")  // For S3 splits
-    .withAwsRegion("us-east-1");
+// Configure cache with AWS credentials
+SplitCacheManager.CacheConfig config =
+    new SplitCacheManager.CacheConfig("s3-cache")
+        .withMaxCacheSize(500_000_000)
+        .withAwsCredentials("AKIA...", "secret-key")
+        .withAwsRegion("us-east-1");
 
-SplitCacheManager cacheManager = SplitCacheManager.getInstance(cacheConfig);
-
-// Search local split file
-try (SplitSearcher searcher = cacheManager.createSplitSearcher("file:///tmp/my_index.split")) {
-    Schema schema = searcher.getSchema();
-    
-    Query query = Query.termQuery(schema, "content", "search");
-    SearchResult result = searcher.search(query, 10);
-    
-    for (Hit hit : result.getHits()) {
-        try (Document doc = searcher.doc(hit.getDocAddress())) {
-            System.out.println("Found: " + doc.getFirst("title"));
-            System.out.println("Score: " + hit.getScore());
+try (SplitCacheManager cacheManager = SplitCacheManager.getInstance(config)) {
+    // Open S3 split
+    String s3Url = "s3://my-bucket/splits/movies.split";
+    try (SplitSearcher searcher = cacheManager.createSplitSearcher(s3Url)) {
+        // Validate before searching
+        if (!searcher.validateSplit()) {
+            System.err.println("Split validation failed");
+            return;
         }
-    }
-}
 
-// Search S3-hosted split
-try (SplitSearcher s3Searcher = cacheManager.createSplitSearcher("s3://my-bucket/splits/index.split")) {
-    // Validate split accessibility
-    boolean isValid = s3Searcher.validateSplit();
-    if (!isValid) {
-        System.err.println("Split validation failed");
-        return;
+        // Get metadata
+        QuickwitSplit.SplitMetadata metadata = searcher.getSplitMetadata();
+        System.out.println("Searching " + metadata.getNumDocs() + " documents");
+
+        // Search
+        Schema schema = searcher.getSchema();
+        SplitQuery query = new SplitTermQuery("title", "matrix");
+        SearchResult results = searcher.search(query, 20);
+
+        System.out.println("Found " + results.getHits().size() + " results");
     }
-    
-    // Get split metadata
-    QuickwitSplit.SplitMetadata metadata = s3Searcher.getSplitMetadata();
-    System.out.println("Searching split with " + metadata.getNumDocs() + " documents");
-    
-    // Perform search
-    Query query = Query.booleanQuery(Map.of(
-        BooleanQueryType.MUST, List.of(
-            Query.termQuery(s3Searcher.getSchema(), "status", "published")
-        )
-    ));
-    
-    SearchResult result = s3Searcher.search(query, 20);
-    processSearchResults(result, s3Searcher);
 }
 ```
 
-### Advanced Cache Management
+### Cache Management
+
+Monitor and control split cache performance:
 
 ```java
-// Monitor cache performance
+// Get cache statistics
 SplitSearcher.CacheStats stats = searcher.getCacheStats();
 System.out.println("Cache hits: " + stats.getHits());
 System.out.println("Cache misses: " + stats.getMisses());
-System.out.println("Cache size: " + stats.getSizeBytes());
+System.out.println("Evictions: " + stats.getEvictions());
+System.out.println("Size: " + stats.getSizeBytes() + " bytes");
 
-// Component-level cache control
+// Preload components for faster queries
 List<String> components = List.of("postings", "fast_fields", "fieldnorms");
-
-// Preload specific components
 searcher.preloadComponents(components);
 
-// Check component cache status
+// Check what's cached
 Map<String, Boolean> status = searcher.getComponentCacheStatus();
-for (Map.Entry<String, Boolean> entry : status.entrySet()) {
-    System.out.println(entry.getKey() + " cached: " + entry.getValue());
-}
+status.forEach((component, cached) ->
+    System.out.println(component + ": " + (cached ? "cached" : "not cached")));
 
-// Manual cache eviction
+// Evict components to free memory
 searcher.evictComponents(List.of("postings"));
 ```
 
-## Configuration
+---
 
-### Debug Logging
-Enable detailed logging for troubleshooting:
+## Performance Guide
+
+### Memory Configuration
+
+Use appropriate heap sizes for your workload:
+
+```java
+// Minimum (15MB) - small indices, testing
+Index.Memory.MIN_HEAP_SIZE
+
+// Default (50MB) - typical workloads
+Index.Memory.DEFAULT_HEAP_SIZE
+
+// Large (128MB) - bulk operations
+Index.Memory.LARGE_HEAP_SIZE
+
+// Extra Large (256MB) - very large indices
+Index.Memory.XL_HEAP_SIZE
+
+// Custom size
+long customHeapSize = 200_000_000L;  // 200MB
+```
+
+### Index Design
+
+**Field Configuration:**
+```java
+// Text fields: stored=true for retrieval, fast=false (not needed)
+builder.addTextField("title", true, false, "default", "position");
+
+// Numeric fields for filtering: indexed=true, fast=true
+builder.addIntegerField("price", true, true, true);
+
+// Numeric fields for sorting: fast=true, indexed can be false
+builder.addFloatField("rating", true, false, true);
+
+// Fields only for display: stored=true, indexed=false, fast=false
+builder.addTextField("description", true, false, "keyword", "");
+```
+
+### Batch Indexing
+
+**Optimal batch configuration:**
+```java
+try (IndexWriter writer = index.writer(Index.Memory.LARGE_HEAP_SIZE, 4)) {
+    try (BatchDocumentBuilder builder = new BatchDocumentBuilder(writer)) {
+        for (Document doc : documents) {
+            builder.addDocument(doc);
+
+            // Flush every 5K-10K documents
+            if (builder.getDocumentCount() >= 5_000) {
+                builder.flush();
+            }
+        }
+    }
+    writer.commit();
+}
+```
+
+**Key points:**
+- Use 4-8 threads for parallel indexing
+- Flush every 5K-10K documents
+- Use `LARGE_HEAP_SIZE` or `XL_HEAP_SIZE`
+- Commit once at the end
+
+### Search Performance
+
+**Fast searches:**
+- Use fast fields for filtering and sorting
+- Merge segments regularly (keep count < 20)
+- Use appropriate cache sizes for splits
+- Preload frequently accessed components
+
+**Query optimization:**
+- Use term queries for exact matches
+- Avoid wildcards on large fields
+- Use fast fields for range filters
+- Combine with boolean queries for complex logic
+
+### Split Architecture
+
+**Best practices:**
+- Split size: 1-10GB per split (optimal for distributed search)
+- Merge periodically to reduce split count
+- Use S3 for storage, local cache for performance
+- Configure appropriate cache sizes (500MB-2GB per searcher)
+
+---
+
+## Developer Guide
+
+### Error Handling
+
+```java
+try (Index index = new Index(schema, path)) {
+    try (IndexWriter writer = index.writer(Index.Memory.DEFAULT_HEAP_SIZE, 1)) {
+        writer.addDocument(doc);
+        writer.commit();
+    } catch (RuntimeException e) {
+        System.err.println("Indexing failed: " + e.getMessage());
+        e.printStackTrace();
+    }
+} catch (Exception e) {
+    System.err.println("Index creation failed: " + e.getMessage());
+}
+```
+
+### Resource Management
+
+**Always use try-with-resources:**
+```java
+// Automatic cleanup
+try (Schema schema = builder.build();
+     Index index = new Index(schema, path);
+     IndexWriter writer = index.writer(Index.Memory.DEFAULT_HEAP_SIZE, 1);
+     Document doc = new Document()) {
+    // Use resources
+}
+// Automatically closed in reverse order
+```
+
+### Thread Safety
+
+- **Index**: Thread-safe for reading
+- **IndexWriter**: Not thread-safe (use single writer per index)
+- **Searcher**: Thread-safe for searching
+- **SplitCacheManager**: Thread-safe (designed for shared use)
+
+### Debugging
+
+Enable debug logging:
 ```bash
 export TANTIVY4JAVA_DEBUG=1
+mvn test -Dtest=YourTest
 ```
 
-### AWS Credentials Configuration
+Query debugging:
 ```java
-// Basic credentials (long-term access)
-SplitCacheManager.CacheConfig config = new SplitCacheManager.CacheConfig("cache")
-    .withAwsCredentials("access-key", "secret-key")
-    .withAwsRegion("us-east-1");
-
-// Temporary credentials (with session token)
-SplitCacheManager.CacheConfig sessionConfig = new SplitCacheManager.CacheConfig("session-cache")
-    .withAwsCredentials("access-key", "secret-key", "session-token")
-    .withAwsRegion("us-east-1");
-
-// Custom S3 endpoint (for MinIO or testing)
-SplitCacheManager.CacheConfig customConfig = new SplitCacheManager.CacheConfig("custom")
-    .withAwsCredentials("access-key", "secret-key")
-    .withAwsRegion("us-east-1")
-    .withS3Endpoint("http://localhost:9000");  // MinIO endpoint
+Query query = Query.booleanQuery(...);
+System.out.println("Query: " + query.toString());
 ```
 
-## Performance Tuning
+### Testing
 
-### Memory Management
-- Use appropriate cache sizes based on available memory
-- Enable fast fields for frequently accessed numeric/date fields
-- Consider field storage requirements (stored vs indexed vs fast)
+```java
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
+import java.nio.file.Path;
 
-### Index Optimization
-- Regularly merge segments to improve search performance
-- Use appropriate merge policies for your use case
-- Monitor segment count and optimize when necessary
+class SearchTest {
+    @Test
+    void testSearch(@TempDir Path tempDir) throws Exception {
+        try (SchemaBuilder builder = new SchemaBuilder()) {
+            builder.addTextField("title", true, false, "default", "position");
 
-### Split-based Architecture
-- Use splits for distributed search scenarios
-- Implement appropriate caching strategies for remote splits
-- Consider split size for optimal performance (typically 1-10GB per split)
+            try (Schema schema = builder.build()) {
+                String indexPath = tempDir.resolve("test_index").toString();
+                try (Index index = new Index(schema, indexPath, false)) {
+                    // Test indexing
+                    try (IndexWriter writer = index.writer(Index.Memory.DEFAULT_HEAP_SIZE, 1)) {
+                        Document doc = new Document();
+                        doc.addText("title", "test document");
+                        writer.addDocument(doc);
+                        writer.commit();
+                    }
+
+                    // Test searching
+                    index.reload();
+                    try (Searcher searcher = index.searcher()) {
+                        Query query = Query.termQuery(schema, "title", "test");
+                        SearchResult results = searcher.search(query, 10);
+                        assertEquals(1, results.getHits().size());
+                    }
+                }
+            }
+        }
+    }
+}
+```
+
+---
 
 ## API Reference
 
 ### Core Classes
+
+**io.indextables.tantivy4java.core**
 - `Index` - Main index interface
-- `IndexWriter` - Document indexing operations
-- `IndexReader` - Index reading operations  
+- `IndexWriter` - Document indexing with batch support
 - `Searcher` - Search execution
-- `Schema` - Index schema definition and introspection
+- `Schema` - Index schema with introspection
 - `SchemaBuilder` - Schema construction
-- `Query` - Query construction utilities with debugging support
 - `Document` - Document representation
-- `TextAnalyzer` - Text tokenization and analysis
+- `DocAddress` - Document location reference
+- `FieldType` - Field type enumeration
+- `SegmentMeta` - Segment metadata
 
-### Batch Processing Classes
-- `BatchDocument` - High-performance document representation for batch operations
-- `BatchDocumentBuilder` - AutoCloseable builder for efficient bulk indexing with automatic flushing
+**io.indextables.tantivy4java.query**
+- `Query` - Query construction utilities
+- `Range` - Range bounds for queries
+- `RangeBound` - Range boundary specification
+- `Occur` - Boolean query occurrence (MUST/SHOULD/MUST_NOT)
+- `Order` - Sort order enumeration
+- `Snippet` - Text snippet for highlighting
+- `SnippetGenerator` - Snippet generation
+- `Explanation` - Query score explanation
 
-### Quickwit Classes
+**io.indextables.tantivy4java.result**
+- `SearchResult` - Search result container
+- `SearchResult.Hit` - Individual search hit
+
+**io.indextables.tantivy4java.batch**
+- `BatchDocument` - High-performance document for batch operations
+- `BatchDocumentBuilder` - AutoCloseable batch builder
+
+**io.indextables.tantivy4java.split**
 - `SplitSearcher` - Split file search operations
 - `SplitCacheManager` - Shared cache management
-- `QuickwitSplit` - Split conversion and merging utilities
-- `QuickwitSplit.AwsConfig` - AWS credential configuration for S3 access
-- `QuickwitSplit.MergeConfig` - Split merge configuration with AWS support
-- `SplitMetadata` - Split information access
+- `SplitQuery` - Base for split queries
+- `SplitTermQuery` - Term query for splits
+- `SplitBooleanQuery` - Boolean query for splits
+- `SplitRangeQuery` - Range query for splits
+- `SplitPhraseQuery` - Phrase query for splits
+- `SplitMatchAllQuery` - Match all query for splits
+- `SplitParsedQuery` - Parsed query for splits
+
+**io.indextables.tantivy4java.split.merge**
+- `QuickwitSplit` - Split conversion and merging
+- `QuickwitSplit.SplitConfig` - Split configuration
+- `QuickwitSplit.SplitMetadata` - Split metadata
+- `QuickwitSplit.MergeConfig` - Merge configuration
+- `QuickwitSplit.AwsConfig` - AWS credential configuration
+- `QuickwitSplitInspector` - Split inspection utilities
+
+**io.indextables.tantivy4java.aggregation**
+- `TermsAggregation` - Terms aggregation (supported)
+- `RangeAggregation` - Range aggregation (not yet supported for splits)
+- `HistogramAggregation` - Histogram aggregation (not yet supported for splits)
+- `DateHistogramAggregation` - Date histogram (not yet supported for splits)
+
+**io.indextables.tantivy4java.config**
+- `FileSystemConfig` - File system configuration
+- `GlobalCacheConfig` - Global cache settings
+- `RuntimeManager` - Runtime management
+
+**io.indextables.tantivy4java.util**
+- `TextAnalyzer` - Text tokenization and analysis
+- `Facet` - Faceted search support
+
+### Memory Constants
+
+```java
+Index.Memory.MIN_HEAP_SIZE      // 15MB - minimum
+Index.Memory.DEFAULT_HEAP_SIZE  // 50MB - typical
+Index.Memory.LARGE_HEAP_SIZE    // 128MB - bulk operations
+Index.Memory.XL_HEAP_SIZE       // 256MB - very large indices
+```
+
+---
+
+## Platform Support
+
+- **macOS** - Intel (x86_64) and Apple Silicon (ARM64)
+- **Linux** - x86_64 and ARM64 (glibc 2.17+)
+- **Windows** - x86_64
 
 ## Requirements
-- Java 11 or higher
-- Compatible with all major operating systems (macOS, Linux)
-- Supports both x86_64 and ARM64 architectures
 
-## License
-[Include your license information here]
+- **Java** - 11 or higher
+- **Memory** - Minimum 100MB heap recommended
+- **Disk** - Depends on index size
+
+## Known Limitations
+
+### SplitSearcher Aggregations
+
+Only **TermsAggregation** is currently supported for SplitSearcher. The following aggregations are not yet implemented:
+- DateHistogramAggregation
+- HistogramAggregation
+- RangeAggregation
+
+All aggregation types work correctly with the standard `Searcher` API.
+
+### Tokenization
+
+When using the "default" tokenizer, remember to lowercase search terms:
+```java
+// ✅ Correct
+Query query = Query.termQuery(schema, "title", "search");
+
+// ❌ Wrong (won't match)
+Query query = Query.termQuery(schema, "title", "Search");
+```
 
 ## Contributing
-[Include contribution guidelines here]
+
+We welcome contributions! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
+
+## License
+
+Apache License 2.0 - See [LICENSE](LICENSE) for details.
 
 ## Support
-[Include support information here]
+
+- **Issues**: [GitHub Issues](https://github.com/indextables/tantivy4java/issues)
+- **Documentation**: [Full API Docs](https://indextables.github.io/tantivy4java)
+- **Examples**: See [examples/](examples/) directory
+
+## Acknowledgments
+
+Built on top of:
+- [Tantivy](https://github.com/quickwit-oss/tantivy) - The Rust search engine
+- [Quickwit](https://github.com/quickwit-oss/quickwit) - Distributed search platform
+
+---
+
+**Made with ❤️ for Java developers who need fast, reliable full-text search**

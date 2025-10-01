@@ -6,7 +6,7 @@
 
     <groupId>com.tantivy4java</groupId>
     <artifactId>tantivy4java</artifactId>
-    <version>0.24.1</version>
+    <version>0.24.1_x86_64</version>
     <packaging>jar</packaging>
 
     <name>Tantivy4Java</name>
@@ -135,7 +135,7 @@
                     <parallel>none</parallel>
                     <perCoreThreadCount>false</perCoreThreadCount>
                     <threadCount>1</threadCount>
-                    <!-- Ensure proper test isolation for @BeforeAll/@AfterAll methods -->
+                    <!-- Fork a new JVM for each test suite (test class) for complete isolation -->
                     <reuseForks>false</reuseForks>
                     <forkCount>1</forkCount>
                     <!-- Set test execution order to be predictable -->
