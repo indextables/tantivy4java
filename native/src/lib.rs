@@ -63,7 +63,7 @@ pub use merge_types::*;
 // pub use split_searcher_simple::*;  // Disabled to avoid conflicts
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_Tantivy_getVersion(
+pub extern "system" fn Java_io_indextables_tantivy4java_core_Tantivy_getVersion(
     env: JNIEnv,
     _class: JClass,
 ) -> jstring {
@@ -73,7 +73,7 @@ pub extern "system" fn Java_com_tantivy4java_Tantivy_getVersion(
 
 // Global cache configuration JNI functions
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_GlobalCacheConfig_initializeGlobalCache(
+pub extern "system" fn Java_io_indextables_tantivy4java_config_GlobalCacheConfig_initializeGlobalCache(
     mut env: JNIEnv,
     _class: JClass,
     fast_field_cache_mb: jni::sys::jlong,

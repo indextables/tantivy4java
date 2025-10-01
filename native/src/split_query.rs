@@ -54,7 +54,7 @@ pub fn get_split_schema(split_uri: &str) -> Option<tantivy::schema::Schema> {
 
 /// Convert a SplitTermQuery to QueryAst JSON (FOR TESTING ONLY - Production should use SplitSearcher.search() directly)
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_SplitTermQuery_toQueryAstJson(
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitTermQuery_toQueryAstJson(
     mut env: JNIEnv,
     obj: JObject,
 ) -> jstring {
@@ -80,7 +80,7 @@ pub extern "system" fn Java_com_tantivy4java_SplitTermQuery_toQueryAstJson(
 
 /// Convert a SplitBooleanQuery to QueryAst JSON (FOR TESTING ONLY - Production should use SplitSearcher.search() directly)
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_SplitBooleanQuery_toQueryAstJson(
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitBooleanQuery_toQueryAstJson(
     mut env: JNIEnv,
     obj: JObject,
 ) -> jstring {
@@ -106,7 +106,7 @@ pub extern "system" fn Java_com_tantivy4java_SplitBooleanQuery_toQueryAstJson(
 
 /// Convert a SplitMatchAllQuery to QueryAst JSON (FOR TESTING ONLY - Production should use SplitSearcher.search() directly)
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_SplitMatchAllQuery_toQueryAstJson(
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitMatchAllQuery_toQueryAstJson(
     mut env: JNIEnv,
     _obj: JObject,
 ) -> jstring {
@@ -134,7 +134,7 @@ pub extern "system" fn Java_com_tantivy4java_SplitMatchAllQuery_toQueryAstJson(
 
 /// Convert a SplitRangeQuery to QueryAst JSON (FOR TESTING ONLY - Production should use SplitSearcher.search() directly)
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_SplitRangeQuery_toQueryAstJson(
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitRangeQuery_toQueryAstJson(
     mut env: JNIEnv,
     obj: JObject,
 ) -> jstring {
@@ -161,14 +161,14 @@ pub extern "system" fn Java_com_tantivy4java_SplitRangeQuery_toQueryAstJson(
 
 /// Parse a query string into a SplitQuery using Quickwit's query parser
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_SplitQuery_parseQuery(
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitQuery_parseQuery(
     mut env: JNIEnv,
     _class: JClass,
     query_string: JString,
     schema_ptr: jlong,
     default_search_fields: jobject,
 ) -> jobject {
-    debug_println!("🚀 ENTRY: Java_com_tantivy4java_SplitQuery_parseQuery called with schema_ptr={}", schema_ptr);
+    debug_println!("🚀 ENTRY: Java_io_indextables_tantivy4java_split_SplitQuery_parseQuery called with schema_ptr={}", schema_ptr);
     let result = parse_query_string(&mut env, query_string, schema_ptr, default_search_fields);
     debug_println!("🚀 RESULT: parse_query_string returned result type: {}", if result.is_ok() { "Ok" } else { "Err" });
     match result {
@@ -305,9 +305,9 @@ fn convert_range_query_to_query_ast(env: &mut JNIEnv, obj: &JObject) -> Result<Q
     // Extract field, bounds, and field type from Java SplitRangeQuery object
     let field_obj = env.get_field(obj, "field", "Ljava/lang/String;")
         .map_err(|e| anyhow!("Failed to get field: {}", e))?;
-    let lower_bound_obj = env.get_field(obj, "lowerBound", "Lcom/tantivy4java/SplitRangeQuery$RangeBound;")
+    let lower_bound_obj = env.get_field(obj, "lowerBound", "Lio/indextables/tantivy4java/split/SplitRangeQuery$RangeBound;")
         .map_err(|e| anyhow!("Failed to get lowerBound: {}", e))?;
-    let upper_bound_obj = env.get_field(obj, "upperBound", "Lcom/tantivy4java/SplitRangeQuery$RangeBound;")
+    let upper_bound_obj = env.get_field(obj, "upperBound", "Lio/indextables/tantivy4java/split/SplitRangeQuery$RangeBound;")
         .map_err(|e| anyhow!("Failed to get upperBound: {}", e))?;
     let field_type_obj = env.get_field(obj, "fieldType", "Ljava/lang/String;")
         .map_err(|e| anyhow!("Failed to get fieldType: {}", e))?;
@@ -343,7 +343,7 @@ fn convert_range_query_to_query_ast(env: &mut JNIEnv, obj: &JObject) -> Result<Q
 
 fn convert_range_bound(env: &mut JNIEnv, bound_obj: &JObject, field_type: &str) -> Result<Bound<JsonLiteral>> {
     // Get the bound type
-    let type_obj = env.get_field(bound_obj, "type", "Lcom/tantivy4java/SplitRangeQuery$RangeBound$BoundType;")?;
+    let type_obj = env.get_field(bound_obj, "type", "Lio/indextables/tantivy4java/split/SplitRangeQuery$RangeBound$BoundType;")?;
     let type_enum = type_obj.l()?;
     
     // Get enum name
@@ -451,26 +451,26 @@ pub fn convert_split_query_to_ast(env: &mut JNIEnv, query_obj: &JObject) -> Resu
     let class_name: String = env.get_string(&class_name_jstring)?.into();
     
     match class_name.as_str() {
-        "com.tantivy4java.SplitTermQuery" => {
+        "io.indextables.tantivy4java.split.SplitTermQuery" => {
             // Create QueryAst directly using native Quickwit structures
             convert_term_query_to_query_ast(env, query_obj)
         }
-        "com.tantivy4java.SplitBooleanQuery" => {
+        "io.indextables.tantivy4java.split.SplitBooleanQuery" => {
             // Create QueryAst directly using native Quickwit structures
             convert_boolean_query_to_query_ast(env, query_obj)
         }
-        "com.tantivy4java.SplitRangeQuery" => {
+        "io.indextables.tantivy4java.split.SplitRangeQuery" => {
             // Create QueryAst directly using native Quickwit structures
             convert_range_query_to_query_ast(env, query_obj)
         }
-        "com.tantivy4java.SplitMatchAllQuery" => {
+        "io.indextables.tantivy4java.split.SplitMatchAllQuery" => {
             Ok(QueryAst::MatchAll)
         }
-        "com.tantivy4java.SplitParsedQuery" => {
+        "io.indextables.tantivy4java.split.SplitParsedQuery" => {
             // SplitParsedQuery already contains the QueryAst as JSON - parse it back
             convert_parsed_query_to_query_ast(env, query_obj)
         }
-        "com.tantivy4java.SplitPhraseQuery" => {
+        "io.indextables.tantivy4java.split.SplitPhraseQuery" => {
             // Create QueryAst directly using native Quickwit structures
             convert_phrase_query_to_query_ast(env, query_obj)
         }
@@ -594,7 +594,7 @@ fn create_split_query_from_ast(env: &mut JNIEnv, query_ast: &QueryAst) -> Result
     match query_ast {
         QueryAst::Term(term_query) => {
             // Create SplitTermQuery Java object
-            let class = env.find_class("com/tantivy4java/SplitTermQuery")?;
+            let class = env.find_class("io/indextables/tantivy4java/split/SplitTermQuery")?;
             let field_jstring = env.new_string(&term_query.field)?;
             let value_jstring = env.new_string(&term_query.value)?;
             
@@ -607,7 +607,7 @@ fn create_split_query_from_ast(env: &mut JNIEnv, query_ast: &QueryAst) -> Result
         QueryAst::FullText(fulltext_query) => {
             // Convert FullTextQuery to SplitTermQuery 
             // FullTextQuery and TermQuery are conceptually the same for our purposes
-            let class = env.find_class("com/tantivy4java/SplitTermQuery")?;
+            let class = env.find_class("io/indextables/tantivy4java/split/SplitTermQuery")?;
             let field_jstring = env.new_string(&fulltext_query.field)?;
             let value_jstring = env.new_string(&fulltext_query.text)?;
             
@@ -619,7 +619,7 @@ fn create_split_query_from_ast(env: &mut JNIEnv, query_ast: &QueryAst) -> Result
         }
         QueryAst::MatchAll => {
             // Create SplitMatchAllQuery Java object
-            let class = env.find_class("com/tantivy4java/SplitMatchAllQuery")?;
+            let class = env.find_class("io/indextables/tantivy4java/split/SplitMatchAllQuery")?;
             let obj = env.new_object(class, "()V", &[])?;
             debug_println!("RUST DEBUG: ✅ Created SplitMatchAllQuery for MatchAll");
             Ok(obj.into_raw())
@@ -630,7 +630,7 @@ fn create_split_query_from_ast(env: &mut JNIEnv, query_ast: &QueryAst) -> Result
             debug_println!("RUST DEBUG: Boolean query creation from QueryAst not yet implemented");
             
             // Fallback to MatchAll for now
-            let class = env.find_class("com/tantivy4java/SplitMatchAllQuery")?;
+            let class = env.find_class("io/indextables/tantivy4java/split/SplitMatchAllQuery")?;
             let obj = env.new_object(class, "()V", &[])?;
             Ok(obj.into_raw())
         }
@@ -638,7 +638,7 @@ fn create_split_query_from_ast(env: &mut JNIEnv, query_ast: &QueryAst) -> Result
             debug_println!("RUST DEBUG: Unsupported QueryAst type for SplitQuery conversion: {:?}", query_ast);
             
             // Fallback to MatchAll
-            let class = env.find_class("com/tantivy4java/SplitMatchAllQuery")?;
+            let class = env.find_class("io/indextables/tantivy4java/split/SplitMatchAllQuery")?;
             let obj = env.new_object(class, "()V", &[])?;
             Ok(obj.into_raw())
         }
@@ -647,7 +647,7 @@ fn create_split_query_from_ast(env: &mut JNIEnv, query_ast: &QueryAst) -> Result
 
 fn create_split_parsed_query(env: &mut JNIEnv, query_ast_json: &str) -> Result<jobject> {
     // Create SplitParsedQuery Java object with the QueryAst JSON
-    let class = env.find_class("com/tantivy4java/SplitParsedQuery")?;
+    let class = env.find_class("io/indextables/tantivy4java/split/SplitParsedQuery")?;
     let json_jstring = env.new_string(query_ast_json)?;
     
     let obj = env.new_object(class, "(Ljava/lang/String;)V", 
@@ -750,7 +750,7 @@ fn convert_json_literal_to_value(literal: JsonLiteral) -> serde_json::Value {
 
 /// Convert a SplitPhraseQuery to QueryAst JSON (FOR TESTING ONLY - Production should use SplitSearcher.search() directly)
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_SplitPhraseQuery_toQueryAstJson(
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitPhraseQuery_toQueryAstJson(
     mut env: JNIEnv,
     obj: JObject,
 ) -> jstring {

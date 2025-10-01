@@ -1,0 +1,166 @@
+package io.indextables.tantivy4java.aggregation;
+
+import io.indextables.tantivy4java.split.SplitAggregation;
+
+import java.util.Map;
+import java.util.HashMap;
+
+/**
+ * Terms aggregation that groups documents by distinct values in a field.
+ * This creates buckets for each unique term value in the specified field.
+ * Similar to Elasticsearch's terms aggregation and Quickwit's terms aggregation.
+ *
+ * Example usage:
+ * <pre>{@code
+ * TermsAggregation categoryTerms = new TermsAggregation("categories", "category");
+ * SearchResult result = searcher.search(query, 10, Map.of("terms", categoryTerms));
+ * TermsResult terms = (TermsResult) result.getAggregation("terms");
+ *
+ * for (TermsBucket bucket : terms.getBuckets()) {
+ *     System.out.println("Category: " + bucket.getKey() + ", Count: " + bucket.getDocCount());
+ * }
+ * }</pre>
+ */
+public class TermsAggregation extends SplitAggregation {
+
+    private final String fieldName;
+    private final int size;
+    private final int shardSize;
+    private final Map<String, SplitAggregation> subAggregations;
+
+    /**
+     * Creates a terms aggregation for the specified field with default size.
+     *
+     * @param fieldName The field to group by (text or keyword field)
+     */
+    public TermsAggregation(String fieldName) {
+        this("terms_" + fieldName, fieldName, 10, 0);
+    }
+
+    /**
+     * Creates a terms aggregation with custom size.
+     *
+     * @param fieldName The field to group by
+     * @param size Maximum number of buckets to return (default: 10)
+     */
+    public TermsAggregation(String fieldName, int size) {
+        this("terms_" + fieldName, fieldName, size, 0);
+    }
+
+    /**
+     * Creates a named terms aggregation with full configuration.
+     *
+     * @param name The name for this aggregation
+     * @param fieldName The field to group by
+     * @param size Maximum number of buckets to return
+     * @param shardSize Number of buckets to return from each shard (0 = auto)
+     */
+    public TermsAggregation(String name, String fieldName, int size, int shardSize) {
+        super(name);
+        if (fieldName == null || fieldName.trim().isEmpty()) {
+            throw new IllegalArgumentException("Field name cannot be null or empty");
+        }
+        if (size <= 0) {
+            throw new IllegalArgumentException("Size must be positive");
+        }
+        this.fieldName = fieldName.trim();
+        this.size = size;
+        this.shardSize = shardSize;
+        this.subAggregations = new HashMap<>();
+    }
+
+    @Override
+    public String getFieldName() {
+        return fieldName;
+    }
+
+    @Override
+    public String getAggregationType() {
+        return "terms";
+    }
+
+    @Override
+    public String toAggregationJson() {
+        StringBuilder json = new StringBuilder();
+        json.append("{\"terms\": {\"field\": \"").append(fieldName).append("\"");
+        json.append(", \"size\": ").append(size);
+        if (shardSize > 0) {
+            json.append(", \"shard_size\": ").append(shardSize);
+        }
+        json.append("}");
+
+        // Add sub-aggregations if any
+        if (!subAggregations.isEmpty()) {
+            json.append(", \"aggs\": {");
+            boolean first = true;
+            for (Map.Entry<String, SplitAggregation> entry : subAggregations.entrySet()) {
+                if (!first) {
+                    json.append(", ");
+                }
+                json.append("\"").append(entry.getKey()).append("\": ");
+                json.append(entry.getValue().toAggregationJson());
+                first = false;
+            }
+            json.append("}");
+        }
+
+        json.append("}");
+        return json.toString();
+    }
+
+    public int getSize() {
+        return size;
+    }
+
+    public int getShardSize() {
+        return shardSize;
+    }
+
+    /**
+     * Adds a sub-aggregation to this terms aggregation.
+     * Sub-aggregations are computed for each bucket.
+     *
+     * @param name The name for the sub-aggregation
+     * @param aggregation The sub-aggregation to add
+     * @return This TermsAggregation for method chaining
+     */
+    public TermsAggregation addSubAggregation(String name, SplitAggregation aggregation) {
+        if (name == null || name.trim().isEmpty()) {
+            throw new IllegalArgumentException("Sub-aggregation name cannot be null or empty");
+        }
+        if (aggregation == null) {
+            throw new IllegalArgumentException("Sub-aggregation cannot be null");
+        }
+        subAggregations.put(name.trim(), aggregation);
+        return this;
+    }
+
+    /**
+     * Gets all sub-aggregations.
+     *
+     * @return Map of sub-aggregation name to aggregation
+     */
+    public Map<String, SplitAggregation> getSubAggregations() {
+        return subAggregations;
+    }
+
+    /**
+     * Checks if this aggregation has any sub-aggregations.
+     *
+     * @return true if sub-aggregations exist, false otherwise
+     */
+    public boolean hasSubAggregations() {
+        return !subAggregations.isEmpty();
+    }
+
+    @Override
+    public String toString() {
+        if (hasSubAggregations()) {
+            return String.format("TermsAggregation{name='%s', field='%s', size=%d, shardSize=%d, subAggs=%s}",
+                               name, fieldName, size, shardSize, subAggregations.keySet());
+        } else {
+            return String.format("TermsAggregation{name='%s', field='%s', size=%d, shardSize=%d}",
+                               name, fieldName, size, shardSize);
+        }
+    }
+}

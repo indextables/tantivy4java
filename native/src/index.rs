@@ -28,7 +28,7 @@ use crate::utils::{handle_error, with_arc_safe, arc_to_jlong, release_arc};
 use std::sync::{Arc, Mutex};
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_Index_nativeNew(
+pub extern "system" fn Java_io_indextables_tantivy4java_core_Index_nativeNew(
     mut env: JNIEnv,
     _class: JClass,
     _schema_ptr: jlong,
@@ -74,7 +74,7 @@ pub extern "system" fn Java_com_tantivy4java_Index_nativeNew(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_Index_nativeOpen(
+pub extern "system" fn Java_io_indextables_tantivy4java_core_Index_nativeOpen(
     mut env: JNIEnv,
     _class: JClass,
     path: JString,
@@ -111,7 +111,7 @@ pub extern "system" fn Java_com_tantivy4java_Index_nativeOpen(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_Index_nativeExists(
+pub extern "system" fn Java_io_indextables_tantivy4java_core_Index_nativeExists(
     mut env: JNIEnv,
     _class: JClass,
     path: JString,
@@ -148,7 +148,7 @@ pub extern "system" fn Java_com_tantivy4java_Index_nativeExists(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_Index_nativeWriter(
+pub extern "system" fn Java_io_indextables_tantivy4java_core_Index_nativeWriter(
     mut env: JNIEnv,
     _class: JClass,
     ptr: jlong,
@@ -181,7 +181,7 @@ pub extern "system" fn Java_com_tantivy4java_Index_nativeWriter(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_Index_nativeConfigReader(
+pub extern "system" fn Java_io_indextables_tantivy4java_core_Index_nativeConfigReader(
     mut env: JNIEnv,
     _class: JClass,
     _ptr: jlong,
@@ -192,7 +192,7 @@ pub extern "system" fn Java_com_tantivy4java_Index_nativeConfigReader(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_Index_nativeSearcher(
+pub extern "system" fn Java_io_indextables_tantivy4java_core_Index_nativeSearcher(
     mut env: JNIEnv,
     _class: JClass,
     ptr: jlong,
@@ -220,7 +220,7 @@ pub extern "system" fn Java_com_tantivy4java_Index_nativeSearcher(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_Index_nativeGetSchema(
+pub extern "system" fn Java_io_indextables_tantivy4java_core_Index_nativeGetSchema(
     mut env: JNIEnv,
     _class: JClass,
     ptr: jlong,
@@ -243,7 +243,7 @@ pub extern "system" fn Java_com_tantivy4java_Index_nativeGetSchema(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_Index_nativeReload(
+pub extern "system" fn Java_io_indextables_tantivy4java_core_Index_nativeReload(
     mut env: JNIEnv,
     _class: JClass,
     ptr: jlong,
@@ -268,7 +268,7 @@ pub extern "system" fn Java_com_tantivy4java_Index_nativeReload(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_Index_nativeParseQuery(
+pub extern "system" fn Java_io_indextables_tantivy4java_core_Index_nativeParseQuery(
     mut env: JNIEnv,
     _class: JClass,
     ptr: jlong,
@@ -388,7 +388,7 @@ fn extract_string_list(env: &mut JNIEnv, list_obj: &JObject) -> Result<Vec<Strin
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_Index_nativeParseQueryLenient(
+pub extern "system" fn Java_io_indextables_tantivy4java_core_Index_nativeParseQueryLenient(
     mut env: JNIEnv,
     _class: JClass,
     _ptr: jlong,
@@ -402,7 +402,7 @@ pub extern "system" fn Java_com_tantivy4java_Index_nativeParseQueryLenient(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_Index_nativeRegisterTokenizer(
+pub extern "system" fn Java_io_indextables_tantivy4java_core_Index_nativeRegisterTokenizer(
     mut env: JNIEnv,
     _class: JClass,
     _ptr: jlong,
@@ -528,7 +528,7 @@ pub fn is_multi_token_pattern_for_quoted_content(schema: &tantivy::schema::Schem
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_Index_nativeClose(
+pub extern "system" fn Java_io_indextables_tantivy4java_core_Index_nativeClose(
     _env: JNIEnv,
     _class: JClass,
     ptr: jlong,

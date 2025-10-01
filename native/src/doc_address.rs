@@ -25,7 +25,7 @@ use crate::utils::{arc_to_jlong, release_arc, with_arc_safe};
 use std::sync::Arc;
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_DocAddress_nativeNew(
+pub extern "system" fn Java_io_indextables_tantivy4java_core_DocAddress_nativeNew(
     _env: JNIEnv,
     _class: JClass,
     segment_ord: jint,
@@ -37,7 +37,7 @@ pub extern "system" fn Java_com_tantivy4java_DocAddress_nativeNew(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_DocAddress_nativeGetSegmentOrd(
+pub extern "system" fn Java_io_indextables_tantivy4java_core_DocAddress_nativeGetSegmentOrd(
     _env: JNIEnv,
     _class: JClass,
     ptr: jlong,
@@ -48,7 +48,7 @@ pub extern "system" fn Java_com_tantivy4java_DocAddress_nativeGetSegmentOrd(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_DocAddress_nativeGetDoc(
+pub extern "system" fn Java_io_indextables_tantivy4java_core_DocAddress_nativeGetDoc(
     _env: JNIEnv,
     _class: JClass,
     ptr: jlong,
@@ -59,7 +59,7 @@ pub extern "system" fn Java_com_tantivy4java_DocAddress_nativeGetDoc(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_DocAddress_nativeClose(
+pub extern "system" fn Java_io_indextables_tantivy4java_core_DocAddress_nativeClose(
     _env: JNIEnv,
     _class: JClass,
     ptr: jlong,

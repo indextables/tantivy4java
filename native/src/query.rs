@@ -30,7 +30,7 @@ use std::sync::Arc;
 use crate::extract_helpers::{extract_long_value, extract_double_value};
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_Query_nativeTermQuery(
+pub extern "system" fn Java_io_indextables_tantivy4java_query_Query_nativeTermQuery(
     mut env: JNIEnv,
     _class: JClass,
     schema_ptr: jlong,
@@ -249,7 +249,7 @@ pub extern "system" fn Java_com_tantivy4java_Query_nativeTermQuery(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_Query_nativeTermSetQuery(
+pub extern "system" fn Java_io_indextables_tantivy4java_query_Query_nativeTermSetQuery(
     mut env: JNIEnv,
     _class: JClass,
     schema_ptr: jlong,
@@ -300,7 +300,7 @@ pub extern "system" fn Java_com_tantivy4java_Query_nativeTermSetQuery(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_Query_nativeAllQuery(
+pub extern "system" fn Java_io_indextables_tantivy4java_query_Query_nativeAllQuery(
     _env: JNIEnv,
     _class: JClass,
 ) -> jlong {
@@ -310,7 +310,7 @@ pub extern "system" fn Java_com_tantivy4java_Query_nativeAllQuery(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_Query_nativeFuzzyTermQuery(
+pub extern "system" fn Java_io_indextables_tantivy4java_query_Query_nativeFuzzyTermQuery(
     mut env: JNIEnv,
     _class: JClass,
     schema_ptr: jlong,
@@ -390,7 +390,7 @@ pub extern "system" fn Java_com_tantivy4java_Query_nativeFuzzyTermQuery(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_Query_nativePhraseQuery(
+pub extern "system" fn Java_io_indextables_tantivy4java_query_Query_nativePhraseQuery(
     mut env: JNIEnv,
     _class: JClass,
     schema_ptr: jlong,
@@ -489,7 +489,7 @@ pub extern "system" fn Java_com_tantivy4java_Query_nativePhraseQuery(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_Query_nativeBooleanQuery(
+pub extern "system" fn Java_io_indextables_tantivy4java_query_Query_nativeBooleanQuery(
     mut env: JNIEnv,
     _class: JClass,
     subqueries: JObject,
@@ -542,7 +542,7 @@ pub extern "system" fn Java_com_tantivy4java_Query_nativeBooleanQuery(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_Query_nativeDisjunctionMaxQuery(
+pub extern "system" fn Java_io_indextables_tantivy4java_query_Query_nativeDisjunctionMaxQuery(
     mut env: JNIEnv,
     _class: JClass,
     _query_ptrs: jlongArray,
@@ -553,7 +553,7 @@ pub extern "system" fn Java_com_tantivy4java_Query_nativeDisjunctionMaxQuery(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_Query_nativeBoostQuery(
+pub extern "system" fn Java_io_indextables_tantivy4java_query_Query_nativeBoostQuery(
     mut env: JNIEnv,
     _class: JClass,
     query_ptr: jlong,
@@ -591,7 +591,7 @@ pub extern "system" fn Java_com_tantivy4java_Query_nativeBoostQuery(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_Query_nativeRegexQuery(
+pub extern "system" fn Java_io_indextables_tantivy4java_query_Query_nativeRegexQuery(
     mut env: JNIEnv,
     _class: JClass,
     schema_ptr: jlong,
@@ -653,7 +653,7 @@ pub extern "system" fn Java_com_tantivy4java_Query_nativeRegexQuery(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_Query_nativeWildcardQuery(
+pub extern "system" fn Java_io_indextables_tantivy4java_query_Query_nativeWildcardQuery(
     mut env: JNIEnv,
     _class: JClass,
     schema_ptr: jlong,
@@ -737,7 +737,7 @@ pub extern "system" fn Java_com_tantivy4java_Query_nativeWildcardQuery(
 
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_Query_nativeWildcardQueryLenient(
+pub extern "system" fn Java_io_indextables_tantivy4java_query_Query_nativeWildcardQueryLenient(
     mut env: JNIEnv,
     _class: JClass,
     schema_ptr: jlong,
@@ -1197,7 +1197,7 @@ mod tests {
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_Query_nativeMoreLikeThisQuery(
+pub extern "system" fn Java_io_indextables_tantivy4java_query_Query_nativeMoreLikeThisQuery(
     mut env: JNIEnv,
     _class: JClass,
     _doc_address_ptr: jlong,
@@ -1215,7 +1215,7 @@ pub extern "system" fn Java_com_tantivy4java_Query_nativeMoreLikeThisQuery(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_Query_nativeConstScoreQuery(
+pub extern "system" fn Java_io_indextables_tantivy4java_query_Query_nativeConstScoreQuery(
     mut env: JNIEnv,
     _class: JClass,
     query_ptr: jlong,
@@ -1253,7 +1253,7 @@ pub extern "system" fn Java_com_tantivy4java_Query_nativeConstScoreQuery(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_Query_nativeRangeQuery(
+pub extern "system" fn Java_io_indextables_tantivy4java_query_Query_nativeRangeQuery(
     mut env: JNIEnv,
     _class: JClass,
     schema_ptr: jlong,
@@ -1466,7 +1466,7 @@ pub extern "system" fn Java_com_tantivy4java_Query_nativeRangeQuery(
 
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_Query_nativeExplain(
+pub extern "system" fn Java_io_indextables_tantivy4java_query_Query_nativeExplain(
     mut env: JNIEnv,
     _class: JClass,
     _query_ptr: jlong,
@@ -1493,7 +1493,7 @@ fn format_query_concise(query: &Box<dyn TantivyQuery>) -> String {
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_Query_nativeToString(
+pub extern "system" fn Java_io_indextables_tantivy4java_query_Query_nativeToString(
     mut env: JNIEnv,
     _class: JClass,
     query_ptr: jlong,
@@ -1521,7 +1521,7 @@ pub extern "system" fn Java_com_tantivy4java_Query_nativeToString(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_Query_nativeClose(
+pub extern "system" fn Java_io_indextables_tantivy4java_query_Query_nativeClose(
     _env: JNIEnv,
     _class: JClass,
     ptr: jlong,
@@ -1550,7 +1550,7 @@ fn extract_occur_queries(env: &mut JNIEnv, list_obj: &JObject) -> Result<Vec<(Oc
         };
         
         // Get the Occur enum value
-        let occur_obj = match env.call_method(&element, "getOccur", "()Lcom/tantivy4java/Occur;", &[]) {
+        let occur_obj = match env.call_method(&element, "getOccur", "()Lio/indextables/tantivy4java/query/Occur;", &[]) {
             Ok(result) => result.l().map_err(|_| "Failed to get Occur object")?,
             Err(_) => return Err("Failed to call getOccur() on OccurQuery".to_string()),
         };
@@ -1572,7 +1572,7 @@ fn extract_occur_queries(env: &mut JNIEnv, list_obj: &JObject) -> Result<Vec<(Oc
         };
         
         // Get the Query object
-        let query_obj = match env.call_method(&element, "getQuery", "()Lcom/tantivy4java/Query;", &[]) {
+        let query_obj = match env.call_method(&element, "getQuery", "()Lio/indextables/tantivy4java/query/Query;", &[]) {
             Ok(result) => result.l().map_err(|_| "Failed to get Query object")?,
             Err(_) => return Err("Failed to call getQuery() on OccurQuery".to_string()),
         };
@@ -1829,7 +1829,7 @@ fn extract_term_set_values(
 
 // SnippetGenerator JNI methods
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_SnippetGenerator_nativeCreate(
+pub extern "system" fn Java_io_indextables_tantivy4java_query_SnippetGenerator_nativeCreate(
     mut env: JNIEnv,
     _class: JClass,
     searcher_ptr: jlong,
@@ -1853,7 +1853,7 @@ pub extern "system" fn Java_com_tantivy4java_SnippetGenerator_nativeCreate(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_SnippetGenerator_nativeSnippetFromDoc(
+pub extern "system" fn Java_io_indextables_tantivy4java_query_SnippetGenerator_nativeSnippetFromDoc(
     env: JNIEnv,
     _class: JClass,
     snippet_generator_ptr: jlong,
@@ -1866,7 +1866,7 @@ pub extern "system" fn Java_com_tantivy4java_SnippetGenerator_nativeSnippetFromD
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_SnippetGenerator_nativeSetMaxNumChars(
+pub extern "system" fn Java_io_indextables_tantivy4java_query_SnippetGenerator_nativeSetMaxNumChars(
     env: JNIEnv,
     _class: JClass,
     snippet_generator_ptr: jlong,
@@ -1876,7 +1876,7 @@ pub extern "system" fn Java_com_tantivy4java_SnippetGenerator_nativeSetMaxNumCha
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_SnippetGenerator_nativeClose(
+pub extern "system" fn Java_io_indextables_tantivy4java_query_SnippetGenerator_nativeClose(
     _env: JNIEnv,
     _class: JClass,
     ptr: jlong,
@@ -1887,7 +1887,7 @@ pub extern "system" fn Java_com_tantivy4java_SnippetGenerator_nativeClose(
 
 // Snippet JNI methods
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_Snippet_nativeToHtml(
+pub extern "system" fn Java_io_indextables_tantivy4java_query_Snippet_nativeToHtml(
     mut env: JNIEnv,
     _class: JClass,
     snippet_ptr: jlong,
@@ -1904,7 +1904,7 @@ pub extern "system" fn Java_com_tantivy4java_Snippet_nativeToHtml(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_Snippet_nativeGetFragment(
+pub extern "system" fn Java_io_indextables_tantivy4java_query_Snippet_nativeGetFragment(
     mut env: JNIEnv,
     _class: JClass,
     snippet_ptr: jlong,
@@ -1921,7 +1921,7 @@ pub extern "system" fn Java_com_tantivy4java_Snippet_nativeGetFragment(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_Snippet_nativeGetHighlighted(
+pub extern "system" fn Java_io_indextables_tantivy4java_query_Snippet_nativeGetHighlighted(
     mut env: JNIEnv,
     _class: JClass,
     snippet_ptr: jlong,
@@ -1937,7 +1937,7 @@ pub extern "system" fn Java_com_tantivy4java_Snippet_nativeGetHighlighted(
                     let range_ptr = arc_to_jlong(range_arc);
                     
                     // Try to create Range object and add to list
-                    match env.find_class("com/tantivy4java/Range") {
+                    match env.find_class("io/indextables/tantivy4java/query/Range") {
                         Ok(range_class) => {
                             match env.new_object(range_class, "(J)V", &[range_ptr.into()]) {
                                 Ok(range_obj) => {
@@ -1965,7 +1965,7 @@ pub extern "system" fn Java_com_tantivy4java_Snippet_nativeGetHighlighted(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_Snippet_nativeClose(
+pub extern "system" fn Java_io_indextables_tantivy4java_query_Snippet_nativeClose(
     _env: JNIEnv,
     _class: JClass,
     ptr: jlong,
@@ -1976,7 +1976,7 @@ pub extern "system" fn Java_com_tantivy4java_Snippet_nativeClose(
 
 // Range JNI methods
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_Range_nativeGetStart(
+pub extern "system" fn Java_io_indextables_tantivy4java_query_Range_nativeGetStart(
     env: JNIEnv,
     _class: JClass,
     range_ptr: jlong,
@@ -1987,7 +1987,7 @@ pub extern "system" fn Java_com_tantivy4java_Range_nativeGetStart(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_Range_nativeGetEnd(
+pub extern "system" fn Java_io_indextables_tantivy4java_query_Range_nativeGetEnd(
     env: JNIEnv,
     _class: JClass,
     range_ptr: jlong,
@@ -1998,7 +1998,7 @@ pub extern "system" fn Java_com_tantivy4java_Range_nativeGetEnd(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_Range_nativeClose(
+pub extern "system" fn Java_io_indextables_tantivy4java_query_Range_nativeClose(
     _env: JNIEnv,
     _class: JClass,
     ptr: jlong,
@@ -2009,7 +2009,7 @@ pub extern "system" fn Java_com_tantivy4java_Range_nativeClose(
 
 // QueryParser JNI methods
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_Index_nativeParseQuerySimple(
+pub extern "system" fn Java_io_indextables_tantivy4java_core_Index_nativeParseQuerySimple(
     mut env: JNIEnv,
     _class: JClass,
     index_ptr: jlong,

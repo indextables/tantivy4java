@@ -177,7 +177,7 @@ impl QuickwitRuntimeManager {
 /// JNI function to trigger graceful shutdown of the runtime
 /// This should be called from Java shutdown hooks or test cleanup
 #[no_mangle]
-pub extern "C" fn Java_com_tantivy4java_RuntimeManager_shutdownGracefullyNative(
+pub extern "C" fn Java_io_indextables_tantivy4java_config_RuntimeManager_shutdownGracefullyNative(
     _env: jni::JNIEnv,
     _class: jni::objects::JClass,
     timeout_seconds: jni::sys::jlong,

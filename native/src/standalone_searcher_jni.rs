@@ -14,7 +14,7 @@ use quickwit_doc_mapper::DocMapper;
 
 /// Create a new StandaloneSearcher with default configuration
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_StandaloneSearcher_createNative(
+pub extern "system" fn Java_io_indextables_tantivy4java_split_StandaloneSearcher_createNative(
     mut env: JNIEnv,
     _class: JClass,
 ) -> jlong {
@@ -33,7 +33,7 @@ pub extern "system" fn Java_com_tantivy4java_StandaloneSearcher_createNative(
 
 /// Create StandaloneSearcher with custom configuration
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_StandaloneSearcher_createWithConfigNative(
+pub extern "system" fn Java_io_indextables_tantivy4java_split_StandaloneSearcher_createWithConfigNative(
     mut env: JNIEnv,
     _class: JClass,
     fast_field_cache_mb: jlong,
@@ -75,7 +75,7 @@ pub extern "system" fn Java_com_tantivy4java_StandaloneSearcher_createWithConfig
 
 /// Search a single split
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_StandaloneSearcher_searchSplitNative(
+pub extern "system" fn Java_io_indextables_tantivy4java_split_StandaloneSearcher_searchSplitNative(
     mut env: JNIEnv,
     _class: JClass,
     searcher_ptr: jlong,
@@ -156,7 +156,7 @@ pub extern "system" fn Java_com_tantivy4java_StandaloneSearcher_searchSplitNativ
 
 /// Get cache statistics
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_StandaloneSearcher_getCacheStatsNative(
+pub extern "system" fn Java_io_indextables_tantivy4java_split_StandaloneSearcher_getCacheStatsNative(
     mut env: JNIEnv,
     _class: JClass,
     searcher_ptr: jlong,
@@ -190,7 +190,7 @@ pub extern "system" fn Java_com_tantivy4java_StandaloneSearcher_getCacheStatsNat
 
 /// Clear all caches
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_StandaloneSearcher_clearCachesNative(
+pub extern "system" fn Java_io_indextables_tantivy4java_split_StandaloneSearcher_clearCachesNative(
     mut env: JNIEnv,
     _class: JClass,
     searcher_ptr: jlong,
@@ -206,7 +206,7 @@ pub extern "system" fn Java_com_tantivy4java_StandaloneSearcher_clearCachesNativ
 
 /// Close the searcher and free resources
 #[no_mangle]
-pub extern "system" fn Java_com_tantivy4java_StandaloneSearcher_closeNative(
+pub extern "system" fn Java_io_indextables_tantivy4java_split_StandaloneSearcher_closeNative(
     env: JNIEnv,
     _class: JClass,
     searcher_ptr: jlong,
