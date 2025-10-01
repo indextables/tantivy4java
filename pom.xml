@@ -4,14 +4,47 @@
          xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
     <modelVersion>4.0.0</modelVersion>
 
-    <groupId>com.tantivy4java</groupId>
+    <groupId>io.indextables</groupId>
     <artifactId>tantivy4java</artifactId>
-    <version>0.24.1_x86_64</version>
+    <version>0.24.1_x86_64-SNAPSHOT</version>
     <packaging>jar</packaging>
 
     <name>Tantivy4Java</name>
-    <description>Java bindings for the Tantivy search engine library</description>
-    <url>https://github.com/tantivy-search/tantivy4java</url>
+    <description>Java bindings for Tantivy and Quickwit</description>
+    <url>https://github.com/indextables/tantivy4java</url>
+
+    <licenses>
+        <license>
+            <name>Apache License, Version 2.0</name>
+            <url>https://www.apache.org/licenses/LICENSE-2.0.txt</url>
+            <distribution>repo</distribution>
+        </license>
+    </licenses>
+
+    <developers>
+        <developer>
+            <id>tantivy4java</id>
+            <name>Tantivy4Java Contributors</name>
+            <url>https://github.com/indextables/tantivy4java</url>
+        </developer>
+    </developers>
+
+    <scm>
+        <connection>scm:git:git://github.com/indextables/tantivy4java.git</connection>
+        <developerConnection>scm:git:ssh://github.com:indextables/tantivy4java.git</developerConnection>
+        <url>https://github.com/indextables/tantivy4java/tree/main</url>
+    </scm>
+
+    <distributionManagement>
+        <snapshotRepository>
+            <id>ossrh</id>
+            <url>https://s01.oss.sonatype.org/content/repositories/snapshots</url>
+        </snapshotRepository>
+        <repository>
+            <id>ossrh</id>
+            <url>https://s01.oss.sonatype.org/service/local/staging/deploy/maven2/</url>
+        </repository>
+    </distributionManagement>
 
     <properties>
         <!-- <maven.compiler.source>11</maven.compiler.source>
@@ -193,7 +226,7 @@
                             <resources>
                                 <resource>
                                     <!-- Use debug directory for debug builds with full symbols -->
-                                    <directory>${rust.target.dir}/debug</directory>
+                                    <directory>${rust.target.dir}/release</directory>
                                     <includes>
                                         <include>libtantivy4java.so</include>
                                         <include>libtantivy4java.dylib</include>
@@ -306,6 +339,85 @@
                                 </configuration>
                             </execution>
                         </executions>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+
+        <!-- Maven Central release profile - activate with -Prelease -->
+        <profile>
+            <id>release</id>
+            <build>
+                <plugins>
+                    <!-- Generate source JAR -->
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-source-plugin</artifactId>
+                        <version>3.3.0</version>
+                        <executions>
+                            <execution>
+                                <id>attach-sources</id>
+                                <goals>
+                                    <goal>jar-no-fork</goal>
+                                </goals>
+                            </execution>
+                        </executions>
+                    </plugin>
+
+                    <!-- Generate Javadoc JAR -->
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-javadoc-plugin</artifactId>
+                        <version>3.6.3</version>
+                        <executions>
+                            <execution>
+                                <id>attach-javadocs</id>
+                                <goals>
+                                    <goal>jar</goal>
+                                </goals>
+                            </execution>
+                        </executions>
+                        <configuration>
+                            <source>11</source>
+                            <detectJavaApiLink>false</detectJavaApiLink>
+                            <doclint>none</doclint>
+                        </configuration>
+                    </plugin>
+
+                    <!-- GPG signing -->
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-gpg-plugin</artifactId>
+                        <version>3.1.0</version>
+                        <executions>
+                            <execution>
+                                <id>sign-artifacts</id>
+                                <phase>verify</phase>
+                                <goals>
+                                    <goal>sign</goal>
+                                </goals>
+                                <configuration>
+                                    <!-- Prevent gpg from using pinentry programs -->
+                                    <gpgArguments>
+                                        <arg>--pinentry-mode</arg>
+                                        <arg>loopback</arg>
+                                    </gpgArguments>
+                                </configuration>
+                            </execution>
+                        </executions>
+                    </plugin>
+
+                    <!-- Nexus Staging Plugin -->
+                    <plugin>
+                        <groupId>org.sonatype.plugins</groupId>
+                        <artifactId>nexus-staging-maven-plugin</artifactId>
+                        <version>1.6.13</version>
+                        <extensions>true</extensions>
+                        <configuration>
+                            <serverId>ossrh</serverId>
+                            <nexusUrl>https://s01.oss.sonatype.org/</nexusUrl>
+                            <autoReleaseAfterClose>false</autoReleaseAfterClose>
+                        </configuration>
                     </plugin>
                 </plugins>
             </build>
