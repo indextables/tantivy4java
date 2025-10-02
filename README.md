@@ -4,15 +4,6 @@
 
 Tantivy4Java is a production-ready Java library that provides direct access to the Tantivy search engine through JNI bindings. Built for Java developers who need enterprise-grade full-text search capabilities with Rust-level performance.
 
-## Why Tantivy4Java?
-
-- **🚀 Blazing Fast** - Zero-copy operations and direct memory sharing for maximum performance
-- **🎯 Type-Safe API** - Idiomatic Java interfaces with full generic type support
-- **📦 Distributed Search** - Built-in Quickwit split support for large-scale deployments
-- **☁️ Cloud Native** - First-class S3/MinIO support for remote index storage
-- **🔧 Production Ready** - Comprehensive memory management and error handling
-- **🌍 Cross-Platform** - Supports macOS (Intel/ARM), Linux (x86_64/ARM64), and Windows
-
 ---
 
 ## Table of Contents
