@@ -29,6 +29,7 @@ Tantivy4Java is a production-ready Java library that provides direct access to t
     <groupId>io.indextables</groupId>
     <artifactId>tantivy4java</artifactId>
     <version>0.24.1</version>
+    <classifier>linux-x86_64</classifier>
 </dependency>
 ```
 
