@@ -4,14 +4,43 @@
          xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
     <modelVersion>4.0.0</modelVersion>
 
-    <groupId>com.tantivy4java</groupId>
+    <groupId>io.indextables</groupId>
     <artifactId>tantivy4java</artifactId>
-    <version>0.24.1_x86_64</version>
+    <version>0.24.1</version>
     <packaging>jar</packaging>
 
     <name>Tantivy4Java</name>
-    <description>Java bindings for the Tantivy search engine library</description>
-    <url>https://github.com/tantivy-search/tantivy4java</url>
+    <description>Java bindings for Tantivy and Quickwit</description>
+    <url>https://github.com/indextables/tantivy4java</url>
+
+    <licenses>
+        <license>
+            <name>Apache License, Version 2.0</name>
+            <url>https://www.apache.org/licenses/LICENSE-2.0.txt</url>
+            <distribution>repo</distribution>
+        </license>
+    </licenses>
+
+    <developers>
+        <developer>
+            <id>tantivy4java</id>
+            <name>Tantivy4Java Contributors</name>
+            <url>https://github.com/indextables/tantivy4java</url>
+        </developer>
+    </developers>
+
+    <scm>
+        <connection>scm:git:git://github.com/indextables/tantivy4java.git</connection>
+        <developerConnection>scm:git:ssh://github.com:indextables/tantivy4java.git</developerConnection>
+        <url>https://github.com/indextables/tantivy4java/tree/main</url>
+    </scm>
+
+    <distributionManagement>
+        <repository>
+            <id>central</id>
+            <url>https://central.sonatype.com/api/v1/publisher</url>
+        </repository>
+    </distributionManagement>
 
     <properties>
         <!-- <maven.compiler.source>11</maven.compiler.source>
@@ -193,7 +222,7 @@
                             <resources>
                                 <resource>
                                     <!-- Use debug directory for debug builds with full symbols -->
-                                    <directory>${rust.target.dir}/debug</directory>
+                                    <directory>${rust.target.dir}/release</directory>
                                     <includes>
                                         <include>libtantivy4java.so</include>
                                         <include>libtantivy4java.dylib</include>
@@ -208,12 +237,13 @@
                 </executions>
             </plugin>
 
-            <!-- JAR packaging with native libraries -->
+            <!-- JAR packaging with native libraries and platform classifier -->
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-jar-plugin</artifactId>
                 <version>3.3.0</version>
                 <configuration>
+                    <classifier>${platform.classifier}</classifier>
                     <archive>
                         <manifest>
                             <addDefaultImplementationEntries>true</addDefaultImplementationEntries>
@@ -226,6 +256,99 @@
 
     <!-- Build profiles -->
     <profiles>
+        <!-- Platform detection profiles - auto-activate based on OS -->
+        <!-- macOS ARM64 (Apple Silicon) -->
+        <profile>
+            <id>platform-darwin-aarch64</id>
+            <activation>
+                <os>
+                    <family>mac</family>
+                    <arch>aarch64</arch>
+                </os>
+                <property>
+                    <name>!platform.classifier</name>
+                </property>
+            </activation>
+            <properties>
+                <platform.classifier>darwin-aarch64</platform.classifier>
+                <rust.target>aarch64-apple-darwin</rust.target>
+            </properties>
+        </profile>
+
+        <!-- macOS x86_64 (Intel) -->
+        <profile>
+            <id>platform-darwin-x86_64</id>
+            <activation>
+                <os>
+                    <family>mac</family>
+                    <arch>x86_64</arch>
+                </os>
+                <property>
+                    <name>!platform.classifier</name>
+                </property>
+            </activation>
+            <properties>
+                <platform.classifier>darwin-x86_64</platform.classifier>
+                <rust.target>x86_64-apple-darwin</rust.target>
+            </properties>
+        </profile>
+
+        <!-- Linux x86_64 -->
+        <profile>
+            <id>platform-linux-x86_64</id>
+            <activation>
+                <os>
+                    <family>unix</family>
+                    <name>linux</name>
+                    <arch>amd64</arch>
+                </os>
+                <property>
+                    <name>!platform.classifier</name>
+                </property>
+            </activation>
+            <properties>
+                <platform.classifier>linux-x86_64</platform.classifier>
+                <rust.target>x86_64-unknown-linux-gnu</rust.target>
+            </properties>
+        </profile>
+
+        <!-- Linux ARM64 -->
+        <profile>
+            <id>platform-linux-aarch64</id>
+            <activation>
+                <os>
+                    <family>unix</family>
+                    <name>linux</name>
+                    <arch>aarch64</arch>
+                </os>
+                <property>
+                    <name>!platform.classifier</name>
+                </property>
+            </activation>
+            <properties>
+                <platform.classifier>linux-aarch64</platform.classifier>
+                <rust.target>aarch64-unknown-linux-gnu</rust.target>
+            </properties>
+        </profile>
+
+        <!-- Windows x86_64 -->
+        <profile>
+            <id>platform-windows-x86_64</id>
+            <activation>
+                <os>
+                    <family>windows</family>
+                    <arch>amd64</arch>
+                </os>
+                <property>
+                    <name>!platform.classifier</name>
+                </property>
+            </activation>
+            <properties>
+                <platform.classifier>windows-x86_64</platform.classifier>
+                <rust.target>x86_64-pc-windows-msvc</rust.target>
+            </properties>
+        </profile>
+
         <!-- Linux optimized build profile - automatically activates on Linux -->
         <profile>
             <id>linux-optimized</id>
@@ -306,6 +429,84 @@
                                 </configuration>
                             </execution>
                         </executions>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+
+        <!-- Maven Central release profile - activate with -Prelease -->
+        <profile>
+            <id>release</id>
+            <build>
+                <plugins>
+                    <!-- Generate source JAR -->
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-source-plugin</artifactId>
+                        <version>3.3.0</version>
+                        <executions>
+                            <execution>
+                                <id>attach-sources</id>
+                                <goals>
+                                    <goal>jar-no-fork</goal>
+                                </goals>
+                            </execution>
+                        </executions>
+                    </plugin>
+
+                    <!-- Generate Javadoc JAR -->
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-javadoc-plugin</artifactId>
+                        <version>3.6.3</version>
+                        <executions>
+                            <execution>
+                                <id>attach-javadocs</id>
+                                <goals>
+                                    <goal>jar</goal>
+                                </goals>
+                            </execution>
+                        </executions>
+                        <configuration>
+                            <source>11</source>
+                            <detectJavaApiLink>false</detectJavaApiLink>
+                            <doclint>none</doclint>
+                        </configuration>
+                    </plugin>
+
+                    <!-- GPG signing -->
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-gpg-plugin</artifactId>
+                        <version>3.1.0</version>
+                        <executions>
+                            <execution>
+                                <id>sign-artifacts</id>
+                                <phase>verify</phase>
+                                <goals>
+                                    <goal>sign</goal>
+                                </goals>
+                                <configuration>
+                                    <!-- Prevent gpg from using pinentry programs -->
+                                    <gpgArguments>
+                                        <arg>--pinentry-mode</arg>
+                                        <arg>loopback</arg>
+                                    </gpgArguments>
+                                </configuration>
+                            </execution>
+                        </executions>
+                    </plugin>
+
+                    <!-- Central Publishing Plugin -->
+                    <plugin>
+                        <groupId>org.sonatype.central</groupId>
+                        <artifactId>central-publishing-maven-plugin</artifactId>
+                        <version>0.4.0</version>
+                        <extensions>true</extensions>
+                        <configuration>
+                            <publishingServerId>central</publishingServerId>
+                            <tokenAuth>true</tokenAuth>
+                        </configuration>
                     </plugin>
                 </plugins>
             </build>
