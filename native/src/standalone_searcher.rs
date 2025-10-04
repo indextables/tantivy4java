@@ -299,11 +299,11 @@ impl StandaloneSearcher {
         let split_id = split.split_id.clone();
 
         // Debug: Dump the QueryAst before calling leaf_search_single_split
-        println!("TANTIVY4JAVA DEBUG: Split ID: {} QueryAst: {}", split_id, search_request.query_ast);
-        
+        debug_println!("TANTIVY4JAVA DEBUG: Split ID: {} QueryAst: {}", split_id, search_request.query_ast);
+
         // Parse and print the QueryAst structure
         if let Ok(parsed_query_ast) = serde_json::from_str::<quickwit_query::query_ast::QueryAst>(&search_request.query_ast) {
-            println!("RUST DEBUG: Successfully parsed QueryAst: {:?}", parsed_query_ast);
+            debug_println!("RUST DEBUG: Successfully parsed QueryAst: {:?}", parsed_query_ast);
         }
 
         // Use Quickwit's proven leaf_search_single_split function directly
@@ -420,7 +420,7 @@ pub async fn resolve_storage_for_split(
                 let directory_uri: Uri = directory_uri_str.parse()
                     .with_context(|| format!("Failed to parse S3 directory URI: {}", directory_uri_str))?;
                 
-                println!("QUICKWIT DEBUG: Resolving S3 storage for directory: '{}'", directory_uri_str);
+                debug_println!("QUICKWIT DEBUG: Resolving S3 storage for directory: '{}'", directory_uri_str);
                 storage_resolver.resolve(&directory_uri).await
                     .with_context(|| format!("Failed to resolve storage for directory URI: {}", directory_uri_str))
             } else {
