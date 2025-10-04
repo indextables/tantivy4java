@@ -1056,26 +1056,23 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_sear
     aggregations_map: JObject<'local>,
 ) -> jobject {
     let method_start_time = std::time::Instant::now();
-    eprintln!("🚀 RUST NATIVE: searchWithAggregations ENTRY - Real aggregation processing starting");
     debug_println!("🚀 RUST NATIVE: searchWithAggregations ENTRY - Real aggregation processing starting");
 
     if searcher_ptr == 0 {
-        eprintln!("RUST DEBUG: ⏱️ searchWithAggregations ERROR: Invalid searcher pointer");
         debug_println!("RUST DEBUG: ⏱️ searchWithAggregations ERROR: Invalid searcher pointer [TIMING: {}ms]", method_start_time.elapsed().as_millis());
         to_java_exception(&mut env, &anyhow::anyhow!("Invalid searcher pointer"));
         return std::ptr::null_mut();
     }
-    eprintln!("RUST DEBUG: searcher_ptr validation passed: {}", searcher_ptr);
+    debug_println!("RUST DEBUG: searcher_ptr validation passed: {}", searcher_ptr);
 
     // Convert SplitQuery to QueryAst JSON (using existing infrastructure)
     let query_json_result = convert_split_query_to_json(&mut env, &split_query);
     let query_json = match query_json_result {
         Ok(json) => {
-            eprintln!("RUST DEBUG: Query conversion successful");
+            debug_println!("RUST DEBUG: Query conversion successful");
             json
         },
         Err(e) => {
-            eprintln!("RUST DEBUG: ⏱️ searchWithAggregations ERROR: Failed to convert SplitQuery");
             debug_println!("RUST DEBUG: ⏱️ searchWithAggregations ERROR: Failed to convert SplitQuery [TIMING: {}ms]", method_start_time.elapsed().as_millis());
             to_java_exception(&mut env, &anyhow::anyhow!("Failed to convert SplitQuery to JSON: {}", e));
             return std::ptr::null_mut();
@@ -1083,28 +1080,25 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_sear
     };
 
     // Convert Java aggregations map to JSON
-    eprintln!("RUST DEBUG: Starting aggregation conversion");
+    debug_println!("RUST DEBUG: Starting aggregation conversion");
     let aggregation_request_json = match convert_java_aggregations_to_json(&mut env, &aggregations_map) {
         Ok(agg_json) => {
-            eprintln!("RUST DEBUG: Aggregation conversion successful");
+            debug_println!("RUST DEBUG: Aggregation conversion successful");
             agg_json
         },
         Err(e) => {
-            eprintln!("RUST DEBUG: ⏱️ searchWithAggregations ERROR: Failed to convert aggregations to JSON: {}", e);
             debug_println!("RUST DEBUG: ⏱️ searchWithAggregations ERROR: Failed to convert aggregations to JSON [TIMING: {}ms]", method_start_time.elapsed().as_millis());
             to_java_exception(&mut env, &anyhow::anyhow!("Failed to convert aggregations to JSON: {}", e));
             return std::ptr::null_mut();
         }
     };
 
-    eprintln!("RUST DEBUG: Query JSON: {}", query_json);
+    debug_println!("RUST DEBUG: Query JSON: {}", query_json);
     if let Some(ref agg_json) = aggregation_request_json {
-        eprintln!("RUST DEBUG: Aggregation JSON: {}", agg_json);
         debug_println!("RUST DEBUG: Aggregation JSON: {}", agg_json);
     } else {
-        eprintln!("RUST DEBUG: No aggregation JSON - aggregation_request_json is None");
+        debug_println!("RUST DEBUG: No aggregation JSON - aggregation_request_json is None");
     }
-    debug_println!("RUST DEBUG: Query JSON: {}", query_json);
 
     // Use block_on_operation to perform the async search with aggregations
     let searcher_ptr_copy = searcher_ptr;
@@ -1114,10 +1108,6 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_sear
         perform_search_async_impl_leaf_response_with_aggregations(searcher_ptr_copy, query_json, limit_copy, aggregation_request_json_copy).await
     }) {
         Ok(leaf_search_response) => {
-            eprintln!("RUST DEBUG: ⏱️ searchWithAggregations SUCCESS [TIMING: {}ms]", method_start_time.elapsed().as_millis());
-            eprintln!("RUST DEBUG: Found {} hits, has aggregations: {}",
-                         leaf_search_response.num_hits,
-                         leaf_search_response.intermediate_aggregation_result.is_some());
             debug_println!("RUST DEBUG: ⏱️ searchWithAggregations SUCCESS [TIMING: {}ms]", method_start_time.elapsed().as_millis());
             debug_println!("RUST DEBUG: Found {} hits, has aggregations: {}",
                          leaf_search_response.num_hits,
@@ -1133,7 +1123,6 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_sear
             }
         }
         Err(e) => {
-            eprintln!("RUST DEBUG: ⏱️ searchWithAggregations ERROR: Search failed: {}", e);
             debug_println!("RUST DEBUG: ⏱️ searchWithAggregations ERROR: Search failed [TIMING: {}ms]: {}", method_start_time.elapsed().as_millis(), e);
             to_java_exception(&mut env, &e);
             std::ptr::null_mut()
@@ -1702,8 +1691,6 @@ fn retrieve_document_from_split(
                 
                 // ✅ Use cached index to eliminate repeated open_index_with_caches calls
                 let index = cached_index.as_ref().clone();
-                eprintln!("🔥 INDEX CACHED: Reusing cached index instead of expensive open_index_with_caches call");
-
                 debug_println!("RUST DEBUG: ✅ Successfully reused cached index");
                 index
             } else {

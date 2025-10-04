@@ -1664,7 +1664,7 @@ fn create_stats_result_object(
     let stats_result_class = env.find_class("io/indextables/tantivy4java/aggregation/StatsResult")?;
     let name_string = env.new_string(aggregation_name)?;
 
-    eprintln!("RUST DEBUG: Creating StatsResult with count={}, sum={}, min={}, max={}",
+    debug_println!("RUST DEBUG: Creating StatsResult with count={}, sum={}, min={}, max={}",
              count, sum, min, max);
 
     use jni::objects::JValue;

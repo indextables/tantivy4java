@@ -190,15 +190,14 @@
                             <executable>cargo</executable>
                             <arguments>
                                 <argument>build</argument>
-                                <!-- Remove - -release to use debug build with full symbols -->
+                                <argument>--release</argument>
                                 <argument>--target-dir</argument>
                                 <argument>${rust.target.dir}</argument>
                             </arguments>
                             <workingDirectory>${project.basedir}/native</workingDirectory>
                             <environmentVariables>
-                                <!-- Force maximum debug symbols and panic unwind -->
-                                <RUST_BACKTRACE>full</RUST_BACKTRACE>
-                                <RUSTFLAGS>-C debuginfo=2 -C panic=unwind</RUSTFLAGS>
+                                <RUST_BACKTRACE>1</RUST_BACKTRACE>
+                                <RUSTFLAGS>-C debuginfo=2</RUSTFLAGS>
                             </environmentVariables>
                         </configuration>
                     </execution>
@@ -237,19 +236,30 @@
                 </executions>
             </plugin>
 
-            <!-- JAR packaging with native libraries and platform classifier -->
+            <!-- JAR packaging - creates both main JAR and platform-specific JAR -->
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-jar-plugin</artifactId>
                 <version>3.3.0</version>
                 <configuration>
-                    <classifier>${platform.classifier}</classifier>
                     <archive>
                         <manifest>
                             <addDefaultImplementationEntries>true</addDefaultImplementationEntries>
                         </manifest>
                     </archive>
                 </configuration>
+                <executions>
+                    <!-- Create platform-specific JAR with classifier -->
+                    <execution>
+                        <id>platform-jar</id>
+                        <goals>
+                            <goal>jar</goal>
+                        </goals>
+                        <configuration>
+                            <classifier>${platform.classifier}</classifier>
+                        </configuration>
+                    </execution>
+                </executions>
             </plugin>
         </plugins>
     </build>
