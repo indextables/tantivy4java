@@ -16,7 +16,7 @@ use jni::sys::{jlong, jint, jobject};
 
 use tokio::runtime::Runtime;
 use crate::global_cache::{get_configured_storage_resolver, get_global_searcher_context};
-use quickwit_config::S3StorageConfig;
+use quickwit_config::{S3StorageConfig, AzureStorageConfig};
 // Note: Using global caches following Quickwit's pattern
 
 /// Global cache manager that follows Quickwit's multi-level caching architecture
@@ -27,8 +27,9 @@ pub struct GlobalSplitCacheManager {
     
     // REMOVED: runtime field - using shared global runtime to prevent deadlocks
     
-    // AWS configuration for storage resolver
+    // Storage configurations for resolver
     s3_config: Option<S3StorageConfig>,
+    azure_config: Option<AzureStorageConfig>,
     
     // Statistics
     total_hits: AtomicU64,
@@ -57,6 +58,7 @@ impl GlobalSplitCacheManager {
             max_cache_size,
             // REMOVED: runtime field to prevent multiple runtime conflicts
             s3_config: None,
+            azure_config: None,
             total_hits: AtomicU64::new(0),
             total_misses: AtomicU64::new(0),
             total_evictions: AtomicU64::new(0),
@@ -144,12 +146,20 @@ impl GlobalSplitCacheManager {
     
     // Set AWS configuration for storage resolver
     pub fn set_aws_config(&mut self, s3_config: S3StorageConfig) {
+        debug_println!("RUST DEBUG: Setting AWS config for cache '{}'", self.cache_name);
         self.s3_config = Some(s3_config);
     }
-    
-    // Get configured storage resolver using the AWS config if set
+
+    // Set Azure configuration for storage resolver
+    pub fn set_azure_config(&mut self, azure_config: AzureStorageConfig) {
+        debug_println!("RUST DEBUG: Setting Azure config for cache '{}'", self.cache_name);
+        debug_println!("   📋 Account: {:?}", azure_config.account_name);
+        self.azure_config = Some(azure_config);
+    }
+
+    // Get configured storage resolver using the AWS or Azure config if set
     pub fn get_storage_resolver(&self) -> quickwit_storage::StorageResolver {
-        get_configured_storage_resolver(self.s3_config.clone())
+        get_configured_storage_resolver(self.s3_config.clone(), self.azure_config.clone())
     }
     
     // Get the global searcher context with all shared caches

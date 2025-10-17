@@ -221,7 +221,7 @@ impl StandaloneSearcher {
         debug_println!("RUST DEBUG: Creating StandaloneSearcher with custom S3 config");
         let context = Arc::new(StandaloneSearchContext::new(config)?);
         // Get a configured storage resolver with the specific S3 config
-        let storage_resolver = get_configured_storage_resolver(Some(s3_config));
+        let storage_resolver = get_configured_storage_resolver(Some(s3_config), None);
         Ok(Self {
             context,
             storage_resolver,
@@ -419,12 +419,29 @@ pub async fn resolve_storage_for_split(
                 let directory_uri_str = &uri_str[..last_slash_pos + 1];
                 let directory_uri: Uri = directory_uri_str.parse()
                     .with_context(|| format!("Failed to parse S3 directory URI: {}", directory_uri_str))?;
-                
+
                 debug_println!("QUICKWIT DEBUG: Resolving S3 storage for directory: '{}'", directory_uri_str);
                 storage_resolver.resolve(&directory_uri).await
                     .with_context(|| format!("Failed to resolve storage for directory URI: {}", directory_uri_str))
             } else {
                 // Fallback if no slash found (shouldn't happen with valid S3 URIs)
+                storage_resolver.resolve(&uri).await
+                    .with_context(|| format!("Failed to resolve storage for URI: {}", split_uri))
+            }
+        },
+        quickwit_common::uri::Protocol::Azure => {
+            // For Azure, we need to resolve the directory, not the file (same as S3)
+            let uri_str = uri.as_str();
+            if let Some(last_slash_pos) = uri_str.rfind('/') {
+                let directory_uri_str = &uri_str[..last_slash_pos + 1];
+                let directory_uri: Uri = directory_uri_str.parse()
+                    .with_context(|| format!("Failed to parse Azure directory URI: {}", directory_uri_str))?;
+
+                debug_println!("QUICKWIT DEBUG: Resolving Azure storage for directory: '{}'", directory_uri_str);
+                storage_resolver.resolve(&directory_uri).await
+                    .with_context(|| format!("Failed to resolve storage for directory URI: {}", directory_uri_str))
+            } else {
+                // Fallback if no slash found (shouldn't happen with valid Azure URIs)
                 storage_resolver.resolve(&uri).await
                     .with_context(|| format!("Failed to resolve storage for URI: {}", split_uri))
             }
@@ -436,7 +453,7 @@ pub async fn resolve_storage_for_split(
                 let directory_uri_str = &uri_str[..last_slash_pos + 1];
                 let directory_uri: Uri = directory_uri_str.parse()
                     .with_context(|| format!("Failed to parse file directory URI: {}", directory_uri_str))?;
-                
+
                 debug_println!("RUST DEBUG: Resolving file:// storage for directory: '{}'", directory_uri_str);
                 storage_resolver.resolve(&directory_uri).await
                     .with_context(|| format!("Failed to resolve storage for file directory URI: {}", directory_uri_str))

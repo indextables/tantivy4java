@@ -97,7 +97,8 @@ public class SplitCacheManager implements AutoCloseable {
     private final AtomicLong totalCacheSize;
     private final long nativePtr;
     private final Map<String, String> awsConfig;
-    
+    private final Map<String, String> azureConfig;
+
     /**
      * Configuration for shared cache across multiple splits
      */
@@ -197,17 +198,18 @@ public class SplitCacheManager implements AutoCloseable {
         // Azure Blob Storage configuration
         public CacheConfig withAzureCredentials(String accountName, String accountKey) {
             this.azureConfig.put("account_name", accountName);
-            this.azureConfig.put("account_key", accountKey);
+            this.azureConfig.put("access_key", accountKey);  // Changed from "account_key" to "access_key" for consistency with native layer
             return this;
         }
-        
+
+        public CacheConfig withAzureBearerToken(String accountName, String bearerToken) {
+            this.azureConfig.put("account_name", accountName);
+            this.azureConfig.put("bearer_token", bearerToken);
+            return this;
+        }
+
         public CacheConfig withAzureConnectionString(String connectionString) {
             this.azureConfig.put("connection_string", connectionString);
-            return this;
-        }
-        
-        public CacheConfig withAzureEndpoint(String endpoint) {
-            this.azureConfig.put("endpoint", endpoint);
             return this;
         }
         
@@ -220,11 +222,6 @@ public class SplitCacheManager implements AutoCloseable {
         
         public CacheConfig withGcpCredentialsFile(String credentialsFilePath) {
             this.gcpConfig.put("credentials_file", credentialsFilePath);
-            return this;
-        }
-        
-        public CacheConfig withGcpEndpoint(String endpoint) {
-            this.gcpConfig.put("endpoint", endpoint);
             return this;
         }
         
@@ -429,6 +426,7 @@ public class SplitCacheManager implements AutoCloseable {
         this.managedSearchers = new ConcurrentHashMap<>();
         this.totalCacheSize = new AtomicLong(0);
         this.awsConfig = new HashMap<>(config.getAwsConfig());
+        this.azureConfig = new HashMap<>(config.getAzureConfig());
         this.nativePtr = createNativeCacheManager(config);
     }
     
@@ -566,6 +564,9 @@ public class SplitCacheManager implements AutoCloseable {
         Map<String, Object> splitConfig = new HashMap<>();
         if (!this.awsConfig.isEmpty()) {
             splitConfig.put("aws_config", this.awsConfig);
+        }
+        if (!this.azureConfig.isEmpty()) {
+            splitConfig.put("azure_config", this.azureConfig);
         }
 
         // Extract specific values for native layer compatibility (based on commit b53bf9d)
