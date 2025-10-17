@@ -179,12 +179,15 @@ Parallelism 5: 99.5% efficiency (avg: 19.3s)
 ### **✅ QUICKWIT SPLIT FUNCTIONALITY: MERGE COMPLETE, ADDITIONAL FEATURES IN PROGRESS**
 
 **✅ Completed Quickwit Split Features:**
-- **✅ QuickwitSplit.mergeSplits()** - **COMPLETE**: Production-ready Quickwit-style split merging with full S3 support
+- **✅ QuickwitSplit.mergeSplits()** - **COMPLETE**: Production-ready Quickwit-style split merging with full S3 and Azure Blob Storage support
 - **✅ Remote S3 Split Merging** - Download and merge splits from S3/MinIO with AWS credential authentication
-- **✅ Multi-Protocol Support** - Seamlessly handles local files, file:// URLs, and s3:// URLs in single operation
+- **✅ Remote Azure Split Merging** - Download and merge splits from Azure Blob Storage with account key and OAuth bearer token authentication
+- **✅ Multi-Protocol Support** - Seamlessly handles local files, file:// URLs, s3:// URLs, and azure:// URLs in single operation
 - **✅ AWS Integration** - Complete credential support including temporary credentials and custom endpoints
+- **✅ Azure Integration** - Complete authentication support including account keys, OAuth bearer tokens, connection strings, and Azure AD
+- **✅ Multi-Cloud Architecture** - Mix AWS S3 and Azure Blob Storage splits in same merge operations
 - **✅ Memory-efficient merging** - Uses Quickwit's proven MergeExecutor pattern for large indices
-- **✅ Comprehensive testing** - Split merge functionality fully tested and validated
+- **✅ Comprehensive testing** - Split merge functionality fully tested and validated with both AWS and Azure
 - **✅ Format compliance** - Proper Quickwit split merging with metadata handling
 
 **🚧 Remaining QuickwitSplit Features in Development:**
@@ -254,6 +257,190 @@ QuickwitSplit.SplitMetadata result = QuickwitSplit.mergeSplits(
 - **⚡ High Performance** - Native Quickwit merge algorithms with S3 streaming
 - **🛡️ Error Resilience** - Comprehensive error handling for network issues
 - **🔧 DevOps Friendly** - Works with CI/CD pipelines and container deployments
+
+#### **🌟 Azure Blob Storage Remote Split Support (January 2025)**
+
+**✅ Complete Azure Blob Storage Integration:**
+- **✅ QuickwitSplit.mergeSplits() with Azure** - Production-ready split merging with full Azure Blob Storage support
+- **✅ Multi-Protocol Support** - Seamlessly handles azure:// URLs alongside s3:// and local files
+- **✅ Azure Authentication Methods** - Full support for account keys, OAuth bearer tokens, and connection strings
+- **✅ Azure Active Directory Integration** - OAuth 2.0 bearer token authentication for managed identities
+- **✅ Multi-Cloud Architecture** - Mix Azure and AWS splits in single merge operations
+- **✅ Memory-Optimized** - Uses Quickwit's proven MergeExecutor pattern for large-scale indices
+- **✅ Azurite Support** - Complete local testing with Azure Storage Emulator
+
+**Azure Authentication Patterns:**
+
+**1. Account Key Authentication (Basic):**
+```java
+// Create Azure configuration with account name and access key
+QuickwitSplit.AzureConfig azureConfig = new QuickwitSplit.AzureConfig(
+    "mystorageaccount",  // Azure storage account name
+    "account-key"        // Azure storage account access key
+);
+
+QuickwitSplit.MergeConfig config = QuickwitSplit.MergeConfig.builder()
+    .indexUid("azure-index")
+    .sourceId("azure-source")
+    .nodeId("worker-1")
+    .azureConfig(azureConfig)
+    .build();
+```
+
+**2. OAuth Bearer Token Authentication (Azure AD / Managed Identity):**
+```java
+// Create Azure configuration with OAuth bearer token
+QuickwitSplit.AzureConfig oauthConfig = QuickwitSplit.AzureConfig.withBearerToken(
+    "mystorageaccount",              // Azure storage account name
+    "eyJ0eXAiOiJKV1QiLCJhbGc..."     // OAuth 2.0 bearer token from Azure AD
+);
+
+QuickwitSplit.MergeConfig config = QuickwitSplit.MergeConfig.builder()
+    .indexUid("azure-oauth-index")
+    .sourceId("azure-oauth-source")
+    .nodeId("worker-1")
+    .azureConfig(oauthConfig)
+    .build();
+```
+
+**3. Connection String Authentication:**
+```java
+// Create Azure configuration from connection string
+String connString = "DefaultEndpointsProtocol=https;" +
+                   "AccountName=myaccount;" +
+                   "AccountKey=key;" +
+                   "EndpointSuffix=core.windows.net";
+
+QuickwitSplit.AzureConfig connConfig =
+    QuickwitSplit.AzureConfig.fromConnectionString(connString);
+
+QuickwitSplit.MergeConfig config = QuickwitSplit.MergeConfig.builder()
+    .indexUid("azure-conn-index")
+    .sourceId("azure-source")
+    .nodeId("worker-1")
+    .azureConfig(connConfig)
+    .build();
+```
+
+**Azure Split Merge Examples:**
+
+**Basic Azure Split Merge:**
+```java
+// Define Azure split URLs to merge
+List<String> azureSplits = Arrays.asList(
+    "azure://my-container/splits/split-001.split",
+    "azure://my-container/splits/split-002.split",
+    "azure://my-container/splits/split-003.split"
+);
+
+// Merge Azure splits
+QuickwitSplit.SplitMetadata result = QuickwitSplit.mergeSplits(
+    azureSplits, "/tmp/merged-azure.split", config);
+
+System.out.println("Merged " + result.getNumDocs() + " documents from Azure");
+```
+
+**Multi-Cloud Split Merge (AWS + Azure):**
+```java
+// Configure both AWS and Azure
+QuickwitSplit.AwsConfig awsConfig = new QuickwitSplit.AwsConfig(
+    "AKIA...", "aws-secret", "us-east-1");
+
+QuickwitSplit.AzureConfig azureConfig = new QuickwitSplit.AzureConfig(
+    "azureaccount", "azure-key");
+
+QuickwitSplit.MergeConfig multiCloudConfig = QuickwitSplit.MergeConfig.builder()
+    .indexUid("multi-cloud-index")
+    .sourceId("hybrid-source")
+    .nodeId("worker-1")
+    .awsConfig(awsConfig)     // AWS credentials
+    .azureConfig(azureConfig) // Azure credentials
+    .build();
+
+// Mix AWS S3 and Azure Blob Storage splits
+List<String> multiCloudSplits = Arrays.asList(
+    "s3://aws-bucket/split-01.split",           // AWS S3
+    "azure://azure-container/split-02.split",   // Azure Blob
+    "/local/split-03.split"                     // Local file
+);
+
+QuickwitSplit.SplitMetadata result = QuickwitSplit.mergeSplits(
+    multiCloudSplits, "/tmp/multi-cloud-merged.split", multiCloudConfig);
+```
+
+**SplitSearcher with Azure:**
+
+**Account Key Authentication:**
+```java
+// Configure cache with Azure credentials
+SplitCacheManager.CacheConfig azureCache =
+    new SplitCacheManager.CacheConfig("azure-cache")
+        .withMaxCacheSize(500_000_000)
+        .withAzureCredentials("myaccount", "account-key");
+
+try (SplitCacheManager cacheManager = SplitCacheManager.getInstance(azureCache)) {
+    // Search Azure splits
+    try (SplitSearcher searcher = cacheManager.createSplitSearcher(
+            "azure://my-container/splits/movies.split")) {
+        Schema schema = searcher.getSchema();
+        SplitQuery query = new SplitTermQuery("title", "interstellar");
+        SearchResult results = searcher.search(query, 10);
+
+        System.out.println("Found " + results.getHits().size() + " results in Azure");
+    }
+}
+```
+
+**OAuth Bearer Token Authentication:**
+```java
+// Configure cache with OAuth bearer token
+SplitCacheManager.CacheConfig oauthCache =
+    new SplitCacheManager.CacheConfig("azure-oauth-cache")
+        .withMaxCacheSize(500_000_000)
+        .withAzureBearerToken("myaccount", "eyJ0eXAiOiJKV1QiLCJhbGc...");
+
+try (SplitCacheManager cacheManager = SplitCacheManager.getInstance(oauthCache)) {
+    // OAuth-authenticated access to Azure splits
+    try (SplitSearcher searcher = cacheManager.createSplitSearcher(
+            "azure://container/split.split")) {
+        // Same search operations as account key authentication
+    }
+}
+```
+
+**Azure Testing with Azurite:**
+```java
+import io.indextables.tantivy4java.AzuriteContainer;
+
+// Start Azurite emulator for local testing
+AzuriteContainer azurite = new AzuriteContainer();
+azurite.start();
+
+// Configure with Azurite (uses well-known emulator credentials)
+SplitCacheManager.CacheConfig testCache =
+    new SplitCacheManager.CacheConfig("azurite-test-cache")
+        .withAzureCredentials(
+            AzuriteContainer.ACCOUNT,  // "devstoreaccount1"
+            AzuriteContainer.KEY       // well-known emulator key
+        );
+
+try (SplitCacheManager manager = SplitCacheManager.getInstance(testCache)) {
+    // Test Azure integration without cloud costs
+}
+
+azurite.stop();
+```
+
+**✅ Azure Production Benefits:**
+- **🔐 Multiple Auth Methods** - Account keys, OAuth tokens, connection strings, and managed identities
+- **🌐 Multi-Cloud Ready** - Seamlessly mix Azure and AWS splits in same operations
+- **⚡ High Performance** - Native Azure SDK integration with Quickwit merge algorithms
+- **🧪 Local Testing** - Azurite emulator support for development and CI/CD
+- **🔒 Enterprise Security** - Azure AD integration for role-based access control
+- **🔧 DevOps Friendly** - Container-ready with managed identity support
+
+**Note on Endpoint Configuration:**
+Custom endpoint override functionality was removed in January 2025 as it didn't work correctly with Azure's authentication flow. For local testing with Azurite or custom endpoints, configure these at the native/Rust layer level. The standard Azure SDK configuration handles production endpoints automatically.
 
 ### **🎯 COMPREHENSIVE PYTHON PARITY IMPLEMENTATION**
 

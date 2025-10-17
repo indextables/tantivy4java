@@ -1455,6 +1455,7 @@ pub struct InternalMergeConfig {
     pub partition_id: u64,
     pub delete_queries: Option<Vec<String>>,
     pub aws_config: Option<InternalAwsConfig>,
+    pub azure_config: Option<InternalAzureConfig>,
     pub temp_directory_path: Option<String>,
 }
 
@@ -1467,6 +1468,14 @@ pub struct InternalAwsConfig {
     pub region: String,
     pub endpoint: Option<String>,
     pub force_path_style: bool,
+}
+
+/// Azure Blob Storage configuration for merge operations
+#[derive(Clone, Debug)]
+pub struct InternalAzureConfig {
+    pub account_name: String,
+    pub account_key: Option<String>,      // Optional: for Storage Account Key auth
+    pub bearer_token: Option<String>,     // Optional: for OAuth token auth
 }
 
 #[no_mangle]
@@ -1558,6 +1567,48 @@ fn extract_aws_config(env: &mut JNIEnv, aws_obj: JObject) -> anyhow::Result<Inte
     })
 }
 
+/// Extract Azure configuration from Java AzureConfig object
+fn extract_azure_config(env: &mut JNIEnv, azure_obj: JObject) -> anyhow::Result<InternalAzureConfig> {
+    let account_name = get_string_field_value(env, &azure_obj, "getAccountName")?;
+
+    // Extract account key (optional - may be null if using bearer token)
+    let account_key = match env.call_method(&azure_obj, "getAccountKey", "()Ljava/lang/String;", &[]) {
+        Ok(result) => {
+            let key_obj = result.l()?;
+            if env.is_same_object(&key_obj, JObject::null())? {
+                None
+            } else {
+                Some(jstring_to_string(env, &key_obj.into())?)
+            }
+        },
+        Err(_) => None,
+    };
+
+    // Extract bearer token (optional - may be null if using account key)
+    let bearer_token = match env.call_method(&azure_obj, "getBearerToken", "()Ljava/lang/String;", &[]) {
+        Ok(result) => {
+            let token_obj = result.l()?;
+            if env.is_same_object(&token_obj, JObject::null())? {
+                None
+            } else {
+                Some(jstring_to_string(env, &token_obj.into())?)
+            }
+        },
+        Err(_) => None,
+    };
+
+    // Validate that at least one auth method is provided
+    if account_key.is_none() && bearer_token.is_none() {
+        return Err(anyhow!("Azure config must provide either accountKey or bearerToken"));
+    }
+
+    Ok(InternalAzureConfig {
+        account_name,
+        account_key,
+        bearer_token,
+    })
+}
+
 /// Extract merge configuration from Java MergeConfig object
 fn extract_merge_config(env: &mut JNIEnv, config_obj: &JObject) -> Result<InternalMergeConfig> {
     let index_uid = get_string_field_value(env, config_obj, "getIndexUid")?;
@@ -1596,6 +1647,19 @@ fn extract_merge_config(env: &mut JNIEnv, config_obj: &JObject) -> Result<Intern
     Err(_) => None,
     };
 
+    // Extract Azure configuration if present
+    let azure_config = match env.call_method(config_obj, "getAzureConfig", "()Lio/indextables/tantivy4java/split/merge/QuickwitSplit$AzureConfig;", &[]) {
+    Ok(azure_result) => {
+        let azure_obj = azure_result.l()?;
+        if env.is_same_object(&azure_obj, JObject::null())? {
+            None
+        } else {
+            Some(extract_azure_config(env, azure_obj)?)
+        }
+    },
+    Err(_) => None,
+    };
+
     // Extract custom temp directory path if present
     let temp_directory_path = match env.call_method(config_obj, "getTempDirectoryPath", "()Ljava/lang/String;", &[]) {
     Ok(temp_result) => {
@@ -1617,6 +1681,7 @@ fn extract_merge_config(env: &mut JNIEnv, config_obj: &JObject) -> Result<Intern
     partition_id,
     delete_queries,
     aws_config,
+    azure_config,
     temp_directory_path,
     })
 }
@@ -1978,14 +2043,14 @@ async fn download_and_extract_single_split(
     // Parse the split URI
     let split_uri = Uri::from_str(split_url)?;
 
-    // For S3 URIs, we need to resolve the parent directory, not the file itself
-    let (storage_uri, file_name) = if split_uri.protocol() == Protocol::S3 {
+    // For S3/Azure URIs, we need to resolve the parent directory, not the file itself
+    let (storage_uri, file_name) = if split_uri.protocol() == Protocol::S3 || split_uri.protocol() == Protocol::Azure {
         let uri_str = split_uri.as_str();
         if let Some(last_slash) = uri_str.rfind('/') {
-            let parent_uri_str = &uri_str[..last_slash]; // Get s3://bucket/splits
+            let parent_uri_str = &uri_str[..last_slash]; // Get s3://bucket/splits or azure://container/path
             let file_name = &uri_str[last_slash + 1..];  // Get filename
-            debug_log!("🔗 Split {}: Split S3 URI into parent: {} and file: {}",
-                      split_index, parent_uri_str, file_name);
+            debug_log!("🔗 Split {}: Split {} URI into parent: {} and file: {}",
+                      split_index, split_uri.protocol(), parent_uri_str, file_name);
             (Uri::from_str(parent_uri_str)?, Some(file_name.to_string()))
         } else {
             (split_uri.clone(), None)
@@ -2056,13 +2121,13 @@ async fn download_and_extract_single_split(
 /// ✅ QUICKWIT NATIVE: Create storage resolver using Quickwit's native configuration system
 /// This replaces custom storage configuration with Quickwit's proven patterns
 fn create_storage_resolver(config: &InternalMergeConfig) -> Result<StorageResolver> {
-    use quickwit_config::{StorageConfigs, StorageConfig, S3StorageConfig};
+    use quickwit_config::{StorageConfigs, StorageConfig, S3StorageConfig, AzureStorageConfig};
 
-    debug_log!("🔧 QUICKWIT NATIVE: Creating storage resolver using Quickwit's native configuration");
+    debug_log!("🔧 Creating storage resolver with multi-cloud support");
 
-    // Convert our AWS config to Quickwit's native S3StorageConfig
     let mut storage_configs = Vec::new();
 
+    // AWS S3 configuration
     if let Some(ref aws_config) = config.aws_config {
         let s3_config = S3StorageConfig {
             access_key_id: aws_config.access_key.clone(),
@@ -2073,44 +2138,29 @@ fn create_storage_resolver(config: &InternalMergeConfig) -> Result<StorageResolv
             force_path_style_access: aws_config.force_path_style,
             ..Default::default()
         };
-
         storage_configs.push(StorageConfig::S3(s3_config));
-        debug_log!("✅ QUICKWIT NATIVE: Added S3 configuration with region={}, endpoint={:?}",
-                  aws_config.region, aws_config.endpoint);
+        debug_log!("   ✅ S3 config added");
     }
 
-    // Create StorageConfigs and let Quickwit handle all the timeout and retry logic
-    let quickwit_storage_configs = StorageConfigs::new(storage_configs);
-
-    // Validate that our S3 configuration is properly found by Quickwit
-    let s3_config_opt = quickwit_storage_configs.find_s3();
-    if let Some(s3_config) = &s3_config_opt {
-        debug_log!("✅ QUICKWIT NATIVE: S3 configuration found and will be used by StorageResolver");
-        debug_log!("   Region: {:?}", s3_config.region);
-        debug_log!("   Endpoint: {:?}", s3_config.endpoint);
-        debug_log!("   Force path style: {}", s3_config.force_path_style_access);
-        debug_log!("   Has access key: {}", s3_config.access_key_id.is_some());
-        debug_log!("   Has secret key: {}", s3_config.secret_access_key.is_some());
-        debug_log!("   Has session token: {}", s3_config.session_token.is_some());
-    } else {
-        debug_log!("ℹ️ QUICKWIT NATIVE: No S3 configuration provided, using default credentials/config");
+    // ✅ NEW: Azure Blob Storage configuration
+    if let Some(ref azure_config) = config.azure_config {
+        let azure_storage_config = AzureStorageConfig {
+            account_name: Some(azure_config.account_name.clone()),
+            access_key: azure_config.account_key.clone(),
+            bearer_token: azure_config.bearer_token.clone(),
+        };
+        storage_configs.push(StorageConfig::Azure(azure_storage_config));
+        debug_log!("   ✅ Azure config added");
     }
 
-    // ✅ BYPASS FIX #8: Use centralized storage resolver function
-    debug_println!("✅ BYPASS_FIXED: Using get_configured_storage_resolver() for cache sharing [FIX #8]");
-    debug_println!("   📍 Location: quickwit_split.rs:2050 (QuickwitSplit merge operation)");
-    // TODO: Fix async compatibility - temporarily use direct call
-    let storage_configs = StorageConfigs::new(if let Some(s3_config) = s3_config_opt.cloned() {
-        vec![StorageConfig::S3(s3_config)]
+    // Create StorageResolver
+    Ok(if !storage_configs.is_empty() {
+        let configs = StorageConfigs::new(storage_configs);
+        StorageResolver::configured(&configs)
     } else {
-        vec![]
-    });
-    let storage_resolver = StorageResolver::configured(&storage_configs);
-
-    debug_log!("✅ QUICKWIT NATIVE: Storage resolver created using Quickwit's native configuration system");
-    debug_log!("✅ QUICKWIT NATIVE: Timeout and retry policies handled by Quickwit's proven implementation");
-
-    Ok(storage_resolver)
+        debug_log!("   ℹ️  No cloud config - using global resolver");
+        crate::global_cache::GLOBAL_STORAGE_RESOLVER.clone()
+    })
 }
 
 // ✅ QUICKWIT NATIVE: Custom timeout policy function removed
@@ -3079,49 +3129,63 @@ fn calculate_directory_size(dir_path: &Path) -> Result<u64> {
     Ok(total_size)
 }
 
-/// Upload a local split file to S3 using the storage resolver with AWS credentials
+/// Upload a local split file to cloud storage (S3 or Azure) using the storage resolver
 async fn upload_split_to_s3_impl(local_split_path: &Path, s3_url: &str, config: &InternalMergeConfig) -> Result<()> {
-    use quickwit_storage::{Storage, StorageResolver, LocalFileStorageFactory, S3CompatibleObjectStorageFactory};
+    use quickwit_storage::{Storage, StorageResolver, LocalFileStorageFactory, S3CompatibleObjectStorageFactory, AzureBlobStorageFactory};
+    use quickwit_config::{AzureStorageConfig, S3StorageConfig};
     use std::str::FromStr;
-    
-    debug_log!("Starting S3 upload from {:?} to {}", local_split_path, s3_url);
-    
-    // Parse the S3 URI
-    let s3_uri = Uri::from_str(s3_url)?;
-    
-    // Create storage resolver with AWS config from MergeConfig
-    let s3_config = if let Some(ref aws_config) = config.aws_config {
-    S3StorageConfig {
-        region: Some(aws_config.region.clone()),
-        access_key_id: aws_config.access_key.clone(),
-        secret_access_key: aws_config.secret_key.clone(),
-        session_token: aws_config.session_token.clone(),
-        endpoint: aws_config.endpoint.clone(),
-        force_path_style_access: aws_config.force_path_style,
-        ..Default::default()
+
+    debug_log!("Starting cloud storage upload from {:?} to {}", local_split_path, s3_url);
+
+    // Parse the URI (could be S3 or Azure)
+    let storage_url_uri = Uri::from_str(s3_url)?;
+
+    // Create storage resolver with AWS and/or Azure config from MergeConfig
+    let mut resolver_builder = StorageResolver::builder()
+        .register(LocalFileStorageFactory::default());
+
+    // Add S3 storage if AWS config is present
+    if let Some(ref aws_config) = config.aws_config {
+        let s3_config = S3StorageConfig {
+            region: Some(aws_config.region.clone()),
+            access_key_id: aws_config.access_key.clone(),
+            secret_access_key: aws_config.secret_key.clone(),
+            session_token: aws_config.session_token.clone(),
+            endpoint: aws_config.endpoint.clone(),
+            force_path_style_access: aws_config.force_path_style,
+            ..Default::default()
+        };
+        resolver_builder = resolver_builder.register(S3CompatibleObjectStorageFactory::new(s3_config));
+        debug_log!("Added S3 storage factory to resolver");
     }
-    } else {
-    S3StorageConfig::default()
-    };
-    let storage_resolver = StorageResolver::builder()
-    .register(LocalFileStorageFactory::default())
-    .register(S3CompatibleObjectStorageFactory::new(s3_config))
-    .build()
-    .map_err(|e| anyhow!("Failed to create storage resolver for upload: {}", e))?;
-    
-    // For S3 URIs, we need to resolve the parent directory, not the file itself
-    let (storage_uri, file_name) = if s3_uri.protocol() == Protocol::S3 {
-    let uri_str = s3_uri.as_str();
-    if let Some(last_slash) = uri_str.rfind('/') {
-        let parent_uri_str = &uri_str[..last_slash]; // Get s3://bucket/splits
-        let file_name = &uri_str[last_slash + 1..];  // Get filename
-        debug_log!("Split S3 URI for upload into parent: {} and file: {}", parent_uri_str, file_name);
-        (Uri::from_str(parent_uri_str)?, file_name.to_string())
-    } else {
-        return Err(anyhow!("Invalid S3 URL format: {}", s3_url));
+
+    // Add Azure storage if Azure config is present
+    if let Some(ref azure_config) = config.azure_config {
+        let azure_storage_config = AzureStorageConfig {
+            account_name: Some(azure_config.account_name.clone()),
+            access_key: azure_config.account_key.clone(),
+            bearer_token: azure_config.bearer_token.clone(),
+        };
+        resolver_builder = resolver_builder.register(AzureBlobStorageFactory::new(azure_storage_config));
+        debug_log!("Added Azure storage factory to resolver");
     }
+
+    let storage_resolver = resolver_builder.build()
+        .map_err(|e| anyhow!("Failed to create storage resolver for upload: {}", e))?;
+
+    // For S3/Azure URIs, we need to resolve the parent directory, not the file itself
+    let (storage_uri, file_name) = if storage_url_uri.protocol() == Protocol::S3 || storage_url_uri.protocol() == Protocol::Azure {
+        let uri_str = storage_url_uri.as_str();
+        if let Some(last_slash) = uri_str.rfind('/') {
+            let parent_uri_str = &uri_str[..last_slash]; // Get s3://bucket/splits or azure://container/path
+            let file_name = &uri_str[last_slash + 1..];  // Get filename
+            debug_log!("Split cloud storage URI for upload into parent: {} and file: {}", parent_uri_str, file_name);
+            (Uri::from_str(parent_uri_str)?, file_name.to_string())
+        } else {
+            return Err(anyhow!("Invalid cloud storage URL format: {}", s3_url));
+        }
     } else {
-    return Err(anyhow!("Only S3 URLs are supported for upload, got: {}", s3_url));
+        return Err(anyhow!("Only S3 and Azure URLs are supported for upload, got: {}", s3_url));
     };
     
     // ✅ QUICKWIT NATIVE: Storage resolver already includes timeout and retry policies

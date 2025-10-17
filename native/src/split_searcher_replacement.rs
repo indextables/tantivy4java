@@ -460,8 +460,9 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_crea
         return 0;
     }
     
-    // Extract AWS configuration and split metadata from the split config map
+    // Extract AWS/Azure configuration and split metadata from the split config map
     let mut aws_config: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut azure_config: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     let mut split_footer_start: u64 = 0;
     let mut split_footer_end: u64 = 0;
     let mut doc_mapping_json: Option<String> = None;
@@ -552,7 +553,49 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_crea
                 }
             }
         }
-        
+
+        // ✅ NEW: Extract Azure config
+        if let Ok(azure_config_obj) = env.call_method(&split_config_jobject, "get", "(Ljava/lang/Object;)Ljava/lang/Object;", &[(&env.new_string("azure_config").unwrap()).into()]) {
+            let azure_config_jobject = azure_config_obj.l().unwrap();
+            if !azure_config_jobject.is_null() {
+                let azure_config_map = &azure_config_jobject;
+
+                // Extract account_name
+                if let Ok(account_name_obj) = env.call_method(azure_config_map, "get", "(Ljava/lang/Object;)Ljava/lang/Object;", &[(&env.new_string("account_name").unwrap()).into()]) {
+                    let account_name_jobject = account_name_obj.l().unwrap();
+                    if !account_name_jobject.is_null() {
+                        if let Ok(account_name_str) = env.get_string((&account_name_jobject).into()) {
+                            azure_config.insert("account_name".to_string(), account_name_str.into());
+                            debug_println!("RUST DEBUG: Extracted Azure account_name from Java config");
+                        }
+                    }
+                }
+
+                // Extract access_key (account key)
+                if let Ok(access_key_obj) = env.call_method(azure_config_map, "get", "(Ljava/lang/Object;)Ljava/lang/Object;", &[(&env.new_string("access_key").unwrap()).into()]) {
+                    let access_key_jobject = access_key_obj.l().unwrap();
+                    if !access_key_jobject.is_null() {
+                        if let Ok(access_key_str) = env.get_string((&access_key_jobject).into()) {
+                            azure_config.insert("access_key".to_string(), access_key_str.into());
+                            debug_println!("RUST DEBUG: Extracted Azure access_key from Java config");
+                        }
+                    }
+                }
+
+                // Extract bearer_token (for OAuth authentication)
+                if let Ok(bearer_token_obj) = env.call_method(azure_config_map, "get", "(Ljava/lang/Object;)Ljava/lang/Object;", &[(&env.new_string("bearer_token").unwrap()).into()]) {
+                    let bearer_token_jobject = bearer_token_obj.l().unwrap();
+                    if !bearer_token_jobject.is_null() {
+                        if let Ok(bearer_token_str) = env.get_string((&bearer_token_jobject).into()) {
+                            let token_len = bearer_token_str.to_str().unwrap().len();
+                            azure_config.insert("bearer_token".to_string(), bearer_token_str.into());
+                            debug_println!("RUST DEBUG: Extracted Azure bearer_token from Java config (length: {} chars)", token_len);
+                        }
+                    }
+                }
+            }
+        }
+
         // Extract doc mapping JSON if available
         debug_println!("RUST DEBUG: Attempting to extract doc mapping from Java config...");
         if let Ok(doc_mapping_obj) = env.call_method(&split_config_jobject, "get", "(Ljava/lang/Object;)Ljava/lang/Object;", &[(&env.new_string("doc_mapping").unwrap()).into()]) {
@@ -649,10 +692,23 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_crea
             s3_config.force_path_style_access = force_path_style == "true";
         }
 
-        crate::global_cache::get_configured_storage_resolver(Some(s3_config))
+        crate::global_cache::get_configured_storage_resolver(Some(s3_config), None)
+    } else if azure_config.contains_key("account_name") && (azure_config.contains_key("access_key") || azure_config.contains_key("bearer_token")) {
+        debug_println!("RUST DEBUG: Pre-creating StorageResolver with Azure config to prevent deadlocks");
+        debug_println!("RUST DEBUG: Azure account_name: {}", azure_config.get("account_name").unwrap());
+        debug_println!("RUST DEBUG: Azure auth method: {}", if azure_config.contains_key("bearer_token") { "OAuth bearer token" } else { "account key" });
+        use quickwit_config::AzureStorageConfig;
+
+        let azure_storage_config = AzureStorageConfig {
+            account_name: Some(azure_config.get("account_name").unwrap().clone()),
+            access_key: azure_config.get("access_key").cloned(),
+            bearer_token: azure_config.get("bearer_token").cloned(),
+        };
+
+        crate::global_cache::get_configured_storage_resolver(None, Some(azure_storage_config))
     } else {
         debug_println!("RUST DEBUG: Pre-creating default StorageResolver to prevent deadlocks");
-        crate::global_cache::get_configured_storage_resolver(None)
+        crate::global_cache::get_configured_storage_resolver(None, None)
     };
 
     match result {
@@ -660,7 +716,8 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_crea
             // Follow Quickwit pattern: resolve storage once and cache it for reuse
             let storage = runtime.handle().block_on(async {
                 use crate::standalone_searcher::resolve_storage_for_split;
-                resolve_storage_for_split(&storage_resolver, &split_uri).await
+                let result = resolve_storage_for_split(&storage_resolver, &split_uri).await;
+                result
             });
 
             match storage {
@@ -693,13 +750,14 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_crea
                         };
 
                         let searcher_context_global = get_global_searcher_context();
-                        quickwit_search::leaf::open_index_with_caches(
+                        let result = quickwit_search::leaf::open_index_with_caches(
                             &searcher_context_global,
                             resolved_storage.clone(),
                             &split_metadata,
                             None, // tokenizer_manager
                             None  // Follow Quickwit fetch_docs.rs pattern
-                        ).await
+                        ).await;
+                        result
                     });
 
                     match opened_index {
@@ -1650,7 +1708,7 @@ fn retrieve_document_from_split(
             // ✅ BYPASS FIX #3: Use centralized storage resolver function
             debug_println!("✅ BYPASS_FIXED: Using get_configured_storage_resolver() for cache sharing [FIX #3]");
             debug_println!("   📍 Location: split_searcher_replacement.rs:1365 (actual storage path)");
-            let storage_resolver = get_configured_storage_resolver(Some(s3_config.clone()));
+            let storage_resolver = get_configured_storage_resolver(Some(s3_config.clone()), None);
             let actual_storage = resolve_storage_for_split(&storage_resolver, split_uri).await?;
             
             // Extract relative path - for direct file paths, use just the filename
@@ -2955,7 +3013,7 @@ fn perform_search_with_query_ast_and_aggregations_using_working_infrastructure(
             // ✅ BYPASS FIX #7: Use centralized storage resolver function
             debug_println!("✅ BYPASS_FIXED: Using get_configured_storage_resolver() for cache sharing [FIX #7]");
             debug_println!("   📍 Location: split_searcher_replacement.rs:2819 (final storage search setup)");
-            let storage_resolver = get_configured_storage_resolver(Some(s3_config.clone()));
+            let storage_resolver = get_configured_storage_resolver(Some(s3_config.clone()), None);
 
             // Use the helper function to resolve storage correctly for S3 URIs
             let storage = resolve_storage_for_split(&storage_resolver, split_uri).await?;

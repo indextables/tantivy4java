@@ -52,8 +52,7 @@ public class AzureStorageIntegrationTest {
         SplitCacheManager.CacheConfig config = new SplitCacheManager.CacheConfig("azure-test-cache")
                 .withMaxCacheSize(200_000_000) // 200MB shared cache
                 .withMaxConcurrentLoads(8)
-                .withAzureCredentials(ACCOUNT_NAME, ACCOUNT_KEY)
-                .withAzureEndpoint(localhostEndpoint);
+                .withAzureCredentials(ACCOUNT_NAME, ACCOUNT_KEY);
                 
         cacheManager = SplitCacheManager.getInstance(config);
     }
@@ -87,13 +86,11 @@ public class AzureStorageIntegrationTest {
         SplitCacheManager.CacheConfig azureConfig = new SplitCacheManager.CacheConfig("azure-custom-test")
                 .withMaxCacheSize(100_000_000)
                 .withAzureCredentials("testaccount", "testkey") 
-                .withAzureConnectionString("DefaultEndpointsProtocol=http;AccountName=testaccount;AccountKey=testkey;BlobEndpoint=http://127.0.0.1:10001/testaccount;")
-                .withAzureEndpoint(customEndpoint);
+                .withAzureConnectionString("DefaultEndpointsProtocol=http;AccountName=testaccount;AccountKey=testkey;BlobEndpoint=http://127.0.0.1:10001/testaccount;");
         
         // Verify configuration values
-        assertEquals(customEndpoint, azureConfig.getAzureConfig().get("endpoint"));
         assertEquals("testaccount", azureConfig.getAzureConfig().get("account_name"));
-        assertEquals("testkey", azureConfig.getAzureConfig().get("account_key"));
+        assertEquals("testkey", azureConfig.getAzureConfig().get("access_key"));
         assertNotNull(azureConfig.getAzureConfig().get("connection_string"));
         
         System.out.println("✅ Azure configuration validation successful");
@@ -127,7 +124,7 @@ public class AzureStorageIntegrationTest {
                 .withAzureCredentials("account1", "key1");
         
         assertEquals("account1", config1.getAzureConfig().get("account_name"));
-        assertEquals("key1", config1.getAzureConfig().get("account_key"));
+        assertEquals("key1", config1.getAzureConfig().get("access_key"));
         
         // Pattern 2: Connection string
         String connectionString = "DefaultEndpointsProtocol=http;AccountName=testaccount;AccountKey=testkey;BlobEndpoint=http://127.0.0.1:10000/testaccount;";
@@ -138,10 +135,8 @@ public class AzureStorageIntegrationTest {
         
         // Pattern 3: Custom endpoint
         String customEndpoint = "http://127.0.0.1:10002/customaccount";
-        SplitCacheManager.CacheConfig config3 = new SplitCacheManager.CacheConfig("azure-config-3")
-                .withAzureEndpoint(customEndpoint);
+        SplitCacheManager.CacheConfig config3 = new SplitCacheManager.CacheConfig("azure-config-3");
         
-        assertEquals(customEndpoint, config3.getAzureConfig().get("endpoint"));
         
         System.out.println("✅ Azure configuration patterns validation successful");
     }

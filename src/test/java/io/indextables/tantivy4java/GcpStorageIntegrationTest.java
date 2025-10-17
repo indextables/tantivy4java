@@ -48,8 +48,7 @@ public class GcpStorageIntegrationTest {
         SplitCacheManager.CacheConfig config = new SplitCacheManager.CacheConfig("gcp-test-cache")
                 .withMaxCacheSize(200_000_000) // 200MB shared cache
                 .withMaxConcurrentLoads(8)
-                .withGcpCredentials(PROJECT_ID, "fake-service-account-key")
-                .withGcpEndpoint(localhostEndpoint);
+                .withGcpCredentials(PROJECT_ID, "fake-service-account-key");
                 
         cacheManager = SplitCacheManager.getInstance(config);
     }
@@ -89,11 +88,9 @@ public class GcpStorageIntegrationTest {
         SplitCacheManager.CacheConfig gcpConfig = new SplitCacheManager.CacheConfig("gcp-custom-test")
                 .withMaxCacheSize(100_000_000)
                 .withGcpCredentials("testproject", "testkey") 
-                .withGcpCredentialsFile("/path/to/credentials.json")
-                .withGcpEndpoint(customEndpoint);
+                .withGcpCredentialsFile("/path/to/credentials.json");
         
         // Verify configuration values
-        assertEquals(customEndpoint, gcpConfig.getGcpConfig().get("endpoint"));
         assertEquals("testproject", gcpConfig.getGcpConfig().get("project_id"));
         assertEquals("testkey", gcpConfig.getGcpConfig().get("service_account_key"));
         assertEquals("/path/to/credentials.json", gcpConfig.getGcpConfig().get("credentials_file"));
@@ -140,10 +137,8 @@ public class GcpStorageIntegrationTest {
         
         // Pattern 3: Custom endpoint
         String customEndpoint = "http://127.0.0.1:9025/custom";
-        SplitCacheManager.CacheConfig config3 = new SplitCacheManager.CacheConfig("gcp-config-3")
-                .withGcpEndpoint(customEndpoint);
+        SplitCacheManager.CacheConfig config3 = new SplitCacheManager.CacheConfig("gcp-config-3");
         
-        assertEquals(customEndpoint, config3.getGcpConfig().get("endpoint"));
         
         System.out.println("✅ GCP configuration patterns validation successful");
     }
@@ -205,23 +200,19 @@ public class GcpStorageIntegrationTest {
         
         SplitCacheManager.CacheConfig serviceAccountConfig = new SplitCacheManager.CacheConfig("gcp-sa-test")
                 .withMaxCacheSize(100_000_000)
-                .withGcpCredentials(PROJECT_ID, "fake-service-account-json-key")
-                .withGcpEndpoint(customEndpoint);
+                .withGcpCredentials(PROJECT_ID, "fake-service-account-json-key");
         
         // Verify service account configuration
         assertEquals(PROJECT_ID, serviceAccountConfig.getGcpConfig().get("project_id"));
         assertEquals("fake-service-account-json-key", serviceAccountConfig.getGcpConfig().get("service_account_key"));
-        assertEquals(customEndpoint, serviceAccountConfig.getGcpConfig().get("endpoint"));
         
         // Test configuration with credentials file
         SplitCacheManager.CacheConfig fileConfig = new SplitCacheManager.CacheConfig("gcp-file-test")
                 .withMaxCacheSize(100_000_000)
-                .withGcpCredentialsFile("/path/to/credentials.json")
-                .withGcpEndpoint(customEndpoint);
+                .withGcpCredentialsFile("/path/to/credentials.json");
         
         // Verify file credentials configuration
         assertEquals("/path/to/credentials.json", fileConfig.getGcpConfig().get("credentials_file"));
-        assertEquals(customEndpoint, fileConfig.getGcpConfig().get("endpoint"));
         
         System.out.println("✅ GCP configuration with credentials and endpoints successful");
     }

@@ -17,7 +17,7 @@ use quickwit_storage::{
     STORAGE_METRICS,
     SplitCache
 };
-use quickwit_config::{StorageConfigs, S3StorageConfig, SearcherConfig, SplitCacheLimits};
+use quickwit_config::{StorageConfigs, S3StorageConfig, AzureStorageConfig, SearcherConfig, SplitCacheLimits};
 use quickwit_search::{SearcherContext, search_permit_provider::SearchPermitProvider};
 use quickwit_search::leaf_cache::LeafSearchCache;
 use quickwit_search::list_fields_cache::ListFieldsCache;
@@ -119,7 +119,7 @@ pub static GLOBAL_STORAGE_RESOLVER: Lazy<StorageResolver> = Lazy::new(|| {
 /// Uses tokio::sync::RwLock to prevent deadlocks in async context
 static CONFIGURED_STORAGE_RESOLVERS: std::sync::OnceLock<TokioRwLock<std::collections::HashMap<String, StorageResolver>>> = std::sync::OnceLock::new();
 
-/// Get or create a cached StorageResolver with specific S3 credentials (async version)
+/// Get or create a cached StorageResolver with specific S3/Azure credentials (async version)
 /// This follows Quickwit's pattern but enables caching for optimal storage instance reuse
 ///
 /// 🚨 CRITICAL: This function should be used for ALL storage resolver creation in ASYNC contexts
@@ -127,7 +127,10 @@ static CONFIGURED_STORAGE_RESOLVERS: std::sync::OnceLock<TokioRwLock<std::collec
 /// bypass caching and cause multiple storage instances.
 ///
 /// ✅ FIXED: Async-compatible using tokio::sync::RwLock to prevent deadlocks
-pub async fn get_configured_storage_resolver_async(s3_config_opt: Option<S3StorageConfig>) -> StorageResolver {
+pub async fn get_configured_storage_resolver_async(
+    s3_config_opt: Option<S3StorageConfig>,
+    azure_config_opt: Option<AzureStorageConfig>
+) -> StorageResolver {
     static RESOLVER_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
 
     if let Some(s3_config) = s3_config_opt {
@@ -181,7 +184,60 @@ pub async fn get_configured_storage_resolver_async(s3_config_opt: Option<S3Stora
         } // <- async write lock released here
 
         resolver
-    } else {
+    }
+    else if let Some(azure_config) = azure_config_opt {
+        // ✅ NEW AZURE LOGIC - EXACT S3 PATTERN
+        let cache_key = format!("azure:{}:{}",
+            azure_config.account_name
+                .as_ref()
+                .map(|n| n.as_str())
+                .unwrap_or("default"),
+            azure_config.access_key
+                .as_ref()
+                .map(|k| &k[..8.min(k.len())])  // First 8 chars for security
+                .unwrap_or("none")
+        );
+
+        let cache = CONFIGURED_STORAGE_RESOLVERS.get_or_init(|| {
+            TokioRwLock::new(HashMap::new())
+        });
+
+        // Try read lock first (async)
+        {
+            let read_cache = cache.read().await;
+            if let Some(cached_resolver) = read_cache.get(&cache_key) {
+                debug_println!("🎯 AZURE_RESOLVER_CACHE_HIT: Reusing resolver for key: {}", cache_key);
+                return cached_resolver.clone();
+            }
+        } // <- Lock released immediately
+
+        // Create resolver OUTSIDE lock (deadlock prevention)
+        let resolver_id = RESOLVER_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        debug_println!("❌ AZURE_RESOLVER_CACHE_MISS: Creating resolver #{} for key: {}",
+                      resolver_id, cache_key);
+        debug_println!("   📋 Azure Config: account={:?}", azure_config.account_name);
+
+        let storage_configs = StorageConfigs::new(vec![
+            quickwit_config::StorageConfig::Azure(azure_config)
+        ]);
+        let resolver = StorageResolver::configured(&storage_configs);
+        debug_println!("✅ AZURE_RESOLVER_CREATED: Resolver #{} at {:p}", resolver_id, &resolver);
+
+        // Cache with write lock (async)
+        {
+            let mut write_cache = cache.write().await;
+            // Double-check for race condition
+            if let Some(existing_resolver) = write_cache.get(&cache_key) {
+                debug_println!("🏃 AZURE_RESOLVER_RACE: Using existing at {:p}", existing_resolver);
+                return existing_resolver.clone();
+            }
+            write_cache.insert(cache_key.clone(), resolver.clone());
+            debug_println!("💾 AZURE_RESOLVER_CACHED: Resolver #{} cached", resolver_id);
+        } // <- Lock released immediately
+
+        resolver
+    }
+    else {
         let resolver_id = RESOLVER_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         debug_println!("🌐 STORAGE_RESOLVER_GLOBAL: Resolver #{} - Using global unconfigured StorageResolver", resolver_id);
         let resolver = GLOBAL_STORAGE_RESOLVER.clone();
@@ -190,11 +246,14 @@ pub async fn get_configured_storage_resolver_async(s3_config_opt: Option<S3Stora
     }
 }
 
-/// Get or create a cached StorageResolver with specific S3 credentials (sync version)
+/// Get or create a cached StorageResolver with specific S3/Azure credentials (sync version)
 /// This version uses a simple sync-safe caching approach for sync contexts
 ///
 /// ✅ FIXED: Now uses deadlock-safe sync caching approach
-pub fn get_configured_storage_resolver(s3_config_opt: Option<S3StorageConfig>) -> StorageResolver {
+pub fn get_configured_storage_resolver(
+    s3_config_opt: Option<S3StorageConfig>,
+    azure_config_opt: Option<AzureStorageConfig>
+) -> StorageResolver {
     use std::sync::{Mutex, Arc};
     use once_cell::sync::Lazy;
 
@@ -247,7 +306,56 @@ pub fn get_configured_storage_resolver(s3_config_opt: Option<S3StorageConfig>) -
         }
 
         resolver
-    } else {
+    }
+    else if let Some(azure_config) = azure_config_opt {
+        // ✅ SAME PATTERN as async but with std::sync::Mutex
+        let cache_key = format!("azure:{}:{}",
+            azure_config.account_name
+                .as_ref()
+                .map(|n| n.as_str())
+                .unwrap_or("default"),
+            azure_config.access_key
+                .as_ref()
+                .map(|k| &k[..8.min(k.len())])  // First 8 chars for security
+                .unwrap_or("none")
+        );
+
+        // Try to get from sync cache
+        {
+            let cache = SYNC_STORAGE_RESOLVERS.lock().unwrap();
+            if let Some(cached_resolver) = cache.get(&cache_key) {
+                debug_println!("🎯 AZURE_RESOLVER_SYNC_CACHE_HIT: Reusing cached sync resolver for key: {} at address {:p}",
+                         cache_key, cached_resolver);
+                return cached_resolver.clone();
+            }
+        }
+
+        // Cache miss - create new resolver
+        let resolver_id = RESOLVER_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        debug_println!("❌ AZURE_RESOLVER_SYNC_CACHE_MISS: Creating new sync resolver #{} for key: {}", resolver_id, cache_key);
+        debug_println!("   📋 Azure Config: account={:?}", azure_config.account_name);
+
+        let storage_configs = StorageConfigs::new(vec![
+            quickwit_config::StorageConfig::Azure(azure_config)
+        ]);
+        let resolver = StorageResolver::configured(&storage_configs);
+        debug_println!("✅ AZURE_RESOLVER_CREATED: Sync resolver #{} created at address {:p}", resolver_id, &resolver);
+
+        // Cache the new resolver
+        {
+            let mut cache = SYNC_STORAGE_RESOLVERS.lock().unwrap();
+            // Double-check in case another thread created it while we were creating ours
+            if let Some(existing_resolver) = cache.get(&cache_key) {
+                debug_println!("🏃 AZURE_RESOLVER_SYNC_RACE: Another thread created sync resolver, using existing at {:p}", existing_resolver);
+                return existing_resolver.clone();
+            }
+            cache.insert(cache_key.clone(), resolver.clone());
+            debug_println!("💾 AZURE_RESOLVER_SYNC_CACHED: Resolver #{} cached for key: {}", resolver_id, cache_key);
+        }
+
+        resolver
+    }
+    else {
         let resolver_id = RESOLVER_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         debug_println!("🌐 STORAGE_RESOLVER_GLOBAL_SYNC: Resolver #{} - Using global unconfigured StorageResolver", resolver_id);
         let resolver = GLOBAL_STORAGE_RESOLVER.clone();

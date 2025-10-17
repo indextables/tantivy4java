@@ -88,10 +88,34 @@
         <dependency>
             <groupId>com.azure</groupId>
             <artifactId>azure-storage-blob</artifactId>
-            <version>12.23.0</version>
+            <version>12.25.0</version>
             <scope>test</scope>
         </dependency>
-        
+
+        <!-- Azure Identity for OAuth token authentication -->
+        <dependency>
+            <groupId>com.azure</groupId>
+            <artifactId>azure-identity</artifactId>
+            <version>1.12.0</version>
+            <scope>test</scope>
+        </dependency>
+
+        <!-- Azure Core - explicit version to ensure compatibility -->
+        <dependency>
+            <groupId>com.azure</groupId>
+            <artifactId>azure-core</artifactId>
+            <version>1.48.0</version>
+            <scope>test</scope>
+        </dependency>
+
+        <!-- Testcontainers for Azurite emulator -->
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>testcontainers</artifactId>
+            <version>1.19.0</version>
+            <scope>test</scope>
+        </dependency>
+
         <!-- GCP Cloud Storage -->
         <dependency>
             <groupId>com.google.cloud</groupId>
@@ -197,7 +221,6 @@
                             <workingDirectory>${project.basedir}/native</workingDirectory>
                             <environmentVariables>
                                 <RUST_BACKTRACE>1</RUST_BACKTRACE>
-                                <RUSTFLAGS>-C debuginfo=2</RUSTFLAGS>
                             </environmentVariables>
                         </configuration>
                     </execution>
@@ -220,7 +243,6 @@
                             <outputDirectory>${project.build.outputDirectory}/native</outputDirectory>
                             <resources>
                                 <resource>
-                                    <!-- Use debug directory for debug builds with full symbols -->
                                     <directory>${rust.target.dir}/release</directory>
                                     <includes>
                                         <include>libtantivy4java.so</include>
@@ -390,8 +412,8 @@
                                     </arguments>
                                     <workingDirectory>${project.basedir}/native</workingDirectory>
                                     <environmentVariables>
-                                        <!-- Optimize for x86_64 Linux with debug symbols -->
-                                        <RUSTFLAGS>-C target-cpu=x86-64 -C debuginfo=2</RUSTFLAGS>
+                                        <!-- Optimize for x86_64 Linux -->
+                                        <RUSTFLAGS>-C target-cpu=x86-64</RUSTFLAGS>
                                         <RUST_BACKTRACE>1</RUST_BACKTRACE>
                                     </environmentVariables>
                                 </configuration>

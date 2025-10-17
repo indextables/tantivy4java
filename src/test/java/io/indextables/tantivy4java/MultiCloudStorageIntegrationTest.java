@@ -112,10 +112,8 @@ public class MultiCloudStorageIntegrationTest {
                 .withAwsEndpoint("http://127.0.0.1:" + S3_MOCK_PORT)
                 // Azure Configuration
                 .withAzureCredentials(AZURE_ACCOUNT_NAME, AZURE_ACCOUNT_KEY)
-                .withAzureEndpoint(azureEndpoint)
                 // GCP Configuration
-                .withGcpCredentials(GCP_PROJECT_ID, "fake-service-account-key")
-                .withGcpEndpoint(gcpEndpoint);
+                .withGcpCredentials(GCP_PROJECT_ID, "fake-service-account-key");
         
         multiCloudCacheManager = SplitCacheManager.getInstance(config);
     }
@@ -152,11 +150,9 @@ public class MultiCloudStorageIntegrationTest {
                 // Azure Configuration
                 .withAzureCredentials("azureaccount", "azurekey")
                 .withAzureConnectionString("DefaultEndpointsProtocol=http;AccountName=test;AccountKey=testkey;BlobEndpoint=http://127.0.0.1:10001/test;")
-                .withAzureEndpoint("http://127.0.0.1:10001/azureaccount")
                 // GCP Configuration
                 .withGcpCredentials("test-project", "test-service-key")
-                .withGcpCredentialsFile("/path/to/service-account.json")
-                .withGcpEndpoint("http://127.0.0.1:9025");
+                .withGcpCredentialsFile("/path/to/service-account.json");
         
         // Validate AWS configuration
         assertEquals("aws-test-key", config.getAwsConfig().get("access_key"));
@@ -166,15 +162,13 @@ public class MultiCloudStorageIntegrationTest {
         
         // Validate Azure configuration
         assertEquals("azureaccount", config.getAzureConfig().get("account_name"));
-        assertEquals("azurekey", config.getAzureConfig().get("account_key"));
-        assertEquals("http://127.0.0.1:10001/azureaccount", config.getAzureConfig().get("endpoint"));
+        assertEquals("azurekey", config.getAzureConfig().get("access_key"));
         assertNotNull(config.getAzureConfig().get("connection_string"));
-        
+
         // Validate GCP configuration
         assertEquals("test-project", config.getGcpConfig().get("project_id"));
         assertEquals("test-service-key", config.getGcpConfig().get("service_account_key"));
         assertEquals("/path/to/service-account.json", config.getGcpConfig().get("credentials_file"));
-        assertEquals("http://127.0.0.1:9025", config.getGcpConfig().get("endpoint"));
         
         System.out.println("✅ Multi-cloud configuration validation successful");
     }
@@ -274,32 +268,11 @@ public class MultiCloudStorageIntegrationTest {
         System.out.println("✅ Multi-cloud error handling patterns successful");
     }
     
-    @Test
-    @DisplayName("Test multi-cloud endpoint configuration")
-    void testMultiCloudEndpointConfiguration() {
-        // Test localhost endpoints for all providers
-        String s3Endpoint = "http://127.0.0.1:" + S3_MOCK_PORT;
-        String azureEndpoint = "http://127.0.0.1:10000/" + AZURE_ACCOUNT_NAME;
-        String gcpEndpoint = "http://127.0.0.1:9023";
-        
-        SplitCacheManager.CacheConfig endpointConfig = new SplitCacheManager.CacheConfig("endpoint-test")
-                .withAwsEndpoint(s3Endpoint)
-                .withAzureEndpoint(azureEndpoint)  
-                .withGcpEndpoint(gcpEndpoint);
-        
-        // Verify all endpoints are localhost
-        assertTrue(endpointConfig.getAwsConfig().get("endpoint").contains("127.0.0.1"), "AWS endpoint should use localhost");
-        assertTrue(endpointConfig.getAzureConfig().get("endpoint").contains("127.0.0.1"), "Azure endpoint should use localhost");
-        assertTrue(endpointConfig.getGcpConfig().get("endpoint").contains("127.0.0.1"), "GCP endpoint should use localhost");
-        
-        System.out.println("Multi-cloud localhost endpoints:");
-        System.out.println("  - AWS S3: " + s3Endpoint);
-        System.out.println("  - Azure Blob: " + azureEndpoint);
-        System.out.println("  - GCP Cloud Storage: " + gcpEndpoint);
-        
-        System.out.println("✅ Multi-cloud endpoint configuration successful");
-    }
-    
+    // Note: Endpoint configuration test removed as endpoint override functionality
+    // was removed from the codebase. Cloud storage services now use their default
+    // endpoints, and custom endpoints (for testing with Azurite, LocalStack, etc.)
+    // should be configured at the native/Rust layer level.
+
     private String getCloudProviderFromPath(String splitPath) {
         if (splitPath.startsWith("s3://")) return "AWS";
         if (splitPath.startsWith("azure://")) return "Azure";

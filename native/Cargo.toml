@@ -30,7 +30,8 @@ once_cell = "1.19.0"
 bytesize = "1.3"
 
 # Quickwit dependencies (for main library only - binaries use lightweight approach)
-quickwit-storage = { path = "../../quickwit/quickwit/quickwit-storage" }
+# Azure feature enabled for Azure Blob Storage support
+quickwit-storage = { path = "../../quickwit/quickwit/quickwit-storage", features = ["azure"] }
 quickwit-metastore = { path = "../../quickwit/quickwit/quickwit-metastore" }
 quickwit-proto = { path = "../../quickwit/quickwit/quickwit-proto" }
 quickwit-directories = { path = "../../quickwit/quickwit/quickwit-directories" }
