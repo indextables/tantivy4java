@@ -69,11 +69,12 @@ codegen-units = 256  # Parallel compilation for faster debug builds
 incremental = true   # Enable incremental compilation
 
 [profile.release]
-debug = 2            # Maximum debug symbols in release builds too
+debug = 0            # No debug info for smallest binary
 debug-assertions = false
 overflow-checks = false
-opt-level = 3        # Full optimization for release
-panic = "unwind"     # Enable stack unwinding for production debugging
-lto = false          # Disable link-time optimization to preserve debug info
-codegen-units = 1    # Better debugging but slower compilation
+opt-level = "z"      # Optimize for size
+panic = "unwind"     # Keep unwinding tables for better error handling
+lto = "thin"         # Thin LTO for good size reduction without extreme compile time
+codegen-units = 1    # Single codegen unit for better optimization
 incremental = false  # No incremental compilation for release
+strip = true         # Strip symbols from binary
