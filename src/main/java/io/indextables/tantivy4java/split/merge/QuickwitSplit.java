@@ -589,43 +589,170 @@ public class QuickwitSplit {
     }
 
     /**
-     * Configuration for split merging operations with optional S3/AWS support.
-     * 
-     * <p>This class configures split merge operations, including metadata for the resulting
-     * merged split and optional AWS credentials for accessing remote S3 splits.
-     * 
+     * Azure Blob Storage configuration for accessing Azure-hosted splits.
+     *
+     * <p>This class provides configuration for accessing Azure Blob Storage splits using
+     * Azure credentials. It supports multiple authentication methods and custom endpoints
+     * for testing with Azurite emulator.
+     *
      * <h3>Usage Examples:</h3>
-     * 
+     *
+     * <h4>Basic Azure Credentials:</h4>
+     * <pre>{@code
+     * AzureConfig config = new AzureConfig("storageaccount", "accesskey");
+     * }</pre>
+     *
+     * <h4>Connection String Authentication:</h4>
+     * <pre>{@code
+     * AzureConfig config = AzureConfig.fromConnectionString(
+     *     "DefaultEndpointsProtocol=https;AccountName=myaccount;AccountKey=mykey;EndpointSuffix=core.windows.net"
+     * );
+     * }</pre>
+     *
+     * @see MergeConfig#MergeConfig(String, String, String, AwsConfig, AzureConfig) for integration
+     * @since 0.25.0
+     */
+    public static class AzureConfig {
+        private final String accountName;
+        private final String accountKey;
+        private final String bearerToken;
+        private final String connectionString;
+
+        /**
+         * Create Azure configuration with account name and access key.
+         *
+         * @param accountName Azure storage account name
+         * @param accountKey Azure storage account access key
+         */
+        public AzureConfig(String accountName, String accountKey) {
+            this(accountName, accountKey, null, null);
+        }
+
+        /**
+         * Create Azure configuration with OAuth bearer token authentication.
+         *
+         * @param accountName Azure storage account name
+         * @param bearerToken OAuth bearer token for Azure AD authentication
+         * @return AzureConfig instance with bearer token authentication
+         */
+        public static AzureConfig withBearerToken(String accountName, String bearerToken) {
+            return new AzureConfig(accountName, null, bearerToken, null);
+        }
+
+        /**
+         * Create Azure configuration with all options.
+         *
+         * @param accountName Azure storage account name
+         * @param accountKey Azure storage account access key
+         * @param bearerToken OAuth bearer token (optional, for Azure AD authentication)
+         * @param connectionString Full connection string (optional, overrides other settings)
+         */
+        private AzureConfig(String accountName, String accountKey, String bearerToken, String connectionString) {
+            this.accountName = accountName;
+            this.accountKey = accountKey;
+            this.bearerToken = bearerToken;
+            this.connectionString = connectionString;
+        }
+
+        /**
+         * Create Azure configuration from a connection string.
+         *
+         * @param connectionString Azure storage connection string
+         * @return AzureConfig instance
+         */
+        public static AzureConfig fromConnectionString(String connectionString) {
+            // Parse account name from connection string for convenience
+            String accountName = extractAccountNameFromConnectionString(connectionString);
+            return new AzureConfig(accountName, null, null, connectionString);
+        }
+
+        /**
+         * Extract account name from connection string.
+         */
+        private static String extractAccountNameFromConnectionString(String connectionString) {
+            if (connectionString == null || connectionString.isEmpty()) {
+                return "unknown";
+            }
+            String[] parts = connectionString.split(";");
+            for (String part : parts) {
+                if (part.trim().startsWith("AccountName=")) {
+                    return part.substring(part.indexOf('=') + 1).trim();
+                }
+            }
+            return "unknown";
+        }
+
+        public String getAccountName() { return accountName; }
+        public String getAccountKey() { return accountKey; }
+        public String getBearerToken() { return bearerToken; }
+        public String getConnectionString() { return connectionString; }
+
+        /**
+         * Check if this configuration uses a connection string.
+         */
+        public boolean usesConnectionString() {
+            return connectionString != null && !connectionString.isEmpty();
+        }
+    }
+
+    /**
+     * Configuration for split merging operations with optional S3/AWS and Azure support.
+     *
+     * <p>This class configures split merge operations using a fluent builder pattern.
+     *
+     * <h3>Usage Examples:</h3>
+     *
      * <h4>Local Split Merging:</h4>
      * <pre>{@code
-     * MergeConfig config = new MergeConfig("my-index", "my-source", "my-node");
+     * MergeConfig config = MergeConfig.builder()
+     *     .indexUid("my-index")
+     *     .sourceId("my-source")
+     *     .nodeId("my-node")
+     *     .build();
      * }</pre>
-     * 
+     *
      * <h4>S3 Remote Split Merging:</h4>
      * <pre>{@code
      * AwsConfig awsConfig = new AwsConfig("access-key", "secret-key", "us-east-1");
-     * MergeConfig config = new MergeConfig("my-index", "my-source", "my-node", awsConfig);
+     * MergeConfig config = MergeConfig.builder()
+     *     .indexUid("my-index")
+     *     .sourceId("my-source")
+     *     .nodeId("my-node")
+     *     .awsConfig(awsConfig)
+     *     .build();
      * }</pre>
-     * 
-     * <h4>Advanced Configuration:</h4>
+     *
+     * <h4>Azure Remote Split Merging:</h4>
      * <pre>{@code
-     * AwsConfig awsConfig = new AwsConfig("access", "secret", "us-east-1");
-     * List<String> deleteQueries = Arrays.asList("deleted:true");
-     * 
-     * MergeConfig config = new MergeConfig(
-     *     "distributed-index",    // Index UID
-     *     "data-source",         // Source ID  
-     *     "worker-node",         // Node ID
-     *     "mapping-v1",          // Document mapping UID
-     *     42L,                   // Partition ID
-     *     deleteQueries,         // Delete queries to apply
-     *     awsConfig              // AWS credentials for S3
-     * );
+     * AzureConfig azureConfig = new AzureConfig("storageaccount", "accesskey");
+     * MergeConfig config = MergeConfig.builder()
+     *     .indexUid("my-index")
+     *     .sourceId("my-source")
+     *     .nodeId("my-node")
+     *     .azureConfig(azureConfig)
+     *     .build();
      * }</pre>
-     * 
+     *
+     * <h4>Multi-Cloud Configuration:</h4>
+     * <pre>{@code
+     * MergeConfig config = MergeConfig.builder()
+     *     .indexUid("distributed-index")
+     *     .sourceId("data-source")
+     *     .nodeId("worker-node")
+     *     .docMappingUid("mapping-v1")
+     *     .partitionId(42L)
+     *     .awsConfig(awsConfig)
+     *     .azureConfig(azureConfig)
+     *     .deleteQueries(Arrays.asList("deleted:true"))
+     *     .heapSizeBytes(256_000_000L)
+     *     .debugEnabled(true)
+     *     .build();
+     * }</pre>
+     *
      * @see AwsConfig for S3 credential configuration
+     * @see AzureConfig for Azure Blob Storage credential configuration
      * @see #mergeSplits(List, String, MergeConfig) for usage
-     * @since 0.24.0
+     * @since 0.25.0
      */
     public static class MergeConfig {
         private final String indexUid;
@@ -635,128 +762,86 @@ public class QuickwitSplit {
         private final long partitionId;
         private final List<String> deleteQueries;
         private final AwsConfig awsConfig;
+        private final AzureConfig azureConfig;
         private final String tempDirectoryPath;
         private final Long heapSizeBytes;
         private final boolean debugEnabled;
 
-        /**
-         * Create a new merge configuration.
-         *
-         * @param indexUid Unique identifier for the index
-         * @param sourceId Source identifier
-         * @param nodeId Node identifier that will create the merged split
-         * @param docMappingUid Document mapping unique identifier (must match across all splits)
-         * @param partitionId Partition identifier (default: 0)
-         * @param deleteQueries Optional list of delete queries to apply during merge
-         * @param awsConfig AWS configuration for S3 access (optional)
-         * @param tempDirectoryPath Custom path for temporary directories (optional, platform-specific)
-         * @param heapSizeBytes Heap size in bytes for merge operations (optional, null for default 15MB)
-         * @param debugEnabled Enable debug logging in child merge process
-         */
-        public MergeConfig(String indexUid, String sourceId, String nodeId, String docMappingUid,
-                          long partitionId, List<String> deleteQueries, AwsConfig awsConfig, String tempDirectoryPath, Long heapSizeBytes, boolean debugEnabled) {
-            this.indexUid = indexUid;
-            this.sourceId = sourceId;
-            this.nodeId = nodeId;
-            this.docMappingUid = docMappingUid;
-            this.partitionId = partitionId;
-            this.deleteQueries = deleteQueries;
-            this.awsConfig = awsConfig;
-            this.tempDirectoryPath = tempDirectoryPath;
-            this.heapSizeBytes = heapSizeBytes;
-            this.debugEnabled = debugEnabled;
+        private MergeConfig(Builder builder) {
+            this.indexUid = builder.indexUid;
+            this.sourceId = builder.sourceId;
+            this.nodeId = builder.nodeId;
+            this.docMappingUid = builder.docMappingUid;
+            this.partitionId = builder.partitionId;
+            this.deleteQueries = builder.deleteQueries;
+            this.awsConfig = builder.awsConfig;
+            this.azureConfig = builder.azureConfig;
+            this.tempDirectoryPath = builder.tempDirectoryPath;
+            this.heapSizeBytes = builder.heapSizeBytes;
+            this.debugEnabled = builder.debugEnabled;
         }
 
         /**
-         * Create a new merge configuration without temp directory customization.
-         *
-         * @param indexUid Unique identifier for the index
-         * @param sourceId Source identifier
-         * @param nodeId Node identifier that will create the merged split
-         * @param docMappingUid Document mapping unique identifier (must match across all splits)
-         * @param partitionId Partition identifier (default: 0)
-         * @param deleteQueries Optional list of delete queries to apply during merge
-         * @param awsConfig AWS configuration for S3 access (optional)
+         * Create a new builder for MergeConfig.
          */
+        public static Builder builder() {
+            return new Builder();
+        }
+
+        /**
+         * Backward compatibility: Create a minimal merge configuration.
+         * @deprecated Use {@link #builder()} instead
+         */
+        @Deprecated
+        public MergeConfig(String indexUid, String sourceId, String nodeId) {
+            this(builder().indexUid(indexUid).sourceId(sourceId).nodeId(nodeId));
+        }
+
+        /**
+         * Backward compatibility: Create merge configuration with AWS config.
+         * @deprecated Use {@link #builder()} instead
+         */
+        @Deprecated
+        public MergeConfig(String indexUid, String sourceId, String nodeId, AwsConfig awsConfig) {
+            this(builder().indexUid(indexUid).sourceId(sourceId).nodeId(nodeId).awsConfig(awsConfig));
+        }
+
+        /**
+         * Backward compatibility: Full 10-parameter constructor.
+         * @deprecated Use {@link #builder()} instead
+         */
+        @Deprecated
+        public MergeConfig(String indexUid, String sourceId, String nodeId, String docMappingUid,
+                          long partitionId, List<String> deleteQueries, AwsConfig awsConfig,
+                          String tempDirectoryPath, Long heapSizeBytes, boolean debugEnabled) {
+            this(builder()
+                .indexUid(indexUid)
+                .sourceId(sourceId)
+                .nodeId(nodeId)
+                .docMappingUid(docMappingUid)
+                .partitionId(partitionId)
+                .deleteQueries(deleteQueries)
+                .awsConfig(awsConfig)
+                .tempDirectoryPath(tempDirectoryPath)
+                .heapSizeBytes(heapSizeBytes)
+                .debugEnabled(debugEnabled));
+        }
+
+        /**
+         * Backward compatibility: 7-parameter constructor with AWS config.
+         * @deprecated Use {@link #builder()} instead
+         */
+        @Deprecated
         public MergeConfig(String indexUid, String sourceId, String nodeId, String docMappingUid,
                           long partitionId, List<String> deleteQueries, AwsConfig awsConfig) {
-            this(indexUid, sourceId, nodeId, docMappingUid, partitionId, deleteQueries, awsConfig, null, null, false);
-        }
-        
-        /**
-         * Create a new merge configuration without AWS config.
-         *
-         * @param indexUid Unique identifier for the index
-         * @param sourceId Source identifier
-         * @param nodeId Node identifier that will create the merged split
-         * @param docMappingUid Document mapping unique identifier (must match across all splits)
-         * @param partitionId Partition identifier (default: 0)
-         * @param deleteQueries Optional list of delete queries to apply during merge
-         */
-        public MergeConfig(String indexUid, String sourceId, String nodeId, String docMappingUid,
-                          long partitionId, List<String> deleteQueries) {
-            this(indexUid, sourceId, nodeId, docMappingUid, partitionId, deleteQueries, null, null, null, false);
-        }
-
-        /**
-         * Create a minimal merge configuration.
-         *
-         * @param indexUid Unique identifier for the index
-         * @param sourceId Source identifier
-         * @param nodeId Node identifier that will create the merged split
-         */
-        public MergeConfig(String indexUid, String sourceId, String nodeId) {
-            this(indexUid, sourceId, nodeId, "default", 0L, null, null, null, null, false);
-        }
-
-        /**
-         * Create a merge configuration with AWS config for S3 splits.
-         *
-         * @param indexUid Unique identifier for the index
-         * @param sourceId Source identifier
-         * @param nodeId Node identifier that will create the merged split
-         * @param awsConfig AWS configuration for S3 access
-         */
-        public MergeConfig(String indexUid, String sourceId, String nodeId, AwsConfig awsConfig) {
-            this(indexUid, sourceId, nodeId, "default", 0L, null, awsConfig, null, null, false);
-        }
-
-        /**
-         * Create a merge configuration with custom temp directory for platforms like Databricks.
-         *
-         * @param indexUid Unique identifier for the index
-         * @param sourceId Source identifier
-         * @param nodeId Node identifier that will create the merged split
-         * @param awsConfig AWS configuration for S3 access
-         * @param tempDirectoryPath Custom temp directory path (e.g., "/local_disk0" for Databricks)
-         */
-        public MergeConfig(String indexUid, String sourceId, String nodeId, AwsConfig awsConfig, String tempDirectoryPath) {
-            this(indexUid, sourceId, nodeId, "default", 0L, null, awsConfig, tempDirectoryPath, null, false);
-        }
-
-        /**
-         * Create a merge configuration with heap size control.
-         *
-         * @param indexUid Unique identifier for the index
-         * @param sourceId Source identifier
-         * @param nodeId Node identifier that will create the merged split
-         * @param heapSizeBytes Heap size in bytes for merge operations
-         */
-        public MergeConfig(String indexUid, String sourceId, String nodeId, Long heapSizeBytes) {
-            this(indexUid, sourceId, nodeId, "default", 0L, null, null, null, heapSizeBytes, false);
-        }
-
-        /**
-         * Create a merge configuration with debug enabled.
-         *
-         * @param indexUid Unique identifier for the index
-         * @param sourceId Source identifier
-         * @param nodeId Node identifier that will create the merged split
-         * @param awsConfig AWS configuration for S3 access
-         * @param debugEnabled Enable debug logging in child merge process
-         */
-        public MergeConfig(String indexUid, String sourceId, String nodeId, AwsConfig awsConfig, boolean debugEnabled) {
-            this(indexUid, sourceId, nodeId, "default", 0L, null, awsConfig, null, null, debugEnabled);
+            this(builder()
+                .indexUid(indexUid)
+                .sourceId(sourceId)
+                .nodeId(nodeId)
+                .docMappingUid(docMappingUid)
+                .partitionId(partitionId)
+                .deleteQueries(deleteQueries)
+                .awsConfig(awsConfig));
         }
 
         // Getters
@@ -767,9 +852,97 @@ public class QuickwitSplit {
         public long getPartitionId() { return partitionId; }
         public List<String> getDeleteQueries() { return deleteQueries; }
         public AwsConfig getAwsConfig() { return awsConfig; }
+        public AzureConfig getAzureConfig() { return azureConfig; }
         public String getTempDirectoryPath() { return tempDirectoryPath; }
         public Long getHeapSizeBytes() { return heapSizeBytes; }
         public boolean isDebugEnabled() { return debugEnabled; }
+
+        /**
+         * Builder for MergeConfig using fluent API.
+         */
+        public static class Builder {
+            private String indexUid;
+            private String sourceId;
+            private String nodeId;
+            private String docMappingUid = "default";
+            private long partitionId = 0L;
+            private List<String> deleteQueries = null;
+            private AwsConfig awsConfig = null;
+            private AzureConfig azureConfig = null;
+            private String tempDirectoryPath = null;
+            private Long heapSizeBytes = null;
+            private boolean debugEnabled = false;
+
+            private Builder() {}
+
+            public Builder indexUid(String indexUid) {
+                this.indexUid = indexUid;
+                return this;
+            }
+
+            public Builder sourceId(String sourceId) {
+                this.sourceId = sourceId;
+                return this;
+            }
+
+            public Builder nodeId(String nodeId) {
+                this.nodeId = nodeId;
+                return this;
+            }
+
+            public Builder docMappingUid(String docMappingUid) {
+                this.docMappingUid = docMappingUid;
+                return this;
+            }
+
+            public Builder partitionId(long partitionId) {
+                this.partitionId = partitionId;
+                return this;
+            }
+
+            public Builder deleteQueries(List<String> deleteQueries) {
+                this.deleteQueries = deleteQueries;
+                return this;
+            }
+
+            public Builder awsConfig(AwsConfig awsConfig) {
+                this.awsConfig = awsConfig;
+                return this;
+            }
+
+            public Builder azureConfig(AzureConfig azureConfig) {
+                this.azureConfig = azureConfig;
+                return this;
+            }
+
+            public Builder tempDirectoryPath(String tempDirectoryPath) {
+                this.tempDirectoryPath = tempDirectoryPath;
+                return this;
+            }
+
+            public Builder heapSizeBytes(Long heapSizeBytes) {
+                this.heapSizeBytes = heapSizeBytes;
+                return this;
+            }
+
+            public Builder debugEnabled(boolean debugEnabled) {
+                this.debugEnabled = debugEnabled;
+                return this;
+            }
+
+            public MergeConfig build() {
+                if (indexUid == null || indexUid.trim().isEmpty()) {
+                    throw new IllegalArgumentException("indexUid cannot be null or empty");
+                }
+                if (sourceId == null || sourceId.trim().isEmpty()) {
+                    throw new IllegalArgumentException("sourceId cannot be null or empty");
+                }
+                if (nodeId == null || nodeId.trim().isEmpty()) {
+                    throw new IllegalArgumentException("nodeId cannot be null or empty");
+                }
+                return new MergeConfig(this);
+            }
+        }
     }
 
     /**
