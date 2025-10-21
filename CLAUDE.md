@@ -264,10 +264,21 @@ QuickwitSplit.SplitMetadata result = QuickwitSplit.mergeSplits(
 - **✅ QuickwitSplit.mergeSplits() with Azure** - Production-ready split merging with full Azure Blob Storage support
 - **✅ Multi-Protocol Support** - Seamlessly handles azure:// URLs alongside s3:// and local files
 - **✅ Azure Authentication Methods** - Full support for account keys, OAuth bearer tokens, and connection strings
-- **✅ Azure Active Directory Integration** - OAuth 2.0 bearer token authentication for managed identities
+- **✅ Azure Active Directory Integration** - OAuth 2.0 bearer token authentication via Service Principal or Managed Identity
 - **✅ Multi-Cloud Architecture** - Mix Azure and AWS splits in single merge operations
 - **✅ Memory-Optimized** - Uses Quickwit's proven MergeExecutor pattern for large-scale indices
 - **✅ Azurite Support** - Complete local testing with Azure Storage Emulator
+
+**Azure Authentication Methods Summary:**
+
+Tantivy4java supports three Azure authentication methods:
+
+1. **Shared Key Authentication** (Account Key) - Simple, uses storage account name + access key
+2. **OAuth 2.0 Bearer Token** - Enterprise-grade, uses Azure AD authentication:
+   - **Service Principal (Client Credentials)** - For applications (recommended for production)
+   - **Managed Identity** - For Azure VMs/App Services (automatic authentication)
+   - **Azure CLI** - For development/testing
+3. **Connection String** - Legacy method, combines account name and key in single string
 
 **Azure Authentication Patterns:**
 
@@ -287,12 +298,49 @@ QuickwitSplit.MergeConfig config = QuickwitSplit.MergeConfig.builder()
     .build();
 ```
 
-**2. OAuth Bearer Token Authentication (Azure AD / Managed Identity):**
+**2. OAuth Bearer Token Authentication (Azure AD / Service Principal):**
+
+OAuth bearer tokens provide enterprise-grade security using Azure Active Directory. The token must be obtained separately using Azure AD authentication flows.
+
+**How to Obtain OAuth Bearer Token:**
+
+There are several methods to obtain an OAuth 2.0 bearer token for Azure Storage:
+
+**Method A: Azure Service Principal (Client Credentials Flow)**
+
+This is the recommended method for application authentication, used in `RealAzureEndToEndTest.step10_oauthBearerTokenEndToEndTest()`:
+
 ```java
-// Create Azure configuration with OAuth bearer token
+// Required credentials from ~/.azure/credentials:
+// [default]
+// storage_account=<your-storage-account>
+// client_id=<service-principal-client-id>
+// client_secret=<service-principal-client-secret>
+// tenant_id=<azure-tenant-id>
+
+import com.azure.identity.ClientSecretCredential;
+import com.azure.identity.ClientSecretCredentialBuilder;
+import com.azure.core.credential.AccessToken;
+import com.azure.core.credential.TokenRequestContext;
+
+// Create Service Principal credential
+ClientSecretCredential credential = new ClientSecretCredentialBuilder()
+    .clientId(clientId)           // From Azure AD App Registration
+    .clientSecret(clientSecret)   // From Azure AD App Registration
+    .tenantId(tenantId)          // Your Azure AD Tenant ID
+    .build();
+
+// Acquire OAuth 2.0 bearer token
+TokenRequestContext context = new TokenRequestContext()
+    .addScopes("https://storage.azure.com/.default");
+
+AccessToken token = credential.getToken(context).block();
+String bearerToken = token.getToken();  // This is your OAuth bearer token
+
+// Use the bearer token with tantivy4java
 QuickwitSplit.AzureConfig oauthConfig = QuickwitSplit.AzureConfig.withBearerToken(
-    "mystorageaccount",              // Azure storage account name
-    "eyJ0eXAiOiJKV1QiLCJhbGc..."     // OAuth 2.0 bearer token from Azure AD
+    "mystorageaccount",  // Azure storage account name
+    bearerToken          // OAuth 2.0 JWT bearer token from Azure AD
 );
 
 QuickwitSplit.MergeConfig config = QuickwitSplit.MergeConfig.builder()
@@ -301,6 +349,82 @@ QuickwitSplit.MergeConfig config = QuickwitSplit.MergeConfig.builder()
     .nodeId("worker-1")
     .azureConfig(oauthConfig)
     .build();
+```
+
+**Method B: Azure Managed Identity (for Azure VMs/App Services)**
+
+```java
+import com.azure.identity.ManagedIdentityCredential;
+import com.azure.identity.ManagedIdentityCredentialBuilder;
+
+// Use Managed Identity (automatically available in Azure VMs/App Services)
+ManagedIdentityCredential credential = new ManagedIdentityCredentialBuilder()
+    .build();
+
+TokenRequestContext context = new TokenRequestContext()
+    .addScopes("https://storage.azure.com/.default");
+
+AccessToken token = credential.getToken(context).block();
+String bearerToken = token.getToken();
+
+// Use with tantivy4java
+QuickwitSplit.AzureConfig oauthConfig = QuickwitSplit.AzureConfig.withBearerToken(
+    storageAccountName, bearerToken);
+```
+
+**Method C: Azure CLI (for development/testing)**
+
+```bash
+# Obtain bearer token using Azure CLI
+az account get-access-token --resource https://storage.azure.com/ --query accessToken -o tsv
+```
+
+Then use the token in Java:
+
+```java
+String bearerToken = "eyJ0eXAiOiJKV1QiLCJhbGc...";  // Token from Azure CLI
+QuickwitSplit.AzureConfig oauthConfig = QuickwitSplit.AzureConfig.withBearerToken(
+    "mystorageaccount", bearerToken);
+```
+
+**Setting Up Azure Service Principal:**
+
+1. Create Azure AD App Registration:
+   ```bash
+   az ad app create --display-name "tantivy4java-service-principal"
+   ```
+
+2. Create Service Principal and note the credentials:
+   ```bash
+   az ad sp create-for-rbac --name "tantivy4java-sp" \
+       --role "Storage Blob Data Contributor" \
+       --scopes /subscriptions/{subscription-id}/resourceGroups/{resource-group}/providers/Microsoft.Storage/storageAccounts/{storage-account}
+   ```
+
+3. Save credentials to `~/.azure/credentials`:
+   ```ini
+   [default]
+   storage_account=yourstorageaccount
+   client_id=<appId from step 2>
+   client_secret=<password from step 2>
+   tenant_id=<tenant from step 2>
+   ```
+
+**Token Lifecycle Management:**
+
+OAuth tokens expire (typically after 1 hour). For long-running applications, implement token refresh:
+
+```java
+// Check token expiration
+if (token.getExpiresAt().isBefore(java.time.OffsetDateTime.now())) {
+    // Refresh token
+    token = credential.getToken(context).block();
+    bearerToken = token.getToken();
+
+    // Update configuration with new token
+    oauthConfig = QuickwitSplit.AzureConfig.withBearerToken(
+        storageAccountName, bearerToken);
+}
 ```
 
 **3. Connection String Authentication:**
@@ -392,21 +516,43 @@ try (SplitCacheManager cacheManager = SplitCacheManager.getInstance(azureCache))
 ```
 
 **OAuth Bearer Token Authentication:**
+
+OAuth bearer tokens must be obtained using Azure AD authentication (see QuickwitSplit OAuth section above for token acquisition methods):
+
 ```java
+// First, obtain OAuth bearer token using Azure Service Principal
+import com.azure.identity.ClientSecretCredential;
+import com.azure.identity.ClientSecretCredentialBuilder;
+import com.azure.core.credential.TokenRequestContext;
+
+ClientSecretCredential credential = new ClientSecretCredentialBuilder()
+    .clientId(clientId)
+    .clientSecret(clientSecret)
+    .tenantId(tenantId)
+    .build();
+
+TokenRequestContext context = new TokenRequestContext()
+    .addScopes("https://storage.azure.com/.default");
+
+String bearerToken = credential.getToken(context).block().getToken();
+
 // Configure cache with OAuth bearer token
 SplitCacheManager.CacheConfig oauthCache =
     new SplitCacheManager.CacheConfig("azure-oauth-cache")
         .withMaxCacheSize(500_000_000)
-        .withAzureBearerToken("myaccount", "eyJ0eXAiOiJKV1QiLCJhbGc...");
+        .withAzureBearerToken("myaccount", bearerToken);
 
 try (SplitCacheManager cacheManager = SplitCacheManager.getInstance(oauthCache)) {
     // OAuth-authenticated access to Azure splits
     try (SplitSearcher searcher = cacheManager.createSplitSearcher(
             "azure://container/split.split")) {
         // Same search operations as account key authentication
+        SearchResult results = searcher.search(query, 10);
     }
 }
 ```
+
+**Note:** See `RealAzureEndToEndTest.step10_oauthBearerTokenEndToEndTest()` for a complete working example of OAuth bearer token authentication.
 
 **Azure Testing with Azurite:**
 ```java
@@ -438,6 +584,11 @@ azurite.stop();
 - **🧪 Local Testing** - Azurite emulator support for development and CI/CD
 - **🔒 Enterprise Security** - Azure AD integration for role-based access control
 - **🔧 DevOps Friendly** - Container-ready with managed identity support
+
+**Complete Test Examples:**
+- **Account Key Authentication**: See `AzureAggregationTest.java` - Tests all aggregation operations with shared key auth
+- **OAuth Bearer Token Authentication**: See `RealAzureEndToEndTest.step10_oauthBearerTokenEndToEndTest()` - Complete OAuth flow using Azure Service Principal
+- **Credentials File**: Both tests support loading credentials from `~/.azure/credentials` file
 
 **Note on Endpoint Configuration:**
 Custom endpoint override functionality was removed in January 2025 as it didn't work correctly with Azure's authentication flow. For local testing with Azurite or custom endpoints, configure these at the native/Rust layer level. The standard Azure SDK configuration handles production endpoints automatically.
