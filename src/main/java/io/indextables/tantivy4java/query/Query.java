@@ -300,6 +300,94 @@ public class Query implements AutoCloseable {
     }
 
     /**
+     * Create a JSON term query using JSONPath syntax.
+     *
+     * <p>Searches for an exact term within a JSON field using JSONPath to specify
+     * the nested field location. For example, "user.name" searches within the "name"
+     * field nested under "user".
+     *
+     * <p>Example:
+     * <pre>
+     * Query query = Query.jsonTermQuery(schema, "attributes", "user.name", "John");
+     * </pre>
+     *
+     * @param schema Schema for field validation
+     * @param fieldName JSON field name
+     * @param jsonPath JSONPath to nested value (e.g., "user.name", "cart.items.price")
+     * @param termValue Term value to search for
+     * @return New Query instance
+     */
+    public static Query jsonTermQuery(Schema schema, String fieldName, String jsonPath, Object termValue) {
+        long ptr = nativeJsonTermQuery(schema.getNativePtr(), fieldName, jsonPath, termValue);
+        return new Query(ptr);
+    }
+
+    /**
+     * Create a JSON range query using JSONPath syntax.
+     *
+     * <p>Searches for values within a range in a JSON field using JSONPath.
+     * Useful for numeric and date fields within JSON objects.
+     *
+     * <p>Example:
+     * <pre>
+     * Query query = Query.jsonRangeQuery(schema, "attributes", "age", 18, 65, true, false);
+     * </pre>
+     *
+     * @param schema Schema for field validation
+     * @param fieldName JSON field name
+     * @param jsonPath JSONPath to nested value
+     * @param lowerBound Lower bound value (or null for unbounded)
+     * @param upperBound Upper bound value (or null for unbounded)
+     * @param includeLower Include lower bound in results
+     * @param includeUpper Include upper bound in results
+     * @return New Query instance
+     */
+    public static Query jsonRangeQuery(Schema schema, String fieldName, String jsonPath,
+                                      Object lowerBound, Object upperBound,
+                                      boolean includeLower, boolean includeUpper) {
+        long ptr = nativeJsonRangeQuery(schema.getNativePtr(), fieldName, jsonPath,
+                                       lowerBound, upperBound, includeLower, includeUpper);
+        return new Query(ptr);
+    }
+
+    /**
+     * Create a JSON range query with inclusive bounds.
+     *
+     * @param schema Schema for field validation
+     * @param fieldName JSON field name
+     * @param jsonPath JSONPath to nested value
+     * @param lowerBound Lower bound value
+     * @param upperBound Upper bound value
+     * @return New Query instance
+     */
+    public static Query jsonRangeQuery(Schema schema, String fieldName, String jsonPath,
+                                      Object lowerBound, Object upperBound) {
+        return jsonRangeQuery(schema, fieldName, jsonPath, lowerBound, upperBound, true, true);
+    }
+
+    /**
+     * Create a JSON exists query to check for field presence.
+     *
+     * <p>Checks whether a specific JSON path exists in documents, regardless
+     * of its value. Useful for filtering documents that have a particular
+     * nested field.
+     *
+     * <p>Example:
+     * <pre>
+     * Query query = Query.jsonExistsQuery(schema, "attributes", "user.email");
+     * </pre>
+     *
+     * @param schema Schema for field validation
+     * @param fieldName JSON field name
+     * @param jsonPath JSONPath to check for existence
+     * @return New Query instance
+     */
+    public static Query jsonExistsQuery(Schema schema, String fieldName, String jsonPath) {
+        long ptr = nativeJsonExistsQuery(schema.getNativePtr(), fieldName, jsonPath);
+        return new Query(ptr);
+    }
+
+    /**
      * Explain how this query matches a specific document.
      * @param searcher Searcher to use for explanation
      * @param docAddress Document address to explain
@@ -372,6 +460,9 @@ public class Query implements AutoCloseable {
     private static native long nativeMoreLikeThisQuery(long docAddressPtr, Integer minDocFrequency, Integer maxDocFrequency, Integer minTermFrequency, Integer maxQueryTerms, Integer minWordLength, Integer maxWordLength, Double boostFactor, List<String> stopWords);
     private static native long nativeConstScoreQuery(long queryPtr, double score);
     private static native long nativeRangeQuery(long schemaPtr, String fieldName, int fieldType, Object lowerBound, Object upperBound, boolean includeLower, boolean includeUpper);
+    private static native long nativeJsonTermQuery(long schemaPtr, String fieldName, String jsonPath, Object termValue);
+    private static native long nativeJsonRangeQuery(long schemaPtr, String fieldName, String jsonPath, Object lowerBound, Object upperBound, boolean includeLower, boolean includeUpper);
+    private static native long nativeJsonExistsQuery(long schemaPtr, String fieldName, String jsonPath);
     private static native long nativeExplain(long queryPtr, long searcherPtr, long docAddressPtr);
     private static native String nativeToString(long queryPtr);
     private static native void nativeClose(long ptr);

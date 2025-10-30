@@ -92,6 +92,9 @@ try (SchemaBuilder builder = new SchemaBuilder()) {
     // Boolean fields
     builder.addBooleanField("featured", true, true, false);
 
+    // JSON fields (dynamic schema-less documents)
+    Field jsonField = builder.addJsonField("metadata", JsonObjectOptions.storedAndIndexed());
+
     Schema schema = builder.build();
 }
 ```
@@ -100,6 +103,76 @@ try (SchemaBuilder builder = new SchemaBuilder()) {
 - **stored** - Can retrieve original value in search results
 - **indexed** - Can search/filter on this field (text fields always indexed)
 - **fast** - Enables fast access for sorting, aggregations, filtering
+
+### JSON Fields
+
+JSON fields enable schema-less, flexible document structures without predefined fields.
+
+```java
+// Add JSON field to schema
+Field jsonField = builder.addJsonField("data", JsonObjectOptions.storedAndIndexed());
+
+// Add nested JSON documents
+Document doc = new Document();
+Map<String, Object> jsonData = new HashMap<>();
+jsonData.put("name", "Alice");
+jsonData.put("age", 30);
+jsonData.put("email", "alice@example.com");
+
+// Nested objects
+Map<String, Object> address = new HashMap<>();
+address.put("city", "New York");
+address.put("zip", "10001");
+jsonData.put("address", address);
+
+// Arrays
+jsonData.put("tags", Arrays.asList("developer", "engineer"));
+
+doc.addJson(jsonField, jsonData);
+writer.addDocument(doc);
+```
+
+**JSON Query Types:**
+
+```java
+// Term query on JSON field
+Query query = Query.jsonTermQuery(schema, "data", "name", "Alice");
+
+// Range query on numeric JSON field
+Query query = Query.jsonRangeQuery(schema, "data", "age", 25L, 35L, true, true);
+
+// Exists query - check if field is present
+Query query = Query.jsonExistsQuery(schema, "data", "email");
+
+// Nested path query
+Query query = Query.jsonTermQuery(schema, "data", "address.city", "New York");
+
+// Boolean combinations
+Query q1 = Query.jsonTermQuery(schema, "data", "name", "Alice");
+Query q2 = Query.jsonRangeQuery(schema, "data", "age", 25L, 35L, true, true);
+Query combined = Query.booleanQuery(
+    Arrays.asList(q1, q2),
+    Arrays.asList(Occur.MUST, Occur.MUST));
+```
+
+**JSON Field Options:**
+
+```java
+// Basic presets
+JsonObjectOptions.storedAndIndexed()  // Searchable + retrievable
+JsonObjectOptions.indexed()           // Searchable only
+JsonObjectOptions.stored()            // Retrievable only
+JsonObjectOptions.full()              // Everything enabled
+
+// Advanced configuration
+JsonObjectOptions.default()
+    .setStored()                      // Enable storage
+    .setIndexingOptions(textIndexing) // Configure text indexing
+    .setFast(tokenizer)               // Enable fast fields
+    .setExpandDotsEnabled()           // Enable dot notation
+```
+
+**JSON fields work in both regular indexes and Quickwit split files with full query support.**
 
 ### Documents
 
@@ -571,6 +644,66 @@ try (SplitCacheManager cacheManager = SplitCacheManager.getInstance(cacheConfig)
     }
 }
 ```
+
+### JSON Fields in Splits
+
+JSON fields work seamlessly in Quickwit splits, enabling flexible schema-less documents:
+
+```java
+// 1. Create index with JSON fields
+try (SchemaBuilder builder = new SchemaBuilder()) {
+    Field jsonField = builder.addJsonField("metadata", JsonObjectOptions.full());
+
+    try (Schema schema = builder.build();
+         Index index = new Index(schema, "/tmp/json_index", false)) {
+
+        try (IndexWriter writer = index.writer(Index.Memory.DEFAULT_HEAP_SIZE, 1)) {
+            // Add JSON documents
+            Document doc = new Document();
+            Map<String, Object> metadata = new HashMap<>();
+            metadata.put("product", "laptop");
+            metadata.put("price", 999.99);
+            metadata.put("category", "electronics");
+            doc.addJson(jsonField, metadata);
+            writer.addDocument(doc);
+            writer.commit();
+        }
+
+        // Convert to split
+        QuickwitSplit.SplitConfig config = new QuickwitSplit.SplitConfig(
+            "products", "catalog", "node-1");
+        QuickwitSplit.convertIndexFromPath(
+            "/tmp/json_index", "/tmp/products.split", config);
+    }
+}
+
+// 2. Search JSON fields in split
+SplitCacheManager.CacheConfig cacheConfig =
+    new SplitCacheManager.CacheConfig("products-cache")
+        .withMaxCacheSize(100_000_000);
+
+try (SplitCacheManager cacheManager = SplitCacheManager.getInstance(cacheConfig);
+     SplitSearcher searcher = cacheManager.createSplitSearcher(
+         "file:///tmp/products.split")) {
+
+    Schema schema = searcher.getSchema();
+
+    // Query JSON fields (all query types supported)
+    SplitQuery query = new SplitTermQuery("metadata", "category", "electronics");
+    SearchResult results = searcher.search(query, 10);
+
+    // Retrieve JSON data
+    for (SearchResult.Hit hit : results.getHits()) {
+        try (Document doc = searcher.doc(hit.getDocAddress())) {
+            Map<String, Object> metadata = doc.getJsonMap("metadata");
+            System.out.println("Product: " + metadata.get("product"));
+            System.out.println("Price: " + metadata.get("price"));
+        }
+    }
+}
+```
+
+**All JSON query types work in splits:** term queries, range queries, exists queries, nested paths, and boolean combinations.
 
 ### Merging Splits
 

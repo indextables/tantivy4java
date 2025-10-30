@@ -124,11 +124,21 @@ impl DocumentBuilder {
     
     pub fn build(self, schema: &Schema) -> Result<TantivyDocument, String> {
         let mut doc = TantivyDocument::new();
-        
-        for (field_name, values) in self.field_values {
-            let field = schema.get_field(&field_name)
-                .map_err(|_| format!("Field '{}' not found in schema", field_name))?;
-            
+
+        for (field_key, values) in self.field_values {
+            // Check if this is a field-ID based key
+            let field = if field_key.starts_with("__field_id_") && field_key.ends_with("__") {
+                // Extract field ID from the key
+                let id_str = &field_key[11..field_key.len()-2]; // Remove prefix and suffix
+                let field_id: u32 = id_str.parse()
+                    .map_err(|_| format!("Invalid field ID in key: {}", field_key))?;
+                tantivy::schema::Field::from_field_id(field_id)
+            } else {
+                // Regular field name lookup
+                schema.get_field(&field_key)
+                    .map_err(|_| format!("Field '{}' not found in schema", field_key))?
+            };
+
             for value in values {
                 match value {
                     OwnedValue::Str(text) => doc.add_text(field, &text),
@@ -143,7 +153,7 @@ impl DocumentBuilder {
                         let json_map: BTreeMap<String, OwnedValue> = obj.into_iter().collect();
                         doc.add_object(field, json_map);
                     },
-                    _ => return Err(format!("Unsupported value type for field '{}'", field_name)),
+                    _ => return Err(format!("Unsupported value type for field '{}'", field_key)),
                 }
             }
         }
@@ -344,8 +354,19 @@ pub extern "system" fn Java_io_indextables_tantivy4java_core_Document_nativeGet(
                             let java_string = env.new_string(&ip_string).map_err(|e| e.to_string())?;
                             java_string.into()
                         },
+                        OwnedValue::Object(_) | OwnedValue::Array(_) => {
+                            // Serialize JSON objects and arrays to proper JSON string
+                            let json_string = serde_json::to_string(value)
+                                .unwrap_or_else(|e| {
+                                    eprintln!("Failed to serialize JSON value: {}", e);
+                                    "{}".to_string()
+                                });
+                            let java_string = env.new_string(&json_string).map_err(|e| e.to_string())?;
+                            java_string.into()
+                        },
                         _ => {
-                            // For other types, convert to string for now
+                            // For any other unsupported types, use debug format with warning
+                            eprintln!("WARNING: Unsupported OwnedValue type encountered, using debug format");
                             let string_value = format!("{:?}", value);
                             let java_string = env.new_string(&string_value).map_err(|e| e.to_string())?;
                             java_string.into()
@@ -698,6 +719,62 @@ pub extern "system" fn Java_io_indextables_tantivy4java_core_Document_nativeAddJ
         match &mut *doc_wrapper {
             DocumentWrapper::Builder(ref mut doc_builder) => {
                 // Parse JSON string into a BTreeMap<String, OwnedValue>
+                let json_value: std::collections::BTreeMap<String, tantivy::schema::OwnedValue> =
+                    match serde_json::from_str(&json_str) {
+                        Ok(value) => value,
+                        Err(e) => return Err(format!("Invalid JSON format: {}", e))
+                    };
+
+                // Add JSON object using the helper method
+                doc_builder.add_json(field_name_str, json_value);
+                Ok(())
+            },
+            DocumentWrapper::Retrieved(_) => {
+                Err("Cannot add values to retrieved documents".to_string())
+            }
+        }
+    });
+
+    match result {
+        Some(Ok(())) => {},
+        Some(Err(err)) => {
+            handle_error(&mut env, &err);
+        },
+        None => {
+            handle_error(&mut env, "Invalid Document pointer");
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_core_Document_nativeAddJsonFromString(
+    mut env: JNIEnv,
+    _class: JClass,
+    ptr: jlong,
+    field_name: JString,
+    json_string: JString,
+) {
+    let field_name_str: String = match env.get_string(&field_name) {
+        Ok(s) => s.into(),
+        Err(_) => {
+            handle_error(&mut env, "Invalid field name");
+            return;
+        }
+    };
+
+    let json_str: String = match env.get_string(&json_string) {
+        Ok(s) => s.into(),
+        Err(_) => {
+            handle_error(&mut env, "Invalid JSON string");
+            return;
+        }
+    };
+
+    let result = with_arc_safe::<Mutex<DocumentWrapper>, Result<(), String>>(ptr, |wrapper_mutex| {
+        let mut doc_wrapper = wrapper_mutex.lock().unwrap();
+        match &mut *doc_wrapper {
+            DocumentWrapper::Builder(ref mut doc_builder) => {
+                // Parse JSON string to BTreeMap<String, OwnedValue>
                 let json_value: std::collections::BTreeMap<String, tantivy::schema::OwnedValue> =
                     match serde_json::from_str(&json_str) {
                         Ok(value) => value,

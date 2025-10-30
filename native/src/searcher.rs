@@ -22,10 +22,11 @@ use jni::sys::{jlong, jboolean, jint, jobject};
 use jni::JNIEnv;
 use jni::sys::jlongArray as JLongArray;
 use tantivy::{IndexWriter as TantivyIndexWriter, Searcher as TantivySearcher, DocAddress as TantivyDocAddress, DateTime, Term};
-use tantivy::schema::{TantivyDocument, Field, Schema, Facet};
+use tantivy::schema::{TantivyDocument, Field, Schema, Facet, OwnedValue};
 use tantivy::query::Query as TantivyQuery;
 use tantivy::index::SegmentId;
 use std::net::IpAddr;
+use std::collections::BTreeMap;
 use crate::utils::{handle_error, with_arc_safe, arc_to_jlong, release_arc};
 use crate::debug_println;
 use std::sync::{Arc, Mutex};
@@ -2417,8 +2418,20 @@ fn parse_single_document(schema: &Schema, buffer: &[u8], offset: usize) -> Resul
                 },
                 FieldValue::Bytes(bytes) => document.add_bytes(field, &bytes),
                 FieldValue::Json(json_str) => {
-                    // JSON field implementation needs proper tantivy API - throw error for now
-                    return Err("JSON field implementation not yet complete - use text fields instead".to_string());
+                    // Parse JSON string and add as JSON object using tantivy::schema::OwnedValue
+                    match serde_json::from_str::<tantivy::schema::OwnedValue>(&json_str) {
+                        Ok(json_value) => {
+                            match json_value {
+                                OwnedValue::Object(obj) => {
+                                    // Convert Vec<(String, OwnedValue)> to BTreeMap for tantivy
+                                    let json_map: BTreeMap<String, OwnedValue> = obj.into_iter().collect();
+                                    document.add_object(field, json_map);
+                                },
+                                _ => return Err(format!("JSON field '{}' must be an object/map, not a primitive value", field_name)),
+                            }
+                        },
+                        Err(e) => return Err(format!("Invalid JSON in field '{}': {}", field_name, e)),
+                    }
                 },
                 FieldValue::IpAddr(ip_str) => {
                     // Parse IP address - convert to IPv6 format for Tantivy
