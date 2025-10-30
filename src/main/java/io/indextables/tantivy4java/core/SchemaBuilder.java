@@ -201,13 +201,64 @@ public class SchemaBuilder implements AutoCloseable {
     }
 
     /**
+     * Add a JSON field to the schema with full configuration options.
+     *
+     * <p>JSON fields allow storing and indexing arbitrary nested JSON objects.
+     * All nested values (strings, numbers, booleans, dates, arrays) are
+     * automatically indexed according to their type and can be queried using
+     * JSONPath syntax.
+     *
+     * <p>Example:
+     * <pre>
+     * Field attrs = schemaBuilder.addJsonField("attributes",
+     *     JsonObjectOptions.storedAndIndexed()
+     *         .setExpandDots(true));
+     * </pre>
+     *
+     * @param name Field name
+     * @param options JSON field configuration options
+     * @return Field handle for the created JSON field
+     * @throws IllegalArgumentException if name is null or empty
+     * @throws IllegalStateException if builder has been closed
+     */
+    public Field addJsonField(String name, JsonObjectOptions options) {
+        if (closed) {
+            throw new IllegalStateException("SchemaBuilder has been closed");
+        }
+        if (name == null || name.isEmpty()) {
+            throw new IllegalArgumentException("Field name cannot be null or empty");
+        }
+        if (options == null) {
+            throw new IllegalArgumentException("JsonObjectOptions cannot be null");
+        }
+
+        // Call native method with all options
+        int fieldId = nativeAddJsonFieldWithOptions(
+            nativePtr,
+            name,
+            options.isStored(),
+            options.getIndexing() != null,
+            options.isFast(),
+            options.getFastTokenizer(),
+            options.isExpandDots(),
+            options.getIndexing() != null ? options.getIndexing().getTokenizerName() : null,
+            options.getIndexing() != null ? options.getIndexing().getIndexOptionCode() : 0
+        );
+        return new Field(name, fieldId);
+    }
+
+    /**
      * Add a JSON field to the schema.
+     *
+     * @deprecated Use {@link #addJsonField(String, JsonObjectOptions)} instead for better type safety
+     *
      * @param name Field name
      * @param stored Whether the field should be stored
      * @param tokenizerName Tokenizer to use for this field
      * @param indexOption Index option for the field
      * @return This builder for method chaining
      */
+    @Deprecated
     public SchemaBuilder addJsonField(String name, boolean stored, String tokenizerName, String indexOption) {
         if (closed) {
             throw new IllegalStateException("SchemaBuilder has been closed");
@@ -218,6 +269,7 @@ public class SchemaBuilder implements AutoCloseable {
 
     /**
      * Add a JSON field with default options.
+     *
      * @param name Field name
      * @return This builder for method chaining
      */
@@ -346,6 +398,7 @@ public class SchemaBuilder implements AutoCloseable {
     private static native void nativeAddBooleanField(long ptr, String name, boolean stored, boolean indexed, boolean fast);
     private static native void nativeAddDateField(long ptr, String name, boolean stored, boolean indexed, boolean fast);
     private static native void nativeAddJsonField(long ptr, String name, boolean stored, String tokenizerName, String indexOption);
+    private static native int nativeAddJsonFieldWithOptions(long ptr, String name, boolean stored, boolean indexed, boolean fast, String fastTokenizer, boolean expandDots, String tokenizerName, int recordOption);
     private static native void nativeAddFacetField(long ptr, String name);
     private static native void nativeAddBytesField(long ptr, String name, boolean stored, boolean indexed, boolean fast, String indexOption);
     private static native void nativeAddIpAddrField(long ptr, String name, boolean stored, boolean indexed, boolean fast);

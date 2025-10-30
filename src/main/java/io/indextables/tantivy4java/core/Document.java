@@ -217,10 +217,83 @@ public class Document implements AutoCloseable {
     }
 
     /**
-     * Add a JSON value to a field.
+     * Add JSON value from string to a JSON field.
+     *
+     * <p>The JSON string must be valid according to RFC 8259.
+     * All nested values will be indexed according to field configuration.
+     *
+     * <p>Example:
+     * <pre>
+     * doc.addJson(field, "{\"user\": {\"name\": \"John\", \"age\": 30}}");
+     * </pre>
+     *
+     * @param field JSON field handle
+     * @param jsonString Valid JSON string
+     * @throws IllegalArgumentException if JSON is invalid
+     * @throws IllegalStateException if document has been closed
+     */
+    public void addJson(Field field, String jsonString) {
+        if (closed) {
+            throw new IllegalStateException("Document has been closed");
+        }
+        if (field == null) {
+            throw new IllegalArgumentException("Field cannot be null");
+        }
+        if (jsonString == null) {
+            throw new IllegalArgumentException("JSON string cannot be null");
+        }
+        nativeAddJsonFromString(nativePtr, field.getName(), jsonString);
+    }
+
+    /**
+     * Add JSON value from Java object to a JSON field.
+     *
+     * <p>Automatically serializes the object to JSON. Supported types:
+     * <ul>
+     *   <li>Map&lt;String, Object&gt; → JSON object</li>
+     *   <li>List&lt;Object&gt; → JSON array</li>
+     *   <li>String, Integer, Long, Float, Double, Boolean → JSON primitives</li>
+     *   <li>java.time.Instant, java.util.Date → ISO 8601 date string</li>
+     * </ul>
+     *
+     * <p>Example:
+     * <pre>
+     * Map&lt;String, Object&gt; data = new HashMap&lt;&gt;();
+     * data.put("name", "John");
+     * data.put("age", 30);
+     * doc.addJson(field, data);
+     * </pre>
+     *
+     * @param field JSON field handle
+     * @param value Java object to serialize
+     * @throws IllegalArgumentException if object cannot be serialized
+     * @throws IllegalStateException if document has been closed
+     */
+    public void addJson(Field field, Object value) {
+        if (closed) {
+            throw new IllegalStateException("Document has been closed");
+        }
+        if (field == null) {
+            throw new IllegalArgumentException("Field cannot be null");
+        }
+        if (value == null) {
+            throw new IllegalArgumentException("Value cannot be null");
+        }
+
+        // Serialize to JSON string
+        String jsonString = serializeToJson(value);
+        addJson(field, jsonString);
+    }
+
+    /**
+     * Add a JSON value to a field using field name.
+     *
+     * @deprecated Use {@link #addJson(Field, Object)} for better type safety
+     *
      * @param fieldName Field name
      * @param value Object to be serialized as JSON
      */
+    @Deprecated
     public void addJson(String fieldName, Object value) {
         if (closed) {
             throw new IllegalStateException("Document has been closed");
@@ -230,8 +303,37 @@ public class Document implements AutoCloseable {
     }
 
     /**
-     * Simple JSON conversion for basic objects
+     * Serialize Java object to JSON string using proper JSON library.
+     *
+     * <p>Uses Jackson for robust JSON serialization with proper
+     * date formatting and type handling.
+     *
+     * @param value Object to serialize
+     * @return JSON string representation
      */
+    private String serializeToJson(Object value) {
+        try {
+            // Use Jackson for proper JSON serialization
+            com.fasterxml.jackson.databind.ObjectMapper mapper = new com.fasterxml.jackson.databind.ObjectMapper();
+
+            // Configure date format for ISO 8601
+            mapper.setDateFormat(new java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'"));
+
+            // Register JavaTimeModule for java.time types
+            mapper.registerModule(new com.fasterxml.jackson.datatype.jsr310.JavaTimeModule());
+
+            return mapper.writeValueAsString(value);
+        } catch (Exception e) {
+            throw new IllegalArgumentException("Failed to serialize object to JSON: " + e.getMessage(), e);
+        }
+    }
+
+    /**
+     * Simple JSON conversion for basic objects (fallback for deprecated method).
+     *
+     * @deprecated Internal method for deprecated addJson(String, Object)
+     */
+    @Deprecated
     private String convertToJsonString(Object value) {
         if (value == null) {
             return "null";
@@ -254,6 +356,19 @@ public class Document implements AutoCloseable {
                 json.append(convertToJsonString(entry.getValue()));
             }
             json.append("}");
+            return json.toString();
+        }
+        if (value instanceof java.util.List) {
+            @SuppressWarnings("unchecked")
+            java.util.List<Object> list = (java.util.List<Object>) value;
+            StringBuilder json = new StringBuilder("[");
+            boolean first = true;
+            for (Object item : list) {
+                if (!first) json.append(",");
+                first = false;
+                json.append(convertToJsonString(item));
+            }
+            json.append("]");
             return json.toString();
         }
         // Fallback: convert to string and quote it
@@ -352,6 +467,7 @@ public class Document implements AutoCloseable {
     private static native void nativeAddFacet(long ptr, String fieldName, long facetPtr);
     private static native void nativeAddBytes(long ptr, String fieldName, byte[] bytes);
     private static native void nativeAddJson(long ptr, String fieldName, String jsonString);
+    private static native void nativeAddJsonFromString(long ptr, String fieldName, String jsonString);
     private static native void nativeAddIpAddr(long ptr, String fieldName, String ipAddr);
     private static native void nativeAddString(long ptr, String fieldName, String value);
     private static native int nativeGetNumFields(long ptr);

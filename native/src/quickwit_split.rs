@@ -531,13 +531,31 @@ fn extract_doc_mapping_from_index(tantivy_index: &tantivy::Index) -> Result<Stri
                 "fast": field_entry.is_fast()
             })
         },
-        tantivy::schema::FieldType::JsonObject(_) => {
-            // JSON object field
-            serde_json::json!({
+        tantivy::schema::FieldType::JsonObject(json_options) => {
+            // JSON object field - export all options for proper reconstruction
+            // Quickwit expects JSON fields to have a "field_mappings" array (can be empty for dynamic JSON)
+            let mut json_obj = serde_json::json!({
                 "name": field_name,
                 "type": "object",
-                "stored": field_entry.is_stored()
-            })
+                "field_mappings": [],  // Empty array for dynamic JSON fields
+                "stored": field_entry.is_stored(),
+                "indexed": json_options.is_indexed(),
+                "fast": json_options.is_fast(),
+                "expand_dots": json_options.is_expand_dots_enabled()
+            });
+
+            // Add tokenizer if indexing is enabled
+            if let Some(text_indexing) = json_options.get_text_indexing_options() {
+                json_obj["tokenizer"] = serde_json::json!(text_indexing.tokenizer());
+            }
+
+            // Add fast field tokenizer if available
+            if let Some(fast_tokenizer) = json_options.get_fast_field_tokenizer_name() {
+                json_obj["fast_tokenizer"] = serde_json::json!(fast_tokenizer);
+            }
+
+            debug_log!("🔧 JSON FIELD EXPORT: field '{}' => {}", field_name, serde_json::to_string_pretty(&json_obj).unwrap_or_else(|_| "error".to_string()));
+            json_obj
         },
         tantivy::schema::FieldType::IpAddr(_) => {
             // IP address field

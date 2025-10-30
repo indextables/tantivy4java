@@ -441,6 +441,104 @@ pub extern "system" fn Java_io_indextables_tantivy4java_core_SchemaBuilder_nativ
 }
 
 #[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_core_SchemaBuilder_nativeAddJsonFieldWithOptions(
+    mut env: JNIEnv,
+    _class: JClass,
+    ptr: jlong,
+    name: JString,
+    stored: jboolean,
+    indexed: jboolean,
+    fast: jboolean,
+    fast_tokenizer: JString,
+    expand_dots: jboolean,
+    tokenizer_name: JString,
+    record_option: jint,
+) -> jint {
+    let field_name: String = match env.get_string(&name) {
+        Ok(s) => s.into(),
+        Err(_) => {
+            handle_error(&mut env, "Invalid field name");
+            return -1;
+        }
+    };
+
+    let result = with_arc_safe::<Mutex<SchemaBuilder>, Result<tantivy::schema::Field, String>>(ptr, |builder_mutex| {
+        let mut builder = builder_mutex.lock().unwrap();
+
+        // Create JSON field options
+        let mut json_options = JsonObjectOptions::default();
+
+        // Set stored flag
+        if stored != 0 {
+            json_options = json_options.set_stored();
+        }
+
+        // Set indexing options if enabled
+        if indexed != 0 {
+            let tokenizer_str: String = if !tokenizer_name.is_null() {
+                match env.get_string(&tokenizer_name) {
+                    Ok(s) => s.into(),
+                    Err(_) => "default".to_string(),
+                }
+            } else {
+                "default".to_string()
+            };
+
+            let index_record_option = match record_option {
+                0 => IndexRecordOption::Basic,
+                1 => IndexRecordOption::WithFreqs,
+                2 => IndexRecordOption::WithFreqsAndPositions,
+                _ => IndexRecordOption::WithFreqsAndPositions,
+            };
+
+            let indexing = TextFieldIndexing::default()
+                .set_tokenizer(&tokenizer_str)
+                .set_index_option(index_record_option);
+
+            json_options = json_options.set_indexing_options(indexing);
+        }
+
+        // Set fast field options if enabled
+        if fast != 0 {
+            if !fast_tokenizer.is_null() {
+                match env.get_string(&fast_tokenizer) {
+                    Ok(s) => {
+                        let fast_tok_str: String = s.into();
+                        json_options = json_options.set_fast(Some(&fast_tok_str));
+                    },
+                    Err(_) => {
+                        json_options = json_options.set_fast(None);
+                    }
+                }
+            } else {
+                json_options = json_options.set_fast(None);
+            }
+        }
+
+        // Set expand_dots flag
+        if expand_dots != 0 {
+            json_options = json_options.set_expand_dots_enabled();
+        }
+
+        // Add the JSON field to the builder and return the field
+        let field = builder.add_json_field(&field_name, json_options);
+        Ok(field)
+    });
+
+    match result {
+        Some(Ok(field)) => field.field_id() as jint,
+        Some(Err(err)) => {
+            handle_error(&mut env, &err);
+            -1
+        },
+        None => {
+            handle_error(&mut env, "Invalid SchemaBuilder pointer");
+            -1
+        }
+    }
+}
+
+#[no_mangle]
 pub extern "system" fn Java_io_indextables_tantivy4java_core_SchemaBuilder_nativeAddFacetField(
     mut env: JNIEnv,
     _class: JClass,
