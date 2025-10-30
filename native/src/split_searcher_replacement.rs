@@ -789,7 +789,7 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_crea
                             debug_println!("RUST DEBUG: 🔧 Using index.schema() directly (doc_mapping has compatibility issues with dynamic JSON fields)");
                             let schema = cached_index.schema();
                             let schema_ptr = crate::utils::arc_to_jlong(std::sync::Arc::new(schema));
-                            eprintln!("RUST DEBUG: 🔧 Created schema_ptr={} from reconstructed schema", schema_ptr);
+                            debug_println!("RUST DEBUG: 🔧 Created schema_ptr={} from reconstructed schema", schema_ptr);
 
                             // Create clean struct-based context instead of complex tuple
                             let cached_context = CachedSearcherContext {
@@ -818,9 +818,9 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_crea
                             }
 
                             // ✅ FIX: Store direct mapping from searcher pointer to schema pointer for fallback
-                            eprintln!("RUST DEBUG: 🔧 Storing schema mapping: searcher_ptr={} -> schema_ptr={}", pointer, schema_ptr);
+                            debug_println!("RUST DEBUG: 🔧 Storing schema mapping: searcher_ptr={} -> schema_ptr={}", pointer, schema_ptr);
                             crate::split_query::store_searcher_schema(pointer, schema_ptr);
-                            eprintln!("RUST DEBUG: 🔧 Schema mapping stored successfully");
+                            debug_println!("RUST DEBUG: 🔧 Schema mapping stored successfully");
                             debug_println!("✅ SEARCHER_SCHEMA_MAPPING: Stored mapping {} -> {} for reliable schema access", pointer, schema_ptr);
 
                             debug_println!("🏁 SPLIT_SEARCHER: Thread {:?} COMPLETED successfully in {}ms - pointer: 0x{:x}",
@@ -2334,27 +2334,27 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_getS
     _class: JClass,
     searcher_ptr: jlong,
 ) -> jlong {
-    eprintln!("🔥 NATIVE: getSchemaFromNative called with pointer: {}", searcher_ptr);
+    debug_println!("🔥 NATIVE: getSchemaFromNative called with pointer: {}", searcher_ptr);
 
     if searcher_ptr == 0 {
-        eprintln!("❌ NATIVE: Invalid searcher pointer (0)");
+        debug_println!("❌ NATIVE: Invalid searcher pointer (0)");
         return 0;
     }
 
-    eprintln!("🔥 NATIVE: About to call block_on_operation");
+    debug_println!("🔥 NATIVE: About to call block_on_operation");
 
     // Use simplified async pattern that returns thread-safe types
     // Note: env cannot be moved into async block due to thread safety
     match block_on_operation(async move {
-        eprintln!("🔥 NATIVE: Inside async block, calling perform_schema_retrieval_async_impl_thread_safe");
+        debug_println!("🔥 NATIVE: Inside async block, calling perform_schema_retrieval_async_impl_thread_safe");
         perform_schema_retrieval_async_impl_thread_safe(searcher_ptr).await
     }) {
         Ok(result) => {
-            eprintln!("✅ NATIVE: block_on_operation succeeded, result: {}", result);
+            debug_println!("✅ NATIVE: block_on_operation succeeded, result: {}", result);
             result
         },
         Err(e) => {
-            eprintln!("❌ NATIVE: block_on_operation FAILED: {}", e);
+            debug_println!("❌ NATIVE: block_on_operation FAILED: {}", e);
             0
         }
     }
@@ -3542,12 +3542,12 @@ pub async fn perform_schema_retrieval_async_impl_thread_safe(
 
     // ✅ FIX: If searcher context is missing, use direct schema mapping fallback
     if searcher_context.is_none() {
-        eprintln!("❌ ASYNC_IMPL: CachedSearcherContext missing for pointer {}, trying direct schema mapping", searcher_ptr);
+        debug_println!("❌ ASYNC_IMPL: CachedSearcherContext missing for pointer {}, trying direct schema mapping", searcher_ptr);
         if let Some(schema_ptr) = crate::split_query::get_searcher_schema(searcher_ptr) {
-            eprintln!("✅ FALLBACK: Found direct schema mapping {} for searcher {}", schema_ptr, searcher_ptr);
+            debug_println!("✅ FALLBACK: Found direct schema mapping {} for searcher {}", schema_ptr, searcher_ptr);
             return Ok(schema_ptr);
         } else {
-            eprintln!("❌ FALLBACK: No direct schema mapping found for searcher {}", searcher_ptr);
+            debug_println!("❌ FALLBACK: No direct schema mapping found for searcher {}", searcher_ptr);
             return Err(anyhow::anyhow!("Invalid searcher context - Arc and direct mapping not found for pointer: {}", searcher_ptr));
         }
     }

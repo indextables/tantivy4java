@@ -358,7 +358,7 @@ pub extern "system" fn Java_io_indextables_tantivy4java_core_Document_nativeGet(
                             // Serialize JSON objects and arrays to proper JSON string
                             let json_string = serde_json::to_string(value)
                                 .unwrap_or_else(|e| {
-                                    eprintln!("Failed to serialize JSON value: {}", e);
+                                    debug_println!("Failed to serialize JSON value: {}", e);
                                     "{}".to_string()
                                 });
                             let java_string = env.new_string(&json_string).map_err(|e| e.to_string())?;
@@ -366,7 +366,7 @@ pub extern "system" fn Java_io_indextables_tantivy4java_core_Document_nativeGet(
                         },
                         _ => {
                             // For any other unsupported types, use debug format with warning
-                            eprintln!("WARNING: Unsupported OwnedValue type encountered, using debug format");
+                            debug_println!("WARNING: Unsupported OwnedValue type encountered, using debug format");
                             let string_value = format!("{:?}", value);
                             let java_string = env.new_string(&string_value).map_err(|e| e.to_string())?;
                             java_string.into()
