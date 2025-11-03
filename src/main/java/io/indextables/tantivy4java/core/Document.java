@@ -319,8 +319,18 @@ public class Document implements AutoCloseable {
             // Configure date format for ISO 8601
             mapper.setDateFormat(new java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'"));
 
-            // Register JavaTimeModule for java.time types
-            mapper.registerModule(new com.fasterxml.jackson.datatype.jsr310.JavaTimeModule());
+            // Try to register JavaTimeModule for java.time types if available
+            try {
+                // Use reflection to avoid hard dependency on jackson-datatype-jsr310
+                Class<?> moduleClass = Class.forName("com.fasterxml.jackson.datatype.jsr310.JavaTimeModule");
+                Object module = moduleClass.getDeclaredConstructor().newInstance();
+                mapper.registerModule((com.fasterxml.jackson.databind.Module) module);
+            } catch (ClassNotFoundException e) {
+                // JavaTimeModule not available - continue without it
+                // java.time types will use default serialization
+            } catch (Exception e) {
+                // Other reflection errors - continue without the module
+            }
 
             return mapper.writeValueAsString(value);
         } catch (Exception e) {
