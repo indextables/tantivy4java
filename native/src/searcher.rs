@@ -2412,9 +2412,9 @@ fn parse_single_document(schema: &Schema, buffer: &[u8], offset: usize) -> Resul
                     // Check schema field type and validate
                     add_boolean_value_safely(&mut document, schema, field, &field_name, bool_val)?;
                 },
-                FieldValue::Date(date_millis) => {
-                    // Check schema field type and validate
-                    add_date_value_safely(&mut document, schema, field, &field_name, date_millis)?;
+                FieldValue::Date(date_nanos) => {
+                    // Check schema field type and validate (nanoseconds for microsecond precision)
+                    add_date_value_safely(&mut document, schema, field, &field_name, date_nanos)?;
                 },
                 FieldValue::Bytes(bytes) => document.add_bytes(field, &bytes),
                 FieldValue::Json(json_str) => {
@@ -2703,7 +2703,7 @@ fn add_unsigned_value_safely(document: &mut TantivyDocument, schema: &Schema, fi
 }
 
 /// Safely add a date value to document, validating schema field type and date range
-fn add_date_value_safely(document: &mut TantivyDocument, schema: &Schema, field: Field, field_name: &str, date_millis: i64) -> Result<(), String> {
+fn add_date_value_safely(document: &mut TantivyDocument, schema: &Schema, field: Field, field_name: &str, date_nanos: i64) -> Result<(), String> {
     let field_entry = schema.get_field_entry(field);
     let field_type = field_entry.field_type();
 
@@ -2711,22 +2711,21 @@ fn add_date_value_safely(document: &mut TantivyDocument, schema: &Schema, field:
         tantivy::schema::FieldType::Date(_) => {
             // Schema expects date - validate range first
             // Tantivy DateTime supports approximately years 1677-2262
-            // Safe range: -9223372036854775808 to 9223372036854775807 milliseconds
-            // But practical range is much smaller due to i64 seconds conversion
-            // Year 1677: approximately -9,223,000,000,000 ms
-            // Year 2262: approximately 9,223,000,000,000 ms
-            const MIN_SAFE_MILLIS: i64 = -9_223_000_000_000;
-            const MAX_SAFE_MILLIS: i64 = 9_223_000_000_000;
+            // Safe range in nanoseconds:
+            // Year 1677: approximately -9,223,000,000,000,000,000 ns
+            // Year 2262: approximately 9,223,000,000,000,000,000 ns
+            const MIN_SAFE_NANOS: i64 = -9_223_000_000_000_000_000;
+            const MAX_SAFE_NANOS: i64 = 9_223_000_000_000_000_000;
 
-            if date_millis < MIN_SAFE_MILLIS || date_millis > MAX_SAFE_MILLIS {
+            if date_nanos < MIN_SAFE_NANOS || date_nanos > MAX_SAFE_NANOS {
                 return Err(format!(
-                    "Date value out of range for field '{}': {} milliseconds. Tantivy DateTime supports approximately years 1677-2262 (range: {} to {} milliseconds).",
-                    field_name, date_millis, MIN_SAFE_MILLIS, MAX_SAFE_MILLIS
+                    "Date value out of range for field '{}': {} nanoseconds. Tantivy DateTime supports approximately years 1677-2262 (range: {} to {} nanoseconds).",
+                    field_name, date_nanos, MIN_SAFE_NANOS, MAX_SAFE_NANOS
                 ));
             }
 
-            // Convert milliseconds to DateTime
-            let date_time = DateTime::from_timestamp_millis(date_millis);
+            // Convert nanoseconds to DateTime for microsecond precision
+            let date_time = DateTime::from_timestamp_nanos(date_nanos);
             document.add_date(field, date_time);
             Ok(())
         },

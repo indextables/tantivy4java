@@ -385,8 +385,12 @@ public class BatchDocumentBuilder implements AutoCloseable {
                 
             case DATE:
                 LocalDateTime date = (LocalDateTime) value;
-                long epochMilli = date.toInstant(ZoneOffset.UTC).toEpochMilli();
-                buffer.putLong(epochMilli);
+                // Use nanoseconds since epoch for microsecond precision
+                // Tantivy DateTime with microsecond precision requires nanosecond timestamps
+                long epochSecond = date.toEpochSecond(ZoneOffset.UTC);
+                int nano = date.getNano();
+                long epochNanos = epochSecond * 1_000_000_000L + nano;
+                buffer.putLong(epochNanos);
                 break;
                 
             case BYTES:
