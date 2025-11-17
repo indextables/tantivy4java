@@ -75,7 +75,6 @@ public class SplitCacheManager implements AutoCloseable {
         Tantivy.initialize();
         // Add shutdown hook to gracefully cleanup all cache instances
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
-            System.out.println("🔧 CACHE CLEANUP: Shutting down all SplitCacheManager instances...");
             synchronized (instances) {
                 for (SplitCacheManager manager : instances.values()) {
                     try {
@@ -86,7 +85,6 @@ public class SplitCacheManager implements AutoCloseable {
                 }
                 instances.clear();
             }
-            System.out.println("🔧 CACHE CLEANUP: All cache instances cleaned up successfully");
         }, "SplitCacheManager-Shutdown"));
     }
     
@@ -441,7 +439,6 @@ public class SplitCacheManager implements AutoCloseable {
         try {
             SplitCacheManager existing = instances.get(cacheKey);
             if (existing != null) {
-                System.out.println("🔧 CACHE REUSE: Using existing cache instance: " + config.getCacheName());
                 return existing;
             }
         } finally {
@@ -454,12 +451,10 @@ public class SplitCacheManager implements AutoCloseable {
             // Double-check pattern - another thread might have created it while we were waiting
             SplitCacheManager existing = instances.get(cacheKey);
             if (existing != null) {
-                System.out.println("🔧 CACHE REUSE: Cache created by another thread: " + config.getCacheName());
                 return existing;
             }
 
             // Create new instance with validation
-            System.out.println("🔧 CACHE CREATE: Creating NEW cache instance: " + config.getCacheName());
             validateCacheConfig(config);
             SplitCacheManager newInstance = new SplitCacheManager(config);
             instances.put(cacheKey, newInstance);
@@ -929,10 +924,6 @@ public class SplitCacheManager implements AutoCloseable {
                 footerStart, footerEnd
             ));
         }
-
-        // All validations passed - log success for debugging
-        System.out.printf("✅ Split metadata validation passed for '%s': footerOffsets=%d-%d%n",
-                         splitPath, footerStart, footerEnd);
     }
     
     // Native method declarations

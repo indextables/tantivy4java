@@ -21,7 +21,7 @@ use jni::objects::{JClass, JString};
 use jni::sys::{jboolean, jlong, jint, jobject};
 use jni::JNIEnv;
 use tantivy::schema::{SchemaBuilder, TextOptions, NumericOptions, DateOptions, IpAddrOptions, JsonObjectOptions};
-use tantivy::schema::{IndexRecordOption, TextFieldIndexing};
+use tantivy::schema::{IndexRecordOption, TextFieldIndexing, DateTimePrecision};
 use crate::utils::{handle_error, with_arc_safe, arc_to_jlong, release_arc};
 use crate::debug_println;
 use std::sync::{Arc, Mutex};
@@ -349,19 +349,22 @@ pub extern "system" fn Java_io_indextables_tantivy4java_core_SchemaBuilder_nativ
     with_arc_safe::<Mutex<SchemaBuilder>, ()>(ptr, |builder_mutex| {
         let mut builder = builder_mutex.lock().unwrap();
         let mut date_options = DateOptions::default();
-        
+
         if stored != 0 {
             date_options = date_options.set_stored();
         }
-        
+
         if indexed != 0 {
             date_options = date_options.set_indexed();
         }
-        
+
         if fast != 0 {
-            date_options = date_options.set_fast();
+            // Set microsecond precision for fast fields to preserve sub-second timestamp accuracy
+            // Note: Inverted index precision remains at seconds (hardcoded in Tantivy)
+            date_options = date_options.set_fast()
+                .set_precision(DateTimePrecision::Microseconds);
         }
-        
+
         builder.add_date_field(&field_name, date_options);
     });
 }

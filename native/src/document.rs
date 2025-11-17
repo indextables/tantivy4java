@@ -319,27 +319,28 @@ pub extern "system" fn Java_io_indextables_tantivy4java_core_Document_nativeGet(
                             env.new_object(&boolean_class, "(Z)V", &[(*b).into()]).map_err(|e| e.to_string())?
                         },
                         OwnedValue::Date(dt) => {
-                            // Convert DateTime to Java LocalDateTime directly
-                            let timestamp_millis = dt.into_timestamp_millis();
-                            let chrono_dt = chrono::DateTime::from_timestamp_millis(timestamp_millis)
-                                .ok_or_else(|| "Invalid timestamp".to_string())?;
+                            // Convert DateTime to Java LocalDateTime with nanosecond precision
+                            let timestamp_nanos = dt.into_timestamp_nanos();
+                            let chrono_dt = chrono::DateTime::from_timestamp_nanos(timestamp_nanos);
                             let naive_dt = chrono_dt.naive_utc();
-                            
-                            // Extract components
+
+                            // Extract components including nanoseconds
                             let year = naive_dt.year();
                             let month = naive_dt.month() as i32;
                             let day = naive_dt.day() as i32;
                             let hour = naive_dt.hour() as i32;
                             let minute = naive_dt.minute() as i32;
                             let second = naive_dt.second() as i32;
-                            
-                            // Create Java LocalDateTime object directly without unsafe operations
+                            let nano = naive_dt.nanosecond() as i32;
+
+                            // Create Java LocalDateTime object with nanosecond precision
+                            // Signature: LocalDateTime.of(int year, int month, int dayOfMonth, int hour, int minute, int second, int nanoOfSecond)
                             let localdatetime_class = env.find_class("java/time/LocalDateTime").map_err(|e| e.to_string())?;
                             let localdatetime_result = env.call_static_method(
                                 &localdatetime_class,
                                 "of",
-                                "(IIIIII)Ljava/time/LocalDateTime;",
-                                &[year.into(), month.into(), day.into(), hour.into(), minute.into(), second.into()]
+                                "(IIIIIII)Ljava/time/LocalDateTime;",
+                                &[year.into(), month.into(), day.into(), hour.into(), minute.into(), second.into(), nano.into()]
                             ).map_err(|e| e.to_string())?;
                             localdatetime_result.l().map_err(|e| e.to_string())?
                         },
@@ -963,17 +964,27 @@ pub fn convert_java_localdatetime_to_tantivy(env: &mut JNIEnv, date_obj: &JObjec
         Ok(result) => result.i().map_err(|e| format!("Failed to get second: {}", e))?,
         Err(e) => return Err(format!("Failed to call getSecond: {}", e)),
     };
-    
-    // Convert to UTC timestamp (assuming input is UTC for simplicity)
-    let timestamp_millis = match chrono::NaiveDate::from_ymd_opt(year, month as u32, day as u32)
-        .and_then(|date| date.and_hms_opt(hour as u32, minute as u32, second as u32))
-        .map(|naive_dt| naive_dt.and_utc().timestamp_millis())
+
+    // Extract nanoseconds to preserve microsecond precision
+    let nano = match env.call_method(date_obj, "getNano", "()I", &[]) {
+        Ok(result) => result.i().map_err(|e| format!("Failed to get nano: {}", e))?,
+        Err(e) => return Err(format!("Failed to call getNano: {}", e)),
+    };
+
+    // Convert to UTC timestamp with nanosecond precision
+    let timestamp_nanos = match chrono::NaiveDate::from_ymd_opt(year, month as u32, day as u32)
+        .and_then(|date| date.and_hms_nano_opt(hour as u32, minute as u32, second as u32, nano as u32))
+        .map(|naive_dt| {
+            let seconds = naive_dt.and_utc().timestamp();
+            let nanos = naive_dt.nanosecond() as i64;
+            seconds * 1_000_000_000 + nanos  // Total nanoseconds since epoch
+        })
     {
         Some(ts) => ts,
         None => return Err("Invalid date/time values".to_string()),
     };
-    
-    Ok(DateTime::from_timestamp_millis(timestamp_millis))
+
+    Ok(DateTime::from_timestamp_nanos(timestamp_nanos))
 }
 
 
