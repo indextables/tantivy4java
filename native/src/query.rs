@@ -1648,7 +1648,16 @@ fn extract_date_value(env: &mut JNIEnv, obj: &JObject) -> Result<DateTime, Strin
         },
         Err(_) => return Err("Failed to call getSecond()".to_string()),
     };
-    
+
+    // Extract nanoseconds to preserve microsecond precision in queries
+    let nano = match env.call_method(obj, "getNano", "()I", &[]) {
+        Ok(result) => match result.i() {
+            Ok(n) => n,
+            Err(_) => return Err("Failed to get nano".to_string()),
+        },
+        Err(_) => return Err("Failed to call getNano()".to_string()),
+    };
+
     // Convert month number to Month enum
     let month_enum = match month {
         1 => Month::January,
@@ -1665,11 +1674,11 @@ fn extract_date_value(env: &mut JNIEnv, obj: &JObject) -> Result<DateTime, Strin
         12 => Month::December,
         _ => return Err(format!("Invalid month: {}", month)),
     };
-    
-    // Create OffsetDateTime and convert to Tantivy DateTime
+
+    // Create OffsetDateTime with nanosecond precision and convert to Tantivy DateTime
     match time::Date::from_calendar_date(year, month_enum, day as u8)
         .and_then(|date| {
-            time::Time::from_hms(hour as u8, minute as u8, second as u8)
+            time::Time::from_hms_nano(hour as u8, minute as u8, second as u8, nano as u32)
                 .map(|time| date.with_time(time))
         })
     {
