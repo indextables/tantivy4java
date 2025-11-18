@@ -358,11 +358,14 @@ pub extern "system" fn Java_io_indextables_tantivy4java_core_SchemaBuilder_nativ
             date_options = date_options.set_indexed();
         }
 
+        // Set microsecond precision for ALL date fields (not just fast fields)
+        // This ensures precision is preserved regardless of storage mode.
+        // Note: Inverted index precision remains at seconds (hardcoded in Tantivy core),
+        // but this affects fast fields and may affect stored field serialization.
+        date_options = date_options.set_precision(DateTimePrecision::Microseconds);
+
         if fast != 0 {
-            // Set microsecond precision for fast fields to preserve sub-second timestamp accuracy
-            // Note: Inverted index precision remains at seconds (hardcoded in Tantivy)
-            date_options = date_options.set_fast()
-                .set_precision(DateTimePrecision::Microseconds);
+            date_options = date_options.set_fast();
         }
 
         builder.add_date_field(&field_name, date_options);

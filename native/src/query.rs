@@ -2143,10 +2143,21 @@ pub extern "system" fn Java_io_indextables_tantivy4java_query_Query_nativeJsonTe
             Err(_) => return Err("Invalid term value".to_string()),
         };
 
-        // Create JSON term using the path - simplified for now
-        // In a full implementation, this would properly construct a JSON path term
-        // For now, just create a simple term query on the field
-        let term = Term::from_field_text(field, &value_str);
+        // Check if expand_dots is enabled in the field options
+        let expand_dots = match field_type {
+            tantivy::schema::FieldType::JsonObject(opts) => opts.is_expand_dots_enabled(),
+            _ => false,
+        };
+
+        // Lowercase the value to match default tokenizer behavior
+        // JSON fields with default indexing use the "default" tokenizer which lowercases text
+        // TODO: In future, properly tokenize based on the actual tokenizer configured
+        let tokenized_value = value_str.to_lowercase();
+
+        // Create JSON term using the path properly with Term::from_field_json_path
+        let mut term = Term::from_field_json_path(field, &json_path_str, expand_dots);
+        // Append the string value with proper type marker
+        term.append_type_and_str(&tokenized_value);
 
         let query = TermQuery::new(term, IndexRecordOption::Basic);
         Ok(Box::new(query) as Box<dyn TantivyQuery>)
