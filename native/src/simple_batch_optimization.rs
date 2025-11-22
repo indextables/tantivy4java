@@ -310,8 +310,8 @@ impl SimpleBatchOptimizer {
                 // This will populate the ByteRangeCache
                 let byte_range = range_start..range_end;
                 let split_path = std::path::Path::new(&split_uri);
-                let _data = storage.get_slice(split_path, byte_range).await
-                    .context("Failed to prefetch byte range")?;
+                let result = storage.get_slice(split_path, byte_range.clone()).await;
+                let _data = result.with_context(|| format!("Failed to prefetch byte range {}..{} from {}", range_start, range_end, split_uri))?;
 
                 debug_println!("  ✅ PREFETCH: Completed range {}..{}", range_start, range_end);
 

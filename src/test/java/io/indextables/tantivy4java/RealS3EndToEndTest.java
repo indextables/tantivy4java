@@ -803,9 +803,11 @@ public class RealS3EndToEndTest {
 
                 // Test batch retrieval performance as well
                 System.out.println("   🔍 Testing batch document retrieval performance...");
-                if (customersResult.getHits().size() >= 3) {
+                // Use at least 50 documents to trigger batch optimization (threshold is 50)
+                int minBatchSize = 50;
+                if (customersResult.getHits().size() >= minBatchSize) {
                     java.util.List<DocAddress> batchAddresses = customersResult.getHits()
-                        .subList(0, Math.min(3, customersResult.getHits().size()))
+                        .subList(0, Math.min(minBatchSize, customersResult.getHits().size()))
                         .stream()
                         .map(hit -> hit.getDocAddress())
                         .collect(java.util.stream.Collectors.toList());
