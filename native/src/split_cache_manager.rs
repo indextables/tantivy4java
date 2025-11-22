@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
 use crate::debug_println;
+use crate::simple_batch_optimization::{PrefetchStats, BatchOptimizationMetrics};
 
 // Debug logging macro - controlled by TANTIVY4JAVA_DEBUG environment variable
 macro_rules! debug_log {
@@ -12,7 +13,7 @@ macro_rules! debug_log {
 
 use jni::JNIEnv;
 use jni::objects::{JClass, JObject, JString};
-use jni::sys::{jlong, jint, jobject};
+use jni::sys::{jlong, jint, jobject, jdouble};
 
 use tokio::runtime::Runtime;
 use crate::global_cache::{get_configured_storage_resolver, get_global_searcher_context};
@@ -186,8 +187,37 @@ pub struct GlobalCacheStats {
 
 // Global registry for cache managers
 lazy_static::lazy_static! {
-    pub static ref CACHE_MANAGERS: Mutex<HashMap<String, Arc<GlobalSplitCacheManager>>> = 
+    pub static ref CACHE_MANAGERS: Mutex<HashMap<String, Arc<GlobalSplitCacheManager>>> =
         Mutex::new(HashMap::new());
+
+    // Global registry for batch optimization metrics (one metrics instance per cache manager)
+    pub static ref BATCH_METRICS: Mutex<HashMap<String, Arc<BatchOptimizationMetrics>>> =
+        Mutex::new(HashMap::new());
+
+    // Global batch optimization metrics (aggregated across all cache managers)
+    pub static ref GLOBAL_BATCH_METRICS: Arc<BatchOptimizationMetrics> =
+        Arc::new(BatchOptimizationMetrics::new());
+}
+
+/// Helper function to record batch optimization metrics
+pub fn record_batch_metrics(
+    cache_name: Option<&str>,
+    doc_count: usize,
+    stats: &PrefetchStats,
+    segments: usize,
+    bytes_wasted: u64,
+) {
+    // Always record to global metrics
+    GLOBAL_BATCH_METRICS.record_batch_operation(doc_count, stats, segments, bytes_wasted);
+
+    // Also record to cache-specific metrics if cache_name is provided
+    if let Some(name) = cache_name {
+        if let Ok(batch_metrics) = BATCH_METRICS.lock() {
+            if let Some(metrics) = batch_metrics.get(name) {
+                metrics.record_batch_operation(doc_count, stats, segments, bytes_wasted);
+            }
+        }
+    }
 }
 
 #[no_mangle]
@@ -278,7 +308,15 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_
         let mut managers = CACHE_MANAGERS.lock().unwrap();
         managers.insert(cache_name.clone(), manager_arc.clone());
     }
-    
+
+    // Create and store batch optimization metrics for this cache manager
+    {
+        let metrics = Arc::new(crate::simple_batch_optimization::BatchOptimizationMetrics::new());
+        let mut batch_metrics = BATCH_METRICS.lock().unwrap();
+        batch_metrics.insert(cache_name.clone(), metrics);
+        debug_println!("RUST DEBUG: Created batch optimization metrics for cache '{}'", cache_name);
+    }
+
     // Use Arc registry for safe memory management
     let cache_name_arc = Arc::new(cache_name);
     crate::utils::arc_to_jlong(cache_name_arc)
@@ -587,4 +625,144 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_
     let error_msg = "Multi-split search across specified splits is not yet implemented. Use individual SplitSearcher instances for searching specific splits.";
     let _ = env.throw_new("java/lang/UnsupportedOperationException", error_msg);
     std::ptr::null_mut()
+}
+
+// ============================================================================
+// Batch Optimization Metrics JNI Methods
+// ============================================================================
+
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_nativeGetBatchMetricsTotalOperations(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jlong {
+    GLOBAL_BATCH_METRICS.get_total_batch_operations() as jlong
+}
+
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_nativeGetBatchMetricsTotalDocuments(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jlong {
+    GLOBAL_BATCH_METRICS.get_total_documents_requested() as jlong
+}
+
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_nativeGetBatchMetricsTotalRequests(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jlong {
+    GLOBAL_BATCH_METRICS.get_total_requests() as jlong
+}
+
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_nativeGetBatchMetricsConsolidatedRequests(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jlong {
+    GLOBAL_BATCH_METRICS.get_consolidated_requests() as jlong
+}
+
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_nativeGetBatchMetricsBytesTransferred(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jlong {
+    GLOBAL_BATCH_METRICS.get_bytes_transferred() as jlong
+}
+
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_nativeGetBatchMetricsBytesWasted(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jlong {
+    GLOBAL_BATCH_METRICS.get_bytes_wasted() as jlong
+}
+
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_nativeGetBatchMetricsTotalPrefetchDuration(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jlong {
+    GLOBAL_BATCH_METRICS.get_total_prefetch_duration_ms() as jlong
+}
+
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_nativeGetBatchMetricsSegmentsProcessed(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jlong {
+    GLOBAL_BATCH_METRICS.get_segments_processed() as jlong
+}
+
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_nativeGetBatchMetricsConsolidationRatio(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jdouble {
+    GLOBAL_BATCH_METRICS.get_consolidation_ratio()
+}
+
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_nativeGetBatchMetricsCostSavingsPercent(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jdouble {
+    GLOBAL_BATCH_METRICS.get_cost_savings_percent()
+}
+
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_nativeGetBatchMetricsEfficiencyPercent(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jdouble {
+    GLOBAL_BATCH_METRICS.get_efficiency_percent()
+}
+
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_nativeResetBatchMetrics(
+    _env: JNIEnv,
+    _class: JClass,
+) {
+    GLOBAL_BATCH_METRICS.reset();
+}
+
+// ===================================
+// Searcher Cache Statistics JNI Methods
+// ===================================
+
+use crate::split_searcher_replacement::{SEARCHER_CACHE_HITS, SEARCHER_CACHE_MISSES, SEARCHER_CACHE_EVICTIONS};
+
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_nativeGetSearcherCacheHits(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jlong {
+    SEARCHER_CACHE_HITS.load(Ordering::Relaxed) as jlong
+}
+
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_nativeGetSearcherCacheMisses(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jlong {
+    SEARCHER_CACHE_MISSES.load(Ordering::Relaxed) as jlong
+}
+
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_nativeGetSearcherCacheEvictions(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jlong {
+    SEARCHER_CACHE_EVICTIONS.load(Ordering::Relaxed) as jlong
+}
+
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_nativeResetSearcherCacheStats(
+    _env: JNIEnv,
+    _class: JClass,
+) {
+    SEARCHER_CACHE_HITS.store(0, Ordering::Relaxed);
+    SEARCHER_CACHE_MISSES.store(0, Ordering::Relaxed);
+    SEARCHER_CACHE_EVICTIONS.store(0, Ordering::Relaxed);
 }

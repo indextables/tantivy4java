@@ -53,6 +53,97 @@ The system tracks four distinct cache types, each serving different purposes:
 - **Quickwit Mapping**: `searcher_split_cache` metrics
 - **Optimal For**: Repeated queries against the same splits
 
+### 5. 🎯 **SearcherCache** (NEW)
+- **Purpose**: LRU cache for Tantivy searcher objects used in document retrieval
+- **Use Case**: Avoids reopening indices for single document retrievals via `docNative`
+- **Cache Type**: In-memory LRU cache (default: 1000 entries)
+- **Memory Management**: Automatic eviction of least recently used entries
+- **Optimal For**: Workloads with repeated document access patterns
+- **Production Impact**: Prevents memory leaks from unbounded cache growth
+
+#### Key Features
+- **Bounded Size**: Default 1000 entries, prevents unbounded memory growth
+- **LRU Eviction**: Automatically removes oldest entries when cache is full
+- **Statistics Tracking**: Hits, misses, and evictions for performance monitoring
+- **Thread-Safe**: Lock-free atomic statistics tracking
+- **Zero Disk Spilling**: Pure in-memory cache (not backed by disk)
+
+#### Getting Searcher Cache Statistics
+
+```java
+import io.indextables.tantivy4java.split.SplitCacheManager;
+import io.indextables.tantivy4java.split.SplitCacheManager.SearcherCacheStats;
+
+// Get searcher cache performance statistics
+SearcherCacheStats stats = SplitCacheManager.getSearcherCacheStats();
+
+System.out.println("Cache Hit Rate: " + stats.getHitRate() + "%");
+System.out.println("Total Hits: " + stats.getHits());
+System.out.println("Total Misses: " + stats.getMisses());
+System.out.println("Total Evictions: " + stats.getEvictions());
+System.out.println("Total Accesses: " + stats.getTotalAccesses());
+
+// Reset statistics for next monitoring period
+SplitCacheManager.resetSearcherCacheStats();
+```
+
+**Expected Output:**
+```
+Cache Hit Rate: 85.5%
+Total Hits: 8,550
+Total Misses: 1,450
+Total Evictions: 50
+Total Accesses: 10,000
+```
+
+#### Memory Leak Prevention
+
+The SearcherCache was specifically designed to prevent memory leaks:
+
+```java
+// OLD: Unbounded HashMap (memory leak risk)
+// Cache grows forever, never evicts entries
+
+// NEW: LRU Cache (memory safe)
+// - Default: 1000 entries maximum
+// - Automatic eviction when full
+// - Statistics track evictions for monitoring
+```
+
+**Monitoring for Memory Issues:**
+
+```java
+SearcherCacheStats stats = SplitCacheManager.getSearcherCacheStats();
+
+// High eviction rate may indicate cache is too small
+long totalOps = stats.getTotalAccesses();
+double evictionRate = totalOps > 0 ? (double) stats.getEvictions() / totalOps : 0;
+
+if (evictionRate > 0.05) { // More than 5% eviction rate
+    System.out.println("WARNING: High eviction rate: " +
+        String.format("%.2f%%", evictionRate * 100));
+    System.out.println("Consider: Cache may be undersized for workload");
+}
+
+// Low hit rate indicates cache effectiveness
+if (stats.getHitRate() < 50.0) {
+    System.out.println("WARNING: Low hit rate: " +
+        String.format("%.1f%%", stats.getHitRate()));
+    System.out.println("Consider: Access patterns may not benefit from caching");
+}
+```
+
+#### Configuration
+
+The SearcherCache is automatically configured with production-ready defaults:
+
+- **Default Size**: 1000 searcher entries
+- **Eviction Policy**: Least Recently Used (LRU)
+- **Memory Location**: In-memory only (no disk spilling)
+- **Thread Safety**: Lock-free statistics, mutex-protected cache access
+
+**Note**: The cache size is currently fixed at 1000 entries. This default is designed to handle most production workloads without requiring tuning.
+
 ## Basic Usage
 
 ### Getting Started

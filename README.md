@@ -1051,6 +1051,58 @@ status.forEach((component, cached) ->
 searcher.evictComponents(List.of("postings"));
 ```
 
+### SearcherCache Monitoring
+
+The internal SearcherCache is an LRU cache (default: 1000 entries) that stores Tantivy searcher objects for efficient document retrieval. Monitor these statistics to detect memory issues and optimize cache performance:
+
+```java
+import io.indextables.tantivy4java.split.SplitCacheManager;
+import io.indextables.tantivy4java.split.SplitCacheManager.SearcherCacheStats;
+
+// Get searcher cache statistics
+SearcherCacheStats stats = SplitCacheManager.getSearcherCacheStats();
+
+System.out.println("📊 SearcherCache Performance:");
+System.out.println("  Cache Hit Rate: " + stats.getHitRate() + "%");
+System.out.println("  Total Hits: " + stats.getHits());
+System.out.println("  Total Misses: " + stats.getMisses());
+System.out.println("  Total Evictions: " + stats.getEvictions());
+
+// Detect potential issues
+if (stats.getHitRate() < 50.0) {
+    System.out.println("⚠️ Low cache hit rate - workload may have poor locality");
+}
+
+if (stats.getEvictions() > 1000) {
+    System.out.println("⚠️ High eviction count - cache thrashing detected");
+}
+
+// Reset statistics for next monitoring period
+SplitCacheManager.resetSearcherCacheStats();
+```
+
+**Memory Leak Prevention:**
+
+The SearcherCache uses LRU eviction to prevent unbounded memory growth that was present in earlier versions:
+
+```java
+// OLD: Unbounded HashMap (memory leak risk ❌)
+// Cache would grow forever, never evict entries
+// Could cause OutOfMemoryError in production
+
+// NEW: LRU Cache (memory safe ✅)
+// - Default: 1000 entries maximum
+// - Automatic eviction when full
+// - Statistics track evictions for monitoring
+// - Safe for long-running production deployments
+```
+
+**Key Metrics:**
+
+- **Cache Hit Rate** - Target >90% for workloads with repeated document access
+- **Evictions** - Should be minimal for stable workloads; high evictions indicate cache size too small
+- **Hits vs Misses** - Ratio indicates cache effectiveness and access pattern locality
+
 ---
 
 ## Performance Guide

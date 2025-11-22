@@ -810,12 +810,32 @@ public class RealS3EndToEndTest {
                         .map(hit -> hit.getDocAddress())
                         .collect(java.util.stream.Collectors.toList());
 
+                    // Reset metrics before batch operation to test metrics recording
+                    SplitCacheManager.resetBatchMetrics();
+
                     long batchStartTime = System.nanoTime();
                     java.util.List<Document> batchDocs = searcher.docBatch(batchAddresses);
                     long batchEndTime = System.nanoTime();
                     long batchTime = (batchEndTime - batchStartTime) / 1_000_000;
 
                     System.out.printf("     📦 Batch retrieval (%d docs): %d ms%n", batchDocs.size(), batchTime);
+
+                    // Validate batch optimization metrics were recorded
+                    BatchOptimizationMetrics metrics = SplitCacheManager.getBatchMetrics();
+                    System.out.println("     📊 Batch Optimization Metrics:");
+                    System.out.printf("        Total Operations: %d%n", metrics.getTotalBatchOperations());
+                    System.out.printf("        Documents Requested: %d%n", metrics.getTotalDocumentsRequested());
+                    System.out.printf("        Consolidation Ratio: %.1fx%n", metrics.getConsolidationRatio());
+                    System.out.printf("        Cost Savings: %.1f%%%n", metrics.getCostSavingsPercent());
+
+                    // Verify metrics were actually recorded (proves the code executed)
+                    assertTrue(metrics.getTotalBatchOperations() > 0,
+                        "Batch operations should be recorded for S3 splits");
+                    assertEquals(batchDocs.size(), metrics.getTotalDocumentsRequested(),
+                        "Documents requested should match batch size");
+                    assertTrue(metrics.getConsolidationRatio() >= 1.0,
+                        "Consolidation ratio should be at least 1.0");
+                    System.out.println("     ✅ METRICS VALIDATED: Batch optimization metrics are being recorded!");
 
                     // Batch retrieval should be efficient with hotcache
                     if (batchTime < (batchDocs.size() * 200)) { // < 200ms per doc in batch
