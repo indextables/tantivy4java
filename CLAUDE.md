@@ -1165,7 +1165,14 @@ Following user feedback about cache configuration inconsistencies, comprehensive
 - **LeafSearchCache** - Global search result cache (per split_id + query) matching Quickwit design
 - **ByteRangeCache** - Global storage byte range cache (per file_path + range) for efficient storage access
 - **ComponentCache** - Global component cache (fast fields, postings, etc.) shared across all splits
+- **SearcherCache** - LRU cache for Tantivy searcher objects (default: 1000 entries) with automatic eviction to prevent memory leaks
 - **Configuration consistency** - Validates cache instances with same name have identical settings
+
+**✅ SearcherCache Memory Leak Prevention**
+- **LRU Eviction Policy** - Bounded cache size (default: 1000 searchers) prevents unbounded memory growth
+- **Statistics Monitoring** - Track hits, misses, and evictions for cache performance analysis
+- **Production Safe** - Eliminates OutOfMemoryError risk from earlier unbounded HashMap implementation
+- **Automatic Management** - No manual configuration required, works transparently
 
 **✅ Enhanced Documentation and API Guidance**
 - **Comprehensive class-level documentation** - Clear explanation of shared cache architecture
@@ -1199,6 +1206,57 @@ SplitSearcher searcher2 = cacheManager.createSplitSearcher("s3://bucket/split2.s
 - **Eliminates anti-patterns** - Removes deprecated per-split cache configuration methods
 - **Matches Quickwit design** - Follows proven Quickwit multi-level caching architecture
 - **Clear migration path** - Explicit guidance for updating existing code
+
+#### **📊 SearcherCache Monitoring and Statistics**
+
+**Monitor cache performance to detect memory issues and optimize efficiency:**
+
+```java
+import io.indextables.tantivy4java.split.SplitCacheManager;
+import io.indextables.tantivy4java.split.SplitCacheManager.SearcherCacheStats;
+
+// Get searcher cache statistics
+SearcherCacheStats stats = SplitCacheManager.getSearcherCacheStats();
+
+System.out.println("📊 SearcherCache Performance:");
+System.out.println("  Cache Hit Rate: " + stats.getHitRate() + "%");
+System.out.println("  Total Hits: " + stats.getHits());
+System.out.println("  Total Misses: " + stats.getMisses());
+System.out.println("  Total Evictions: " + stats.getEvictions());
+System.out.println("  Total Accesses: " + stats.getTotalAccesses());
+
+// Detect potential memory issues
+if (stats.getHitRate() < 50.0) {
+    System.out.println("⚠️ Warning: Low cache hit rate - workload has poor locality");
+}
+
+if (stats.getEvictions() > 1000) {
+    System.out.println("⚠️ Warning: High eviction count - cache thrashing detected");
+    System.out.println("   Consider: Increase cache size or reduce working set");
+}
+
+// Reset statistics for next monitoring period
+SplitCacheManager.resetSearcherCacheStats();
+```
+
+**Key Metrics:**
+- **Cache Hit Rate**: Target >90% for workloads with repeated document access
+- **Evictions**: Should be minimal for stable workloads; high evictions indicate cache too small
+- **Hits vs Misses**: Ratio indicates cache effectiveness and access pattern locality
+
+**Memory Leak Prevention:**
+```java
+// OLD: Unbounded HashMap (memory leak risk ❌)
+// Cache would grow forever, never evict entries
+// Could cause OutOfMemoryError in long-running production deployments
+
+// NEW: LRU Cache (memory safe ✅)
+// - Default: 1000 entries maximum
+// - Automatic eviction when full
+// - Statistics track evictions for monitoring
+// - Production-safe for long-running deployments
+// - Thread-safe implementation
+```
 
 #### **🔐 AWS Credential Configuration Patterns**
 

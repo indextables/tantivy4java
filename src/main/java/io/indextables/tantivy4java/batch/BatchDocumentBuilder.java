@@ -272,7 +272,7 @@ public class BatchDocumentBuilder implements AutoCloseable {
             buffer.flip(); // Prepare for reading
             return buffer;
         } catch (Exception e) {
-            throw new RuntimeException("Failed to serialize document batch", e);
+            throw new RuntimeException("Failed to serialize document batch: " + e.getMessage(), e);
         }
     }
     
@@ -389,6 +389,22 @@ public class BatchDocumentBuilder implements AutoCloseable {
                 // Tantivy DateTime with microsecond precision requires nanosecond timestamps
                 long epochSecond = date.toEpochSecond(ZoneOffset.UTC);
                 int nano = date.getNano();
+
+                // Validate date range to prevent overflow
+                // Tantivy DateTime supports approximately years 1677-2262
+                // Safe range in seconds: approximately -9,223,000 to 9,223,000 billion seconds
+                // To avoid overflow when converting to nanoseconds, check epoch seconds range
+                final long MAX_SAFE_SECONDS = 9_223_000_000L;  // ~292 years from epoch
+                final long MIN_SAFE_SECONDS = -9_223_000_000L;
+
+                if (epochSecond < MIN_SAFE_SECONDS || epochSecond > MAX_SAFE_SECONDS) {
+                    throw new RuntimeException(
+                        "Date value out of range for field: " + date +
+                        ". Tantivy DateTime supports approximately years 1677-2262 " +
+                        "(epoch second range: " + MIN_SAFE_SECONDS + " to " + MAX_SAFE_SECONDS + ")"
+                    );
+                }
+
                 long epochNanos = epochSecond * 1_000_000_000L + nano;
                 buffer.putLong(epochNanos);
                 break;

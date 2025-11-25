@@ -48,6 +48,8 @@ mod test_query_parser;  // Test module for query parser debugging
 mod common;
 mod extract_helpers;
 mod global_cache;  // Global cache infrastructure following Quickwit's pattern
+mod simple_batch_optimization;  // Priority 1: Simplified batch optimization with range consolidation
+mod adaptive_tuning;  // Priority 5: Adaptive tuning engine for automatic parameter optimization
 
 pub use schema::*;
 pub use document::*;

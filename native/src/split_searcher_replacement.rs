@@ -339,8 +339,9 @@ fn has_footer_metadata(footer_start: u64, footer_end: u64) -> bool {
 /// Check if split URI is remote (S3/cloud) vs local file
 /// Quickwit's hotcache optimization is designed for remote splits, not local files
 fn is_remote_split(split_uri: &str) -> bool {
-    split_uri.starts_with("s3://") || 
-    split_uri.starts_with("http://") || 
+    split_uri.starts_with("s3://") ||
+    split_uri.starts_with("azure://") ||
+    split_uri.starts_with("http://") ||
     split_uri.starts_with("https://")
 }
 
@@ -373,14 +374,29 @@ fn get_shared_searcher_context() -> anyhow::Result<Arc<SearcherContext>> {
 }
 
 /// Cached Tantivy searcher for efficient single document retrieval
-/// This cache avoids reopening the index for every docNative call
-use std::collections::HashMap;
+/// LRU cache with configurable size to prevent unbounded memory growth
+use lru::LruCache;
+use std::num::NonZeroUsize;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-static SEARCHER_CACHE: OnceLock<Mutex<HashMap<String, Arc<tantivy::Searcher>>>> = OnceLock::new();
+// Default cache size: 1000 searchers (reasonably large for production)
+const DEFAULT_SEARCHER_CACHE_SIZE: usize = 1000;
 
-fn get_searcher_cache() -> &'static Mutex<HashMap<String, Arc<tantivy::Searcher>>> {
-    SEARCHER_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+// Cache statistics for monitoring
+lazy_static::lazy_static! {
+    pub static ref SEARCHER_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
+    pub static ref SEARCHER_CACHE_MISSES: AtomicU64 = AtomicU64::new(0);
+    pub static ref SEARCHER_CACHE_EVICTIONS: AtomicU64 = AtomicU64::new(0);
+}
+
+static SEARCHER_CACHE: OnceLock<Mutex<LruCache<String, Arc<tantivy::Searcher>>>> = OnceLock::new();
+
+fn get_searcher_cache() -> &'static Mutex<LruCache<String, Arc<tantivy::Searcher>>> {
+    SEARCHER_CACHE.get_or_init(|| {
+        let capacity = NonZeroUsize::new(DEFAULT_SEARCHER_CACHE_SIZE).unwrap();
+        Mutex::new(LruCache::new(capacity))
+    })
 }
 
 /// Simple data structure to hold search results for JNI integration
@@ -1387,11 +1403,19 @@ fn retrieve_document_from_split_optimized(
     let cache_check_start = std::time::Instant::now();
     let searcher_cache = get_searcher_cache();
     let cached_searcher = {
-        let cache = searcher_cache.lock().unwrap();
+        let mut cache = searcher_cache.lock().unwrap();
         cache.get(&split_uri).cloned()
     };
+
+    // Track cache statistics
+    if cached_searcher.is_some() {
+        SEARCHER_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
+    } else {
+        SEARCHER_CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
+    }
+
     debug_println!("RUST DEBUG: ⏱️ Cache lookup completed [TIMING: {}ms] - cache_hit: {}", cache_check_start.elapsed().as_millis(), cached_searcher.is_some());
-    
+
     if let Some(searcher) = cached_searcher {
         // Use cached searcher - very fast path (cache hit)
         // IMPORTANT: Use async method for StorageDirectory compatibility
@@ -1619,7 +1643,11 @@ fn retrieve_document_from_split_optimized(
                 {
                     let searcher_cache = get_searcher_cache();
                     let mut cache = searcher_cache.lock().unwrap();
-                    cache.insert(split_uri.clone(), searcher.clone());
+                    // LRU push returns Some(evicted_value) if an entry was evicted
+                    if cache.push(split_uri.clone(), searcher.clone()).is_some() {
+                        SEARCHER_CACHE_EVICTIONS.fetch_add(1, Ordering::Relaxed);
+                        debug_println!("RUST DEBUG: 🗑️ LRU EVICTION - cache full, evicted oldest searcher");
+                    }
                 }
                 debug_println!("RUST DEBUG: ⏱️ 📖 Searcher caching completed [TIMING: {}ms]", caching_start.elapsed().as_millis());
                 debug_println!("RUST DEBUG: ⏱️ 📖 TOTAL INDEX OPENING completed [TIMING: {}ms]", index_opening_start.elapsed().as_millis());
@@ -1833,9 +1861,10 @@ fn retrieve_documents_batch_from_split_optimized(
     mut doc_addresses: Vec<tantivy::DocAddress>,
 ) -> Result<Vec<jobject>, anyhow::Error> {
     use crate::utils::with_arc_safe;
-    
+    use crate::simple_batch_optimization::{SimpleBatchOptimizer, SimpleBatchConfig};
+
     use std::sync::Arc;
-    
+
     // Sort by DocAddress for cache locality (following Quickwit pattern)
     doc_addresses.sort();
 
@@ -1862,17 +1891,71 @@ fn retrieve_documents_batch_from_split_optimized(
                 // ✅ OPTIMIZATION: Check searcher cache first (like individual retrieval)
                 let searcher_cache = get_searcher_cache();
                 let cached_searcher_option = {
-                    let cache = searcher_cache.lock().unwrap();
+                    let mut cache = searcher_cache.lock().unwrap();
                     cache.get(split_uri as &str).cloned()
                 };
+
+                // Track cache statistics
+                if cached_searcher_option.is_some() {
+                    SEARCHER_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    SEARCHER_CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
+                }
 
                 // If we have a cached searcher, use it for concurrent batch processing
                 if let Some(cached_searcher) = cached_searcher_option {
                     debug_println!("RUST DEBUG: ✅ BATCH CACHE HIT: Using cached searcher for batch processing");
                     let schema = cached_searcher.schema(); // Get schema from cached searcher
 
+                    // 🚀 BATCH OPTIMIZATION: Prefetch consolidated byte ranges for better S3 performance
+                    let optimizer = SimpleBatchOptimizer::new(SimpleBatchConfig::default());
+
+                    if optimizer.should_optimize(doc_addresses.len()) {
+                        debug_println!("🚀 BATCH_OPT: Starting range consolidation for {} documents", doc_addresses.len());
+
+                        match optimizer.consolidate_ranges(&doc_addresses, &cached_searcher) {
+                            Ok(ranges) => {
+                                let num_segments = ranges.iter().map(|r| r.file_path.clone()).collect::<std::collections::HashSet<_>>().len();
+                                debug_println!("🚀 BATCH_OPT: Consolidated {} docs → {} ranges across {} segments",
+                                    doc_addresses.len(), ranges.len(), num_segments);
+
+                                // Prefetch the consolidated ranges to populate ByteRangeCache
+                                match optimizer.prefetch_ranges(ranges.clone(), storage_resolver.clone(), split_uri).await {
+                                    Ok(stats) => {
+                                        debug_println!("🚀 BATCH_OPT SUCCESS: Prefetched {} ranges, {} bytes in {}ms",
+                                            stats.ranges_fetched, stats.bytes_fetched, stats.duration_ms);
+                                        debug_println!("   📊 Consolidation ratio: {:.1}x (docs/ranges)",
+                                            stats.consolidation_ratio(doc_addresses.len()));
+
+                                        // Record metrics (estimate bytes wasted from gaps)
+                                        let bytes_wasted = 0; // TODO: Calculate actual gap bytes
+                                        crate::split_cache_manager::record_batch_metrics(
+                                            None, // cache_name not available in this context
+                                            doc_addresses.len(),
+                                            &stats,
+                                            num_segments,
+                                            bytes_wasted,
+                                        );
+                                    }
+                                    Err(e) => {
+                                        debug_println!("⚠️ BATCH_OPT: Prefetch failed (continuing with normal retrieval): {}", e);
+                                        // Non-fatal: continue with normal doc_async which will fetch on-demand
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                debug_println!("⚠️ BATCH_OPT: Range consolidation failed (continuing with normal retrieval): {}", e);
+                                // Non-fatal: continue with normal doc_async
+                            }
+                        }
+                    } else {
+                        debug_println!("⏭️ BATCH_OPT: Skipping optimization (only {} docs, threshold: {})",
+                            doc_addresses.len(), optimizer.config.min_docs_for_optimization);
+                    }
+
                     // ✅ QUICKWIT CONCURRENT PATTERN: Use cached searcher with concurrency
                     // Using global cache configuration for concurrent batch processing
+                    // Note: doc_async calls will now benefit from prefetched ByteRangeCache
 
                     let doc_futures = doc_addresses.into_iter().map(|doc_addr| {
                         let moved_searcher = cached_searcher.clone(); // Reuse cached searcher
@@ -2027,11 +2110,61 @@ fn retrieve_documents_batch_from_split_optimized(
                 {
                     let searcher_cache = get_searcher_cache();
                     let mut cache = searcher_cache.lock().unwrap();
-                    cache.insert(split_uri.clone(), tantivy_searcher.clone());
+                    // LRU push returns Some(evicted_value) if an entry was evicted
+                    if cache.push(split_uri.clone(), tantivy_searcher.clone()).is_some() {
+                        SEARCHER_CACHE_EVICTIONS.fetch_add(1, Ordering::Relaxed);
+                        debug_println!("RUST DEBUG: 🗑️ LRU EVICTION - cache full, evicted oldest searcher");
+                    }
                     debug_println!("RUST DEBUG: ✅ CACHED NEW SEARCHER: Stored searcher for future batch operations");
                 }
-                
+
+                // 🚀 BATCH OPTIMIZATION: Prefetch consolidated byte ranges for better S3 performance
+                let optimizer = SimpleBatchOptimizer::new(SimpleBatchConfig::default());
+
+                if optimizer.should_optimize(doc_addresses.len()) {
+                    debug_println!("🚀 BATCH_OPT: Starting range consolidation for {} documents", doc_addresses.len());
+
+                    match optimizer.consolidate_ranges(&doc_addresses, &tantivy_searcher) {
+                        Ok(ranges) => {
+                            debug_println!("🚀 BATCH_OPT: Consolidated {} docs → {} ranges", doc_addresses.len(), ranges.len());
+
+                            // Prefetch the consolidated ranges to populate ByteRangeCache
+                            match optimizer.prefetch_ranges(ranges.clone(), index_storage.clone(), split_uri).await {
+                                Ok(stats) => {
+                                    debug_println!("🚀 BATCH_OPT SUCCESS: Prefetched {} ranges, {} bytes in {}ms",
+                                        stats.ranges_fetched, stats.bytes_fetched, stats.duration_ms);
+                                    debug_println!("   📊 Consolidation ratio: {:.1}x (docs/ranges)",
+                                        stats.consolidation_ratio(doc_addresses.len()));
+
+                                    // Record metrics (estimate bytes wasted from gaps)
+                                    let num_segments = ranges.iter().map(|r| r.file_path.clone()).collect::<std::collections::HashSet<_>>().len();
+                                    let bytes_wasted = 0; // TODO: Calculate actual gap bytes
+                                    crate::split_cache_manager::record_batch_metrics(
+                                        None, // cache_name not available in this context
+                                        doc_addresses.len(),
+                                        &stats,
+                                        num_segments,
+                                        bytes_wasted,
+                                    );
+                                }
+                                Err(e) => {
+                                    debug_println!("⚠️ BATCH_OPT: Prefetch failed (continuing with normal retrieval): {}", e);
+                                    // Non-fatal: continue with normal doc_async which will fetch on-demand
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            debug_println!("⚠️ BATCH_OPT: Range consolidation failed (continuing with normal retrieval): {}", e);
+                            // Non-fatal: continue with normal doc_async
+                        }
+                    }
+                } else {
+                    debug_println!("⏭️ BATCH_OPT: Skipping optimization (only {} docs, threshold: {})",
+                        doc_addresses.len(), optimizer.config.min_docs_for_optimization);
+                }
+
                 // ✅ QUICKWIT CONCURRENT PATTERN: Use concurrent document retrieval (fetch_docs.rs line 200-258)
+                // Note: doc_async calls will now benefit from prefetched ByteRangeCache
 
                 // Create async futures for concurrent document retrieval (like Quickwit)
                 let doc_futures = doc_addresses.into_iter().map(|doc_addr| {

@@ -5200,6 +5200,7 @@ dependencies = [
  "jni",
  "lazy_static",
  "libc",
+ "lru 0.12.5",
  "memmap2",
  "num_cpus",
  "once_cell",
