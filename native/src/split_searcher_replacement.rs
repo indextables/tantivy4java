@@ -339,8 +339,9 @@ fn has_footer_metadata(footer_start: u64, footer_end: u64) -> bool {
 /// Check if split URI is remote (S3/cloud) vs local file
 /// Quickwit's hotcache optimization is designed for remote splits, not local files
 fn is_remote_split(split_uri: &str) -> bool {
-    split_uri.starts_with("s3://") || 
-    split_uri.starts_with("http://") || 
+    split_uri.starts_with("s3://") ||
+    split_uri.starts_with("azure://") ||
+    split_uri.starts_with("http://") ||
     split_uri.starts_with("https://")
 }
 
