@@ -193,73 +193,113 @@ impl SimpleBatchOptimizer {
         Ok(all_ranges)
     }
 
-    /// Consolidate documents within a single segment
+    /// Consolidate documents within a single segment using actual byte ranges
     ///
-    /// Note: This is a simplified implementation that groups documents by proximity.
-    /// For full optimization, we'd need to extract actual byte positions from Tantivy's
-    /// doc store, which requires deeper integration with Tantivy internals.
-    ///
-    /// Current approach: Group documents into batches based on doc_id proximity
+    /// This implementation uses Tantivy's StoreReader to get real block byte ranges,
+    /// then consolidates nearby blocks based on gap_tolerance and max_range_size.
     fn consolidate_segment_docs(
         &self,
         segment_ord: u32,
-        mut doc_addresses: Vec<DocAddress>,
-        _segment_reader: &tantivy::SegmentReader,
+        doc_addresses: Vec<DocAddress>,
+        segment_reader: &tantivy::SegmentReader,
     ) -> Result<Vec<PrefetchRange>> {
-        // Sort by doc_id for sequential access
-        doc_addresses.sort_by_key(|addr| addr.doc_id);
-
-        debug_println!("    📏 Segment {} consolidating {} documents",
+        debug_println!("    📏 Segment {} consolidating {} documents using real byte ranges",
                       segment_ord, doc_addresses.len());
 
-        // Group documents into batches based on doc_id proximity
-        // This encourages sequential I/O which helps with storage cache hit rates
-        let mut ranges = Vec::new();
-        let mut current_batch: Vec<DocAddress> = Vec::new();
-        let mut last_doc_id: Option<u32> = None;
+        // Get the store reader to access block byte ranges
+        // Use a small cache since we're just reading block metadata, not decompressing
+        let store_reader = segment_reader.get_store_reader(1)
+            .context("Failed to get store reader for byte range lookup")?;
 
-        // Group documents where doc_ids are within a reasonable range
-        let doc_id_gap_threshold = 100; // Documents within 100 doc_ids are likely nearby
+        // Get the store file path (segment_uuid.store)
+        let segment_id = segment_reader.segment_id().uuid_string();
+        let store_file_path = format!("{}.store", segment_id);
 
-        for addr in doc_addresses {
-            let should_start_new_batch = if let Some(last_id) = last_doc_id {
-                let gap = addr.doc_id.saturating_sub(last_id);
-                gap > doc_id_gap_threshold || current_batch.len() >= 100
+        // Collect (doc_address, byte_range) pairs
+        // Documents in the same block will have the same byte_range
+        let mut doc_with_ranges: Vec<(DocAddress, std::ops::Range<usize>)> = Vec::with_capacity(doc_addresses.len());
+
+        for addr in &doc_addresses {
+            match store_reader.get_block_byte_range(addr.doc_id) {
+                Ok(byte_range) => {
+                    doc_with_ranges.push((*addr, byte_range));
+                }
+                Err(e) => {
+                    debug_println!("    ⚠️ Failed to get byte range for doc {}: {}", addr.doc_id, e);
+                    // Skip documents we can't get byte ranges for
+                    continue;
+                }
+            }
+        }
+
+        if doc_with_ranges.is_empty() {
+            debug_println!("    ⚠️ No valid byte ranges found, skipping segment");
+            return Ok(Vec::new());
+        }
+
+        // Sort by byte range start for sequential consolidation
+        doc_with_ranges.sort_by_key(|(_, range)| range.start);
+
+        debug_println!("    📊 Got {} byte ranges, consolidating with gap_tolerance={}KB, max_range={}MB",
+                      doc_with_ranges.len(),
+                      self.config.gap_tolerance / 1024,
+                      self.config.max_range_size / (1024 * 1024));
+
+        // Consolidate into ranges based on gap_tolerance and max_range_size
+        let mut ranges: Vec<PrefetchRange> = Vec::new();
+        let mut current_start: Option<usize> = None;
+        let mut current_end: usize = 0;
+        let mut current_docs: Vec<DocAddress> = Vec::new();
+
+        for (addr, byte_range) in doc_with_ranges {
+            let should_start_new_range = if let Some(start) = current_start {
+                let gap = byte_range.start.saturating_sub(current_end);
+                let new_size = byte_range.end.saturating_sub(start);
+
+                // Start new range if:
+                // 1. Gap between current end and new start exceeds gap_tolerance
+                // 2. Adding this block would exceed max_range_size
+                gap > self.config.gap_tolerance || new_size > self.config.max_range_size
             } else {
                 false
             };
 
-            if should_start_new_batch && !current_batch.is_empty() {
-                // Create range for current batch
-                let first_doc_id = current_batch[0].doc_id;
-                let last_doc_id = current_batch[current_batch.len() - 1].doc_id;
-
+            if should_start_new_range && !current_docs.is_empty() {
+                // Finalize current range
                 ranges.push(PrefetchRange {
-                    file_path: format!("segment_{}_store", segment_ord),
-                    start: first_doc_id as usize, // Simplified: use doc_id as proxy
-                    end: (last_doc_id + 1) as usize,
-                    doc_addresses: current_batch.clone(),
+                    file_path: store_file_path.clone(),
+                    start: current_start.unwrap(),
+                    end: current_end,
+                    doc_addresses: std::mem::take(&mut current_docs),
                 });
-
-                current_batch.clear();
+                current_start = None;
             }
 
-            current_batch.push(addr);
-            last_doc_id = Some(addr.doc_id);
+            // Add to current range
+            if current_start.is_none() {
+                current_start = Some(byte_range.start);
+            }
+            current_end = current_end.max(byte_range.end);
+            current_docs.push(addr);
         }
 
-        // Add final batch
-        if !current_batch.is_empty() {
-            let first_doc_id = current_batch[0].doc_id;
-            let last_doc_id = current_batch[current_batch.len() - 1].doc_id;
-
-            ranges.push(PrefetchRange {
-                file_path: format!("segment_{}_store", segment_ord),
-                start: first_doc_id as usize,
-                end: (last_doc_id + 1) as usize,
-                doc_addresses: current_batch,
-            });
+        // Add final range
+        if !current_docs.is_empty() {
+            if let Some(start) = current_start {
+                ranges.push(PrefetchRange {
+                    file_path: store_file_path,
+                    start,
+                    end: current_end,
+                    doc_addresses: current_docs,
+                });
+            }
         }
+
+        // Log consolidation results
+        let total_bytes: usize = ranges.iter().map(|r| r.size()).sum();
+        let unique_blocks = ranges.len();
+        debug_println!("    ✅ Consolidated {} docs into {} ranges ({} bytes total)",
+                      doc_addresses.len(), unique_blocks, total_bytes);
 
         Ok(ranges)
     }
