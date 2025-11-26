@@ -363,6 +363,138 @@ fn extract_split_id_from_uri(split_uri: &str) -> String {
     }
 }
 
+/// 🚀 BATCH OPTIMIZATION FIX: Parse bundle metadata from split file footer
+/// Returns the file offsets map: inner_file_path -> Range<u64> in split file
+/// This allows prefetch to translate inner byte ranges to split file byte ranges
+///
+/// Uses the SearcherContext's split_footer_cache to avoid redundant S3 requests.
+/// This is the same cache that open_index_with_caches uses.
+async fn parse_bundle_file_offsets(
+    storage: &Arc<dyn Storage>,
+    split_uri: &str,
+    footer_start: u64,
+    footer_end: u64,
+    searcher_context: &quickwit_search::SearcherContext,
+) -> anyhow::Result<std::collections::HashMap<std::path::PathBuf, std::ops::Range<u64>>> {
+    use std::path::PathBuf;
+
+    debug_println!("🔍 BUNDLE_METADATA: Parsing bundle file offsets from footer");
+    debug_println!("   Footer range: {} - {} ({} bytes)", footer_start, footer_end, footer_end - footer_start);
+
+    // Extract split_id from split_uri (same logic as quickwit)
+    let split_filename = if let Some(last_slash_pos) = split_uri.rfind('/') {
+        &split_uri[last_slash_pos + 1..]
+    } else {
+        split_uri
+    };
+    let split_id = if split_filename.ends_with(".split") {
+        &split_filename[..split_filename.len() - 6]
+    } else {
+        split_filename
+    };
+    let split_path = std::path::Path::new(split_filename);
+
+    // 🚀 OPTIMIZATION: Check quickwit's split_footer_cache first (same cache open_index_with_caches uses)
+    let footer_bytes = {
+        let cached = searcher_context.split_footer_cache.get(split_id);
+        if let Some(footer_data) = cached {
+            debug_println!("🔍 BUNDLE_METADATA: Footer cache HIT - {} bytes from split_footer_cache (no S3 request)", footer_data.len());
+            footer_data
+        } else {
+            debug_println!("🔍 BUNDLE_METADATA: Footer cache MISS - fetching from S3");
+            let footer_range = footer_start as usize..footer_end as usize;
+            let data = storage.get_slice(split_path, footer_range).await
+                .map_err(|e| anyhow::anyhow!("Failed to fetch footer for bundle metadata: {}", e))?;
+            // Store in cache for future use (though open_index_with_caches will also cache it)
+            searcher_context.split_footer_cache.put(split_id.to_string(), data.clone());
+            data
+        }
+    };
+
+    debug_println!("🔍 BUNDLE_METADATA: Using {} footer bytes", footer_bytes.len());
+
+    // Parse the footer directly - no need for BundleStorage intermediate step
+    // Footer format: [FileMetadata, FileMetadata Len (4 bytes), HotCache, HotCache Len (4 bytes)]
+    let mut file_offsets = std::collections::HashMap::new();
+
+    // Footer structure: [HotCache Len (last 4 bytes)] points to HotCache
+    // Before that: [FileMetadata Len (4 bytes)] points to JSON metadata
+    let footer_len = footer_bytes.len();
+    if footer_len < 8 {
+        return Err(anyhow::anyhow!("Footer too small: {} bytes", footer_len));
+    }
+
+    // Read hotcache length from last 4 bytes
+    let hotcache_len = u32::from_le_bytes([
+        footer_bytes[footer_len - 4],
+        footer_bytes[footer_len - 3],
+        footer_bytes[footer_len - 2],
+        footer_bytes[footer_len - 1],
+    ]) as usize;
+
+    debug_println!("🔍 BUNDLE_METADATA: Hotcache length: {} bytes", hotcache_len);
+
+    // The metadata is before the hotcache, with its length at the end
+    let before_hotcache_len = footer_len - 4 - hotcache_len;
+    if before_hotcache_len < 4 {
+        return Err(anyhow::anyhow!("Invalid footer structure: not enough bytes before hotcache"));
+    }
+
+    // Read metadata length
+    let metadata_len_pos = before_hotcache_len - 4;
+    let metadata_len = u32::from_le_bytes([
+        footer_bytes[metadata_len_pos],
+        footer_bytes[metadata_len_pos + 1],
+        footer_bytes[metadata_len_pos + 2],
+        footer_bytes[metadata_len_pos + 3],
+    ]) as usize;
+
+    debug_println!("🔍 BUNDLE_METADATA: Metadata length: {} bytes", metadata_len);
+
+    // Read metadata bytes (before the length field)
+    let metadata_start = metadata_len_pos - metadata_len;
+    let metadata_bytes = &footer_bytes[metadata_start..metadata_len_pos];
+
+    debug_println!("🔍 BUNDLE_METADATA: Metadata bytes range: {}..{}", metadata_start, metadata_len_pos);
+
+    // The metadata has a versioned format - skip the version header (magic number + version code = 8 bytes)
+    // Then parse the JSON
+    if metadata_bytes.len() > 8 {
+        let json_bytes = &metadata_bytes[8..];
+
+        // Parse the JSON to get file offsets
+        if let Ok(json_str) = std::str::from_utf8(json_bytes) {
+            debug_println!("🔍 BUNDLE_METADATA: JSON metadata: {}",
+                if json_str.len() > 200 { &json_str[..200] } else { json_str });
+
+            // Parse as BundleStorageFileOffsets JSON format: { "files": { "path": { "start": N, "end": M }, ... } }
+            #[derive(serde::Deserialize)]
+            struct BundleMetadata {
+                files: std::collections::HashMap<String, FileRange>,
+            }
+
+            #[derive(serde::Deserialize)]
+            struct FileRange {
+                start: u64,
+                end: u64,
+            }
+
+            if let Ok(metadata) = serde_json::from_str::<BundleMetadata>(json_str) {
+                for (path_str, range) in metadata.files {
+                    let path = PathBuf::from(path_str);
+                    debug_println!("🔍 BUNDLE_METADATA: File {:?} -> {}..{}", path, range.start, range.end);
+                    file_offsets.insert(path, range.start..range.end);
+                }
+                debug_println!("🔍 BUNDLE_METADATA: Parsed {} file offsets", file_offsets.len());
+            } else {
+                debug_println!("⚠️ BUNDLE_METADATA: Failed to parse JSON, continuing without prefetch optimization");
+            }
+        }
+    }
+
+    Ok(file_offsets)
+}
+
 /// Get Arc<SearcherContext> using the global cache system
 /// CRITICAL FIX: Use shared caches by returning the Arc directly
 fn get_shared_searcher_context() -> anyhow::Result<Arc<SearcherContext>> {
@@ -741,7 +873,8 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_crea
                     debug_println!("🔥 STORAGE RESOLVED: Storage resolved once for reuse, instance: {:p}", Arc::as_ptr(&resolved_storage));
 
                     // Follow Quickwit pattern: open index once and cache it
-                    let opened_index = runtime.handle().block_on(async {
+                    // 🚀 BATCH OPTIMIZATION FIX: Create ByteRangeCache and parse bundle metadata
+                    let (opened_index, byte_range_cache, bundle_file_offsets) = runtime.handle().block_on(async {
                         use quickwit_proto::search::SplitIdAndFooterOffsets;
                         use crate::global_cache::get_global_searcher_context;
 
@@ -765,15 +898,44 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_crea
                             num_docs: 0,
                         };
 
+                        // 🚀 BATCH OPTIMIZATION FIX: Create ByteRangeCache for prefetch optimization
+                        // This cache will be shared between prefetch_ranges and doc_async (via CachingDirectory)
+                        let byte_range_cache = ByteRangeCache::with_infinite_capacity(
+                            &STORAGE_METRICS.shortlived_cache,
+                        );
+                        debug_println!("🚀 BATCH_OPT: Created ByteRangeCache for prefetch optimization");
+
+                        // 🚀 OPTIMIZATION: Call open_index_with_caches FIRST to populate split_footer_cache
+                        // This eliminates redundant footer fetches when we parse bundle offsets below
                         let searcher_context_global = get_global_searcher_context();
                         let result = quickwit_search::leaf::open_index_with_caches(
                             &searcher_context_global,
                             resolved_storage.clone(),
                             &split_metadata,
                             None, // tokenizer_manager
-                            None  // Follow Quickwit fetch_docs.rs pattern
+                            Some(byte_range_cache.clone())  // 🚀 Pass ByteRangeCache for prefetch optimization
                         ).await;
-                        result
+
+                        // 🚀 BATCH OPTIMIZATION FIX: Parse bundle file offsets from footer (now cached in split_footer_cache!)
+                        // This allows prefetch to translate inner file byte ranges to split file byte ranges
+                        let bundle_file_offsets = if split_footer_start > 0 && split_footer_end > split_footer_start {
+                            // Use searcher_context_global.split_footer_cache - same cache open_index_with_caches uses
+                            match parse_bundle_file_offsets(&resolved_storage, &split_uri, split_footer_start, split_footer_end, &searcher_context_global).await {
+                                Ok(offsets) => {
+                                    debug_println!("🚀 BATCH_OPT: Parsed {} bundle file offsets for prefetch optimization", offsets.len());
+                                    offsets
+                                }
+                                Err(e) => {
+                                    debug_println!("⚠️ BATCH_OPT: Failed to parse bundle file offsets (prefetch optimization disabled): {}", e);
+                                    std::collections::HashMap::new()
+                                }
+                            }
+                        } else {
+                            debug_println!("⚠️ BATCH_OPT: No footer metadata available (prefetch optimization disabled)");
+                            std::collections::HashMap::new()
+                        };
+
+                        (result, byte_range_cache, bundle_file_offsets)
                     });
 
                     match opened_index {
@@ -819,6 +981,9 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_crea
                                 cached_storage: resolved_storage,
                                 cached_index: std::sync::Arc::new(cached_index),
                                 cached_searcher,
+                                // 🚀 BATCH OPTIMIZATION FIX: Store ByteRangeCache and bundle file offsets
+                                byte_range_cache: Some(byte_range_cache),
+                                bundle_file_offsets,
                             };
 
                             let searcher_context = std::sync::Arc::new(cached_context);
@@ -1865,6 +2030,9 @@ fn retrieve_documents_batch_from_split_optimized(
 
     use std::sync::Arc;
 
+    // TRACE: Entry point
+    debug_println!("🔍 TRACE: retrieve_documents_batch_from_split_optimized called with {} docs", doc_addresses.len());
+
     // Sort by DocAddress for cache locality (following Quickwit pattern)
     doc_addresses.sort();
 
@@ -1880,31 +2048,28 @@ fn retrieve_documents_batch_from_split_optimized(
         let _doc_mapping = &context.doc_mapping_json;
         let storage_resolver = &context.cached_storage;
         let cached_index = &context.cached_index;
+        // 🚀 BATCH OPTIMIZATION FIX: Access cache and file offsets
+        let byte_range_cache = &context.byte_range_cache;
+        let bundle_file_offsets = &context.bundle_file_offsets;
 
         let _guard = runtime.enter();
-        
+
         // Use block_in_place to run async code synchronously (Quickwit pattern) with timeout
         tokio::task::block_in_place(|| {
             // Add timeout to prevent hanging during runtime shutdown
             let timeout_duration = std::time::Duration::from_secs(5);
             runtime.block_on(tokio::time::timeout(timeout_duration, async {
-                // ✅ OPTIMIZATION: Check searcher cache first (like individual retrieval)
-                let searcher_cache = get_searcher_cache();
-                let cached_searcher_option = {
-                    let mut cache = searcher_cache.lock().unwrap();
-                    cache.get(split_uri as &str).cloned()
-                };
+                // 🚀 BATCH OPTIMIZATION FIX: Use cached_searcher from context directly
+                // instead of looking up from the LRU cache (which may not be populated)
+                let cached_searcher = &context.cached_searcher;
+                debug_println!("🔍 TRACE: Using cached_searcher from CachedSearcherContext");
 
-                // Track cache statistics
-                if cached_searcher_option.is_some() {
-                    SEARCHER_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
-                } else {
-                    SEARCHER_CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
-                }
-
-                // If we have a cached searcher, use it for concurrent batch processing
-                if let Some(cached_searcher) = cached_searcher_option {
+                // The context always has a cached searcher, so use it directly
+                {
                     debug_println!("RUST DEBUG: ✅ BATCH CACHE HIT: Using cached searcher for batch processing");
+                    debug_println!("🔍 TRACE: Entered batch processing path with {} docs", doc_addresses.len());
+                    debug_println!("🔍 TRACE: byte_range_cache is_some = {}", byte_range_cache.is_some());
+                    debug_println!("🔍 TRACE: bundle_file_offsets len = {}", bundle_file_offsets.len());
                     let schema = cached_searcher.schema(); // Get schema from cached searcher
 
                     // 🚀 BATCH OPTIMIZATION: Prefetch consolidated byte ranges for better S3 performance
@@ -1912,15 +2077,38 @@ fn retrieve_documents_batch_from_split_optimized(
 
                     if optimizer.should_optimize(doc_addresses.len()) {
                         debug_println!("🚀 BATCH_OPT: Starting range consolidation for {} documents", doc_addresses.len());
+                        debug_println!("🔍 TRACE: Should optimize = true");
 
                         match optimizer.consolidate_ranges(&doc_addresses, &cached_searcher) {
                             Ok(ranges) => {
                                 let num_segments = ranges.iter().map(|r| r.file_path.clone()).collect::<std::collections::HashSet<_>>().len();
                                 debug_println!("🚀 BATCH_OPT: Consolidated {} docs → {} ranges across {} segments",
                                     doc_addresses.len(), ranges.len(), num_segments);
+                                debug_println!("🔍 TRACE: Consolidated to {} ranges", ranges.len());
+                                if *crate::debug::DEBUG_ENABLED {
+                                    for (i, range) in ranges.iter().enumerate() {
+                                        debug_println!("🔍 TRACE:   Range {}: {:?}, {}..{}", i, range.file_path, range.start, range.end);
+                                    }
+                                }
 
-                                // Prefetch the consolidated ranges to populate ByteRangeCache
-                                match optimizer.prefetch_ranges(ranges.clone(), storage_resolver.clone(), split_uri).await {
+                                // 🚀 BATCH OPTIMIZATION FIX: Use prefetch_ranges_with_cache to populate the correct cache
+                                let prefetch_result = if let Some(cache) = byte_range_cache {
+                                    debug_println!("🚀 BATCH_OPT: Using prefetch_ranges_with_cache (OPTIMIZED)");
+                                    debug_println!("🔍 TRACE: Calling prefetch_ranges_with_cache with {} bundle offsets", bundle_file_offsets.len());
+                                    crate::simple_batch_optimization::prefetch_ranges_with_cache(
+                                        ranges.clone(),
+                                        storage_resolver.clone(),
+                                        split_uri,
+                                        cache,
+                                        bundle_file_offsets,
+                                    ).await
+                                } else {
+                                    debug_println!("⚠️ BATCH_OPT: ByteRangeCache not available, using fallback prefetch");
+                                    debug_println!("🔍 TRACE: FALLBACK - ByteRangeCache is None!");
+                                    optimizer.prefetch_ranges(ranges.clone(), storage_resolver.clone(), split_uri).await
+                                };
+
+                                match prefetch_result {
                                     Ok(stats) => {
                                         debug_println!("🚀 BATCH_OPT SUCCESS: Prefetched {} ranges, {} bytes in {}ms",
                                             stats.ranges_fetched, stats.bytes_fetched, stats.duration_ms);
@@ -1989,12 +2177,13 @@ fn retrieve_documents_batch_from_split_optimized(
                         .await
                         .map_err(|e| anyhow::anyhow!("Cached searcher batch retrieval failed: {}", e))?;
 
+                    // 🚀 BATCH OPTIMIZATION FIX: Always return here - using context.cached_searcher
                     return Ok::<Vec<jobject>, anyhow::Error>(doc_ptrs);
                 }
-
-                debug_println!("RUST DEBUG: ⚠️ BATCH CACHE MISS: Creating new searcher for batch processing");
-
-                
+                // 🚀 BATCH OPTIMIZATION FIX: Fallback code below is now unreachable
+                // The code is kept for compatibility but should be removed in cleanup
+                #[allow(unreachable_code)]
+                {
                 use quickwit_config::{StorageConfigs, S3StorageConfig};
                 use quickwit_proto::search::SplitIdAndFooterOffsets;
                 use quickwit_storage::StorageResolver;
@@ -2199,8 +2388,9 @@ fn retrieve_documents_batch_from_split_optimized(
                     .try_collect::<Vec<_>>()
                     .await
                     .map_err(|e| anyhow::anyhow!("Concurrent document retrieval failed: {}", e))?;
-                
+
                 Ok::<Vec<jobject>, anyhow::Error>(doc_ptrs)
+                } // Close the #[allow(unreachable_code)] block
             }))
             .map_err(|timeout_err| {
                 debug_println!("🕐 TIMEOUT: Document retrieval timed out after 10 seconds: {}", timeout_err);
@@ -4031,6 +4221,10 @@ struct CachedSearcherContext {
     cached_storage: std::sync::Arc<dyn Storage>,
     cached_index: std::sync::Arc<tantivy::Index>,
     cached_searcher: std::sync::Arc<tantivy::Searcher>,
+    // 🚀 BATCH OPTIMIZATION FIX: Store ByteRangeCache and bundle file offsets
+    // This allows prefetch to populate the same cache that doc_async uses
+    byte_range_cache: Option<ByteRangeCache>,
+    bundle_file_offsets: std::collections::HashMap<std::path::PathBuf, std::ops::Range<u64>>,
 }
 
 // Dead code removed - perform_real_quickwit_doc_retrieval function was not called anywhere

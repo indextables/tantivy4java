@@ -766,3 +766,35 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_
     SEARCHER_CACHE_MISSES.store(0, Ordering::Relaxed);
     SEARCHER_CACHE_EVICTIONS.store(0, Ordering::Relaxed);
 }
+
+// ===================================
+// Object Storage Request Statistics JNI Methods
+// ===================================
+
+/// Get the total number of object storage get_slice requests made (accurate count from storage layer)
+/// This includes both S3 and Azure requests
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_nativeGetObjectStorageRequestCount(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jlong {
+    quickwit_storage::get_object_storage_request_count() as jlong
+}
+
+/// Get the total bytes fetched via object storage get_slice requests
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_nativeGetObjectStorageBytesFetched(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jlong {
+    quickwit_storage::get_object_storage_bytes_fetched() as jlong
+}
+
+/// Reset object storage request statistics (useful for per-operation tracking)
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_nativeResetObjectStorageRequestStats(
+    _env: JNIEnv,
+    _class: JClass,
+) {
+    quickwit_storage::reset_object_storage_request_stats();
+}

@@ -244,6 +244,7 @@ public class BatchConsolidationValidationTest {
 
         // Reset metrics
         SplitCacheManager.resetBatchMetrics();
+        SplitCacheManager.resetObjectStorageRequestStats();
 
         // Configure cache with AWS credentials
         SplitCacheManager.CacheConfig cacheConfig = new SplitCacheManager.CacheConfig("consolidation-test")
@@ -274,11 +275,18 @@ public class BatchConsolidationValidationTest {
                 // Get metrics
                 BatchOptimizationMetrics metrics = SplitCacheManager.getBatchMetrics();
 
+                // Get actual object storage request count (accurate count from storage layer)
+                long actualStorageRequests = SplitCacheManager.getObjectStorageRequestCount();
+                long actualBytesFetched = SplitCacheManager.getObjectStorageBytesFetched();
+
                 System.out.println("\n📊 Batch Optimization Metrics:");
                 System.out.println("   Total Documents Requested: " + metrics.getTotalDocumentsRequested());
                 System.out.println("   Total Requests (without optimization): " + metrics.getTotalRequests());
                 System.out.println("   Consolidated Requests (with optimization): " + metrics.getConsolidatedRequests());
                 System.out.println("   Consolidation Ratio: " + String.format("%.1fx", metrics.getConsolidationRatio()));
+                System.out.println("\n📊 Actual Object Storage Statistics (from storage layer):");
+                System.out.println("   Actual Storage Requests: " + actualStorageRequests);
+                System.out.println("   Actual Bytes Fetched: " + actualBytesFetched + " bytes");
 
                 // CRITICAL ASSERTIONS
                 long consolidatedRequests = metrics.getConsolidatedRequests();
@@ -306,6 +314,17 @@ public class BatchConsolidationValidationTest {
                     assertTrue(ratio >= 2.0 || consolidatedRequests <= buggyRangeCount / 2,
                             "Batch consolidation should be significantly better than 100-doc batches. " +
                             "Got ratio=" + ratio + ", consolidatedRequests=" + consolidatedRequests);
+
+                    // Validate actual storage request count
+                    // Expected: ~2 requests (1 footer + 1 consolidated store data)
+                    // Without optimization: 1000+ requests (one per document)
+                    System.out.println("\n📊 Storage Request Validation:");
+                    System.out.println("   Expected ~2 actual S3 requests (1 footer + 1 consolidated)");
+                    System.out.println("   Got " + actualStorageRequests + " actual S3 requests");
+
+                    assertTrue(actualStorageRequests <= 5,
+                            "Should have minimal actual S3 requests. Got " + actualStorageRequests +
+                            " (expected ~2: 1 footer + 1 consolidated store data)");
 
                 } else {
                     System.out.println("   ⚠️ No requests recorded - checking if optimization triggered");

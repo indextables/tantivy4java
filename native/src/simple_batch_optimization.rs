@@ -416,6 +416,121 @@ impl PrefetchStats {
     }
 }
 
+/// 🚀 BATCH OPTIMIZATION FIX: Prefetch with ByteRangeCache and proper byte range translation
+///
+/// This function properly populates the ByteRangeCache that CachingDirectory uses,
+/// translating inner file byte ranges to split file byte ranges for S3 fetching,
+/// then storing them with inner file paths so doc_async cache lookups succeed.
+pub async fn prefetch_ranges_with_cache(
+    ranges: Vec<PrefetchRange>,
+    storage: Arc<dyn Storage>,
+    split_uri: &str,
+    byte_range_cache: &quickwit_storage::ByteRangeCache,
+    bundle_file_offsets: &std::collections::HashMap<std::path::PathBuf, std::ops::Range<u64>>,
+) -> Result<PrefetchStats> {
+    use futures::stream::{self, StreamExt, TryStreamExt};
+    use tokio::time::Instant;
+    use std::path::PathBuf;
+
+    let start_time = Instant::now();
+    let total_ranges = ranges.len();
+    let total_bytes: usize = ranges.iter().map(|r| r.size()).sum();
+
+    debug_println!("🚀 PREFETCH_CACHE: Starting prefetch with cache of {} ranges ({} bytes total)",
+                  total_ranges, total_bytes);
+    debug_println!("   Bundle file offsets available: {}", bundle_file_offsets.len());
+
+    if ranges.is_empty() {
+        return Ok(PrefetchStats {
+            ranges_fetched: 0,
+            bytes_fetched: 0,
+            duration_ms: 0,
+            s3_requests: 0,
+        });
+    }
+
+    if bundle_file_offsets.is_empty() {
+        debug_println!("⚠️ PREFETCH_CACHE: No bundle file offsets available, falling back to uncached prefetch");
+        // Fall back to the old method that doesn't populate the right cache
+        return SimpleBatchOptimizer::with_defaults().prefetch_ranges(ranges, storage, split_uri).await;
+    }
+
+    // Extract split filename for S3 path
+    let split_filename = if let Some(last_slash_pos) = split_uri.rfind('/') {
+        &split_uri[last_slash_pos + 1..]
+    } else {
+        split_uri
+    };
+    let split_path = std::path::Path::new(split_filename);
+
+    // Prefetch ranges with proper cache population
+    let prefetch_futures = ranges.iter().map(|range| {
+        let storage = storage.clone();
+        let inner_file_path = PathBuf::from(&range.file_path);
+        let inner_start = range.start;
+        let inner_end = range.end;
+        let range_size = range.size();
+        let split_path = split_path.to_path_buf();
+        let byte_range_cache = byte_range_cache.clone();
+        let bundle_file_offsets = bundle_file_offsets.clone();
+
+        async move {
+            // Look up the inner file's offset in the split file
+            let file_offset = bundle_file_offsets.get(&inner_file_path).cloned();
+
+            if let Some(file_offset) = file_offset {
+                // Translate inner file byte range to split file byte range
+                let split_start = file_offset.start as usize + inner_start;
+                let split_end = file_offset.start as usize + inner_end;
+
+                debug_println!("  📥 PREFETCH_CACHE: Fetching range for {:?}",
+                              inner_file_path);
+                debug_println!("     Inner range: {}..{}", inner_start, inner_end);
+                debug_println!("     Split range: {}..{} (file offset: {})", split_start, split_end, file_offset.start);
+
+                // Fetch from S3 using the split file path and translated range
+                let split_range = split_start..split_end;
+                let data = storage.get_slice(&split_path, split_range.clone()).await
+                    .with_context(|| format!("Failed to prefetch byte range {}..{} from {}", split_start, split_end, split_path.display()))?;
+
+                debug_println!("  📥 PREFETCH_CACHE: Fetched {} bytes from S3", data.len());
+
+                // Store in ByteRangeCache using INNER file path and INNER byte range
+                // This is the key fix - CachingDirectory looks up by inner path!
+                let inner_range = inner_start..inner_end;
+                byte_range_cache.put_slice(inner_file_path.clone(), inner_range.clone(), data.clone());
+
+                debug_println!("  ✅ PREFETCH_CACHE: Cached {:?} range {}..{}", inner_file_path, inner_start, inner_end);
+
+                Ok::<usize, anyhow::Error>(range_size)
+            } else {
+                debug_println!("  ⚠️ PREFETCH_CACHE: No offset found for {:?}, skipping", inner_file_path);
+                // File offset not found - skip this range
+                Ok::<usize, anyhow::Error>(0)
+            }
+        }
+    });
+
+    // Execute prefetch with controlled concurrency
+    let bytes_fetched_per_range: Vec<usize> = stream::iter(prefetch_futures)
+        .buffer_unordered(8) // Same concurrency as SimpleBatchConfig::default
+        .try_collect()
+        .await?;
+
+    let total_fetched: usize = bytes_fetched_per_range.iter().sum();
+    let duration = start_time.elapsed();
+
+    debug_println!("✅ PREFETCH_CACHE: Completed {} ranges, {} bytes in {}ms (CACHE POPULATED)",
+                  total_ranges, total_fetched, duration.as_millis());
+
+    Ok(PrefetchStats {
+        ranges_fetched: total_ranges,
+        bytes_fetched: total_fetched,
+        duration_ms: duration.as_millis() as u64,
+        s3_requests: total_ranges,
+    })
+}
+
 /// Cumulative metrics tracking batch optimization effectiveness across all operations
 ///
 /// This struct uses atomic operations to track metrics thread-safely without locks.

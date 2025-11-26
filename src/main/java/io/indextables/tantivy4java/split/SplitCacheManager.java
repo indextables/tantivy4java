@@ -1012,6 +1012,13 @@ public class SplitCacheManager implements AutoCloseable {
     static native long nativeGetSearcherCacheEvictions();
     static native void nativeResetSearcherCacheStats();
 
+    // ========================================
+    // Object Storage Request Statistics Native Methods
+    // ========================================
+    static native long nativeGetObjectStorageRequestCount();
+    static native long nativeGetObjectStorageBytesFetched();
+    static native void nativeResetObjectStorageRequestStats();
+
     /**
      * Get global batch optimization metrics.
      *
@@ -1145,6 +1152,63 @@ public class SplitCacheManager implements AutoCloseable {
      */
     public static void resetBatchMetrics() {
         nativeResetBatchMetrics();
+    }
+
+    // ========================================
+    // Object Storage Request Statistics API
+    // ========================================
+
+    /**
+     * Get the total number of object storage get_slice requests made.
+     *
+     * <p>This is an accurate count from the storage layer that includes ALL object storage
+     * requests (S3 and Azure), not just batch optimization requests. This includes:
+     * <ul>
+     *   <li>Footer/hotcache fetches during searcher initialization</li>
+     *   <li>Consolidated store data fetches from batch optimization</li>
+     *   <li>Any other storage layer requests</li>
+     * </ul>
+     *
+     * <p><strong>Example Usage:</strong>
+     * <pre>{@code
+     * SplitCacheManager.resetObjectStorageRequestStats();
+     * // ... perform some operations ...
+     * long requestCount = SplitCacheManager.getObjectStorageRequestCount();
+     * long bytesFetched = SplitCacheManager.getObjectStorageBytesFetched();
+     * System.out.println("Object Storage Requests: " + requestCount);
+     * System.out.println("Bytes Fetched: " + bytesFetched);
+     * }</pre>
+     *
+     * @return total number of object storage get_slice requests since startup or last reset
+     * @see #getObjectStorageBytesFetched()
+     * @see #resetObjectStorageRequestStats()
+     */
+    public static long getObjectStorageRequestCount() {
+        return nativeGetObjectStorageRequestCount();
+    }
+
+    /**
+     * Get the total bytes fetched via object storage get_slice requests.
+     *
+     * @return total bytes fetched since startup or last reset
+     * @see #getObjectStorageRequestCount()
+     * @see #resetObjectStorageRequestStats()
+     */
+    public static long getObjectStorageBytesFetched() {
+        return nativeGetObjectStorageBytesFetched();
+    }
+
+    /**
+     * Reset object storage request statistics.
+     *
+     * <p>This resets both the request count and bytes fetched counters to zero.
+     * Useful for per-operation tracking or testing.
+     *
+     * @see #getObjectStorageRequestCount()
+     * @see #getObjectStorageBytesFetched()
+     */
+    public static void resetObjectStorageRequestStats() {
+        nativeResetObjectStorageRequestStats();
     }
 
     // Package-private getters for SplitSearcher
