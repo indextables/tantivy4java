@@ -193,73 +193,113 @@ impl SimpleBatchOptimizer {
         Ok(all_ranges)
     }
 
-    /// Consolidate documents within a single segment
+    /// Consolidate documents within a single segment using actual byte ranges
     ///
-    /// Note: This is a simplified implementation that groups documents by proximity.
-    /// For full optimization, we'd need to extract actual byte positions from Tantivy's
-    /// doc store, which requires deeper integration with Tantivy internals.
-    ///
-    /// Current approach: Group documents into batches based on doc_id proximity
+    /// This implementation uses Tantivy's StoreReader to get real block byte ranges,
+    /// then consolidates nearby blocks based on gap_tolerance and max_range_size.
     fn consolidate_segment_docs(
         &self,
         segment_ord: u32,
-        mut doc_addresses: Vec<DocAddress>,
-        _segment_reader: &tantivy::SegmentReader,
+        doc_addresses: Vec<DocAddress>,
+        segment_reader: &tantivy::SegmentReader,
     ) -> Result<Vec<PrefetchRange>> {
-        // Sort by doc_id for sequential access
-        doc_addresses.sort_by_key(|addr| addr.doc_id);
-
-        debug_println!("    📏 Segment {} consolidating {} documents",
+        debug_println!("    📏 Segment {} consolidating {} documents using real byte ranges",
                       segment_ord, doc_addresses.len());
 
-        // Group documents into batches based on doc_id proximity
-        // This encourages sequential I/O which helps with storage cache hit rates
-        let mut ranges = Vec::new();
-        let mut current_batch: Vec<DocAddress> = Vec::new();
-        let mut last_doc_id: Option<u32> = None;
+        // Get the store reader to access block byte ranges
+        // Use a small cache since we're just reading block metadata, not decompressing
+        let store_reader = segment_reader.get_store_reader(1)
+            .context("Failed to get store reader for byte range lookup")?;
 
-        // Group documents where doc_ids are within a reasonable range
-        let doc_id_gap_threshold = 100; // Documents within 100 doc_ids are likely nearby
+        // Get the store file path (segment_uuid.store)
+        let segment_id = segment_reader.segment_id().uuid_string();
+        let store_file_path = format!("{}.store", segment_id);
 
-        for addr in doc_addresses {
-            let should_start_new_batch = if let Some(last_id) = last_doc_id {
-                let gap = addr.doc_id.saturating_sub(last_id);
-                gap > doc_id_gap_threshold || current_batch.len() >= 100
+        // Collect (doc_address, byte_range) pairs
+        // Documents in the same block will have the same byte_range
+        let mut doc_with_ranges: Vec<(DocAddress, std::ops::Range<usize>)> = Vec::with_capacity(doc_addresses.len());
+
+        for addr in &doc_addresses {
+            match store_reader.get_block_byte_range(addr.doc_id) {
+                Ok(byte_range) => {
+                    doc_with_ranges.push((*addr, byte_range));
+                }
+                Err(e) => {
+                    debug_println!("    ⚠️ Failed to get byte range for doc {}: {}", addr.doc_id, e);
+                    // Skip documents we can't get byte ranges for
+                    continue;
+                }
+            }
+        }
+
+        if doc_with_ranges.is_empty() {
+            debug_println!("    ⚠️ No valid byte ranges found, skipping segment");
+            return Ok(Vec::new());
+        }
+
+        // Sort by byte range start for sequential consolidation
+        doc_with_ranges.sort_by_key(|(_, range)| range.start);
+
+        debug_println!("    📊 Got {} byte ranges, consolidating with gap_tolerance={}KB, max_range={}MB",
+                      doc_with_ranges.len(),
+                      self.config.gap_tolerance / 1024,
+                      self.config.max_range_size / (1024 * 1024));
+
+        // Consolidate into ranges based on gap_tolerance and max_range_size
+        let mut ranges: Vec<PrefetchRange> = Vec::new();
+        let mut current_start: Option<usize> = None;
+        let mut current_end: usize = 0;
+        let mut current_docs: Vec<DocAddress> = Vec::new();
+
+        for (addr, byte_range) in doc_with_ranges {
+            let should_start_new_range = if let Some(start) = current_start {
+                let gap = byte_range.start.saturating_sub(current_end);
+                let new_size = byte_range.end.saturating_sub(start);
+
+                // Start new range if:
+                // 1. Gap between current end and new start exceeds gap_tolerance
+                // 2. Adding this block would exceed max_range_size
+                gap > self.config.gap_tolerance || new_size > self.config.max_range_size
             } else {
                 false
             };
 
-            if should_start_new_batch && !current_batch.is_empty() {
-                // Create range for current batch
-                let first_doc_id = current_batch[0].doc_id;
-                let last_doc_id = current_batch[current_batch.len() - 1].doc_id;
-
+            if should_start_new_range && !current_docs.is_empty() {
+                // Finalize current range
                 ranges.push(PrefetchRange {
-                    file_path: format!("segment_{}_store", segment_ord),
-                    start: first_doc_id as usize, // Simplified: use doc_id as proxy
-                    end: (last_doc_id + 1) as usize,
-                    doc_addresses: current_batch.clone(),
+                    file_path: store_file_path.clone(),
+                    start: current_start.unwrap(),
+                    end: current_end,
+                    doc_addresses: std::mem::take(&mut current_docs),
                 });
-
-                current_batch.clear();
+                current_start = None;
             }
 
-            current_batch.push(addr);
-            last_doc_id = Some(addr.doc_id);
+            // Add to current range
+            if current_start.is_none() {
+                current_start = Some(byte_range.start);
+            }
+            current_end = current_end.max(byte_range.end);
+            current_docs.push(addr);
         }
 
-        // Add final batch
-        if !current_batch.is_empty() {
-            let first_doc_id = current_batch[0].doc_id;
-            let last_doc_id = current_batch[current_batch.len() - 1].doc_id;
-
-            ranges.push(PrefetchRange {
-                file_path: format!("segment_{}_store", segment_ord),
-                start: first_doc_id as usize,
-                end: (last_doc_id + 1) as usize,
-                doc_addresses: current_batch,
-            });
+        // Add final range
+        if !current_docs.is_empty() {
+            if let Some(start) = current_start {
+                ranges.push(PrefetchRange {
+                    file_path: store_file_path,
+                    start,
+                    end: current_end,
+                    doc_addresses: current_docs,
+                });
+            }
         }
+
+        // Log consolidation results
+        let total_bytes: usize = ranges.iter().map(|r| r.size()).sum();
+        let unique_blocks = ranges.len();
+        debug_println!("    ✅ Consolidated {} docs into {} ranges ({} bytes total)",
+                      doc_addresses.len(), unique_blocks, total_bytes);
 
         Ok(ranges)
     }
@@ -374,6 +414,121 @@ impl PrefetchStats {
             total_docs as f64 / self.ranges_fetched as f64
         }
     }
+}
+
+/// 🚀 BATCH OPTIMIZATION FIX: Prefetch with ByteRangeCache and proper byte range translation
+///
+/// This function properly populates the ByteRangeCache that CachingDirectory uses,
+/// translating inner file byte ranges to split file byte ranges for S3 fetching,
+/// then storing them with inner file paths so doc_async cache lookups succeed.
+pub async fn prefetch_ranges_with_cache(
+    ranges: Vec<PrefetchRange>,
+    storage: Arc<dyn Storage>,
+    split_uri: &str,
+    byte_range_cache: &quickwit_storage::ByteRangeCache,
+    bundle_file_offsets: &std::collections::HashMap<std::path::PathBuf, std::ops::Range<u64>>,
+) -> Result<PrefetchStats> {
+    use futures::stream::{self, StreamExt, TryStreamExt};
+    use tokio::time::Instant;
+    use std::path::PathBuf;
+
+    let start_time = Instant::now();
+    let total_ranges = ranges.len();
+    let total_bytes: usize = ranges.iter().map(|r| r.size()).sum();
+
+    debug_println!("🚀 PREFETCH_CACHE: Starting prefetch with cache of {} ranges ({} bytes total)",
+                  total_ranges, total_bytes);
+    debug_println!("   Bundle file offsets available: {}", bundle_file_offsets.len());
+
+    if ranges.is_empty() {
+        return Ok(PrefetchStats {
+            ranges_fetched: 0,
+            bytes_fetched: 0,
+            duration_ms: 0,
+            s3_requests: 0,
+        });
+    }
+
+    if bundle_file_offsets.is_empty() {
+        debug_println!("⚠️ PREFETCH_CACHE: No bundle file offsets available, falling back to uncached prefetch");
+        // Fall back to the old method that doesn't populate the right cache
+        return SimpleBatchOptimizer::with_defaults().prefetch_ranges(ranges, storage, split_uri).await;
+    }
+
+    // Extract split filename for S3 path
+    let split_filename = if let Some(last_slash_pos) = split_uri.rfind('/') {
+        &split_uri[last_slash_pos + 1..]
+    } else {
+        split_uri
+    };
+    let split_path = std::path::Path::new(split_filename);
+
+    // Prefetch ranges with proper cache population
+    let prefetch_futures = ranges.iter().map(|range| {
+        let storage = storage.clone();
+        let inner_file_path = PathBuf::from(&range.file_path);
+        let inner_start = range.start;
+        let inner_end = range.end;
+        let range_size = range.size();
+        let split_path = split_path.to_path_buf();
+        let byte_range_cache = byte_range_cache.clone();
+        let bundle_file_offsets = bundle_file_offsets.clone();
+
+        async move {
+            // Look up the inner file's offset in the split file
+            let file_offset = bundle_file_offsets.get(&inner_file_path).cloned();
+
+            if let Some(file_offset) = file_offset {
+                // Translate inner file byte range to split file byte range
+                let split_start = file_offset.start as usize + inner_start;
+                let split_end = file_offset.start as usize + inner_end;
+
+                debug_println!("  📥 PREFETCH_CACHE: Fetching range for {:?}",
+                              inner_file_path);
+                debug_println!("     Inner range: {}..{}", inner_start, inner_end);
+                debug_println!("     Split range: {}..{} (file offset: {})", split_start, split_end, file_offset.start);
+
+                // Fetch from S3 using the split file path and translated range
+                let split_range = split_start..split_end;
+                let data = storage.get_slice(&split_path, split_range.clone()).await
+                    .with_context(|| format!("Failed to prefetch byte range {}..{} from {}", split_start, split_end, split_path.display()))?;
+
+                debug_println!("  📥 PREFETCH_CACHE: Fetched {} bytes from S3", data.len());
+
+                // Store in ByteRangeCache using INNER file path and INNER byte range
+                // This is the key fix - CachingDirectory looks up by inner path!
+                let inner_range = inner_start..inner_end;
+                byte_range_cache.put_slice(inner_file_path.clone(), inner_range.clone(), data.clone());
+
+                debug_println!("  ✅ PREFETCH_CACHE: Cached {:?} range {}..{}", inner_file_path, inner_start, inner_end);
+
+                Ok::<usize, anyhow::Error>(range_size)
+            } else {
+                debug_println!("  ⚠️ PREFETCH_CACHE: No offset found for {:?}, skipping", inner_file_path);
+                // File offset not found - skip this range
+                Ok::<usize, anyhow::Error>(0)
+            }
+        }
+    });
+
+    // Execute prefetch with controlled concurrency
+    let bytes_fetched_per_range: Vec<usize> = stream::iter(prefetch_futures)
+        .buffer_unordered(8) // Same concurrency as SimpleBatchConfig::default
+        .try_collect()
+        .await?;
+
+    let total_fetched: usize = bytes_fetched_per_range.iter().sum();
+    let duration = start_time.elapsed();
+
+    debug_println!("✅ PREFETCH_CACHE: Completed {} ranges, {} bytes in {}ms (CACHE POPULATED)",
+                  total_ranges, total_fetched, duration.as_millis());
+
+    Ok(PrefetchStats {
+        ranges_fetched: total_ranges,
+        bytes_fetched: total_fetched,
+        duration_ms: duration.as_millis() as u64,
+        s3_requests: total_ranges,
+    })
 }
 
 /// Cumulative metrics tracking batch optimization effectiveness across all operations

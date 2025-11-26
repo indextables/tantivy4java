@@ -57,6 +57,10 @@ lru = "0.12"  # LRU cache for searcher caching
 [build-dependencies]
 jni = "0.21.1"
 
+# Patch to use local tantivy fork with batch optimization API
+[patch."https://github.com/quickwit-oss/tantivy/"]
+tantivy = { path = "../../tantivy" }
+
 # Debug symbols configuration for maximum debug information
 [profile.dev]
 debug = 2            # Maximum debug info (line tables, local variables, etc)
