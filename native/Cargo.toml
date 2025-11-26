@@ -12,7 +12,8 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 # Main library dependencies (for JNI functions and core search functionality)
-tantivy = { git = "https://github.com/quickwit-oss/tantivy/", rev = "80f5f1e", default-features = false, features = [
+# Pin to specific commit for reproducible builds (batch-optimization-api branch)
+tantivy = { git = "https://github.com/indextables/tantivy", rev = "3e2d4f494c97d033662b6bf70dc6257d3b7a1ea7", default-features = false, features = [
   "lz4-compression",
   "mmap",
   "quickwit",
@@ -57,9 +58,10 @@ lru = "0.12"  # LRU cache for searcher caching
 [build-dependencies]
 jni = "0.21.1"
 
-# Patch to use local tantivy fork with batch optimization API
+# Patch to redirect quickwit's tantivy dependency to our fork with batch optimization API
+# This ensures ALL tantivy references use the same pinned commit
 [patch."https://github.com/quickwit-oss/tantivy/"]
-tantivy = { path = "../../tantivy" }
+tantivy = { git = "https://github.com/indextables/tantivy", rev = "3e2d4f494c97d033662b6bf70dc6257d3b7a1ea7" }
 
 # Debug symbols configuration for maximum debug information
 [profile.dev]
