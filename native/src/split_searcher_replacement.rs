@@ -900,10 +900,15 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_crea
 
                         // 🚀 BATCH OPTIMIZATION FIX: Create ByteRangeCache for prefetch optimization
                         // This cache will be shared between prefetch_ranges and doc_async (via CachingDirectory)
+                        //
+                        // ⚠️ RESOURCE NOTE: ByteRangeCache uses with_infinite_capacity (Quickwit's only option).
+                        // The cache is bounded by CachedSearcherContext lifetime - it's dropped when searcher closes.
+                        // For heavy batch operations, cache can grow to 100MB+ but is released on searcher.close().
+                        // Global caches (split_footer_cache, component_cache) have proper bounds configured in GlobalCacheConfig.
                         let byte_range_cache = ByteRangeCache::with_infinite_capacity(
                             &STORAGE_METRICS.shortlived_cache,
                         );
-                        debug_println!("🚀 BATCH_OPT: Created ByteRangeCache for prefetch optimization");
+                        debug_println!("🚀 BATCH_OPT: Created ByteRangeCache for prefetch optimization (bounded by searcher lifetime)");
 
                         // 🚀 OPTIMIZATION: Call open_index_with_caches FIRST to populate split_footer_cache
                         // This eliminates redundant footer fetches when we parse bundle offsets below
@@ -1069,6 +1074,15 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_clos
     // ✅ FIX: Clean up direct schema mapping when searcher is closed
     crate::split_query::remove_searcher_schema(searcher_ptr);
     debug_println!("✅ CLEANUP: Removed direct schema mapping for searcher {}", searcher_ptr);
+
+    // ✅ RESOURCE LEAK FIX: Extract split_uri before releasing Arc, then clean up schema cache
+    let split_uri = with_arc_safe(searcher_ptr, |searcher_context: &Arc<CachedSearcherContext>| {
+        searcher_context.split_uri.clone()
+    });
+    if let Some(uri) = split_uri {
+        crate::split_query::remove_split_schema(&uri);
+        debug_println!("✅ CLEANUP: Removed split schema cache entry for '{}'", uri);
+    }
 
     // Unregister searcher from runtime manager
     let runtime = crate::runtime_manager::QuickwitRuntimeManager::global();

@@ -115,9 +115,29 @@ pub static GLOBAL_STORAGE_RESOLVER: Lazy<StorageResolver> = Lazy::new(|| {
     StorageResolver::configured(&storage_configs)
 });
 
+/// Maximum number of storage resolvers to cache (prevents unbounded memory growth)
+///
+/// NOTE: This cache is keyed by CREDENTIAL CONFIGURATION, not per-split:
+/// - S3: region + endpoint + access_key[0:8] + path_style_access
+/// - Azure: account_name + access_key[0:8]
+///
+/// Multiple split searchers with the same credentials share ONE cached resolver.
+/// This limit only matters in multi-tenant scenarios where each tenant has different credentials.
+///
+/// Set to 1000 to support multi-tenant deployments with many different credential sets.
+/// In single-tenant deployments, typically only 1-2 resolvers are created regardless of split count.
+const MAX_STORAGE_RESOLVER_CACHE_SIZE: usize = 1000;
+
+/// Cached storage resolver with last access time for LRU-style eviction
+struct CachedStorageResolver {
+    resolver: StorageResolver,
+    last_access: std::time::Instant,
+}
+
 /// Global storage resolver cache for configured S3 instances (async-compatible)
 /// Uses tokio::sync::RwLock to prevent deadlocks in async context
-static CONFIGURED_STORAGE_RESOLVERS: std::sync::OnceLock<TokioRwLock<std::collections::HashMap<String, StorageResolver>>> = std::sync::OnceLock::new();
+/// Now bounded with LRU-style eviction to prevent memory leaks
+static CONFIGURED_STORAGE_RESOLVERS: std::sync::OnceLock<TokioRwLock<std::collections::HashMap<String, CachedStorageResolver>>> = std::sync::OnceLock::new();
 
 /// Get or create a cached StorageResolver with specific S3/Azure credentials (async version)
 /// This follows Quickwit's pattern but enables caching for optimal storage instance reuse
@@ -152,10 +172,10 @@ pub async fn get_configured_storage_resolver_async(
         // Try to get from cache first (async read lock) - DEADLOCK FIXED
         {
             let read_cache = cache.read().await;
-            if let Some(cached_resolver) = read_cache.get(&cache_key) {
+            if let Some(cached) = read_cache.get(&cache_key) {
                 debug_println!("🎯 STORAGE_RESOLVER_CACHE_HIT: Reusing cached resolver for key: {} at address {:p}",
-                         cache_key, cached_resolver);
-                return cached_resolver.clone();
+                         cache_key, &cached.resolver);
+                return cached.resolver.clone();
             }
         } // <- async read lock released here
 
@@ -168,19 +188,36 @@ pub async fn get_configured_storage_resolver_async(
         let storage_configs = StorageConfigs::new(vec![
             quickwit_config::StorageConfig::S3(s3_config)
         ]);
-        let resolver = StorageResolver::configured(&storage_configs); // <- DEADLOCK SUSPECT: Quickwit resolver creation
+        let resolver = StorageResolver::configured(&storage_configs);
         debug_println!("✅ STORAGE_RESOLVER_CREATED: Resolver #{} created at address {:p}", resolver_id, &resolver);
 
         // Cache the new resolver (async write lock) - DEADLOCK FIXED
         {
             let mut write_cache = cache.write().await;
             // Double-check in case another thread created it while we were creating ours
-            if let Some(existing_resolver) = write_cache.get(&cache_key) {
-                debug_println!("🏃 STORAGE_RESOLVER_RACE: Another thread created resolver, using existing at {:p}", existing_resolver);
-                return existing_resolver.clone();
+            if let Some(cached) = write_cache.get(&cache_key) {
+                debug_println!("🏃 STORAGE_RESOLVER_RACE: Another thread created resolver, using existing at {:p}", &cached.resolver);
+                return cached.resolver.clone();
             }
-            write_cache.insert(cache_key.clone(), resolver.clone());
-            debug_println!("💾 STORAGE_RESOLVER_CACHED: Resolver #{} cached for key: {}", resolver_id, cache_key);
+
+            // ✅ RESOURCE LEAK FIX: Evict oldest entry if cache is full
+            if write_cache.len() >= MAX_STORAGE_RESOLVER_CACHE_SIZE {
+                // Find the oldest entry by last_access time
+                if let Some(oldest_key) = write_cache.iter()
+                    .min_by_key(|(_, v)| v.last_access)
+                    .map(|(k, _)| k.clone())
+                {
+                    write_cache.remove(&oldest_key);
+                    debug_println!("🗑️ STORAGE_RESOLVER_EVICTED: Removed oldest resolver for key: {}", oldest_key);
+                }
+            }
+
+            write_cache.insert(cache_key.clone(), CachedStorageResolver {
+                resolver: resolver.clone(),
+                last_access: std::time::Instant::now(),
+            });
+            debug_println!("💾 STORAGE_RESOLVER_CACHED: Resolver #{} cached for key: {} (cache size: {})",
+                          resolver_id, cache_key, write_cache.len());
         } // <- async write lock released here
 
         resolver
@@ -205,9 +242,9 @@ pub async fn get_configured_storage_resolver_async(
         // Try read lock first (async)
         {
             let read_cache = cache.read().await;
-            if let Some(cached_resolver) = read_cache.get(&cache_key) {
+            if let Some(cached) = read_cache.get(&cache_key) {
                 debug_println!("🎯 AZURE_RESOLVER_CACHE_HIT: Reusing resolver for key: {}", cache_key);
-                return cached_resolver.clone();
+                return cached.resolver.clone();
             }
         } // <- Lock released immediately
 
@@ -227,12 +264,28 @@ pub async fn get_configured_storage_resolver_async(
         {
             let mut write_cache = cache.write().await;
             // Double-check for race condition
-            if let Some(existing_resolver) = write_cache.get(&cache_key) {
-                debug_println!("🏃 AZURE_RESOLVER_RACE: Using existing at {:p}", existing_resolver);
-                return existing_resolver.clone();
+            if let Some(cached) = write_cache.get(&cache_key) {
+                debug_println!("🏃 AZURE_RESOLVER_RACE: Using existing at {:p}", &cached.resolver);
+                return cached.resolver.clone();
             }
-            write_cache.insert(cache_key.clone(), resolver.clone());
-            debug_println!("💾 AZURE_RESOLVER_CACHED: Resolver #{} cached", resolver_id);
+
+            // ✅ RESOURCE LEAK FIX: Evict oldest entry if cache is full
+            if write_cache.len() >= MAX_STORAGE_RESOLVER_CACHE_SIZE {
+                if let Some(oldest_key) = write_cache.iter()
+                    .min_by_key(|(_, v)| v.last_access)
+                    .map(|(k, _)| k.clone())
+                {
+                    write_cache.remove(&oldest_key);
+                    debug_println!("🗑️ AZURE_RESOLVER_EVICTED: Removed oldest resolver for key: {}", oldest_key);
+                }
+            }
+
+            write_cache.insert(cache_key.clone(), CachedStorageResolver {
+                resolver: resolver.clone(),
+                last_access: std::time::Instant::now(),
+            });
+            debug_println!("💾 AZURE_RESOLVER_CACHED: Resolver #{} cached (cache size: {})",
+                          resolver_id, write_cache.len());
         } // <- Lock released immediately
 
         resolver
@@ -246,10 +299,16 @@ pub async fn get_configured_storage_resolver_async(
     }
 }
 
+/// Cached storage resolver for sync context with last access time
+struct SyncCachedStorageResolver {
+    resolver: StorageResolver,
+    last_access: std::time::Instant,
+}
+
 /// Get or create a cached StorageResolver with specific S3/Azure credentials (sync version)
 /// This version uses a simple sync-safe caching approach for sync contexts
 ///
-/// ✅ FIXED: Now uses deadlock-safe sync caching approach
+/// ✅ FIXED: Now uses deadlock-safe sync caching approach with bounded cache
 pub fn get_configured_storage_resolver(
     s3_config_opt: Option<S3StorageConfig>,
     azure_config_opt: Option<AzureStorageConfig>
@@ -257,27 +316,26 @@ pub fn get_configured_storage_resolver(
     use std::sync::{Mutex, Arc};
     use once_cell::sync::Lazy;
 
-    static SYNC_STORAGE_RESOLVERS: Lazy<Arc<Mutex<std::collections::HashMap<String, StorageResolver>>>> =
+    static SYNC_STORAGE_RESOLVERS: Lazy<Arc<Mutex<std::collections::HashMap<String, SyncCachedStorageResolver>>>> =
         Lazy::new(|| Arc::new(Mutex::new(std::collections::HashMap::new())));
     static RESOLVER_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
 
     if let Some(s3_config) = s3_config_opt {
         // Create a cache key from S3 configuration
-        // NOTE: We may also need to add "user id" later for multi-tenant scenarios
         let cache_key = format!("{}:{}:{}:{}",
             s3_config.region.as_ref().map(|r| r.as_str()).unwrap_or("default"),
             s3_config.endpoint.as_ref().map(|e| e.as_str()).unwrap_or("default"),
-            s3_config.access_key_id.as_ref().map(|k| &k[..8]).unwrap_or("none"), // First 8 chars for security
+            s3_config.access_key_id.as_ref().map(|k| &k[..8]).unwrap_or("none"),
             s3_config.force_path_style_access
         );
 
         // Try to get from sync cache (simple mutex approach)
         {
             let cache = SYNC_STORAGE_RESOLVERS.lock().unwrap();
-            if let Some(cached_resolver) = cache.get(&cache_key) {
-                debug_println!("🎯 STORAGE_RESOLVER_SYNC_CACHE_HIT: Reusing cached sync resolver for key: {} at address {:p}",
-                         cache_key, cached_resolver);
-                return cached_resolver.clone();
+            if let Some(cached) = cache.get(&cache_key) {
+                debug_println!("🎯 STORAGE_RESOLVER_SYNC_CACHE_HIT: Reusing cached sync resolver for key: {}",
+                         cache_key);
+                return cached.resolver.clone();
             }
         }
 
@@ -293,16 +351,32 @@ pub fn get_configured_storage_resolver(
         let resolver = StorageResolver::configured(&storage_configs);
         debug_println!("✅ STORAGE_RESOLVER_CREATED: Sync resolver #{} created at address {:p}", resolver_id, &resolver);
 
-        // Cache the new resolver
+        // Cache the new resolver with bounded eviction
         {
             let mut cache = SYNC_STORAGE_RESOLVERS.lock().unwrap();
-            // Double-check in case another thread created it while we were creating ours
-            if let Some(existing_resolver) = cache.get(&cache_key) {
-                debug_println!("🏃 STORAGE_RESOLVER_SYNC_RACE: Another thread created sync resolver, using existing at {:p}", existing_resolver);
-                return existing_resolver.clone();
+            // Double-check in case another thread created it
+            if let Some(cached) = cache.get(&cache_key) {
+                debug_println!("🏃 STORAGE_RESOLVER_SYNC_RACE: Another thread created sync resolver, using existing");
+                return cached.resolver.clone();
             }
-            cache.insert(cache_key.clone(), resolver.clone());
-            debug_println!("💾 STORAGE_RESOLVER_SYNC_CACHED: Resolver #{} cached for key: {}", resolver_id, cache_key);
+
+            // ✅ RESOURCE LEAK FIX: Evict oldest entry if cache is full
+            if cache.len() >= MAX_STORAGE_RESOLVER_CACHE_SIZE {
+                if let Some(oldest_key) = cache.iter()
+                    .min_by_key(|(_, v)| v.last_access)
+                    .map(|(k, _)| k.clone())
+                {
+                    cache.remove(&oldest_key);
+                    debug_println!("🗑️ STORAGE_RESOLVER_SYNC_EVICTED: Removed oldest resolver for key: {}", oldest_key);
+                }
+            }
+
+            cache.insert(cache_key.clone(), SyncCachedStorageResolver {
+                resolver: resolver.clone(),
+                last_access: std::time::Instant::now(),
+            });
+            debug_println!("💾 STORAGE_RESOLVER_SYNC_CACHED: Resolver #{} cached (cache size: {})",
+                          resolver_id, cache.len());
         }
 
         resolver
@@ -316,17 +390,17 @@ pub fn get_configured_storage_resolver(
                 .unwrap_or("default"),
             azure_config.access_key
                 .as_ref()
-                .map(|k| &k[..8.min(k.len())])  // First 8 chars for security
+                .map(|k| &k[..8.min(k.len())])
                 .unwrap_or("none")
         );
 
         // Try to get from sync cache
         {
             let cache = SYNC_STORAGE_RESOLVERS.lock().unwrap();
-            if let Some(cached_resolver) = cache.get(&cache_key) {
-                debug_println!("🎯 AZURE_RESOLVER_SYNC_CACHE_HIT: Reusing cached sync resolver for key: {} at address {:p}",
-                         cache_key, cached_resolver);
-                return cached_resolver.clone();
+            if let Some(cached) = cache.get(&cache_key) {
+                debug_println!("🎯 AZURE_RESOLVER_SYNC_CACHE_HIT: Reusing cached sync resolver for key: {}",
+                         cache_key);
+                return cached.resolver.clone();
             }
         }
 
@@ -341,16 +415,32 @@ pub fn get_configured_storage_resolver(
         let resolver = StorageResolver::configured(&storage_configs);
         debug_println!("✅ AZURE_RESOLVER_CREATED: Sync resolver #{} created at address {:p}", resolver_id, &resolver);
 
-        // Cache the new resolver
+        // Cache the new resolver with bounded eviction
         {
             let mut cache = SYNC_STORAGE_RESOLVERS.lock().unwrap();
-            // Double-check in case another thread created it while we were creating ours
-            if let Some(existing_resolver) = cache.get(&cache_key) {
-                debug_println!("🏃 AZURE_RESOLVER_SYNC_RACE: Another thread created sync resolver, using existing at {:p}", existing_resolver);
-                return existing_resolver.clone();
+            // Double-check in case another thread created it
+            if let Some(cached) = cache.get(&cache_key) {
+                debug_println!("🏃 AZURE_RESOLVER_SYNC_RACE: Another thread created sync resolver, using existing");
+                return cached.resolver.clone();
             }
-            cache.insert(cache_key.clone(), resolver.clone());
-            debug_println!("💾 AZURE_RESOLVER_SYNC_CACHED: Resolver #{} cached for key: {}", resolver_id, cache_key);
+
+            // ✅ RESOURCE LEAK FIX: Evict oldest entry if cache is full
+            if cache.len() >= MAX_STORAGE_RESOLVER_CACHE_SIZE {
+                if let Some(oldest_key) = cache.iter()
+                    .min_by_key(|(_, v)| v.last_access)
+                    .map(|(k, _)| k.clone())
+                {
+                    cache.remove(&oldest_key);
+                    debug_println!("🗑️ AZURE_RESOLVER_SYNC_EVICTED: Removed oldest resolver for key: {}", oldest_key);
+                }
+            }
+
+            cache.insert(cache_key.clone(), SyncCachedStorageResolver {
+                resolver: resolver.clone(),
+                last_access: std::time::Instant::now(),
+            });
+            debug_println!("💾 AZURE_RESOLVER_SYNC_CACHED: Resolver #{} cached (cache size: {})",
+                          resolver_id, cache.len());
         }
 
         resolver

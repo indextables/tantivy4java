@@ -60,6 +60,32 @@ pub fn get_split_schema(split_uri: &str) -> Option<tantivy::schema::Schema> {
     }
 }
 
+/// Remove schema from cache for a split URI (called when searcher is closed to prevent memory leaks)
+pub fn remove_split_schema(split_uri: &str) -> bool {
+    debug_println!("RUST DEBUG: Removing schema from cache for split: {}", split_uri);
+    // SAFETY FIX: Handle poisoned mutex gracefully to prevent cascading panics
+    let mut cache = SPLIT_SCHEMA_CACHE.lock().unwrap_or_else(|poisoned| {
+        debug_println!("RUST DEBUG: Warning - SPLIT_SCHEMA_CACHE mutex was poisoned, recovering");
+        poisoned.into_inner()
+    });
+    if cache.remove(split_uri).is_some() {
+        debug_println!("RUST DEBUG: ✅ Removed schema from cache for split: {}", split_uri);
+        debug_println!("RUST DEBUG: Schema cache now contains {} entries", cache.len());
+        true
+    } else {
+        debug_println!("RUST DEBUG: Schema not found in cache for removal: {}", split_uri);
+        false
+    }
+}
+
+/// Get the current size of the schema cache (for monitoring/debugging)
+pub fn get_split_schema_cache_size() -> usize {
+    let cache = SPLIT_SCHEMA_CACHE.lock().unwrap_or_else(|poisoned| {
+        poisoned.into_inner()
+    });
+    cache.len()
+}
+
 /// Convert a SplitTermQuery to QueryAst JSON (FOR TESTING ONLY - Production should use SplitSearcher.search() directly)
 #[no_mangle]
 pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitTermQuery_toQueryAstJson(

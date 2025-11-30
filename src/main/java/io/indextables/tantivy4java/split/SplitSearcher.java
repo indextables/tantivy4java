@@ -192,8 +192,14 @@ public class SplitSearcher implements AutoCloseable {
         if (queryString == null || queryString.trim().isEmpty()) {
             throw new IllegalArgumentException("Query string cannot be null or empty");
         }
+        // CRITICAL: Schema must be closed to prevent native memory leak
+        // getSchema() returns a NEW Schema object each time with its own native pointer
         Schema schema = getSchema();
-        return SplitQuery.parseQuery(queryString, schema);
+        try {
+            return SplitQuery.parseQuery(queryString, schema);
+        } finally {
+            schema.close();
+        }
     }
 
     /**
@@ -224,8 +230,14 @@ public class SplitSearcher implements AutoCloseable {
         // Convert List<String> to String[] for native method
         String[] defaultFieldArray = defaultFieldNames.toArray(new String[0]);
 
+        // CRITICAL: Schema must be closed to prevent native memory leak
+        // getSchema() returns a NEW Schema object each time with its own native pointer
         Schema schema = getSchema();
-        return SplitQuery.parseQuery(queryString, schema, defaultFieldArray);
+        try {
+            return SplitQuery.parseQuery(queryString, schema, defaultFieldArray);
+        } finally {
+            schema.close();
+        }
     }
 
     /**
