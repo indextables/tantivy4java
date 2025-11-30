@@ -74,8 +74,10 @@ public class SplitCacheManager implements AutoCloseable {
     static {
         Tantivy.initialize();
         // Add shutdown hook to gracefully cleanup all cache instances
+        // SAFETY FIX: Use the same lock (instancesLock) as normal access to prevent deadlocks
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
-            synchronized (instances) {
+            instancesLock.writeLock().lock();
+            try {
                 for (SplitCacheManager manager : instances.values()) {
                     try {
                         manager.close();
@@ -84,6 +86,8 @@ public class SplitCacheManager implements AutoCloseable {
                     }
                 }
                 instances.clear();
+            } finally {
+                instancesLock.writeLock().unlock();
             }
         }, "SplitCacheManager-Shutdown"));
     }

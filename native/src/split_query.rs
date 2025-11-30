@@ -33,7 +33,11 @@ fn convert_query_ast_to_json_string(query: QueryAst) -> Result<String> {
 pub fn store_split_schema(split_uri: &str, schema: tantivy::schema::Schema) {
     debug_println!("RUST DEBUG: *** STORE_SPLIT_SCHEMA CALLED WITH URI: {}", split_uri);
     debug_println!("RUST DEBUG: Storing schema clone in cache for split: {}", split_uri);
-    let mut cache = SPLIT_SCHEMA_CACHE.lock().unwrap();
+    // SAFETY FIX: Handle poisoned mutex gracefully to prevent cascading panics
+    let mut cache = SPLIT_SCHEMA_CACHE.lock().unwrap_or_else(|poisoned| {
+        debug_println!("RUST DEBUG: Warning - SPLIT_SCHEMA_CACHE mutex was poisoned, recovering");
+        poisoned.into_inner()
+    });
     cache.insert(split_uri.to_string(), schema);
     debug_println!("RUST DEBUG: Schema cache now contains {} entries", cache.len());
     debug_println!("RUST DEBUG: *** STORE_SPLIT_SCHEMA COMPLETED");
@@ -41,7 +45,11 @@ pub fn store_split_schema(split_uri: &str, schema: tantivy::schema::Schema) {
 
 /// Retrieve schema clone for a split URI
 pub fn get_split_schema(split_uri: &str) -> Option<tantivy::schema::Schema> {
-    let cache = SPLIT_SCHEMA_CACHE.lock().unwrap();
+    // SAFETY FIX: Handle poisoned mutex gracefully to prevent cascading panics
+    let cache = SPLIT_SCHEMA_CACHE.lock().unwrap_or_else(|poisoned| {
+        debug_println!("RUST DEBUG: Warning - SPLIT_SCHEMA_CACHE mutex was poisoned, recovering");
+        poisoned.into_inner()
+    });
     if let Some(schema) = cache.get(split_uri) {
         debug_println!("RUST DEBUG: ✅ Retrieved schema from cache for split: {}", split_uri);
         Some(schema.clone())
@@ -423,12 +431,13 @@ fn convert_query_list(env: &mut JNIEnv, list_obj: JObject) -> Result<Vec<QueryAs
     if list_obj.is_null() {
         return Ok(Vec::new());
     }
-    
+
     // Get list size
     let size_result = env.call_method(&list_obj, "size", "()I", &[])?;
     let size = size_result.i()? as usize;
-    
-    let mut queries = Vec::new();
+
+    // PERFORMANCE FIX: Pre-allocate Vec with known capacity
+    let mut queries = Vec::with_capacity(size);
     
     for i in 0..size {
         // Get element at index i
@@ -663,15 +672,19 @@ fn extract_default_search_fields(env: &mut JNIEnv, default_search_fields: jobjec
         debug_println!("RUST DEBUG: Default search fields is null, using empty list");
         return Ok(Vec::new());
     }
-    
-    // Convert to JObjectArray (requires unsafe block)
-    let fields_array = JObjectArray::from(unsafe { JObject::from_raw(default_search_fields) });
-    
+
+    // SAFETY FIX: Create a new local reference that Rust owns to avoid use-after-free
+    // The original jobject is owned by Java and should not be deleted by Rust
+    let local_ref = env.new_local_ref(unsafe { JObject::from_raw(default_search_fields) })
+        .map_err(|e| anyhow!("Failed to create local reference for search fields array: {}", e))?;
+    let fields_array = JObjectArray::from(local_ref);
+
     // Get array length
     let array_len = env.get_array_length(&fields_array)?;
     debug_println!("RUST DEBUG: Default search fields array length: {}", array_len);
-    
-    let mut fields = Vec::new();
+
+    // Performance: pre-allocate Vec with known capacity
+    let mut fields = Vec::with_capacity(array_len as usize);
     
     // Extract each string from the array
     for i in 0..array_len {
@@ -702,7 +715,11 @@ fn extract_text_fields_from_schema(_env: &mut JNIEnv, schema_ptr: jlong) -> Resu
     // NEW APPROACH: Try to get any cached schema from the split schema cache
     // Since we don't have the split URI in this context, iterate through all cached schemas
     debug_println!("RUST DEBUG: Attempting to retrieve schema from split schema cache...");
-    let cache = SPLIT_SCHEMA_CACHE.lock().unwrap();
+    // SAFETY FIX: Handle poisoned mutex gracefully to prevent cascading panics
+    let cache = SPLIT_SCHEMA_CACHE.lock().unwrap_or_else(|poisoned| {
+        debug_println!("RUST DEBUG: Warning - SPLIT_SCHEMA_CACHE mutex was poisoned, recovering");
+        poisoned.into_inner()
+    });
     for (split_uri, cached_schema) in cache.iter() {
         debug_println!("RUST DEBUG: Found cached schema for split URI: {}", split_uri);
         let text_fields = extract_fields_from_schema(cached_schema)?;
@@ -843,14 +860,22 @@ fn convert_phrase_query_to_query_ast(env: &mut JNIEnv, obj: &JObject) -> Result<
 /// ✅ FIX: Store direct mapping from searcher pointer to schema pointer
 pub fn store_searcher_schema(searcher_ptr: jlong, schema_ptr: jlong) {
     debug_println!("RUST DEBUG: Storing searcher->schema mapping: {} -> {}", searcher_ptr, schema_ptr);
-    let mut mapping = SEARCHER_SCHEMA_MAPPING.lock().unwrap();
+    // SAFETY FIX: Handle poisoned mutex gracefully to prevent cascading panics
+    let mut mapping = SEARCHER_SCHEMA_MAPPING.lock().unwrap_or_else(|poisoned| {
+        debug_println!("RUST DEBUG: Warning - SEARCHER_SCHEMA_MAPPING mutex was poisoned, recovering");
+        poisoned.into_inner()
+    });
     mapping.insert(searcher_ptr, schema_ptr);
     debug_println!("RUST DEBUG: Searcher schema mapping now contains {} entries", mapping.len());
 }
 
 /// ✅ FIX: Retrieve schema pointer for a searcher pointer
 pub fn get_searcher_schema(searcher_ptr: jlong) -> Option<jlong> {
-    let mapping = SEARCHER_SCHEMA_MAPPING.lock().unwrap();
+    // SAFETY FIX: Handle poisoned mutex gracefully to prevent cascading panics
+    let mapping = SEARCHER_SCHEMA_MAPPING.lock().unwrap_or_else(|poisoned| {
+        debug_println!("RUST DEBUG: Warning - SEARCHER_SCHEMA_MAPPING mutex was poisoned, recovering");
+        poisoned.into_inner()
+    });
     if let Some(&schema_ptr) = mapping.get(&searcher_ptr) {
         debug_println!("RUST DEBUG: ✅ Found schema pointer {} for searcher {}", schema_ptr, searcher_ptr);
         Some(schema_ptr)
@@ -862,7 +887,11 @@ pub fn get_searcher_schema(searcher_ptr: jlong) -> Option<jlong> {
 
 /// ✅ FIX: Remove schema mapping when searcher is closed
 pub fn remove_searcher_schema(searcher_ptr: jlong) -> bool {
-    let mut mapping = SEARCHER_SCHEMA_MAPPING.lock().unwrap();
+    // SAFETY FIX: Handle poisoned mutex gracefully to prevent cascading panics
+    let mut mapping = SEARCHER_SCHEMA_MAPPING.lock().unwrap_or_else(|poisoned| {
+        debug_println!("RUST DEBUG: Warning - SEARCHER_SCHEMA_MAPPING mutex was poisoned, recovering");
+        poisoned.into_inner()
+    });
     if let Some(schema_ptr) = mapping.remove(&searcher_ptr) {
         debug_println!("RUST DEBUG: ✅ Removed schema mapping: {} -> {}", searcher_ptr, schema_ptr);
         // Also release the schema Arc to prevent memory leaks

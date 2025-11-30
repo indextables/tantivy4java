@@ -2056,8 +2056,13 @@ fn retrieve_documents_batch_from_split_optimized(
 
         // Use block_in_place to run async code synchronously (Quickwit pattern) with timeout
         tokio::task::block_in_place(|| {
-            // Add timeout to prevent hanging during runtime shutdown
-            let timeout_duration = std::time::Duration::from_secs(5);
+            // PERFORMANCE FIX: Scale timeout based on batch size to prevent premature timeouts
+            // on large batches while still protecting against hangs
+            let base_timeout_secs: usize = 5;
+            let scaled_timeout_secs = base_timeout_secs + (doc_addresses.len() / 100);
+            let timeout_duration = std::time::Duration::from_secs(scaled_timeout_secs.min(60) as u64);
+            debug_println!("🔍 TRACE: Using scaled timeout of {} seconds for {} docs",
+                          scaled_timeout_secs.min(60), doc_addresses.len());
             runtime.block_on(tokio::time::timeout(timeout_duration, async {
                 // 🚀 BATCH OPTIMIZATION FIX: Use cached_searcher from context directly
                 // instead of looking up from the LRU cache (which may not be populated)

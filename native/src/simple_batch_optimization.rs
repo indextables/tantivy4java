@@ -463,6 +463,9 @@ pub async fn prefetch_ranges_with_cache(
     };
     let split_path = std::path::Path::new(split_filename);
 
+    // PERFORMANCE FIX: Wrap bundle_file_offsets in Arc to avoid cloning the entire HashMap for each future
+    let bundle_file_offsets = Arc::new(bundle_file_offsets.clone());
+
     // Prefetch ranges with proper cache population
     let prefetch_futures = ranges.iter().map(|range| {
         let storage = storage.clone();
@@ -472,16 +475,22 @@ pub async fn prefetch_ranges_with_cache(
         let range_size = range.size();
         let split_path = split_path.to_path_buf();
         let byte_range_cache = byte_range_cache.clone();
-        let bundle_file_offsets = bundle_file_offsets.clone();
+        let bundle_file_offsets = bundle_file_offsets.clone(); // Now just increments Arc refcount
 
         async move {
             // Look up the inner file's offset in the split file
             let file_offset = bundle_file_offsets.get(&inner_file_path).cloned();
 
             if let Some(file_offset) = file_offset {
-                // Translate inner file byte range to split file byte range
-                let split_start = file_offset.start as usize + inner_start;
-                let split_end = file_offset.start as usize + inner_end;
+                // SAFETY FIX: Use checked arithmetic to prevent overflow on 32-bit systems
+                let split_start = (file_offset.start as u64)
+                    .checked_add(inner_start as u64)
+                    .ok_or_else(|| anyhow::anyhow!("Byte range overflow: start offset {} + inner_start {}", file_offset.start, inner_start))?
+                    as usize;
+                let split_end = (file_offset.start as u64)
+                    .checked_add(inner_end as u64)
+                    .ok_or_else(|| anyhow::anyhow!("Byte range overflow: start offset {} + inner_end {}", file_offset.start, inner_end))?
+                    as usize;
 
                 debug_println!("  📥 PREFETCH_CACHE: Fetching range for {:?}",
                               inner_file_path);

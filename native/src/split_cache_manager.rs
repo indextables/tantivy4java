@@ -69,20 +69,33 @@ impl GlobalSplitCacheManager {
     }
     
     pub fn add_split(&self, split_path: String) {
-        let mut splits = self.managed_splits.lock().unwrap();
+        // SAFETY FIX: Handle poisoned mutex gracefully
+        let mut splits = self.managed_splits.lock().unwrap_or_else(|poisoned| {
+            debug_println!("RUST DEBUG: Warning - managed_splits mutex was poisoned, recovering");
+            poisoned.into_inner()
+        });
+        // SAFETY FIX: Use unwrap_or_default() to prevent panic on misconfigured system clocks
         splits.insert(split_path, std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs());
     }
     
     pub fn remove_split(&self, split_path: &str) {
-        let mut splits = self.managed_splits.lock().unwrap();
+        // SAFETY FIX: Handle poisoned mutex gracefully
+        let mut splits = self.managed_splits.lock().unwrap_or_else(|poisoned| {
+            debug_println!("RUST DEBUG: Warning - managed_splits mutex was poisoned, recovering");
+            poisoned.into_inner()
+        });
         splits.remove(split_path);
     }
-    
+
     pub fn get_managed_split_count(&self) -> usize {
-        self.managed_splits.lock().unwrap().len()
+        // SAFETY FIX: Handle poisoned mutex gracefully
+        self.managed_splits.lock().unwrap_or_else(|poisoned| {
+            debug_println!("RUST DEBUG: Warning - managed_splits mutex was poisoned, recovering");
+            poisoned.into_inner()
+        }).len()
     }
     
     pub fn get_cache_stats(&self) -> GlobalCacheStats {
@@ -226,29 +239,30 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_
     _class: JClass,
     config: JObject,
 ) -> jlong {
+    // CONSISTENCY FIX: Use consistent error handling (no unwrap on JNI calls)
     // Extract cache name from config
-    let cache_name = match env.call_method(&config, "getCacheName", "()Ljava/lang/String;", &[]) {
-        Ok(result) => {
-            let name_obj = result.l().unwrap();
-            match env.get_string(&JString::from(name_obj)) {
-                Ok(name) => name.to_string_lossy().to_string(),
-                Err(_) => "default".to_string(),
-            }
-        }
-        _ => "default".to_string(),
-    };
-    
+    let cache_name = (|| -> Option<String> {
+        let result = env.call_method(&config, "getCacheName", "()Ljava/lang/String;", &[]).ok()?;
+        let name_obj = result.l().ok()?;
+        let name_jstring = JString::from(name_obj);
+        let name = env.get_string(&name_jstring).ok()?;
+        Some(name.to_string_lossy().to_string())
+    })().unwrap_or_else(|| "default".to_string());
+
     // Extract max cache size
-    let max_cache_size = match env.call_method(&config, "getMaxCacheSize", "()J", &[]) {
-        Ok(result) => result.j().unwrap() as u64,
-        _ => 200_000_000, // 200MB default
-    };
-    
+    let max_cache_size = (|| -> Option<u64> {
+        let result = env.call_method(&config, "getMaxCacheSize", "()J", &[]).ok()?;
+        Some(result.j().ok()? as u64)
+    })().unwrap_or(200_000_000); // 200MB default
+
     let mut manager = GlobalSplitCacheManager::new(cache_name.clone(), max_cache_size);
-    
+
     // Extract AWS configuration from the Java CacheConfig
-    if let Ok(aws_config_map) = env.call_method(&config, "getAwsConfig", "()Ljava/util/Map;", &[]) {
-        let aws_map_obj = aws_config_map.l().unwrap();
+    let aws_map_obj = (|| -> Option<JObject> {
+        let result = env.call_method(&config, "getAwsConfig", "()Ljava/util/Map;", &[]).ok()?;
+        result.l().ok()
+    })();
+    if let Some(aws_map_obj) = aws_map_obj {
         
         // Extract AWS configuration values
         let mut access_key = None;

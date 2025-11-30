@@ -33,6 +33,25 @@ public class Document implements AutoCloseable {
         Tantivy.initialize();
     }
 
+    // PERFORMANCE FIX: Static, pre-configured ObjectMapper for JSON serialization
+    // ObjectMapper is thread-safe and expensive to create, so we reuse a single instance
+    private static final com.fasterxml.jackson.databind.ObjectMapper JSON_MAPPER;
+
+    static {
+        JSON_MAPPER = new com.fasterxml.jackson.databind.ObjectMapper();
+        JSON_MAPPER.setDateFormat(new java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'"));
+        // Try to register JavaTimeModule for java.time types if available
+        try {
+            Class<?> moduleClass = Class.forName("com.fasterxml.jackson.datatype.jsr310.JavaTimeModule");
+            Object module = moduleClass.getDeclaredConstructor().newInstance();
+            JSON_MAPPER.registerModule((com.fasterxml.jackson.databind.Module) module);
+        } catch (ClassNotFoundException e) {
+            // JavaTimeModule not available - continue without it
+        } catch (Exception e) {
+            // Other reflection errors - continue without the module
+        }
+    }
+
     private long nativePtr;
     private boolean closed = false;
 
@@ -306,33 +325,16 @@ public class Document implements AutoCloseable {
      * Serialize Java object to JSON string using proper JSON library.
      *
      * <p>Uses Jackson for robust JSON serialization with proper
-     * date formatting and type handling.
+     * date formatting and type handling. Uses a static pre-configured
+     * ObjectMapper for performance (ObjectMapper is thread-safe).
      *
      * @param value Object to serialize
      * @return JSON string representation
      */
     private String serializeToJson(Object value) {
         try {
-            // Use Jackson for proper JSON serialization
-            com.fasterxml.jackson.databind.ObjectMapper mapper = new com.fasterxml.jackson.databind.ObjectMapper();
-
-            // Configure date format for ISO 8601
-            mapper.setDateFormat(new java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'"));
-
-            // Try to register JavaTimeModule for java.time types if available
-            try {
-                // Use reflection to avoid hard dependency on jackson-datatype-jsr310
-                Class<?> moduleClass = Class.forName("com.fasterxml.jackson.datatype.jsr310.JavaTimeModule");
-                Object module = moduleClass.getDeclaredConstructor().newInstance();
-                mapper.registerModule((com.fasterxml.jackson.databind.Module) module);
-            } catch (ClassNotFoundException e) {
-                // JavaTimeModule not available - continue without it
-                // java.time types will use default serialization
-            } catch (Exception e) {
-                // Other reflection errors - continue without the module
-            }
-
-            return mapper.writeValueAsString(value);
+            // PERFORMANCE FIX: Use static JSON_MAPPER instead of creating new instance per call
+            return JSON_MAPPER.writeValueAsString(value);
         } catch (Exception e) {
             throw new IllegalArgumentException("Failed to serialize object to JSON: " + e.getMessage(), e);
         }
