@@ -301,6 +301,410 @@ public class XRefFieldTypeTest {
         System.out.println("  XRef with mixed field types: PASS");
     }
 
+    // ========== EQUALITY SEARCH TESTS (Full round-trip validation) ==========
+
+    @Test
+    @Order(10)
+    @DisplayName("XRef search finds correct splits for INTEGER equality query")
+    void testIntegerEqualitySearch() throws Exception {
+        System.out.println("\n=== Testing XRef INTEGER Equality Search ===");
+
+        // Create split 1 with values: 100, 200, 300
+        SplitInfo split1 = createIntegerSplit("int-search-1", new int[]{100, 200, 300});
+
+        // Create split 2 with values: 1000, 2000, 3000
+        SplitInfo split2 = createIntegerSplit("int-search-2", new int[]{1000, 2000, 3000});
+
+        System.out.println("  Split1 values: [100, 200, 300]");
+        System.out.println("  Split2 values: [1000, 2000, 3000]");
+
+        // Build XRef
+        XRefMetadata xrefMetadata = buildXRef(Arrays.asList(split1, split2), "int-search-xref");
+        Path xrefPath = tempDir.resolve("int-search-xref.xref.split");
+
+        System.out.println("  XRef built with " + xrefMetadata.getTotalTerms() + " terms");
+
+        // Open XRef for searching
+        SplitCacheManager.CacheConfig cacheConfig = new SplitCacheManager.CacheConfig("int-search-cache")
+            .withMaxCacheSize(100_000_000);
+
+        try (SplitCacheManager cacheManager = SplitCacheManager.getInstance(cacheConfig);
+             XRefSearcher searcher = XRefSplit.open(cacheManager, "file://" + xrefPath.toString(), xrefMetadata)) {
+
+            // Search for value=100 (should only match split1)
+            System.out.println("\n  Searching for value:100...");
+            XRefSearchResult result100 = searcher.search("value:100", 10);
+            System.out.println("    Found " + result100.getNumMatchingSplits() + " matching split(s)");
+
+            assertEquals(1, result100.getNumMatchingSplits(), "value:100 should find exactly 1 split");
+            String matchingUri100 = result100.getMatchingSplits().get(0).getUri();
+            assertTrue(matchingUri100.contains("int-search-1"), "value:100 should match split1, got: " + matchingUri100);
+
+            // Search for value=1000 (should only match split2)
+            System.out.println("\n  Searching for value:1000...");
+            XRefSearchResult result1000 = searcher.search("value:1000", 10);
+            System.out.println("    Found " + result1000.getNumMatchingSplits() + " matching split(s)");
+
+            assertEquals(1, result1000.getNumMatchingSplits(), "value:1000 should find exactly 1 split");
+            String matchingUri1000 = result1000.getMatchingSplits().get(0).getUri();
+            assertTrue(matchingUri1000.contains("int-search-2"), "value:1000 should match split2, got: " + matchingUri1000);
+
+            // Search for value=9999 (should match no splits)
+            System.out.println("\n  Searching for value:9999 (non-existent)...");
+            XRefSearchResult result9999 = searcher.search("value:9999", 10);
+            System.out.println("    Found " + result9999.getNumMatchingSplits() + " matching split(s)");
+
+            assertEquals(0, result9999.getNumMatchingSplits(), "value:9999 should find no splits");
+        }
+
+        System.out.println("\n  XRef INTEGER equality search: PASS");
+    }
+
+    @Test
+    @Order(11)
+    @DisplayName("XRef search finds correct splits for NEGATIVE INTEGER equality query")
+    void testNegativeIntegerEqualitySearch() throws Exception {
+        System.out.println("\n=== Testing XRef NEGATIVE INTEGER Equality Search ===");
+
+        // Create split 1 with negative values: -100, -50, 0
+        SplitInfo split1 = createIntegerSplit("negint-search-1", new int[]{-100, -50, 0});
+
+        // Create split 2 with different negative values: -1000, -500
+        SplitInfo split2 = createIntegerSplit("negint-search-2", new int[]{-1000, -500});
+
+        System.out.println("  Split1 values: [-100, -50, 0]");
+        System.out.println("  Split2 values: [-1000, -500]");
+
+        XRefMetadata xrefMetadata = buildXRef(Arrays.asList(split1, split2), "negint-search-xref");
+        Path xrefPath = tempDir.resolve("negint-search-xref.xref.split");
+
+        System.out.println("  XRef built with " + xrefMetadata.getTotalTerms() + " terms");
+
+        SplitCacheManager.CacheConfig cacheConfig = new SplitCacheManager.CacheConfig("negint-search-cache")
+            .withMaxCacheSize(100_000_000);
+
+        try (SplitCacheManager cacheManager = SplitCacheManager.getInstance(cacheConfig);
+             XRefSearcher searcher = XRefSplit.open(cacheManager, "file://" + xrefPath.toString(), xrefMetadata)) {
+
+            // Search for value=-100 (should only match split1)
+            System.out.println("\n  Searching for value:-100...");
+            XRefSearchResult resultNeg100 = searcher.search("value:-100", 10);
+            System.out.println("    Found " + resultNeg100.getNumMatchingSplits() + " matching split(s)");
+
+            assertEquals(1, resultNeg100.getNumMatchingSplits(), "value:-100 should find exactly 1 split");
+            assertTrue(resultNeg100.getMatchingSplits().get(0).getUri().contains("negint-search-1"),
+                "value:-100 should match split1");
+
+            // Search for value=-1000 (should only match split2)
+            System.out.println("\n  Searching for value:-1000...");
+            XRefSearchResult resultNeg1000 = searcher.search("value:-1000", 10);
+            System.out.println("    Found " + resultNeg1000.getNumMatchingSplits() + " matching split(s)");
+
+            assertEquals(1, resultNeg1000.getNumMatchingSplits(), "value:-1000 should find exactly 1 split");
+            assertTrue(resultNeg1000.getMatchingSplits().get(0).getUri().contains("negint-search-2"),
+                "value:-1000 should match split2");
+
+            // Search for value=0 (should only match split1)
+            System.out.println("\n  Searching for value:0...");
+            XRefSearchResult result0 = searcher.search("value:0", 10);
+            System.out.println("    Found " + result0.getNumMatchingSplits() + " matching split(s)");
+
+            assertEquals(1, result0.getNumMatchingSplits(), "value:0 should find exactly 1 split");
+            assertTrue(result0.getMatchingSplits().get(0).getUri().contains("negint-search-1"),
+                "value:0 should match split1");
+        }
+
+        System.out.println("\n  XRef NEGATIVE INTEGER equality search: PASS");
+    }
+
+    @Test
+    @Order(12)
+    @DisplayName("XRef search finds correct splits for FLOAT equality query")
+    void testFloatEqualitySearch() throws Exception {
+        System.out.println("\n=== Testing XRef FLOAT Equality Search ===");
+
+        // Create split 1 with float values: 1.5, 2.5, 3.14159
+        SplitInfo split1 = createFloatSplit("float-search-1", new double[]{1.5, 2.5, 3.14159});
+
+        // Create split 2 with different float values: 100.5, 200.25
+        SplitInfo split2 = createFloatSplit("float-search-2", new double[]{100.5, 200.25});
+
+        System.out.println("  Split1 values: [1.5, 2.5, 3.14159]");
+        System.out.println("  Split2 values: [100.5, 200.25]");
+
+        XRefMetadata xrefMetadata = buildXRef(Arrays.asList(split1, split2), "float-search-xref");
+        Path xrefPath = tempDir.resolve("float-search-xref.xref.split");
+
+        System.out.println("  XRef built with " + xrefMetadata.getTotalTerms() + " terms");
+
+        SplitCacheManager.CacheConfig cacheConfig = new SplitCacheManager.CacheConfig("float-search-cache")
+            .withMaxCacheSize(100_000_000);
+
+        try (SplitCacheManager cacheManager = SplitCacheManager.getInstance(cacheConfig);
+             XRefSearcher searcher = XRefSplit.open(cacheManager, "file://" + xrefPath.toString(), xrefMetadata)) {
+
+            // Search for value=1.5 (should only match split1)
+            System.out.println("\n  Searching for value:1.5...");
+            XRefSearchResult result15 = searcher.search("value:1.5", 10);
+            System.out.println("    Found " + result15.getNumMatchingSplits() + " matching split(s)");
+
+            assertEquals(1, result15.getNumMatchingSplits(), "value:1.5 should find exactly 1 split");
+            assertTrue(result15.getMatchingSplits().get(0).getUri().contains("float-search-1"),
+                "value:1.5 should match split1");
+
+            // Search for value=100.5 (should only match split2)
+            System.out.println("\n  Searching for value:100.5...");
+            XRefSearchResult result1005 = searcher.search("value:100.5", 10);
+            System.out.println("    Found " + result1005.getNumMatchingSplits() + " matching split(s)");
+
+            assertEquals(1, result1005.getNumMatchingSplits(), "value:100.5 should find exactly 1 split");
+            assertTrue(result1005.getMatchingSplits().get(0).getUri().contains("float-search-2"),
+                "value:100.5 should match split2");
+
+            // Search for non-existent float
+            System.out.println("\n  Searching for value:999.999 (non-existent)...");
+            XRefSearchResult resultNone = searcher.search("value:999.999", 10);
+            System.out.println("    Found " + resultNone.getNumMatchingSplits() + " matching split(s)");
+
+            assertEquals(0, resultNone.getNumMatchingSplits(), "value:999.999 should find no splits");
+        }
+
+        System.out.println("\n  XRef FLOAT equality search: PASS");
+    }
+
+    @Test
+    @Order(13)
+    @DisplayName("XRef search finds correct splits for BOOLEAN equality query")
+    void testBooleanEqualitySearch() throws Exception {
+        System.out.println("\n=== Testing XRef BOOLEAN Equality Search ===");
+
+        // Create split 1 with only TRUE values
+        SplitInfo split1 = createBooleanSplit("bool-search-true", new boolean[]{true, true, true});
+
+        // Create split 2 with only FALSE values
+        SplitInfo split2 = createBooleanSplit("bool-search-false", new boolean[]{false, false, false});
+
+        System.out.println("  Split1 values: [true, true, true]");
+        System.out.println("  Split2 values: [false, false, false]");
+
+        XRefMetadata xrefMetadata = buildXRef(Arrays.asList(split1, split2), "bool-search-xref");
+        Path xrefPath = tempDir.resolve("bool-search-xref.xref.split");
+
+        System.out.println("  XRef built with " + xrefMetadata.getTotalTerms() + " terms");
+
+        SplitCacheManager.CacheConfig cacheConfig = new SplitCacheManager.CacheConfig("bool-search-cache")
+            .withMaxCacheSize(100_000_000);
+
+        try (SplitCacheManager cacheManager = SplitCacheManager.getInstance(cacheConfig);
+             XRefSearcher searcher = XRefSplit.open(cacheManager, "file://" + xrefPath.toString(), xrefMetadata)) {
+
+            // Search for active:true (should only match split1)
+            System.out.println("\n  Searching for active:true...");
+            XRefSearchResult resultTrue = searcher.search("active:true", 10);
+            System.out.println("    Found " + resultTrue.getNumMatchingSplits() + " matching split(s)");
+
+            assertEquals(1, resultTrue.getNumMatchingSplits(), "active:true should find exactly 1 split");
+            assertTrue(resultTrue.getMatchingSplits().get(0).getUri().contains("bool-search-true"),
+                "active:true should match split1");
+
+            // Search for active:false (should only match split2)
+            System.out.println("\n  Searching for active:false...");
+            XRefSearchResult resultFalse = searcher.search("active:false", 10);
+            System.out.println("    Found " + resultFalse.getNumMatchingSplits() + " matching split(s)");
+
+            assertEquals(1, resultFalse.getNumMatchingSplits(), "active:false should find exactly 1 split");
+            assertTrue(resultFalse.getMatchingSplits().get(0).getUri().contains("bool-search-false"),
+                "active:false should match split2");
+        }
+
+        System.out.println("\n  XRef BOOLEAN equality search: PASS");
+    }
+
+    @Test
+    @Order(14)
+    @DisplayName("XRef search finds correct splits for DATE/TIMESTAMP equality query")
+    void testDateEqualitySearch() throws Exception {
+        System.out.println("\n=== Testing XRef DATE/TIMESTAMP Equality Search ===");
+
+        // Create split 1 with dates from 2023
+        long ts2023Jan = Instant.parse("2023-01-15T10:30:00Z").toEpochMilli() * 1000; // microseconds
+        long ts2023Jun = Instant.parse("2023-06-20T14:45:00Z").toEpochMilli() * 1000;
+        SplitInfo split1 = createDateSplit("date-search-2023", new long[]{ts2023Jan, ts2023Jun});
+
+        // Create split 2 with dates from 2024
+        long ts2024Mar = Instant.parse("2024-03-01T08:00:00Z").toEpochMilli() * 1000;
+        long ts2024Jul = Instant.parse("2024-07-04T12:00:00Z").toEpochMilli() * 1000;
+        SplitInfo split2 = createDateSplit("date-search-2024", new long[]{ts2024Mar, ts2024Jul});
+
+        System.out.println("  Split1 timestamps: [2023-01-15, 2023-06-20]");
+        System.out.println("  Split2 timestamps: [2024-03-01, 2024-07-04]");
+
+        XRefMetadata xrefMetadata = buildXRef(Arrays.asList(split1, split2), "date-search-xref");
+        Path xrefPath = tempDir.resolve("date-search-xref.xref.split");
+
+        System.out.println("  XRef built with " + xrefMetadata.getTotalTerms() + " terms");
+
+        SplitCacheManager.CacheConfig cacheConfig = new SplitCacheManager.CacheConfig("date-search-cache")
+            .withMaxCacheSize(100_000_000);
+
+        try (SplitCacheManager cacheManager = SplitCacheManager.getInstance(cacheConfig);
+             XRefSearcher searcher = XRefSplit.open(cacheManager, "file://" + xrefPath.toString(), xrefMetadata)) {
+
+            // Search for the 2023 timestamp (should only match split1)
+            // XRef stores timestamps as nanoseconds (Tantivy's internal format)
+            // The test creates timestamps in microseconds, then divides by 1000 to get millis for LocalDateTime
+            // Tantivy stores as nanoseconds = millis * 1_000_000 = micros * 1000
+            String ts2023JanStr = String.valueOf(ts2023Jan * 1000); // Convert to nanoseconds
+            System.out.println("\n  Searching for timestamp from 2023-01-15...");
+            System.out.println("    Query: timestamp:" + ts2023JanStr);
+            XRefSearchResult result2023 = searcher.search("timestamp:" + ts2023JanStr, 10);
+            System.out.println("    Found " + result2023.getNumMatchingSplits() + " matching split(s)");
+
+            assertEquals(1, result2023.getNumMatchingSplits(), "2023 timestamp should find exactly 1 split");
+            assertTrue(result2023.getMatchingSplits().get(0).getUri().contains("date-search-2023"),
+                "2023 timestamp should match split1");
+
+            // Search for the 2024 timestamp (should only match split2)
+            String ts2024MarStr = String.valueOf(ts2024Mar * 1000); // Convert to nanoseconds
+            System.out.println("\n  Searching for timestamp from 2024-03-01...");
+            System.out.println("    Query: timestamp:" + ts2024MarStr);
+            XRefSearchResult result2024 = searcher.search("timestamp:" + ts2024MarStr, 10);
+            System.out.println("    Found " + result2024.getNumMatchingSplits() + " matching split(s)");
+
+            assertEquals(1, result2024.getNumMatchingSplits(), "2024 timestamp should find exactly 1 split");
+            assertTrue(result2024.getMatchingSplits().get(0).getUri().contains("date-search-2024"),
+                "2024 timestamp should match split2");
+        }
+
+        System.out.println("\n  XRef DATE/TIMESTAMP equality search: PASS");
+    }
+
+    @Test
+    @Order(15)
+    @DisplayName("XRef search finds correct splits for TEXT equality query")
+    void testTextEqualitySearch() throws Exception {
+        System.out.println("\n=== Testing XRef TEXT Equality Search ===");
+
+        // Create split 1 with specific text content
+        SplitInfo split1 = createTextSplit("text-search-1", "default",
+            "The nebula is beautiful",
+            "A distant quasar shines bright");
+
+        // Create split 2 with different text content
+        SplitInfo split2 = createTextSplit("text-search-2", "default",
+            "The mitochondria powers the cell",
+            "Ribosomes synthesize proteins");
+
+        System.out.println("  Split1 content contains: nebula, quasar");
+        System.out.println("  Split2 content contains: mitochondria, ribosomes");
+
+        XRefMetadata xrefMetadata = buildXRef(Arrays.asList(split1, split2), "text-search-xref");
+        Path xrefPath = tempDir.resolve("text-search-xref.xref.split");
+
+        System.out.println("  XRef built with " + xrefMetadata.getTotalTerms() + " terms");
+
+        SplitCacheManager.CacheConfig cacheConfig = new SplitCacheManager.CacheConfig("text-search-cache")
+            .withMaxCacheSize(100_000_000);
+
+        try (SplitCacheManager cacheManager = SplitCacheManager.getInstance(cacheConfig);
+             XRefSearcher searcher = XRefSplit.open(cacheManager, "file://" + xrefPath.toString(), xrefMetadata)) {
+
+            // Search for "nebula" (should only match split1)
+            System.out.println("\n  Searching for content:nebula...");
+            XRefSearchResult resultNebula = searcher.search("content:nebula", 10);
+            System.out.println("    Found " + resultNebula.getNumMatchingSplits() + " matching split(s)");
+
+            assertEquals(1, resultNebula.getNumMatchingSplits(), "content:nebula should find exactly 1 split");
+            assertTrue(resultNebula.getMatchingSplits().get(0).getUri().contains("text-search-1"),
+                "content:nebula should match split1");
+
+            // Search for "mitochondria" (should only match split2)
+            System.out.println("\n  Searching for content:mitochondria...");
+            XRefSearchResult resultMito = searcher.search("content:mitochondria", 10);
+            System.out.println("    Found " + resultMito.getNumMatchingSplits() + " matching split(s)");
+
+            assertEquals(1, resultMito.getNumMatchingSplits(), "content:mitochondria should find exactly 1 split");
+            assertTrue(resultMito.getMatchingSplits().get(0).getUri().contains("text-search-2"),
+                "content:mitochondria should match split2");
+
+            // Search for non-existent term
+            System.out.println("\n  Searching for content:xyznonexistent (non-existent)...");
+            XRefSearchResult resultNone = searcher.search("content:xyznonexistent", 10);
+            System.out.println("    Found " + resultNone.getNumMatchingSplits() + " matching split(s)");
+
+            assertEquals(0, resultNone.getNumMatchingSplits(), "Non-existent term should find no splits");
+        }
+
+        System.out.println("\n  XRef TEXT equality search: PASS");
+    }
+
+    @Test
+    @Order(16)
+    @DisplayName("XRef search finds correct splits for JSON field equality query")
+    void testJsonEqualitySearch() throws Exception {
+        System.out.println("\n=== Testing XRef JSON Field Equality Search ===");
+
+        // Create split 1 with JSON containing "Alice"
+        SplitInfo split1 = createJsonSplit("json-search-1", Arrays.asList(
+            Map.of("name", "Alice", "city", "NewYork"),
+            Map.of("name", "Bob", "city", "Boston")
+        ));
+
+        // Create split 2 with JSON containing "Charlie"
+        SplitInfo split2 = createJsonSplit("json-search-2", Arrays.asList(
+            Map.of("name", "Charlie", "city", "Chicago"),
+            Map.of("name", "Diana", "city", "Denver")
+        ));
+
+        System.out.println("  Split1 JSON names: [Alice, Bob], cities: [NewYork, Boston]");
+        System.out.println("  Split2 JSON names: [Charlie, Diana], cities: [Chicago, Denver]");
+
+        XRefMetadata xrefMetadata = buildXRef(Arrays.asList(split1, split2), "json-search-xref");
+        Path xrefPath = tempDir.resolve("json-search-xref.xref.split");
+
+        System.out.println("  XRef built with " + xrefMetadata.getTotalTerms() + " terms");
+
+        SplitCacheManager.CacheConfig cacheConfig = new SplitCacheManager.CacheConfig("json-search-cache")
+            .withMaxCacheSize(100_000_000);
+
+        try (SplitCacheManager cacheManager = SplitCacheManager.getInstance(cacheConfig);
+             XRefSearcher searcher = XRefSplit.open(cacheManager, "file://" + xrefPath.toString(), xrefMetadata)) {
+
+            // XRef stores JSON terms as "path:value" format in the base JSON field
+            // So query format is: field:path:value -> data:name:alice
+            // Note: values are lowercased by default tokenizer
+
+            // Search for "alice" (should only match split1)
+            System.out.println("\n  Searching for data:name:alice...");
+            XRefSearchResult resultAlice = searcher.search("data:name:alice", 10);
+            System.out.println("    Found " + resultAlice.getNumMatchingSplits() + " matching split(s)");
+
+            assertEquals(1, resultAlice.getNumMatchingSplits(), "data:name:alice should find exactly 1 split");
+            assertTrue(resultAlice.getMatchingSplits().get(0).getUri().contains("json-search-1"),
+                "data:name:alice should match split1");
+
+            // Search for "charlie" (should only match split2)
+            System.out.println("\n  Searching for data:name:charlie...");
+            XRefSearchResult resultCharlie = searcher.search("data:name:charlie", 10);
+            System.out.println("    Found " + resultCharlie.getNumMatchingSplits() + " matching split(s)");
+
+            assertEquals(1, resultCharlie.getNumMatchingSplits(), "data:name:charlie should find exactly 1 split");
+            assertTrue(resultCharlie.getMatchingSplits().get(0).getUri().contains("json-search-2"),
+                "data:name:charlie should match split2");
+
+            // Search for city in split1
+            System.out.println("\n  Searching for data:city:newyork...");
+            XRefSearchResult resultNY = searcher.search("data:city:newyork", 10);
+            System.out.println("    Found " + resultNY.getNumMatchingSplits() + " matching split(s)");
+
+            assertEquals(1, resultNY.getNumMatchingSplits(), "data:city:newyork should find exactly 1 split");
+            assertTrue(resultNY.getMatchingSplits().get(0).getUri().contains("json-search-1"),
+                "data.city:newyork should match split1");
+        }
+
+        System.out.println("\n  XRef JSON equality search: PASS");
+    }
+
     // ========== HELPER METHODS ==========
 
     private SplitInfo createTextSplit(String name, String tokenizer, String... contents) throws IOException {

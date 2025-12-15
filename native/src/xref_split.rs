@@ -548,22 +548,28 @@ impl XRefSplitBuilder {
                     let term_bytes = term_stream.key();
 
                     // Decode term based on field type
+                    // IMPORTANT: Tantivy uses special monotonic encoding for numeric types
+                    // to preserve sort order. We must decode using the same encoding.
+                    const HIGHEST_BIT: u64 = 1u64 << 63;
+
                     let term_str_opt: Option<String> = match field_entry.field_type() {
                         tantivy::schema::FieldType::Str(_) => {
                             // Text fields: decode as UTF-8
                             std::str::from_utf8(term_bytes).ok().map(|s| s.to_string())
                         }
                         tantivy::schema::FieldType::I64(_) => {
-                            // Integer fields: decode as big-endian i64
+                            // Integer fields: Tantivy stores as (val as u64) ^ HIGHEST_BIT
+                            // to make signed integers sort correctly
                             if term_bytes.len() == 8 {
-                                let value = i64::from_be_bytes(term_bytes.try_into().unwrap());
+                                let encoded = u64::from_be_bytes(term_bytes.try_into().unwrap());
+                                let value = (encoded ^ HIGHEST_BIT) as i64;
                                 Some(value.to_string())
                             } else {
                                 None
                             }
                         }
                         tantivy::schema::FieldType::U64(_) => {
-                            // Unsigned integer fields: decode as big-endian u64
+                            // Unsigned integer fields: stored as big-endian u64
                             if term_bytes.len() == 8 {
                                 let value = u64::from_be_bytes(term_bytes.try_into().unwrap());
                                 Some(value.to_string())
@@ -572,27 +578,36 @@ impl XRefSplitBuilder {
                             }
                         }
                         tantivy::schema::FieldType::F64(_) => {
-                            // Float fields: decode as big-endian f64
+                            // Float fields: Tantivy uses monotonic mapping
+                            // Positive: bits ^ HIGHEST_BIT, Negative: !bits
                             if term_bytes.len() == 8 {
-                                let bits = u64::from_be_bytes(term_bytes.try_into().unwrap());
-                                let value = f64::from_bits(bits);
+                                let encoded = u64::from_be_bytes(term_bytes.try_into().unwrap());
+                                // Reverse the monotonic mapping
+                                let value = if encoded & HIGHEST_BIT != 0 {
+                                    f64::from_bits(encoded ^ HIGHEST_BIT)
+                                } else {
+                                    f64::from_bits(!encoded)
+                                };
                                 Some(value.to_string())
                             } else {
                                 None
                             }
                         }
                         tantivy::schema::FieldType::Bool(_) => {
-                            // Boolean fields: decode as single byte
-                            if term_bytes.len() == 1 {
-                                Some(if term_bytes[0] == 0 { "false" } else { "true" }.to_string())
+                            // Boolean fields: stored as u64 (0 or 1) in big-endian format
+                            if term_bytes.len() == 8 {
+                                let value = u64::from_be_bytes(term_bytes.try_into().unwrap());
+                                Some(if value == 0 { "false" } else { "true" }.to_string())
                             } else {
                                 None
                             }
                         }
                         tantivy::schema::FieldType::Date(_) => {
                             // Date fields: stored as i64 timestamp (microseconds since epoch)
+                            // Uses same encoding as I64
                             if term_bytes.len() == 8 {
-                                let timestamp = i64::from_be_bytes(term_bytes.try_into().unwrap());
+                                let encoded = u64::from_be_bytes(term_bytes.try_into().unwrap());
+                                let timestamp = (encoded ^ HIGHEST_BIT) as i64;
                                 Some(timestamp.to_string())
                             } else {
                                 None
@@ -606,8 +621,90 @@ impl XRefSplitBuilder {
                             Some(hex_str)
                         }
                         tantivy::schema::FieldType::JsonObject(_) => {
-                            // JSON fields: try UTF-8 decode (JSON paths/values are strings)
-                            std::str::from_utf8(term_bytes).ok().map(|s| s.to_string())
+                            // JSON fields have complex encoding:
+                            // [path segments separated by \x01] \x00 [type byte] [value bytes]
+                            // We need to parse this and create a searchable format
+                            const JSON_PATH_SEGMENT_SEP: u8 = 1u8;
+                            const JSON_END_OF_PATH: u8 = 0u8;
+
+                            // Find the end of path marker
+                            if let Some(end_pos) = term_bytes.iter().position(|&b| b == JSON_END_OF_PATH) {
+                                let path_bytes = &term_bytes[..end_pos];
+                                let value_bytes = &term_bytes[end_pos + 1..]; // Skip the \x00 marker
+
+                                // Parse path (replace \x01 separators with dots)
+                                let path: String = path_bytes.iter()
+                                    .map(|&b| if b == JSON_PATH_SEGMENT_SEP { '.' } else { b as char })
+                                    .collect();
+
+                                // Parse value based on type byte
+                                if value_bytes.len() > 1 {
+                                    let type_byte = value_bytes[0];
+                                    let actual_value = &value_bytes[1..];
+
+                                    // Type codes from tantivy::schema::Type
+                                    match type_byte {
+                                        b's' => {
+                                            // String value - UTF-8 decode
+                                            if let Ok(val_str) = std::str::from_utf8(actual_value) {
+                                                Some(format!("{}:{}", path, val_str))
+                                            } else {
+                                                None
+                                            }
+                                        }
+                                        b'i' | b'u' => {
+                                            // Integer value (signed or unsigned)
+                                            if actual_value.len() == 8 {
+                                                let encoded = u64::from_be_bytes(actual_value.try_into().unwrap());
+                                                // For JSON numeric values, decode using the same i64 encoding
+                                                let value = (encoded ^ HIGHEST_BIT) as i64;
+                                                Some(format!("{}:{}", path, value))
+                                            } else {
+                                                None
+                                            }
+                                        }
+                                        b'f' => {
+                                            // Float value
+                                            if actual_value.len() == 8 {
+                                                let encoded = u64::from_be_bytes(actual_value.try_into().unwrap());
+                                                let value = if encoded & HIGHEST_BIT != 0 {
+                                                    f64::from_bits(encoded ^ HIGHEST_BIT)
+                                                } else {
+                                                    f64::from_bits(!encoded)
+                                                };
+                                                Some(format!("{}:{}", path, value))
+                                            } else {
+                                                None
+                                            }
+                                        }
+                                        b'o' => {
+                                            // Boolean value
+                                            if actual_value.len() == 8 {
+                                                let value = u64::from_be_bytes(actual_value.try_into().unwrap());
+                                                Some(format!("{}:{}", path, if value == 0 { "false" } else { "true" }))
+                                            } else {
+                                                None
+                                            }
+                                        }
+                                        _ => {
+                                            // Unknown type - try raw decode
+                                            if let Ok(val_str) = std::str::from_utf8(actual_value) {
+                                                Some(format!("{}:{}", path, val_str))
+                                            } else {
+                                                None
+                                            }
+                                        }
+                                    }
+                                } else if !path.is_empty() {
+                                    // Path-only term (exists query)
+                                    Some(path)
+                                } else {
+                                    None
+                                }
+                            } else {
+                                // No path separator found - try raw UTF-8
+                                std::str::from_utf8(term_bytes).ok().map(|s| s.to_string())
+                            }
                         }
                         tantivy::schema::FieldType::IpAddr(_) => {
                             // IP address fields: decode as 16-byte IPv6 (or IPv4-mapped)
