@@ -467,4 +467,132 @@ public class LocalXRefBuildTest {
             System.out.println("\n=== Non-range query passthrough test passed! ===");
         }
     }
+
+    @Test
+    @DisplayName("Build XRef with custom tempDirectoryPath and heapSize")
+    void testBuildXRefWithCustomTempDirAndHeapSize() throws Exception {
+        System.out.println("\n=== Testing XRef Build with Custom tempDirectoryPath and heapSize ===");
+
+        // Create custom temp directory
+        Path customTempDir = tempDir.resolve("custom-xref-temp");
+        java.nio.file.Files.createDirectories(customTempDir);
+        System.out.println("Custom temp directory: " + customTempDir);
+
+        // Create split 1
+        Path index1Path = tempDir.resolve("index1-customconfig");
+        Path split1Path = tempDir.resolve("split1-customconfig.split");
+        createTestIndex(index1Path, "custom1", new String[]{"alpha", "beta", "gamma"});
+        QuickwitSplit.SplitConfig config1 = new QuickwitSplit.SplitConfig(
+            "xref-customconfig-test", "test-source", "node-1");
+        QuickwitSplit.SplitMetadata meta1 = QuickwitSplit.convertIndexFromPath(
+            index1Path.toString(), split1Path.toString(), config1);
+        System.out.println("Created split1: " + meta1.getNumDocs() + " docs");
+
+        // Create split 2
+        Path index2Path = tempDir.resolve("index2-customconfig");
+        Path split2Path = tempDir.resolve("split2-customconfig.split");
+        createTestIndex(index2Path, "custom2", new String[]{"delta", "epsilon", "zeta"});
+        QuickwitSplit.SplitConfig config2 = new QuickwitSplit.SplitConfig(
+            "xref-customconfig-test", "test-source", "node-2");
+        QuickwitSplit.SplitMetadata meta2 = QuickwitSplit.convertIndexFromPath(
+            index2Path.toString(), split2Path.toString(), config2);
+        System.out.println("Created split2: " + meta2.getNumDocs() + " docs");
+
+        // Build XRef with custom configuration - EXPLICITLY SET tempDirectoryPath and heapSize
+        XRefSourceSplit source1 = XRefSourceSplit.fromSplitMetadata(split1Path.toString(), meta1);
+        XRefSourceSplit source2 = XRefSourceSplit.fromSplitMetadata(split2Path.toString(), meta2);
+
+        XRefBuildConfig xrefConfig = XRefBuildConfig.builder()
+            .xrefId("customconfig-xref")
+            .indexUid("customconfig-index")
+            .sourceSplits(Arrays.asList(source1, source2))
+            .includePositions(false)
+            .tempDirectoryPath(customTempDir.toString())  // Explicitly set custom temp directory
+            .heapSize(XRefBuildConfig.DEFAULT_HEAP_SIZE)  // Explicitly set heap size (same as default)
+            .build();
+
+        System.out.println("Building XRef with:");
+        System.out.println("  tempDirectoryPath: " + xrefConfig.getTempDirectoryPath());
+        System.out.println("  heapSize: " + xrefConfig.getHeapSize() + " bytes");
+
+        Path xrefPath = tempDir.resolve("customconfig.xref.split");
+        XRefMetadata xrefMetadata = XRefSplit.build(xrefConfig, xrefPath.toString());
+
+        assertNotNull(xrefMetadata, "XRef metadata should be returned");
+        assertEquals(2, xrefMetadata.getNumSplits(), "XRef should have 2 source splits");
+        assertTrue(xrefMetadata.hasFooterOffsets(), "XRef should have footer offsets");
+
+        System.out.println("XRef built successfully with custom configuration:");
+        System.out.println("  - XRef ID: " + xrefMetadata.getXrefId());
+        System.out.println("  - Source splits: " + xrefMetadata.getNumSplits());
+        System.out.println("  - Total terms: " + xrefMetadata.getTotalTerms());
+        System.out.println("  - Build duration: " + xrefMetadata.getBuildStats().getBuildDurationMs() + "ms");
+
+        // Verify the XRef can be searched
+        SplitCacheManager.CacheConfig cacheConfig = new SplitCacheManager.CacheConfig("xref-customconfig-cache")
+            .withMaxCacheSize(100_000_000);
+
+        try (SplitCacheManager cacheManager = SplitCacheManager.getInstance(cacheConfig);
+             XRefSearcher xrefSearcher = XRefSplit.open(cacheManager, "file://" + xrefPath.toString(), xrefMetadata)) {
+
+            // Verify search works
+            XRefSearchResult result = xrefSearcher.search("*", 10);
+            assertEquals(2, result.getNumMatchingSplits(), "Match-all should return 2 splits");
+            System.out.println("  - Search verification passed: " + result.getNumMatchingSplits() + " splits found");
+        }
+
+        System.out.println("\n=== Custom tempDirectoryPath and heapSize test passed! ===");
+    }
+
+    @Test
+    @DisplayName("Build XRef with doubled heap size")
+    void testBuildXRefWithLargeHeapSize() throws Exception {
+        System.out.println("\n=== Testing XRef Build with Doubled Heap Size ===");
+
+        // Create split 1
+        Path index1Path = tempDir.resolve("index1-largeheap");
+        Path split1Path = tempDir.resolve("split1-largeheap.split");
+        createTestIndex(index1Path, "largeheap1", new String[]{"omega", "sigma", "theta"});
+        QuickwitSplit.SplitConfig config1 = new QuickwitSplit.SplitConfig(
+            "xref-largeheap-test", "test-source", "node-1");
+        QuickwitSplit.SplitMetadata meta1 = QuickwitSplit.convertIndexFromPath(
+            index1Path.toString(), split1Path.toString(), config1);
+
+        // Create split 2
+        Path index2Path = tempDir.resolve("index2-largeheap");
+        Path split2Path = tempDir.resolve("split2-largeheap.split");
+        createTestIndex(index2Path, "largeheap2", new String[]{"lambda", "kappa", "iota"});
+        QuickwitSplit.SplitConfig config2 = new QuickwitSplit.SplitConfig(
+            "xref-largeheap-test", "test-source", "node-2");
+        QuickwitSplit.SplitMetadata meta2 = QuickwitSplit.convertIndexFromPath(
+            index2Path.toString(), split2Path.toString(), config2);
+
+        // Build XRef with doubled heap size
+        XRefSourceSplit source1 = XRefSourceSplit.fromSplitMetadata(split1Path.toString(), meta1);
+        XRefSourceSplit source2 = XRefSourceSplit.fromSplitMetadata(split2Path.toString(), meta2);
+
+        // Use 2x default heap size (100MB instead of 50MB)
+        long doubledHeapSize = XRefBuildConfig.DEFAULT_HEAP_SIZE * 2;
+
+        XRefBuildConfig xrefConfig = XRefBuildConfig.builder()
+            .xrefId("largeheap-xref")
+            .indexUid("largeheap-index")
+            .sourceSplits(Arrays.asList(source1, source2))
+            .includePositions(false)
+            .heapSize(doubledHeapSize)  // 100MB heap
+            .build();
+
+        System.out.println("Building XRef with heapSize: " + xrefConfig.getHeapSize() + " bytes (2x default)");
+
+        Path xrefPath = tempDir.resolve("largeheap.xref.split");
+        XRefMetadata xrefMetadata = XRefSplit.build(xrefConfig, xrefPath.toString());
+
+        assertNotNull(xrefMetadata, "XRef metadata should be returned");
+        assertEquals(2, xrefMetadata.getNumSplits(), "XRef should have 2 source splits");
+
+        System.out.println("XRef built successfully with doubled heap size:");
+        System.out.println("  - Build duration: " + xrefMetadata.getBuildStats().getBuildDurationMs() + "ms");
+
+        System.out.println("\n=== Doubled heap size test passed! ===");
+    }
 }

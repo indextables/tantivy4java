@@ -237,7 +237,27 @@ impl XRefSplitBuilder {
         // Convert config types for storage resolver
         let s3_config = self.config.aws_config.as_ref().map(merge_aws_to_s3_config);
         let azure_config = self.config.azure_config.as_ref().map(merge_azure_to_azure_config);
-        let storage_resolver = get_configured_storage_resolver(s3_config, azure_config);
+
+        // Debug: Log the S3/Azure configuration being used
+        if let Some(ref aws) = self.config.aws_config {
+            debug_println!("📁 XREF: Creating storage resolver with AWS config:");
+            debug_println!("📁 XREF:   region: {}", aws.region);
+            debug_println!("📁 XREF:   access_key (first 8): {}...", &aws.access_key[..8.min(aws.access_key.len())]);
+            debug_println!("📁 XREF:   session_token: {}", if aws.session_token.is_some() { "present" } else { "none" });
+            debug_println!("📁 XREF:   endpoint_url: {:?}", aws.endpoint_url);
+            debug_println!("📁 XREF:   force_path_style: {}", aws.force_path_style);
+        } else {
+            debug_println!("📁 XREF: No AWS config provided");
+        }
+        if let Some(ref azure) = self.config.azure_config {
+            debug_println!("📁 XREF: Creating storage resolver with Azure config:");
+            debug_println!("📁 XREF:   account_name: {}", azure.account_name);
+        } else {
+            debug_println!("📁 XREF: No Azure config provided");
+        }
+
+        let storage_resolver = get_configured_storage_resolver(s3_config.clone(), azure_config.clone());
+        debug_println!("📁 XREF: Storage resolver created");
 
         // Sample the first split to discover the schema
         let first_source_split = self.config.source_splits.first().ok_or_else(|| {
@@ -368,18 +388,34 @@ impl XRefSplitBuilder {
         // 2. Creates HotDirectory with proper async support
         // 3. Handles byte-range requests on-demand
         // 4. With ephemeral_cache, warmed data is cached for subsequent sync reads
-        let (tantivy_index, _hot_directory) = open_index_with_caches(
+        let open_result = open_index_with_caches(
             &searcher_context,
-            storage,
+            storage.clone(),
             &split_and_footer_offsets,
             None,  // No tokenizer manager override
             Some(ephemeral_cache),  // Ephemeral cache for warmup data
-        ).await.with_context(|| format!(
-            "Failed to open source split with caches: split_id='{}', footer={}-{}",
-            split_and_footer_offsets.split_id,
-            split_and_footer_offsets.split_footer_start,
-            split_and_footer_offsets.split_footer_end
-        ))?;
+        ).await;
+
+        // Enhanced error reporting for S3 XRef debugging
+        let (tantivy_index, _hot_directory) = match open_result {
+            Ok(result) => result,
+            Err(e) => {
+                debug_println!("❌ XREF: open_index_with_caches FAILED");
+                debug_println!("❌ XREF:   split_uri: {}", source_split.uri);
+                debug_println!("❌ XREF:   split_id: {}", split_and_footer_offsets.split_id);
+                debug_println!("❌ XREF:   footer: {}-{}", split_and_footer_offsets.split_footer_start, split_and_footer_offsets.split_footer_end);
+                debug_println!("❌ XREF:   storage_uri: {}", storage.uri());
+                debug_println!("❌ XREF:   error: {:?}", e);
+                return Err(anyhow!(
+                    "Failed to open source split with caches: split_id='{}', footer={}-{}, storage_uri='{}', error: {}",
+                    split_and_footer_offsets.split_id,
+                    split_and_footer_offsets.split_footer_start,
+                    split_and_footer_offsets.split_footer_end,
+                    storage.uri(),
+                    e
+                ));
+            }
+        };
 
         debug_println!("📁 XREF: Opened split via open_index_with_caches (async-compatible)");
 
@@ -918,6 +954,27 @@ pub extern "system" fn Java_io_indextables_tantivy4java_xref_XRefSplit_nativeBui
         temp_directory_path: temp_dir_path,
         heap_size: heap_size as usize,
     };
+
+    // Debug logging: Show received configuration (helps diagnose version mismatch issues)
+    debug_println!("🔧 XREF JNI: Configuration received:");
+    debug_println!("  xref_id: {}", config.xref_id);
+    debug_println!("  index_uid: {}", config.index_uid);
+    debug_println!("  source_splits: {} splits", config.source_splits.len());
+    debug_println!("  temp_directory_path: {:?}", config.temp_directory_path);
+    debug_println!("  heap_size: {} bytes", config.heap_size);
+    debug_println!("  aws_config present: {}", config.aws_config.is_some());
+    if let Some(ref aws) = config.aws_config {
+        debug_println!("    aws region: {}", aws.region);
+        debug_println!("    aws access_key (first 8 chars): {}...", &aws.access_key[..8.min(aws.access_key.len())]);
+        debug_println!("    aws session_token present: {}", aws.session_token.is_some());
+        debug_println!("    aws endpoint_url: {:?}", aws.endpoint_url);
+    }
+    debug_println!("  azure_config present: {}", config.azure_config.is_some());
+    if let Some(ref azure) = config.azure_config {
+        debug_println!("    azure account_name: {}", azure.account_name);
+        debug_println!("    azure account_key present: {}", azure.account_key.is_some());
+        debug_println!("    azure bearer_token present: {}", azure.bearer_token.is_some());
+    }
 
     // Build the XRef split
     debug_println!("🔧 XREF JNI: About to build XRef with {} source splits", config.source_splits.len());
