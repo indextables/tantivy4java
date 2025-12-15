@@ -543,12 +543,89 @@ impl XRefSplitBuilder {
                 let mut term_count = 0u64;
 
                 // Extract all terms and add to XRef document
+                // Handle different field types appropriately
                 while term_stream.advance() {
                     let term_bytes = term_stream.key();
 
-                    // Try to decode as UTF-8 string
-                    if let Ok(term_str) = std::str::from_utf8(term_bytes) {
-                        xref_doc.add_text(xref_field, term_str);
+                    // Decode term based on field type
+                    let term_str_opt: Option<String> = match field_entry.field_type() {
+                        tantivy::schema::FieldType::Str(_) => {
+                            // Text fields: decode as UTF-8
+                            std::str::from_utf8(term_bytes).ok().map(|s| s.to_string())
+                        }
+                        tantivy::schema::FieldType::I64(_) => {
+                            // Integer fields: decode as big-endian i64
+                            if term_bytes.len() == 8 {
+                                let value = i64::from_be_bytes(term_bytes.try_into().unwrap());
+                                Some(value.to_string())
+                            } else {
+                                None
+                            }
+                        }
+                        tantivy::schema::FieldType::U64(_) => {
+                            // Unsigned integer fields: decode as big-endian u64
+                            if term_bytes.len() == 8 {
+                                let value = u64::from_be_bytes(term_bytes.try_into().unwrap());
+                                Some(value.to_string())
+                            } else {
+                                None
+                            }
+                        }
+                        tantivy::schema::FieldType::F64(_) => {
+                            // Float fields: decode as big-endian f64
+                            if term_bytes.len() == 8 {
+                                let bits = u64::from_be_bytes(term_bytes.try_into().unwrap());
+                                let value = f64::from_bits(bits);
+                                Some(value.to_string())
+                            } else {
+                                None
+                            }
+                        }
+                        tantivy::schema::FieldType::Bool(_) => {
+                            // Boolean fields: decode as single byte
+                            if term_bytes.len() == 1 {
+                                Some(if term_bytes[0] == 0 { "false" } else { "true" }.to_string())
+                            } else {
+                                None
+                            }
+                        }
+                        tantivy::schema::FieldType::Date(_) => {
+                            // Date fields: stored as i64 timestamp (microseconds since epoch)
+                            if term_bytes.len() == 8 {
+                                let timestamp = i64::from_be_bytes(term_bytes.try_into().unwrap());
+                                Some(timestamp.to_string())
+                            } else {
+                                None
+                            }
+                        }
+                        tantivy::schema::FieldType::Bytes(_) => {
+                            // Bytes fields: encode as hex string for indexing
+                            let hex_str: String = term_bytes.iter()
+                                .map(|b| format!("{:02x}", b))
+                                .collect();
+                            Some(hex_str)
+                        }
+                        tantivy::schema::FieldType::JsonObject(_) => {
+                            // JSON fields: try UTF-8 decode (JSON paths/values are strings)
+                            std::str::from_utf8(term_bytes).ok().map(|s| s.to_string())
+                        }
+                        tantivy::schema::FieldType::IpAddr(_) => {
+                            // IP address fields: decode as 16-byte IPv6 (or IPv4-mapped)
+                            if term_bytes.len() == 16 {
+                                let addr = std::net::Ipv6Addr::from(<[u8; 16]>::try_from(term_bytes).unwrap());
+                                Some(addr.to_string())
+                            } else {
+                                None
+                            }
+                        }
+                        tantivy::schema::FieldType::Facet(_) => {
+                            // Facet fields: hierarchical paths stored as UTF-8
+                            std::str::from_utf8(term_bytes).ok().map(|s| s.to_string())
+                        }
+                    };
+
+                    if let Some(term_str) = term_str_opt {
+                        xref_doc.add_text(xref_field, &term_str);
                         term_count += 1;
                     }
                 }
