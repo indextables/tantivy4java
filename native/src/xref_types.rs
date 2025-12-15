@@ -122,7 +122,19 @@ pub struct XRefBuildConfig {
     /// Whether to include position data (for phrase queries)
     /// Note: Positions increase XRef size but enable phrase query routing
     pub include_positions: bool,
+
+    /// Optional: Custom temp directory path for intermediate files
+    pub temp_directory_path: Option<String>,
+
+    /// Heap size for the index writer in bytes (default: 50MB, minimum: 15MB)
+    pub heap_size: usize,
 }
+
+/// Default heap size for XRef index building (50MB)
+pub const DEFAULT_XREF_HEAP_SIZE: usize = 50_000_000;
+
+/// Minimum heap size required by Tantivy (15MB)
+pub const MIN_XREF_HEAP_SIZE: usize = 15_000_000;
 
 impl XRefBuildConfig {
     /// Create a new XRef build configuration
@@ -135,6 +147,8 @@ impl XRefBuildConfig {
             azure_config: None,
             included_fields: Vec::new(),
             include_positions: false,
+            temp_directory_path: None,
+            heap_size: DEFAULT_XREF_HEAP_SIZE,
         }
     }
 
@@ -159,6 +173,18 @@ impl XRefBuildConfig {
     /// Enable position data for phrase query support
     pub fn with_positions(mut self, include: bool) -> Self {
         self.include_positions = include;
+        self
+    }
+
+    /// Set custom temp directory path for intermediate files
+    pub fn with_temp_directory_path(mut self, path: String) -> Self {
+        self.temp_directory_path = Some(path);
+        self
+    }
+
+    /// Set heap size for the index writer
+    pub fn with_heap_size(mut self, size: usize) -> Self {
+        self.heap_size = size.max(MIN_XREF_HEAP_SIZE);
         self
     }
 }

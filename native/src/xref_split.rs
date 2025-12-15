@@ -135,16 +135,17 @@ impl XRefSplitBuilder {
 
         // Phase 2: Create XRef index in a temporary directory
         debug_println!("🏗️  XREF BUILD: Phase 2 - Creating XRef index...");
-        let temp_dir = tempfile::tempdir().context("Failed to create temp directory")?;
+        let temp_dir = create_xref_temp_directory(self.config.temp_directory_path.as_deref())
+            .context("Failed to create temp directory")?;
         let index_path = temp_dir.path().join("xref_index");
         std::fs::create_dir_all(&index_path)?;
 
         let xref_index = Index::create_in_dir(&index_path, xref_schema.clone())
             .context("Failed to create XRef index")?;
 
-        // 50MB heap for indexing
+        // Use configured heap size (validated on Java side, minimum 15MB)
         let mut writer = xref_index
-            .writer(50_000_000)
+            .writer(self.config.heap_size)
             .context("Failed to create index writer")?;
 
         // Phase 3: Process each source split and create XRef documents
@@ -724,6 +725,40 @@ fn extract_split_id_from_filename(split_uri: &str) -> String {
     }
 }
 
+/// Create a temporary directory for XRef build operations.
+///
+/// If a custom temp directory path is provided, the directory will be created
+/// there. Otherwise, the system default temp directory will be used.
+fn create_xref_temp_directory(custom_base: Option<&str>) -> Result<tempfile::TempDir> {
+    use tempfile::Builder;
+
+    let mut builder = Builder::new();
+    builder.prefix("xref_build_");
+
+    if let Some(base_path) = custom_base {
+        let base_path_buf = std::path::PathBuf::from(base_path);
+        if !base_path_buf.exists() {
+            return Err(anyhow::anyhow!(
+                "Custom temp directory base path does not exist: {}",
+                base_path
+            ));
+        }
+        if !base_path_buf.is_dir() {
+            return Err(anyhow::anyhow!(
+                "Custom temp directory base path is not a directory: {}",
+                base_path
+            ));
+        }
+        debug_println!("🏗️ XREF: Using custom temp directory base: {}", base_path);
+        builder.tempdir_in(&base_path_buf)
+            .context("Failed to create temp directory in custom path")
+    } else {
+        debug_println!("🏗️ XREF: Using system temp directory");
+        builder.tempdir()
+            .context("Failed to create temp directory")
+    }
+}
+
 // JNI bindings for XRef split building
 use jni::objects::{JClass, JObject, JString};
 use jni::sys::{jobject, jstring};
@@ -759,6 +794,8 @@ pub extern "system" fn Java_io_indextables_tantivy4java_xref_XRefSplit_nativeBui
     output_path: JString,
     include_positions: jni::sys::jboolean,
     included_fields: JObject, // String[] or null
+    temp_directory_path: JString, // Temp directory for intermediate files (nullable)
+    heap_size: jni::sys::jlong, // Heap size for index writer in bytes
     // AWS config (all nullable)
     aws_access_key: JString,
     aws_secret_key: JString,
@@ -819,6 +856,13 @@ pub extern "system" fn Java_io_indextables_tantivy4java_xref_XRefSplit_nativeBui
         Vec::new()
     };
 
+    // Extract temp directory path (optional)
+    let temp_dir_path = if !temp_directory_path.is_null() {
+        jstring_to_string(&mut env, &temp_directory_path).ok()
+    } else {
+        None
+    };
+
     // Build AWS config if provided
     let aws_config = if !aws_access_key.is_null() {
         let access_key = jstring_to_string(&mut env, &aws_access_key).unwrap_or_default();
@@ -871,6 +915,8 @@ pub extern "system" fn Java_io_indextables_tantivy4java_xref_XRefSplit_nativeBui
         azure_config,
         included_fields: included_fields_vec,
         include_positions: include_positions != 0,
+        temp_directory_path: temp_dir_path,
+        heap_size: heap_size as usize,
     };
 
     // Build the XRef split

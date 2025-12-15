@@ -174,6 +174,8 @@ public class XRefSplit {
             config.getIncludedFields().isEmpty()
                 ? null
                 : config.getIncludedFields().toArray(new String[0]),
+            config.getTempDirectoryPath(),
+            config.getHeapSize(),
             awsAccessKey,
             awsSecretKey,
             awsSessionToken,
@@ -238,6 +240,8 @@ public class XRefSplit {
         String outputPath,
         boolean includePositions,
         String[] includedFields,
+        String tempDirectoryPath,
+        long heapSize,
         String awsAccessKey,
         String awsSecretKey,
         String awsSessionToken,

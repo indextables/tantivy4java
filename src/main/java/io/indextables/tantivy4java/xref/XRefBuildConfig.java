@@ -53,6 +53,17 @@ import java.util.List;
  * }</pre>
  */
 public class XRefBuildConfig {
+    /**
+     * Default heap size for XRef index building (50MB).
+     * This is sufficient for most XRef builds since XRef documents are small.
+     */
+    public static final long DEFAULT_HEAP_SIZE = 50_000_000L;
+
+    /**
+     * Minimum heap size required by Tantivy (15MB).
+     */
+    public static final long MIN_HEAP_SIZE = 15_000_000L;
+
     private final String xrefId;
     private final String indexUid;
     private final List<XRefSourceSplit> sourceSplits;
@@ -60,6 +71,8 @@ public class XRefBuildConfig {
     private final QuickwitSplit.AzureConfig azureConfig;
     private final List<String> includedFields;
     private final boolean includePositions;
+    private final String tempDirectoryPath;
+    private final long heapSize;
 
     private XRefBuildConfig(Builder builder) {
         this.xrefId = builder.xrefId;
@@ -71,6 +84,8 @@ public class XRefBuildConfig {
             ? Collections.unmodifiableList(new ArrayList<>(builder.includedFields))
             : Collections.emptyList();
         this.includePositions = builder.includePositions;
+        this.tempDirectoryPath = builder.tempDirectoryPath;
+        this.heapSize = builder.heapSize;
     }
 
     /**
@@ -130,6 +145,21 @@ public class XRefBuildConfig {
     }
 
     /**
+     * Get the custom temporary directory path for intermediate files.
+     * Returns null if the system default should be used.
+     */
+    public String getTempDirectoryPath() {
+        return tempDirectoryPath;
+    }
+
+    /**
+     * Get the heap size for the index writer in bytes.
+     */
+    public long getHeapSize() {
+        return heapSize;
+    }
+
+    /**
      * Builder for XRefBuildConfig.
      */
     public static class Builder {
@@ -140,6 +170,8 @@ public class XRefBuildConfig {
         private QuickwitSplit.AzureConfig azureConfig;
         private List<String> includedFields;
         private boolean includePositions = false;
+        private String tempDirectoryPath;
+        private long heapSize = DEFAULT_HEAP_SIZE;
 
         /**
          * Set the XRef split ID.
@@ -221,6 +253,36 @@ public class XRefBuildConfig {
          */
         public Builder includePositions(boolean includePositions) {
             this.includePositions = includePositions;
+            return this;
+        }
+
+        /**
+         * Set a custom temporary directory path for intermediate files.
+         * If not set, the system default temporary directory will be used.
+         *
+         * @param tempDirectoryPath Path to use for temporary files
+         */
+        public Builder tempDirectoryPath(String tempDirectoryPath) {
+            this.tempDirectoryPath = tempDirectoryPath;
+            return this;
+        }
+
+        /**
+         * Set the heap size for the index writer.
+         * Default is {@link #DEFAULT_HEAP_SIZE} (50MB).
+         * Minimum is {@link #MIN_HEAP_SIZE} (15MB).
+         *
+         * @param heapSize Heap size in bytes
+         * @throws IllegalArgumentException if heapSize is less than MIN_HEAP_SIZE
+         */
+        public Builder heapSize(long heapSize) {
+            if (heapSize < MIN_HEAP_SIZE) {
+                throw new IllegalArgumentException(
+                    "Heap size must be at least " + MIN_HEAP_SIZE + " bytes (15MB). " +
+                    "Consider using XRefBuildConfig.DEFAULT_HEAP_SIZE (" + DEFAULT_HEAP_SIZE + ")."
+                );
+            }
+            this.heapSize = heapSize;
             return this;
         }
 
