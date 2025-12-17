@@ -47,11 +47,17 @@ use tantivy::termdict::{TermDictionary, TermStreamer};
 use tantivy::{Index, TantivyDocument};
 
 use quickwit_config::{AzureStorageConfig, S3StorageConfig};
-use quickwit_directories::write_hotcache;
-use quickwit_storage::{PutPayload, SplitPayloadBuilder, Storage, StorageResolver};
+use quickwit_directories::{write_hotcache, BundleDirectory, HotDirectory, StorageDirectory, CachingDirectory, get_hotcache_from_split};
+use quickwit_storage::{BundleStorage, ByteRangeCache, PutPayload, SplitPayloadBuilder, Storage, StorageResolver, STORAGE_METRICS};
+use quickwit_search::leaf::{open_index_with_caches, open_split_bundle};
+use quickwit_search::SearcherContext;
+use quickwit_proto::search::SplitIdAndFooterOffsets;
+use tantivy::directory::{FileSlice, OwnedBytes, FileHandle};
+use tantivy::HasLen;
+use tokio::runtime::Handle;
 
 use crate::debug_println;
-use crate::global_cache::get_configured_storage_resolver;
+use crate::global_cache::{get_configured_storage_resolver, get_global_searcher_context};
 use crate::merge_types::{MergeAwsConfig, MergeAzureConfig};
 use crate::runtime_manager::QuickwitRuntimeManager;
 use crate::standalone_searcher::resolve_storage_for_split;
@@ -534,28 +540,32 @@ impl<'a> XRefTermMerger<'a> {
 }
 
 // ============================================================================
-// PHASE 3: Opened Split with Term Dictionary Access
+// PHASE 3: Optimized Term Dictionary Access
 // ============================================================================
 
-/// An opened source split with access to its term dictionaries.
+/// An opened source split with optimized term dictionary access using HotDirectory.
 ///
-/// Extracts split to a local temp directory for synchronous term dictionary access.
-/// Caches inverted index readers so term sources can borrow from them safely.
+/// Uses Quickwit's HotDirectory pattern:
+/// - Downloads ONLY the split footer (contains file offsets + hotcache)
+/// - HotDirectory provides virtual file access with pre-cached term dictionary data
+/// - Actual reads for term dictionaries come from the hotcache (already in footer)
+/// - Falls back to byte-range storage requests only for data not in hotcache
+///
+/// This is extremely efficient as term dictionaries are included in the hotcache.
 pub struct OpenedSplitTermAccess {
-    /// The Tantivy index
+    /// The Tantivy index backed by HotDirectory
     index: Index,
 
     /// Searcher for accessing segments
     searcher: Arc<tantivy::Searcher>,
 
     /// Cached inverted index readers for term streaming.
-    /// Stored here so get_term_sources() can return borrowing iterators.
     /// Format: (inverted_index, field, field_name, field_type)
     inverted_indexes: Vec<(Arc<tantivy::InvertedIndexReader>, Field, String, XRefFieldType)>,
 
-    /// Temp directory containing extracted split files (kept alive)
+    /// Keep storage alive for potential fallback reads
     #[allow(dead_code)]
-    temp_dir: tempfile::TempDir,
+    storage: Arc<dyn Storage>,
 
     /// Split metadata
     uri: String,
@@ -569,8 +579,7 @@ impl OpenedSplitTermAccess {
     /// Get term streams for all indexed fields in this split.
     ///
     /// Returns a vector of MmapTermSource, one per (segment, field) pair.
-    /// The term sources borrow from the cached inverted_indexes, ensuring
-    /// the underlying data lives long enough.
+    /// The term sources borrow from the cached inverted_indexes.
     pub fn get_term_sources(&self) -> Result<Vec<MmapTermSource<'_>>> {
         let mut sources = Vec::new();
 
@@ -624,6 +633,11 @@ impl OpenedSplitTermAccess {
     /// Get the split ID
     pub fn split_id(&self) -> &str {
         &self.split_id
+    }
+
+    /// Get the schema
+    pub fn schema(&self) -> Schema {
+        self.index.schema()
     }
 }
 
@@ -778,22 +792,28 @@ impl StreamingXRefBuilder {
             });
 
             debug_println!("[XREF STREAMING] Opened {} splits in batch", opened_splits.len());
+            eprintln!("[XREF TRACE] Opened {} splits in batch", opened_splits.len());
             if opened_splits.is_empty() {
                 debug_println!("[XREF STREAMING] No splits opened, continuing to next batch");
+                eprintln!("[XREF TRACE] No splits opened, continuing to next batch");
                 continue;
             }
 
             // Process each split individually to create proper XRef documents
             // Each split becomes one document with all its terms indexed
+            eprintln!("[XREF TRACE] About to process {} opened splits", opened_splits.len());
             for opened in &opened_splits {
+                eprintln!("[XREF TRACE] Processing split: {}", opened.split_id());
                 debug_println!("[XREF STREAMING] Processing split: {}", opened.split_id());
                 let mut doc = opened.create_metadata_doc(&field_map);
                 let mut split_term_count = 0u64;
 
                 // Get term sources for this split
+                eprintln!("[XREF TRACE] Getting term sources for split {}...", opened.split_id());
                 debug_println!("[XREF STREAMING] Getting term sources...");
                 match opened.get_term_sources() {
                     Ok(sources) => {
+                        eprintln!("[XREF TRACE] Split {} got {} term sources", opened.split_id(), sources.len());
                         debug_println!(
                             "[XREF DEBUG] Split {} has {} term sources, field_map has {} fields: {:?}",
                             opened.split_id(),
@@ -827,7 +847,11 @@ impl StreamingXRefBuilder {
                             // call advance() first to position at the first term
                             let mut field_term_count = 0u64;
                             debug_println!("[XREF DEBUG]     Starting term iteration for field '{}' (type={:?})", source_field_name, source.field_type());
+                            eprintln!("[XREF TRACE] Starting term iteration for field '{}'", source_field_name);
                             while source.advance() {
+                                if field_term_count == 0 {
+                                    eprintln!("[XREF TRACE] First term found in field '{}'", source_field_name);
+                                }
                                 let key = source.key();
                                 debug_println!("[XREF DEBUG]       Term {} bytes: {:?}", key.len(), &key[..key.len().min(30)]);
                                 // Add term to document with proper type encoding
@@ -858,6 +882,7 @@ impl StreamingXRefBuilder {
                         }
                     }
                     Err(e) => {
+                        eprintln!("[XREF TRACE] ERROR: Failed to get term sources for split {}: {}", opened.split_id(), e);
                         debug_println!("[XREF ERROR] Failed to get term sources for split {}: {}", opened.split_id(), e);
                     }
                 }
@@ -926,7 +951,7 @@ impl StreamingXRefBuilder {
         })?;
 
         let opened = self.open_source_split(storage_resolver, first_split, 0).await?;
-        let source_schema = opened.index.schema();
+        let source_schema = opened.schema();
 
         // Build XRef schema
         let mut builder = SchemaBuilder::new();
@@ -1021,83 +1046,77 @@ impl StreamingXRefBuilder {
         Ok((xref_schema, field_map))
     }
 
-    /// Open a source split for term dictionary access
+    /// Open a source split for term dictionary access using existing Quickwit infrastructure.
     ///
-    /// This extracts the split to a local temp directory and opens it with MmapDirectory,
-    /// which supports synchronous I/O needed for term dictionary streaming.
+    /// Reuses `open_index_with_caches` from quickwit_search::leaf which:
+    /// - Downloads ONLY the split footer (contains file offsets + hotcache)
+    /// - Uses CachingDirectory to enable sync reads with async storage
+    /// - HotDirectory serves term dictionary reads from the hotcache
     async fn open_source_split(
         &self,
         storage_resolver: &StorageResolver,
         source_split: &XRefSourceSplit,
         split_idx: u32,
     ) -> Result<OpenedSplitTermAccess> {
-        use quickwit_storage::BundleStorage;
-        use std::io::Write;
-
         let storage = resolve_storage_for_split(storage_resolver, &source_split.uri).await?;
 
-        // Create a temp directory for this split
-        let temp_dir = tempfile::tempdir()
-            .context("Failed to create temp directory for split extraction")?;
-        let extract_path = temp_dir.path().to_path_buf();
+        // Extract the filename (without .split extension) from the URI for file lookup
+        // open_split_bundle uses format!("{}.split", split_id) to find the file,
+        // so we need the actual filename stem, not the metadata split_id
+        let filename_for_lookup = extract_split_id_from_filename(&source_split.uri);
 
-        // Extract filename from the URI (e.g., "s3://bucket/splits/split-001.split" -> "split-001.split")
-        let split_filename = source_split.uri
-            .rsplit('/')
-            .next()
-            .unwrap_or(&source_split.uri);
-        let split_filepath = PathBuf::from(split_filename);
+        // Create split and footer offsets structure for open_index_with_caches
+        // Note: We use the actual filename for file lookup, not the metadata split_id
+        let split_and_footer = SplitIdAndFooterOffsets {
+            split_id: filename_for_lookup.clone(),
+            split_footer_start: source_split.footer_start,
+            split_footer_end: source_split.footer_end,
+            timestamp_start: None,  // Not used for XRef building
+            timestamp_end: None,    // Not used for XRef building
+            num_docs: source_split.num_docs.unwrap_or(0),
+        };
 
-        // Read the split bundle footer data
-        let footer_range = source_split.footer_start as usize..source_split.footer_end as usize;
-        let split_data = storage.get_slice(&split_filepath, footer_range.clone()).await
-            .with_context(|| format!("Failed to read split footer for {}", split_filename))?;
+        let footer_size = source_split.footer_end - source_split.footer_start;
+        debug_println!("[XREF OPEN] Opening split {} (filename: {}) via open_index_with_caches (footer: {} bytes)",
+            source_split.split_id, filename_for_lookup, footer_size);
 
-        // Open the bundle storage to get file listing (NOT async!)
-        let (_hotcache_bytes, bundle_storage) = BundleStorage::open_from_split_data_with_owned_bytes(
+        // Get the global searcher context which has all the caches configured
+        let searcher_context = get_global_searcher_context();
+
+        // Create an unbounded cache for this split's reads
+        // This allows sync reads to work by caching async results
+        let ephemeral_cache = ByteRangeCache::with_infinite_capacity(&STORAGE_METRICS.shortlived_cache);
+
+        // Use Quickwit's open_index_with_caches which handles all the complexity:
+        // - Footer download via searcher_context.split_footer_cache
+        // - HotDirectory with hotcache bytes
+        // - CachingDirectory for async->sync conversion
+        debug_println!("[XREF OPEN] Calling open_index_with_caches for split_id={}, storage_uri={}",
+            split_and_footer.split_id, source_split.uri);
+
+        let result = open_index_with_caches(
+            &searcher_context,
             storage.clone(),
-            split_filepath.clone(),
-            split_data,
+            &split_and_footer,
+            None,  // No tokenizer manager needed for term iteration
+            Some(ephemeral_cache),
         )
-        .context("Failed to open bundle storage")?;
+        .await;
 
-        // Extract all files from the bundle to local directory
-        for filepath in bundle_storage.iter_files() {
-            let filename_str = filepath.to_string_lossy();
-            // Skip lock files and metadata files that aren't needed for Tantivy index access
-            if filename_str.ends_with(".managed.json")
-                || filename_str == ".tantivy-meta.lock"
-                || filename_str == "split_fields"  // Quickwit metadata, not needed for Tantivy
-            {
-                continue;
+        let (tantivy_index, hot_directory) = match result {
+            Ok(r) => r,
+            Err(e) => {
+                debug_println!("[XREF OPEN] ERROR in open_index_with_caches: {:?}", e);
+                return Err(e).context(format!(
+                    "Failed to open index with caches for split_id={}, footer_start={}, footer_end={}, uri={}",
+                    split_and_footer.split_id, split_and_footer.split_footer_start,
+                    split_and_footer.split_footer_end, source_split.uri
+                ));
             }
+        };
 
-            // Check file size to skip 0-byte files (which can cause issues with cloud storage)
-            let file_size = bundle_storage.file_num_bytes(filepath).await
-                .unwrap_or(0);
-            if file_size == 0 {
-                debug_println!("[XREF OPEN] Skipping 0-byte file: {}", filename_str);
-                continue;
-            }
-
-            let file_data = bundle_storage.get_all(filepath).await
-                .with_context(|| format!("Failed to read file {} from bundle", filename_str))?;
-
-            let local_path = extract_path.join(filepath);
-            if let Some(parent) = local_path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-
-            let mut file = std::fs::File::create(&local_path)
-                .with_context(|| format!("Failed to create local file {}", local_path.display()))?;
-            file.write_all(&file_data)?;
-        }
-
-        // Open the extracted index with MmapDirectory (supports sync I/O)
-        let mmap_directory = MmapDirectory::open(&extract_path)
-            .context("Failed to open MmapDirectory")?;
-        let tantivy_index = Index::open(mmap_directory)
-            .context("Failed to open tantivy index")?;
+        debug_println!("[XREF OPEN] HotDirectory created - files available: {:?}",
+            hot_directory.get_file_lengths().iter().map(|(p, l)| format!("{}:{}b", p.display(), l)).collect::<Vec<_>>());
 
         let reader = tantivy_index.reader()?;
         let searcher = Arc::new(reader.searcher());
@@ -1108,43 +1127,78 @@ impl StreamingXRefBuilder {
             .map(|r| r.num_docs() as u64)
             .sum();
 
-        // Cache inverted indexes upfront so get_term_sources() can borrow from them safely
+        // First, find all indexed fields and warm up their term dictionaries
+        // This is required because StorageDirectory only supports async reads,
+        // and the CachingDirectory needs data pre-loaded before sync access
         let schema = tantivy_index.schema();
+        let indexed_fields: Vec<Field> = schema.fields()
+            .filter(|(_, entry)| entry.is_indexed())
+            .map(|(field, _)| field)
+            .collect();
+
+        debug_println!("[XREF OPEN] Warming up {} indexed fields for split {}",
+            indexed_fields.len(), source_split.split_id);
+
+        // Warm up term dictionaries for all indexed fields (async)
+        use futures::future::try_join_all;
+        let mut warmup_futures = Vec::new();
+        for &field in &indexed_fields {
+            for segment_reader in searcher.segment_readers() {
+                if let Ok(inverted_index) = segment_reader.inverted_index(field) {
+                    let inverted_index_clone = inverted_index.clone();
+                    warmup_futures.push(async move {
+                        let dict = inverted_index_clone.terms();
+                        dict.warm_up_dictionary().await
+                    });
+                }
+            }
+        }
+
+        if !warmup_futures.is_empty() {
+            try_join_all(warmup_futures).await
+                .context("Failed to warm up term dictionaries")?;
+            debug_println!("[XREF OPEN] Term dictionary warmup complete");
+        }
+
+        // Now cache inverted indexes - they should be accessible from cache
         let mut inverted_indexes = Vec::new();
+
         for segment_reader in searcher.segment_readers() {
             debug_println!("[XREF OPEN] Segment has {} docs", segment_reader.num_docs());
             for (field, field_entry) in schema.fields() {
                 let field_name = field_entry.name().to_string();
-                let field_type_str = format!("{:?}", field_entry.field_type());
                 let is_indexed = field_entry.is_indexed();
-                debug_println!("[XREF OPEN]   Field '{}': type={}, is_indexed={}", field_name, field_type_str, is_indexed);
 
                 // Skip non-indexed fields
                 if !is_indexed {
-                    debug_println!("[XREF OPEN]     -> Skipping (not indexed)");
                     continue;
                 }
 
                 let field_type = XRefFieldType::from_tantivy_field_type(field_entry.field_type());
 
                 // Get inverted index for this field
+                // Data should now be in the cache from warmup
                 match segment_reader.inverted_index(field) {
                     Ok(inverted_index) => {
-                        debug_println!("[XREF OPEN]     -> Got inverted index, field_type={:?}", field_type);
+                        debug_println!("[XREF OPEN]   Field '{}': opened term dict, type={:?}",
+                            field_name, field_type);
                         inverted_indexes.push((inverted_index, field, field_name, field_type));
                     }
                     Err(e) => {
-                        debug_println!("[XREF OPEN]     -> Failed to get inverted index: {}", e);
+                        debug_println!("[XREF OPEN]   Field '{}': no term dict ({})", field_name, e);
                     }
                 }
             }
         }
 
+        debug_println!("[XREF OPEN] Opened {} term dictionaries for {} using HotDirectory (footer-only download: {} bytes)",
+            inverted_indexes.len(), source_split.split_id, footer_size);
+
         Ok(OpenedSplitTermAccess {
             index: tantivy_index,
             searcher,
             inverted_indexes,
-            temp_dir,
+            storage,
             uri: source_split.uri.clone(),
             split_id: source_split.split_id.clone(),
             split_idx,
