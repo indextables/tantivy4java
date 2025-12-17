@@ -185,20 +185,19 @@ public class XRefSearcher implements AutoCloseable {
         long startTime = System.currentTimeMillis();
 
         try {
-            // Create query - use all query for "*" or term query otherwise
+            // Create query - use Quickwit's query parser for proper handling of all field types
+            // including JSON fields which require special path syntax (e.g., data.name:alice)
             SplitQuery splitQuery;
             if ("*".equals(query.trim())) {
                 splitQuery = new SplitMatchAllQuery();
             } else {
-                // Parse simple field:term format or search all fields
-                String[] parts = query.split(":", 2);
-                if (parts.length == 2) {
-                    splitQuery = new SplitTermQuery(parts[0].trim(), parts[1].trim());
-                } else {
-                    // For simple terms, we'd need to search across all indexed fields
-                    // For now, search the URI field (which contains all split URIs)
-                    splitQuery = new SplitMatchAllQuery();
-                }
+                // Use the underlying SplitSearcher's parseQuery() which leverages Quickwit's
+                // query parser. This properly handles:
+                // - JSON field syntax: data.name:alice (dot notation for JSON paths)
+                // - Range queries: age:[1 TO 100]
+                // - Boolean queries: status:active AND priority:high
+                // - All other Quickwit query syntax
+                splitQuery = searcher.parseQuery(query);
             }
 
             // Execute search
