@@ -79,6 +79,111 @@ fn merge_azure_to_azure_config(azure_config: &MergeAzureConfig) -> AzureStorageC
     }
 }
 
+/// JSON term format constants (from tantivy-common)
+const JSON_PATH_SEGMENT_SEP: u8 = 1u8;
+const JSON_END_OF_PATH: u8 = 0u8;
+
+/// Parse JSON term bytes and construct a serde_json::Value representing the nested structure.
+///
+/// JSON term format in Tantivy:
+/// `[path_segments_separated_by_0x01][0x00][value_type_byte][value_bytes]`
+///
+/// For example, `{"name": "alice"}` produces term bytes like: `name\x00salice`
+/// where 's' is the type code for string.
+fn parse_json_term_to_value(term_bytes: &[u8]) -> Option<serde_json::Value> {
+    // Find the JSON_END_OF_PATH marker (0x00)
+    let end_of_path_pos = term_bytes.iter().position(|&b| b == JSON_END_OF_PATH)?;
+
+    // Split into path and value parts
+    let path_bytes = &term_bytes[..end_of_path_pos];
+    let value_bytes = &term_bytes[end_of_path_pos + 1..];
+
+    if value_bytes.is_empty() {
+        return None;
+    }
+
+    // Parse the path segments (separated by 0x01)
+    let path_str = std::str::from_utf8(path_bytes).ok()?;
+    let path_segments: Vec<&str> = path_str
+        .split(|c: char| c as u8 == JSON_PATH_SEGMENT_SEP)
+        .collect();
+
+    // Parse the value based on type byte
+    let type_byte = value_bytes[0];
+    let raw_value = &value_bytes[1..];
+
+    let leaf_value = match type_byte {
+        b's' => {
+            // String value
+            let s = std::str::from_utf8(raw_value).ok()?;
+            serde_json::Value::String(s.to_string())
+        }
+        b'u' => {
+            // U64 value
+            if raw_value.len() >= 8 {
+                let bytes: [u8; 8] = raw_value[..8].try_into().ok()?;
+                let value = u64::from_be_bytes(bytes);
+                serde_json::Value::Number(serde_json::Number::from(value))
+            } else {
+                return None;
+            }
+        }
+        b'i' => {
+            // I64 value (stored as u64 with sign bit flipped)
+            if raw_value.len() >= 8 {
+                let bytes: [u8; 8] = raw_value[..8].try_into().ok()?;
+                let u_value = u64::from_be_bytes(bytes);
+                let value = tantivy::u64_to_i64(u_value);
+                serde_json::Value::Number(serde_json::Number::from(value))
+            } else {
+                return None;
+            }
+        }
+        b'f' => {
+            // F64 value (stored as u64 mantissa representation)
+            if raw_value.len() >= 8 {
+                let bytes: [u8; 8] = raw_value[..8].try_into().ok()?;
+                let u_value = u64::from_be_bytes(bytes);
+                let value = tantivy::u64_to_f64(u_value);
+                serde_json::Value::Number(serde_json::Number::from_f64(value)?)
+            } else {
+                return None;
+            }
+        }
+        b'o' => {
+            // Bool value (stored as u64)
+            if raw_value.len() >= 8 {
+                let bytes: [u8; 8] = raw_value[..8].try_into().ok()?;
+                let u_value = u64::from_be_bytes(bytes);
+                serde_json::Value::Bool(u_value != 0)
+            } else {
+                return None;
+            }
+        }
+        _ => {
+            // Unknown type - try to interpret as string
+            if let Ok(s) = std::str::from_utf8(raw_value) {
+                serde_json::Value::String(s.to_string())
+            } else {
+                return None;
+            }
+        }
+    };
+
+    // Build nested JSON object from path
+    let mut result = leaf_value;
+    for segment in path_segments.into_iter().rev() {
+        if segment.is_empty() {
+            continue;
+        }
+        let mut obj = serde_json::Map::new();
+        obj.insert(segment.to_string(), result);
+        result = serde_json::Value::Object(obj);
+    }
+
+    Some(result)
+}
+
 /// Internal field names for XRef documents
 const SPLIT_METADATA_FIELD: &str = "_xref_split_metadata";
 const SPLIT_URI_FIELD: &str = "_xref_uri";
@@ -87,6 +192,38 @@ const SPLIT_ID_FIELD: &str = "_xref_split_id";
 // ============================================================================
 // PHASE 1: Memory-Mapped Term Source
 // ============================================================================
+
+/// Field type for term decoding
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum XRefFieldType {
+    Text,
+    U64,
+    I64,
+    F64,
+    Bool,
+    Date,
+    Bytes,
+    Json,
+    IpAddr,
+}
+
+impl XRefFieldType {
+    /// Convert from Tantivy FieldType
+    pub fn from_tantivy_field_type(field_type: &FieldType) -> Self {
+        match field_type {
+            FieldType::Str(_) => XRefFieldType::Text,
+            FieldType::U64(_) => XRefFieldType::U64,
+            FieldType::I64(_) => XRefFieldType::I64,
+            FieldType::F64(_) => XRefFieldType::F64,
+            FieldType::Bool(_) => XRefFieldType::Bool,
+            FieldType::Date(_) => XRefFieldType::Date,
+            FieldType::Bytes(_) => XRefFieldType::Bytes,
+            FieldType::JsonObject(_) => XRefFieldType::Json,
+            FieldType::IpAddr(_) => XRefFieldType::IpAddr,
+            FieldType::Facet(_) => XRefFieldType::Text, // Facets are hierarchical paths stored as text
+        }
+    }
+}
 
 /// A term source backed by memory-mapped data from a source split.
 ///
@@ -103,6 +240,9 @@ pub struct MmapTermSource<'a> {
 
     /// Field name for stats
     field_name: String,
+
+    /// Field type for term decoding
+    field_type: XRefFieldType,
 }
 
 impl<'a> MmapTermSource<'a> {
@@ -136,6 +276,129 @@ impl<'a> MmapTermSource<'a> {
     /// Get field name
     pub fn field_name(&self) -> &str {
         &self.field_name
+    }
+
+    /// Get field type
+    pub fn field_type(&self) -> XRefFieldType {
+        self.field_type
+    }
+
+    /// Add term to document with proper type encoding
+    pub fn add_term_to_doc(&self, doc: &mut TantivyDocument, xref_field: Field) -> bool {
+        let term_bytes = self.term_stream.key();
+        if term_bytes.is_empty() {
+            return false;
+        }
+
+        match self.field_type {
+            XRefFieldType::Text => {
+                // Text fields are UTF-8 encoded
+                if let Ok(term_str) = std::str::from_utf8(term_bytes) {
+                    doc.add_text(xref_field, term_str);
+                    return true;
+                }
+            }
+            XRefFieldType::Json => {
+                // JSON terms in Tantivy have format: path\0type_byte+value
+                // We need to reconstruct the JSON object and add it properly so that
+                // Tantivy creates the same terms when indexing.
+                if !term_bytes.is_empty() {
+                    // Parse the JSON term and reconstruct the JSON value
+                    if let Some(json_value) = parse_json_term_to_value(term_bytes) {
+                        debug_println!("[JSON DEBUG] Reconstructed JSON: {:?}", json_value);
+                        // Convert serde_json::Value to BTreeMap<String, OwnedValue>
+                        if let serde_json::Value::Object(map) = json_value {
+                            let btree: std::collections::BTreeMap<String, tantivy::schema::OwnedValue> =
+                                map.into_iter()
+                                    .map(|(k, v)| (k, tantivy::schema::OwnedValue::from(v)))
+                                    .collect();
+                            doc.add_object(xref_field, btree);
+                            return true;
+                        } else {
+                            debug_println!("[JSON DEBUG] Expected object, got: {:?}", json_value);
+                        }
+                    } else {
+                        debug_println!("[JSON DEBUG] Failed to parse JSON term bytes: {:?}", &term_bytes[..term_bytes.len().min(30)]);
+                    }
+                }
+            }
+            XRefFieldType::U64 => {
+                // U64 is stored as 8-byte big-endian
+                if term_bytes.len() >= 8 {
+                    if let Ok(bytes) = term_bytes[..8].try_into() {
+                        let value = u64::from_be_bytes(bytes);
+                        doc.add_u64(xref_field, value);
+                        return true;
+                    }
+                }
+            }
+            XRefFieldType::I64 => {
+                // I64 is stored as u64 with sign bit flipped for sorting
+                if term_bytes.len() >= 8 {
+                    if let Ok(bytes) = term_bytes[..8].try_into() {
+                        let u_value = u64::from_be_bytes(bytes);
+                        let value = tantivy::u64_to_i64(u_value);
+                        doc.add_i64(xref_field, value);
+                        return true;
+                    }
+                }
+            }
+            XRefFieldType::F64 => {
+                // F64 is stored as u64 with special encoding for sorting
+                if term_bytes.len() >= 8 {
+                    if let Ok(bytes) = term_bytes[..8].try_into() {
+                        let u_value = u64::from_be_bytes(bytes);
+                        let value = tantivy::u64_to_f64(u_value);
+                        doc.add_f64(xref_field, value);
+                        return true;
+                    }
+                }
+            }
+            XRefFieldType::Bool => {
+                // Bool is stored as u64 (8-byte big-endian) via FastValue::to_u64()
+                // This matches Tantivy's Term::from_field_bool which uses from_fast_value
+                if term_bytes.len() >= 8 {
+                    if let Ok(bytes) = term_bytes[..8].try_into() {
+                        let u_value = u64::from_be_bytes(bytes);
+                        let value = u_value != 0;
+                        doc.add_bool(xref_field, value);
+                        return true;
+                    }
+                }
+            }
+            XRefFieldType::Date => {
+                // DateTime is stored as i64 nanoseconds since epoch (truncated to seconds precision)
+                // via MonotonicallyMappableToU64::to_u64() which calls into_timestamp_nanos()
+                // and then i64_to_u64() for sorting order.
+                // See: tantivy/columnar/src/column_values/monotonic_mapping.rs
+                if term_bytes.len() >= 8 {
+                    if let Ok(bytes) = term_bytes[..8].try_into() {
+                        let u_value = u64::from_be_bytes(bytes);
+                        let timestamp_nanos = tantivy::u64_to_i64(u_value);
+                        // Convert nanoseconds to DateTime
+                        let datetime = tantivy::DateTime::from_timestamp_nanos(timestamp_nanos);
+                        doc.add_date(xref_field, datetime);
+                        return true;
+                    }
+                }
+            }
+            XRefFieldType::Bytes => {
+                // Bytes are stored as-is
+                doc.add_bytes(xref_field, term_bytes);
+                return true;
+            }
+            XRefFieldType::IpAddr => {
+                // IP addresses are stored as 16-byte IPv6 format
+                if term_bytes.len() >= 16 {
+                    if let Ok(bytes) = <[u8; 16]>::try_from(&term_bytes[..16]) {
+                        let addr = std::net::Ipv6Addr::from(bytes);
+                        doc.add_ip_addr(xref_field, addr);
+                        return true;
+                    }
+                }
+            }
+        }
+        false
     }
 }
 
@@ -287,8 +550,8 @@ pub struct OpenedSplitTermAccess {
 
     /// Cached inverted index readers for term streaming.
     /// Stored here so get_term_sources() can return borrowing iterators.
-    /// Format: (inverted_index, field, field_name)
-    inverted_indexes: Vec<(Arc<tantivy::InvertedIndexReader>, Field, String)>,
+    /// Format: (inverted_index, field, field_name, field_type)
+    inverted_indexes: Vec<(Arc<tantivy::InvertedIndexReader>, Field, String, XRefFieldType)>,
 
     /// Temp directory containing extracted split files (kept alive)
     #[allow(dead_code)]
@@ -312,7 +575,7 @@ impl OpenedSplitTermAccess {
         let mut sources = Vec::new();
 
         // Iterate over cached inverted indexes
-        for (inverted_index, field, field_name) in &self.inverted_indexes {
+        for (inverted_index, field, field_name, field_type) in &self.inverted_indexes {
             // Get term dictionary and create streamer
             let term_dict = inverted_index.terms();
             let term_stream = term_dict.stream()?;
@@ -322,6 +585,7 @@ impl OpenedSplitTermAccess {
                 split_idx: self.split_idx,
                 field: *field,
                 field_name: field_name.clone(),
+                field_type: *field_type,
             });
         }
 
@@ -409,11 +673,11 @@ impl StreamingXRefBuilder {
 
     /// Build the XRef split using streaming merge
     pub fn build(&self, output_path: &Path) -> Result<XRefMetadata> {
-        eprintln!("[XREF STREAMING] Starting build for output: {:?}", output_path);
+        debug_println!("[XREF STREAMING] Starting build for output: {:?}", output_path);
         let start_time = Instant::now();
         let base_config = &self.config.base_config;
         let num_splits = base_config.source_splits.len();
-        eprintln!("[XREF STREAMING] num_splits = {}", num_splits);
+        debug_println!("[XREF STREAMING] num_splits = {}", num_splits);
 
         debug_println!(
             "🚀 STREAMING XREF BUILD: Building XRef with {} source splits (max concurrent: {})",
@@ -462,12 +726,12 @@ impl StreamingXRefBuilder {
         let batch_size = self.config.max_concurrent_splits.min(num_splits);
         let num_batches = (num_splits + batch_size - 1) / batch_size;
 
-        eprintln!("[XREF STREAMING] Starting batch processing: {} batches", num_batches);
+        debug_println!("[XREF STREAMING] Starting batch processing: {} batches", num_batches);
         for batch_idx in 0..num_batches {
             let batch_start = batch_idx * batch_size;
             let batch_end = (batch_start + batch_size).min(num_splits);
             let batch_splits = &base_config.source_splits[batch_start..batch_end];
-            eprintln!("[XREF STREAMING] Processing batch {}/{} with {} splits", batch_idx+1, num_batches, batch_splits.len());
+            debug_println!("[XREF STREAMING] Processing batch {}/{} with {} splits", batch_idx+1, num_batches, batch_splits.len());
 
             debug_println!(
                 "  Processing batch {}/{}: splits {}-{}",
@@ -513,24 +777,24 @@ impl StreamingXRefBuilder {
                 splits
             });
 
-            eprintln!("[XREF STREAMING] Opened {} splits in batch", opened_splits.len());
+            debug_println!("[XREF STREAMING] Opened {} splits in batch", opened_splits.len());
             if opened_splits.is_empty() {
-                eprintln!("[XREF STREAMING] No splits opened, continuing to next batch");
+                debug_println!("[XREF STREAMING] No splits opened, continuing to next batch");
                 continue;
             }
 
             // Process each split individually to create proper XRef documents
             // Each split becomes one document with all its terms indexed
             for opened in &opened_splits {
-                eprintln!("[XREF STREAMING] Processing split: {}", opened.split_id());
+                debug_println!("[XREF STREAMING] Processing split: {}", opened.split_id());
                 let mut doc = opened.create_metadata_doc(&field_map);
                 let mut split_term_count = 0u64;
 
                 // Get term sources for this split
-                eprintln!("[XREF STREAMING] Getting term sources...");
+                debug_println!("[XREF STREAMING] Getting term sources...");
                 match opened.get_term_sources() {
                     Ok(sources) => {
-                        eprintln!(
+                        debug_println!(
                             "[XREF DEBUG] Split {} has {} term sources, field_map has {} fields: {:?}",
                             opened.split_id(),
                             sources.len(),
@@ -543,7 +807,7 @@ impl StreamingXRefBuilder {
                             // Get the field name from the source (this is from the source split's schema)
                             let source_field_name = source.field_name().to_string();
 
-                            eprintln!(
+                            debug_println!(
                                 "[XREF DEBUG]   Processing field '{}', field_map contains it: {}",
                                 source_field_name,
                                 field_map.contains_key(&source_field_name)
@@ -562,16 +826,12 @@ impl StreamingXRefBuilder {
                             // NOTE: TermStreamer starts BEFORE the first element, so we must
                             // call advance() first to position at the first term
                             let mut field_term_count = 0u64;
+                            debug_println!("[XREF DEBUG]     Starting term iteration for field '{}' (type={:?})", source_field_name, source.field_type());
                             while source.advance() {
-                                let term_bytes = source.key();
-                                if term_bytes.is_empty() {
-                                    debug_println!("        Term bytes empty, breaking");
-                                    break;
-                                }
-
-                                // Convert term bytes to string and add to document
-                                if let Ok(term_str) = std::str::from_utf8(term_bytes) {
-                                    doc.add_text(xref_field, term_str);
+                                let key = source.key();
+                                debug_println!("[XREF DEBUG]       Term {} bytes: {:?}", key.len(), &key[..key.len().min(30)]);
+                                // Add term to document with proper type encoding
+                                if source.add_term_to_doc(&mut doc, xref_field) {
                                     split_term_count += 1;
                                     total_terms_written += 1;
                                     field_term_count += 1;
@@ -598,7 +858,7 @@ impl StreamingXRefBuilder {
                         }
                     }
                     Err(e) => {
-                        eprintln!("[XREF ERROR] Failed to get term sources for split {}: {}", opened.split_id(), e);
+                        debug_println!("[XREF ERROR] Failed to get term sources for split {}: {}", opened.split_id(), e);
                     }
                 }
 
@@ -682,7 +942,7 @@ impl StreamingXRefBuilder {
         let metadata_field = builder.add_text_field(SPLIT_METADATA_FIELD, STORED);
         field_map.insert(SPLIT_METADATA_FIELD.to_string(), metadata_field);
 
-        // Add indexed text fields for each source field
+        // Add indexed fields for each source field, preserving their types
         let text_indexing = if base_config.include_positions {
             TextFieldIndexing::default()
                 .set_tokenizer("raw")
@@ -694,6 +954,8 @@ impl StreamingXRefBuilder {
         };
 
         let text_options = TextOptions::default().set_indexing_options(text_indexing);
+
+        use tantivy::schema::{NumericOptions, DateOptions, BytesOptions, IpAddrOptions, JsonObjectOptions};
 
         for (field, field_entry) in source_schema.fields() {
             if !field_entry.is_indexed() {
@@ -712,7 +974,44 @@ impl StreamingXRefBuilder {
                 continue;
             }
 
-            let xref_field = builder.add_text_field(field_name, text_options.clone());
+            // Create field with same type as source, but indexed for XRef querying
+            let xref_field = match field_entry.field_type() {
+                FieldType::Str(_) => {
+                    builder.add_text_field(field_name, text_options.clone())
+                }
+                FieldType::U64(_) => {
+                    builder.add_u64_field(field_name, NumericOptions::default().set_indexed())
+                }
+                FieldType::I64(_) => {
+                    builder.add_i64_field(field_name, NumericOptions::default().set_indexed())
+                }
+                FieldType::F64(_) => {
+                    builder.add_f64_field(field_name, NumericOptions::default().set_indexed())
+                }
+                FieldType::Bool(_) => {
+                    builder.add_bool_field(field_name, NumericOptions::default().set_indexed())
+                }
+                FieldType::Date(_) => {
+                    builder.add_date_field(field_name, DateOptions::default().set_indexed())
+                }
+                FieldType::Bytes(_) => {
+                    builder.add_bytes_field(field_name, BytesOptions::default().set_indexed())
+                }
+                FieldType::JsonObject(_) => {
+                    // JSON fields need indexing enabled for term queries
+                    let json_options = JsonObjectOptions::default()
+                        .set_indexing_options(TextFieldIndexing::default()
+                            .set_tokenizer("raw")
+                            .set_index_option(tantivy::schema::IndexRecordOption::Basic));
+                    builder.add_json_field(field_name, json_options)
+                }
+                FieldType::IpAddr(_) => {
+                    builder.add_ip_addr_field(field_name, IpAddrOptions::default().set_indexed())
+                }
+                FieldType::Facet(_) => {
+                    builder.add_facet_field(field_name, tantivy::schema::FacetOptions::default())
+                }
+            };
             field_map.insert(field_name.to_string(), xref_field);
         }
 
@@ -765,8 +1064,20 @@ impl StreamingXRefBuilder {
         // Extract all files from the bundle to local directory
         for filepath in bundle_storage.iter_files() {
             let filename_str = filepath.to_string_lossy();
-            if filename_str.ends_with(".managed.json") || filename_str == ".tantivy-meta.lock" {
-                continue; // Skip lock files
+            // Skip lock files and metadata files that aren't needed for Tantivy index access
+            if filename_str.ends_with(".managed.json")
+                || filename_str == ".tantivy-meta.lock"
+                || filename_str == "split_fields"  // Quickwit metadata, not needed for Tantivy
+            {
+                continue;
+            }
+
+            // Check file size to skip 0-byte files (which can cause issues with cloud storage)
+            let file_size = bundle_storage.file_num_bytes(filepath).await
+                .unwrap_or(0);
+            if file_size == 0 {
+                debug_println!("[XREF OPEN] Skipping 0-byte file: {}", filename_str);
+                continue;
             }
 
             let file_data = bundle_storage.get_all(filepath).await
@@ -801,17 +1112,30 @@ impl StreamingXRefBuilder {
         let schema = tantivy_index.schema();
         let mut inverted_indexes = Vec::new();
         for segment_reader in searcher.segment_readers() {
+            debug_println!("[XREF OPEN] Segment has {} docs", segment_reader.num_docs());
             for (field, field_entry) in schema.fields() {
+                let field_name = field_entry.name().to_string();
+                let field_type_str = format!("{:?}", field_entry.field_type());
+                let is_indexed = field_entry.is_indexed();
+                debug_println!("[XREF OPEN]   Field '{}': type={}, is_indexed={}", field_name, field_type_str, is_indexed);
+
                 // Skip non-indexed fields
-                if !field_entry.is_indexed() {
+                if !is_indexed {
+                    debug_println!("[XREF OPEN]     -> Skipping (not indexed)");
                     continue;
                 }
 
-                let field_name = field_entry.name().to_string();
+                let field_type = XRefFieldType::from_tantivy_field_type(field_entry.field_type());
 
                 // Get inverted index for this field
-                if let Ok(inverted_index) = segment_reader.inverted_index(field) {
-                    inverted_indexes.push((inverted_index, field, field_name));
+                match segment_reader.inverted_index(field) {
+                    Ok(inverted_index) => {
+                        debug_println!("[XREF OPEN]     -> Got inverted index, field_type={:?}", field_type);
+                        inverted_indexes.push((inverted_index, field, field_name, field_type));
+                    }
+                    Err(e) => {
+                        debug_println!("[XREF OPEN]     -> Failed to get inverted index: {}", e);
+                    }
                 }
             }
         }
@@ -836,6 +1160,8 @@ impl StreamingXRefBuilder {
         index_path: &Path,
     ) -> Result<(u64, u64, u64)> {
         use std::io::{Read, Seek, SeekFrom};
+        use quickwit_proto::search::{ListFields, ListFieldsEntryResponse, ListFieldType, serialize_split_fields};
+        use tantivy::schema::Type;
 
         // Collect index files
         let mut file_entries: Vec<PathBuf> = Vec::new();
@@ -847,14 +1173,50 @@ impl StreamingXRefBuilder {
             }
         }
 
-        // Generate hotcache
+        // Open the index to get field metadata
         let mmap_directory = MmapDirectory::open(index_path)?;
+        let tantivy_index = Index::open(mmap_directory.clone())?;
+        let fields_metadata = tantivy_index.fields_metadata()?;
+
+        // Convert field metadata to ListFieldsEntryResponse
+        let fields: Vec<ListFieldsEntryResponse> = fields_metadata
+            .iter()
+            .map(|fm| {
+                let field_type = match fm.typ {
+                    Type::Str => ListFieldType::Str,
+                    Type::U64 => ListFieldType::U64,
+                    Type::I64 => ListFieldType::I64,
+                    Type::F64 => ListFieldType::F64,
+                    Type::Bool => ListFieldType::Bool,
+                    Type::Date => ListFieldType::Date,
+                    Type::Facet => ListFieldType::Facet,
+                    Type::Bytes => ListFieldType::Bytes,
+                    Type::Json => ListFieldType::Json,
+                    Type::IpAddr => ListFieldType::IpAddr,
+                };
+                ListFieldsEntryResponse {
+                    field_name: fm.field_name.clone(),
+                    field_type: field_type as i32,
+                    searchable: fm.indexed,
+                    aggregatable: fm.fast,
+                    index_ids: Vec::new(),
+                    non_searchable_index_ids: Vec::new(),
+                    non_aggregatable_index_ids: Vec::new(),
+                }
+            })
+            .collect();
+
+        // Serialize field metadata
+        let serialized_split_fields = serialize_split_fields(ListFields { fields });
+        debug_println!("[XREF STREAMING] Serialized {} field metadata entries ({} bytes)",
+            fields_metadata.len(), serialized_split_fields.len());
+
+        // Generate hotcache
         let mut hotcache_buffer = Vec::new();
         write_hotcache(mmap_directory, &mut hotcache_buffer)
             .map_err(|e| anyhow!("Failed to generate hotcache: {}", e))?;
 
         // Create split payload
-        let serialized_split_fields: Vec<u8> = Vec::new();
         let split_payload = SplitPayloadBuilder::get_split_payload(
             &file_entries,
             &serialized_split_fields,
