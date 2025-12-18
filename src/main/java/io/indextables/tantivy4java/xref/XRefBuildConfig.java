@@ -28,14 +28,9 @@ import java.util.List;
 /**
  * Configuration for building an XRef split.
  *
- * <p>An XRef split is a lightweight index that consolidates term dictionaries from
+ * An XRef split is a lightweight index that consolidates term dictionaries from
  * multiple source splits. Each document in the XRef split represents one source split,
- * enabling fast query routing to determine which splits contain matching documents.</p>
- *
- * <p><strong>Memory Efficiency:</strong> The build process uses a streaming architecture
- * with memory-mapped I/O, enabling efficient processing of thousands of source splits
- * with minimal memory footprint (~15MB for 10,000 splits). Term dictionaries are merged
- * using an N-way streaming merge algorithm that processes terms incrementally.</p>
+ * enabling fast query routing to determine which splits contain matching documents.
  *
  * <p>IMPORTANT: Source splits must include footer offsets from their SplitMetadata.
  * This follows the same pattern as other split operations in tantivy4java.</p>
