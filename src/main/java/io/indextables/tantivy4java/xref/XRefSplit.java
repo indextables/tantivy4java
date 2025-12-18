@@ -67,7 +67,6 @@ import java.util.List;
  *     .indexUid("logs-index")
  *     .sourceSplits(Arrays.asList(source1, source2))
  *     .awsConfig(new QuickwitSplit.AwsConfig("access-key", "secret-key", "us-east-1"))
- *     .includePositions(false)  // Skip positions for faster build
  *     .build();
  *
  * XRefMetadata metadata = XRefSplit.build(config, "s3://bucket/xref/daily-xref.xref.split");
@@ -165,17 +164,18 @@ public class XRefSplit {
         XRefSourceSplit[] sourceSplitsArray = sourceSplits.toArray(new XRefSourceSplit[0]);
 
         // Call native method with XRefSourceSplit objects (containing footer offsets)
-        String result = nativeBuildXRefSplit(
+        // Now uses Binary Fuse Filter implementation for faster build and smaller output
+        String result = nativeBuildFuseXRef(
             config.getXrefId(),
             config.getIndexUid(),
             sourceSplitsArray,
             outputPath,
-            config.isIncludePositions(),
             config.getIncludedFields().isEmpty()
                 ? null
                 : config.getIncludedFields().toArray(new String[0]),
             config.getTempDirectoryPath(),
-            config.getHeapSize(),
+            config.getFilterType().getValue(),
+            config.getCompression().getValue(),
             awsAccessKey,
             awsSecretKey,
             awsSessionToken,
@@ -220,7 +220,10 @@ public class XRefSplit {
     }
 
     /**
-     * Native method for building XRef split.
+     * Native method for building Binary Fuse Filter XRef.
+     *
+     * <p>Uses Binary Fuse filters for ~70% smaller output and ~5x faster queries
+     * compared to the previous Tantivy-based implementation.</p>
      *
      * <p>The sourceSplits parameter is an array of XRefSourceSplit objects, each containing:
      * <ul>
@@ -229,19 +232,20 @@ public class XRefSplit {
      *   <li>footerStart (long): Footer start offset for efficient split opening</li>
      *   <li>footerEnd (long): Footer end offset for efficient split opening</li>
      *   <li>numDocs (Long): Optional document count</li>
-     *   <li>sizeBytes (Long): Optional size in bytes</li>
-     *   <li>docMappingJson (String): Optional doc mapping JSON for schema derivation</li>
      * </ul>
+     *
+     * @param filterType "fuse8" for ~0.39% FPR, "fuse16" for ~0.0015% FPR
+     * @param compression "none", "zstd1", "zstd3" (default), "zstd6", or "zstd9"
      */
-    private static native String nativeBuildXRefSplit(
+    private static native String nativeBuildFuseXRef(
         String xrefId,
         String indexUid,
         XRefSourceSplit[] sourceSplits,
         String outputPath,
-        boolean includePositions,
         String[] includedFields,
         String tempDirectoryPath,
-        long heapSize,
+        String filterType,
+        String compression,
         String awsAccessKey,
         String awsSecretKey,
         String awsSessionToken,

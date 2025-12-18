@@ -971,7 +971,6 @@ public class XRefFieldTypeTest {
             .xrefId(xrefId)
             .indexUid("test-index")
             .sourceSplits(sourceSplits)
-            .includePositions(false)
             .build();
 
         Path xrefPath = tempDir.resolve(xrefId + ".xref.split");

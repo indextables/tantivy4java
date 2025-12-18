@@ -37,7 +37,7 @@ import java.util.concurrent.CompletableFuture;
  * SplitSearcher searcher2 = cacheManager.createSplitSearcher("s3://bucket/split2.split");
  * }</pre>
  */
-public class SplitSearcher implements AutoCloseable {
+public class SplitSearcher implements AutoCloseable, QueryParser {
     
     static {
         Tantivy.initialize();

@@ -55,6 +55,12 @@ memmap2 = "0.9.5"
 libc = "0.2"
 lru = "0.12"  # LRU cache for searcher caching
 
+# Binary Fuse Filter XRef dependencies
+xorf = { version = "0.11", features = ["serde"] }  # Binary fuse filters (~3% space overhead)
+fxhash = "0.2"  # Fast non-cryptographic hashing for filter keys
+hex = "0.4"  # Hex encoding for non-string term values
+zstd = "0.13"  # Fast compression for XRef splits
+
 [build-dependencies]
 jni = "0.21.1"
 

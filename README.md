@@ -1206,6 +1206,38 @@ try (SplitCacheManager cacheManager = SplitCacheManager.getInstance(cacheConfig)
 }
 ```
 
+#### Loading XRef from Cloud Storage
+
+XRef files can be loaded directly from S3 or Azure Blob Storage:
+
+```java
+// S3 configuration
+SplitCacheManager.CacheConfig s3Config = new SplitCacheManager.CacheConfig("xref-s3-cache")
+    .withMaxCacheSize(100_000_000)
+    .withAwsCredentials("access-key", "secret-key")
+    .withAwsRegion("us-east-1");
+
+try (SplitCacheManager cacheManager = SplitCacheManager.getInstance(s3Config);
+     XRefSearcher searcher = XRefSplit.open(cacheManager, "s3://bucket/xref/daily.xref.split", xrefMetadata)) {
+
+    // Search XRef loaded from S3
+    XRefSearchResult result = searcher.search("field:value", 100);
+    List<String> splitsToSearch = result.getSplitUrisToSearch();
+}
+
+// Azure configuration
+SplitCacheManager.CacheConfig azureConfig = new SplitCacheManager.CacheConfig("xref-azure-cache")
+    .withMaxCacheSize(100_000_000)
+    .withAzureCredentials("account-name", "account-key");
+
+try (SplitCacheManager cacheManager = SplitCacheManager.getInstance(azureConfig);
+     XRefSearcher searcher = XRefSplit.open(cacheManager, "azure://container/xref.split", xrefMetadata)) {
+
+    // Search XRef loaded from Azure
+    XRefSearchResult result = searcher.search("*", 100);
+}
+```
+
 #### XRef Document Fields
 
 Each document in an XRef split contains:

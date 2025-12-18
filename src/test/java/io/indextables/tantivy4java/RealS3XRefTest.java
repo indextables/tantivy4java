@@ -338,7 +338,6 @@ public class RealS3XRefTest {
             .indexUid("science-index")
             .sourceSplits(sourceSplits)
             .awsConfig(awsConfig)
-            .includePositions(false)  // Skip positions for faster build
             .build();
 
         // Build XRef split

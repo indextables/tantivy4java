@@ -456,25 +456,7 @@ fn transform_range_recursive(value: &mut Value) -> bool {
     transformed
 }
 
-/// JNI binding for transforming range queries to match_all
-#[no_mangle]
-pub extern "system" fn Java_io_indextables_tantivy4java_xref_XRefSearcher_nativeTransformRangeToMatchAll<'local>(
-    mut env: JNIEnv<'local>,
-    _class: JClass<'local>,
-    query_json: JString<'local>,
-) -> jstring {
-    let query_str = match jstring_to_string(&mut env, &query_json) {
-        Ok(s) => s,
-        Err(e) => {
-            return make_jstring(&mut env, &format!("ERROR: Failed to get query string: {}", e));
-        }
-    };
-
-    match transform_range_to_match_all(&query_str) {
-        Ok(result) => make_jstring(&mut env, &result),
-        Err(e) => make_jstring(&mut env, &format!("ERROR: Transform failed: {}", e)),
-    }
-}
+// NOTE: nativeTransformRangeToMatchAll JNI binding moved to fuse_xref/jni_bindings.rs
 
 // ============================================================================
 // Tests

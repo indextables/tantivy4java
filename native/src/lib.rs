@@ -59,6 +59,9 @@ pub mod xref_split;    // XRef split builder (uses streaming implementation)
 // so use SplitSearcher directly to search them. Each document in XRef
 // represents a source split with stored metadata fields.
 
+// Binary Fuse Filter XRef - faster and smaller than Tantivy-based XRef
+pub mod fuse_xref;     // Binary Fuse8 filter-based XRef (replaces xref_* modules)
+
 pub use schema::*;
 pub use document::*;
 pub use query::*;
@@ -71,6 +74,7 @@ pub use quickwit_split::{merge_splits_impl, InternalMergeConfig, InternalAwsConf
 pub use merge_types::*;
 pub use xref_types::*;
 pub use xref_split::XRefSplitBuilder;
+pub use fuse_xref::*;  // Binary Fuse Filter XRef types and functions
 // pub use split_searcher::*;  // Disabled - now using replacement JNI methods
 // pub use split_searcher_simple::*;  // Disabled to avoid conflicts
 

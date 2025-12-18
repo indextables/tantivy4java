@@ -51,14 +51,12 @@ public class XRefSplitTest {
             .xrefId("test-xref")
             .indexUid("test-index")
             .sourceSplits(Arrays.asList(source1, source2))
-            .includePositions(true)
             .includedFields(Arrays.asList("title", "content"))
             .build();
 
         assertEquals("test-xref", config.getXrefId());
         assertEquals("test-index", config.getIndexUid());
         assertEquals(2, config.getSourceSplits().size());
-        assertTrue(config.isIncludePositions());
         assertEquals(2, config.getIncludedFields().size());
     }
 
@@ -216,8 +214,10 @@ public class XRefSplitTest {
     }
 
     @Test
-    void testXRefSearcherRequiresFooterOffsets() throws Exception {
-        // Test that opening with metadata lacking footer offsets throws an error
+    void testXRefSearcherHandlesNonexistentFile() throws Exception {
+        // Test that opening a nonexistent XRef file throws a RuntimeException
+        // NOTE: FuseXRef doesn't require footer offsets like the old Tantivy-based XRef.
+        // It loads the entire file directly, so the error is about the file not existing.
         String jsonWithoutOffsets = "{" +
             "\"format_version\": 1," +
             "\"xref_id\": \"test-xref\"," +
@@ -240,14 +240,16 @@ public class XRefSplitTest {
             "}";
 
         XRefMetadata metadataWithoutOffsets = XRefMetadata.fromJson(jsonWithoutOffsets);
+        // FuseXRef doesn't use footer offsets, but we can still check the hasFooterOffsets method
         assertFalse(metadataWithoutOffsets.hasFooterOffsets());
 
         SplitCacheManager.CacheConfig cacheConfig = new SplitCacheManager.CacheConfig("test-cache2")
             .withMaxCacheSize(100_000_000);
 
         try (SplitCacheManager cacheManager = SplitCacheManager.getInstance(cacheConfig)) {
-            // Should throw IllegalArgumentException when footer offsets are missing
-            assertThrows(IllegalArgumentException.class, () -> {
+            // Should throw RuntimeException when opening a nonexistent file
+            // FuseXRef loads the entire file, so no footer offsets validation is done
+            assertThrows(RuntimeException.class, () -> {
                 XRefSearcher.open(cacheManager, "file:///nonexistent.split", metadataWithoutOffsets);
             });
         }

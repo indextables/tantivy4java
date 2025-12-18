@@ -661,9 +661,40 @@ try (SplitCacheManager cacheManager = SplitCacheManager.getInstance(cacheConfig)
 - **Footer-only downloads** - source splits opened efficiently using footer offsets
 - **Bounded size** - XRef with 10,000 splits = 10,000 documents (15-70 MB total)
 
+**Loading XRef from S3/Azure:**
+
+XRef files can be loaded directly from cloud storage URLs:
+
+```java
+// Configure cache manager with cloud credentials
+SplitCacheManager.CacheConfig cacheConfig = new SplitCacheManager.CacheConfig("xref-cache")
+    .withMaxCacheSize(100_000_000)
+    .withAwsCredentials("access-key", "secret-key")
+    .withAwsRegion("us-east-1");
+
+try (SplitCacheManager cacheManager = SplitCacheManager.getInstance(cacheConfig)) {
+    // Load XRef from S3
+    XRefSearcher searcher = XRefSplit.open(cacheManager, "s3://bucket/xref/daily.xref.split", xrefMetadata);
+
+    // Search as usual
+    XRefSearchResult result = searcher.search("field:value", 100);
+    List<String> splitsToSearch = result.getSplitUrisToSearch();
+}
+
+// Azure support
+SplitCacheManager.CacheConfig azureConfig = new SplitCacheManager.CacheConfig("azure-xref-cache")
+    .withMaxCacheSize(100_000_000)
+    .withAzureCredentials("account-name", "account-key");
+
+try (SplitCacheManager cacheManager = SplitCacheManager.getInstance(azureConfig)) {
+    XRefSearcher searcher = XRefSplit.open(cacheManager, "azure://container/xref.split", xrefMetadata);
+}
+```
+
 **Test Coverage:**
-- ✅ `LocalXRefBuildTest` - Local XRef building and SplitSearcher search
+- ✅ `LocalXRefBuildTest` - Local XRef building, search, error handling, edge cases (20 tests)
 - ✅ `XRefSplitTest` - Builder internals and packaging
+- ✅ `XRefS3MockTest` - S3Mock integration including XRef upload and S3 loading (5 tests)
 - ✅ `RealS3XRefTest` - End-to-end S3 workflow
 - ✅ `RealAzureXRefTest` - End-to-end Azure workflow with account key and OAuth
 

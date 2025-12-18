@@ -53,11 +53,115 @@ import java.util.List;
  *     .indexUid("logs-index")
  *     .sourceSplits(Arrays.asList(source1, source2))
  *     .awsConfig(new QuickwitSplit.AwsConfig("access-key", "secret-key", "us-east-1"))
- *     .includePositions(false)
+ *     .filterType(FilterType.FUSE16)  // Optional: lower FPR, larger size
  *     .build();
  * }</pre>
  */
 public class XRefBuildConfig {
+
+    /**
+     * Filter type for XRef Binary Fuse filters.
+     *
+     * <p>Controls the trade-off between filter size and false positive rate (FPR).
+     * The filter type determines how many bits are used per fingerprint.</p>
+     */
+    public enum FilterType {
+        /**
+         * 8-bit fingerprints (~1.24 bytes per key).
+         * <ul>
+         *   <li>False positive rate: ~0.39% (1/256)</li>
+         *   <li>Size for 10K splits × 50K terms: ~620 MB</li>
+         *   <li>Best for: Most use cases, good balance of size and accuracy</li>
+         * </ul>
+         */
+        FUSE8("fuse8"),
+
+        /**
+         * 16-bit fingerprints (~2.24 bytes per key).
+         * <ul>
+         *   <li>False positive rate: ~0.0015% (1/65536)</li>
+         *   <li>Size for 10K splits × 50K terms: ~1.1 GB</li>
+         *   <li>Best for: When minimizing false positives is critical</li>
+         * </ul>
+         */
+        FUSE16("fuse16");
+
+        private final String value;
+
+        FilterType(String value) {
+            this.value = value;
+        }
+
+        /**
+         * Get the string value used in JSON serialization.
+         */
+        public String getValue() {
+            return value;
+        }
+
+        /**
+         * Get the false positive rate for this filter type.
+         */
+        public double getFalsePositiveRate() {
+            return this == FUSE8 ? 1.0 / 256 : 1.0 / 65536;
+        }
+
+        /**
+         * Get approximate bytes per key for this filter type.
+         */
+        public double getBytesPerKey() {
+            return this == FUSE8 ? 1.24 : 2.24;
+        }
+    }
+
+    /**
+     * Compression type for XRef storage.
+     *
+     * <p>Zstd compression provides excellent compression ratios with minimal overhead.
+     * The compression type is embedded in the file header, so readers automatically
+     * detect and decompress regardless of the setting used during build.</p>
+     */
+    public enum CompressionType {
+        /**
+         * No compression (fastest writes, largest files).
+         */
+        NONE("none"),
+
+        /**
+         * Zstd compression level 1 (fastest compression, good ratio).
+         */
+        ZSTD1("zstd1"),
+
+        /**
+         * Zstd compression level 3 (default - good balance of speed and ratio).
+         * Typically achieves 30-50% size reduction on filter data.
+         */
+        ZSTD3("zstd3"),
+
+        /**
+         * Zstd compression level 6 (better compression, slower).
+         */
+        ZSTD6("zstd6"),
+
+        /**
+         * Zstd compression level 9 (best compression, slowest).
+         */
+        ZSTD9("zstd9");
+
+        private final String value;
+
+        CompressionType(String value) {
+            this.value = value;
+        }
+
+        /**
+         * Get the string value used in native calls.
+         */
+        public String getValue() {
+            return value;
+        }
+    }
+
     /**
      * Default heap size for XRef index building (50MB).
      * This is sufficient for most XRef builds since XRef documents are small.
@@ -75,9 +179,10 @@ public class XRefBuildConfig {
     private final QuickwitSplit.AwsConfig awsConfig;
     private final QuickwitSplit.AzureConfig azureConfig;
     private final List<String> includedFields;
-    private final boolean includePositions;
     private final String tempDirectoryPath;
     private final long heapSize;
+    private final FilterType filterType;
+    private final CompressionType compression;
 
     private XRefBuildConfig(Builder builder) {
         this.xrefId = builder.xrefId;
@@ -88,9 +193,10 @@ public class XRefBuildConfig {
         this.includedFields = builder.includedFields != null
             ? Collections.unmodifiableList(new ArrayList<>(builder.includedFields))
             : Collections.emptyList();
-        this.includePositions = builder.includePositions;
         this.tempDirectoryPath = builder.tempDirectoryPath;
         this.heapSize = builder.heapSize;
+        this.filterType = builder.filterType;
+        this.compression = builder.compression;
     }
 
     /**
@@ -143,13 +249,6 @@ public class XRefBuildConfig {
     }
 
     /**
-     * Check if position data should be included (for phrase query support).
-     */
-    public boolean isIncludePositions() {
-        return includePositions;
-    }
-
-    /**
      * Get the custom temporary directory path for intermediate files.
      * Returns null if the system default should be used.
      */
@@ -165,6 +264,22 @@ public class XRefBuildConfig {
     }
 
     /**
+     * Get the filter type for Binary Fuse filters.
+     * Default is FUSE8 (~0.39% false positive rate).
+     */
+    public FilterType getFilterType() {
+        return filterType;
+    }
+
+    /**
+     * Get the compression type for output files.
+     * Default is ZSTD3 (good balance of speed and compression).
+     */
+    public CompressionType getCompression() {
+        return compression;
+    }
+
+    /**
      * Builder for XRefBuildConfig.
      */
     public static class Builder {
@@ -174,9 +289,10 @@ public class XRefBuildConfig {
         private QuickwitSplit.AwsConfig awsConfig;
         private QuickwitSplit.AzureConfig azureConfig;
         private List<String> includedFields;
-        private boolean includePositions = false;
         private String tempDirectoryPath;
         private long heapSize = DEFAULT_HEAP_SIZE;
+        private FilterType filterType = FilterType.FUSE8;
+        private CompressionType compression = CompressionType.ZSTD3;
 
         /**
          * Set the XRef split ID.
@@ -253,15 +369,6 @@ public class XRefBuildConfig {
         }
 
         /**
-         * Enable position data for phrase query support.
-         * Note: Positions increase XRef size but enable phrase query routing.
-         */
-        public Builder includePositions(boolean includePositions) {
-            this.includePositions = includePositions;
-            return this;
-        }
-
-        /**
          * Set a custom temporary directory path for intermediate files.
          * If not set, the system default temporary directory will be used.
          *
@@ -288,6 +395,50 @@ public class XRefBuildConfig {
                 );
             }
             this.heapSize = heapSize;
+            return this;
+        }
+
+        /**
+         * Set the filter type for Binary Fuse filters.
+         *
+         * <p>This controls the trade-off between filter size and false positive rate:</p>
+         * <ul>
+         *   <li>{@link FilterType#FUSE8} (default): ~0.39% FPR, ~1.24 bytes/key</li>
+         *   <li>{@link FilterType#FUSE16}: ~0.0015% FPR, ~2.24 bytes/key (260× fewer false positives)</li>
+         * </ul>
+         *
+         * @param filterType The filter type to use
+         */
+        public Builder filterType(FilterType filterType) {
+            if (filterType == null) {
+                throw new IllegalArgumentException("filterType cannot be null");
+            }
+            this.filterType = filterType;
+            return this;
+        }
+
+        /**
+         * Set the compression type for output files.
+         *
+         * <p>Compression is applied to the filter data section. The compression type
+         * is embedded in the file header, so readers automatically detect and decompress
+         * regardless of the setting used during build.</p>
+         *
+         * <ul>
+         *   <li>{@link CompressionType#NONE}: Fastest writes, largest files</li>
+         *   <li>{@link CompressionType#ZSTD1}: Fast compression, good ratio</li>
+         *   <li>{@link CompressionType#ZSTD3} (default): Good balance of speed and compression</li>
+         *   <li>{@link CompressionType#ZSTD6}: Better compression, slower</li>
+         *   <li>{@link CompressionType#ZSTD9}: Best compression, slowest</li>
+         * </ul>
+         *
+         * @param compression The compression type to use
+         */
+        public Builder compression(CompressionType compression) {
+            if (compression == null) {
+                throw new IllegalArgumentException("compression cannot be null");
+            }
+            this.compression = compression;
             return this;
         }
 

@@ -21,30 +21,25 @@ package io.indextables.tantivy4java.xref;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 
-import io.indextables.tantivy4java.core.Document;
 import io.indextables.tantivy4java.core.Tantivy;
-import io.indextables.tantivy4java.result.SearchResult;
 import io.indextables.tantivy4java.split.SplitCacheManager;
-import io.indextables.tantivy4java.split.SplitSearcher;
 import io.indextables.tantivy4java.split.SplitQuery;
-import io.indextables.tantivy4java.split.SplitTermQuery;
 import io.indextables.tantivy4java.split.SplitMatchAllQuery;
-import io.indextables.tantivy4java.split.SplitParsedQuery;
 import io.indextables.tantivy4java.split.merge.QuickwitSplit;
 
 import java.util.ArrayList;
 import java.util.List;
 
 /**
- * Searcher for XRef splits.
+ * Searcher for FuseXRef (Binary Fuse Filter) splits.
  *
- * <p>This class wraps a standard {@link SplitSearcher} and provides convenience methods
- * for XRef-specific operations. Since XRef splits ARE Quickwit splits, this class uses
- * the existing SplitSearcher infrastructure for all search operations.</p>
+ * <p>FuseXRef is a compact index format that uses Binary Fuse8 filters for fast
+ * split-level query routing. Each filter stores hashed field:term pairs from
+ * a source split, enabling quick identification of which splits may contain
+ * documents matching a query.</p>
  *
- * <p>KEY INSIGHT: In an XRef split, each document represents one source split.
- * Document fields contain split metadata (_xref_uri, _xref_split_id, etc.)
- * and indexed fields contain all terms from that source split.</p>
+ * <p>KEY INSIGHT: FuseXRef uses a custom binary format (NOT Quickwit split format).
+ * This searcher uses native FuseXRef operations for all queries.</p>
  *
  * <h2>Example Usage</h2>
  * <pre>{@code
@@ -52,12 +47,12 @@ import java.util.List;
  * XRefBuildConfig buildConfig = XRefBuildConfig.builder()
  *     .xrefId("daily-xref")
  *     .indexUid("logs-index")
- *     .sourceSplits(Arrays.asList("s3://bucket/split1.split", "s3://bucket/split2.split"))
+ *     .sourceSplits(Arrays.asList(source1, source2))
  *     .build();
  *
  * XRefMetadata metadata = XRefSplit.build(buildConfig, "/tmp/daily.xref.split");
  *
- * // Search the XRef using the metadata
+ * // Search the XRef
  * SplitCacheManager.CacheConfig cacheConfig = new SplitCacheManager.CacheConfig("xref-cache")
  *     .withMaxCacheSize(100_000_000);
  *
@@ -77,61 +72,29 @@ import java.util.List;
  * }
  * }</pre>
  */
-public class XRefSearcher implements AutoCloseable {
+public class XRefSearcher implements AutoCloseable, io.indextables.tantivy4java.split.QueryParser {
     static {
         Tantivy.initialize();
     }
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
-    /** Field name for split URI */
-    public static final String FIELD_URI = "_xref_uri";
-
-    /** Field name for split ID */
-    public static final String FIELD_SPLIT_ID = "_xref_split_id";
-
-    /** Field name for full metadata JSON */
-    public static final String FIELD_METADATA = "_xref_split_metadata";
-
-    private final SplitSearcher searcher;
+    private final long handle;
+    private final String xrefPath;
     private final XRefMetadata xrefMetadata;
     private volatile boolean closed = false;
 
     /**
-     * Create an XRefSearcher wrapping a SplitSearcher.
+     * Create an XRefSearcher with a native handle.
      *
-     * @param searcher The underlying SplitSearcher for the XRef split
-     * @param metadata The XRef metadata from the build process
+     * @param handle The native FuseXRef handle
+     * @param xrefPath Path to the XRef file
+     * @param metadata The XRef metadata from the build process (optional)
      */
-    XRefSearcher(SplitSearcher searcher, XRefMetadata metadata) {
-        this.searcher = searcher;
+    XRefSearcher(long handle, String xrefPath, XRefMetadata metadata) {
+        this.handle = handle;
+        this.xrefPath = xrefPath;
         this.xrefMetadata = metadata;
-    }
-
-    /**
-     * Open an XRef split for searching using standard SplitMetadata.
-     *
-     * <p>This is the preferred method when you only have SplitMetadata (e.g., from a metadata store).
-     * XRef splits are standard Quickwit splits, so they work with regular SplitMetadata.</p>
-     *
-     * <p>Note: When opened this way, convenience methods like {@link #getNumSplits()} and
-     * {@link #getAllSplitUris()} will not be available. Use the document fields
-     * (_xref_uri, _xref_split_metadata) to get source split information from search results.</p>
-     *
-     * @param cacheManager The cache manager to use
-     * @param xrefUri URI of the XRef split file
-     * @param splitMetadata Standard split metadata (same as used for regular splits)
-     * @return XRefSearcher for querying the XRef split
-     * @throws IllegalArgumentException if splitMetadata is null
-     * @throws RuntimeException if opening fails
-     */
-    public static XRefSearcher open(SplitCacheManager cacheManager, String xrefUri, QuickwitSplit.SplitMetadata splitMetadata) {
-        if (splitMetadata == null) {
-            throw new IllegalArgumentException("SplitMetadata is required");
-        }
-
-        SplitSearcher searcher = cacheManager.createSplitSearcher(xrefUri, splitMetadata);
-        return new XRefSearcher(searcher, null);  // No XRefMetadata available
     }
 
     /**
@@ -140,41 +103,153 @@ public class XRefSearcher implements AutoCloseable {
      * <p>Use this method when you have the full XRefMetadata from {@link XRefSplit#build}.
      * This enables convenience methods like {@link #getNumSplits()} and {@link #getAllSplitUris()}.</p>
      *
-     * @param cacheManager The cache manager to use
-     * @param xrefUri URI of the XRef split file
-     * @param metadata XRef metadata from the build process (must have footer offsets)
+     * <p>Supports local files, S3 URLs (s3://), and Azure URLs (azure://).</p>
+     *
+     * @param cacheManager The cache manager with cloud credentials
+     * @param xrefUri URI of the XRef split file (file://, s3://, azure://)
+     * @param metadata XRef metadata from the build process
      * @return XRefSearcher for querying the XRef split
-     * @throws IllegalArgumentException if metadata is null or lacks footer offsets
+     * @throws IllegalArgumentException if metadata is null
      * @throws RuntimeException if opening fails
      */
     public static XRefSearcher open(SplitCacheManager cacheManager, String xrefUri, XRefMetadata metadata) {
         if (metadata == null) {
             throw new IllegalArgumentException(
-                "XRef metadata is required. Use XRefSplit.build() to create an XRef and use the returned metadata, " +
-                "or use open(cacheManager, uri, SplitMetadata) if you only have split metadata."
+                "XRef metadata is required. Use XRefSplit.build() to create an XRef and use the returned metadata."
             );
         }
 
-        if (!metadata.hasFooterOffsets()) {
-            throw new IllegalArgumentException(
-                "XRef metadata must have footer offsets. Ensure the metadata came from XRefSplit.build()."
+        long handle;
+        String pathForDisplay = xrefUri;
+
+        if (xrefUri.startsWith("s3://") || xrefUri.startsWith("azure://")) {
+            // Remote URL - use native loader with credentials
+            java.util.Map<String, String> awsConfig = cacheManager != null ? cacheManager.getAwsConfig() : java.util.Collections.emptyMap();
+            java.util.Map<String, String> azureConfig = cacheManager != null ? cacheManager.getAzureConfig() : java.util.Collections.emptyMap();
+
+            // Get endpoint - check both "endpoint" (SplitCacheManager) and "endpoint_url" (legacy)
+            String endpoint = awsConfig.get("endpoint");
+            if (endpoint == null) {
+                endpoint = awsConfig.get("endpoint_url");
+            }
+
+            // Get path style access - check both "path_style_access" (SplitCacheManager) and "force_path_style" (legacy)
+            boolean pathStyleAccess = "true".equals(awsConfig.get("path_style_access"))
+                || "true".equals(awsConfig.get("force_path_style"));
+
+            handle = nativeLoadFuseXRefFromUri(
+                xrefUri,
+                // AWS credentials
+                awsConfig.get("access_key"),
+                awsConfig.get("secret_key"),
+                awsConfig.get("session_token"),
+                awsConfig.get("region"),
+                endpoint,
+                pathStyleAccess,
+                // Azure credentials
+                azureConfig.get("account_name"),
+                azureConfig.get("access_key"),
+                azureConfig.get("bearer_token")
             );
+        } else {
+            // Local file path
+            String path = xrefUri;
+            if (path.startsWith("file://")) {
+                path = path.substring(7);
+            }
+            pathForDisplay = path;
+            handle = nativeLoadFuseXRef(path);
         }
 
-        // Use the standard SplitMetadata conversion for consistent handling
-        QuickwitSplit.SplitMetadata splitMetadata = metadata.toSplitMetadata();
+        if (handle < 0) {
+            throw new RuntimeException("Failed to open FuseXRef: " + pathForDisplay);
+        }
 
-        SplitSearcher searcher = cacheManager.createSplitSearcher(xrefUri, splitMetadata);
-        return new XRefSearcher(searcher, metadata);
+        return new XRefSearcher(handle, pathForDisplay, metadata);
     }
 
     /**
-     * Search the XRef split and return matching source splits.
+     * Open an XRef split for searching using standard SplitMetadata.
      *
-     * <p>Each matching document represents a source split that contains
-     * documents matching the query terms.</p>
+     * <p>Note: When opened this way, convenience methods like {@link #getNumSplits()} and
+     * {@link #getAllSplitUris()} will not be available.</p>
      *
-     * @param query Query string (will be searched as a term across all fields)
+     * @param cacheManager The cache manager (not used for FuseXRef)
+     * @param xrefUri URI of the XRef split file
+     * @param splitMetadata Standard split metadata (not used for FuseXRef, but kept for API compatibility)
+     * @return XRefSearcher for querying the XRef split
+     * @throws RuntimeException if opening fails
+     */
+    public static XRefSearcher open(SplitCacheManager cacheManager, String xrefUri, QuickwitSplit.SplitMetadata splitMetadata) {
+        long handle;
+        String pathForDisplay = xrefUri;
+
+        if (xrefUri.startsWith("s3://") || xrefUri.startsWith("azure://")) {
+            // Remote URL - use native loader with credentials
+            java.util.Map<String, String> awsConfig = cacheManager != null ? cacheManager.getAwsConfig() : java.util.Collections.emptyMap();
+            java.util.Map<String, String> azureConfig = cacheManager != null ? cacheManager.getAzureConfig() : java.util.Collections.emptyMap();
+
+            // Get endpoint - check both "endpoint" (SplitCacheManager) and "endpoint_url" (legacy)
+            String endpoint = awsConfig.get("endpoint");
+            if (endpoint == null) {
+                endpoint = awsConfig.get("endpoint_url");
+            }
+
+            // Get path style access - check both "path_style_access" (SplitCacheManager) and "force_path_style" (legacy)
+            boolean pathStyleAccess = "true".equals(awsConfig.get("path_style_access"))
+                || "true".equals(awsConfig.get("force_path_style"));
+
+            handle = nativeLoadFuseXRefFromUri(
+                xrefUri,
+                // AWS credentials
+                awsConfig.get("access_key"),
+                awsConfig.get("secret_key"),
+                awsConfig.get("session_token"),
+                awsConfig.get("region"),
+                endpoint,
+                pathStyleAccess,
+                // Azure credentials
+                azureConfig.get("account_name"),
+                azureConfig.get("access_key"),
+                azureConfig.get("bearer_token")
+            );
+        } else {
+            // Local file path - strip file:// prefix if present
+            String path = xrefUri;
+            if (path.startsWith("file://")) {
+                path = path.substring(7);
+            }
+            pathForDisplay = path;
+            handle = nativeLoadFuseXRef(path);
+        }
+
+        if (handle < 0) {
+            throw new RuntimeException("Failed to open FuseXRef: " + pathForDisplay);
+        }
+
+        return new XRefSearcher(handle, pathForDisplay, null);
+    }
+
+    /**
+     * Search the XRef split using Quickwit query syntax.
+     *
+     * <p>This method parses the query string using the schema stored in the FuseXRef,
+     * allowing you to use Quickwit query syntax without needing a SplitSearcher.</p>
+     *
+     * <p>Supported query syntax:</p>
+     * <ul>
+     *   <li>{@code field:value} - term query</li>
+     *   <li>{@code field:value AND field2:value2} - boolean AND</li>
+     *   <li>{@code field:value OR field2:value2} - boolean OR</li>
+     *   <li>{@code NOT field:value} - boolean NOT</li>
+     *   <li>{@code *} - match all</li>
+     *   <li>Unqualified terms search across all text fields</li>
+     * </ul>
+     *
+     * <p>Note: Range and wildcard queries cannot be evaluated by filters and will
+     * cause all splits to be returned (with hasUnevaluatedClauses=true).</p>
+     *
+     * @param query Query string in Quickwit syntax
      * @param limit Maximum number of splits to return
      * @return XRefSearchResult containing matching splits
      * @throws IllegalStateException if searcher is closed
@@ -185,43 +260,18 @@ public class XRefSearcher implements AutoCloseable {
         long startTime = System.currentTimeMillis();
 
         try {
-            // Create query - use Quickwit's query parser for proper handling of all field types
-            // including JSON fields which require special path syntax (e.g., data.name:alice)
-            SplitQuery splitQuery;
-            if ("*".equals(query.trim())) {
-                splitQuery = new SplitMatchAllQuery();
-            } else {
-                // Use the underlying SplitSearcher's parseQuery() which leverages Quickwit's
-                // query parser. This properly handles:
-                // - JSON field syntax: data.name:alice (dot notation for JSON paths)
-                // - Range queries: age:[1 TO 100]
-                // - Boolean queries: status:active AND priority:high
-                // - All other Quickwit query syntax
-                splitQuery = searcher.parseQuery(query);
+            // Use native query string parsing which leverages the stored schema
+            String resultJson = nativeSearchWithQueryString(handle, query, limit);
+
+            if (resultJson == null || resultJson.startsWith("ERROR:")) {
+                String error = resultJson == null ? "null result" : resultJson.substring(6).trim();
+                throw new RuntimeException("FuseXRef search failed: " + error);
             }
 
-            // Execute search
-            SearchResult result = searcher.search(splitQuery, limit);
+            XRefSearchResult result = MAPPER.readValue(resultJson, XRefSearchResult.class);
+            result.setSearchTimeMs(System.currentTimeMillis() - startTime);
 
-            // Convert hits to matching splits
-            List<MatchingSplit> matchingSplits = new ArrayList<>();
-            for (var hit : result.getHits()) {
-                try (Document doc = searcher.doc(hit.getDocAddress())) {
-                    MatchingSplit split = extractMatchingSplit(doc, (float) hit.getScore());
-                    if (split != null) {
-                        matchingSplits.add(split);
-                    }
-                }
-            }
-
-            long searchTimeMs = System.currentTimeMillis() - startTime;
-
-            XRefSearchResult xrefResult = new XRefSearchResult();
-            xrefResult.setMatchingSplits(matchingSplits);
-            xrefResult.setNumMatchingSplits(matchingSplits.size());
-            xrefResult.setSearchTimeMs(searchTimeMs);
-
-            return xrefResult;
+            return result;
         } catch (Exception e) {
             throw new RuntimeException("XRef search failed: " + e.getMessage(), e);
         }
@@ -230,9 +280,9 @@ public class XRefSearcher implements AutoCloseable {
     /**
      * Search with a pre-built SplitQuery.
      *
-     * <p>IMPORTANT: Range queries in the SplitQuery will be automatically transformed
-     * to match-all queries because XRef splits don't have fast fields. This ensures
-     * conservative results - all potentially matching splits are returned.</p>
+     * <p>IMPORTANT: Range queries and wildcard queries cannot be evaluated by
+     * Binary Fuse Filters. When such queries are detected, hasUnevaluatedClauses
+     * will be set to true in the result, and all splits will be returned.</p>
      *
      * @param query The query to execute
      * @param limit Maximum number of splits to return
@@ -243,29 +293,18 @@ public class XRefSearcher implements AutoCloseable {
         long startTime = System.currentTimeMillis();
 
         try {
-            // Transform the query to replace range queries with match-all
-            SplitQuery transformedQuery = transformQueryForXRef(query);
+            String queryJson = query.toQueryAstJson();
+            String resultJson = nativeSearchFuseXRef(handle, queryJson, limit);
 
-            SearchResult result = searcher.search(transformedQuery, limit);
-
-            List<MatchingSplit> matchingSplits = new ArrayList<>();
-            for (var hit : result.getHits()) {
-                try (Document doc = searcher.doc(hit.getDocAddress())) {
-                    MatchingSplit split = extractMatchingSplit(doc, (float) hit.getScore());
-                    if (split != null) {
-                        matchingSplits.add(split);
-                    }
-                }
+            if (resultJson == null || resultJson.startsWith("ERROR:")) {
+                String error = resultJson == null ? "null result" : resultJson.substring(6).trim();
+                throw new RuntimeException("FuseXRef search failed: " + error);
             }
 
-            long searchTimeMs = System.currentTimeMillis() - startTime;
+            XRefSearchResult result = MAPPER.readValue(resultJson, XRefSearchResult.class);
+            result.setSearchTimeMs(System.currentTimeMillis() - startTime);
 
-            XRefSearchResult xrefResult = new XRefSearchResult();
-            xrefResult.setMatchingSplits(matchingSplits);
-            xrefResult.setNumMatchingSplits(matchingSplits.size());
-            xrefResult.setSearchTimeMs(searchTimeMs);
-
-            return xrefResult;
+            return result;
         } catch (Exception e) {
             throw new RuntimeException("XRef search failed: " + e.getMessage(), e);
         }
@@ -274,9 +313,10 @@ public class XRefSearcher implements AutoCloseable {
     /**
      * Transform a SplitQuery for XRef searching by replacing range queries with match-all.
      *
-     * <p>XRef splits don't have fast fields (columnar data), so range queries cannot
-     * be evaluated. To ensure conservative results (never miss a split that might
-     * contain matching documents), range queries are transformed to match-all.</p>
+     * <p>FuseXRef (Binary Fuse Filters) cannot evaluate range queries because they
+     * don't store term values, only hashes. To ensure conservative results (never
+     * miss a split that might contain matching documents), range queries are
+     * transformed to match-all.</p>
      *
      * @param query The original query
      * @return A transformed query with range queries replaced by match-all
@@ -299,7 +339,7 @@ public class XRefSearcher implements AutoCloseable {
 
         // If the JSON changed, return a new parsed query
         if (!queryJson.equals(transformedJson)) {
-            return new SplitParsedQuery(transformedJson);
+            return new io.indextables.tantivy4java.split.SplitParsedQuery(transformedJson);
         }
 
         // No transformation needed, return original query
@@ -307,34 +347,26 @@ public class XRefSearcher implements AutoCloseable {
     }
 
     /**
-     * Native method to transform range queries to match-all in a QueryAst JSON.
-     * This walks the query tree in Rust and replaces any range query nodes with match_all.
-     *
-     * @param queryJson The QueryAst JSON string
-     * @return Transformed QueryAst JSON, or error string starting with "ERROR:"
-     */
-    private static native String nativeTransformRangeToMatchAll(String queryJson);
-
-    /**
      * Get the number of source splits in this XRef.
      *
      * <p>This method requires XRefMetadata. If opened with SplitMetadata only,
-     * use a match-all query and count the results instead.</p>
+     * use the native split count method instead.</p>
      *
      * @return Number of source splits
-     * @throws IllegalStateException if searcher is closed or opened without XRefMetadata
+     * @throws IllegalStateException if searcher is closed
      */
     public int getNumSplits() {
         checkNotClosed();
-        checkHasXRefMetadata("getNumSplits");
-        return xrefMetadata.getNumSplits();
+        if (xrefMetadata != null) {
+            return xrefMetadata.getNumSplits();
+        }
+        return nativeGetFuseXRefSplitCount(handle);
     }
 
     /**
      * Get all source split URIs from the metadata.
      *
-     * <p>This method requires XRefMetadata. If opened with SplitMetadata only,
-     * use a match-all query and extract URIs from the _xref_uri field instead.</p>
+     * <p>This method requires XRefMetadata.</p>
      *
      * @return List of split URIs
      * @throws IllegalStateException if searcher is closed or opened without XRefMetadata
@@ -385,10 +417,28 @@ public class XRefSearcher implements AutoCloseable {
     }
 
     /**
+     * Get the schema stored in the FuseXRef.
+     *
+     * <p>The schema is preserved from the source splits during XRef build
+     * and can be used for query construction and validation.</p>
+     *
+     * @return The schema for this XRef
+     * @throws IllegalStateException if searcher is closed
+     */
+    @Override
+    public io.indextables.tantivy4java.core.Schema getSchema() {
+        checkNotClosed();
+        long schemaPtr = nativeGetSchema(handle);
+        if (schemaPtr <= 0) {
+            throw new RuntimeException("Failed to get schema from FuseXRef");
+        }
+        return new io.indextables.tantivy4java.core.Schema(schemaPtr);
+    }
+
+    /**
      * Get the XRef metadata, if available.
      *
-     * <p>Returns null if this searcher was opened with SplitMetadata only
-     * (via {@link #open(SplitCacheManager, String, QuickwitSplit.SplitMetadata)}).</p>
+     * <p>Returns null if this searcher was opened without XRefMetadata.</p>
      *
      * @return The XRef metadata, or null if not available
      */
@@ -406,45 +456,12 @@ public class XRefSearcher implements AutoCloseable {
     }
 
     /**
-     * Get the underlying SplitSearcher for advanced operations.
+     * Get the native handle for advanced operations.
      *
-     * @return The underlying SplitSearcher
+     * @return The native FuseXRef handle
      */
-    public SplitSearcher getSearcher() {
-        return searcher;
-    }
-
-    /**
-     * Extract a MatchingSplit from a document.
-     */
-    private MatchingSplit extractMatchingSplit(Document doc, float score) {
-        try {
-            // Try to get the full metadata JSON first
-            Object metadataObj = doc.getFirst(FIELD_METADATA);
-            if (metadataObj != null) {
-                String metadataJson = metadataObj.toString();
-                MatchingSplit split = MAPPER.readValue(metadataJson, MatchingSplit.class);
-                split.setScore(score);
-                return split;
-            }
-
-            // Fall back to individual fields
-            Object uriObj = doc.getFirst(FIELD_URI);
-            Object splitIdObj = doc.getFirst(FIELD_SPLIT_ID);
-
-            if (uriObj != null) {
-                MatchingSplit split = new MatchingSplit();
-                split.setUri(uriObj.toString());
-                split.setSplitId(splitIdObj != null ? splitIdObj.toString() : "");
-                split.setScore(score);
-                return split;
-            }
-
-            return null;
-        } catch (Exception e) {
-            // Log and continue
-            return null;
-        }
+    public long getHandle() {
+        return handle;
     }
 
     private void checkNotClosed() {
@@ -456,19 +473,110 @@ public class XRefSearcher implements AutoCloseable {
     private void checkHasXRefMetadata(String methodName) {
         if (xrefMetadata == null) {
             throw new IllegalStateException(
-                methodName + "() requires XRefMetadata. This searcher was opened with SplitMetadata only. " +
-                "Use a match-all query and extract info from document fields (_xref_uri, _xref_split_metadata) instead."
+                methodName + "() requires XRefMetadata. This searcher was opened without XRefMetadata."
             );
         }
+    }
+
+    private static String escapeJson(String s) {
+        return s.replace("\\", "\\\\")
+                .replace("\"", "\\\"")
+                .replace("\n", "\\n")
+                .replace("\r", "\\r")
+                .replace("\t", "\\t");
     }
 
     @Override
     public void close() {
         if (!closed) {
             closed = true;
-            if (searcher != null) {
-                searcher.close();
-            }
+            nativeCloseFuseXRef(handle);
         }
     }
+
+    /**
+     * Parse a query string using Quickwit syntax and return as a SplitQuery.
+     *
+     * <p>This method parses the query string using the schema stored in the FuseXRef,
+     * returning a SplitQuery that can be used with {@link #search(SplitQuery, int)}.</p>
+     *
+     * <p>This provides API compatibility with {@link io.indextables.tantivy4java.split.SplitSearcher#parseQuery(String)},
+     * allowing the same query objects to be used with both searchers.</p>
+     *
+     * @param queryString Query string in Quickwit syntax (e.g., "field:value", "age:[1 TO 100]")
+     * @return SplitQuery that can be used with search(SplitQuery, limit)
+     * @throws IllegalStateException if searcher is closed
+     * @throws RuntimeException if parsing fails
+     */
+    public SplitQuery parseQuery(String queryString) {
+        checkNotClosed();
+
+        String queryJson = nativeParseQuery(handle, queryString);
+        if (queryJson == null || queryJson.startsWith("ERROR:")) {
+            String error = queryJson == null ? "null result" : queryJson.substring(6).trim();
+            throw new RuntimeException("Query parsing failed: " + error);
+        }
+
+        return new io.indextables.tantivy4java.split.SplitParsedQuery(queryJson);
+    }
+
+    /**
+     * Parse a query string and return the raw QueryAst JSON.
+     *
+     * <p>This method is useful for debugging or when you need to inspect
+     * the parsed query structure.</p>
+     *
+     * @param queryString Query string in Quickwit syntax
+     * @return JSON representation of the parsed QueryAst
+     * @throws IllegalStateException if searcher is closed
+     * @throws RuntimeException if parsing fails
+     */
+    public String parseQueryToJson(String queryString) {
+        checkNotClosed();
+
+        String result = nativeParseQuery(handle, queryString);
+        if (result == null || result.startsWith("ERROR:")) {
+            String error = result == null ? "null result" : result.substring(6).trim();
+            throw new RuntimeException("Query parsing failed: " + error);
+        }
+
+        return result;
+    }
+
+    /**
+     * Parse a query string and return as a SplitQuery.
+     *
+     * @param queryString Query string in Quickwit syntax
+     * @return SplitQuery that can be used with search(SplitQuery, limit)
+     * @deprecated Use {@link #parseQuery(String)} instead
+     */
+    @Deprecated
+    public SplitQuery parseQueryToSplitQuery(String queryString) {
+        return parseQuery(queryString);
+    }
+
+    // Native methods for FuseXRef operations
+    private static native long nativeLoadFuseXRef(String path);
+    private static native long nativeLoadFuseXRefFromUri(
+        String uri,
+        // AWS credentials
+        String awsAccessKey,
+        String awsSecretKey,
+        String awsSessionToken,
+        String awsRegion,
+        String awsEndpointUrl,
+        boolean awsForcePathStyle,
+        // Azure credentials
+        String azureAccountName,
+        String azureAccountKey,
+        String azureBearerToken
+    );
+    private static native void nativeCloseFuseXRef(long handle);
+    private static native String nativeSearchFuseXRef(long handle, String queryJson, int limit);
+    private static native String nativeSearchWithQueryString(long handle, String queryString, int limit);
+    private static native String nativeParseQuery(long handle, String queryString);
+    private static native String nativeGetFuseXRefMetadata(long handle);
+    private static native int nativeGetFuseXRefSplitCount(long handle);
+    private static native String nativeTransformRangeToMatchAll(String queryJson);
+    private static native long nativeGetSchema(long handle);
 }

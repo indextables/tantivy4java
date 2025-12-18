@@ -184,7 +184,6 @@ public class XRefS3MockTest {
             .indexUid("test-index")
             .sourceSplits(sourceSplits)
             .awsConfig(awsConfig)
-            .includePositions(false)
             .build();
 
         // Build XRef split
@@ -221,6 +220,110 @@ public class XRefS3MockTest {
         System.out.println("  XRef file size: " + Files.size(xrefPath) + " bytes");
 
         System.out.println("[Step 3] XRef file verification complete");
+    }
+
+    // Static field to store XRef metadata between tests
+    private static XRefMetadata xrefMetadata;
+    private static String xrefS3Url;
+
+    @Test
+    @Order(4)
+    @DisplayName("Step 4: Upload XRef split to S3Mock")
+    void step4_uploadXRefToS3Mock() throws Exception {
+        System.out.println("\n[Step 4] Uploading XRef split to S3Mock...");
+
+        Path xrefPath = tempDir.resolve("test.xref.split");
+        assertTrue(Files.exists(xrefPath), "XRef split should exist from step 2");
+
+        // Upload to S3Mock
+        String s3Key = "xref/test.xref.split";
+        xrefS3Url = String.format("s3://%s/%s", TEST_BUCKET, s3Key);
+
+        PutObjectRequest putRequest = PutObjectRequest.builder()
+            .bucket(TEST_BUCKET)
+            .key(s3Key)
+            .build();
+        s3Client.putObject(putRequest, xrefPath);
+
+        System.out.println("  Uploaded XRef to: " + xrefS3Url);
+        System.out.println("[Step 4] XRef upload to S3Mock complete");
+    }
+
+    @Test
+    @Order(5)
+    @DisplayName("Step 5: Load and search XRef from S3Mock")
+    void step5_loadAndSearchXRefFromS3Mock() throws Exception {
+        System.out.println("\n[Step 5] Loading and searching XRef from S3Mock...");
+
+        assertNotNull(xrefS3Url, "XRef S3 URL should be set from step 4");
+
+        // Build XRef to get metadata (needed to open the XRef)
+        // We need to rebuild the metadata for the XRef we already created
+        QuickwitSplit.AwsConfig awsConfig = new QuickwitSplit.AwsConfig(
+            ACCESS_KEY,
+            SECRET_KEY,
+            null, // no session token
+            "us-east-1",
+            "http://localhost:" + S3_MOCK_PORT,
+            true  // force path style for S3Mock
+        );
+
+        // Build source split list with footer offsets
+        List<XRefSourceSplit> sourceSplits = new ArrayList<>();
+        for (int i = 0; i < 2; i++) {
+            XRefSourceSplit source = XRefSourceSplit.fromSplitMetadata(
+                splitS3Urls[i], splitMetadata[i]
+            );
+            sourceSplits.add(source);
+        }
+
+        // Build temporary XRef to get metadata
+        XRefBuildConfig buildConfig = XRefBuildConfig.builder()
+            .xrefId("test-xref")
+            .indexUid("test-index")
+            .sourceSplits(sourceSplits)
+            .awsConfig(awsConfig)
+            .build();
+
+        Path tempXrefPath = tempDir.resolve("temp.xref.split");
+        xrefMetadata = XRefSplit.build(buildConfig, tempXrefPath.toString());
+        assertNotNull(xrefMetadata, "XRef metadata should be returned");
+
+        // Create cache manager with S3Mock credentials
+        SplitCacheManager.CacheConfig cacheConfig = new SplitCacheManager.CacheConfig("s3mock-xref-cache")
+            .withMaxCacheSize(100_000_000)
+            .withAwsCredentials(ACCESS_KEY, SECRET_KEY)
+            .withAwsRegion("us-east-1")
+            .withAwsEndpoint("http://localhost:" + S3_MOCK_PORT)
+            .withAwsPathStyleAccess(true);
+
+        // Open XRef from S3Mock and search
+        try (SplitCacheManager cacheManager = SplitCacheManager.getInstance(cacheConfig);
+             XRefSearcher xrefSearcher = XRefSplit.open(cacheManager, xrefS3Url, xrefMetadata)) {
+
+            System.out.println("  XRef opened from S3Mock successfully");
+            System.out.println("  Number of source splits: " + xrefSearcher.getNumSplits());
+
+            // Search for domain0-specific term
+            System.out.println("\n  Searching for 'domain0_term_0'...");
+            XRefSearchResult result = xrefSearcher.search("content:domain0_term_0", 10);
+            System.out.println("    Found in " + result.getNumMatchingSplits() + " split(s)");
+            assertTrue(result.hasMatches(), "Should find at least one matching split");
+
+            // Search for domain1-specific term
+            System.out.println("  Searching for 'domain1_term_0'...");
+            XRefSearchResult result2 = xrefSearcher.search("content:domain1_term_0", 10);
+            System.out.println("    Found in " + result2.getNumMatchingSplits() + " split(s)");
+            assertTrue(result2.hasMatches(), "Should find at least one matching split");
+
+            // Match-all query
+            System.out.println("  Match-all query...");
+            XRefSearchResult result3 = xrefSearcher.search("*", 10);
+            System.out.println("    Found " + result3.getNumMatchingSplits() + " split(s)");
+            assertEquals(2, result3.getNumMatchingSplits(), "Match-all should return 2 splits");
+        }
+
+        System.out.println("\n[Step 5] XRef S3Mock loading and searching complete");
     }
 
     /**

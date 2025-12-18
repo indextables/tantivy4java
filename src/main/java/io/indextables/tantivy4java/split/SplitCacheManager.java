@@ -1216,4 +1216,20 @@ public class SplitCacheManager implements AutoCloseable {
     String getCacheKey() { return cacheKey; }
     long getMaxCacheSize() { return maxCacheSize; }
     long getNativePtr() { return nativePtr; }
+
+    /**
+     * Get AWS configuration for this cache manager.
+     * Used by XRefSearcher to load FuseXRef from S3.
+     *
+     * @return Map of AWS config keys (access_key, secret_key, region, etc.)
+     */
+    public Map<String, String> getAwsConfig() { return awsConfig; }
+
+    /**
+     * Get Azure configuration for this cache manager.
+     * Used by XRefSearcher to load FuseXRef from Azure Blob Storage.
+     *
+     * @return Map of Azure config keys (account_name, access_key, bearer_token, etc.)
+     */
+    public Map<String, String> getAzureConfig() { return azureConfig; }
 }

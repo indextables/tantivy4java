@@ -317,7 +317,6 @@ public class RealAzureXRefTest {
             .indexUid("science-azure-index")
             .sourceSplits(sourceSplits)
             .azureConfig(azureConfig)
-            .includePositions(false)
             .build();
 
         // Build XRef split

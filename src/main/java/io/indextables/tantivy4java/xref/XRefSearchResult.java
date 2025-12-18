@@ -65,9 +65,18 @@ public class XRefSearchResult {
     @JsonProperty("search_time_ms")
     private long searchTimeMs;
 
+    /**
+     * True if the query contained clauses that could not be evaluated
+     * (e.g., range queries, wildcard queries, regex queries).
+     * When true, results may include splits that don't actually match.
+     */
+    @JsonProperty("has_unevaluated_clauses")
+    private boolean hasUnevaluatedClauses;
+
     // Default constructor for Jackson
     public XRefSearchResult() {
         this.matchingSplits = new ArrayList<>();
+        this.hasUnevaluatedClauses = false;
     }
 
     // Setters for Java-side construction
@@ -82,6 +91,10 @@ public class XRefSearchResult {
 
     public void setSearchTimeMs(long searchTimeMs) {
         this.searchTimeMs = searchTimeMs;
+    }
+
+    public void setHasUnevaluatedClauses(boolean hasUnevaluatedClauses) {
+        this.hasUnevaluatedClauses = hasUnevaluatedClauses;
     }
 
     /**
@@ -112,6 +125,20 @@ public class XRefSearchResult {
      */
     public long getSearchTimeMs() {
         return searchTimeMs;
+    }
+
+    /**
+     * Check if the query contained clauses that could not be evaluated.
+     *
+     * When this returns true, it means the query contained range queries,
+     * wildcard queries, regex queries, or other clauses that Binary Fuse
+     * filters cannot evaluate. The results may include splits that don't
+     * actually match the query.
+     *
+     * @return true if the query had unevaluatable clauses
+     */
+    public boolean hasUnevaluatedClauses() {
+        return hasUnevaluatedClauses;
     }
 
     /**
@@ -157,6 +184,7 @@ public class XRefSearchResult {
             "numMatchingSplits=" + numMatchingSplits +
             ", searchTimeMs=" + searchTimeMs +
             ", estimatedDocs=" + getTotalEstimatedDocs() +
+            ", hasUnevaluatedClauses=" + hasUnevaluatedClauses +
             '}';
     }
 }
