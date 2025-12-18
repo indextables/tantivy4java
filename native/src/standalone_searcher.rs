@@ -415,27 +415,14 @@ pub async fn resolve_storage_for_split(
         quickwit_common::uri::Protocol::S3 => {
             // For S3, we need to resolve the directory, not the file
             let uri_str = uri.as_str();
-            debug_println!("📁 RESOLVE_STORAGE: S3 URI input: '{}'", uri_str);
             if let Some(last_slash_pos) = uri_str.rfind('/') {
                 let directory_uri_str = &uri_str[..last_slash_pos + 1];
-                let filename = &uri_str[last_slash_pos + 1..];
-                debug_println!("📁 RESOLVE_STORAGE: Extracted directory: '{}'", directory_uri_str);
-                debug_println!("📁 RESOLVE_STORAGE: Extracted filename: '{}'", filename);
-
                 let directory_uri: Uri = directory_uri_str.parse()
                     .with_context(|| format!("Failed to parse S3 directory URI: {}", directory_uri_str))?;
 
-                debug_println!("📁 RESOLVE_STORAGE: Calling storage_resolver.resolve() for S3 directory...");
-                let storage_result = storage_resolver.resolve(&directory_uri).await;
-                match &storage_result {
-                    Ok(storage) => {
-                        debug_println!("📁 RESOLVE_STORAGE: Successfully resolved S3 storage, uri: '{}'", storage.uri());
-                    }
-                    Err(e) => {
-                        debug_println!("❌ RESOLVE_STORAGE: Failed to resolve S3 storage: {:?}", e);
-                    }
-                }
-                storage_result.with_context(|| format!("Failed to resolve storage for directory URI: {}", directory_uri_str))
+                debug_println!("QUICKWIT DEBUG: Resolving S3 storage for directory: '{}'", directory_uri_str);
+                storage_resolver.resolve(&directory_uri).await
+                    .with_context(|| format!("Failed to resolve storage for directory URI: {}", directory_uri_str))
             } else {
                 // Fallback if no slash found (shouldn't happen with valid S3 URIs)
                 storage_resolver.resolve(&uri).await
