@@ -51,13 +51,6 @@ mod global_cache;  // Global cache infrastructure following Quickwit's pattern
 mod simple_batch_optimization;  // Priority 1: Simplified batch optimization with range consolidation
 mod adaptive_tuning;  // Priority 5: Adaptive tuning engine for automatic parameter optimization
 
-// Cross-Reference Split modules for query routing and split skipping
-pub mod xref_types;    // Core XRef data structures
-pub mod xref_split;    // XRef split builder
-// NOTE: No xref_searcher module - XRef splits are regular Quickwit splits,
-// so use SplitSearcher directly to search them. Each document in XRef
-// represents a source split with stored metadata fields.
-
 pub use schema::*;
 pub use document::*;
 pub use query::*;
@@ -68,8 +61,6 @@ pub use utils::*;
 pub use text_analyzer::*;
 pub use quickwit_split::{merge_splits_impl, InternalMergeConfig, InternalAwsConfig};
 pub use merge_types::*;
-pub use xref_types::*;
-pub use xref_split::XRefSplitBuilder;
 // pub use split_searcher::*;  // Disabled - now using replacement JNI methods
 // pub use split_searcher_simple::*;  // Disabled to avoid conflicts
 
