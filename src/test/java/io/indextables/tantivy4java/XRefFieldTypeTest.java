@@ -551,13 +551,13 @@ public class XRefFieldTypeTest {
              XRefSearcher searcher = XRefSplit.open(cacheManager, "file://" + xrefPath.toString(), xrefMetadata)) {
 
             // Search for the 2023 timestamp (should only match split1)
-            // Date fields in Tantivy/Quickwit are queried using ISO 8601 format
-            // The date value must be quoted because it contains colons
-            // Query format: timestamp:"2023-01-15T10:30:00Z"
+            // XRef stores timestamps as nanoseconds (Tantivy's internal format)
+            // The test creates timestamps in microseconds, then divides by 1000 to get millis for LocalDateTime
+            // Tantivy stores as nanoseconds = millis * 1_000_000 = micros * 1000
+            String ts2023JanStr = String.valueOf(ts2023Jan * 1000); // Convert to nanoseconds
             System.out.println("\n  Searching for timestamp from 2023-01-15...");
-            String dateQuery2023 = "timestamp:\"2023-01-15T10:30:00Z\"";
-            System.out.println("    Query: " + dateQuery2023);
-            XRefSearchResult result2023 = searcher.search(dateQuery2023, 10);
+            System.out.println("    Query: timestamp:" + ts2023JanStr);
+            XRefSearchResult result2023 = searcher.search("timestamp:" + ts2023JanStr, 10);
             System.out.println("    Found " + result2023.getNumMatchingSplits() + " matching split(s)");
 
             assertEquals(1, result2023.getNumMatchingSplits(), "2023 timestamp should find exactly 1 split");
@@ -565,10 +565,10 @@ public class XRefFieldTypeTest {
                 "2023 timestamp should match split1");
 
             // Search for the 2024 timestamp (should only match split2)
+            String ts2024MarStr = String.valueOf(ts2024Mar * 1000); // Convert to nanoseconds
             System.out.println("\n  Searching for timestamp from 2024-03-01...");
-            String dateQuery2024 = "timestamp:\"2024-03-01T08:00:00Z\"";
-            System.out.println("    Query: " + dateQuery2024);
-            XRefSearchResult result2024 = searcher.search(dateQuery2024, 10);
+            System.out.println("    Query: timestamp:" + ts2024MarStr);
+            XRefSearchResult result2024 = searcher.search("timestamp:" + ts2024MarStr, 10);
             System.out.println("    Found " + result2024.getNumMatchingSplits() + " matching split(s)");
 
             assertEquals(1, result2024.getNumMatchingSplits(), "2024 timestamp should find exactly 1 split");
@@ -670,35 +670,34 @@ public class XRefFieldTypeTest {
         try (SplitCacheManager cacheManager = SplitCacheManager.getInstance(cacheConfig);
              XRefSearcher searcher = XRefSplit.open(cacheManager, "file://" + xrefPath.toString(), xrefMetadata)) {
 
-            // JSON field queries use dot notation for the path: field.path:value
-            // For example, to search for {"name": "alice"} in JSON field "data":
-            //   Query: data.name:alice (not data:name:alice)
-            // Note: values are lowercased by default tokenizer during indexing
+            // XRef stores JSON terms as "path:value" format in the base JSON field
+            // So query format is: field:path:value -> data:name:alice
+            // Note: values are lowercased by default tokenizer
 
             // Search for "alice" (should only match split1)
-            System.out.println("\n  Searching for data.name:alice...");
-            XRefSearchResult resultAlice = searcher.search("data.name:alice", 10);
+            System.out.println("\n  Searching for data:name:alice...");
+            XRefSearchResult resultAlice = searcher.search("data:name:alice", 10);
             System.out.println("    Found " + resultAlice.getNumMatchingSplits() + " matching split(s)");
 
-            assertEquals(1, resultAlice.getNumMatchingSplits(), "data.name:alice should find exactly 1 split");
+            assertEquals(1, resultAlice.getNumMatchingSplits(), "data:name:alice should find exactly 1 split");
             assertTrue(resultAlice.getMatchingSplits().get(0).getUri().contains("json-search-1"),
-                "data.name:alice should match split1");
+                "data:name:alice should match split1");
 
             // Search for "charlie" (should only match split2)
-            System.out.println("\n  Searching for data.name:charlie...");
-            XRefSearchResult resultCharlie = searcher.search("data.name:charlie", 10);
+            System.out.println("\n  Searching for data:name:charlie...");
+            XRefSearchResult resultCharlie = searcher.search("data:name:charlie", 10);
             System.out.println("    Found " + resultCharlie.getNumMatchingSplits() + " matching split(s)");
 
-            assertEquals(1, resultCharlie.getNumMatchingSplits(), "data.name:charlie should find exactly 1 split");
+            assertEquals(1, resultCharlie.getNumMatchingSplits(), "data:name:charlie should find exactly 1 split");
             assertTrue(resultCharlie.getMatchingSplits().get(0).getUri().contains("json-search-2"),
-                "data.name:charlie should match split2");
+                "data:name:charlie should match split2");
 
             // Search for city in split1
-            System.out.println("\n  Searching for data.city:newyork...");
-            XRefSearchResult resultNY = searcher.search("data.city:newyork", 10);
+            System.out.println("\n  Searching for data:city:newyork...");
+            XRefSearchResult resultNY = searcher.search("data:city:newyork", 10);
             System.out.println("    Found " + resultNY.getNumMatchingSplits() + " matching split(s)");
 
-            assertEquals(1, resultNY.getNumMatchingSplits(), "data.city:newyork should find exactly 1 split");
+            assertEquals(1, resultNY.getNumMatchingSplits(), "data:city:newyork should find exactly 1 split");
             assertTrue(resultNY.getMatchingSplits().get(0).getUri().contains("json-search-1"),
                 "data.city:newyork should match split1");
         }

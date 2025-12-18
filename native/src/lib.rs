@@ -53,8 +53,7 @@ mod adaptive_tuning;  // Priority 5: Adaptive tuning engine for automatic parame
 
 // Cross-Reference Split modules for query routing and split skipping
 pub mod xref_types;    // Core XRef data structures
-pub mod xref_streaming; // Memory-efficient streaming XRef builder
-pub mod xref_split;    // XRef split builder (uses streaming implementation)
+pub mod xref_split;    // XRef split builder
 // NOTE: No xref_searcher module - XRef splits are regular Quickwit splits,
 // so use SplitSearcher directly to search them. Each document in XRef
 // represents a source split with stored metadata fields.
