@@ -72,7 +72,7 @@ public class PrescanCacheMissPerformanceTest {
 
                         String localPath = "file://" + splitFile.toString();
                         splitPaths.add(localPath);
-                        splits.add(new SplitInfo(localPath, metadata.getFooterStartOffset()));
+                        splits.add(new SplitInfo(localPath, metadata.getFooterStartOffset(), metadata.getFooterEndOffset()));
 
                         if (docMappingJson == null) {
                             docMappingJson = metadata.getDocMappingJson();

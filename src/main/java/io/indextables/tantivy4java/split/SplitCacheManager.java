@@ -1032,6 +1032,8 @@ public class SplitCacheManager implements AutoCloseable {
                 .append(escapeJson(info.getSplitUrl()))
                 .append("\",\"footerOffset\":")
                 .append(info.getFooterOffset())
+                .append(",\"fileSize\":")
+                .append(info.getFileSize())
                 .append("}");
         }
         splitInfosJson.append("]");

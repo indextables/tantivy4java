@@ -49,6 +49,7 @@ public class PrescanIntegrationTest {
     private Path splitPath;
     private SplitCacheManager cacheManager;
     private long footerOffset;
+    private long fileSize;
     private String docMappingJson;
     private String uniqueId;
 
@@ -108,13 +109,14 @@ public class PrescanIntegrationTest {
                         QuickwitSplit.convertIndexFromPath(
                             indexDir.toString(), splitPath.toString(), splitConfig);
 
-                    // Get footer offset and doc mapping from the metadata returned by split creation
+                    // Get footer offset, file size, and doc mapping from the metadata returned by split creation
                     footerOffset = metadata.getFooterStartOffset();
+                    fileSize = metadata.getFooterEndOffset();
                     docMappingJson = metadata.getDocMappingJson();
 
                     System.out.println("Created split with " + metadata.getNumDocs() + " documents");
                     System.out.println("Split path: " + splitPath);
-                    System.out.println("Split file size: " + splitPath.toFile().length() + " bytes");
+                    System.out.println("Split file size: " + fileSize + " bytes");
                     System.out.println("Footer offset: " + footerOffset);
                     System.out.println("Doc mapping JSON: " + docMappingJson);
                 }
@@ -137,7 +139,7 @@ public class PrescanIntegrationTest {
     public void testPrescanWithExactTermMatch() throws IOException {
         // Test prescan with a term that exists in the split
         List<SplitInfo> splits = Collections.singletonList(
-            new SplitInfo("file://" + splitPath.toAbsolutePath(), footerOffset));
+            new SplitInfo("file://" + splitPath.toAbsolutePath(), footerOffset, fileSize));
 
         SplitQuery query = new SplitTermQuery("title", "hello");
 
@@ -163,7 +165,7 @@ public class PrescanIntegrationTest {
     public void testPrescanWithNonExistentTerm() throws IOException {
         // Test prescan with a term that doesn't exist in the split
         List<SplitInfo> splits = Collections.singletonList(
-            new SplitInfo("file://" + splitPath.toAbsolutePath(), footerOffset));
+            new SplitInfo("file://" + splitPath.toAbsolutePath(), footerOffset, fileSize));
 
         SplitQuery query = new SplitTermQuery("title", "nonexistentterm12345");
 
@@ -187,7 +189,7 @@ public class PrescanIntegrationTest {
     public void testPrescanWithWildcardPrefix() throws IOException {
         // Test prescan with a prefix wildcard pattern
         List<SplitInfo> splits = Collections.singletonList(
-            new SplitInfo("file://" + splitPath.toAbsolutePath(), footerOffset));
+            new SplitInfo("file://" + splitPath.toAbsolutePath(), footerOffset, fileSize));
 
         SplitQuery query = new SplitWildcardQuery("title", "hel*");
 
@@ -211,7 +213,7 @@ public class PrescanIntegrationTest {
     public void testPrescanWithWildcardSuffix() throws IOException {
         // Test prescan with a suffix wildcard pattern
         List<SplitInfo> splits = Collections.singletonList(
-            new SplitInfo("file://" + splitPath.toAbsolutePath(), footerOffset));
+            new SplitInfo("file://" + splitPath.toAbsolutePath(), footerOffset, fileSize));
 
         SplitQuery query = new SplitWildcardQuery("title", "*world");
 
@@ -236,7 +238,7 @@ public class PrescanIntegrationTest {
         // Test prescan with a complex wildcard that doesn't match anything
         // Complex patterns (like xyz*abc with wildcard in middle) return conservative true
         List<SplitInfo> splits = Collections.singletonList(
-            new SplitInfo("file://" + splitPath.toAbsolutePath(), footerOffset));
+            new SplitInfo("file://" + splitPath.toAbsolutePath(), footerOffset, fileSize));
 
         SplitQuery query = new SplitWildcardQuery("title", "xyz*abc");
 
@@ -260,7 +262,7 @@ public class PrescanIntegrationTest {
     public void testPrescanWithNonMatchingPrefixWildcard() throws IOException {
         // Test prescan with a prefix wildcard that doesn't match any terms
         List<SplitInfo> splits = Collections.singletonList(
-            new SplitInfo("file://" + splitPath.toAbsolutePath(), footerOffset));
+            new SplitInfo("file://" + splitPath.toAbsolutePath(), footerOffset, fileSize));
 
         // "zzz*" should not match any terms in our test data
         SplitQuery query = new SplitWildcardQuery("title", "zzz*");
@@ -285,7 +287,7 @@ public class PrescanIntegrationTest {
     public void testPrescanWithNonMatchingSuffixWildcard() throws IOException {
         // Test prescan with a suffix wildcard that doesn't match any terms
         List<SplitInfo> splits = Collections.singletonList(
-            new SplitInfo("file://" + splitPath.toAbsolutePath(), footerOffset));
+            new SplitInfo("file://" + splitPath.toAbsolutePath(), footerOffset, fileSize));
 
         // "*zzz" should not match any terms in our test data
         SplitQuery query = new SplitWildcardQuery("title", "*zzz");
@@ -310,7 +312,7 @@ public class PrescanIntegrationTest {
     public void testPrescanSimpleReturnsMatchingUrls() throws IOException {
         // Test the convenience method that returns only matching URLs
         List<SplitInfo> splits = Collections.singletonList(
-            new SplitInfo("file://" + splitPath.toAbsolutePath(), footerOffset));
+            new SplitInfo("file://" + splitPath.toAbsolutePath(), footerOffset, fileSize));
 
         SplitQuery query = new SplitTermQuery("body", "document");
 
@@ -329,7 +331,7 @@ public class PrescanIntegrationTest {
     public void testPrescanWithBooleanQuery() throws IOException {
         // Test prescan with a boolean query (MUST + MUST)
         List<SplitInfo> splits = Collections.singletonList(
-            new SplitInfo("file://" + splitPath.toAbsolutePath(), footerOffset));
+            new SplitInfo("file://" + splitPath.toAbsolutePath(), footerOffset, fileSize));
 
         // Create a boolean query: title:hello AND body:document
         SplitQuery titleQuery = new SplitTermQuery("title", "hello");
@@ -359,7 +361,7 @@ public class PrescanIntegrationTest {
     public void testPrescanWithRawTokenizerField() throws IOException {
         // Test prescan with a field using raw tokenizer (exact match)
         List<SplitInfo> splits = Collections.singletonList(
-            new SplitInfo("file://" + splitPath.toAbsolutePath(), footerOffset));
+            new SplitInfo("file://" + splitPath.toAbsolutePath(), footerOffset, fileSize));
 
         // Raw tokenizer should match exact values
         SplitQuery query = new SplitTermQuery("tags", "java,rust");
@@ -385,6 +387,7 @@ public class PrescanIntegrationTest {
         Path splitPath2 = tempDir.resolve("test2_" + uniqueId2 + ".split");
 
         long footerOffset2 = 0;
+        long fileSize2 = 0;
         try (SchemaBuilder builder = new SchemaBuilder()) {
             builder.addTextField("title");
             builder.addTextField("body");
@@ -409,6 +412,7 @@ public class PrescanIntegrationTest {
                     QuickwitSplit.SplitMetadata metadata = QuickwitSplit.convertIndexFromPath(
                         indexDir2.toString(), splitPath2.toString(), splitConfig);
                     footerOffset2 = metadata.getFooterStartOffset();
+                    fileSize2 = metadata.getFooterEndOffset();
                 }
             }
         }
@@ -416,8 +420,8 @@ public class PrescanIntegrationTest {
         // Now prescan both splits for a term that only exists in one
         // Use actual footer offsets to ensure correct split parsing
         List<SplitInfo> splits = Arrays.asList(
-            new SplitInfo("file://" + splitPath.toAbsolutePath(), footerOffset),
-            new SplitInfo("file://" + splitPath2.toAbsolutePath(), footerOffset2));
+            new SplitInfo("file://" + splitPath.toAbsolutePath(), footerOffset, fileSize),
+            new SplitInfo("file://" + splitPath2.toAbsolutePath(), footerOffset2, fileSize2));
 
         // Search for "hello" which only exists in first split
         SplitQuery query = new SplitTermQuery("title", "hello");
@@ -443,7 +447,7 @@ public class PrescanIntegrationTest {
         // Test that a pure range query returns conservative true
         // (we can't efficiently evaluate range queries in FST prescan)
         List<SplitInfo> splits = Collections.singletonList(
-            new SplitInfo("file://" + splitPath.toAbsolutePath(), footerOffset));
+            new SplitInfo("file://" + splitPath.toAbsolutePath(), footerOffset, fileSize));
 
         // Create a range query on title field
         SplitQuery query = SplitRangeQuery.inclusiveRange("title", "a", "z", "str");
@@ -469,7 +473,7 @@ public class PrescanIntegrationTest {
         // Test that a Boolean query with range + non-existent term returns FALSE
         // The term clause should cause the query to fail, even though range is conservative true
         List<SplitInfo> splits = Collections.singletonList(
-            new SplitInfo("file://" + splitPath.toAbsolutePath(), footerOffset));
+            new SplitInfo("file://" + splitPath.toAbsolutePath(), footerOffset, fileSize));
 
         // Create boolean query: range:[a TO z] AND nonexistent_term
         SplitQuery rangeQuery = SplitRangeQuery.inclusiveRange("title", "a", "z", "str");
@@ -499,7 +503,7 @@ public class PrescanIntegrationTest {
     public void testPrescanWithRangeAndExistingTerm() throws IOException {
         // Test that a Boolean query with range + existing term returns TRUE
         List<SplitInfo> splits = Collections.singletonList(
-            new SplitInfo("file://" + splitPath.toAbsolutePath(), footerOffset));
+            new SplitInfo("file://" + splitPath.toAbsolutePath(), footerOffset, fileSize));
 
         // Create boolean query: range:[a TO z] AND hello
         SplitQuery rangeQuery = SplitRangeQuery.inclusiveRange("title", "a", "z", "str");
@@ -529,7 +533,7 @@ public class PrescanIntegrationTest {
     public void testPrescanResultDetails() throws IOException {
         // Test that prescan results include detailed term existence information
         List<SplitInfo> splits = Collections.singletonList(
-            new SplitInfo("file://" + splitPath.toAbsolutePath(), footerOffset));
+            new SplitInfo("file://" + splitPath.toAbsolutePath(), footerOffset, fileSize));
 
         SplitQuery query = new SplitTermQuery("title", "hello");
 

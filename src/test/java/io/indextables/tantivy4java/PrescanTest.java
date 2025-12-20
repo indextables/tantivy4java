@@ -58,23 +58,38 @@ public class PrescanTest {
 
     @Test
     public void testSplitInfoCreation() {
-        // Test basic SplitInfo creation
-        SplitInfo info = new SplitInfo("s3://bucket/split.split", 12345678L);
+        // Test basic SplitInfo creation with all 3 required parameters
+        SplitInfo info = new SplitInfo("s3://bucket/split.split", 12345678L, 50_000_000L);
         assertEquals("s3://bucket/split.split", info.getSplitUrl());
         assertEquals(12345678L, info.getFooterOffset());
+        assertEquals(50_000_000L, info.getFileSize());
     }
 
     @Test
     public void testSplitInfoRequiresSplitUrl() {
         assertThrows(NullPointerException.class, () -> {
-            new SplitInfo(null, 12345L);
+            new SplitInfo(null, 12345L, 50_000_000L);
         });
     }
 
     @Test
     public void testSplitInfoRequiresPositiveOffset() {
         assertThrows(IllegalArgumentException.class, () -> {
-            new SplitInfo("s3://bucket/split.split", -1L);
+            new SplitInfo("s3://bucket/split.split", -1L, 50_000_000L);
+        });
+    }
+
+    @Test
+    public void testSplitInfoRequiresPositiveFileSize() {
+        assertThrows(IllegalArgumentException.class, () -> {
+            new SplitInfo("s3://bucket/split.split", 12345L, 0L);
+        });
+    }
+
+    @Test
+    public void testSplitInfoRequiresFileSizeGreaterThanFooterOffset() {
+        assertThrows(IllegalArgumentException.class, () -> {
+            new SplitInfo("s3://bucket/split.split", 12345L, 1000L); // fileSize < footerOffset
         });
     }
 
@@ -188,11 +203,12 @@ public class PrescanTest {
 
     @Test
     public void testSplitInfoToString() {
-        SplitInfo info = new SplitInfo("s3://bucket/split.split", 12345L);
+        SplitInfo info = new SplitInfo("s3://bucket/split.split", 12345L, 50_000_000L);
         String str = info.toString();
 
         assertTrue(str.contains("s3://bucket/split.split"));
         assertTrue(str.contains("12345"));
+        assertTrue(str.contains("50000000"));
     }
 
     @Test

@@ -285,7 +285,7 @@ public class RealS3PrescanPerformanceTest {
                         );
 
                         String s3Url = "s3://" + TEST_BUCKET + "/" + s3Key;
-                        s3SplitInfos.add(new SplitInfo(s3Url, metadata.getFooterStartOffset()));
+                        s3SplitInfos.add(new SplitInfo(s3Url, metadata.getFooterStartOffset(), metadata.getFooterEndOffset()));
 
                         if (docMappingJson == null) {
                             docMappingJson = metadata.getDocMappingJson();

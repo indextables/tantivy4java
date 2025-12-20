@@ -35,6 +35,7 @@ public class PrescanPerformanceTest {
     private static String localSplitPath;
     private static String s3SplitPath;
     private static long footerOffset;
+    private static long fileSize;
     private static String docMappingJson;
 
     // AWS credentials loaded from ~/.aws/credentials
@@ -93,13 +94,14 @@ public class PrescanPerformanceTest {
 
                     localSplitPath = "file://" + splitFile.toString();
                     footerOffset = metadata.getFooterStartOffset();
+                    fileSize = metadata.getFooterEndOffset();
                     docMappingJson = metadata.getDocMappingJson();
                 }
             }
         }
 
         System.out.println("Local split: " + localSplitPath);
-        System.out.println("Footer offset: " + footerOffset);
+        System.out.println("Footer offset: " + footerOffset + ", File size: " + fileSize);
 
         // Load AWS credentials and upload to real S3
         loadAwsCredentials();
@@ -208,7 +210,7 @@ public class PrescanPerformanceTest {
                 .withMaxCacheSize(100_000_000);
 
         try (SplitCacheManager cacheManager = SplitCacheManager.getInstance(cacheConfig)) {
-            List<SplitInfo> splits = List.of(new SplitInfo(localSplitPath, footerOffset));
+            List<SplitInfo> splits = List.of(new SplitInfo(localSplitPath, footerOffset, fileSize));
 
             // Simple query
             SplitQuery simpleQuery = new SplitTermQuery("title", "hello");
@@ -267,7 +269,7 @@ public class PrescanPerformanceTest {
                 .withAwsRegion(TEST_REGION);
 
         try (SplitCacheManager cacheManager = SplitCacheManager.getInstance(cacheConfig)) {
-            List<SplitInfo> splits = List.of(new SplitInfo(s3SplitPath, footerOffset));
+            List<SplitInfo> splits = List.of(new SplitInfo(s3SplitPath, footerOffset, fileSize));
 
             // Simple query
             SplitQuery simpleQuery = new SplitTermQuery("title", "hello");

@@ -296,7 +296,7 @@ public class PrescanCacheVerificationTest {
                     QuickwitSplit.SplitMetadata metadata = QuickwitSplit.convertIndexFromPath(
                         indexDir.toString(), splitPath.toString(), splitConfig);
 
-                    SplitInfo splitInfo = new SplitInfo("file://" + splitPath.toString(), metadata.getFooterStartOffset());
+                    SplitInfo splitInfo = new SplitInfo("file://" + splitPath.toString(), metadata.getFooterStartOffset(), metadata.getFooterEndOffset());
                     return new SplitTestData(splitInfo, metadata);
                 }
             }

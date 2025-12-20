@@ -63,6 +63,7 @@ public class PrescanComprehensiveTest {
     private Path splitPath;
     private SplitCacheManager cacheManager;
     private long footerOffset;
+    private long fileSize;
     private String docMappingJson;
     private String uniqueId;
 
@@ -175,9 +176,11 @@ public class PrescanComprehensiveTest {
                             indexDir.toString(), splitPath.toString(), splitConfig);
 
                     footerOffset = metadata.getFooterStartOffset();
+                    fileSize = metadata.getFooterEndOffset();
                     docMappingJson = metadata.getDocMappingJson();
 
                     System.out.println("Created comprehensive split with " + metadata.getNumDocs() + " documents");
+                    System.out.println("File size: " + fileSize + ", Footer offset: " + footerOffset);
                     System.out.println("Doc mapping: " + docMappingJson);
                 }
             }
@@ -209,7 +212,7 @@ public class PrescanComprehensiveTest {
 
     private List<SplitInfo> getSplits() {
         return Collections.singletonList(
-            new SplitInfo("file://" + splitPath.toAbsolutePath(), footerOffset));
+            new SplitInfo("file://" + splitPath.toAbsolutePath(), footerOffset, fileSize));
     }
 
     // ============================================================
@@ -870,12 +873,13 @@ public class PrescanComprehensiveTest {
                             indexDir2.toString(), splitPath2.toString(), splitConfig2);
 
                     long footerOffset2 = metadata2.getFooterStartOffset();
+                    long fileSize2 = metadata2.getFooterEndOffset();
 
                     // Query for "hello" - only exists in split1, not split2
                     SplitQuery query = new SplitTermQuery("title", "hello");
                     List<SplitInfo> bothSplits = Arrays.asList(
-                        new SplitInfo("file://" + splitPath.toAbsolutePath(), footerOffset),
-                        new SplitInfo("file://" + splitPath2.toAbsolutePath(), footerOffset2)
+                        new SplitInfo("file://" + splitPath.toAbsolutePath(), footerOffset, fileSize),
+                        new SplitInfo("file://" + splitPath2.toAbsolutePath(), footerOffset2, fileSize2)
                     );
 
                     List<PrescanResult> results = cacheManager.prescanSplits(bothSplits, docMappingJson, query);
@@ -935,12 +939,13 @@ public class PrescanComprehensiveTest {
                             indexDir2.toString(), splitPath2.toString(), splitConfig2);
 
                     long footerOffset2 = metadata2.getFooterStartOffset();
+                    long fileSize2 = metadata2.getFooterEndOffset();
 
                     // Query for "world" - exists in both splits
                     SplitQuery query = new SplitTermQuery("title", "world");
                     List<SplitInfo> bothSplits = Arrays.asList(
-                        new SplitInfo("file://" + splitPath.toAbsolutePath(), footerOffset),
-                        new SplitInfo("file://" + splitPath2.toAbsolutePath(), footerOffset2)
+                        new SplitInfo("file://" + splitPath.toAbsolutePath(), footerOffset, fileSize),
+                        new SplitInfo("file://" + splitPath2.toAbsolutePath(), footerOffset2, fileSize2)
                     );
 
                     List<PrescanResult> results = cacheManager.prescanSplits(bothSplits, docMappingJson, query);
@@ -985,12 +990,13 @@ public class PrescanComprehensiveTest {
                             indexDir2.toString(), splitPath2.toString(), splitConfig2);
 
                     long footerOffset2 = metadata2.getFooterStartOffset();
+                    long fileSize2 = metadata2.getFooterEndOffset();
 
                     // Query for term that doesn't exist in either split
                     SplitQuery query = new SplitTermQuery("title", "nonexistent");
                     List<SplitInfo> bothSplits = Arrays.asList(
-                        new SplitInfo("file://" + splitPath.toAbsolutePath(), footerOffset),
-                        new SplitInfo("file://" + splitPath2.toAbsolutePath(), footerOffset2)
+                        new SplitInfo("file://" + splitPath.toAbsolutePath(), footerOffset, fileSize),
+                        new SplitInfo("file://" + splitPath2.toAbsolutePath(), footerOffset2, fileSize2)
                     );
 
                     List<PrescanResult> results = cacheManager.prescanSplits(bothSplits, docMappingJson, query);

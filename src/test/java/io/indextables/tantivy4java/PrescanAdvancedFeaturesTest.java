@@ -186,7 +186,7 @@ public class PrescanAdvancedFeaturesTest {
                         indexDir.toString(), splitPath.toString(), splitConfig);
 
                     // Use the actual footer offset from metadata
-                    return new SplitInfo("file://" + splitPath.toString(), metadata.getFooterStartOffset());
+                    return new SplitInfo("file://" + splitPath.toString(), metadata.getFooterStartOffset(), metadata.getFooterEndOffset());
                 }
             }
         }
@@ -288,7 +288,7 @@ public class PrescanAdvancedFeaturesTest {
                     QuickwitSplit.SplitMetadata metadata = QuickwitSplit.convertIndexFromPath(
                         indexDir.toString(), splitPath.toString(), splitConfig);
 
-                    return new SplitInfo("file://" + splitPath.toString(), metadata.getFooterStartOffset());
+                    return new SplitInfo("file://" + splitPath.toString(), metadata.getFooterStartOffset(), metadata.getFooterEndOffset());
                 }
             }
         }
@@ -457,7 +457,7 @@ public class PrescanAdvancedFeaturesTest {
                     QuickwitSplit.SplitMetadata metadata = QuickwitSplit.convertIndexFromPath(
                         indexDir.toString(), splitPath.toString(), splitConfig);
 
-                    return new SplitInfo("file://" + splitPath.toString(), metadata.getFooterStartOffset());
+                    return new SplitInfo("file://" + splitPath.toString(), metadata.getFooterStartOffset(), metadata.getFooterEndOffset());
                 }
             }
         }
@@ -532,7 +532,7 @@ public class PrescanAdvancedFeaturesTest {
                     QuickwitSplit.SplitMetadata metadata = QuickwitSplit.convertIndexFromPath(
                         indexDir.toString(), splitPath.toString(), splitConfig);
 
-                    return new SplitInfo("file://" + splitPath.toString(), metadata.getFooterStartOffset());
+                    return new SplitInfo("file://" + splitPath.toString(), metadata.getFooterStartOffset(), metadata.getFooterEndOffset());
                 }
             }
         }
@@ -725,7 +725,7 @@ public class PrescanAdvancedFeaturesTest {
                     QuickwitSplit.SplitMetadata metadata = QuickwitSplit.convertIndexFromPath(
                         indexDir.toString(), splitPath.toString(), splitConfig);
 
-                    return new SplitInfo("file://" + splitPath.toString(), metadata.getFooterStartOffset());
+                    return new SplitInfo("file://" + splitPath.toString(), metadata.getFooterStartOffset(), metadata.getFooterEndOffset());
                 }
             }
         }
@@ -761,8 +761,8 @@ public class PrescanAdvancedFeaturesTest {
     public void testError_InvalidFooterOffset() throws Exception {
         SplitInfo validSplitInfo = getOrCreateSimpleSplit();
 
-        // Use an invalid footer offset with the same URL
-        SplitInfo invalidSplitInfo = new SplitInfo(validSplitInfo.getSplitUrl(), 999999999L);
+        // Use an invalid footer offset with the same URL (fileSize must be > footerOffset)
+        SplitInfo invalidSplitInfo = new SplitInfo(validSplitInfo.getSplitUrl(), 999999999L, 1_000_000_000L);
         String docMappingJson = getSimpleDocMapping();
 
         SplitQuery query = new SplitTermQuery("title", "hello");
@@ -783,7 +783,7 @@ public class PrescanAdvancedFeaturesTest {
     @DisplayName("Error - Non-existent split file returns error status")
     public void testError_NonExistentFile() throws Exception {
         Path nonExistentPath = tempDir.resolve("nonexistent_" + UUID.randomUUID() + ".split");
-        SplitInfo splitInfo = new SplitInfo("file://" + nonExistentPath.toString(), 0L);
+        SplitInfo splitInfo = new SplitInfo("file://" + nonExistentPath.toString(), 0L, 1_000_000L);
         String docMappingJson = getSimpleDocMapping();
 
         SplitQuery query = new SplitTermQuery("title", "hello");
@@ -863,7 +863,7 @@ public class PrescanAdvancedFeaturesTest {
                         indexDir.toString(), splitPath.toString(), splitConfig);
 
                     // Use the actual footer offset from metadata
-                    return new SplitInfo("file://" + splitPath.toString(), metadata.getFooterStartOffset());
+                    return new SplitInfo("file://" + splitPath.toString(), metadata.getFooterStartOffset(), metadata.getFooterEndOffset());
                 }
             }
         }
