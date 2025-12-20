@@ -140,8 +140,8 @@ impl AsyncCacheManager {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_async_cache_manager_creation() {
+    #[tokio::test]
+    async fn test_async_cache_manager_creation() {
         let cache_manager = AsyncCacheManager::new();
         // Basic test - should create successfully
         assert!(cache_manager.storage_cache.try_lock().is_ok());

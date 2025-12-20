@@ -54,6 +54,7 @@ num_cpus = "1.0"
 memmap2 = "0.9.5"
 libc = "0.2"
 lru = "0.12"  # LRU cache for searcher caching
+tantivy-fst = "0.5"  # FST automaton for wildcard prescan
 
 [build-dependencies]
 jni = "0.21.1"

@@ -162,6 +162,16 @@ impl GlobalSplitCacheManager {
     pub fn get_storage_resolver(&self) -> quickwit_storage::StorageResolver {
         get_configured_storage_resolver(self.s3_config.clone(), self.azure_config.clone())
     }
+
+    /// Get the S3 configuration (if set) for use by prescan operations
+    pub fn get_s3_config(&self) -> Option<S3StorageConfig> {
+        self.s3_config.clone()
+    }
+
+    /// Get the Azure configuration (if set) for use by prescan operations
+    pub fn get_azure_config(&self) -> Option<AzureStorageConfig> {
+        self.azure_config.clone()
+    }
     
     // Get the global searcher context with all shared caches
     pub fn get_searcher_context(&self) -> Arc<quickwit_search::SearcherContext> {

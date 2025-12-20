@@ -510,10 +510,31 @@ fn get_shared_searcher_context() -> anyhow::Result<Arc<SearcherContext>> {
 use lru::LruCache;
 use std::num::NonZeroUsize;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
-// Default cache size: 1000 searchers (reasonably large for production)
-const DEFAULT_SEARCHER_CACHE_SIZE: usize = 1000;
+// Default cache size: 50,000 searchers (large for production workloads with many splits)
+// Can be configured via GlobalCacheConfig.withSearcherCacheSize() before first use
+const DEFAULT_SEARCHER_CACHE_SIZE: usize = 50_000;
+
+// Configured searcher cache size (set via GlobalCacheConfig before cache initialization)
+static CONFIGURED_SEARCHER_CACHE_SIZE: AtomicUsize = AtomicUsize::new(0);
+
+/// Set the searcher cache size. Must be called BEFORE get_searcher_cache() is first called.
+/// Called from GlobalCacheConfig.initialize() via JNI.
+pub fn set_searcher_cache_size(size: usize) {
+    CONFIGURED_SEARCHER_CACHE_SIZE.store(size, Ordering::SeqCst);
+    debug_println!("RUST DEBUG: Searcher cache size configured to {} entries", size);
+}
+
+/// Get the configured searcher cache size
+fn get_searcher_cache_size() -> usize {
+    let configured = CONFIGURED_SEARCHER_CACHE_SIZE.load(Ordering::SeqCst);
+    if configured > 0 {
+        configured
+    } else {
+        DEFAULT_SEARCHER_CACHE_SIZE
+    }
+}
 
 // Cache statistics for monitoring
 lazy_static::lazy_static! {
@@ -524,11 +545,31 @@ lazy_static::lazy_static! {
 
 static SEARCHER_CACHE: OnceLock<Mutex<LruCache<String, Arc<tantivy::Searcher>>>> = OnceLock::new();
 
-fn get_searcher_cache() -> &'static Mutex<LruCache<String, Arc<tantivy::Searcher>>> {
+/// Get the global searcher cache - shared between regular search and prescan
+pub fn get_searcher_cache() -> &'static Mutex<LruCache<String, Arc<tantivy::Searcher>>> {
     SEARCHER_CACHE.get_or_init(|| {
-        let capacity = NonZeroUsize::new(DEFAULT_SEARCHER_CACHE_SIZE).unwrap();
+        let cache_size = get_searcher_cache_size();
+        debug_println!("RUST DEBUG: Initializing searcher cache with {} entries", cache_size);
+        let capacity = NonZeroUsize::new(cache_size).unwrap();
         Mutex::new(LruCache::new(capacity))
     })
+}
+
+/// Try to get a cached searcher by split URL
+pub fn get_cached_searcher(split_url: &str) -> Option<Arc<tantivy::Searcher>> {
+    let cache = get_searcher_cache();
+    let mut guard = cache.lock().ok()?;
+    guard.get(split_url).cloned()
+}
+
+/// Store a searcher in the cache
+pub fn cache_searcher(split_url: String, searcher: Arc<tantivy::Searcher>) {
+    let cache = get_searcher_cache();
+    if let Ok(mut guard) = cache.lock() {
+        if guard.push(split_url, searcher).is_some() {
+            SEARCHER_CACHE_EVICTIONS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
 }
 
 /// Simple data structure to hold search results for JNI integration

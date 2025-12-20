@@ -113,6 +113,13 @@ impl DocumentBuilder {
             .push(OwnedValue::IpAddr(ipv6_value));
     }
 
+    pub fn add_bytes(&mut self, field_name: String, value: Vec<u8>) {
+        self.field_values
+            .entry(field_name)
+            .or_default()
+            .push(OwnedValue::Bytes(value));
+    }
+
     pub fn add_json(&mut self, field_name: String, json_object: BTreeMap<String, OwnedValue>) {
         // Convert BTreeMap to Vec<(String, OwnedValue)> for tantivy
         let json_vec: Vec<(String, OwnedValue)> = json_object.into_iter().collect();
@@ -148,6 +155,7 @@ impl DocumentBuilder {
                     OwnedValue::Bool(b) => doc.add_bool(field, b),
                     OwnedValue::Date(dt) => doc.add_date(field, dt),
                     OwnedValue::IpAddr(ipv6) => doc.add_ip_addr(field, ipv6),
+                    OwnedValue::Bytes(bytes) => doc.add_bytes(field, &bytes),
                     OwnedValue::Object(obj) => {
                         // Convert Vec<(String, OwnedValue)> to BTreeMap for tantivy
                         let json_map: BTreeMap<String, OwnedValue> = obj.into_iter().collect();
@@ -684,11 +692,38 @@ pub extern "system" fn Java_io_indextables_tantivy4java_core_Document_nativeAddF
 pub extern "system" fn Java_io_indextables_tantivy4java_core_Document_nativeAddBytes(
     mut env: JNIEnv,
     _class: JClass,
-    _ptr: jlong,
-    _field_name: JString,
-    _bytes: JByteArray,
+    ptr: jlong,
+    field_name: JString,
+    bytes: JByteArray,
 ) {
-    handle_error(&mut env, "Document native methods not fully implemented yet");
+    let field_name_str: String = match env.get_string(&field_name) {
+        Ok(s) => s.into(),
+        Err(_) => {
+            handle_error(&mut env, "Invalid field name");
+            return;
+        }
+    };
+
+    // Convert JByteArray to Vec<u8>
+    let bytes_vec: Vec<u8> = match env.convert_byte_array(bytes) {
+        Ok(b) => b,
+        Err(_) => {
+            handle_error(&mut env, "Failed to convert byte array");
+            return;
+        }
+    };
+
+    with_arc_safe::<Mutex<DocumentWrapper>, ()>(ptr, |wrapper_mutex| {
+        let mut wrapper = wrapper_mutex.lock().unwrap();
+        match &mut *wrapper {
+            DocumentWrapper::Builder(doc_builder) => {
+                doc_builder.add_bytes(field_name_str, bytes_vec);
+            },
+            DocumentWrapper::Retrieved(_) => {
+                // Retrieved documents are read-only
+            }
+        }
+    });
 }
 
 #[no_mangle]

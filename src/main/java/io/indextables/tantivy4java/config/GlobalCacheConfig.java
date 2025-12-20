@@ -24,6 +24,12 @@ public class GlobalCacheConfig {
     private long splitCacheGB = 10; // 10GB default
     private int splitCacheMaxSplits = 10000;
     private String splitCachePath = null; // null means use temp directory
+
+    // Searcher cache configuration
+    private int searcherCacheSize = 50000; // 50,000 searcher entries default
+
+    // Prescan parallelism configuration
+    private int prescanParallelism = 16; // 16 concurrent prescan operations default
     
     private static boolean initialized = false;
     
@@ -124,7 +130,27 @@ public class GlobalCacheConfig {
         this.splitCachePath = path;
         return this;
     }
-    
+
+    /**
+     * Set the searcher cache size (number of cached Tantivy Searcher instances).
+     * This is an LRU cache that caches searchers by split URL.
+     * Default: 50000 entries
+     */
+    public GlobalCacheConfig withSearcherCacheSize(int size) {
+        this.searcherCacheSize = size;
+        return this;
+    }
+
+    /**
+     * Set the prescan parallelism (number of concurrent prescan operations).
+     * This controls how many splits are checked in parallel during prescan.
+     * Default: 16 concurrent operations
+     */
+    public GlobalCacheConfig withPrescanParallelism(int parallelism) {
+        this.prescanParallelism = parallelism;
+        return this;
+    }
+
     /**
      * Initialize the global cache with this configuration.
      * This can only be called once. Subsequent calls will be ignored.
@@ -146,7 +172,9 @@ public class GlobalCacheConfig {
             warmupMemoryGB,
             splitCacheGB,
             splitCacheMaxSplits,
-            splitCachePath
+            splitCachePath,
+            searcherCacheSize,
+            prescanParallelism
         );
         
         if (success) {
@@ -174,7 +202,9 @@ public class GlobalCacheConfig {
         long warmupMemoryGB,
         long splitCacheGB,
         int splitCacheMaxSplits,
-        String splitCachePath
+        String splitCachePath,
+        int searcherCacheSize,
+        int prescanParallelism
     );
     
     static {

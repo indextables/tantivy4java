@@ -5219,6 +5219,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "tantivy",
+ "tantivy-fst",
  "tempfile",
  "time",
  "tokio",

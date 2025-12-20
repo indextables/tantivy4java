@@ -50,6 +50,8 @@ mod extract_helpers;
 mod global_cache;  // Global cache infrastructure following Quickwit's pattern
 mod simple_batch_optimization;  // Priority 1: Simplified batch optimization with range consolidation
 mod adaptive_tuning;  // Priority 5: Adaptive tuning engine for automatic parameter optimization
+mod prescan;  // FST-based term existence checking for split filtering
+mod fst_cache;  // Simple 2-tier FST/term dictionary cache (memory LRU + disk)
 
 pub use schema::*;
 pub use document::*;
@@ -88,13 +90,28 @@ pub extern "system" fn Java_io_indextables_tantivy4java_config_GlobalCacheConfig
     split_cache_gb: jni::sys::jlong,
     split_cache_max_splits: jni::sys::jint,
     split_cache_path: jni::objects::JString,
+    searcher_cache_size: jni::sys::jint,
+    prescan_parallelism: jni::sys::jint,
 ) -> jni::sys::jboolean {
     use bytesize::ByteSize;
     use std::num::NonZeroU32;
     use std::path::PathBuf;
     use crate::global_cache::{GlobalCacheConfig, initialize_global_cache};
+    use crate::split_searcher_replacement::set_searcher_cache_size;
+    use crate::prescan::set_prescan_parallelism;
     use quickwit_config::SplitCacheLimits;
-    
+
+    // Set searcher cache size BEFORE initializing global cache
+    // This must happen before any searcher is created
+    if searcher_cache_size > 0 {
+        set_searcher_cache_size(searcher_cache_size as usize);
+    }
+
+    // Set prescan parallelism BEFORE any prescan operations
+    if prescan_parallelism > 0 {
+        set_prescan_parallelism(prescan_parallelism as usize);
+    }
+
     let split_cache_path_opt = if !split_cache_path.is_null() {
         match env.get_string(&split_cache_path) {
             Ok(path_str) => {
@@ -110,7 +127,7 @@ pub extern "system" fn Java_io_indextables_tantivy4java_config_GlobalCacheConfig
     } else {
         None
     };
-    
+
     let split_cache_limits = if split_cache_gb > 0 && split_cache_max_splits > 0 {
         Some(SplitCacheLimits {
             max_num_bytes: ByteSize::gb(split_cache_gb as u64),
@@ -121,7 +138,7 @@ pub extern "system" fn Java_io_indextables_tantivy4java_config_GlobalCacheConfig
     } else {
         None
     };
-    
+
     let config = GlobalCacheConfig {
         fast_field_cache_capacity: ByteSize::mb(fast_field_cache_mb as u64),
         split_footer_cache_capacity: ByteSize::mb(split_footer_cache_mb as u64),
@@ -133,7 +150,7 @@ pub extern "system" fn Java_io_indextables_tantivy4java_config_GlobalCacheConfig
         split_cache_limits,
         split_cache_root_path: split_cache_path_opt,
     };
-    
+
     if initialize_global_cache(config) {
         jni::sys::JNI_TRUE
     } else {

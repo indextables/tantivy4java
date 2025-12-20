@@ -474,6 +474,18 @@ pub fn convert_split_query_to_ast(env: &mut JNIEnv, query_obj: &JObject) -> Resu
             // Create QueryAst directly using native Quickwit structures
             convert_phrase_query_to_query_ast(env, query_obj)
         }
+        "io.indextables.tantivy4java.split.SplitWildcardQuery" => {
+            // Create QueryAst directly using native Quickwit structures
+            convert_wildcard_query_to_query_ast(env, query_obj)
+        }
+        "io.indextables.tantivy4java.split.SplitExistsQuery" => {
+            // Create QueryAst directly using native Quickwit structures
+            convert_exists_query_to_query_ast(env, query_obj)
+        }
+        "io.indextables.tantivy4java.split.SplitRegexQuery" => {
+            // Create QueryAst directly using native Quickwit structures
+            convert_regex_query_to_query_ast(env, query_obj)
+        }
         _ => {
             Err(anyhow!("Unsupported SplitQuery type: {}", class_name))
         }
@@ -873,4 +885,186 @@ pub fn remove_searcher_schema(searcher_ptr: jlong) -> bool {
         debug_println!("RUST DEBUG: ❌ No schema mapping found to remove for searcher {}", searcher_ptr);
         false
     }
+}
+
+/// Convert a SplitWildcardQuery to QueryAst JSON (FOR TESTING ONLY - Production should use SplitSearcher.search() directly)
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitWildcardQuery_toQueryAstJson(
+    mut env: JNIEnv,
+    obj: JObject,
+) -> jstring {
+    let result = convert_wildcard_query_to_ast(&mut env, &obj);
+    match result {
+        Ok(json) => {
+            match env.new_string(json) {
+                Ok(jstring) => jstring.into_raw(),
+                Err(e) => {
+                    debug_println!("RUST DEBUG: Failed to create JString from QueryAst JSON: {}", e);
+                    crate::common::to_java_exception(&mut env, &anyhow::anyhow!("Failed to create JString from QueryAst JSON: {}", e));
+                    std::ptr::null_mut()
+                }
+            }
+        }
+        Err(e) => {
+            debug_println!("RUST DEBUG: Error converting SplitWildcardQuery to QueryAst: {}", e);
+            crate::common::to_java_exception(&mut env, &e);
+            std::ptr::null_mut()
+        }
+    }
+}
+
+// Wrapper function for JNI layer - converts to JSON string
+fn convert_wildcard_query_to_ast(env: &mut JNIEnv, obj: &JObject) -> Result<String> {
+    let query_ast = convert_wildcard_query_to_query_ast(env, obj)?;
+    convert_query_ast_to_json_string(query_ast)
+}
+
+fn convert_wildcard_query_to_query_ast(env: &mut JNIEnv, obj: &JObject) -> Result<QueryAst> {
+    // Extract field, pattern, and lenient from Java SplitWildcardQuery object
+    let field_obj = env.get_field(obj, "field", "Ljava/lang/String;")
+        .map_err(|e| anyhow!("Failed to get field: {}", e))?;
+    let pattern_obj = env.get_field(obj, "pattern", "Ljava/lang/String;")
+        .map_err(|e| anyhow!("Failed to get pattern: {}", e))?;
+    let lenient_obj = env.get_field(obj, "lenient", "Z")
+        .map_err(|e| anyhow!("Failed to get lenient: {}", e))?;
+
+    let field_jstring: JString = field_obj.l()?.into();
+    let pattern_jstring: JString = pattern_obj.l()?.into();
+
+    let field: String = env.get_string(&field_jstring)?.into();
+    let value: String = env.get_string(&pattern_jstring)?.into();
+    let lenient: bool = lenient_obj.z()?;
+
+    debug_println!("RUST DEBUG: SplitWildcardQuery - field: '{}', pattern: '{}', lenient: {}",
+                   field, value, lenient);
+
+    // Create proper Quickwit QueryAst using official WildcardQuery structure
+    use quickwit_query::query_ast::WildcardQuery;
+
+    let wildcard_query = WildcardQuery {
+        field,
+        value,
+        lenient,
+    };
+
+    let query_ast = QueryAst::Wildcard(wildcard_query);
+
+    debug_println!("RUST DEBUG: Created WildcardQuery QueryAst using native Quickwit structures");
+    Ok(query_ast)
+}
+
+/// Convert a SplitExistsQuery to QueryAst JSON (FOR TESTING ONLY - Production should use SplitSearcher.search() directly)
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitExistsQuery_toQueryAstJson(
+    mut env: JNIEnv,
+    obj: JObject,
+) -> jstring {
+    let result = convert_exists_query_to_ast(&mut env, &obj);
+    match result {
+        Ok(json) => {
+            match env.new_string(json) {
+                Ok(jstring) => jstring.into_raw(),
+                Err(e) => {
+                    debug_println!("RUST DEBUG: Failed to create JString from QueryAst JSON: {}", e);
+                    crate::common::to_java_exception(&mut env, &anyhow::anyhow!("Failed to create JString from QueryAst JSON: {}", e));
+                    std::ptr::null_mut()
+                }
+            }
+        }
+        Err(e) => {
+            debug_println!("RUST DEBUG: Error converting SplitExistsQuery to QueryAst: {}", e);
+            crate::common::to_java_exception(&mut env, &e);
+            std::ptr::null_mut()
+        }
+    }
+}
+
+// Wrapper function for JNI layer - converts to JSON string
+fn convert_exists_query_to_ast(env: &mut JNIEnv, obj: &JObject) -> Result<String> {
+    let query_ast = convert_exists_query_to_query_ast(env, obj)?;
+    convert_query_ast_to_json_string(query_ast)
+}
+
+fn convert_exists_query_to_query_ast(env: &mut JNIEnv, obj: &JObject) -> Result<QueryAst> {
+    // Extract field from Java SplitExistsQuery object
+    let field_obj = env.get_field(obj, "field", "Ljava/lang/String;")
+        .map_err(|e| anyhow!("Failed to get field: {}", e))?;
+
+    let field_jstring: JString = field_obj.l()?.into();
+    let field: String = env.get_string(&field_jstring)?.into();
+
+    debug_println!("RUST DEBUG: SplitExistsQuery - field: '{}'", field);
+
+    // Create proper Quickwit QueryAst using FieldPresenceQuery structure
+    use quickwit_query::query_ast::FieldPresenceQuery;
+
+    let field_presence_query = FieldPresenceQuery {
+        field,
+    };
+
+    let query_ast = QueryAst::FieldPresence(field_presence_query);
+
+    debug_println!("RUST DEBUG: Created FieldPresenceQuery QueryAst using native Quickwit structures");
+    Ok(query_ast)
+}
+
+/// Convert a SplitRegexQuery to QueryAst JSON (FOR TESTING ONLY - Production should use SplitSearcher.search() directly)
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitRegexQuery_toQueryAstJson(
+    mut env: JNIEnv,
+    obj: JObject,
+) -> jstring {
+    let result = convert_regex_query_to_ast(&mut env, &obj);
+    match result {
+        Ok(json) => {
+            match env.new_string(json) {
+                Ok(jstring) => jstring.into_raw(),
+                Err(e) => {
+                    debug_println!("RUST DEBUG: Failed to create JString from QueryAst JSON: {}", e);
+                    crate::common::to_java_exception(&mut env, &anyhow::anyhow!("Failed to create JString from QueryAst JSON: {}", e));
+                    std::ptr::null_mut()
+                }
+            }
+        }
+        Err(e) => {
+            debug_println!("RUST DEBUG: Error converting SplitRegexQuery to QueryAst: {}", e);
+            crate::common::to_java_exception(&mut env, &e);
+            std::ptr::null_mut()
+        }
+    }
+}
+
+// Wrapper function for JNI layer - converts to JSON string
+fn convert_regex_query_to_ast(env: &mut JNIEnv, obj: &JObject) -> Result<String> {
+    let query_ast = convert_regex_query_to_query_ast(env, obj)?;
+    convert_query_ast_to_json_string(query_ast)
+}
+
+pub fn convert_regex_query_to_query_ast(env: &mut JNIEnv, obj: &JObject) -> Result<QueryAst> {
+    // Extract field and pattern from Java SplitRegexQuery object
+    let field_obj = env.get_field(obj, "field", "Ljava/lang/String;")
+        .map_err(|e| anyhow!("Failed to get field: {}", e))?;
+    let pattern_obj = env.get_field(obj, "pattern", "Ljava/lang/String;")
+        .map_err(|e| anyhow!("Failed to get pattern: {}", e))?;
+
+    let field_jstring: JString = field_obj.l()?.into();
+    let pattern_jstring: JString = pattern_obj.l()?.into();
+
+    let field: String = env.get_string(&field_jstring)?.into();
+    let regex: String = env.get_string(&pattern_jstring)?.into();
+
+    debug_println!("RUST DEBUG: SplitRegexQuery - field: '{}', pattern: '{}'", field, regex);
+
+    // Create proper Quickwit QueryAst using RegexQuery structure
+    use quickwit_query::query_ast::RegexQuery;
+
+    let regex_query = RegexQuery {
+        field,
+        regex,
+    };
+
+    let query_ast = QueryAst::Regex(regex_query);
+
+    debug_println!("RUST DEBUG: Created RegexQuery QueryAst using native Quickwit structures");
+    Ok(query_ast)
 }

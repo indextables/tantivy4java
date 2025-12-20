@@ -896,6 +896,12 @@ fn wildcard_to_regex_preserve_case(pattern: &str) -> String {
     regex
 }
 
+/// Alias for wildcard_to_regex_preserve_case (used by tests)
+#[cfg(test)]
+fn wildcard_to_regex(pattern: &str) -> String {
+    wildcard_to_regex_preserve_case(pattern)
+}
+
 
 /// Tokenize a pattern using the field's actual tokenizer to determine token boundaries
 fn tokenize_pattern_for_field(schema: &Schema, field: Field, pattern: &str) -> Vec<String> {

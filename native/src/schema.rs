@@ -20,7 +20,7 @@
 use jni::objects::{JClass, JString};
 use jni::sys::{jboolean, jlong, jint, jobject};
 use jni::JNIEnv;
-use tantivy::schema::{SchemaBuilder, TextOptions, NumericOptions, DateOptions, IpAddrOptions, JsonObjectOptions};
+use tantivy::schema::{SchemaBuilder, TextOptions, NumericOptions, DateOptions, IpAddrOptions, JsonObjectOptions, BytesOptions};
 use tantivy::schema::{IndexRecordOption, TextFieldIndexing, DateTimePrecision};
 use crate::utils::{handle_error, with_arc_safe, arc_to_jlong, release_arc};
 use crate::debug_println;
@@ -558,14 +558,39 @@ pub extern "system" fn Java_io_indextables_tantivy4java_core_SchemaBuilder_nativ
 pub extern "system" fn Java_io_indextables_tantivy4java_core_SchemaBuilder_nativeAddBytesField(
     mut env: JNIEnv,
     _class: JClass,
-    _ptr: jlong,
-    _name: JString,
-    _stored: jboolean,
-    _indexed: jboolean,
-    _fast: jboolean,
+    ptr: jlong,
+    name: JString,
+    stored: jboolean,
+    indexed: jboolean,
+    fast: jboolean,
     _index_option: JString,
 ) {
-    handle_error(&mut env, "SchemaBuilder native methods not fully implemented yet");
+    let field_name: String = match env.get_string(&name) {
+        Ok(s) => s.into(),
+        Err(_) => {
+            handle_error(&mut env, "Invalid field name");
+            return;
+        }
+    };
+
+    with_arc_safe::<Mutex<SchemaBuilder>, ()>(ptr, |builder_mutex| {
+        let mut builder = builder_mutex.lock().unwrap();
+        let mut bytes_options = BytesOptions::default();
+
+        if stored != 0 {
+            bytes_options = bytes_options.set_stored();
+        }
+
+        if indexed != 0 {
+            bytes_options = bytes_options.set_indexed();
+        }
+
+        if fast != 0 {
+            bytes_options = bytes_options.set_fast();
+        }
+
+        builder.add_bytes_field(&field_name, bytes_options);
+    });
 }
 
 #[no_mangle]

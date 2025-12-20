@@ -915,7 +915,316 @@ public class SplitCacheManager implements AutoCloseable {
         // Remove from instances using the cache key
         instances.remove(cacheKey);
     }
-    
+
+    // ========================================
+    // PRESCAN API - Term Existence Filtering
+    // ========================================
+
+    /**
+     * Prescan multiple splits to determine which could have results for a query.
+     *
+     * <p>This method checks term existence in the FST (term dictionary) only,
+     * without loading posting lists. This is significantly faster than a full search
+     * and allows filtering out splits that definitely won't have results.
+     *
+     * <p>All fetched data (footers, term dictionaries) is cached for subsequent
+     * full searches using the same cache infrastructure.
+     *
+     * <h3>Conservative Approximation</h3>
+     * The prescan performs a conservative approximation:
+     * <ul>
+     *   <li><b>"No results" = CERTAIN</b> - term doesn't exist in FST, so no documents can match</li>
+     *   <li><b>"Maybe results" = UNCERTAIN</b> - term exists, but full query might still return 0</li>
+     * </ul>
+     *
+     * <h3>Query Type Handling</h3>
+     * <ul>
+     *   <li>TermQuery: term must exist in FST</li>
+     *   <li>BooleanQuery (MUST): ALL must terms must exist</li>
+     *   <li>BooleanQuery (SHOULD): at least one should term must exist</li>
+     *   <li>PhraseQuery: ALL phrase terms must exist (conservative)</li>
+     *   <li>WildcardQuery: FST automaton matching</li>
+     *   <li>RangeQuery: conservatively returns true (skipped)</li>
+     *   <li>MatchAllQuery: always returns true</li>
+     * </ul>
+     *
+     * <h3>Usage Example</h3>
+     * <pre>{@code
+     * // Prepare split infos with footer offsets (from metastore)
+     * List<SplitInfo> splits = Arrays.asList(
+     *     new SplitInfo("s3://bucket/split1.split", 1234567890L),
+     *     new SplitInfo("s3://bucket/split2.split", 2345678901L)
+     * );
+     *
+     * // Doc mapping JSON (from index configuration)
+     * String docMappingJson = "{\"field_mappings\": [...]}";
+     *
+     * // Prescan to find matching splits
+     * List<PrescanResult> results = cacheManager.prescanSplits(splits, docMappingJson, query);
+     *
+     * // Only search splits that could have results
+     * for (PrescanResult result : results) {
+     *     if (result.couldHaveResults()) {
+     *         // Search this split
+     *     }
+     * }
+     * }</pre>
+     *
+     * @param splits List of SplitInfo (url + footerOffset) - REQUIRED
+     * @param docMappingJson Document mapping JSON with field types/tokenizers - REQUIRED
+     * @param query The query to check against
+     * @return List of PrescanResult with detailed term existence info
+     * @throws IOException if there's an error accessing splits
+     * @throws IllegalArgumentException if splits or docMappingJson is null
+     */
+    public List<PrescanResult> prescanSplits(
+            List<SplitInfo> splits,
+            String docMappingJson,
+            SplitQuery query) throws java.io.IOException {
+        // Default: don't warmup fast fields (only term dictionaries)
+        return prescanSplits(splits, docMappingJson, query, false);
+    }
+
+    /**
+     * Prescan multiple splits to determine which could have results for a query.
+     *
+     * <p>This method checks term existence in the term dictionary (FST) only,
+     * without loading posting lists. Results are cached for subsequent
+     * full searches using the same cache infrastructure.
+     *
+     * @param splits List of SplitInfo (url + footerOffset) - REQUIRED
+     * @param docMappingJson Document mapping JSON with field types/tokenizers - REQUIRED
+     * @param query The query to check against
+     * @param warmupFastFields If true, also cache fast fields during prescan.
+     *                         This is useful if you know you'll search matching splits
+     *                         immediately after prescan, as it reduces subsequent I/O.
+     *                         Default is false for maximum prescan efficiency.
+     * @return List of PrescanResult with detailed term existence info
+     * @throws IOException if there's an error accessing splits
+     * @throws IllegalArgumentException if splits or docMappingJson is null
+     */
+    public List<PrescanResult> prescanSplits(
+            List<SplitInfo> splits,
+            String docMappingJson,
+            SplitQuery query,
+            boolean warmupFastFields) throws java.io.IOException {
+
+        if (splits == null) {
+            throw new IllegalArgumentException("splits list cannot be null");
+        }
+        if (docMappingJson == null || docMappingJson.trim().isEmpty()) {
+            throw new IllegalArgumentException("docMappingJson is required for term normalization");
+        }
+        if (query == null) {
+            throw new IllegalArgumentException("query cannot be null");
+        }
+
+        if (splits.isEmpty()) {
+            return Collections.emptyList();
+        }
+
+        // Convert SplitInfo list to JSON for native layer
+        StringBuilder splitInfosJson = new StringBuilder("[");
+        for (int i = 0; i < splits.size(); i++) {
+            SplitInfo info = splits.get(i);
+            if (i > 0) splitInfosJson.append(",");
+            splitInfosJson.append("{\"splitUrl\":\"")
+                .append(escapeJson(info.getSplitUrl()))
+                .append("\",\"footerOffset\":")
+                .append(info.getFooterOffset())
+                .append("}");
+        }
+        splitInfosJson.append("]");
+
+        // Get query AST JSON
+        String queryAstJson = query.toQueryAstJson();
+
+        // Call native prescan with warmup option
+        String resultsJson = nativePrescanSplits(
+            nativePtr,
+            splitInfosJson.toString(),
+            docMappingJson,
+            queryAstJson,
+            warmupFastFields
+        );
+
+        // Debug output for prescan results
+        if ("1".equals(System.getenv("TANTIVY4JAVA_DEBUG"))) {
+            System.out.println("JAVA DEBUG: nativePrescanSplits returned: " + resultsJson);
+        }
+
+        // Parse results JSON
+        return parsePrescanResults(resultsJson);
+    }
+
+    /**
+     * Convenience method returning only matching URLs.
+     *
+     * @param splits List of SplitInfo (url + footerOffset) - REQUIRED
+     * @param docMappingJson Document mapping JSON with field types/tokenizers - REQUIRED
+     * @param query The query to check against
+     * @return List of split URLs that could potentially have results
+     * @throws IOException if there's an error accessing splits
+     */
+    public List<String> prescanSplitsSimple(
+            List<SplitInfo> splits,
+            String docMappingJson,
+            SplitQuery query) throws java.io.IOException {
+        return prescanSplitsSimple(splits, docMappingJson, query, false);
+    }
+
+    /**
+     * Convenience method returning only matching URLs, with option to warmup fast fields.
+     *
+     * @param splits List of SplitInfo (url + footerOffset) - REQUIRED
+     * @param docMappingJson Document mapping JSON with field types/tokenizers - REQUIRED
+     * @param query The query to check against
+     * @param warmupFastFields If true, also cache fast fields during prescan
+     * @return List of split URLs that could potentially have results
+     * @throws IOException if there's an error accessing splits
+     */
+    public List<String> prescanSplitsSimple(
+            List<SplitInfo> splits,
+            String docMappingJson,
+            SplitQuery query,
+            boolean warmupFastFields) throws java.io.IOException {
+
+        List<PrescanResult> results = prescanSplits(splits, docMappingJson, query, warmupFastFields);
+        List<String> matchingUrls = new ArrayList<>();
+        for (PrescanResult result : results) {
+            if (result.couldHaveResults()) {
+                matchingUrls.add(result.getSplitUrl());
+            }
+        }
+        return matchingUrls;
+    }
+
+    /**
+     * Escape special characters in JSON string values.
+     */
+    private static String escapeJson(String value) {
+        if (value == null) return "";
+        StringBuilder sb = new StringBuilder();
+        for (char c : value.toCharArray()) {
+            switch (c) {
+                case '"': sb.append("\\\""); break;
+                case '\\': sb.append("\\\\"); break;
+                case '\n': sb.append("\\n"); break;
+                case '\r': sb.append("\\r"); break;
+                case '\t': sb.append("\\t"); break;
+                default: sb.append(c);
+            }
+        }
+        return sb.toString();
+    }
+
+    /**
+     * Parse prescan results JSON from native layer.
+     */
+    private List<PrescanResult> parsePrescanResults(String resultsJson) {
+        List<PrescanResult> results = new ArrayList<>();
+
+        if (resultsJson == null || resultsJson.trim().isEmpty() || resultsJson.equals("[]")) {
+            return results;
+        }
+
+        // Simple JSON array parsing - each element is a PrescanResult
+        // Format: [{"splitUrl":"...", "couldHaveResults":true, "status":"SUCCESS", ...}, ...]
+        try {
+            // Remove outer brackets
+            String content = resultsJson.trim();
+            if (content.startsWith("[")) content = content.substring(1);
+            if (content.endsWith("]")) content = content.substring(0, content.length() - 1);
+
+            if (content.trim().isEmpty()) {
+                return results;
+            }
+
+            // Split by },{ to get individual objects (simple approach)
+            // This is a simplified parser - production might use a proper JSON library
+            int depth = 0;
+            int start = 0;
+            for (int i = 0; i < content.length(); i++) {
+                char c = content.charAt(i);
+                if (c == '{') depth++;
+                else if (c == '}') {
+                    depth--;
+                    if (depth == 0) {
+                        String objStr = content.substring(start, i + 1).trim();
+                        if (objStr.startsWith(",")) objStr = objStr.substring(1).trim();
+                        results.add(parsePrescanResult(objStr));
+                        start = i + 1;
+                    }
+                }
+            }
+        } catch (Exception e) {
+            // If parsing fails, return empty list
+            System.err.println("Warning: Failed to parse prescan results: " + e.getMessage());
+        }
+
+        return results;
+    }
+
+    /**
+     * Parse a single PrescanResult from JSON object string.
+     */
+    private PrescanResult parsePrescanResult(String json) {
+        String splitUrl = extractJsonString(json, "splitUrl");
+        boolean couldHaveResults = extractJsonBoolean(json, "couldHaveResults");
+        String statusStr = extractJsonString(json, "status");
+        String errorMessage = extractJsonString(json, "errorMessage");
+
+        PrescanResult.PrescanStatus status;
+        try {
+            status = PrescanResult.PrescanStatus.valueOf(statusStr);
+        } catch (Exception e) {
+            status = PrescanResult.PrescanStatus.SUCCESS;
+        }
+
+        // Parse term existence map
+        Map<String, Boolean> termExistence = new HashMap<>();
+        int termExistenceStart = json.indexOf("\"termExistence\"");
+        if (termExistenceStart >= 0) {
+            int mapStart = json.indexOf("{", termExistenceStart);
+            int mapEnd = json.indexOf("}", mapStart);
+            if (mapStart >= 0 && mapEnd > mapStart) {
+                String mapContent = json.substring(mapStart + 1, mapEnd);
+                // Parse key:value pairs
+                String[] pairs = mapContent.split(",");
+                for (String pair : pairs) {
+                    String[] kv = pair.split(":");
+                    if (kv.length == 2) {
+                        String key = kv[0].trim().replaceAll("\"", "");
+                        boolean value = kv[1].trim().equals("true");
+                        if (!key.isEmpty()) {
+                            termExistence.put(key, value);
+                        }
+                    }
+                }
+            }
+        }
+
+        return new PrescanResult(splitUrl, couldHaveResults, termExistence, status, errorMessage);
+    }
+
+    private static String extractJsonString(String json, String key) {
+        String pattern = "\"" + key + "\":\"";
+        int start = json.indexOf(pattern);
+        if (start < 0) return null;
+        start += pattern.length();
+        int end = json.indexOf("\"", start);
+        if (end < 0) return null;
+        return json.substring(start, end);
+    }
+
+    private static boolean extractJsonBoolean(String json, String key) {
+        String pattern = "\"" + key + "\":";
+        int start = json.indexOf(pattern);
+        if (start < 0) return false;
+        start += pattern.length();
+        return json.substring(start).trim().startsWith("true");
+    }
+
     /**
      * Validates that split metadata contains sensible offset values to prevent native crashes.
      * Throws IllegalArgumentException with detailed information if any offsets are invalid.
@@ -989,6 +1298,29 @@ public class SplitCacheManager implements AutoCloseable {
     private static native void forceEvictionNative(long ptr, long targetSizeBytes);
     private static native SearchResult searchAcrossAllSplitsNative(long ptr, long queryPtr, int totalLimit);
     private static native SearchResult searchAcrossSplitsNative(long ptr, List<String> splitPaths, long queryPtr, int totalLimit);
+
+    /**
+     * Native prescan method for checking term existence across multiple splits.
+     *
+     * <p>This method performs parallel I/O to fetch footer and term dictionary data from
+     * each split, checking if query terms exist in the FST. All fetched data is cached
+     * for subsequent full searches.
+     *
+     * @param cacheManagerPtr Pointer to native cache manager
+     * @param splitInfosJson JSON array: [{"splitUrl": "...", "footerOffset": 12345}, ...]
+     * @param docMappingJson Document mapping JSON with field types/tokenizers
+     * @param queryAstJson Query AST in Quickwit JSON format
+     * @param warmupFastFields If true, also cache fast fields during prescan for faster subsequent searches
+     * @return JSON array of PrescanResult objects:
+     *         [{"splitUrl": "...", "couldHaveResults": true, "status": "SUCCESS", "termExistence": {...}}, ...]
+     */
+    private static native String nativePrescanSplits(
+        long cacheManagerPtr,
+        String splitInfosJson,
+        String docMappingJson,
+        String queryAstJson,
+        boolean warmupFastFields
+    );
 
     // Batch optimization metrics native methods
     static native long nativeGetBatchMetricsTotalOperations();
