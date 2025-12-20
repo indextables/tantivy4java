@@ -5,8 +5,8 @@
     <modelVersion>4.0.0</modelVersion>
 
     <groupId>io.indextables</groupId>
-    <artifactId>tantivy4java</artifactId>
-    <version>0.25.6</version>
+    <artifactId>tantivy4javaexperimental</artifactId>
+    <version>0.25.13</version>
     <packaging>jar</packaging>
 
     <name>Tantivy4Java</name>
