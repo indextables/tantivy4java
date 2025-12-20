@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use anyhow::{Result, anyhow, Context};
 use futures::future::join_all;
+use futures::stream::{self, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
 
@@ -35,30 +36,48 @@ use crate::split_searcher_replacement::{
 };
 use std::sync::atomic::{Ordering, AtomicUsize};
 
-// Default and configured prescan parallelism
-const DEFAULT_PRESCAN_PARALLELISM: usize = 16;
-static CONFIGURED_PRESCAN_PARALLELISM: AtomicUsize = AtomicUsize::new(0);
+// Configured maximum prescan parallelism (0 = use dynamic calculation)
+static CONFIGURED_MAX_PRESCAN_PARALLELISM: AtomicUsize = AtomicUsize::new(0);
 
-/// Set the maximum prescan parallelism (number of concurrent prescan operations).
-/// This must be called BEFORE any prescan operations are performed.
-/// If not called, defaults to 16 concurrent operations.
-pub fn set_prescan_parallelism(parallelism: usize) {
-    CONFIGURED_PRESCAN_PARALLELISM.store(parallelism, Ordering::SeqCst);
-    debug_println!("RUST DEBUG: Prescan parallelism configured to {} concurrent operations", parallelism);
+/// Set the maximum prescan parallelism (upper bound for concurrent prescan operations).
+/// If not called or set to 0, parallelism is dynamically calculated as:
+///   max(num_splits, num_cpu_cores)
+/// This provides optimal parallelism automatically while allowing an upper bound for resource control.
+pub fn set_prescan_parallelism(max_parallelism: usize) {
+    CONFIGURED_MAX_PRESCAN_PARALLELISM.store(max_parallelism, Ordering::SeqCst);
+    if max_parallelism > 0 {
+        debug_println!("RUST DEBUG: Prescan max parallelism configured to {} concurrent operations", max_parallelism);
+    } else {
+        debug_println!("RUST DEBUG: Prescan parallelism set to dynamic mode (based on splits and CPU cores)");
+    }
 }
 
-fn get_prescan_parallelism() -> usize {
-    let configured = CONFIGURED_PRESCAN_PARALLELISM.load(Ordering::SeqCst);
-    if configured > 0 { configured } else { DEFAULT_PRESCAN_PARALLELISM }
+/// Get the number of CPU cores available
+fn get_num_cpus() -> usize {
+    // Use available_parallelism which respects cgroups/container limits
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4) // Fallback to 4 if detection fails
 }
 
-// Maximum concurrent prescan operations (configured via GlobalCacheConfig)
-lazy_static::lazy_static! {
-    static ref PRESCAN_SEMAPHORE: Semaphore = {
-        let max_concurrent = get_prescan_parallelism();
-        debug_println!("RUST DEBUG: PRESCAN_SEMAPHORE initialized with {} permits", max_concurrent);
-        Semaphore::new(max_concurrent)
+/// Calculate optimal parallelism for a given prescan operation.
+/// Returns max(num_splits, num_cpus), optionally capped by configured maximum.
+fn calculate_prescan_parallelism(num_splits: usize) -> usize {
+    let num_cpus = get_num_cpus();
+    let dynamic_parallelism = std::cmp::max(num_splits, num_cpus);
+
+    let configured_max = CONFIGURED_MAX_PRESCAN_PARALLELISM.load(Ordering::SeqCst);
+    let effective_parallelism = if configured_max > 0 {
+        std::cmp::min(dynamic_parallelism, configured_max)
+    } else {
+        dynamic_parallelism
     };
+
+    debug_println!("RUST DEBUG: Prescan parallelism: {} splits, {} CPUs -> {} concurrent (max={})",
+        num_splits, num_cpus, effective_parallelism,
+        if configured_max > 0 { configured_max.to_string() } else { "unlimited".to_string() });
+
+    effective_parallelism
 }
 
 /// Split info with required footer offset and file size for efficient prescan.
@@ -883,6 +902,7 @@ async fn prescan_single_split_v2(
     storage: Arc<dyn Storage>,
     searcher_context: Arc<quickwit_search::SearcherContext>,
     warmup_fast_fields: bool,
+    pre_cached_searcher: Option<Arc<tantivy::Searcher>>,  // Pre-looked-up searcher to avoid lock contention
 ) -> PrescanResult {
     debug_println!("RUST DEBUG: Prescan V2: Processing split {} (using open_index_with_caches)", split_info.split_url);
     debug_println!("RUST DEBUG: Prescan V2: warmup_fast_fields={}", warmup_fast_fields);
@@ -909,13 +929,12 @@ async fn prescan_single_split_v2(
 
     debug_println!("RUST DEBUG: Prescan V2: split_id={}", split_id);
 
-    // 🚀 OPTIMIZATION: Check shared searcher cache FIRST (same cache used by regular search)
-    // This is the key optimization - if a searcher is already cached from a previous
-    // prescan or regular search, we skip all expensive operations (file_size lookup,
-    // open_index_with_caches, warmup) and use the cached searcher directly.
-    let searcher: Arc<tantivy::Searcher> = if let Some(cached) = get_cached_searcher(&split_info.split_url) {
+    // 🚀 OPTIMIZATION: Use pre-cached searcher if available (avoids lock contention)
+    // The caller pre-looks-up searchers ONCE per unique URL before the parallel loop,
+    // so 5000 identical splits don't contend on the cache lock.
+    let searcher: Arc<tantivy::Searcher> = if let Some(cached) = pre_cached_searcher {
         SEARCHER_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
-        debug_println!("RUST DEBUG: Prescan V2: SEARCHER CACHE HIT - using cached searcher");
+        debug_println!("RUST DEBUG: Prescan V2: USING PRE-CACHED SEARCHER");
         cached
     } else {
         SEARCHER_CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
@@ -1719,20 +1738,24 @@ pub async fn prescan_splits_async(
     debug_println!("RUST DEBUG: warmup_fast_fields = {}", warmup_fast_fields);
     debug_println!("RUST DEBUG: query_ast_json = {}", query_ast_json);
 
-    // Parse doc mapping
-    let doc_mapping = DocMapping::from_json(doc_mapping_json)
-        .context("Failed to parse doc mapping")?;
-    debug_println!("RUST DEBUG: Parsed doc mapping with {} fields", doc_mapping.field_mappings.len());
+    // Parse doc mapping ONCE before parallel processing, wrap in Arc for sharing
+    let doc_mapping = Arc::new(
+        DocMapping::from_json(doc_mapping_json)
+            .context("Failed to parse doc mapping")?
+    );
+    debug_println!("RUST DEBUG: Parsed doc mapping with {} fields (shared via Arc)", doc_mapping.field_mappings.len());
 
-    // Parse query AST
-    let query_ast: QueryAst = serde_json::from_str(query_ast_json)
-        .context("Failed to parse query AST")?;
-    debug_println!("RUST DEBUG: Parsed query_ast = {:?}", query_ast);
+    // Parse query AST ONCE before parallel processing, wrap in Arc for sharing
+    let query_ast: Arc<QueryAst> = Arc::new(
+        serde_json::from_str(query_ast_json)
+            .context("Failed to parse query AST")?
+    );
+    debug_println!("RUST DEBUG: Parsed query_ast (shared via Arc)");
 
-    // Extract terms for prescan
-    let prescan_terms = extract_prescan_terms(&query_ast, &doc_mapping);
-    debug_println!("RUST DEBUG: Extracted {} prescan terms", prescan_terms.len());
-    for term in &prescan_terms {
+    // Extract terms for prescan ONCE, wrap in Arc for sharing
+    let prescan_terms = Arc::new(extract_prescan_terms(&query_ast, &doc_mapping));
+    debug_println!("RUST DEBUG: Extracted {} prescan terms (shared via Arc)", prescan_terms.len());
+    for term in prescan_terms.iter() {
         debug_println!("RUST DEBUG:   Term: field='{}', term='{}', occurrence={:?}, match_type={:?}",
             term.field, term.term, term.occurrence, term.match_type);
     }
@@ -1770,65 +1793,110 @@ pub async fn prescan_splits_async(
     // Wrap in Arc for sharing across parallel tasks
     let parent_to_storage = Arc::new(parent_to_storage);
 
-    // Create parallel tasks for all splits
-    let prescan_tasks: Vec<_> = splits
+    // PRE-CACHE: Look up cached searchers ONCE per unique URL (avoids lock contention)
+    // With 5000 identical splits, this does ONE cache lookup instead of 5000 contending locks
+    let mut url_to_searcher: std::collections::HashMap<String, Option<Arc<tantivy::Searcher>>> =
+        std::collections::HashMap::new();
+
+    for split_info in &splits {
+        if !url_to_searcher.contains_key(&split_info.split_url) {
+            let cached = get_cached_searcher(&split_info.split_url);
+            url_to_searcher.insert(split_info.split_url.clone(), cached);
+        }
+    }
+    debug_println!("RUST DEBUG: Pre-cached {} unique searcher lookups for {} splits",
+        url_to_searcher.len(), splits.len());
+
+    // Wrap in Arc for sharing across parallel tasks
+    let url_to_searcher = Arc::new(url_to_searcher);
+
+    // Calculate number of worker threads (one per CPU core)
+    let num_workers = get_num_cpus();
+    let num_splits = splits.len();
+
+    debug_println!("RUST DEBUG: Splitting {} splits across {} worker threads", num_splits, num_workers);
+
+    // Split the list N ways (one chunk per worker)
+    let chunk_size = (num_splits + num_workers - 1) / num_workers;
+    let chunks: Vec<Vec<SplitInfo>> = splits
+        .chunks(chunk_size)
+        .map(|c| c.to_vec())
+        .collect();
+
+    debug_println!("RUST DEBUG: Created {} chunks of ~{} splits each", chunks.len(), chunk_size);
+
+    // Create a worker task for each chunk - each worker processes its splits sequentially
+    // All Arc clones are cheap (just reference count increment)
+    let worker_tasks: Vec<_> = chunks
         .into_iter()
-        .map(|split_info| {
-            let terms = prescan_terms.clone();
-            let query_ast_clone = query_ast.clone();
-            let doc_mapping_clone = doc_mapping.clone();
+        .enumerate()
+        .map(|(worker_id, chunk)| {
+            let terms = Arc::clone(&prescan_terms);
+            let query_ast_clone = Arc::clone(&query_ast);
+            let doc_mapping_clone = Arc::clone(&doc_mapping);
             let resolver = storage_resolver.clone();
             let ctx = Arc::clone(&searcher_context);
             let do_warmup_fast_fields = warmup_fast_fields;
             let storage_map = Arc::clone(&parent_to_storage);
+            let searcher_map = Arc::clone(&url_to_searcher);
 
             async move {
-                // Acquire semaphore permit
-                let _permit = match PRESCAN_SEMAPHORE.acquire().await {
-                    Ok(permit) => permit,
-                    Err(_) => {
-                        return PrescanResult::error(
-                            split_info.split_url.clone(),
-                            "Semaphore closed",
-                        );
-                    }
-                };
+                let chunk_len = chunk.len();
+                debug_println!("RUST DEBUG: Worker {} starting with {} splits", worker_id, chunk_len);
 
-                // Get pre-resolved storage for this split's parent directory
-                let parent_dir = get_parent_directory(&split_info.split_url);
-                let storage = match storage_map.get(&parent_dir) {
-                    Some(s) => s.clone(),
-                    None => {
-                        // Fallback: resolve storage if not pre-resolved (shouldn't happen normally)
-                        debug_println!("RUST DEBUG: Storage not pre-resolved for {}, resolving now", parent_dir);
-                        match resolve_storage_for_prescan(&resolver, &split_info.split_url).await {
-                            Ok(s) => s,
-                            Err(e) => {
-                                return PrescanResult::error(
-                                    split_info.split_url.clone(),
-                                    &format!("Failed to resolve storage: {}", e),
-                                );
+                let mut results = Vec::with_capacity(chunk_len);
+
+                // Process each split in this chunk sequentially
+                for split_info in chunk {
+                    // Get pre-resolved storage for this split's parent directory
+                    let parent_dir = get_parent_directory(&split_info.split_url);
+                    let storage = match storage_map.get(&parent_dir) {
+                        Some(s) => s.clone(),
+                        None => {
+                            // Fallback: resolve storage if not pre-resolved
+                            debug_println!("RUST DEBUG: Worker {}: Storage not pre-resolved for {}", worker_id, parent_dir);
+                            match resolve_storage_for_prescan(&resolver, &split_info.split_url).await {
+                                Ok(s) => s,
+                                Err(e) => {
+                                    results.push(PrescanResult::error(
+                                        split_info.split_url.clone(),
+                                        &format!("Failed to resolve storage: {}", e),
+                                    ));
+                                    continue;
+                                }
                             }
                         }
-                    }
-                };
+                    };
 
-                // Prescan the split using open_index_with_caches
-                prescan_single_split_v2(
-                    &split_info,
-                    &terms,
-                    &query_ast_clone,
-                    &doc_mapping_clone,
-                    storage,
-                    ctx,
-                    do_warmup_fast_fields,
-                ).await
+                    // Get pre-cached searcher
+                    let pre_cached = searcher_map.get(&split_info.split_url).cloned().flatten();
+
+                    // Prescan the split
+                    let result = prescan_single_split_v2(
+                        &split_info,
+                        &terms,
+                        &query_ast_clone,
+                        &doc_mapping_clone,
+                        storage,
+                        ctx.clone(),
+                        do_warmup_fast_fields,
+                        pre_cached,
+                    ).await;
+
+                    results.push(result);
+                }
+
+                debug_println!("RUST DEBUG: Worker {} completed {} splits", worker_id, results.len());
+                results
             }
         })
         .collect();
 
-    // Execute all tasks in parallel
-    let results = join_all(prescan_tasks).await;
+    // Execute all worker tasks in parallel, then merge results
+    let chunk_results: Vec<Vec<PrescanResult>> = join_all(worker_tasks).await;
+
+    // Flatten all chunk results into a single vector (maintains order within chunks)
+    let results: Vec<PrescanResult> = chunk_results.into_iter().flatten().collect();
 
     debug_println!("RUST DEBUG: prescan_splits_async completed with {} results", results.len());
     Ok(results)
