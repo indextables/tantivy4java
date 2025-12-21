@@ -51,7 +51,6 @@ mod global_cache;  // Global cache infrastructure following Quickwit's pattern
 mod simple_batch_optimization;  // Priority 1: Simplified batch optimization with range consolidation
 mod adaptive_tuning;  // Priority 5: Adaptive tuning engine for automatic parameter optimization
 mod prescan;  // FST-based term existence checking for split filtering
-mod fst_cache;  // Simple 2-tier FST/term dictionary cache (memory LRU + disk)
 
 pub use schema::*;
 pub use document::*;

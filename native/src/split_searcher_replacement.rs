@@ -12,7 +12,7 @@ use crate::common::to_java_exception;
 use crate::debug_println;
 use crate::runtime_manager::block_on_operation;
 use crate::global_cache::{get_configured_storage_resolver, get_configured_storage_resolver_async};
-use crate::split_query::{store_split_schema, get_split_schema, convert_split_query_to_ast, convert_split_query_to_json};
+use crate::split_query::{store_split_schema, convert_split_query_to_ast, convert_split_query_to_json};
 use quickwit_search::{SearcherContext, search_permit_provider::SearchPermitProvider};
 use quickwit_search::leaf_cache::LeafSearchCache;
 use quickwit_search::list_fields_cache::ListFieldsCache;
@@ -2860,14 +2860,7 @@ fn fix_range_query_types(searcher_ptr: jlong, query_json: &str) -> anyhow::Resul
         let _storage_resolver = &context.cached_storage;
         let _cached_index = &context.cached_index;
         
-        // First try to get schema from cache
-        if let Some(cached_schema) = get_split_schema(split_uri) {
-            debug_println!("RUST DEBUG: ⏱️ 🚀 Using CACHED schema instead of expensive I/O [TIMING: {}ms]", schema_start.elapsed().as_millis());
-            return Ok(cached_schema);
-        }
-        
-        // Fallback to expensive I/O only if cache miss
-        debug_println!("RUST DEBUG: ⚠️ Cache miss, falling back to expensive I/O for schema [TIMING: {}ms]", schema_start.elapsed().as_millis());
+        // Get schema from split
         get_schema_from_split(searcher_ptr)
     }).ok_or_else(|| anyhow::anyhow!("Failed to access searcher context"))??;
     

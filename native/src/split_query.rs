@@ -39,19 +39,6 @@ pub fn store_split_schema(split_uri: &str, schema: tantivy::schema::Schema) {
     debug_println!("RUST DEBUG: *** STORE_SPLIT_SCHEMA COMPLETED");
 }
 
-/// Retrieve schema clone for a split URI
-pub fn get_split_schema(split_uri: &str) -> Option<tantivy::schema::Schema> {
-    let cache = SPLIT_SCHEMA_CACHE.lock().unwrap();
-    if let Some(schema) = cache.get(split_uri) {
-        debug_println!("RUST DEBUG: ✅ Retrieved schema from cache for split: {}", split_uri);
-        Some(schema.clone())
-    } else {
-        debug_println!("RUST DEBUG: ❌ Schema not found in cache for split: {}", split_uri);
-        debug_println!("RUST DEBUG: Available cache entries: {:?}", cache.keys().collect::<Vec<_>>());
-        None
-    }
-}
-
 /// Convert a SplitTermQuery to QueryAst JSON (FOR TESTING ONLY - Production should use SplitSearcher.search() directly)
 #[no_mangle]
 pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitTermQuery_toQueryAstJson(
@@ -600,61 +587,6 @@ fn parse_query_string(env: &mut JNIEnv, query_string: JString, schema_ptr: jlong
     let split_query_obj = create_split_parsed_query(env, &query_ast_json)?;
     
     Ok(split_query_obj)
-}
-
-fn create_split_query_from_ast(env: &mut JNIEnv, query_ast: &QueryAst) -> Result<jobject> {
-    match query_ast {
-        QueryAst::Term(term_query) => {
-            // Create SplitTermQuery Java object
-            let class = env.find_class("io/indextables/tantivy4java/split/SplitTermQuery")?;
-            let field_jstring = env.new_string(&term_query.field)?;
-            let value_jstring = env.new_string(&term_query.value)?;
-            
-            let obj = env.new_object(class, "(Ljava/lang/String;Ljava/lang/String;)V", 
-                &[JValue::Object(&field_jstring.into()), JValue::Object(&value_jstring.into())])?;
-            
-            debug_println!("RUST DEBUG: ✅ Created SplitTermQuery for Term: field='{}', value='{}'", term_query.field, term_query.value);
-            Ok(obj.into_raw())
-        }
-        QueryAst::FullText(fulltext_query) => {
-            // Convert FullTextQuery to SplitTermQuery 
-            // FullTextQuery and TermQuery are conceptually the same for our purposes
-            let class = env.find_class("io/indextables/tantivy4java/split/SplitTermQuery")?;
-            let field_jstring = env.new_string(&fulltext_query.field)?;
-            let value_jstring = env.new_string(&fulltext_query.text)?;
-            
-            let obj = env.new_object(class, "(Ljava/lang/String;Ljava/lang/String;)V", 
-                &[JValue::Object(&field_jstring.into()), JValue::Object(&value_jstring.into())])?;
-            
-            debug_println!("RUST DEBUG: ✅ Created SplitTermQuery for FullText: field='{}', text='{}'", fulltext_query.field, fulltext_query.text);
-            Ok(obj.into_raw())
-        }
-        QueryAst::MatchAll => {
-            // Create SplitMatchAllQuery Java object
-            let class = env.find_class("io/indextables/tantivy4java/split/SplitMatchAllQuery")?;
-            let obj = env.new_object(class, "()V", &[])?;
-            debug_println!("RUST DEBUG: ✅ Created SplitMatchAllQuery for MatchAll");
-            Ok(obj.into_raw())
-        }
-        QueryAst::Bool(_bool_query) => {
-            // TODO: Implement SplitBooleanQuery creation from QueryAst
-            // This is more complex as we need to recursively convert subqueries
-            debug_println!("RUST DEBUG: Boolean query creation from QueryAst not yet implemented");
-            
-            // Fallback to MatchAll for now
-            let class = env.find_class("io/indextables/tantivy4java/split/SplitMatchAllQuery")?;
-            let obj = env.new_object(class, "()V", &[])?;
-            Ok(obj.into_raw())
-        }
-        _ => {
-            debug_println!("RUST DEBUG: Unsupported QueryAst type for SplitQuery conversion: {:?}", query_ast);
-            
-            // Fallback to MatchAll
-            let class = env.find_class("io/indextables/tantivy4java/split/SplitMatchAllQuery")?;
-            let obj = env.new_object(class, "()V", &[])?;
-            Ok(obj.into_raw())
-        }
-    }
 }
 
 fn create_split_parsed_query(env: &mut JNIEnv, query_ast_json: &str) -> Result<jobject> {

@@ -9,9 +9,7 @@ use std::sync::Arc;
 
 use anyhow::{Result, anyhow, Context};
 use futures::future::join_all;
-use futures::stream::{self, StreamExt};
 use serde::{Deserialize, Serialize};
-use tokio::sync::Semaphore;
 
 use quickwit_storage::{Storage, StorageResolver, ByteRangeCache, STORAGE_METRICS};
 use quickwit_query::query_ast::QueryAst;
@@ -60,26 +58,6 @@ fn get_num_cpus() -> usize {
         .unwrap_or(4) // Fallback to 4 if detection fails
 }
 
-/// Calculate optimal parallelism for a given prescan operation.
-/// Returns max(num_splits, num_cpus), optionally capped by configured maximum.
-fn calculate_prescan_parallelism(num_splits: usize) -> usize {
-    let num_cpus = get_num_cpus();
-    let dynamic_parallelism = std::cmp::max(num_splits, num_cpus);
-
-    let configured_max = CONFIGURED_MAX_PRESCAN_PARALLELISM.load(Ordering::SeqCst);
-    let effective_parallelism = if configured_max > 0 {
-        std::cmp::min(dynamic_parallelism, configured_max)
-    } else {
-        dynamic_parallelism
-    };
-
-    debug_println!("RUST DEBUG: Prescan parallelism: {} splits, {} CPUs -> {} concurrent (max={})",
-        num_splits, num_cpus, effective_parallelism,
-        if configured_max > 0 { configured_max.to_string() } else { "unlimited".to_string() });
-
-    effective_parallelism
-}
-
 /// Split info with required footer offset and file size for efficient prescan.
 /// Both values are required to avoid S3/Azure HEAD requests.
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -98,6 +76,7 @@ pub struct FieldMapping {
     pub field_type: String,
     #[serde(default)]
     pub tokenizer: Option<String>,
+    #[allow(dead_code)] // Required for JSON deserialization but not used in prescan logic
     #[serde(default = "default_true")]
     pub indexed: bool,
 }
@@ -178,34 +157,6 @@ impl DocMapping {
     /// Get the field type string (e.g., "text", "i64", "u64", "f64", "bool", "datetime", "object")
     pub fn get_field_type(&self, field_name: &str) -> Option<&str> {
         self.get_field(field_name).map(|f| f.field_type.as_str())
-    }
-
-    /// Check if a field is a numeric type (i64, u64, f64)
-    pub fn is_numeric_field(&self, field_name: &str) -> bool {
-        self.get_field_type(field_name)
-            .map(|t| t == "i64" || t == "u64" || t == "f64")
-            .unwrap_or(false)
-    }
-
-    /// Check if a field is a boolean type
-    pub fn is_bool_field(&self, field_name: &str) -> bool {
-        self.get_field_type(field_name)
-            .map(|t| t == "bool")
-            .unwrap_or(false)
-    }
-
-    /// Check if a field is a datetime type
-    pub fn is_datetime_field(&self, field_name: &str) -> bool {
-        self.get_field_type(field_name)
-            .map(|t| t == "datetime")
-            .unwrap_or(false)
-    }
-
-    /// Check if a field is a text type
-    pub fn is_text_field(&self, field_name: &str) -> bool {
-        self.get_field_type(field_name)
-            .map(|t| t == "text")
-            .unwrap_or(true) // Default to text for unknown fields
     }
 }
 
@@ -303,32 +254,6 @@ impl WildcardPattern {
         }
     }
 
-    /// Convert wildcard pattern to regex pattern for FST automaton
-    pub fn to_regex(&self) -> String {
-        match self {
-            WildcardPattern::Prefix(prefix) => format!("^{}.*$", escape_regex(prefix)),
-            WildcardPattern::Suffix(suffix) => format!("^.*{}$", escape_regex(suffix)),
-            WildcardPattern::Contains(inner) => format!("^.*{}.*$", escape_regex(inner)),
-            WildcardPattern::Complex(pattern) => {
-                // Convert wildcard pattern to regex
-                // * matches zero or more characters
-                // ? matches exactly one character (if supported)
-                let escaped = escape_regex(pattern);
-                let regex_pattern = escaped
-                    .replace(r"\*", ".*")
-                    .replace(r"\?", ".");
-                format!("^{}$", regex_pattern)
-            }
-        }
-    }
-
-    /// Get the prefix for efficient FST seek (if applicable)
-    pub fn get_prefix(&self) -> Option<&str> {
-        match self {
-            WildcardPattern::Prefix(prefix) => Some(prefix),
-            _ => None,
-        }
-    }
 }
 
 /// Escape special regex characters in a string
@@ -352,7 +277,6 @@ fn escape_regex(s: &str) -> String {
 pub enum TermOccurrence {
     Must,     // Term MUST exist (AND logic)
     Should,   // Term SHOULD exist (OR logic)
-    MustNot,  // Term MUST NOT exist (negation - ignored for prescan)
 }
 
 /// Result of prescanning a single split
@@ -386,16 +310,6 @@ impl PrescanResult {
             status: "ERROR".to_string(),
             term_existence: None,
             error_message: Some(error.to_string()),
-        }
-    }
-
-    pub fn timeout(split_url: String) -> Self {
-        Self {
-            split_url,
-            could_have_results: true, // Conservative: include on timeout
-            status: "TIMEOUT".to_string(),
-            term_existence: None,
-            error_message: Some("Prescan timed out".to_string()),
         }
     }
 }
@@ -817,60 +731,6 @@ pub fn evaluate_prescan_recursive(
     }
 }
 
-/// Evaluate prescan results to determine if split could have results (legacy - kept for compatibility)
-pub fn evaluate_prescan(
-    term_existence: &HashMap<String, bool>,
-    prescan_terms: &[PrescanTerm],
-) -> bool {
-    if prescan_terms.is_empty() {
-        // No terms to check - conservative: could have results
-        return true;
-    }
-
-    // Separate MUST and SHOULD terms
-    let must_terms: Vec<_> = prescan_terms.iter()
-        .filter(|t| t.occurrence == TermOccurrence::Must)
-        .collect();
-    let should_terms: Vec<_> = prescan_terms.iter()
-        .filter(|t| t.occurrence == TermOccurrence::Should)
-        .collect();
-
-    // ALL must terms must exist
-    for term in &must_terms {
-        // Use original_field for key matching (e.g., "metadata.color" for JSON path queries)
-        let key = format!("{}:{}", term.original_field, term.term);
-        if !term_existence.get(&key).copied().unwrap_or(false) {
-            debug_println!("RUST DEBUG: Prescan: MUST term missing: {}", key);
-            return false;
-        }
-    }
-
-    // At least one SHOULD term must exist (if there are any)
-    if !should_terms.is_empty() {
-        let any_should_exists = should_terms.iter().any(|term| {
-            // Use original_field for key matching
-            let key = format!("{}:{}", term.original_field, term.term);
-            term_existence.get(&key).copied().unwrap_or(false)
-        });
-
-        if !any_should_exists {
-            debug_println!("RUST DEBUG: Prescan: No SHOULD terms exist");
-            return false;
-        }
-    }
-
-    true
-}
-
-/// Extract the table path from a split URL (parent directory)
-fn extract_table_path(split_url: &str) -> String {
-    if let Some(last_slash) = split_url.rfind('/') {
-        split_url[..last_slash].to_string()
-    } else {
-        split_url.to_string()
-    }
-}
-
 /// Extract split_id from URL (filename without .split extension)
 fn extract_split_id(url: &str) -> Option<String> {
     let filename = extract_filename(url)?;
@@ -1029,7 +889,7 @@ async fn prescan_single_split_v2(
         if warmup_fast_fields {
             // Add all fields from doc_mapping as fast fields
             for field_mapping in &doc_mapping.field_mappings {
-                if let Ok(field) = schema.get_field(&field_mapping.name) {
+                if let Ok(_field) = schema.get_field(&field_mapping.name) {
                     warmup_info.fast_fields.insert(quickwit_doc_mapper::FastFieldWarmupInfo {
                         name: field_mapping.name.clone(),
                         with_subfields: false,
@@ -1550,86 +1410,6 @@ async fn check_regex_exists_v2(
 /// - F64 = 102 ('f')
 /// - Bool = 98 ('b')
 /// - Date = 100 ('d')
-/// - Bytes = 66 ('B')
-/// - Json = 106 ('j')
-/// - IpAddr = 112 ('p')
-///
-/// This matches how Tantivy's Term struct serializes itself.
-fn make_term_key(field_id: u32, term_text: &str) -> Vec<u8> {
-    const TYPE_CODE_STR: u8 = b's'; // 115 = 's' for Str type
-
-    let term_bytes = term_text.as_bytes();
-    let mut key = Vec::with_capacity(4 + 1 + term_bytes.len());
-    // Field ID in BIG ENDIAN (not little endian!)
-    key.extend_from_slice(&field_id.to_be_bytes());
-    // Type code for string
-    key.push(TYPE_CODE_STR);
-    // Term value bytes
-    key.extend_from_slice(term_bytes);
-    key
-}
-
-// NOTE: Old check_exact_term_exists_fst and check_wildcard_exists_fst functions have been removed.
-// We now use check_exact_term_exists_v2 and check_wildcard_exists_v2 which use Tantivy's native API.
-
-/// Check if a term matches a wildcard pattern
-fn matches_wildcard_pattern(term: &str, pattern: &WildcardPattern) -> bool {
-    match pattern {
-        WildcardPattern::Prefix(prefix) => term.starts_with(prefix),
-        WildcardPattern::Suffix(suffix) => term.ends_with(suffix),
-        WildcardPattern::Contains(inner) => term.contains(inner),
-        WildcardPattern::Complex(pat) => {
-            // Convert wildcard pattern to simple matcher
-            // Pattern uses * for zero-or-more and ? for single char
-            wildcard_match(term, pat)
-        }
-    }
-}
-
-/// Simple wildcard pattern matching (supports * and ?)
-fn wildcard_match(text: &str, pattern: &str) -> bool {
-    let text_chars: Vec<char> = text.chars().collect();
-    let pattern_chars: Vec<char> = pattern.chars().collect();
-
-    wildcard_match_impl(&text_chars, &pattern_chars)
-}
-
-fn wildcard_match_impl(text: &[char], pattern: &[char]) -> bool {
-    // Base cases
-    if pattern.is_empty() {
-        return text.is_empty();
-    }
-    if text.is_empty() {
-        // Check if remaining pattern is all '*'
-        return pattern.iter().all(|&c| c == '*');
-    }
-
-    let (first_pat, _rest_pat) = pattern.split_first().unwrap();
-
-    match *first_pat {
-        '*' => {
-            // * matches zero or more characters
-            // Try matching rest of pattern with:
-            // 1. Current position (zero chars matched by *)
-            // 2. Skip one char (one char matched by *)
-            wildcard_match_impl(text, &pattern[1..]) ||
-            wildcard_match_impl(&text[1..], pattern)
-        }
-        '?' => {
-            // ? matches exactly one character
-            wildcard_match_impl(&text[1..], &pattern[1..])
-        }
-        c => {
-            // Regular character must match
-            if text[0] == c {
-                wildcard_match_impl(&text[1..], &pattern[1..])
-            } else {
-                false
-            }
-        }
-    }
-}
-
 // NOTE: Old check_prefix_exists_fst has been removed.
 // Prefix checking is now done in check_wildcard_exists_v2.
 
@@ -1688,31 +1468,6 @@ async fn resolve_storage_for_prescan(
 
     storage_resolver.resolve(&uri).await
         .with_context(|| format!("Failed to resolve storage for: {}", parent_uri))
-}
-
-/// Configuration for prescan operation
-#[derive(Clone, Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PrescanConfig {
-    #[serde(default)]
-    pub aws_access_key_id: Option<String>,
-    #[serde(default)]
-    pub aws_secret_access_key: Option<String>,
-    #[serde(default)]
-    pub aws_session_token: Option<String>,
-    #[serde(default)]
-    pub aws_region: Option<String>,
-    #[serde(default)]
-    pub aws_endpoint: Option<String>,
-    #[serde(default)]
-    pub azure_account: Option<String>,
-    #[serde(default)]
-    pub azure_access_key: Option<String>,
-    /// If true, also warmup (cache) fast fields during prescan.
-    /// This is useful if you know you'll search matching splits after prescan.
-    /// Default: false (only download term dictionaries for prescan efficiency)
-    #[serde(default)]
-    pub warmup_fast_fields: bool,
 }
 
 /// Main prescan function that processes multiple splits in parallel
