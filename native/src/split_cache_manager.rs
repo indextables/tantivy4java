@@ -310,7 +310,76 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_
             manager.set_aws_config(s3_config);
         }
     }
-    
+
+    // Extract Azure configuration from the Java CacheConfig
+    debug_println!("RUST DEBUG: Attempting to extract Azure config from CacheConfig");
+    if let Ok(azure_config_map) = env.call_method(&config, "getAzureConfig", "()Ljava/util/Map;", &[]) {
+        let azure_map_obj = azure_config_map.l().unwrap();
+        debug_println!("RUST DEBUG: Got Azure config map from Java");
+
+        // Helper function to extract string value from HashMap
+        let extract_string_value = |env: &mut JNIEnv, map_obj: &JObject, key: &str| -> Option<String> {
+            let key_jstring = env.new_string(key).ok()?;
+            let value = env.call_method(map_obj, "get", "(Ljava/lang/Object;)Ljava/lang/Object;", &[(&key_jstring).into()]).ok()?.l().ok()?;
+            if value.is_null() {
+                return None;
+            }
+            let value_jstring = JString::from(value);
+            let value_string = env.get_string(&value_jstring).ok()?;
+            Some(value_string.to_string_lossy().to_string())
+        };
+
+        // Extract Azure configuration values
+        let account_name = extract_string_value(&mut env, &azure_map_obj, "account_name");
+        let access_key = extract_string_value(&mut env, &azure_map_obj, "access_key");
+        let bearer_token = extract_string_value(&mut env, &azure_map_obj, "bearer_token");
+        let connection_string = extract_string_value(&mut env, &azure_map_obj, "connection_string");
+
+        debug_println!("RUST DEBUG: Azure config extraction - account_name={:?}, access_key={}, bearer_token={}, connection_string={}",
+            account_name, access_key.is_some(), bearer_token.is_some(), connection_string.is_some());
+
+        // Create AzureStorageConfig if we have account_name and either access_key or bearer_token
+        if let Some(account_name) = account_name {
+            debug_println!("RUST DEBUG: Configuring Azure storage for account: {}", account_name);
+
+            let azure_config = AzureStorageConfig {
+                account_name: Some(account_name),
+                access_key,
+                bearer_token,
+            };
+
+            // Set the Azure config on the manager
+            manager.set_azure_config(azure_config);
+        } else if let Some(connection_string) = connection_string {
+            debug_println!("RUST DEBUG: Configuring Azure storage from connection string");
+
+            // Parse connection string to extract account_name
+            // Format: DefaultEndpointsProtocol=https;AccountName=...;AccountKey=...;EndpointSuffix=...
+            let mut parsed_account_name = None;
+            let mut parsed_access_key = None;
+
+            for part in connection_string.split(';') {
+                if let Some((key, value)) = part.split_once('=') {
+                    match key {
+                        "AccountName" => parsed_account_name = Some(value.to_string()),
+                        "AccountKey" => parsed_access_key = Some(value.to_string()),
+                        _ => {}
+                    }
+                }
+            }
+
+            if let Some(account_name) = parsed_account_name {
+                let azure_config = AzureStorageConfig {
+                    account_name: Some(account_name),
+                    access_key: parsed_access_key,
+                    bearer_token: None,
+                };
+
+                manager.set_azure_config(azure_config);
+            }
+        }
+    }
+
     let manager_arc = Arc::new(manager);
     
     // Store in global registry

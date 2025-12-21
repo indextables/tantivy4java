@@ -1783,11 +1783,28 @@ fn prescan_splits_jni(
 }
 
 /// Get S3/Azure config from cache manager pointer
+///
+/// The pointer is actually a pointer to the cache name String (stored via Arc),
+/// so we need to:
+/// 1. Get the cache name from the pointer using jlong_to_arc
+/// 2. Use the cache name to look up the manager in CACHE_MANAGERS
 fn get_config_from_cache_manager(ptr: jni::sys::jlong) -> (Option<quickwit_config::S3StorageConfig>, Option<quickwit_config::AzureStorageConfig>) {
     if ptr == 0 {
         debug_println!("RUST DEBUG: get_config_from_cache_manager: ptr is 0, returning None");
         return (None, None);
     }
+
+    // The ptr is a pointer to a cache name String Arc, not the manager itself
+    // Use jlong_to_arc to get the cache name
+    let cache_name = match crate::utils::jlong_to_arc::<String>(ptr) {
+        Some(name_arc) => (*name_arc).clone(),
+        None => {
+            debug_println!("RUST DEBUG: get_config_from_cache_manager: failed to get cache name from ptr");
+            return (None, None);
+        }
+    };
+
+    debug_println!("RUST DEBUG: get_config_from_cache_manager: looking up manager for cache '{}'", cache_name);
 
     // Access the cache manager from the global registry
     use crate::split_cache_manager::CACHE_MANAGERS;
@@ -1800,18 +1817,16 @@ fn get_config_from_cache_manager(ptr: jni::sys::jlong) -> (Option<quickwit_confi
         }
     };
 
-    // Find the manager by pointer address and get its configs
-    for manager in managers.values() {
-        if std::sync::Arc::as_ptr(manager) as jni::sys::jlong == ptr {
-            let s3_config = manager.get_s3_config();
-            let azure_config = manager.get_azure_config();
-            debug_println!("RUST DEBUG: get_config_from_cache_manager: found manager, s3_config={}, azure_config={}",
-                s3_config.is_some(), azure_config.is_some());
-            return (s3_config, azure_config);
-        }
+    // Find the manager by cache name
+    if let Some(manager) = managers.get(&cache_name) {
+        let s3_config = manager.get_s3_config();
+        let azure_config = manager.get_azure_config();
+        debug_println!("RUST DEBUG: get_config_from_cache_manager: found manager '{}', s3_config={}, azure_config={}",
+            cache_name, s3_config.is_some(), azure_config.is_some());
+        return (s3_config, azure_config);
     }
 
-    debug_println!("RUST DEBUG: get_config_from_cache_manager: manager not found for ptr={}", ptr);
+    debug_println!("RUST DEBUG: get_config_from_cache_manager: manager '{}' not found", cache_name);
     (None, None)
 }
 
