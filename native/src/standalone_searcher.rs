@@ -6,9 +6,10 @@ use std::time::Duration;
 use bytesize::ByteSize;
 use anyhow::{Result, Context as AnyhowContext};
 
-use quickwit_storage::{Storage, StorageResolver};
+use quickwit_storage::{Storage, StorageResolver, MemorySizedCache, STORAGE_METRICS};
 use quickwit_config::{S3StorageConfig, StorageConfigs};
-use crate::global_cache::{get_configured_storage_resolver, get_global_searcher_context};
+use crate::global_cache::{get_configured_storage_resolver, get_global_searcher_context, get_global_disk_cache};
+use crate::persistent_cache_storage::StorageWithPersistentCache;
 use quickwit_proto::search::{SearchRequest, LeafSearchResponse, SplitIdAndFooterOffsets};
 use quickwit_doc_mapper::DocMapper;
 use quickwit_search::{leaf_search_single_split, SearcherContext, CanSplitDoBetter};
@@ -247,9 +248,29 @@ impl StandaloneSearcher {
         doc_mapper: Arc<DocMapper>,
     ) -> Result<LeafSearchResponse> {
         // Resolve storage using the helper that handles S3 URIs correctly
-        // println!("SCOTTWIT: search_split : before resolve");
-        let storage = resolve_storage_for_split(&self.storage_resolver, split_uri).await?;
-        // println!("SCOTTWIT: search_split : after resolve");
+        let raw_storage = resolve_storage_for_split(&self.storage_resolver, split_uri).await?;
+
+        // Wrap with L2 disk cache only (no L1 - Quickwit's caches handle memory caching)
+        debug_println!("RUST DEBUG: Checking get_global_disk_cache()");
+        let disk_cache_result = get_global_disk_cache();
+        debug_println!("RUST DEBUG: get_global_disk_cache() returned is_some={}", disk_cache_result.is_some());
+        let storage: Arc<dyn Storage> = match disk_cache_result {
+            Some(disk_cache) => {
+                debug_println!("RUST DEBUG: Creating StorageWithPersistentCache with L2 only");
+                debug_println!("🔄 TIERED_CACHE: Wrapping storage with L2 disk cache (no redundant L1)");
+                Arc::new(StorageWithPersistentCache::with_disk_cache_only(
+                    raw_storage,
+                    disk_cache,
+                    split_uri.to_string(),
+                    metadata.split_id.clone(),
+                ))
+            }
+            None => {
+                // No disk cache configured - use raw storage directly
+                debug_println!("RUST DEBUG: No disk cache configured - using raw storage");
+                raw_storage
+            }
+        };
         
         // Convert metadata to internal format
         let split_offsets = SplitIdAndFooterOffsets::from(metadata.clone());

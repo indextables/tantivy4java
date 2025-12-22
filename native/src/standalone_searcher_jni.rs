@@ -1,6 +1,7 @@
 // standalone_searcher_jni.rs - JNI bindings for the clean StandaloneSearcher implementation
 
 use std::sync::Arc;
+use crate::debug_println;
 use jni::objects::{JClass, JString};
 use jni::sys::{jlong, jstring};
 use jni::JNIEnv;
@@ -132,7 +133,9 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_StandaloneSearcher
             }).ok_or_else(|| anyhow::anyhow!("Invalid doc mapper pointer"))?;
 
             // Perform the search
+            debug_println!("RUST DEBUG: JNI search_split called for split_uri={}", split_uri);
             let response = searcher.search_split(&split_uri, metadata, search_request, doc_mapper).await?;
+            debug_println!("RUST DEBUG: JNI search_split completed");
             
             Ok::<LeafSearchResponse, anyhow::Error>(response)
         })

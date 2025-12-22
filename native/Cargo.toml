@@ -54,6 +54,9 @@ num_cpus = "1.0"
 memmap2 = "0.9.5"
 libc = "0.2"
 lru = "0.12"  # LRU cache for searcher caching
+lz4_flex = "0.11"  # Pure Rust LZ4 for disk cache compression
+fs2 = "0.4"  # Disk space detection for cache auto-sizing
+async-trait = "0.1"  # For Storage trait implementation
 
 [build-dependencies]
 jni = "0.21.1"

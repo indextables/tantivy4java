@@ -284,6 +284,52 @@ public class SplitCacheManager implements AutoCloseable {
         public BatchOptimizationConfig getBatchOptimization() {
             return batchOptimization;
         }
+
+        // Tiered disk cache configuration
+        private TieredCacheConfig tieredCacheConfig = null;
+
+        /**
+         * Configure L2 tiered disk cache for persistent caching.
+         *
+         * <p>The tiered disk cache provides a second-level persistent cache on local disk
+         * (typically NVMe) that survives process restarts and provides faster access than
+         * remote storage (S3/Azure).
+         *
+         * <p><b>Cache Hierarchy:</b>
+         * <ul>
+         *   <li>L1: In-memory cache (fast, ephemeral)</li>
+         *   <li>L2: Disk cache (configured here, persistent)</li>
+         *   <li>L3: Remote storage (S3/Azure, slowest)</li>
+         * </ul>
+         *
+         * <p><b>Usage Example:</b>
+         * <pre>{@code
+         * CacheConfig config = new CacheConfig("prod-cache")
+         *     .withMaxCacheSize(500_000_000)  // 500MB L1 memory cache
+         *     .withTieredCache(new TieredCacheConfig()
+         *         .withDiskCachePath("/mnt/nvme/cache")
+         *         .withMaxDiskSize(100_000_000_000L)  // 100GB disk cache
+         *         .withCompression(CompressionAlgorithm.LZ4));  // Fast compression
+         * }</pre>
+         *
+         * @param tieredCacheConfig the tiered cache configuration
+         * @return this CacheConfig for method chaining
+         * @see TieredCacheConfig
+         * @see CompressionAlgorithm
+         */
+        public CacheConfig withTieredCache(TieredCacheConfig tieredCacheConfig) {
+            this.tieredCacheConfig = tieredCacheConfig;
+            return this;
+        }
+
+        /**
+         * Gets the tiered cache configuration.
+         *
+         * @return tiered cache config, or null if not configured
+         */
+        public TieredCacheConfig getTieredCacheConfig() {
+            return tieredCacheConfig;
+        }
         
         /**
          * Generate a comprehensive cache key based on all configuration parameters.
@@ -332,6 +378,182 @@ public class SplitCacheManager implements AutoCloseable {
         }
     }
     
+    /**
+     * Compression algorithm for L2 disk cache.
+     *
+     * <p>Determines how cached data is compressed on disk:
+     * <ul>
+     *   <li>{@link #NONE} - No compression, fastest I/O but largest disk usage</li>
+     *   <li>{@link #LZ4} - Fast compression (~400 MB/s), good compression ratio (default)</li>
+     *   <li>{@link #ZSTD} - Better compression, slower (falls back to LZ4 currently)</li>
+     * </ul>
+     *
+     * <p>The cache uses intelligent compression decisions based on component type:
+     * <ul>
+     *   <li>Small data (&lt;4KB): Never compressed (overhead exceeds benefit)</li>
+     *   <li>Hot data (footer, metadata): Never compressed (CPU cost not worth it)</li>
+     *   <li>Large components (.term, .idx, .pos): Always compressed (50-70% savings)</li>
+     * </ul>
+     */
+    public enum CompressionAlgorithm {
+        /** No compression - use for already-compressed or small data */
+        NONE,
+        /** LZ4 compression - fast, good for index data (default) */
+        LZ4,
+        /** Zstd compression - better ratio, slower (currently falls back to LZ4) */
+        ZSTD
+    }
+
+    /**
+     * Configuration for L2 tiered disk cache.
+     *
+     * <p>Provides persistent disk caching with intelligent compression for Quickwit split
+     * components. The disk cache sits between the L1 memory cache and remote storage (S3/Azure).
+     *
+     * <p><b>Features:</b>
+     * <ul>
+     *   <li>Persistent across restarts - survives JVM shutdown</li>
+     *   <li>Intelligent compression - LZ4 for large components, skips small/hot data</li>
+     *   <li>Split-level LRU eviction - removes entire splits when disk space is needed</li>
+     *   <li>Crash-safe manifest - periodic sync with backup for recovery</li>
+     * </ul>
+     *
+     * <p><b>Directory Structure:</b>
+     * <pre>
+     * {diskCachePath}/
+     *   manifest.json           # Cache manifest with metadata
+     *   s3_bucket__hash/        # Storage location directory
+     *     split-001/            # Split directory
+     *       term_full.cache.lz4 # Compressed term dictionary
+     *       idx_0-65536.cache   # Byte-range slice
+     *       footer.cache        # Uncompressed footer (hot data)
+     * </pre>
+     *
+     * <p><b>Usage Example:</b>
+     * <pre>{@code
+     * TieredCacheConfig tieredConfig = new TieredCacheConfig()
+     *     .withDiskCachePath("/mnt/nvme/tantivy_cache")
+     *     .withMaxDiskSize(100_000_000_000L)  // 100GB
+     *     .withCompression(CompressionAlgorithm.LZ4)
+     *     .withMinCompressSize(4096);  // Don't compress data < 4KB
+     *
+     * CacheConfig config = new CacheConfig("prod-cache")
+     *     .withMaxCacheSize(500_000_000)  // 500MB L1
+     *     .withTieredCache(tieredConfig);  // 100GB L2
+     * }</pre>
+     */
+    public static class TieredCacheConfig {
+        private String diskCachePath;
+        private long maxDiskSizeBytes = 0;  // 0 = auto (2/3 of available disk space)
+        private CompressionAlgorithm compression = CompressionAlgorithm.LZ4;
+        private int minCompressSizeBytes = 4096;  // Skip compression below 4KB
+        private int manifestSyncIntervalSecs = 30;  // Sync manifest every 30 seconds
+
+        /**
+         * Set the disk cache directory path.
+         *
+         * <p>This directory will contain all cached split components. It should be on
+         * fast storage (NVMe SSD recommended) with sufficient space for the cache.
+         *
+         * @param path absolute path to disk cache directory
+         * @return this TieredCacheConfig for method chaining
+         */
+        public TieredCacheConfig withDiskCachePath(String path) {
+            this.diskCachePath = path;
+            return this;
+        }
+
+        /**
+         * Set the maximum disk cache size in bytes.
+         *
+         * <p>When the cache exceeds this size, the least recently used splits are
+         * evicted to make room. If set to 0 (default), the cache will automatically
+         * use 2/3 of the available disk space.
+         *
+         * @param bytes maximum cache size in bytes (0 = auto-detect)
+         * @return this TieredCacheConfig for method chaining
+         */
+        public TieredCacheConfig withMaxDiskSize(long bytes) {
+            this.maxDiskSizeBytes = bytes;
+            return this;
+        }
+
+        /**
+         * Set the compression algorithm for cached data.
+         *
+         * <p>The default is {@link CompressionAlgorithm#LZ4} which provides fast
+         * compression (~400 MB/s) with good ratios (50-70% for index data).
+         *
+         * <p>Note: Compression is only applied to components where it provides benefit.
+         * Small data (&lt;4KB), hot data (footer), and already-compact data (numeric fast fields)
+         * are not compressed regardless of this setting.
+         *
+         * @param compression compression algorithm to use
+         * @return this TieredCacheConfig for method chaining
+         */
+        public TieredCacheConfig withCompression(CompressionAlgorithm compression) {
+            this.compression = compression;
+            return this;
+        }
+
+        /**
+         * Disable compression entirely.
+         *
+         * <p>Use this if CPU is limited or if the data is already compressed.
+         *
+         * @return this TieredCacheConfig for method chaining
+         */
+        public TieredCacheConfig withoutCompression() {
+            this.compression = CompressionAlgorithm.NONE;
+            return this;
+        }
+
+        /**
+         * Set minimum data size for compression.
+         *
+         * <p>Data smaller than this threshold will not be compressed, as the
+         * CPU overhead exceeds the I/O savings. Default is 4KB.
+         *
+         * @param bytes minimum size in bytes to consider for compression
+         * @return this TieredCacheConfig for method chaining
+         */
+        public TieredCacheConfig withMinCompressSize(int bytes) {
+            this.minCompressSizeBytes = bytes;
+            return this;
+        }
+
+        /**
+         * Set the interval for syncing the cache manifest to disk.
+         *
+         * <p>The manifest tracks all cached components. Periodic sync ensures
+         * the cache can be recovered after crashes. Default is 30 seconds.
+         * Set to 0 to sync on every write (slower but safest).
+         *
+         * @param seconds sync interval in seconds (0 = sync every write)
+         * @return this TieredCacheConfig for method chaining
+         */
+        public TieredCacheConfig withManifestSyncInterval(int seconds) {
+            this.manifestSyncIntervalSecs = seconds;
+            return this;
+        }
+
+        // Getters
+        public String getDiskCachePath() { return diskCachePath; }
+        public long getMaxDiskSizeBytes() { return maxDiskSizeBytes; }
+        public CompressionAlgorithm getCompression() { return compression; }
+        public int getMinCompressSizeBytes() { return minCompressSizeBytes; }
+        public int getManifestSyncIntervalSecs() { return manifestSyncIntervalSecs; }
+
+        /**
+         * Convert compression algorithm to ordinal for native layer.
+         *
+         * @return ordinal value (0=None, 1=LZ4, 2=ZSTD)
+         */
+        public int getCompressionOrdinal() {
+            return compression.ordinal();
+        }
+    }
+
     /**
      * Global cache statistics across all managed splits
      */
@@ -1019,6 +1241,16 @@ public class SplitCacheManager implements AutoCloseable {
     static native long nativeGetObjectStorageBytesFetched();
     static native void nativeResetObjectStorageRequestStats();
 
+    // ========================================
+    // L2 Disk Cache Statistics Native Methods
+    // ========================================
+    private static native long nativeGetDiskCacheTotalBytes(long ptr);
+    private static native long nativeGetDiskCacheMaxBytes(long ptr);
+    private static native int nativeGetDiskCacheSplitCount(long ptr);
+    private static native int nativeGetDiskCacheComponentCount(long ptr);
+    private static native boolean nativeIsDiskCacheEnabled(long ptr);
+    private static native boolean nativeEvictSplitFromDiskCache(long ptr, String splitUri);
+
     /**
      * Get global batch optimization metrics.
      *
@@ -1209,6 +1441,132 @@ public class SplitCacheManager implements AutoCloseable {
      */
     public static void resetObjectStorageRequestStats() {
         nativeResetObjectStorageRequestStats();
+    }
+
+    // ========================================
+    // L2 Disk Cache Statistics API
+    // ========================================
+
+    /**
+     * Get L2 disk cache statistics.
+     *
+     * <p>The L2 disk cache provides persistent caching of split data on local disk,
+     * reducing repeated fetches from remote storage (S3/Azure). This method returns
+     * statistics about the current state of the disk cache.
+     *
+     * <p><strong>Example Usage:</strong>
+     * <pre>{@code
+     * DiskCacheStats stats = cacheManager.getDiskCacheStats();
+     * if (stats.isEnabled()) {
+     *     System.out.println("Disk Cache Usage: " + stats.getUsagePercent() + "%");
+     *     System.out.println("Splits Cached: " + stats.getSplitCount());
+     *     System.out.println("Components Cached: " + stats.getComponentCount());
+     *     System.out.println("Total Bytes: " + stats.getTotalBytes());
+     * }
+     * }</pre>
+     *
+     * @return disk cache statistics, or empty stats if disk cache is not enabled
+     */
+    public DiskCacheStats getDiskCacheStats() {
+        if (nativePtr == 0) {
+            return new DiskCacheStats(false, 0, 0, 0, 0);
+        }
+        boolean enabled = nativeIsDiskCacheEnabled(nativePtr);
+        if (!enabled) {
+            return new DiskCacheStats(false, 0, 0, 0, 0);
+        }
+        return new DiskCacheStats(
+            true,
+            nativeGetDiskCacheTotalBytes(nativePtr),
+            nativeGetDiskCacheMaxBytes(nativePtr),
+            nativeGetDiskCacheSplitCount(nativePtr),
+            nativeGetDiskCacheComponentCount(nativePtr)
+        );
+    }
+
+    /**
+     * Check if L2 disk cache is enabled for this cache manager.
+     *
+     * @return true if disk cache is enabled and configured
+     */
+    public boolean isDiskCacheEnabled() {
+        return nativePtr != 0 && nativeIsDiskCacheEnabled(nativePtr);
+    }
+
+    /**
+     * Evict a specific split from the disk cache.
+     *
+     * <p>This removes all cached components for the specified split from the L2 disk cache.
+     * The split will be re-fetched from remote storage on next access.
+     *
+     * @param splitUri the URI of the split to evict (e.g., "s3://bucket/path/split.split")
+     * @return true if the eviction was performed, false if disk cache is not enabled
+     */
+    public boolean evictSplitFromDiskCache(String splitUri) {
+        if (nativePtr == 0 || !nativeIsDiskCacheEnabled(nativePtr)) {
+            return false;
+        }
+        return nativeEvictSplitFromDiskCache(nativePtr, splitUri);
+    }
+
+    /**
+     * L2 disk cache statistics.
+     *
+     * <p>Provides visibility into the state of the persistent disk cache layer.
+     * The disk cache stores split components on local disk with optional LZ4 compression
+     * to reduce repeated fetches from remote storage.
+     */
+    public static class DiskCacheStats {
+        private final boolean enabled;
+        private final long totalBytes;
+        private final long maxBytes;
+        private final int splitCount;
+        private final int componentCount;
+
+        DiskCacheStats(boolean enabled, long totalBytes, long maxBytes, int splitCount, int componentCount) {
+            this.enabled = enabled;
+            this.totalBytes = totalBytes;
+            this.maxBytes = maxBytes;
+            this.splitCount = splitCount;
+            this.componentCount = componentCount;
+        }
+
+        /** Whether the disk cache is enabled and active. */
+        public boolean isEnabled() { return enabled; }
+
+        /** Total bytes currently used by the disk cache. */
+        public long getTotalBytes() { return totalBytes; }
+
+        /** Maximum bytes allowed for the disk cache. */
+        public long getMaxBytes() { return maxBytes; }
+
+        /** Number of splits currently cached on disk. */
+        public int getSplitCount() { return splitCount; }
+
+        /** Total number of components cached across all splits. */
+        public int getComponentCount() { return componentCount; }
+
+        /**
+         * Cache usage as a percentage (0-100).
+         * Returns 0 if disk cache is not enabled or max size is 0.
+         */
+        public double getUsagePercent() {
+            if (!enabled || maxBytes == 0) {
+                return 0.0;
+            }
+            return (totalBytes * 100.0 / maxBytes);
+        }
+
+        @Override
+        public String toString() {
+            if (!enabled) {
+                return "DiskCacheStats{enabled=false}";
+            }
+            return String.format(
+                "DiskCacheStats{totalBytes=%d, maxBytes=%d, usage=%.1f%%, splits=%d, components=%d}",
+                totalBytes, maxBytes, getUsagePercent(), splitCount, componentCount
+            );
+        }
     }
 
     // Package-private getters for SplitSearcher

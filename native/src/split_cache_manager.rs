@@ -1,8 +1,10 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::path::PathBuf;
 use crate::debug_println;
 use crate::simple_batch_optimization::{PrefetchStats, BatchOptimizationMetrics};
+use crate::disk_cache::{L2DiskCache, DiskCacheConfig, CompressionAlgorithm};
 
 // Debug logging macro - controlled by TANTIVY4JAVA_DEBUG environment variable
 macro_rules! debug_log {
@@ -13,7 +15,7 @@ macro_rules! debug_log {
 
 use jni::JNIEnv;
 use jni::objects::{JClass, JObject, JString};
-use jni::sys::{jlong, jint, jobject, jdouble};
+use jni::sys::{jlong, jint, jobject, jdouble, jboolean};
 
 use tokio::runtime::Runtime;
 use crate::global_cache::{get_configured_storage_resolver, get_global_searcher_context};
@@ -25,19 +27,22 @@ use quickwit_config::{S3StorageConfig, AzureStorageConfig};
 pub struct GlobalSplitCacheManager {
     cache_name: String,
     max_cache_size: u64,
-    
+
     // REMOVED: runtime field - using shared global runtime to prevent deadlocks
-    
+
     // Storage configurations for resolver
     s3_config: Option<S3StorageConfig>,
     azure_config: Option<AzureStorageConfig>,
-    
+
+    // L2 Disk cache for persistent caching
+    disk_cache: Option<Arc<L2DiskCache>>,
+
     // Statistics
     total_hits: AtomicU64,
     total_misses: AtomicU64,
     total_evictions: AtomicU64,
     current_size: AtomicU64,
-    
+
     // Managed splits
     managed_splits: Mutex<HashMap<String, u64>>, // split_path -> last_access_time
 }
@@ -45,27 +50,53 @@ pub struct GlobalSplitCacheManager {
 impl GlobalSplitCacheManager {
     pub fn new(cache_name: String, max_cache_size: u64) -> Self {
         debug_println!("RUST DEBUG: Creating GlobalSplitCacheManager '{}' using global caches", cache_name);
-        
+
         // CRITICAL FIX: DO NOT create separate Tokio runtime - causes multiple runtime deadlocks
         // All async operations should use the shared global runtime via QuickwitRuntimeManager
         debug_println!("🔧 RUNTIME_FIX: Eliminating separate Tokio runtime to prevent deadlocks");
-        
+
         // Note: We're using the global caches from GLOBAL_SEARCHER_COMPONENTS
         // This ensures all split cache managers share the same underlying caches
         // following Quickwit's architecture pattern
-        
+
         Self {
             cache_name,
             max_cache_size,
             // REMOVED: runtime field to prevent multiple runtime conflicts
             s3_config: None,
             azure_config: None,
+            disk_cache: None,
             total_hits: AtomicU64::new(0),
             total_misses: AtomicU64::new(0),
             total_evictions: AtomicU64::new(0),
             current_size: AtomicU64::new(0),
             managed_splits: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Initialize L2 disk cache with the given configuration
+    pub fn set_disk_cache(&mut self, config: DiskCacheConfig) {
+        debug_println!("RUST DEBUG: Initializing L2DiskCache for cache '{}' at {:?}",
+                      self.cache_name, config.root_path);
+
+        match L2DiskCache::new(config) {
+            Ok(cache) => {
+                let stats = cache.stats();
+                debug_println!("RUST DEBUG: L2DiskCache created successfully. Max size: {} bytes, {} splits cached",
+                             stats.max_bytes, stats.split_count);
+                // Also set the global disk cache so StandaloneSearcher can access it
+                crate::global_cache::set_global_disk_cache(cache.clone());
+                self.disk_cache = Some(cache);
+            }
+            Err(e) => {
+                debug_println!("RUST WARNING: Failed to create L2DiskCache: {}. Continuing without disk cache.", e);
+            }
+        }
+    }
+
+    /// Get reference to L2 disk cache if configured
+    pub fn get_disk_cache(&self) -> Option<&Arc<L2DiskCache>> {
+        self.disk_cache.as_ref()
     }
     
     pub fn add_split(&self, split_path: String) {
@@ -226,6 +257,7 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_
     _class: JClass,
     config: JObject,
 ) -> jlong {
+    debug_println!("RUST DEBUG: createNativeCacheManager called");
     // Extract cache name from config
     let cache_name = match env.call_method(&config, "getCacheName", "()Ljava/lang/String;", &[]) {
         Ok(result) => {
@@ -300,7 +332,95 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_
             manager.set_aws_config(s3_config);
         }
     }
-    
+
+    // Extract TieredCacheConfig from the Java CacheConfig
+    debug_println!("RUST DEBUG: Attempting to extract TieredCacheConfig");
+    if let Ok(tiered_config_result) = env.call_method(&config, "getTieredCacheConfig",
+        "()Lio/indextables/tantivy4java/split/SplitCacheManager$TieredCacheConfig;", &[]) {
+        let tiered_config_obj = tiered_config_result.l().unwrap();
+        debug_println!("RUST DEBUG: TieredCacheConfig result obtained, is_null={}", tiered_config_obj.is_null());
+
+        if !tiered_config_obj.is_null() {
+            debug_println!("RUST DEBUG: Found non-null TieredCacheConfig");
+            debug_println!("RUST DEBUG: Found TieredCacheConfig in Java CacheConfig");
+
+            // Extract disk cache path
+            debug_println!("RUST DEBUG: Extracting disk cache path");
+            let disk_path = match env.call_method(&tiered_config_obj, "getDiskCachePath", "()Ljava/lang/String;", &[]) {
+                Ok(result) => {
+                    let path_obj = result.l().unwrap();
+                    debug_println!("RUST DEBUG: getDiskCachePath result is_null={}", path_obj.is_null());
+                    if !path_obj.is_null() {
+                        match env.get_string(&JString::from(path_obj)) {
+                            Ok(path) => {
+                                let path_str = path.to_string_lossy().to_string();
+                                debug_println!("RUST DEBUG: Got disk cache path: {}", path_str);
+                                Some(path_str)
+                            },
+                            Err(e) => {
+                                debug_println!("RUST DEBUG: Failed to get path string: {:?}", e);
+                                None
+                            },
+                        }
+                    } else {
+                        debug_println!("RUST DEBUG: path_obj is null");
+                        None
+                    }
+                }
+                Err(e) => {
+                    debug_println!("RUST DEBUG: getDiskCachePath call failed: {:?}", e);
+                    None
+                }
+            };
+
+            // Extract max disk size
+            let max_disk_size = match env.call_method(&tiered_config_obj, "getMaxDiskSizeBytes", "()J", &[]) {
+                Ok(result) => result.j().unwrap() as u64,
+                _ => 0, // 0 = auto-detect
+            };
+
+            // Extract compression ordinal (0=None, 1=LZ4, 2=ZSTD)
+            let compression_ordinal = match env.call_method(&tiered_config_obj, "getCompressionOrdinal", "()I", &[]) {
+                Ok(result) => result.i().unwrap(),
+                _ => 1, // Default to LZ4
+            };
+
+            // Extract min compress size
+            let min_compress_size = match env.call_method(&tiered_config_obj, "getMinCompressSizeBytes", "()I", &[]) {
+                Ok(result) => result.i().unwrap() as usize,
+                _ => 4096, // 4KB default
+            };
+
+            // Extract manifest sync interval
+            let manifest_sync_interval = match env.call_method(&tiered_config_obj, "getManifestSyncIntervalSecs", "()I", &[]) {
+                Ok(result) => result.i().unwrap() as u64,
+                _ => 30, // 30 seconds default
+            };
+
+            // Create disk cache config if we have a path
+            debug_println!("RUST DEBUG: disk_path is_some={}", disk_path.is_some());
+            if let Some(path) = disk_path {
+                debug_println!("RUST DEBUG: Creating L2DiskCache config at '{}'", path);
+                debug_println!("RUST DEBUG: Configuring L2DiskCache at '{}', max_size={}, compression={}, min_compress={}",
+                             path, max_disk_size, compression_ordinal, min_compress_size);
+
+                let disk_config = DiskCacheConfig {
+                    root_path: PathBuf::from(path.clone()),
+                    max_size_bytes: max_disk_size,
+                    compression: CompressionAlgorithm::from_ordinal(compression_ordinal),
+                    min_compress_size,
+                    manifest_sync_interval_secs: manifest_sync_interval,
+                };
+
+                debug_println!("RUST DEBUG: Calling set_disk_cache");
+                manager.set_disk_cache(disk_config);
+                debug_println!("RUST DEBUG: set_disk_cache complete");
+            } else {
+                debug_println!("RUST DEBUG: disk_path is None, skipping disk cache setup");
+            }
+        }
+    }
+
     let manager_arc = Arc::new(manager);
     
     // Store in global registry
@@ -331,9 +451,20 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_
     if ptr != 0 {
         // Safely find and remove from global registry instead of dangerous Arc::from_raw()
         let mut managers = CACHE_MANAGERS.lock().unwrap();
-        
+
         // Use Arc registry to find cache name, then remove from managers
         if let Some(cache_name_arc) = crate::utils::jlong_to_arc::<String>(ptr) {
+            // Check if this manager has a disk cache and clear caches
+            if let Some(manager) = managers.get(&*cache_name_arc) {
+                if manager.disk_cache.is_some() {
+                    debug_println!("RUST DEBUG: Clearing caches for cache '{}' with disk cache", *cache_name_arc);
+                    // Clear searcher cache first - this releases Arc<Searcher> which holds
+                    // references to StorageWithPersistentCache -> L2DiskCache
+                    crate::split_searcher_replacement::clear_searcher_cache();
+                    // Then clear the global disk cache reference
+                    crate::global_cache::clear_global_disk_cache();
+                }
+            }
             managers.remove(&*cache_name_arc);
             // Release the Arc from registry
             crate::utils::release_arc(ptr);
@@ -797,4 +928,183 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_
     _class: JClass,
 ) {
     quickwit_storage::reset_object_storage_request_stats();
+}
+
+// ===================================
+// L2 Disk Cache Statistics JNI Methods
+// ===================================
+
+/// Get disk cache total bytes used
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_nativeGetDiskCacheTotalBytes(
+    _env: JNIEnv,
+    _class: JClass,
+    ptr: jlong,
+) -> jlong {
+    if ptr == 0 {
+        return 0;
+    }
+
+    let cache_name = match crate::utils::jlong_to_arc::<String>(ptr) {
+        Some(name_arc) => (*name_arc).clone(),
+        None => return 0,
+    };
+
+    let managers = CACHE_MANAGERS.lock().unwrap();
+    match managers.get(&cache_name) {
+        Some(manager) => match manager.get_disk_cache() {
+            Some(disk_cache) => disk_cache.stats().total_bytes as jlong,
+            None => 0,
+        },
+        None => 0,
+    }
+}
+
+/// Get disk cache max bytes limit
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_nativeGetDiskCacheMaxBytes(
+    _env: JNIEnv,
+    _class: JClass,
+    ptr: jlong,
+) -> jlong {
+    if ptr == 0 {
+        return 0;
+    }
+
+    let cache_name = match crate::utils::jlong_to_arc::<String>(ptr) {
+        Some(name_arc) => (*name_arc).clone(),
+        None => return 0,
+    };
+
+    let managers = CACHE_MANAGERS.lock().unwrap();
+    match managers.get(&cache_name) {
+        Some(manager) => match manager.get_disk_cache() {
+            Some(disk_cache) => disk_cache.stats().max_bytes as jlong,
+            None => 0,
+        },
+        None => 0,
+    }
+}
+
+/// Get number of splits cached on disk
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_nativeGetDiskCacheSplitCount(
+    _env: JNIEnv,
+    _class: JClass,
+    ptr: jlong,
+) -> jint {
+    if ptr == 0 {
+        return 0;
+    }
+
+    let cache_name = match crate::utils::jlong_to_arc::<String>(ptr) {
+        Some(name_arc) => (*name_arc).clone(),
+        None => return 0,
+    };
+
+    let managers = CACHE_MANAGERS.lock().unwrap();
+    match managers.get(&cache_name) {
+        Some(manager) => match manager.get_disk_cache() {
+            Some(disk_cache) => disk_cache.stats().split_count as jint,
+            None => 0,
+        },
+        None => 0,
+    }
+}
+
+/// Get number of components cached on disk
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_nativeGetDiskCacheComponentCount(
+    _env: JNIEnv,
+    _class: JClass,
+    ptr: jlong,
+) -> jint {
+    if ptr == 0 {
+        return 0;
+    }
+
+    let cache_name = match crate::utils::jlong_to_arc::<String>(ptr) {
+        Some(name_arc) => (*name_arc).clone(),
+        None => return 0,
+    };
+
+    let managers = CACHE_MANAGERS.lock().unwrap();
+    match managers.get(&cache_name) {
+        Some(manager) => match manager.get_disk_cache() {
+            Some(disk_cache) => disk_cache.stats().component_count as jint,
+            None => 0,
+        },
+        None => 0,
+    }
+}
+
+/// Check if disk cache is enabled
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_nativeIsDiskCacheEnabled(
+    _env: JNIEnv,
+    _class: JClass,
+    ptr: jlong,
+) -> jboolean {
+    if ptr == 0 {
+        return 0;
+    }
+
+    let cache_name = match crate::utils::jlong_to_arc::<String>(ptr) {
+        Some(name_arc) => (*name_arc).clone(),
+        None => return 0,
+    };
+
+    let managers = CACHE_MANAGERS.lock().unwrap();
+    match managers.get(&cache_name) {
+        Some(manager) => if manager.get_disk_cache().is_some() { 1 } else { 0 },
+        None => 0,
+    }
+}
+
+/// Evict a specific split from the disk cache
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_nativeEvictSplitFromDiskCache(
+    mut env: JNIEnv,
+    _class: JClass,
+    ptr: jlong,
+    split_uri: JString,
+) -> jboolean {
+    if ptr == 0 {
+        return 0;
+    }
+
+    let split_uri_str: String = match env.get_string(&split_uri) {
+        Ok(s) => s.into(),
+        Err(_) => return 0,
+    };
+
+    let cache_name = match crate::utils::jlong_to_arc::<String>(ptr) {
+        Some(name_arc) => (*name_arc).clone(),
+        None => return 0,
+    };
+
+    let managers = CACHE_MANAGERS.lock().unwrap();
+    match managers.get(&cache_name) {
+        Some(manager) => match manager.get_disk_cache() {
+            Some(disk_cache) => {
+                // Extract split_id from URI (e.g., "s3://bucket/path/split-id.split" -> "split-id")
+                let split_id = split_uri_str
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or(&split_uri_str)
+                    .trim_end_matches(".split");
+
+                // The storage_loc is the URI without the split filename
+                let storage_loc = split_uri_str
+                    .rsplit_once('/')
+                    .map(|(base, _)| base)
+                    .unwrap_or(&split_uri_str);
+
+                disk_cache.evict_split(storage_loc, split_id);
+                1
+            },
+            None => 0,
+        },
+        None => 0,
+    }
 }

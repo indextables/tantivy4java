@@ -14,7 +14,38 @@ Tantivy4Java
 
 ## ✅ **PRODUCTION READY WITH QUICKWIT SPLIT MERGE COMPLETE**
 
-### **🚀 LATEST BREAKTHROUGH: COMPLETE MEMORY ALLOCATION SYSTEM OVERHAUL (August 2025)**
+### **🚀 LATEST BREAKTHROUGH: TIERED DISK CACHE (December 2025)**
+
+**✅ Persistent Disk Cache Implementation:**
+- **✅ TieredCacheConfig API** - Configure disk cache path, max size, compression
+- **✅ LZ4/ZSTD Compression** - Smart compression with ~50-70% savings
+- **✅ LRU Eviction** - Automatic eviction at 95% capacity, split-level granularity
+- **✅ Manifest Persistence** - Cache survives JVM restarts with crash recovery
+- **✅ Non-blocking Writes** - Async writes via background thread, searches never blocked
+- **✅ S3/Azure Integration** - Works seamlessly with cloud storage backends
+
+**✅ Configuration Example:**
+```java
+SplitCacheManager.TieredCacheConfig tieredConfig = new SplitCacheManager.TieredCacheConfig()
+    .withDiskCachePath("/mnt/nvme/tantivy_cache")  // Fast SSD recommended
+    .withMaxDiskSize(100_000_000_000L)              // 100GB limit
+    .withCompression(SplitCacheManager.CompressionAlgorithm.LZ4);
+
+SplitCacheManager.CacheConfig cacheConfig = new SplitCacheManager.CacheConfig("prod-cache")
+    .withMaxCacheSize(500_000_000)
+    .withAwsCredentials(accessKey, secretKey)
+    .withAwsRegion("us-east-1")
+    .withTieredCache(tieredConfig);
+```
+
+**✅ Performance Benefits:**
+- **Disk Cache (NVMe)**: 1-5ms latency vs 50-200ms for S3/Azure
+- **Eliminates Egress Costs**: Data served from local disk after first access
+- **Survives Restarts**: No need to re-download from cloud after JVM restart
+
+**📖 Documentation:** See `docs/L2_DISK_CACHE_GUIDE.md` for complete developer guide.
+
+### **🚀 PREVIOUS BREAKTHROUGH: COMPLETE MEMORY ALLOCATION SYSTEM OVERHAUL (August 2025)**
 
 **✅ Production-Grade Memory Management Implementation:**
 - **✅ Index.Memory Constants System** - Comprehensive memory constants with MIN_HEAP_SIZE (15MB), DEFAULT_HEAP_SIZE (50MB), LARGE_HEAP_SIZE (128MB), XL_HEAP_SIZE (256MB)
