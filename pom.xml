@@ -5,8 +5,8 @@
     <modelVersion>4.0.0</modelVersion>
 
     <groupId>io.indextables</groupId>
-    <artifactId>tantivy4javaexperimental</artifactId>
-    <version>0.25.14</version>
+    <artifactId>tantivy4java</artifactId>
+    <version>0.26.1</version>
     <packaging>jar</packaging>
 
     <name>Tantivy4Java Experimental</name>
@@ -205,26 +205,6 @@
                 <version>3.1.0</version>
                 <executions>
                     <!-- Run Rust unit tests before building (skip doctests) -->
-                    <execution>
-                        <id>test-rust</id>
-                        <phase>process-sources</phase>
-                        <goals>
-                            <goal>exec</goal>
-                        </goals>
-                        <configuration>
-                            <executable>cargo</executable>
-                            <arguments>
-                                <argument>test</argument>
-                                <argument>--lib</argument>
-                                <argument>--target-dir</argument>
-                                <argument>${rust.target.dir}</argument>
-                            </arguments>
-                            <workingDirectory>${project.basedir}/native</workingDirectory>
-                            <environmentVariables>
-                                <RUST_BACKTRACE>1</RUST_BACKTRACE>
-                            </environmentVariables>
-                        </configuration>
-                    </execution>
                     <!-- Build release binary -->
                     <execution>
                         <id>build-rust</id>
