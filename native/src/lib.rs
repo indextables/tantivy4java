@@ -48,6 +48,8 @@ mod test_query_parser;  // Test module for query parser debugging
 mod common;
 mod extract_helpers;
 mod global_cache;  // Global cache infrastructure following Quickwit's pattern
+mod disk_cache;  // L2 tiered disk cache with intelligent compression
+mod persistent_cache_storage;  // Tiered cache integration with memory + disk
 mod simple_batch_optimization;  // Priority 1: Simplified batch optimization with range consolidation
 mod adaptive_tuning;  // Priority 5: Adaptive tuning engine for automatic parameter optimization
 
@@ -132,6 +134,7 @@ pub extern "system" fn Java_io_indextables_tantivy4java_config_GlobalCacheConfig
         warmup_memory_budget: ByteSize::gb(warmup_memory_gb as u64),
         split_cache_limits,
         split_cache_root_path: split_cache_path_opt,
+        disk_cache_config: None, // L2 disk cache configured separately via SplitCacheManager
     };
     
     if initialize_global_cache(config) {

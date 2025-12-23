@@ -1173,26 +1173,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_wildcard_to_regex() {
+    fn test_wildcard_to_regex_preserve_case() {
         // Basic patterns
-        assert_eq!(wildcard_to_regex("Hello*"), "Hello.*");
-        assert_eq!(wildcard_to_regex("*World"), ".*World");
-        assert_eq!(wildcard_to_regex("He?lo"), "He.lo");
-        
+        assert_eq!(wildcard_to_regex_preserve_case("Hello*"), "Hello.*");
+        assert_eq!(wildcard_to_regex_preserve_case("*World"), ".*World");
+        assert_eq!(wildcard_to_regex_preserve_case("He?lo"), "He.lo");
+
         // Complex patterns
-        assert_eq!(wildcard_to_regex("Hello*World"), "Hello.*World");
-        assert_eq!(wildcard_to_regex("*test*"), ".*test.*");
-        
-        // Escape sequences
-        assert_eq!(wildcard_to_regex("test\\*"), "test*");
-        assert_eq!(wildcard_to_regex("test\\?"), "test?");
-        
+        assert_eq!(wildcard_to_regex_preserve_case("Hello*World"), "Hello.*World");
+        assert_eq!(wildcard_to_regex_preserve_case("*test*"), ".*test.*");
+
+        // Escape sequences - \* becomes literal *, \? becomes literal ?
+        assert_eq!(wildcard_to_regex_preserve_case("test\\*"), "test*");
+        assert_eq!(wildcard_to_regex_preserve_case("test\\?"), "test?");
+
         // Special regex characters
-        assert_eq!(wildcard_to_regex("test.txt"), "test\\.txt");
-        assert_eq!(wildcard_to_regex("test(1)"), "test\\(1\\)");
-        
+        assert_eq!(wildcard_to_regex_preserve_case("test.txt"), "test\\.txt");
+        assert_eq!(wildcard_to_regex_preserve_case("test(1)"), "test\\(1\\)");
+
         // Exact match (no wildcards)
-        assert_eq!(wildcard_to_regex("Hello"), "Hello");
+        assert_eq!(wildcard_to_regex_preserve_case("Hello"), "Hello");
     }
 }
 

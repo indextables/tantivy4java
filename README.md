@@ -14,9 +14,10 @@ Tantivy4Java is a production-ready Java library that provides direct access to t
 4. [Basic Usage](#basic-usage)
 5. [Advanced Features](#advanced-features)
 6. [Quickwit Integration](#quickwit-integration)
-7. [Performance Guide](#performance-guide)
-8. [Developer Guide](#developer-guide)
-9. [API Reference](#api-reference)
+7. [L2 Tiered Disk Cache](#l2-tiered-disk-cache)
+8. [Performance Guide](#performance-guide)
+9. [Developer Guide](#developer-guide)
+10. [API Reference](#api-reference)
 
 ---
 
@@ -27,11 +28,13 @@ Tantivy4Java is a production-ready Java library that provides direct access to t
 ```xml
 <dependency>
     <groupId>io.indextables</groupId>
-    <artifactId>tantivy4java</artifactId>
-    <version>0.24.1</version>
+    <artifactId>tantivy4javaexperimental</artifactId>
+    <version>0.25.14</version>
     <classifier>linux-x86_64</classifier>
 </dependency>
 ```
+
+> **Note:** This experimental version includes the new L2 tiered disk cache feature. See [L2 Disk Cache](#l2-tiered-disk-cache) for details.
 
 ### 30-Second Example
 
@@ -1102,6 +1105,90 @@ The SearcherCache uses LRU eviction to prevent unbounded memory growth that was 
 - **Cache Hit Rate** - Target >90% for workloads with repeated document access
 - **Evictions** - Should be minimal for stable workloads; high evictions indicate cache size too small
 - **Hits vs Misses** - Ratio indicates cache effectiveness and access pattern locality
+
+---
+
+## L2 Tiered Disk Cache
+
+The disk cache provides persistent caching between the application and remote storage (S3/Azure), dramatically reducing latency and cloud egress costs.
+
+### Quick Configuration
+
+```java
+import io.indextables.tantivy4java.split.*;
+
+// Configure disk cache
+SplitCacheManager.TieredCacheConfig tieredConfig = new SplitCacheManager.TieredCacheConfig()
+    .withDiskCachePath("/mnt/nvme/tantivy_cache")  // Fast SSD recommended
+    .withMaxDiskSize(100_000_000_000L)              // 100GB limit
+    .withCompression(SplitCacheManager.CompressionAlgorithm.LZ4);
+
+// Create cache manager with disk cache
+SplitCacheManager.CacheConfig cacheConfig =
+    new SplitCacheManager.CacheConfig("production-cache")
+        .withMaxCacheSize(500_000_000)
+        .withAwsCredentials(accessKey, secretKey)
+        .withAwsRegion("us-east-1")
+        .withTieredCache(tieredConfig);
+
+try (SplitCacheManager cacheManager = SplitCacheManager.getInstance(cacheConfig)) {
+    try (SplitSearcher searcher = cacheManager.createSplitSearcher(splitUrl, metadata)) {
+        // First search: cache miss → S3 download → populate disk cache
+        SearchResult result1 = searcher.search(query, 10);
+
+        // Subsequent searches: cache HIT (fast)
+        SearchResult result2 = searcher.search(query, 10);
+    }
+}
+
+// After JVM restart: disk cache HIT → no S3 download needed
+```
+
+### Cache Configuration Options
+
+| Method | Default | Description |
+|--------|---------|-------------|
+| `withDiskCachePath(path)` | *required* | Directory for cache files |
+| `withMaxDiskSize(bytes)` | 0 | Max cache size; 0 = auto (2/3 available disk) |
+| `withCompression(algo)` | LZ4 | Compression: `LZ4`, `ZSTD`, or `NONE` |
+| `withMinCompressSize(bytes)` | 4096 | Skip compression below this threshold |
+| `withManifestSyncInterval(secs)` | 30 | How often to persist manifest to disk |
+
+### Compression Algorithms
+
+| Algorithm | Speed | Ratio | Use Case |
+|-----------|-------|-------|----------|
+| `LZ4` | ~400 MB/s | 50-70% | Default, best balance |
+| `ZSTD` | ~150 MB/s | 60-80% | Cold data, max compression |
+| `NONE` | N/A | 0% | Pre-compressed data, CPU-limited |
+
+### Cache Statistics
+
+```java
+SplitCacheManager.DiskCacheStats stats = cacheManager.getDiskCacheStats();
+if (stats != null) {
+    System.out.println("Total bytes: " + stats.getTotalBytes());
+    System.out.println("Max bytes: " + stats.getMaxBytes());
+    System.out.println("Usage: " + stats.getUsagePercent() + "%");
+    System.out.println("Splits cached: " + stats.getSplitCount());
+    System.out.println("Components cached: " + stats.getComponentCount());
+}
+```
+
+### Performance Characteristics
+
+| Storage Layer | Typical Latency | Notes |
+|---------------|-----------------|-------|
+| Disk Cache (NVMe) | 1-5ms | Local I/O, decompression |
+| S3/Azure | 50-200ms | Network RTT + transfer |
+
+**Key features:**
+- **Non-blocking writes** - Searches complete immediately; cache population happens in background
+- **LRU eviction** - Automatic eviction at 95% capacity (to 90%)
+- **Smart compression** - Automatically skips small data and numeric fields
+- **Crash recovery** - Manifest persistence with backup for recovery
+
+For detailed documentation, see [L2 Disk Cache Developer Guide](docs/L2_DISK_CACHE_GUIDE.md).
 
 ---
 

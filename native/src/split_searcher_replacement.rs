@@ -531,6 +531,19 @@ fn get_searcher_cache() -> &'static Mutex<LruCache<String, Arc<tantivy::Searcher
     })
 }
 
+/// Clear the entire searcher cache
+/// This releases all Arc<tantivy::Searcher> references, which in turn releases
+/// Storage/L2DiskCache references, allowing proper cleanup of disk cache files.
+pub fn clear_searcher_cache() {
+    if let Some(cache) = SEARCHER_CACHE.get() {
+        if let Ok(mut guard) = cache.lock() {
+            let count = guard.len();
+            guard.clear();
+            debug_println!("RUST DEBUG: 🧹 Cleared searcher cache ({} entries removed)", count);
+        }
+    }
+}
+
 /// Simple data structure to hold search results for JNI integration
 #[derive(Debug)]
 pub struct SearchResultData {
@@ -869,8 +882,43 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_crea
             });
 
             match storage {
-                Ok(resolved_storage) => {
-                    debug_println!("🔥 STORAGE RESOLVED: Storage resolved once for reuse, instance: {:p}", Arc::as_ptr(&resolved_storage));
+                Ok(raw_storage) => {
+                    debug_println!("🔥 STORAGE RESOLVED: Raw storage resolved, instance: {:p}", Arc::as_ptr(&raw_storage));
+
+                    // Wrap with L2 disk cache only (no L1 - Quickwit's caches handle memory caching)
+                    use crate::persistent_cache_storage::StorageWithPersistentCache;
+                    use crate::global_cache::get_global_disk_cache;
+
+                    let split_filename = if let Some(last_slash_pos) = split_uri.rfind('/') {
+                        &split_uri[last_slash_pos + 1..]
+                    } else {
+                        &split_uri
+                    };
+                    let split_id_for_cache = if split_filename.ends_with(".split") {
+                        split_filename[..split_filename.len() - 6].to_string()
+                    } else {
+                        split_filename.to_string()
+                    };
+
+                    debug_println!("RUST TRACE: Checking disk cache for tiered storage wrapper (split_uri={})", split_uri);
+                    let resolved_storage: Arc<dyn Storage> = match get_global_disk_cache() {
+                        Some(disk_cache) => {
+                            debug_println!("RUST TRACE: Creating StorageWithPersistentCache with L2 only for {}", split_uri);
+                            debug_println!("🔄 TIERED_CACHE: Wrapping storage with L2 disk cache (no redundant L1)");
+                            Arc::new(StorageWithPersistentCache::with_disk_cache_only(
+                                raw_storage,
+                                disk_cache,
+                                split_uri.clone(),
+                                split_id_for_cache,
+                            ))
+                        }
+                        None => {
+                            // No disk cache configured - use raw storage directly
+                            debug_println!("RUST DEBUG: No disk cache configured - using raw storage");
+                            raw_storage
+                        }
+                    };
+                    debug_println!("🔥 STORAGE WRAPPED: Storage wrapped with tiered cache, instance: {:p}", Arc::as_ptr(&resolved_storage));
 
                     // Follow Quickwit pattern: open index once and cache it
                     // 🚀 BATCH OPTIMIZATION FIX: Create ByteRangeCache and parse bundle metadata
@@ -908,12 +956,13 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_crea
                         // 🚀 OPTIMIZATION: Call open_index_with_caches FIRST to populate split_footer_cache
                         // This eliminates redundant footer fetches when we parse bundle offsets below
                         let searcher_context_global = get_global_searcher_context();
-                        let result = quickwit_search::leaf::open_index_with_caches(
+
+                        let result = quickwit_search::open_index_with_caches(
                             &searcher_context_global,
                             resolved_storage.clone(),
                             &split_metadata,
                             None, // tokenizer_manager
-                            Some(byte_range_cache.clone())  // 🚀 Pass ByteRangeCache for prefetch optimization
+                            Some(byte_range_cache.clone()),  // 🚀 Pass ByteRangeCache for prefetch optimization
                         ).await;
 
                         // 🚀 BATCH OPTIMIZATION FIX: Parse bundle file offsets from footer (now cached in split_footer_cache!)

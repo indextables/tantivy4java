@@ -27,6 +27,7 @@ use tempfile::TempDir;
 
 use crate::debug_println;
 use crate::cache_debug::{debug_arc_string_cache_identity, debug_cache_summary};
+use crate::disk_cache::{L2DiskCache, DiskCacheConfig, CompressionAlgorithm};
 
 /// Helper function to track storage instance creation for debugging
 /// This helps us understand when and where multiple storage instances are created
@@ -65,7 +66,7 @@ pub async fn tracked_storage_resolve(
 pub struct GlobalCacheConfig {
     /// Fast field cache capacity (default: 1GB)
     pub fast_field_cache_capacity: ByteSize,
-    /// Split footer cache capacity (default: 500MB)  
+    /// Split footer cache capacity (default: 500MB)
     pub split_footer_cache_capacity: ByteSize,
     /// Partial request cache capacity (default: 64MB)
     pub partial_request_cache_capacity: ByteSize,
@@ -81,6 +82,8 @@ pub struct GlobalCacheConfig {
     pub split_cache_limits: Option<SplitCacheLimits>,
     /// Split cache root directory (if not specified, uses temp directory)
     pub split_cache_root_path: Option<PathBuf>,
+    /// L2 disk cache configuration (optional)
+    pub disk_cache_config: Option<DiskCacheConfig>,
 }
 
 impl Default for GlobalCacheConfig {
@@ -103,6 +106,7 @@ impl Default for GlobalCacheConfig {
             warmup_memory_budget: ByteSize::gb(100),
             split_cache_limits: default_split_cache_limits,
             split_cache_root_path: None, // Will use temp directory if not specified
+            disk_cache_config: None, // L2 disk cache disabled by default
         }
     }
 }
@@ -384,6 +388,8 @@ pub struct GlobalSearcherComponents {
     pub aggregation_limit: AggregationLimitsGuard,
     /// Split cache - caches entire split files on disk (optional)
     pub split_cache_opt: Option<Arc<SplitCache>>,
+    /// L2 disk cache - tiered persistent disk cache with compression (optional)
+    pub disk_cache: Option<Arc<L2DiskCache>>,
     /// Temp directory for split cache (kept alive to prevent cleanup)
     _temp_dir: Option<TempDir>,
 }
@@ -464,7 +470,27 @@ impl GlobalSearcherComponents {
             debug_println!("RUST DEBUG: SplitCache not configured, skipping creation");
             (None, None)
         };
-        
+
+        // Create L2 disk cache if configured
+        let disk_cache = if let Some(disk_config) = config.disk_cache_config {
+            debug_println!("RUST DEBUG: Creating L2DiskCache at {}", disk_config.root_path.display());
+            match L2DiskCache::new(disk_config) {
+                Ok(cache) => {
+                    let stats = cache.stats();
+                    debug_println!("RUST DEBUG: L2DiskCache created successfully. Max size: {} bytes, {} splits cached",
+                                 stats.max_bytes, stats.split_count);
+                    Some(cache)
+                }
+                Err(e) => {
+                    debug_println!("RUST WARNING: Failed to create L2DiskCache: {}. Continuing without disk cache.", e);
+                    None
+                }
+            }
+        } else {
+            debug_println!("RUST DEBUG: L2DiskCache not configured, skipping creation");
+            None
+        };
+
         Self {
             fast_fields_cache,
             split_footer_cache,
@@ -474,6 +500,7 @@ impl GlobalSearcherComponents {
             split_stream_semaphore,
             aggregation_limit,
             split_cache_opt,
+            disk_cache,
             _temp_dir: temp_dir,
         }
     }
@@ -530,6 +557,31 @@ static GLOBAL_SEARCHER_COMPONENTS: OnceLock<Arc<GlobalSearcherComponents>> = Onc
 /// Global cached SearcherContext - the ACTUAL shared instance that should be reused
 static GLOBAL_SEARCHER_CONTEXT: OnceLock<Arc<SearcherContext>> = OnceLock::new();
 
+/// Global L2 disk cache that can be set by SplitCacheManager
+/// This is separate from GlobalSearcherComponents to allow dynamic configuration
+static GLOBAL_DISK_CACHE: OnceLock<std::sync::RwLock<Option<Arc<L2DiskCache>>>> = OnceLock::new();
+
+fn get_disk_cache_holder() -> &'static std::sync::RwLock<Option<Arc<L2DiskCache>>> {
+    GLOBAL_DISK_CACHE.get_or_init(|| std::sync::RwLock::new(None))
+}
+
+/// Set the global L2 disk cache (called by SplitCacheManager when TieredCacheConfig is provided)
+pub fn set_global_disk_cache(cache: Arc<L2DiskCache>) {
+    let holder = get_disk_cache_holder();
+    let mut guard = holder.write().unwrap();
+    debug_println!("RUST DEBUG: Setting global L2 disk cache");
+    *guard = Some(cache);
+}
+
+/// Clear the global L2 disk cache (called when SplitCacheManager is closed)
+/// This removes the global Arc reference, allowing the disk cache to be dropped
+pub fn clear_global_disk_cache() {
+    let holder = get_disk_cache_holder();
+    let mut guard = holder.write().unwrap();
+    debug_println!("RUST DEBUG: Clearing global L2 disk cache");
+    *guard = None;
+}
+
 /// Initialize the global cache with custom configuration
 /// This should be called once at startup from Java if custom configuration is needed
 /// Returns true if initialization succeeded, false if already initialized
@@ -578,4 +630,20 @@ pub fn get_global_searcher_context() -> Arc<SearcherContext> {
 pub fn get_searcher_context_with_config(searcher_config: SearcherConfig) -> Arc<SearcherContext> {
     debug_println!("RUST DEBUG: Getting SearcherContext with custom config");
     get_global_components().create_searcher_context(searcher_config)
+}
+
+/// Get the global L2 disk cache if configured
+/// First checks the dynamically set cache (from SplitCacheManager),
+/// then falls back to the components' disk_cache if set at initialization
+pub fn get_global_disk_cache() -> Option<Arc<L2DiskCache>> {
+    // First check the dynamically set disk cache
+    let holder = get_disk_cache_holder();
+    let guard = holder.read().unwrap();
+    if let Some(ref cache) = *guard {
+        return Some(cache.clone());
+    }
+    drop(guard);
+
+    // Fall back to the components' disk_cache
+    get_global_components().disk_cache.clone()
 }

@@ -6,11 +6,11 @@
 
     <groupId>io.indextables</groupId>
     <artifactId>tantivy4java</artifactId>
-    <version>0.25.6</version>
+    <version>0.26.1</version>
     <packaging>jar</packaging>
 
-    <name>Tantivy4Java</name>
-    <description>Java bindings for Tantivy and Quickwit</description>
+    <name>Tantivy4Java Experimental</name>
+    <description>Java bindings for Tantivy and Quickwit with experimental L2 disk cache</description>
     <url>https://github.com/indextables/tantivy4java</url>
 
     <licenses>
@@ -204,6 +204,8 @@
                 <artifactId>exec-maven-plugin</artifactId>
                 <version>3.1.0</version>
                 <executions>
+                    <!-- Run Rust unit tests before building (skip doctests) -->
+                    <!-- Build release binary -->
                     <execution>
                         <id>build-rust</id>
                         <phase>compile</phase>
