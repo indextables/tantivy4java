@@ -1258,16 +1258,80 @@ async fn create_quickwit_split(
         &hotcache
     )?;
     
-    // ✅ STEP 5: Write payload to output file
-    // Note: Streaming functionality available but using simple approach for now
+    // ✅ STEP 5: Write payload to output file using streaming I/O to minimize memory usage
+    // Memory reduction: Instead of loading entire split into memory (O(file_size)),
+    // we stream in configurable chunks (O(chunk_size) = ~8-64MB constant)
     debug_log!("✅ STREAMING CONFIG: chunk_size={}MB, progress_tracking={}, streaming_io={}",
               config.streaming_chunk_size / 1024 / 1024,
               config.enable_progress_tracking,
               config.enable_streaming_io);
     let total_size = split_payload.len();
-    let payload_bytes = split_payload.read_all().await?;
-    std::fs::write(output_path, &payload_bytes)?;
-    let bytes_written = payload_bytes.len() as u64;
+
+    let bytes_written = if config.enable_streaming_io && total_size > config.streaming_chunk_size {
+        // ✅ MEMORY OPTIMIZATION: Stream payload in chunks instead of loading entire file
+        // This reduces peak memory from O(file_size) to O(chunk_size)
+        debug_log!("✅ STREAMING WRITE: Writing {} bytes in {} byte chunks",
+                  total_size, config.streaming_chunk_size);
+
+        let mut output_file = tokio::fs::File::create(output_path).await
+            .context("Failed to create output file for streaming write")?;
+        let mut output_writer = tokio::io::BufWriter::with_capacity(
+            8 * 1024 * 1024,  // 8MB buffer for efficient disk I/O
+            output_file
+        );
+
+        let chunk_size = config.streaming_chunk_size;
+        let mut offset = 0u64;
+        let mut total_written = 0u64;
+        let start_time = std::time::Instant::now();
+
+        while offset < total_size {
+            let end = (offset + chunk_size).min(total_size);
+            let range = offset..end;
+
+            // Get byte stream for this chunk
+            let byte_stream = split_payload.range_byte_stream(range.clone()).await
+                .map_err(|e| anyhow::anyhow!("Failed to get byte stream for range {:?}: {}", range, e))?;
+
+            // Read bytes from stream using async reader
+            let mut async_reader = tokio::io::BufReader::new(byte_stream.into_async_read());
+            let chunk_written = tokio::io::copy(&mut async_reader, &mut output_writer).await
+                .map_err(|e| anyhow::anyhow!("Failed to write chunk at offset {}: {}", offset, e))?;
+
+            total_written += chunk_written;
+
+            if config.enable_progress_tracking {
+                let progress = (offset as f64 / total_size as f64) * 100.0;
+                let elapsed = start_time.elapsed().as_secs_f64();
+                let speed_mbps = if elapsed > 0.0 {
+                    (total_written as f64 / 1024.0 / 1024.0) / elapsed
+                } else {
+                    0.0
+                };
+                debug_log!("✅ PROGRESS: {:.1}% ({}/{} bytes) - {:.1} MB/s",
+                          progress, total_written, total_size, speed_mbps);
+            }
+
+            offset = end;
+        }
+
+        output_writer.flush().await
+            .context("Failed to flush output buffer")?;
+
+        let elapsed = start_time.elapsed();
+        debug_log!("✅ STREAMING COMPLETE: Wrote {} bytes in {:.2}s ({:.1} MB/s)",
+                  total_written, elapsed.as_secs_f64(),
+                  (total_written as f64 / 1024.0 / 1024.0) / elapsed.as_secs_f64().max(0.001));
+
+        total_written
+    } else {
+        // Fallback for small files or when streaming is disabled
+        debug_log!("✅ DIRECT WRITE: File size {} < chunk size {}, using read_all()",
+                  total_size, config.streaming_chunk_size);
+        let payload_bytes = split_payload.read_all().await?;
+        std::fs::write(output_path, &payload_bytes)?;
+        payload_bytes.len() as u64
+    };
 
     debug_log!("✅ PAYLOAD WRITTEN: Successfully wrote split file: {:?} ({} bytes total, {} written)",
               output_path, total_size, bytes_written);
@@ -1664,6 +1728,10 @@ pub struct InternalMergeConfig {
     pub aws_config: Option<InternalAwsConfig>,
     pub azure_config: Option<InternalAzureConfig>,
     pub temp_directory_path: Option<String>,
+    /// Maximum number of splits to process concurrently (memory optimization)
+    /// Default: 0 (unlimited - use global semaphore limit)
+    /// Set to a lower value (e.g., 3-5) for very large splits to reduce peak memory
+    pub max_concurrent_splits: usize,
 }
 
 /// AWS configuration for S3-compatible storage (copy from split_searcher.rs)
@@ -1890,6 +1958,7 @@ fn extract_merge_config(env: &mut JNIEnv, config_obj: &JObject) -> Result<Intern
     aws_config,
     azure_config,
     temp_directory_path,
+    max_concurrent_splits: 0,  // Default: unlimited (use global semaphore)
     })
 }
 
@@ -2110,8 +2179,22 @@ async fn download_and_extract_splits_parallel(
     let available_permits = download_semaphore.available_permits();
     debug_log!("✅ GLOBAL DOWNLOAD LIMIT: Using global download semaphore ({} permits available)", available_permits);
 
+    // ✅ MEMORY OPTIMIZATION: Optional per-operation limit for very large splits
+    // If max_concurrent_splits is set, create additional local semaphore
+    let local_limit = if config.max_concurrent_splits > 0 {
+        debug_log!("✅ MEMORY LIMIT: Using per-operation limit of {} concurrent splits", config.max_concurrent_splits);
+        Some(std::sync::Arc::new(tokio::sync::Semaphore::new(config.max_concurrent_splits)))
+    } else {
+        None
+    };
+
     // Create shared storage resolver for connection pooling
     let shared_storage_resolver = Arc::new(create_storage_resolver(config)?);
+
+    // ✅ MEMORY OPTIMIZATION: Wrap config in Arc to avoid cloning for each split
+    // This reduces memory allocations from O(N * config_size) to O(config_size)
+    let shared_config = Arc::new(config.clone());
+    let merge_id_arc: Arc<str> = Arc::from(merge_id);
 
     // Create download tasks for each split
     let download_tasks: Vec<_> = split_urls
@@ -2119,23 +2202,33 @@ async fn download_and_extract_splits_parallel(
     .enumerate()
     .map(|(i, split_url)| {
         let split_url = split_url.clone();
-        let merge_id = merge_id.to_string();
-        let config = config.clone();
+        let merge_id = Arc::clone(&merge_id_arc);
+        let config = Arc::clone(&shared_config);
         let storage_resolver = Arc::clone(&shared_storage_resolver);
+        let local_limit_clone = local_limit.clone();
 
         async move {
             // Acquire semaphore permit to limit concurrent downloads globally
-            let _permit = GLOBAL_DOWNLOAD_SEMAPHORE.acquire().await
+            let _global_permit = GLOBAL_DOWNLOAD_SEMAPHORE.acquire().await
                 .map_err(|e| anyhow!("Failed to acquire global download permit: {}", e))?;
+
+            // ✅ MEMORY OPTIMIZATION: Also acquire local permit if per-operation limit configured
+            let _local_permit = if let Some(ref local_sem) = local_limit_clone {
+                Some(local_sem.acquire().await
+                    .map_err(|e| anyhow!("Failed to acquire local download permit: {}", e))?)
+            } else {
+                None
+            };
 
             debug_log!("📥 Starting download task {} for: {}", i, split_url);
 
             // Download and extract single split - gracefully handle failures
+            // Note: Arc derefs to &T, but for explicit ref we use as_ref()
             download_and_extract_single_split_resilient(
                 &split_url,
                 i,
-                &merge_id,
-                &config,
+                merge_id.as_ref(),
+                config.as_ref(),
                 &storage_resolver,
             ).await
         }
@@ -2684,6 +2777,17 @@ pub fn merge_splits_impl(split_urls: &[String], output_path: &str, config: &Inte
     ))?;
     debug_log!("Segment merge completed with {} documents", merged_docs);
 
+    // ✅ MEMORY OPTIMIZATION: Early temp directory cleanup
+    // Source split temp directories are no longer needed after merge completes
+    // The merged data is now in output_temp_dir, so we can free the source temp dirs
+    // This reduces peak memory/disk usage by releasing temp space earlier
+    let temp_dirs_count = temp_dirs.len();
+    debug_log!("🧹 EARLY CLEANUP: Releasing {} source temp directories after merge (before split file creation)", temp_dirs_count);
+    drop(temp_dirs);  // TempDir RAII handles cleanup automatically
+    debug_log!("✅ EARLY CLEANUP: {} source temp directories released, freeing ~{} bytes of temp space",
+              temp_dirs_count,
+              total_size);  // Approximate - actual might be larger due to extraction
+
     // 4. Extract doc mapping from the merged index
     let merged_directory = MmapDirectory::open(&output_temp_dir)?;
     let tokenizer_manager = get_quickwit_fastfield_normalizer_manager().tantivy_manager();
@@ -2784,11 +2888,12 @@ pub fn merge_splits_impl(split_urls: &[String], output_path: &str, config: &Inte
            footer_offsets.hotcache_length, footer_offsets.hotcache_start_offset);
     
     // 11. ✅ REENTRANCY FIX: Coordinated cleanup to prevent race conditions
-    // Use match to ensure cleanup doesn't fail the entire merge operation
-    match coordinate_temp_directory_cleanup(&merge_id, &output_temp_dir, temp_dirs) {
-        Ok(_) => debug_log!("✅ CLEANUP: Temporary directories cleaned up successfully"),
+    // Note: Source temp_dirs were already cleaned up early (after merge, before split creation)
+    // Only output temp directory cleanup remains
+    match cleanup_output_directory_safe(&output_temp_dir) {
+        Ok(_) => debug_log!("✅ CLEANUP: Output temporary directory cleaned up successfully"),
         Err(e) => {
-            debug_log!("⚠️ CLEANUP WARNING: Cleanup failed but merge succeeded: {}", e);
+            debug_log!("⚠️ CLEANUP WARNING: Output cleanup failed but merge succeeded: {}", e);
             // Continue with merge completion - don't fail the operation due to cleanup issues
         }
     }
