@@ -31,27 +31,40 @@ import static org.junit.jupiter.api.Assertions.*;
 public class BulkDocumentRetrievalTest {
 
     private static SplitCacheManager cacheManager;
-
+    
     @TempDir
     static Path tempDir;
-
-    // All state is now static and created once for all tests
-    private static Path indexPath;
-    private static Path splitPath;
-    private static String splitUrl;
-    private static Schema schema;
-    private static QuickwitSplit.SplitMetadata metadata;
-    private static final int TOTAL_DOCUMENTS = 50;
+    
+    private Path indexPath;
+    private Path splitPath;
+    private String splitUrl;
+    private Schema schema;
+    private QuickwitSplit.SplitMetadata metadata;
+    private final int TOTAL_DOCUMENTS = 50;
 
     @BeforeAll
-    static void setUpOnce() throws IOException {
+    static void setUpCacheManager() {
         // Create shared cache manager for split operations
-        SplitCacheManager.CacheConfig cacheConfig = new SplitCacheManager.CacheConfig("bulk-retrieval-cache")
+        SplitCacheManager.CacheConfig config = new SplitCacheManager.CacheConfig("bulk-retrieval-cache")
                 .withMaxCacheSize(200_000_000) // 200MB cache
                 .withMaxConcurrentLoads(8);
+                
+        cacheManager = SplitCacheManager.getInstance(config);
+    }
+    
+    @AfterAll
+    static void tearDownCacheManager() {
+        if (cacheManager != null) {
+            try {
+                cacheManager.close();
+            } catch (Exception e) {
+                // Log error but continue cleanup
+            }
+        }
+    }
 
-        cacheManager = SplitCacheManager.getInstance(cacheConfig);
-
+    @BeforeEach
+    void setUp() throws IOException {
         // Create a comprehensive test schema with all field types
         schema = new SchemaBuilder()
             .addTextField("title", true, false, "default", "position")
@@ -65,7 +78,7 @@ public class BulkDocumentRetrievalTest {
             .addTextField("thumbnail", true, false, "default", "position")
             .build();
 
-        indexPath = tempDir.resolve("bulk-test-index");
+        Path indexPath = tempDir.resolve("bulk-test-index");
         Index testIndex = new Index(schema, indexPath.toString());
         IndexWriter writer = testIndex.writer(Index.Memory.DEFAULT_HEAP_SIZE, 1);
 
@@ -73,7 +86,7 @@ public class BulkDocumentRetrievalTest {
         for (int i = 0; i < TOTAL_DOCUMENTS; i++) {
             Document doc = new Document();
             doc.addText("title", "Bulk Document " + i);
-            doc.addText("content", "This is comprehensive test content for bulk document " + i +
+            doc.addText("content", "This is comprehensive test content for bulk document " + i + 
                 " with varied terms like " + getVariedTerms(i));
             doc.addText("category", getCategoryForIndex(i));
             doc.addInteger("score", 85 + (i % 15));
@@ -92,25 +105,14 @@ public class BulkDocumentRetrievalTest {
 
         // Convert index to split file
         splitPath = tempDir.resolve("bulk_retrieval_test.split");
-        QuickwitSplit.SplitConfig splitConfig = new QuickwitSplit.SplitConfig(
+        QuickwitSplit.SplitConfig config = new QuickwitSplit.SplitConfig(
             "bulk-retrieval-test-index",
-            "bulk-retrieval-source",
+            "bulk-retrieval-source", 
             "bulk-retrieval-node"
         );
-
-        metadata = QuickwitSplit.convertIndexFromPath(indexPath.toString(), splitPath.toString(), splitConfig);
+        
+        metadata = QuickwitSplit.convertIndexFromPath(indexPath.toString(), splitPath.toString(), config);
         splitUrl = "file://" + splitPath.toAbsolutePath().toString();
-    }
-
-    @AfterAll
-    static void tearDownCacheManager() {
-        if (cacheManager != null) {
-            try {
-                cacheManager.close();
-            } catch (Exception e) {
-                // Log error but continue cleanup
-            }
-        }
     }
 
     @Test
@@ -369,13 +371,13 @@ public class BulkDocumentRetrievalTest {
         }
     }
     
-    // Helper methods for test data generation (static for @BeforeAll usage)
-    private static String getVariedTerms(int index) {
+    // Helper methods for test data generation
+    private String getVariedTerms(int index) {
         String[] terms = {"search", "index", "document", "query", "text", "field", "score", "match"};
         return terms[index % terms.length];
     }
-
-    private static String getCategoryForIndex(int index) {
+    
+    private String getCategoryForIndex(int index) {
         String[] categories = {"Technology", "Science", "Business", "Education", "Health"};
         return categories[index % categories.length];
     }
