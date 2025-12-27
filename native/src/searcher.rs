@@ -1191,7 +1191,10 @@ fn deserialize_aggregation_results(
     for (agg_name, agg_result) in final_results.0 {
         debug_println!("RUST DEBUG: Processing aggregation '{}'", agg_name);
 
-        match create_java_aggregation_from_final_result(env, &agg_name, &agg_result) {
+        // Check if this aggregation is a date_histogram based on the original request
+        let is_date_histogram_hint = is_date_histogram_aggregation(&aggregation_json, &agg_name);
+
+        match create_java_aggregation_from_final_result(env, &agg_name, &agg_result, is_date_histogram_hint) {
             Ok(java_obj) => {
                 if !java_obj.is_null() {
                     let name_string = env.new_string(&agg_name)?;
@@ -1426,9 +1429,13 @@ fn find_specific_aggregation_result(
     // Step 5: Extract specific aggregation values
     debug_println!("RUST DEBUG: Extracting values for aggregation '{}'", aggregation_name);
 
+    // Determine if this is a date_histogram request from the JSON
+    let is_date_histogram_request = is_date_histogram_aggregation(aggregation_json, aggregation_name);
+    debug_println!("RUST DEBUG: is_date_histogram_request for '{}': {}", aggregation_name, is_date_histogram_request);
+
     if let Some(agg_result) = final_results.0.get(aggregation_name) {
         debug_println!("RUST DEBUG: Found aggregation result: {:?}", agg_result);
-        return create_java_aggregation_from_final_result(env, aggregation_name, agg_result);
+        return create_java_aggregation_from_final_result(env, aggregation_name, agg_result, is_date_histogram_request);
     } else {
         debug_println!("RUST DEBUG: Aggregation '{}' not found in final results", aggregation_name);
         let available_keys: Vec<String> = final_results.0.keys().cloned().collect();
@@ -1439,15 +1446,33 @@ fn find_specific_aggregation_result(
     Ok(std::ptr::null_mut())
 }
 
+/// Check if the aggregation JSON indicates a date_histogram aggregation for the given name
+fn is_date_histogram_aggregation(aggregation_json: &str, aggregation_name: &str) -> bool {
+    if let Ok(json_value) = serde_json::from_str::<serde_json::Value>(aggregation_json) {
+        if let Some(obj) = json_value.as_object() {
+            if let Some(agg_def) = obj.get(aggregation_name) {
+                // Check if this aggregation definition contains "date_histogram"
+                if agg_def.get("date_histogram").is_some() {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 /// Create Java aggregation result from final Tantivy aggregation result
+/// is_date_histogram_hint: true if the original request was a date_histogram aggregation
 fn create_java_aggregation_from_final_result(
     env: &mut JNIEnv,
     aggregation_name: &str,
     agg_result: &tantivy::aggregation::agg_result::AggregationResult,
+    is_date_histogram_hint: bool,
 ) -> anyhow::Result<jobject> {
     use tantivy::aggregation::agg_result::AggregationResult;
 
-    debug_println!("RUST DEBUG: Creating Java aggregation for '{}', type: {:?}", aggregation_name, agg_result);
+    debug_println!("RUST DEBUG: Creating Java aggregation for '{}', type: {:?}, date_histogram_hint: {}",
+                   aggregation_name, agg_result, is_date_histogram_hint);
 
     match agg_result {
         AggregationResult::MetricResult(metric_result) => {
@@ -1518,16 +1543,23 @@ fn create_java_aggregation_from_final_result(
                     create_range_result_object(env, aggregation_name, buckets)
                 }
                 BucketResult::Histogram { buckets } => {
-                    // Detect if this is a date histogram by checking if any bucket has key_as_string set
-                    // Tantivy sets key_as_string for date fields with RFC3339 format
+                    // Use the hint from the aggregation request JSON if available
+                    // Fall back to detecting by checking if any bucket has key_as_string set
                     use tantivy::aggregation::agg_result::BucketEntries;
-                    let is_date_histogram = match buckets {
-                        BucketEntries::Vec(vec) => vec.iter().any(|b| b.key_as_string.is_some()),
-                        BucketEntries::HashMap(map) => map.values().any(|b| b.key_as_string.is_some()),
+                    let is_date_histogram = if is_date_histogram_hint {
+                        // Trust the hint from the request JSON
+                        true
+                    } else {
+                        // Fall back to bucket-based detection
+                        match buckets {
+                            BucketEntries::Vec(vec) => vec.iter().any(|b| b.key_as_string.is_some()),
+                            BucketEntries::HashMap(map) => map.values().any(|b| b.key_as_string.is_some()),
+                        }
                     };
 
                     if is_date_histogram {
-                        debug_println!("RUST DEBUG: Creating DateHistogramResult (detected date field)");
+                        debug_println!("RUST DEBUG: Creating DateHistogramResult (hint={}, detected from buckets={})",
+                                       is_date_histogram_hint, !is_date_histogram_hint);
                         create_date_histogram_result_object(env, aggregation_name, buckets)
                     } else {
                         debug_println!("RUST DEBUG: Creating HistogramResult (numeric field)");
@@ -1641,7 +1673,8 @@ fn create_sub_aggregations_map(
         debug_println!("RUST DEBUG: Processing sub-aggregation: {} -> {:?}", agg_name, agg_result);
 
         // Convert aggregation result to Java object
-        let java_agg_result = create_java_aggregation_from_final_result(env, agg_name, agg_result)?;
+        // Sub-aggregations don't have access to the original JSON, so pass false as default hint
+        let java_agg_result = create_java_aggregation_from_final_result(env, agg_name, agg_result, false)?;
 
         if !java_agg_result.is_null() {
             // Add to HashMap - Convert jobject to JObject for JValue::Object
