@@ -210,7 +210,7 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_StandaloneSearcher
 /// Close the searcher and free resources
 #[no_mangle]
 pub extern "system" fn Java_io_indextables_tantivy4java_split_StandaloneSearcher_closeNative(
-    env: JNIEnv,
+    _env: JNIEnv,
     _class: JClass,
     searcher_ptr: jlong,
 ) {

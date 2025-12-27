@@ -6,7 +6,7 @@ use std::time::Duration;
 use bytesize::ByteSize;
 use anyhow::{Result, Context as AnyhowContext};
 
-use quickwit_storage::{Storage, StorageResolver, MemorySizedCache, STORAGE_METRICS};
+use quickwit_storage::{Storage, StorageResolver};
 use quickwit_config::{S3StorageConfig, StorageConfigs};
 use crate::global_cache::{get_configured_storage_resolver, get_global_searcher_context, get_global_disk_cache};
 use crate::persistent_cache_storage::StorageWithPersistentCache;
@@ -489,48 +489,5 @@ pub async fn resolve_storage_for_split(
             storage_resolver.resolve(&uri).await
                 .with_context(|| format!("Failed to resolve storage for URI: {}", split_uri))
         }
-    }
-}
-
-/// Builder pattern for convenience
-pub struct StandaloneSearcherBuilder {
-    config: StandaloneSearchConfig,
-}
-
-impl StandaloneSearcherBuilder {
-    pub fn new() -> Self {
-        Self {
-            config: StandaloneSearchConfig::default(),
-        }
-    }
-    
-    pub fn fast_field_cache_size(mut self, size: ByteSize) -> Self {
-        self.config.cache.fast_field_cache_capacity = size;
-        self
-    }
-    
-    pub fn split_footer_cache_size(mut self, size: ByteSize) -> Self {
-        self.config.cache.split_footer_cache_capacity = size;
-        self
-    }
-    
-    pub fn max_concurrent_splits(mut self, max: usize) -> Self {
-        self.config.resources.max_concurrent_splits = max;
-        self
-    }
-    
-    pub fn request_timeout(mut self, timeout: Duration) -> Self {
-        self.config.timeouts.request_timeout = timeout;
-        self
-    }
-    
-    pub fn build(self) -> Result<StandaloneSearcher> {
-        StandaloneSearcher::new(self.config)
-    }
-}
-
-impl Default for StandaloneSearcherBuilder {
-    fn default() -> Self {
-        Self::new()
     }
 }

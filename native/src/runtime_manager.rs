@@ -5,18 +5,13 @@
 
 use std::sync::{Arc, OnceLock, atomic::{AtomicBool, AtomicUsize, Ordering}};
 use tokio::runtime::{Runtime, Handle};
-use tokio::task::JoinHandle;
 use std::future::Future;
-use jni::sys::jobject;
-use quickwit_common::thread_pool::ThreadPool;
 use crate::debug_println;
 
 /// Global singleton runtime manager for all Quickwit async operations
 pub struct QuickwitRuntimeManager {
     /// Main tokio runtime for all async operations
     runtime: Arc<Runtime>,
-    /// Quickwit-compatible thread pool for search operations
-    thread_pool: Arc<ThreadPool>,
     /// Track if runtime is shutting down to prevent new operations
     is_shutting_down: AtomicBool,
     /// Count of active searchers to prevent premature shutdown
@@ -37,14 +32,10 @@ impl QuickwitRuntimeManager {
                 .build()?
         );
 
-        // Create Quickwit-compatible thread pool for search operations
-        let thread_pool = Arc::new(ThreadPool::new("quickwit-search", None));
-
         debug_println!("✅ RUNTIME_MANAGER: QuickwitRuntimeManager created successfully");
 
         Ok(QuickwitRuntimeManager {
             runtime,
-            thread_pool,
             is_shutting_down: AtomicBool::new(false),
             active_searcher_count: AtomicUsize::new(0),
         })
@@ -74,11 +65,6 @@ impl QuickwitRuntimeManager {
         self.runtime.handle()
     }
 
-    /// Get the search thread pool for Quickwit compatibility
-    pub fn search_thread_pool(&self) -> &ThreadPool {
-        &self.thread_pool
-    }
-
     /// Register a new searcher to prevent premature runtime shutdown
     pub fn register_searcher(&self) {
         let count = self.active_searcher_count.fetch_add(1, Ordering::Relaxed);
@@ -89,11 +75,6 @@ impl QuickwitRuntimeManager {
     pub fn unregister_searcher(&self) {
         let old_count = self.active_searcher_count.fetch_sub(1, Ordering::Relaxed);
         debug_println!("📊 RUNTIME_MANAGER: Unregistered searcher, active count: {}", old_count.saturating_sub(1));
-    }
-
-    /// Check if runtime is available for new operations
-    pub fn is_runtime_available(&self) -> bool {
-        !self.is_shutting_down.load(Ordering::Acquire)
     }
 
     /// Block on any generic async operation (not search-specific)
@@ -129,11 +110,6 @@ impl QuickwitRuntimeManager {
                 panic!("Runtime was dropped externally while operation was in progress - this indicates the runtime shutdown coordination is not working properly");
             }
         }
-    }
-
-    /// Check if we're currently in the runtime context
-    pub fn is_in_runtime_context(&self) -> bool {
-        Handle::try_current().is_ok()
     }
 
     /// Gracefully shutdown the runtime with a timeout for pending operations
@@ -227,15 +203,5 @@ mod tests {
         });
 
         assert_eq!(result, 42);
-    }
-
-    #[test]
-    fn test_runtime_context_detection() {
-        let manager = QuickwitRuntimeManager::global();
-
-        // Should not be in runtime context initially
-        assert!(!manager.is_in_runtime_context());
-
-        // This test can't easily test the positive case without more complex setup
     }
 }

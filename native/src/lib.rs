@@ -24,8 +24,6 @@ use jni::JNIEnv;
 mod debug;  // Debug utilities and conditional logging
 mod cache_debug;  // Enhanced cache debugging and monitoring utilities
 mod runtime_manager;  // Global Quickwit runtime manager for async-first architecture
-mod async_jni_bridge;  // Async-first JNI bridge utilities
-mod async_split_searcher;  // Minimal async-first wrappers using Quickwit's existing components
 mod schema;
 mod document;
 mod query;
@@ -51,7 +49,6 @@ mod global_cache;  // Global cache infrastructure following Quickwit's pattern
 mod disk_cache;  // L2 tiered disk cache with intelligent compression
 mod persistent_cache_storage;  // Tiered cache integration with memory + disk
 mod simple_batch_optimization;  // Priority 1: Simplified batch optimization with range consolidation
-mod adaptive_tuning;  // Priority 5: Adaptive tuning engine for automatic parameter optimization
 
 pub use schema::*;
 pub use document::*;

@@ -318,7 +318,7 @@ pub extern "system" fn Java_io_indextables_tantivy4java_query_Query_nativeFuzzyT
     text: JString,
     distance: jint,
     transposition_cost_one: jboolean,
-    prefix: jboolean,
+    _prefix: jboolean,
 ) -> jlong {
     let field_name_str: String = match env.get_string(&field_name) {
         Ok(s) => s.into(),
@@ -1124,7 +1124,7 @@ fn create_multi_wildcard_regex_query(field: Field, pattern: &str) -> Result<Box<
 
 /// Create a tokenized wildcard query that preserves wildcards correctly
 /// This fixes the issue where wildcards were being stripped in the original implementation
-fn create_fixed_tokenized_wildcard_query(schema: &Schema, field: Field, pattern: &str, uses_default_tokenizer: bool) -> Result<Box<dyn TantivyQuery>, String> {
+fn create_fixed_tokenized_wildcard_query(_schema: &Schema, field: Field, pattern: &str, uses_default_tokenizer: bool) -> Result<Box<dyn TantivyQuery>, String> {
     // Split pattern on whitespace to get individual wildcard tokens
     let tokens: Vec<&str> = pattern.split_whitespace()
         .filter(|token| !token.is_empty())
@@ -1841,12 +1841,12 @@ fn extract_term_set_values(
 pub extern "system" fn Java_io_indextables_tantivy4java_query_SnippetGenerator_nativeCreate(
     mut env: JNIEnv,
     _class: JClass,
-    searcher_ptr: jlong,
-    query_ptr: jlong,
-    schema_ptr: jlong,
+    _searcher_ptr: jlong,
+    _query_ptr: jlong,
+    _schema_ptr: jlong,
     field_name: JString,
 ) -> jlong {
-    let field_name_str: String = match env.get_string(&field_name) {
+    let _field_name_str: String = match env.get_string(&field_name) {
         Ok(s) => s.into(),
         Err(_) => {
             handle_error(&mut env, "Invalid field name");
@@ -1863,10 +1863,10 @@ pub extern "system" fn Java_io_indextables_tantivy4java_query_SnippetGenerator_n
 
 #[no_mangle]
 pub extern "system" fn Java_io_indextables_tantivy4java_query_SnippetGenerator_nativeSnippetFromDoc(
-    env: JNIEnv,
+    _env: JNIEnv,
     _class: JClass,
-    snippet_generator_ptr: jlong,
-    doc_ptr: jlong,
+    _snippet_generator_ptr: jlong,
+    _doc_ptr: jlong,
 ) -> jlong {
     // Return a valid stub pointer for Snippet
     let stub_snippet = Box::new(2u64); // Simple stub object
@@ -1876,10 +1876,10 @@ pub extern "system" fn Java_io_indextables_tantivy4java_query_SnippetGenerator_n
 
 #[no_mangle]
 pub extern "system" fn Java_io_indextables_tantivy4java_query_SnippetGenerator_nativeSetMaxNumChars(
-    env: JNIEnv,
+    _env: JNIEnv,
     _class: JClass,
-    snippet_generator_ptr: jlong,
-    max_num_chars: jint,
+    _snippet_generator_ptr: jlong,
+    _max_num_chars: jint,
 ) {
     // Stub implementation - do nothing but don't error
 }
@@ -1888,7 +1888,7 @@ pub extern "system" fn Java_io_indextables_tantivy4java_query_SnippetGenerator_n
 pub extern "system" fn Java_io_indextables_tantivy4java_query_SnippetGenerator_nativeClose(
     _env: JNIEnv,
     _class: JClass,
-    ptr: jlong,
+    _ptr: jlong,
 ) {
     // Stub implementation - snippets not yet implemented
     // In future, would use: release_arc(ptr);
@@ -1899,7 +1899,7 @@ pub extern "system" fn Java_io_indextables_tantivy4java_query_SnippetGenerator_n
 pub extern "system" fn Java_io_indextables_tantivy4java_query_Snippet_nativeToHtml(
     mut env: JNIEnv,
     _class: JClass,
-    snippet_ptr: jlong,
+    _snippet_ptr: jlong,
 ) -> jobject {
     // Return a stub HTML string with basic highlighting
     let stub_html = "<b>sample</b> highlighted text";
@@ -1916,7 +1916,7 @@ pub extern "system" fn Java_io_indextables_tantivy4java_query_Snippet_nativeToHt
 pub extern "system" fn Java_io_indextables_tantivy4java_query_Snippet_nativeGetFragment(
     mut env: JNIEnv,
     _class: JClass,
-    snippet_ptr: jlong,
+    _snippet_ptr: jlong,
 ) -> jobject {
     // Return a stub fragment string
     let stub_fragment = "sample highlighted text";
@@ -1933,7 +1933,7 @@ pub extern "system" fn Java_io_indextables_tantivy4java_query_Snippet_nativeGetF
 pub extern "system" fn Java_io_indextables_tantivy4java_query_Snippet_nativeGetHighlighted(
     mut env: JNIEnv,
     _class: JClass,
-    snippet_ptr: jlong,
+    _snippet_ptr: jlong,
 ) -> jobject {
     // Return an ArrayList with a stub Range
     match env.find_class("java/util/ArrayList") {
@@ -1977,7 +1977,7 @@ pub extern "system" fn Java_io_indextables_tantivy4java_query_Snippet_nativeGetH
 pub extern "system" fn Java_io_indextables_tantivy4java_query_Snippet_nativeClose(
     _env: JNIEnv,
     _class: JClass,
-    ptr: jlong,
+    _ptr: jlong,
 ) {
     // Stub implementation - snippets not yet implemented
     // In future, would use: release_arc(ptr);
@@ -1986,9 +1986,9 @@ pub extern "system" fn Java_io_indextables_tantivy4java_query_Snippet_nativeClos
 // Range JNI methods
 #[no_mangle]
 pub extern "system" fn Java_io_indextables_tantivy4java_query_Range_nativeGetStart(
-    env: JNIEnv,
+    _env: JNIEnv,
     _class: JClass,
-    range_ptr: jlong,
+    _range_ptr: jlong,
 ) -> jint {
     // Stub implementation - ranges not yet implemented
     // Would use with_arc_safe for real implementation
@@ -1997,9 +1997,9 @@ pub extern "system" fn Java_io_indextables_tantivy4java_query_Range_nativeGetSta
 
 #[no_mangle]
 pub extern "system" fn Java_io_indextables_tantivy4java_query_Range_nativeGetEnd(
-    env: JNIEnv,
+    _env: JNIEnv,
     _class: JClass,
-    range_ptr: jlong,
+    _range_ptr: jlong,
 ) -> jint {
     // Stub implementation - ranges not yet implemented
     // Would use with_arc_safe for real implementation
@@ -2010,7 +2010,7 @@ pub extern "system" fn Java_io_indextables_tantivy4java_query_Range_nativeGetEnd
 pub extern "system" fn Java_io_indextables_tantivy4java_query_Range_nativeClose(
     _env: JNIEnv,
     _class: JClass,
-    ptr: jlong,
+    _ptr: jlong,
 ) {
     // Stub implementation - ranges not yet implemented
     // In future, would use: release_arc(ptr);

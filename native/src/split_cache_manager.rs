@@ -17,7 +17,6 @@ use jni::JNIEnv;
 use jni::objects::{JClass, JObject, JString};
 use jni::sys::{jlong, jint, jobject, jdouble, jboolean};
 
-use tokio::runtime::Runtime;
 use crate::global_cache::{get_configured_storage_resolver, get_global_searcher_context};
 use quickwit_config::{S3StorageConfig, AzureStorageConfig};
 // Note: Using global caches following Quickwit's pattern
@@ -282,14 +281,6 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_
     if let Ok(aws_config_map) = env.call_method(&config, "getAwsConfig", "()Ljava/util/Map;", &[]) {
         let aws_map_obj = aws_config_map.l().unwrap();
         
-        // Extract AWS configuration values
-        let mut access_key = None;
-        let mut secret_key = None;
-        let mut session_token = None;
-        let mut region = None;
-        let mut endpoint = None;
-        let mut path_style_access = false;
-        
         // Helper function to extract string value from HashMap
         let extract_string_value = |env: &mut JNIEnv, map_obj: &JObject, key: &str| -> Option<String> {
             let key_jstring = env.new_string(key).ok()?;
@@ -301,17 +292,18 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_
             let value_string = env.get_string(&value_jstring).ok()?;
             Some(value_string.to_string_lossy().to_string())
         };
-        
-        access_key = extract_string_value(&mut env, &aws_map_obj, "access_key");
-        secret_key = extract_string_value(&mut env, &aws_map_obj, "secret_key");
-        session_token = extract_string_value(&mut env, &aws_map_obj, "session_token");
-        region = extract_string_value(&mut env, &aws_map_obj, "region");
-        endpoint = extract_string_value(&mut env, &aws_map_obj, "endpoint");
-        
+
+        // Extract AWS configuration values
+        let access_key = extract_string_value(&mut env, &aws_map_obj, "access_key");
+        let secret_key = extract_string_value(&mut env, &aws_map_obj, "secret_key");
+        let session_token = extract_string_value(&mut env, &aws_map_obj, "session_token");
+        let region = extract_string_value(&mut env, &aws_map_obj, "region");
+        let endpoint = extract_string_value(&mut env, &aws_map_obj, "endpoint");
+
         // Extract path_style_access boolean value
-        if let Some(path_style_str) = extract_string_value(&mut env, &aws_map_obj, "path_style_access") {
-            path_style_access = path_style_str == "true";
-        }
+        let path_style_access = extract_string_value(&mut env, &aws_map_obj, "path_style_access")
+            .map(|s| s == "true")
+            .unwrap_or(false);
         
         // Create S3StorageConfig if we have access key and secret key
         if let (Some(access_key), Some(secret_key)) = (access_key, secret_key) {
@@ -705,14 +697,14 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_
     
     // THEN access the cache managers registry
     let managers = CACHE_MANAGERS.lock().unwrap();
-    let manager = match managers.get(&cache_name) {
+    let _manager = match managers.get(&cache_name) {
         Some(manager_arc) => manager_arc,
         None => {
             let _ = env.throw_new("java/lang/RuntimeException", "SplitCacheManager not found in registry");
             return std::ptr::null_mut();
         }
     };
-    
+
     // Multi-split search is not yet implemented
     let error_msg = "Multi-split search across all splits is not yet implemented. Use individual SplitSearcher instances for searching specific splits.";
     let _ = env.throw_new("java/lang/UnsupportedOperationException", error_msg);
@@ -732,7 +724,7 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_
         let _ = env.throw_new("java/lang/RuntimeException", "Invalid SplitCacheManager pointer");
         return std::ptr::null_mut();
     }
-    
+
     // Get cache name FIRST to avoid double-locking
     let cache_name = match crate::utils::jlong_to_arc::<String>(ptr) {
         Some(name_arc) => (*name_arc).clone(),
@@ -741,10 +733,10 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_
             return std::ptr::null_mut();
         }
     };
-    
+
     // THEN access the cache managers registry
     let managers = CACHE_MANAGERS.lock().unwrap();
-    let manager = match managers.get(&cache_name) {
+    let _manager = match managers.get(&cache_name) {
         Some(manager_arc) => manager_arc,
         None => {
             let _ = env.throw_new("java/lang/RuntimeException", "SplitCacheManager not found in registry");

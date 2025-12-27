@@ -1218,7 +1218,7 @@ fn deserialize_aggregation_results(
 /// Fallback aggregation results creation when proper deserialization isn't possible
 fn create_fallback_aggregation_results(
     env: &mut JNIEnv,
-    intermediate_agg_bytes: &[u8],
+    _intermediate_agg_bytes: &[u8],
 ) -> anyhow::Result<jobject> {
     debug_println!("RUST DEBUG: Creating fallback aggregation results");
 
@@ -1872,9 +1872,9 @@ fn try_deserialize_final_aggregation_results(
 
     // Try direct tantivy aggregation result deserialization
     use tantivy::aggregation::agg_result::AggregationResults;
-    use tantivy::aggregation::intermediate_agg_result::IntermediateAggregationResults;
-    use tantivy::aggregation::agg_req::Aggregations;
-    use tantivy::aggregation::AggregationLimitsGuard;
+    
+    
+    
 
     match postcard::from_bytes::<AggregationResults>(intermediate_agg_bytes) {
         Ok(agg_results) => {

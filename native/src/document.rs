@@ -989,7 +989,7 @@ pub fn convert_java_localdatetime_to_tantivy(env: &mut JNIEnv, date_obj: &JObjec
 
 
 /// Create a Java Document object from a RetrievedDocument for bulk operations
-pub fn create_java_document_from_retrieved(env: &mut JNIEnv, retrieved_doc: RetrievedDocument) -> anyhow::Result<jlong> {
+pub fn create_java_document_from_retrieved(_env: &mut JNIEnv, retrieved_doc: RetrievedDocument) -> anyhow::Result<jlong> {
     // Create a new DocumentWrapper with the retrieved document
     let document_wrapper = DocumentWrapper::Retrieved(retrieved_doc);
     

@@ -10,10 +10,9 @@
 // - No complex caching infrastructure required
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use tantivy::{DocAddress, Index, Searcher};
-use tantivy::directory::FileSlice;
+use tantivy::{DocAddress, Searcher};
 use quickwit_storage::Storage;
 use anyhow::{Result, Context};
 use crate::debug_println;
