@@ -2,7 +2,6 @@ use jni::objects::{JClass, JObject, JString, JValue};
 use jni::sys::jobject;
 use jni::JNIEnv;
 use crate::debug_println;
-use crate::global_cache::get_configured_storage_resolver;
 use crate::runtime_manager::QuickwitRuntimeManager;
 
 // Re-export types for standalone usage
@@ -35,7 +34,6 @@ use serde_json;
 use quickwit_storage::{PutPayload, Storage, StorageResolver, SplitPayloadBuilder};
 use quickwit_indexing::{
     open_split_directories,
-    merge_split_directories_standalone,
     open_index,
     ControlledDirectory,
     create_shadowing_meta_json_directory,
@@ -50,7 +48,6 @@ use tantivy::tokenizer::TokenizerManager;
 use tantivy::directory::{Directory, FileHandle};
 use tantivy::schema::Document;  // Trait for to_named_doc() method
 use tantivy::IndexMeta;
-use std::io::{self, Cursor, Read, Seek, SeekFrom};
 
 // ✅ REENTRANCY FIX: Enhanced merge ID generation system to prevent collisions
 // Global atomic counter for merge operations (process-wide uniqueness)
@@ -184,9 +181,8 @@ fn cleanup_temp_directory_safe(registry_key: &str) -> Result<bool> {
     }
 }
 
-use tokio::io::{AsyncWriteExt, AsyncReadExt};
+use tokio::io::AsyncWriteExt;
 use quickwit_directories::write_hotcache;
-use quickwit_config::S3StorageConfig;
 use quickwit_common::uri::{Uri, Protocol};
 // Removed: use quickwit_doc_mapper::default_doc_mapper_for_test; - now creating real doc mapping from schema
 use std::str::FromStr;
@@ -438,7 +434,7 @@ mod resilient_ops {
 /// Returns a vector of discovered field mappings for nested fields
 fn discover_json_subfields(
     tantivy_index: &tantivy::Index,
-    json_field: tantivy::schema::Field,
+    _json_field: tantivy::schema::Field,
     field_name: &str,
     sample_size: usize
 ) -> Result<Vec<serde_json::Value>> {
@@ -1192,7 +1188,7 @@ struct FooterOffsets {
 }
 
 async fn create_quickwit_split(
-    tantivy_index: &tantivy::Index,
+    _tantivy_index: &tantivy::Index,
     index_dir: &PathBuf,
     output_path: &PathBuf,
     _split_metadata: &QuickwitSplitMetadata,
@@ -1273,7 +1269,7 @@ async fn create_quickwit_split(
         debug_log!("✅ STREAMING WRITE: Writing {} bytes in {} byte chunks",
                   total_size, config.streaming_chunk_size);
 
-        let mut output_file = tokio::fs::File::create(output_path).await
+        let output_file = tokio::fs::File::create(output_path).await
             .context("Failed to create output file for streaming write")?;
         let mut output_writer = tokio::io::BufWriter::with_capacity(
             8 * 1024 * 1024,  // 8MB buffer for efficient disk I/O
@@ -1481,7 +1477,7 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_merge_QuickwitSpli
     // Add explicit synchronization and validation to prevent truncation
     // ✅ QUICKWIT NATIVE: Use Quickwit's native functions to open the split
     // This replaces all custom memory mapping and index opening logic
-    let (tantivy_index, bundle_directory) = open_split_with_quickwit_native(&split_path_str)?;
+    let (tantivy_index, _bundle_directory) = open_split_with_quickwit_native(&split_path_str)?;
 
     // Get actual document count from the split
     let reader = tantivy_index.reader()
@@ -2000,7 +1996,7 @@ fn get_nullable_string_field_value(env: &mut JNIEnv, obj: &JObject, method_name:
 /// CRITICAL: This function is used by merge operations and must NOT use lazy loading
 /// to prevent range assertion failures in the native layer
 fn extract_split_to_directory_impl(split_path: &Path, output_dir: &Path) -> Result<()> {
-    use tantivy::directory::{MmapDirectory, DirectoryClone};
+    use tantivy::directory::MmapDirectory;
 
     debug_log!("🔧 MERGE EXTRACTION: Extracting split {:?} to directory {:?}", split_path, output_dir);
     debug_log!("🚨 MERGE SAFETY: Using full file access (NO lazy loading) to prevent native crashes");
@@ -2324,7 +2320,6 @@ async fn download_and_extract_single_split(
     config: &InternalMergeConfig,
     storage_resolver: &StorageResolver,
 ) -> Result<ExtractedSplit> {
-    use quickwit_storage::Storage;
     use std::path::Path;
 
     // Create process-specific temp directory to avoid race conditions
@@ -2474,7 +2469,6 @@ async fn download_split_to_temp_file(
     temp_file_path: &Path,
     split_index: usize
 ) -> Result<()> {
-    use quickwit_storage::Storage;
     use tokio::io::AsyncWriteExt;
 
     debug_log!("🔧 Split {}: Starting direct file download for: {}", split_index, split_filename);
@@ -3021,8 +3015,7 @@ fn open_split_with_quickwit_native(split_path: &str) -> Result<(tantivy::Index, 
 /// CRITICAL: This version is used for merge operations to prevent range assertion failures
 /// It forces full file download instead of using lazy loading with potentially corrupted offsets
 fn get_tantivy_directory_from_split_bundle_full_access(split_path: &str) -> Result<Box<dyn tantivy::Directory>> {
-    use quickwit_storage::PutPayload;
-    use tantivy::directory::{OwnedBytes, FileSlice};
+    use tantivy::directory::FileSlice;
     use quickwit_directories::BundleDirectory;
     
     debug_log!("🔧 MERGE SAFETY: Opening bundle directory with FULL ACCESS (no lazy loading): {}", split_path);
@@ -3443,7 +3436,7 @@ fn calculate_directory_size(dir_path: &Path) -> Result<u64> {
 
 /// Upload a local split file to cloud storage (S3 or Azure) using the storage resolver
 async fn upload_split_to_s3_impl(local_split_path: &Path, s3_url: &str, config: &InternalMergeConfig) -> Result<()> {
-    use quickwit_storage::{Storage, StorageResolver, LocalFileStorageFactory, S3CompatibleObjectStorageFactory, AzureBlobStorageFactory};
+    use quickwit_storage::{StorageResolver, LocalFileStorageFactory, S3CompatibleObjectStorageFactory, AzureBlobStorageFactory};
     use quickwit_config::{AzureStorageConfig, S3StorageConfig};
     use std::str::FromStr;
 

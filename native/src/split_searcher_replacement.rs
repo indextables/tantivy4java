@@ -11,22 +11,16 @@ use crate::utils::{arc_to_jlong, with_arc_safe, release_arc};
 use crate::common::to_java_exception;
 use crate::debug_println;
 use crate::runtime_manager::block_on_operation;
-use crate::global_cache::{get_configured_storage_resolver, get_configured_storage_resolver_async};
-use crate::split_query::{store_split_schema, get_split_schema, convert_split_query_to_ast, convert_split_query_to_json};
-use quickwit_search::{SearcherContext, search_permit_provider::SearchPermitProvider};
-use quickwit_search::leaf_cache::LeafSearchCache;
-use quickwit_search::list_fields_cache::ListFieldsCache;
-use tantivy::aggregation::AggregationLimitsGuard;
-use tokio::sync::Semaphore;
+use crate::global_cache::get_configured_storage_resolver;
+use crate::split_query::{get_split_schema, convert_split_query_to_json};
+use quickwit_search::SearcherContext;
 use quickwit_common::thread_pool::ThreadPool;
 
 use serde_json::{Value, Map};
-use tantivy::schema::{Document as DocumentTrait, NamedFieldDocument};
 
-use quickwit_proto::search::{SearchRequest, SplitIdAndFooterOffsets};
+use quickwit_proto::search::SearchRequest;
 use quickwit_config::S3StorageConfig;
-use quickwit_storage::{StorageResolver, Storage, ByteRangeCache, STORAGE_METRICS, MemorySizedCache};
-use quickwit_search::leaf::open_index_with_caches;
+use quickwit_storage::{Storage, ByteRangeCache, STORAGE_METRICS};
 use quickwit_indexing::open_index;
 use quickwit_query::get_quickwit_fastfield_normalizer_manager;
 use tantivy::directory::DirectoryClone;
@@ -184,7 +178,7 @@ fn extract_split_metadata_for_allocation(split_uri: &str) -> Option<(usize, usiz
 
 /// Get size hint for split file (basic implementation)
 /// This could be enhanced to cache split metadata for better performance
-fn get_split_size_hint(split_uri: &str) -> Option<usize> {
+fn get_split_size_hint(_split_uri: &str) -> Option<usize> {
     // Basic size estimation based on split file name or cached data
     // This is a placeholder that could be enhanced with actual metadata caching
     None // For now, fallback to thread-based scaling
@@ -1084,7 +1078,7 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_crea
 /// Replacement for Java_io_indextables_tantivy4java_split_SplitSearcher_closeNative
 #[no_mangle]
 pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_closeNative(
-    env: JNIEnv,
+    _env: JNIEnv,
     _class: JClass,
     searcher_ptr: jlong,
 ) {
@@ -1134,7 +1128,7 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_clos
 /// Replacement for Java_io_indextables_tantivy4java_split_SplitSearcher_validateSplitNative  
 #[no_mangle]
 pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_validateSplitNative(
-    env: JNIEnv,
+    _env: JNIEnv,
     _class: JClass,
     searcher_ptr: jlong,
 ) -> jboolean {
@@ -1143,7 +1137,7 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_vali
         return 0; // false
     }
     
-    let is_valid = with_arc_safe(searcher_ptr, |searcher_context: &Arc<CachedSearcherContext>| {
+    let is_valid = with_arc_safe(searcher_ptr, |_searcher_context: &Arc<CachedSearcherContext>| {
         // Searcher exists and is valid
         true
     }).unwrap_or(false);
@@ -1638,7 +1632,7 @@ fn retrieve_document_from_split_optimized(
         
         // Extract the runtime and use async document retrieval
         let doc_and_schema = with_arc_safe(searcher_ptr, |searcher_context: &Arc<CachedSearcherContext>| {
-            let context = searcher_context.as_ref();
+            let _context = searcher_context.as_ref();
 
             // ✅ CRITICAL FIX: Use shared global runtime instead of context.runtime
             tokio::task::block_in_place(|| {
@@ -1677,7 +1671,6 @@ fn retrieve_document_from_split_optimized(
 
         // Extract variables from context for compatibility with existing code
         let split_uri = &context.split_uri;
-        let aws_config = &context.aws_config;
         let footer_start = context.footer_start;
         let footer_end = context.footer_end;
         let storage_resolver = &context.cached_storage;
@@ -1687,76 +1680,12 @@ fn retrieve_document_from_split_optimized(
         tokio::task::block_in_place(|| {
             crate::runtime_manager::QuickwitRuntimeManager::global().handle().block_on(async {
 
-                use quickwit_config::{StorageConfigs, S3StorageConfig};
-                use quickwit_proto::search::SplitIdAndFooterOffsets;
-                use quickwit_storage::StorageResolver;
-                
-                
-                
                 use std::sync::Arc;
-                
-                // Create split metadata for Quickwit's open_index_with_caches with correct field names
-                // Extract just the filename as the split_id (e.g., "consolidated.split" from the full URL)
-                let split_filename = if let Some(last_slash_pos) = split_uri.rfind('/') {
-                    &split_uri[last_slash_pos + 1..]
-                } else {
-                    split_uri
-                };
 
-                // For split_id, use the filename without .split extension if present
-                // This is what Quickwit expects for the split identifier
-                let split_id = if split_filename.ends_with(".split") {
-                    &split_filename[..split_filename.len() - 6] // Remove ".split"
-                } else {
-                    split_filename
-                };
-
-                let split_metadata = SplitIdAndFooterOffsets {
-                    split_id: split_id.to_string(),
-                    split_footer_start: footer_start,
-                    split_footer_end: footer_end,
-                    timestamp_start: Some(0), // Not used for our purposes
-                    timestamp_end: Some(i64::MAX), // Not used for our purposes  
-                    num_docs: 0, // Will be filled by Quickwit
-                };
-                
-                // Create S3 storage configuration
-                let s3_config = S3StorageConfig {
-                    flavor: None,
-                    access_key_id: aws_config.get("access_key").cloned(),
-                    secret_access_key: aws_config.get("secret_key").cloned(), 
-                    session_token: aws_config.get("session_token").cloned(),
-                    region: aws_config.get("region").cloned(),
-                    endpoint: aws_config.get("endpoint").cloned(),
-                    force_path_style_access: aws_config.get("path_style_access").map_or(false, |v| v == "true"),
-                    disable_multi_object_delete: false,
-                    disable_multipart_upload: false,
-                };
-                
-                // Create storage that points to the directory containing the split (not the split file itself)
-                // This is what open_index_with_caches expects
-                let storage_resolution_start = std::time::Instant::now();
-                let split_dir_uri = if let Some(last_slash_pos) = split_uri.rfind('/') {
-                    &split_uri[..last_slash_pos + 1] // Include the trailing slash
-                } else {
-                    split_uri // If no slash, use the full URI as directory
-                };
-                debug_println!("RUST DEBUG: ⏱️ 🔧 STORAGE RESOLUTION - Creating S3 storage configuration");
-
-                // ✅ DEADLOCK FIX #2: Use pre-created storage resolver from searcher context
+                // Use pre-created storage resolver from searcher context
                 debug_println!("✅ QUICKWIT_LIFECYCLE: Using cached storage from searcher context (Quickwit pattern)");
-                debug_println!("   📍 Location: split_searcher_replacement.rs:878 (S3 index storage path)");
                 debug_println!("✅ CACHED_STORAGE_USED: Storage at address {:p} (Quickwit lifecycle)", Arc::as_ptr(storage_resolver));
                 let index_storage = storage_resolver.clone();
-                debug_println!("RUST DEBUG: ⏱️ 🔧 STORAGE RESOLUTION completed [TIMING: {}ms]", storage_resolution_start.elapsed().as_millis());
-                
-                // Use global SearcherContext for long-term shared caches (Quickwit pattern)
-                let searcher_context = crate::global_cache::get_global_searcher_context();
-                
-                // Create short-lived ByteRangeCache per operation (Quickwit pattern for optimal memory use)
-                let byte_range_cache = quickwit_storage::ByteRangeCache::with_infinite_capacity(
-                    &quickwit_storage::STORAGE_METRICS.shortlived_cache
-                );
                 
                 // Manual index opening with Quickwit caching components
                 // (open_index_with_caches expects Quickwit's native split format, but we use bundle format)
@@ -1772,25 +1701,8 @@ fn retrieve_document_from_split_optimized(
                 // 🚀 INDIVIDUAL DOC OPTIMIZATION: Use same hotcache optimization as batch retrieval
                 let mut index = if has_footer_metadata(footer_start, footer_end) && is_remote_split(split_uri) {
                     debug_println!("RUST DEBUG: 🚀 Using Quickwit optimized path for individual document retrieval (footer: {}..{})", footer_start, footer_end);
-                    
-                    use quickwit_proto::search::SplitIdAndFooterOffsets;
-                    use quickwit_search::leaf::open_index_with_caches;
-                    
-                    // Create SplitIdAndFooterOffsets for Quickwit's open_index_with_caches
-                    let footer_offsets = SplitIdAndFooterOffsets {
-                        split_id: extract_split_id_from_uri(split_uri),
-                        split_footer_start: footer_start,
-                        split_footer_end: footer_end,
-                        timestamp_start: Some(0),
-                        timestamp_end: Some(i64::MAX),
-                        num_docs: 0, // Will be filled by Quickwit
-                    };
-                    
-                    // Create minimal SearcherContext for Quickwit functions
-                    let searcher_context = get_shared_searcher_context()
-                        .map_err(|e| anyhow::anyhow!("Failed to create searcher context: {}", e))?;
-                    
-                    // ✅ Use cached index to eliminate repeated open_index_with_caches calls
+
+                    // Use cached index to eliminate repeated open_index_with_caches calls
                     let index_creation_start = std::time::Instant::now();
                     let index = cached_index.as_ref().clone();
                     debug_println!("🔥 INDEX CACHED: Reusing cached index instead of expensive open_index_with_caches call");
@@ -1906,21 +1818,18 @@ fn retrieve_document_from_split(
     doc_address: tantivy::DocAddress,
 ) -> Result<(tantivy::schema::TantivyDocument, tantivy::schema::Schema), anyhow::Error> {
     use crate::utils::with_arc_safe;
-    use quickwit_storage::StorageResolver;
+    
     use std::sync::Arc;
     
     // Use the searcher context to retrieve the document from the split
     let result = with_arc_safe(searcher_ptr, |searcher_context: &Arc<CachedSearcherContext>| {
         let context = searcher_context.as_ref();
-        let searcher = &context.standalone_searcher;
         // ✅ CRITICAL FIX: Use shared global runtime handle instead of context.runtime
         let runtime = crate::runtime_manager::QuickwitRuntimeManager::global().handle();
         let split_uri = &context.split_uri;
         let aws_config = &context.aws_config;
         let footer_start = context.footer_start;
         let footer_end = context.footer_end;
-        let _doc_mapping = &context.doc_mapping_json;
-        let storage_resolver = &context.cached_storage;
         let cached_index = &context.cached_index;
         
         // Enter the runtime context for async operations
@@ -1930,13 +1839,13 @@ fn retrieve_document_from_split(
         runtime.block_on(async {
             // Parse URI and resolve storage (same as before)
             use quickwit_common::uri::Uri;
-            use quickwit_config::{StorageConfigs, S3StorageConfig};
+            use quickwit_config::S3StorageConfig;
             use quickwit_directories::BundleDirectory;
             use tantivy::directory::FileSlice;
             use tantivy::ReloadPolicy;
             use std::path::Path;
             
-            let uri: Uri = split_uri.parse()
+            let _uri: Uri = split_uri.parse()
                 .map_err(|e| anyhow::anyhow!("Failed to parse split URI {}: {}", split_uri, e))?;
             
             // Create S3 storage configuration with credentials from Java config
@@ -1979,22 +1888,8 @@ fn retrieve_document_from_split(
                 has_footer_metadata(footer_start, footer_end), is_remote_split(split_uri));
             let index = if has_footer_metadata(footer_start, footer_end) && is_remote_split(split_uri) {
                 debug_println!("RUST DEBUG: 🚀 Using Quickwit optimized path with hotcache (footer: {}..{})", footer_start, footer_end);
-                
-                // Create SplitIdAndFooterOffsets for Quickwit's open_index_with_caches
-                let footer_offsets = SplitIdAndFooterOffsets {
-                    split_id: extract_split_id_from_uri(split_uri),
-                    split_footer_start: footer_start,
-                    split_footer_end: footer_end,
-                    timestamp_start: Some(0),
-                    timestamp_end: Some(i64::MAX),
-                    num_docs: 0, // Will be filled by Quickwit
-                };
-                
-                // Create minimal SearcherContext for Quickwit functions
-                let searcher_context = get_shared_searcher_context()
-                    .map_err(|e| anyhow::anyhow!("Failed to create searcher context: {}", e))?;
-                
-                // ✅ Use cached index to eliminate repeated open_index_with_caches calls
+
+                // Use cached index to eliminate repeated open_index_with_caches calls
                 let index = cached_index.as_ref().clone();
                 debug_println!("RUST DEBUG: ✅ Successfully reused cached index");
                 index
@@ -2087,14 +1982,11 @@ fn retrieve_documents_batch_from_split_optimized(
 
     let result = with_arc_safe(searcher_ptr, |searcher_context: &Arc<CachedSearcherContext>| {
         let context = searcher_context.as_ref();
-        let searcher = &context.standalone_searcher;
         // ✅ CRITICAL FIX: Use shared global runtime handle instead of context.runtime
         let runtime = crate::runtime_manager::QuickwitRuntimeManager::global().handle();
         let split_uri = &context.split_uri;
-        let aws_config = &context.aws_config;
         let footer_start = context.footer_start;
         let footer_end = context.footer_end;
-        let _doc_mapping = &context.doc_mapping_json;
         let storage_resolver = &context.cached_storage;
         let cached_index = &context.cached_index;
         // 🚀 BATCH OPTIMIZATION FIX: Access cache and file offsets
@@ -2233,39 +2125,8 @@ fn retrieve_documents_batch_from_split_optimized(
                 // The code is kept for compatibility but should be removed in cleanup
                 #[allow(unreachable_code)]
                 {
-                use quickwit_config::{StorageConfigs, S3StorageConfig};
-                use quickwit_proto::search::SplitIdAndFooterOffsets;
-                use quickwit_storage::StorageResolver;
-                use quickwit_search::leaf::open_index_with_caches;
-                
-                
-                
-                
-                
-                // Use the same storage resolution approach as individual document retrieval
-                // Create S3 storage configuration
-                let s3_config = S3StorageConfig {
-                    flavor: None,
-                    access_key_id: aws_config.get("access_key").cloned(),
-                    secret_access_key: aws_config.get("secret_key").cloned(), 
-                    session_token: aws_config.get("session_token").cloned(),
-                    region: aws_config.get("region").cloned(),
-                    endpoint: aws_config.get("endpoint").cloned(),
-                    force_path_style_access: aws_config.get("path_style_access").map_or(false, |v| v == "true"),
-                    disable_multi_object_delete: false,
-                    disable_multipart_upload: false,
-                };
-                
-                // Create storage that points to the directory containing the split (same as individual retrieval)
-                let split_dir_uri = if let Some(last_slash_pos) = split_uri.rfind('/') {
-                    &split_uri[..last_slash_pos + 1] // Include the trailing slash
-                } else {
-                    split_uri // If no slash, use the full URI as directory
-                };
-
-                // ✅ DEADLOCK FIX #4: Use pre-created storage resolver from searcher context
+                // Use pre-created storage resolver from searcher context
                 debug_println!("✅ QUICKWIT_LIFECYCLE: Using cached storage from searcher context (Quickwit pattern)");
-                debug_println!("   📍 Location: split_searcher_replacement.rs:1271 (batch documents split directory)");
                 debug_println!("✅ CACHED_STORAGE_USED: Storage at address {:p} (Quickwit lifecycle)", Arc::as_ptr(storage_resolver));
                 let index_storage = storage_resolver.clone();
                 
@@ -2281,22 +2142,8 @@ fn retrieve_documents_batch_from_split_optimized(
                     has_footer_metadata(footer_start, footer_end), is_remote_split(split_uri));
                 let mut index = if has_footer_metadata(footer_start, footer_end) && is_remote_split(split_uri) {
                     debug_println!("RUST DEBUG: 🚀 Using Quickwit optimized path for batch retrieval (footer: {}..{})", footer_start, footer_end);
-                    
-                    // Create SplitIdAndFooterOffsets for Quickwit's open_index_with_caches
-                    let footer_offsets = SplitIdAndFooterOffsets {
-                        split_id: extract_split_id_from_uri(split_uri),
-                        split_footer_start: footer_start,
-                        split_footer_end: footer_end,
-                        timestamp_start: Some(0),
-                        timestamp_end: Some(i64::MAX),
-                        num_docs: 0, // Will be filled by Quickwit
-                    };
-                    
-                    // Create minimal SearcherContext for Quickwit functions
-                    let searcher_context = get_shared_searcher_context()
-                        .map_err(|e| anyhow::anyhow!("Failed to create searcher context: {}", e))?;
-                    
-                    // ✅ Use cached index to eliminate repeated open_index_with_caches calls
+
+                    // Use cached index to eliminate repeated open_index_with_caches calls
                     let index = cached_index.as_ref().clone();
                     debug_println!("🔥 INDEX CACHED: Reusing cached index for batch operations instead of expensive open_index_with_caches call");
 
@@ -2702,7 +2549,7 @@ pub fn create_schema_from_doc_mapping(doc_mapping_json: &str) -> anyhow::Result<
 /// Async-first replacement for Java_io_indextables_tantivy4java_split_SplitSearcher_getSchemaFromNative
 #[no_mangle]
 pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_getSchemaFromNative(
-    env: JNIEnv,
+    _env: JNIEnv,
     _class: JClass,
     searcher_ptr: jlong,
 ) -> jlong {
@@ -2771,34 +2618,12 @@ fn get_schema_from_split(searcher_ptr: jlong) -> anyhow::Result<tantivy::schema:
         // ✅ CRITICAL FIX: Use shared global runtime instead of context.runtime
 
         // Parse the split URI and extract schema using Quickwit's storage abstractions
-        use quickwit_common::uri::Uri;
         use std::path::Path;
 
         // Use block_on to run async code synchronously within the runtime context
         tokio::task::block_in_place(|| {
             crate::runtime_manager::QuickwitRuntimeManager::global().handle().block_on(async {
-                // Parse URI and resolve storage
-                let uri: Uri = context.split_uri.parse()
-                    .map_err(|e| anyhow::anyhow!("Failed to parse split URI {}: {}", context.split_uri, e))?;
-                
-                // Create S3 storage configuration with credentials from Java config
-                use quickwit_config::{StorageConfigs, S3StorageConfig};
-                
-                let s3_config = S3StorageConfig {
-                    flavor: None,
-                    access_key_id: context.aws_config.get("access_key").cloned(),
-                    secret_access_key: context.aws_config.get("secret_key").cloned(),
-                    session_token: context.aws_config.get("session_token").cloned(),
-                    region: context.aws_config.get("region").cloned(),
-                    endpoint: context.aws_config.get("endpoint").cloned(),
-                    force_path_style_access: context.aws_config.get("path_style_access").map_or(false, |v| v == "true"),
-                    disable_multi_object_delete: false,
-                    disable_multipart_upload: false,
-                };
-
-                // ✅ DEADLOCK FIX #6: Use pre-created storage resolver from searcher context
-                debug_println!("✅ DEADLOCK_FIXED: Using pre-created StorageResolver from searcher context [FIX #6]");
-                debug_println!("   📍 Location: split_searcher_replacement.rs:2249 (document retrieval storage)");
+                // Use pre-created storage resolver from searcher context
                 debug_println!("✅ CACHED_STORAGE_USED: Storage at address {:p} (Quickwit lifecycle)", Arc::as_ptr(&context.cached_storage));
 
                 // Use cached storage directly (Quickwit pattern)
@@ -2857,17 +2682,8 @@ fn fix_range_query_types(searcher_ptr: jlong, query_json: &str) -> anyhow::Resul
     let schema_start = std::time::Instant::now();
     let schema = with_arc_safe(searcher_ptr, |searcher_context: &Arc<CachedSearcherContext>| {
         let context = searcher_context.as_ref();
-        let _searcher = &context.standalone_searcher;
-        // ✅ CRITICAL FIX: Use shared global runtime handle instead of context.runtime
-        let _runtime = crate::runtime_manager::QuickwitRuntimeManager::global().handle();
         let split_uri = &context.split_uri;
-        let _aws_config = &context.aws_config;
-        let _footer_start = context.footer_start;
-        let _footer_end = context.footer_end;
-        let _doc_mapping_json = &context.doc_mapping_json;
-        let _storage_resolver = &context.cached_storage;
-        let _cached_index = &context.cached_index;
-        
+
         // First try to get schema from cache
         if let Some(cached_schema) = get_split_schema(split_uri) {
             debug_println!("RUST DEBUG: ⏱️ 🚀 Using CACHED schema instead of expensive I/O [TIMING: {}ms]", schema_start.elapsed().as_millis());
@@ -3098,16 +2914,7 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_toke
     // Get the searcher context and schema (same pattern as get_schema_from_split)
     let result = with_arc_safe(searcher_ptr, |searcher_context: &Arc<CachedSearcherContext>| {
         let context = searcher_context.as_ref();
-        let _searcher = &context.standalone_searcher;
-        // ✅ CRITICAL FIX: Use shared global runtime handle instead of context.runtime
-        let _runtime = crate::runtime_manager::QuickwitRuntimeManager::global().handle();
-        let _split_uri = &context.split_uri;
-        let _aws_config = &context.aws_config;
-        let _footer_start = context.footer_start;
-        let _footer_end = context.footer_end;
         let doc_mapping_json = &context.doc_mapping_json;
-        let _storage_resolver = &context.cached_storage;
-        let _cached_index = &context.cached_index;
 
         // Get schema from doc mapping - throw exception if not available
         let schema = if let Some(doc_mapping) = doc_mapping_json {
@@ -3373,11 +3180,8 @@ fn perform_search_with_query_ast_and_aggregations_using_working_infrastructure(
         // ✅ CRITICAL FIX: Use shared global runtime handle instead of context.runtime
         let runtime = crate::runtime_manager::QuickwitRuntimeManager::global().handle();
         let split_uri = &context.split_uri;
-        let aws_config = &context.aws_config;
         let footer_start = context.footer_start;
         let footer_end = context.footer_end;
-        let doc_mapping_json = &context.doc_mapping_json;
-        let storage_resolver = &context.cached_storage;
         let cached_index = &context.cached_index;
 
         // Enter the runtime context for async operations
@@ -3387,8 +3191,6 @@ fn perform_search_with_query_ast_and_aggregations_using_working_infrastructure(
         runtime.block_on(async {
             // Parse the QueryAst JSON using Quickwit's libraries - IDENTICAL TO WORKING SEARCH
             use quickwit_query::query_ast::QueryAst;
-            use quickwit_common::uri::Uri;
-            use quickwit_config::StorageConfigs;
 
             let query_ast: QueryAst = serde_json::from_str(&query_json)
                 .map_err(|e| anyhow::anyhow!("Failed to parse QueryAst JSON: {}", e))?;
@@ -3399,75 +3201,20 @@ fn perform_search_with_query_ast_and_aggregations_using_working_infrastructure(
             let storage_setup_start = std::time::Instant::now();
             debug_println!("RUST DEBUG: ⏱️ 🔧 SEARCH STORAGE SETUP - Starting storage resolution for: {}", split_uri);
 
-            let uri: Uri = split_uri.parse()
-                .map_err(|e| anyhow::anyhow!("Failed to parse split URI {}: {}", split_uri, e))?;
-
-            // Create S3 storage configuration with credentials from Java config
-            let mut storage_configs = StorageConfigs::default();
-
-            debug_println!("RUST DEBUG: ⏱️ 🔧 Creating S3 config with credentials from Java configuration");
-            let s3_config = S3StorageConfig {
-                flavor: None,
-                access_key_id: aws_config.get("access_key").cloned(),
-                secret_access_key: aws_config.get("secret_key").cloned(),
-                session_token: aws_config.get("session_token").cloned(),
-                region: aws_config.get("region").cloned(),
-                endpoint: aws_config.get("endpoint").cloned(),
-                force_path_style_access: aws_config.get("path_style_access").map_or(false, |v| v == "true"),
-                disable_multi_object_delete: false,
-                disable_multipart_upload: false,
-            };
-
-            // ✅ BYPASS FIX #7: Use centralized storage resolver function
-            debug_println!("✅ BYPASS_FIXED: Using get_configured_storage_resolver() for cache sharing [FIX #7]");
-            debug_println!("   📍 Location: split_searcher_replacement.rs:2819 (final storage search setup)");
-            let storage_resolver = get_configured_storage_resolver(Some(s3_config.clone()), None);
-
-            // Use the helper function to resolve storage correctly for S3 URIs
-            let storage = resolve_storage_for_split(&storage_resolver, split_uri).await?;
             debug_println!("RUST DEBUG: ⏱️ 🔧 SEARCH STORAGE SETUP completed [TIMING: {}ms]", storage_setup_start.elapsed().as_millis());
+            debug_println!("RUST DEBUG: 🚀 Using Quickwit optimized path - NO full file download");
+            debug_println!("RUST DEBUG: Footer offsets from Java config: start={}, end={}", footer_start, footer_end);
 
-            // Extract relative path - IDENTICAL TO WORKING SEARCH
-            let relative_path = if split_uri.contains("://") {
-                // This is a URI, extract just the filename
-                if let Some(last_slash_pos) = split_uri.rfind('/') {
-                    std::path::Path::new(&split_uri[last_slash_pos + 1..])
-                } else {
-                    std::path::Path::new(split_uri)
-                }
+            // Extract the relative path from the split URI
+            let relative_path = if let Some(last_slash_pos) = split_uri.rfind('/') {
+                std::path::Path::new(&split_uri[last_slash_pos + 1..])
             } else {
-                // This is a direct file path, extract just the filename
                 std::path::Path::new(split_uri)
-                    .file_name()
-                    .map(|name| std::path::Path::new(name))
-                    .unwrap_or_else(|| std::path::Path::new(split_uri))
             };
 
-            debug_println!("RUST DEBUG: Reading split file metadata from: '{}'", relative_path.display());
-
-            // Use footer offsets from Java configuration for optimized access
+            // Use context footer offsets for split metadata
             let split_footer_start = footer_start;
             let split_footer_end = footer_end;
-
-            debug_println!("RUST DEBUG: 🚀 Using Quickwit optimized path with open_index_with_caches - NO full file download");
-            debug_println!("RUST DEBUG: Footer offsets from Java config: start={}, end={}", split_footer_start, split_footer_end);
-
-            // Create SplitIdAndFooterOffsets for Quickwit optimization
-            let split_id = relative_path.file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("unknown");
-
-            let split_and_footer_offsets = quickwit_proto::search::SplitIdAndFooterOffsets {
-                split_id: split_id.to_string(),
-                split_footer_start,
-                split_footer_end,
-                num_docs: 0, // Not used for opening, will be filled later
-                timestamp_start: None,
-                timestamp_end: None,
-            };
-
-            // Create proper SearcherContext for Quickwit functions
-            let quickwit_searcher_context = crate::global_cache::get_global_searcher_context();
 
             // Use cached index to eliminate repeated open_index_with_caches calls - OPTIMAL PERFORMANCE
             let index = cached_index.as_ref().clone();
@@ -3598,7 +3345,6 @@ fn perform_search_with_query_ast_and_aggregations_using_working_infrastructure(
             debug_println!("RUST DEBUG: ⏱️ 🔍 Starting actual search execution via searcher.search_split()");
 
             // We're already in an async context, so use the async method directly
-            let split_id_for_error = split_metadata.split_id.clone();
             let leaf_search_response = match searcher.search_split(
                 split_uri,
                 split_metadata,
@@ -3801,16 +3547,6 @@ async fn perform_quickwit_async_doc_retrieval(
 
     debug_println!("🔥 QUICKWIT_DOC: Extracted split_id: {} from split_uri: {}", split_id, context.split_uri);
 
-    // Create split metadata (same pattern as search implementation)
-    let split_metadata = quickwit_proto::search::SplitIdAndFooterOffsets {
-        split_id: split_id.to_string(),
-        split_footer_start: context.footer_start as u64,
-        split_footer_end: context.footer_end as u64,
-        timestamp_start: None,
-        timestamp_end: None,
-        num_docs: 0, // This will be determined when the index is opened
-    };
-
     // Use cached searcher to eliminate repeated searcher creation and ensure cache reuse
     let searcher = context.cached_searcher.clone(); // Follow Quickwit's exact pattern: reuse the same Arc<Searcher>
     debug_println!("🔥 SEARCHER CACHED: Reusing cached searcher following Quickwit's exact pattern for optimal cache performance");
@@ -3956,13 +3692,13 @@ pub async fn perform_schema_retrieval_async_impl(
 /// Real Quickwit search implementation using cached components directly
 async fn perform_real_quickwit_search(
     split_uri: &str,
-    aws_config: &std::collections::HashMap<String, String>,
+    _aws_config: &std::collections::HashMap<String, String>,
     footer_start: u64,
     footer_end: u64,
-    doc_mapping_json: &Option<String>,
+    _doc_mapping_json: &Option<String>,
     cached_storage: Arc<dyn Storage>,
-    cached_searcher: Arc<tantivy::Searcher>,
-    cached_index: Arc<tantivy::Index>,
+    _cached_searcher: Arc<tantivy::Searcher>,
+    _cached_index: Arc<tantivy::Index>,
     query_json: &str,
     limit: usize,
 ) -> anyhow::Result<quickwit_proto::search::LeafSearchResponse> {
@@ -3975,7 +3711,6 @@ async fn perform_real_quickwit_search(
     // DocMapper parsing has compatibility issues with dynamic JSON fields (requires non-empty field_mappings)
     debug_println!("🔍 REAL_QUICKWIT: Creating DocMapper from cached index schema (bypassing doc_mapping JSON)");
 
-    let schema = cached_index.schema();
     let doc_mapper = quickwit_doc_mapper::default_doc_mapper_for_test();
     let doc_mapper = Arc::new(doc_mapper);
 
@@ -4109,13 +3844,13 @@ async fn perform_real_quickwit_search(
 /// Uses the SAME pattern as perform_real_quickwit_search but enables aggregation_request
 async fn perform_real_quickwit_search_with_aggregations(
     split_uri: &str,
-    aws_config: &std::collections::HashMap<String, String>,
+    _aws_config: &std::collections::HashMap<String, String>,
     footer_start: u64,
     footer_end: u64,
     doc_mapping_json: &Option<String>,
     cached_storage: Arc<dyn Storage>,
-    cached_searcher: Arc<tantivy::Searcher>,
-    cached_index: Arc<tantivy::Index>,
+    _cached_searcher: Arc<tantivy::Searcher>,
+    _cached_index: Arc<tantivy::Index>,
     query_json: &str,
     limit: usize,
     aggregation_request_json: Option<String>,

@@ -27,7 +27,7 @@ use tempfile::TempDir;
 
 use crate::debug_println;
 use crate::cache_debug::{debug_arc_string_cache_identity, debug_cache_summary};
-use crate::disk_cache::{L2DiskCache, DiskCacheConfig, CompressionAlgorithm};
+use crate::disk_cache::{L2DiskCache, DiskCacheConfig};
 
 /// Helper function to track storage instance creation for debugging
 /// This helps us understand when and where multiple storage instances are created
