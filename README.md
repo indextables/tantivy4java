@@ -14,6 +14,7 @@ Tantivy4Java is a production-ready Java library that provides direct access to t
 4. [Basic Usage](#basic-usage)
 5. [Advanced Features](#advanced-features)
 6. [Quickwit Integration](#quickwit-integration)
+   - [Aggregations](#aggregations)
 7. [L2 Tiered Disk Cache](#l2-tiered-disk-cache)
 8. [Performance Guide](#performance-guide)
 9. [Developer Guide](#developer-guide)
@@ -1029,6 +1030,122 @@ try (SplitCacheManager manager = SplitCacheManager.getInstance(testCache)) {
 azurite.stop();
 ```
 
+### Aggregations
+
+Tantivy4Java provides comprehensive aggregation support for analytics and faceted search on split files.
+
+#### Terms Aggregation
+
+Group documents by field values (categorical data):
+
+```java
+TermsAggregation termsAgg = new TermsAggregation("categories", "category");
+
+SearchResult result = searcher.search(query, 10, "categories", termsAgg);
+TermsResult termsResult = (TermsResult) result.getAggregation("categories");
+
+for (TermsResult.TermBucket bucket : termsResult.getBuckets()) {
+    System.out.println(bucket.getKey() + ": " + bucket.getDocCount() + " docs");
+}
+```
+
+#### Histogram Aggregation
+
+Create numeric buckets with fixed intervals:
+
+```java
+HistogramAggregation histAgg = new HistogramAggregation("price_dist", "price", 100.0)
+    .setOffset(25.0)           // Shift bucket boundaries
+    .setMinDocCount(1)         // Only buckets with docs
+    .setHardBounds(0.0, 1000.0)    // Limit bucket range
+    .setExtendedBounds(0.0, 2000.0); // Force bucket creation
+
+SearchResult result = searcher.search(query, 10, "price_dist", histAgg);
+HistogramResult histResult = (HistogramResult) result.getAggregation("price_dist");
+
+for (HistogramResult.HistogramBucket bucket : histResult.getBuckets()) {
+    System.out.println("Bucket " + bucket.getKey() + ": " + bucket.getDocCount() + " docs");
+}
+```
+
+#### Date Histogram Aggregation
+
+Time-series bucketing with fixed intervals:
+
+```java
+// Supported intervals: 1ms, 10ms, 100ms, 1s, 30s, 1m, 30m, 1h, 6h, 1d, 7d
+DateHistogramAggregation dateAgg = new DateHistogramAggregation("daily", "timestamp", "1d")
+    .setMinDocCount(1)
+    .setOffset("6h");  // Shift day boundaries by 6 hours
+
+SearchResult result = searcher.search(query, 10, "daily", dateAgg);
+DateHistogramResult dateResult = (DateHistogramResult) result.getAggregation("daily");
+
+for (DateHistogramResult.DateHistogramBucket bucket : dateResult.getBuckets()) {
+    System.out.println(bucket.getKeyAsString() + ": " + bucket.getDocCount() + " docs");
+}
+```
+
+#### Range Aggregation
+
+Custom range buckets for numeric fields:
+
+```java
+RangeAggregation rangeAgg = new RangeAggregation("price_ranges", "price")
+    .addRange("cheap", null, 100.0)      // < 100
+    .addRange("medium", 100.0, 500.0)    // 100-500
+    .addRange("expensive", 500.0, null); // >= 500
+
+SearchResult result = searcher.search(query, 10, "price_ranges", rangeAgg);
+RangeResult rangeResult = (RangeResult) result.getAggregation("price_ranges");
+
+for (RangeResult.RangeBucket bucket : rangeResult.getBuckets()) {
+    System.out.println(bucket.getKey() + ": " + bucket.getDocCount() + " docs");
+}
+```
+
+#### Multiple Aggregations
+
+Run multiple aggregations in a single query:
+
+```java
+Map<String, SplitAggregation> aggs = new HashMap<>();
+aggs.put("categories", new TermsAggregation("categories", "category"));
+aggs.put("price_hist", new HistogramAggregation("price_hist", "price", 100.0));
+aggs.put("price_ranges", new RangeAggregation("price_ranges", "price")
+    .addRange("low", null, 100.0)
+    .addRange("high", 100.0, null));
+
+SearchResult result = searcher.search(query, 10, aggs);
+
+TermsResult categories = (TermsResult) result.getAggregation("categories");
+HistogramResult priceHist = (HistogramResult) result.getAggregation("price_hist");
+RangeResult priceRanges = (RangeResult) result.getAggregation("price_ranges");
+```
+
+#### Sub-Aggregations
+
+Nest aggregations within bucket aggregations:
+
+```java
+HistogramAggregation histAgg = new HistogramAggregation("price_hist", "price", 500.0)
+    .addSubAggregation(new StatsAggregation("qty_stats", "quantity"))
+    .addSubAggregation(new AverageAggregation("avg_rating", "rating"));
+
+SearchResult result = searcher.search(query, 10, "price_hist", histAgg);
+HistogramResult histResult = (HistogramResult) result.getAggregation("price_hist");
+
+for (HistogramResult.HistogramBucket bucket : histResult.getBuckets()) {
+    StatsResult stats = bucket.getSubAggregation("qty_stats", StatsResult.class);
+    if (stats != null) {
+        System.out.println("Bucket " + bucket.getKey() +
+            " - Avg quantity: " + stats.getAverage());
+    }
+}
+```
+
+For comprehensive documentation, see [Bucket Aggregation Developer Guide](docs/BUCKET_AGGREGATION_GUIDE.md).
+
 ### Cache Management
 
 Monitor and control split cache performance:
@@ -1428,10 +1545,17 @@ class SearchTest {
 - `QuickwitSplitInspector` - Split inspection utilities
 
 **io.indextables.tantivy4java.aggregation**
-- `TermsAggregation` - Terms aggregation (supported)
-- `RangeAggregation` - Range aggregation (not yet supported for splits)
-- `HistogramAggregation` - Histogram aggregation (not yet supported for splits)
-- `DateHistogramAggregation` - Date histogram (not yet supported for splits)
+- `TermsAggregation` - Terms/categorical aggregation
+- `HistogramAggregation` - Numeric histogram with configurable intervals
+- `DateHistogramAggregation` - Date/time histogram with fixed intervals
+- `RangeAggregation` - Custom range buckets
+- `StatsAggregation` - Statistical metrics (count, sum, avg, min, max)
+- `AverageAggregation` - Average value aggregation
+- `SumAggregation` - Sum aggregation
+- `MinAggregation` - Minimum value aggregation
+- `MaxAggregation` - Maximum value aggregation
+- `CountAggregation` - Document count aggregation
+- Result classes: `TermsResult`, `HistogramResult`, `DateHistogramResult`, `RangeResult`, `StatsResult`
 
 **io.indextables.tantivy4java.config**
 - `FileSystemConfig` - File system configuration
@@ -1467,14 +1591,13 @@ Index.Memory.XL_HEAP_SIZE       // 256MB - very large indices
 
 ## Known Limitations
 
-### SplitSearcher Aggregations
+### SplitSearcher Aggregation Limitations
 
-Only **TermsAggregation** is currently supported for SplitSearcher. The following aggregations are not yet implemented:
-- DateHistogramAggregation
-- HistogramAggregation
-- RangeAggregation
+The following aggregation features have Quickwit/Tantivy limitations:
+- **Overlapping ranges** - RangeAggregation does not support overlapping range definitions
+- **Calendar intervals** - DateHistogramAggregation only supports fixed intervals (1d, 1h, etc.), not calendar intervals (1M, 1y)
 
-All aggregation types work correctly with the standard `Searcher` API.
+All core aggregation types (Terms, Histogram, DateHistogram, Range) are fully supported for both `Searcher` and `SplitSearcher` APIs.
 
 ### Tokenization
 
