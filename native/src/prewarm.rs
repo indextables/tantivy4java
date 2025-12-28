@@ -620,55 +620,78 @@ pub async fn prewarm_fastfields_for_fields(
 
 /// Async implementation of store (document storage) prewarming
 ///
-/// This reads the entire .store file for each segment into cache,
+/// This reads the entire .store file for each segment into the disk cache,
 /// which eliminates cache misses when retrieving documents.
+///
+/// IMPORTANT: We must read the raw .store file bytes through the Storage layer
+/// to populate the disk cache. Using store_reader.get(doc_id) does NOT work
+/// because Tantivy's StoreReader has its own internal LRU cache that bypasses
+/// our disk cache.
 pub async fn prewarm_store_impl(searcher_ptr: jlong) -> anyhow::Result<()> {
     debug_println!("🔥 PREWARM_STORE: Starting document store warmup");
 
-    let searcher = with_arc_safe(searcher_ptr, |ctx: &Arc<CachedSearcherContext>| {
-        ctx.cached_searcher.clone()
+    // Get storage and bundle file offsets from the context
+    let (storage, bundle_offsets) = with_arc_safe(searcher_ptr, |ctx: &Arc<CachedSearcherContext>| {
+        (ctx.cached_storage.clone(), ctx.bundle_file_offsets.clone())
     }).ok_or_else(|| anyhow::anyhow!("Failed to access searcher context"))?;
 
-    let mut warmed_count = 0;
+    // Find all .store files in the bundle
+    let store_files: Vec<_> = bundle_offsets.iter()
+        .filter(|(path, _)| {
+            path.extension()
+                .map(|ext| ext == "store")
+                .unwrap_or(false)
+        })
+        .collect();
 
-    // For each segment, read the store file into cache
-    for segment_reader in searcher.segment_readers() {
-        let segment_id = segment_reader.segment_id().uuid_string();
-
-        debug_println!("🔥 PREWARM_STORE: Warming store for segment '{}'", segment_id);
-
-        // Get the store reader to trigger loading the store data
-        // The cache size here is for decompressed blocks, we use a small value
-        // since we just want to read the raw bytes
-        match segment_reader.get_store_reader(1) {
-            Ok(store_reader) => {
-                // Access the store to trigger loading
-                // We read through all documents to warm the store blocks
-                let max_doc = segment_reader.max_doc();
-
-                // Read documents in batches to warm all store blocks
-                // This is more efficient than reading all bytes directly
-                // because it uses Tantivy's block-based store format
-                let batch_size = 100;
-                for start_doc in (0..max_doc).step_by(batch_size) {
-                    let end_doc = std::cmp::min(start_doc + batch_size as u32, max_doc);
-                    // Reading a document warms the store block it's in
-                    for doc_id in start_doc..end_doc {
-                        // Just access the document to warm the block
-                        // We use TantivyDocument as the type parameter
-                        let _: Result<tantivy::TantivyDocument, _> = store_reader.get(doc_id);
-                    }
-                }
-
-                debug_println!("🔥 PREWARM_STORE: Warmed store for segment {} ({} docs)", segment_id, max_doc);
-                warmed_count += 1;
-            },
-            Err(e) => {
-                debug_println!("⚠️ PREWARM_STORE: Failed to get store reader for segment {}: {}", segment_id, e);
-            }
-        }
+    if store_files.is_empty() {
+        debug_println!("⚠️ PREWARM_STORE: No .store files found in bundle");
+        return Ok(());
     }
 
-    debug_println!("✅ PREWARM_STORE: Completed - warmed {} segments", warmed_count);
-    Ok(())
+    debug_println!("🔥 PREWARM_STORE: Found {} .store files to warm", store_files.len());
+
+    let mut warm_up_futures = Vec::new();
+
+    for (path, byte_range) in store_files {
+        let storage = storage.clone();
+        let path = path.clone();
+        let range_start = byte_range.start as usize;
+        let range_end = byte_range.end as usize;
+        let range_len = range_end - range_start;
+
+        debug_println!("🔥 PREWARM_STORE: Queuing warmup for '{}' ({} bytes at {}..{})",
+                       path.display(), range_len, range_start, range_end);
+
+        warm_up_futures.push(async move {
+            // Read the entire .store file through the Storage layer
+            // This populates the disk cache with the raw bytes
+            match storage.get_slice(&path, range_start..range_end).await {
+                Ok(bytes) => {
+                    debug_println!("✅ PREWARM_STORE: Cached '{}' ({} bytes)",
+                                   path.display(), bytes.len());
+                    Ok(())
+                },
+                Err(e) => {
+                    debug_println!("⚠️ PREWARM_STORE: Failed to cache '{}': {}",
+                                   path.display(), e);
+                    Err(anyhow::anyhow!("Failed to cache store file: {}", e))
+                }
+            }
+        });
+    }
+
+    debug_println!("🔥 PREWARM_STORE: Executing {} warmup operations in parallel", warm_up_futures.len());
+
+    let results = futures::future::join_all(warm_up_futures).await;
+    let success_count = results.iter().filter(|r| r.is_ok()).count();
+    let failure_count = results.len() - success_count;
+
+    debug_println!("✅ PREWARM_STORE: Completed - {} success, {} failures", success_count, failure_count);
+
+    if success_count > 0 || failure_count == 0 {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!("All store warmup operations failed"))
+    }
 }
