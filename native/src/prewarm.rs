@@ -45,6 +45,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use jni::sys::jlong;
+use quickwit_storage::ByteRangeCache;
 use tantivy::schema::FieldType;
 
 use crate::debug_println;
@@ -623,17 +624,39 @@ pub async fn prewarm_fastfields_for_fields(
 /// This reads the entire .store file for each segment into the disk cache,
 /// which eliminates cache misses when retrieving documents.
 ///
-/// IMPORTANT: We must read the raw .store file bytes through the Storage layer
-/// to populate the disk cache. Using store_reader.get(doc_id) does NOT work
-/// because Tantivy's StoreReader has its own internal LRU cache that bypasses
-/// our disk cache.
+/// IMPORTANT: The cached_storage is the RAW storage (S3, file, etc.), not BundleStorage.
+/// We must:
+/// 1. Read from the split file at the bundle byte range
+/// 2. Cache using the inner file path and inner byte range (0..file_length)
+/// This matches how CachingDirectory looks up cache entries.
 pub async fn prewarm_store_impl(searcher_ptr: jlong) -> anyhow::Result<()> {
     debug_println!("🔥 PREWARM_STORE: Starting document store warmup");
 
-    // Get storage and bundle file offsets from the context
-    let (storage, bundle_offsets) = with_arc_safe(searcher_ptr, |ctx: &Arc<CachedSearcherContext>| {
-        (ctx.cached_storage.clone(), ctx.bundle_file_offsets.clone())
+    // Get storage, bundle file offsets, split_uri, and byte_range_cache from the context
+    let (storage, bundle_offsets, split_uri, byte_range_cache) = with_arc_safe(searcher_ptr, |ctx: &Arc<CachedSearcherContext>| {
+        (
+            ctx.cached_storage.clone(),
+            ctx.bundle_file_offsets.clone(),
+            ctx.split_uri.clone(),
+            ctx.byte_range_cache.clone(),
+        )
     }).ok_or_else(|| anyhow::anyhow!("Failed to access searcher context"))?;
+
+    // We need the byte_range_cache to cache the data correctly
+    let byte_range_cache = byte_range_cache
+        .ok_or_else(|| anyhow::anyhow!("ByteRangeCache not available in context"))?;
+
+    // Extract split filename from split_uri
+    // Following the pattern from simple_batch_optimization.rs - just use the filename
+    // The storage layer knows how to resolve it based on its configured base path
+    let split_filename = if let Some(last_slash_pos) = split_uri.rfind('/') {
+        &split_uri[last_slash_pos + 1..]
+    } else {
+        &split_uri
+    };
+    let split_path = std::path::PathBuf::from(split_filename);
+
+    debug_println!("🔥 PREWARM_STORE: Split path: {:?}", split_path);
 
     // Find all .store files in the bundle
     let store_files: Vec<_> = bundle_offsets.iter()
@@ -653,28 +676,36 @@ pub async fn prewarm_store_impl(searcher_ptr: jlong) -> anyhow::Result<()> {
 
     let mut warm_up_futures = Vec::new();
 
-    for (path, byte_range) in store_files {
+    for (inner_path, bundle_range) in store_files {
         let storage = storage.clone();
-        let path = path.clone();
-        let range_start = byte_range.start as usize;
-        let range_end = byte_range.end as usize;
-        let range_len = range_end - range_start;
+        let split_path = split_path.clone();
+        let inner_path = inner_path.clone();
+        let byte_range_cache = byte_range_cache.clone();
 
-        debug_println!("🔥 PREWARM_STORE: Queuing warmup for '{}' ({} bytes at {}..{})",
-                       path.display(), range_len, range_start, range_end);
+        // Bundle range is the absolute byte range within the split file
+        let bundle_start = bundle_range.start as usize;
+        let bundle_end = bundle_range.end as usize;
+        let file_length = bundle_end - bundle_start;
+
+        debug_println!("🔥 PREWARM_STORE: Queuing warmup for '{}' ({} bytes from split at {}..{})",
+                       inner_path.display(), file_length, bundle_start, bundle_end);
 
         warm_up_futures.push(async move {
-            // Read the entire .store file through the Storage layer
-            // This populates the disk cache with the raw bytes
-            match storage.get_slice(&path, range_start..range_end).await {
+            // Read from the split file at the bundle byte range
+            match storage.get_slice(&split_path, bundle_start..bundle_end).await {
                 Ok(bytes) => {
-                    debug_println!("✅ PREWARM_STORE: Cached '{}' ({} bytes)",
-                                   path.display(), bytes.len());
+                    // Cache using inner file path and inner byte range (0..file_length)
+                    // This matches how CachingDirectory looks up cache entries
+                    let inner_range = 0..file_length;
+                    byte_range_cache.put_slice(inner_path.clone(), inner_range.clone(), bytes.clone());
+
+                    debug_println!("✅ PREWARM_STORE: Cached '{}' ({} bytes) with inner range 0..{}",
+                                   inner_path.display(), bytes.len(), file_length);
                     Ok(())
                 },
                 Err(e) => {
-                    debug_println!("⚠️ PREWARM_STORE: Failed to cache '{}': {}",
-                                   path.display(), e);
+                    debug_println!("⚠️ PREWARM_STORE: Failed to read from split for '{}': {}",
+                                   inner_path.display(), e);
                     Err(anyhow::anyhow!("Failed to cache store file: {}", e))
                 }
             }
