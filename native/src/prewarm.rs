@@ -43,184 +43,206 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::path::PathBuf;
+use std::collections::HashMap;
+use std::ops::Range;
 
 use jni::sys::jlong;
-use quickwit_storage::ByteRangeCache;
+use quickwit_storage::{ByteRangeCache, Storage};
 use tantivy::schema::FieldType;
 
 use crate::debug_println;
 use crate::split_searcher_replacement::CachedSearcherContext;
 use crate::utils::with_arc_safe;
 
-/// Async implementation of term dictionary prewarming
+/// Helper function to cache all files with a given extension from the bundle.
 ///
-/// This follows the Quickwit pattern from leaf.rs:warm_up_term_dict_fields():
-/// 1. Get all indexed text fields from the schema
-/// 2. For each segment reader, get the inverted index for each field
-/// 3. Call warm_up_dictionary() which fetches the entire FST via get_slice()
-/// 4. The disk cache stores the full range, and subsequent sub-range requests
-///    are served from the cached data via get_coalesced()
-pub async fn prewarm_term_dictionaries_impl(searcher_ptr: jlong) -> anyhow::Result<()> {
-    debug_println!("🔥 PREWARM_IMPL: Starting term dictionary warmup");
-
-    // Get the searcher context
-    let (searcher, schema) = with_arc_safe(searcher_ptr, |ctx: &Arc<CachedSearcherContext>| {
-        (ctx.cached_searcher.clone(), ctx.cached_index.schema())
-    }).ok_or_else(|| anyhow::anyhow!("Failed to access searcher context"))?;
-
-    // Find all indexed text fields (fields with term dictionaries)
-    let indexed_fields: HashSet<tantivy::schema::Field> = schema.fields()
-        .filter_map(|(field, field_entry)| {
-            match field_entry.field_type() {
-                // Text fields are indexed if they have indexing options
-                FieldType::Str(text_options) => {
-                    if text_options.get_indexing_options().is_some() {
-                        debug_println!("🔥 PREWARM_IMPL: Found indexed text field: {}", field_entry.name());
-                        Some(field)
-                    } else {
-                        None
-                    }
-                },
-                // JSON fields can also have term dictionaries
-                FieldType::JsonObject(json_options) => {
-                    if json_options.get_text_indexing_options().is_some() {
-                        debug_println!("🔥 PREWARM_IMPL: Found indexed JSON field: {}", field_entry.name());
-                        Some(field)
-                    } else {
-                        None
-                    }
-                },
-                _ => None,
-            }
+/// This implements full-file caching which ensures that any sub-range query
+/// will hit the cache. The ByteRangeCache.get_slice() method uses get_block()
+/// to find cached ranges that contain the requested range.
+///
+/// # Arguments
+/// * `extension` - File extension to match (e.g., "term", "store", "fast")
+/// * `storage` - Storage backend for reading files
+/// * `split_path` - Path to the split file
+/// * `bundle_offsets` - Map of inner paths to bundle byte ranges
+/// * `byte_range_cache` - Cache to populate
+///
+/// # Returns
+/// Tuple of (success_count, failure_count)
+async fn cache_files_by_extension(
+    extension: &str,
+    storage: Arc<dyn Storage>,
+    split_path: PathBuf,
+    bundle_offsets: &HashMap<PathBuf, Range<u64>>,
+    byte_range_cache: ByteRangeCache,
+) -> (usize, usize) {
+    // Find all files with the given extension
+    let files: Vec<_> = bundle_offsets.iter()
+        .filter(|(path, _)| {
+            path.extension()
+                .map(|ext| ext == extension)
+                .unwrap_or(false)
         })
         .collect();
 
-    if indexed_fields.is_empty() {
-        debug_println!("🔥 PREWARM_IMPL: No indexed text fields found, nothing to warm up");
-        return Ok(());
+    if files.is_empty() {
+        debug_println!("⚠️ PREWARM_CACHE: No .{} files found in bundle", extension);
+        return (0, 0);
     }
 
-    debug_println!("🔥 PREWARM_IMPL: Found {} indexed fields, warming up term dictionaries for {} segments",
-                   indexed_fields.len(), searcher.segment_readers().len());
+    debug_println!("🔥 PREWARM_CACHE: Found {} .{} files to cache", files.len(), extension);
 
-    // Collect warmup futures for parallel execution
     let mut warm_up_futures = Vec::new();
 
-    for field in &indexed_fields {
-        for segment_reader in searcher.segment_readers() {
-            // Clone the inverted index for async move
-            match segment_reader.inverted_index(*field) {
-                Ok(inverted_index) => {
-                    let inverted_index = inverted_index.clone();
-                    warm_up_futures.push(async move {
-                        let dict = inverted_index.terms();
-                        dict.warm_up_dictionary().await
-                    });
+    for (inner_path, bundle_range) in files {
+        let storage = storage.clone();
+        let split_path = split_path.clone();
+        let inner_path = inner_path.clone();
+        let byte_range_cache = byte_range_cache.clone();
+
+        let bundle_start = bundle_range.start as usize;
+        let bundle_end = bundle_range.end as usize;
+        let file_length = bundle_end - bundle_start;
+
+        debug_println!("🔥 PREWARM_CACHE: Queuing '{}' ({} bytes)", inner_path.display(), file_length);
+
+        warm_up_futures.push(async move {
+            match storage.get_slice(&split_path, bundle_start..bundle_end).await {
+                Ok(bytes) => {
+                    // Cache with INNER path and INNER range (0..file_length)
+                    // This matches how CachingDirectory does lookups
+                    let inner_range = 0..file_length;
+                    byte_range_cache.put_slice(inner_path.clone(), inner_range, bytes.clone());
+                    debug_println!("✅ PREWARM_CACHE: Cached '{}' (0..{} bytes)", inner_path.display(), file_length);
+                    Ok(())
                 },
                 Err(e) => {
-                    debug_println!("⚠️ PREWARM_IMPL: Failed to get inverted index for field: {}", e);
-                    // Continue with other fields/segments
+                    debug_println!("⚠️ PREWARM_CACHE: Failed '{}': {}", inner_path.display(), e);
+                    Err(e)
                 }
             }
-        }
+        });
     }
-
-    debug_println!("🔥 PREWARM_IMPL: Executing {} warmup operations in parallel", warm_up_futures.len());
-
-    // Execute all warmup operations in parallel
-    let results = futures::future::join_all(warm_up_futures).await;
-
-    // Count successes and failures
-    let mut success_count = 0;
-    let mut failure_count = 0;
-    for result in results {
-        match result {
-            Ok(_) => success_count += 1,
-            Err(e) => {
-                debug_println!("⚠️ PREWARM_IMPL: Warmup operation failed: {}", e);
-                failure_count += 1;
-            }
-        }
-    }
-
-    debug_println!("✅ PREWARM_IMPL: Term dictionary warmup complete - {} success, {} failures",
-                   success_count, failure_count);
-
-    // Consider it success if at least some warmups succeeded
-    if success_count > 0 || failure_count == 0 {
-        Ok(())
-    } else {
-        Err(anyhow::anyhow!("All warmup operations failed"))
-    }
-}
-
-/// Async implementation of postings prewarming
-///
-/// This follows the Quickwit pattern from leaf.rs:warm_up_postings():
-/// For each indexed field, for each segment, call warm_postings_full()
-pub async fn prewarm_postings_impl(searcher_ptr: jlong) -> anyhow::Result<()> {
-    debug_println!("🔥 PREWARM_POSTINGS: Starting postings warmup");
-
-    let (searcher, schema) = with_arc_safe(searcher_ptr, |ctx: &Arc<CachedSearcherContext>| {
-        (ctx.cached_searcher.clone(), ctx.cached_index.schema())
-    }).ok_or_else(|| anyhow::anyhow!("Failed to access searcher context"))?;
-
-    // Find all indexed text fields
-    let indexed_fields: HashSet<tantivy::schema::Field> = schema.fields()
-        .filter_map(|(field, field_entry)| {
-            match field_entry.field_type() {
-                FieldType::Str(text_options) => {
-                    if text_options.get_indexing_options().is_some() {
-                        Some(field)
-                    } else {
-                        None
-                    }
-                },
-                FieldType::JsonObject(json_options) => {
-                    if json_options.get_text_indexing_options().is_some() {
-                        Some(field)
-                    } else {
-                        None
-                    }
-                },
-                _ => None,
-            }
-        })
-        .collect();
-
-    if indexed_fields.is_empty() {
-        debug_println!("🔥 PREWARM_POSTINGS: No indexed fields found");
-        return Ok(());
-    }
-
-    debug_println!("🔥 PREWARM_POSTINGS: Warming up postings for {} fields", indexed_fields.len());
-
-    let mut warm_up_futures = Vec::new();
-    for field in &indexed_fields {
-        for segment_reader in searcher.segment_readers() {
-            match segment_reader.inverted_index(*field) {
-                Ok(inverted_index) => {
-                    let inverted_index = inverted_index.clone();
-                    warm_up_futures.push(async move {
-                        inverted_index.warm_postings_full(false).await
-                    });
-                },
-                Err(e) => {
-                    debug_println!("⚠️ PREWARM_POSTINGS: Failed to get inverted index: {}", e);
-                }
-            }
-        }
-    }
-
-    debug_println!("🔥 PREWARM_POSTINGS: Executing {} warmup operations", warm_up_futures.len());
 
     let results = futures::future::join_all(warm_up_futures).await;
     let success_count = results.iter().filter(|r| r.is_ok()).count();
     let failure_count = results.len() - success_count;
 
-    debug_println!("✅ PREWARM_POSTINGS: Completed - {} success, {} failures", success_count, failure_count);
+    (success_count, failure_count)
+}
+
+/// Async implementation of term dictionary prewarming
+///
+/// This uses full-file caching to ensure 100% cache hit coverage:
+/// 1. Read entire .term files from the bundle into cache
+/// 2. Cache with inner path and inner range (0..file_length)
+/// 3. ByteRangeCache.get_slice() will find cached data for any sub-range query
+///
+/// This replaces the previous approach that used Tantivy's warm_up_dictionary(),
+/// which only fetched specific byte ranges and left gaps in cache coverage.
+pub async fn prewarm_term_dictionaries_impl(searcher_ptr: jlong) -> anyhow::Result<()> {
+    debug_println!("🔥 PREWARM_TERM: Starting term dictionary warmup (full-file caching)");
+
+    // Get storage, bundle file offsets, split_uri, and byte_range_cache from the context
+    let (storage, bundle_offsets, split_uri, byte_range_cache) = with_arc_safe(searcher_ptr, |ctx: &Arc<CachedSearcherContext>| {
+        (
+            ctx.cached_storage.clone(),
+            ctx.bundle_file_offsets.clone(),
+            ctx.split_uri.clone(),
+            ctx.byte_range_cache.clone(),
+        )
+    }).ok_or_else(|| anyhow::anyhow!("Failed to access searcher context"))?;
+
+    let byte_range_cache = byte_range_cache
+        .ok_or_else(|| anyhow::anyhow!("ByteRangeCache not available in context"))?;
+
+    // Extract split filename from split_uri
+    let split_filename = if let Some(last_slash_pos) = split_uri.rfind('/') {
+        &split_uri[last_slash_pos + 1..]
+    } else {
+        &split_uri
+    };
+    let split_path = PathBuf::from(split_filename);
+
+    // Cache all .term files
+    let (success_count, failure_count) = cache_files_by_extension(
+        "term",
+        storage,
+        split_path,
+        &bundle_offsets,
+        byte_range_cache,
+    ).await;
+
+    debug_println!("✅ PREWARM_TERM: Term dictionary warmup complete - {} success, {} failures",
+                   success_count, failure_count);
 
     if success_count > 0 || failure_count == 0 {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!("All term dictionary warmup operations failed"))
+    }
+}
+
+/// Async implementation of postings prewarming
+///
+/// This uses full-file caching to ensure 100% cache hit coverage:
+/// 1. Read entire .idx files (term-to-posting list index) into cache
+/// 2. Read entire .pos files (positions data) into cache
+/// 3. Cache with inner path and inner range (0..file_length)
+/// 4. ByteRangeCache.get_slice() will find cached data for any sub-range query
+///
+/// This replaces the previous approach that used Tantivy's warm_postings_full(),
+/// which only fetched specific byte ranges and left gaps in cache coverage.
+pub async fn prewarm_postings_impl(searcher_ptr: jlong) -> anyhow::Result<()> {
+    debug_println!("🔥 PREWARM_POSTINGS: Starting postings warmup (full-file caching)");
+
+    // Get storage, bundle file offsets, split_uri, and byte_range_cache from the context
+    let (storage, bundle_offsets, split_uri, byte_range_cache) = with_arc_safe(searcher_ptr, |ctx: &Arc<CachedSearcherContext>| {
+        (
+            ctx.cached_storage.clone(),
+            ctx.bundle_file_offsets.clone(),
+            ctx.split_uri.clone(),
+            ctx.byte_range_cache.clone(),
+        )
+    }).ok_or_else(|| anyhow::anyhow!("Failed to access searcher context"))?;
+
+    let byte_range_cache = byte_range_cache
+        .ok_or_else(|| anyhow::anyhow!("ByteRangeCache not available in context"))?;
+
+    // Extract split filename from split_uri
+    let split_filename = if let Some(last_slash_pos) = split_uri.rfind('/') {
+        &split_uri[last_slash_pos + 1..]
+    } else {
+        &split_uri
+    };
+    let split_path = PathBuf::from(split_filename);
+
+    // Cache all .idx files (term-to-posting list index)
+    let (idx_success, idx_failure) = cache_files_by_extension(
+        "idx",
+        storage.clone(),
+        split_path.clone(),
+        &bundle_offsets,
+        byte_range_cache.clone(),
+    ).await;
+
+    // Cache all .pos files (positions data)
+    let (pos_success, pos_failure) = cache_files_by_extension(
+        "pos",
+        storage,
+        split_path,
+        &bundle_offsets,
+        byte_range_cache,
+    ).await;
+
+    let total_success = idx_success + pos_success;
+    let total_failure = idx_failure + pos_failure;
+
+    debug_println!("✅ PREWARM_POSTINGS: Completed - {} success ({} idx, {} pos), {} failures",
+                   total_success, idx_success, pos_success, total_failure);
+
+    if total_success > 0 || total_failure == 0 {
         Ok(())
     } else {
         Err(anyhow::anyhow!("All postings warmup operations failed"))
@@ -229,116 +251,103 @@ pub async fn prewarm_postings_impl(searcher_ptr: jlong) -> anyhow::Result<()> {
 
 /// Async implementation of field norms prewarming
 ///
-/// This follows the Quickwit pattern from leaf.rs:warm_up_fieldnorms():
-/// For each field with norms, load the fieldnorm data by accessing the fieldnorm reader
+/// This uses full-file caching to ensure 100% cache hit coverage:
+/// 1. Read entire .fieldnorm files into cache
+/// 2. Cache with inner path and inner range (0..file_length)
+/// 3. ByteRangeCache.get_slice() will find cached data for any sub-range query
+///
+/// This replaces the previous approach that just accessed fieldnorm readers,
+/// which only fetched specific byte ranges and left gaps in cache coverage.
 pub async fn prewarm_fieldnorms_impl(searcher_ptr: jlong) -> anyhow::Result<()> {
-    debug_println!("🔥 PREWARM_FIELDNORMS: Starting fieldnorms warmup");
+    debug_println!("🔥 PREWARM_FIELDNORMS: Starting fieldnorms warmup (full-file caching)");
 
-    let searcher = with_arc_safe(searcher_ptr, |ctx: &Arc<CachedSearcherContext>| {
-        ctx.cached_searcher.clone()
+    // Get storage, bundle file offsets, split_uri, and byte_range_cache from the context
+    let (storage, bundle_offsets, split_uri, byte_range_cache) = with_arc_safe(searcher_ptr, |ctx: &Arc<CachedSearcherContext>| {
+        (
+            ctx.cached_storage.clone(),
+            ctx.bundle_file_offsets.clone(),
+            ctx.split_uri.clone(),
+            ctx.byte_range_cache.clone(),
+        )
     }).ok_or_else(|| anyhow::anyhow!("Failed to access searcher context"))?;
 
-    let schema = searcher.schema();
-    let mut warmed_count = 0;
+    let byte_range_cache = byte_range_cache
+        .ok_or_else(|| anyhow::anyhow!("ByteRangeCache not available in context"))?;
 
-    // For fieldnorms, we simply access the fieldnorms reader for each indexed text field
-    // The access itself triggers loading the data into cache
-    for (field, field_entry) in schema.fields() {
-        // Only text fields have field norms
-        if matches!(field_entry.field_type(), FieldType::Str(_)) {
-            for segment_reader in searcher.segment_readers() {
-                // Accessing the fieldnorm reader loads the data
-                if let Ok(Some(_fieldnorm_reader)) = segment_reader.fieldnorms_readers().get_field(field) {
-                    debug_println!("🔥 PREWARM_FIELDNORMS: Warmed fieldnorms for field '{}'", field_entry.name());
-                    warmed_count += 1;
-                }
-            }
-        }
-    }
+    // Extract split filename from split_uri
+    let split_filename = if let Some(last_slash_pos) = split_uri.rfind('/') {
+        &split_uri[last_slash_pos + 1..]
+    } else {
+        &split_uri
+    };
+    let split_path = PathBuf::from(split_filename);
 
-    debug_println!("✅ PREWARM_FIELDNORMS: Completed - warmed {} fieldnorm readers", warmed_count);
+    // Cache all .fieldnorm files
+    let (success_count, failure_count) = cache_files_by_extension(
+        "fieldnorm",
+        storage,
+        split_path,
+        &bundle_offsets,
+        byte_range_cache,
+    ).await;
+
+    debug_println!("✅ PREWARM_FIELDNORMS: Completed - {} success, {} failures",
+                   success_count, failure_count);
+
+    // Fieldnorms are optional, so don't fail if none found
     Ok(())
 }
 
 /// Async implementation of fast fields prewarming
 ///
-/// This warms up fast field data for sorting, filtering, and aggregations.
-/// For each segment, we warm up the fast field readers.
+/// This uses full-file caching to ensure 100% cache hit coverage:
+/// 1. Read entire .fast files into cache
+/// 2. Cache with inner path and inner range (0..file_length)
+/// 3. ByteRangeCache.get_slice() will find cached data for any sub-range query
+///
+/// This replaces the previous approach that accessed fast field readers,
+/// which only fetched specific byte ranges and left gaps in cache coverage.
 pub async fn prewarm_fastfields_impl(searcher_ptr: jlong) -> anyhow::Result<()> {
-    debug_println!("🔥 PREWARM_FASTFIELDS: Starting fast fields warmup");
+    debug_println!("🔥 PREWARM_FASTFIELDS: Starting fast fields warmup (full-file caching)");
 
-    let (searcher, schema) = with_arc_safe(searcher_ptr, |ctx: &Arc<CachedSearcherContext>| {
-        (ctx.cached_searcher.clone(), ctx.cached_index.schema())
+    // Get storage, bundle file offsets, split_uri, and byte_range_cache from the context
+    let (storage, bundle_offsets, split_uri, byte_range_cache) = with_arc_safe(searcher_ptr, |ctx: &Arc<CachedSearcherContext>| {
+        (
+            ctx.cached_storage.clone(),
+            ctx.bundle_file_offsets.clone(),
+            ctx.split_uri.clone(),
+            ctx.byte_range_cache.clone(),
+        )
     }).ok_or_else(|| anyhow::anyhow!("Failed to access searcher context"))?;
 
-    // Find all fast fields with their names
-    let fast_fields: Vec<(tantivy::schema::Field, String)> = schema.fields()
-        .filter_map(|(field, field_entry)| {
-            if field_entry.is_fast() {
-                debug_println!("🔥 PREWARM_FASTFIELDS: Found fast field: {}", field_entry.name());
-                Some((field, field_entry.name().to_string()))
-            } else {
-                None
-            }
-        })
-        .collect();
+    let byte_range_cache = byte_range_cache
+        .ok_or_else(|| anyhow::anyhow!("ByteRangeCache not available in context"))?;
 
-    if fast_fields.is_empty() {
-        debug_println!("🔥 PREWARM_FASTFIELDS: No fast fields found");
-        return Ok(());
+    // Extract split filename from split_uri
+    let split_filename = if let Some(last_slash_pos) = split_uri.rfind('/') {
+        &split_uri[last_slash_pos + 1..]
+    } else {
+        &split_uri
+    };
+    let split_path = PathBuf::from(split_filename);
+
+    // Cache all .fast files
+    let (success_count, failure_count) = cache_files_by_extension(
+        "fast",
+        storage,
+        split_path,
+        &bundle_offsets,
+        byte_range_cache,
+    ).await;
+
+    debug_println!("✅ PREWARM_FASTFIELDS: Completed - {} success, {} failures",
+                   success_count, failure_count);
+
+    if success_count > 0 || failure_count == 0 {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!("All fast field warmup operations failed"))
     }
-
-    debug_println!("🔥 PREWARM_FASTFIELDS: Warming up {} fast fields", fast_fields.len());
-
-    let mut warm_up_futures = Vec::new();
-
-    for segment_reader in searcher.segment_readers() {
-        let fast_field_reader = segment_reader.fast_fields().clone();
-        for (field, field_name) in &fast_fields {
-            let field_entry = schema.get_field_entry(*field);
-            let fast_field_reader = fast_field_reader.clone();
-            let field_name = field_name.clone();
-
-            warm_up_futures.push(async move {
-                // Warm up based on field type - methods expect field name as &str
-                match field_entry.field_type() {
-                    FieldType::U64(_) => {
-                        let _ = fast_field_reader.u64(&field_name);
-                    },
-                    FieldType::I64(_) => {
-                        let _ = fast_field_reader.i64(&field_name);
-                    },
-                    FieldType::F64(_) => {
-                        let _ = fast_field_reader.f64(&field_name);
-                    },
-                    FieldType::Bool(_) => {
-                        let _ = fast_field_reader.bool(&field_name);
-                    },
-                    FieldType::Date(_) => {
-                        let _ = fast_field_reader.date(&field_name);
-                    },
-                    FieldType::Bytes(_) => {
-                        let _ = fast_field_reader.bytes(&field_name);
-                    },
-                    _ => {
-                        // Text fast fields require column access
-                        // This is more complex, skip for now
-                    }
-                }
-                Ok::<(), anyhow::Error>(())
-            });
-        }
-    }
-
-    debug_println!("🔥 PREWARM_FASTFIELDS: Executing {} warmup operations", warm_up_futures.len());
-
-    let results = futures::future::join_all(warm_up_futures).await;
-    let success_count = results.iter().filter(|r| r.is_ok()).count();
-    let failure_count = results.len() - success_count;
-
-    debug_println!("✅ PREWARM_FASTFIELDS: Completed - {} success, {} failures", success_count, failure_count);
-
-    Ok(())
 }
 
 // =============================================================================
@@ -624,11 +633,15 @@ pub async fn prewarm_fastfields_for_fields(
 /// This reads the entire .store file for each segment into the disk cache,
 /// which eliminates cache misses when retrieving documents.
 ///
-/// IMPORTANT: The cached_storage is the RAW storage (S3, file, etc.), not BundleStorage.
-/// We must:
-/// 1. Read from the split file at the bundle byte range
-/// 2. Cache using the inner file path and inner byte range (0..file_length)
-/// This matches how CachingDirectory looks up cache entries.
+/// IMPORTANT: Cache key matching for ByteRangeCache
+///
+/// When Tantivy reads from a .store file (e.g., uuid.store at range 1000..4494):
+/// 1. CachingDirectory.get_file_handle("uuid.store") creates a CachingFileHandle with path="uuid.store"
+/// 2. CachingFileHandle.read_bytes(1000..4494) checks ByteRangeCache with key ("uuid.store", 1000..4494)
+/// 3. If cache miss → calls underlying BundleDirectory → BundleStorage translates to split file read
+///
+/// So we must cache using the INNER file path (uuid.store) and INNER byte range (0..file_length).
+/// The ByteRangeCache.get_slice() will find our cached full-file range and serve sub-ranges from it.
 pub async fn prewarm_store_impl(searcher_ptr: jlong) -> anyhow::Result<()> {
     debug_println!("🔥 PREWARM_STORE: Starting document store warmup");
 
@@ -694,13 +707,16 @@ pub async fn prewarm_store_impl(searcher_ptr: jlong) -> anyhow::Result<()> {
             // Read from the split file at the bundle byte range
             match storage.get_slice(&split_path, bundle_start..bundle_end).await {
                 Ok(bytes) => {
-                    // Cache using inner file path and inner byte range (0..file_length)
-                    // This matches how CachingDirectory looks up cache entries
+                    // IMPORTANT: Cache using INNER path and INNER byte range (0..file_length)!
+                    // This matches how CachingDirectory lookups work:
+                    // - CachingFileHandle stores path="uuid.store" (the inner path)
+                    // - CachingFileHandle.read_bytes(R) checks cache with key (inner_path, R)
+                    // - ByteRangeCache.get_slice() finds our full-file cache and serves sub-ranges
                     let inner_range = 0..file_length;
                     byte_range_cache.put_slice(inner_path.clone(), inner_range.clone(), bytes.clone());
 
-                    debug_println!("✅ PREWARM_STORE: Cached '{}' ({} bytes) with inner range 0..{}",
-                                   inner_path.display(), bytes.len(), file_length);
+                    debug_println!("✅ PREWARM_STORE: Cached inner path '{}' with inner range 0..{} ({} bytes)",
+                                   inner_path.display(), file_length, bytes.len());
                     Ok(())
                 },
                 Err(e) => {
