@@ -340,6 +340,284 @@ pub async fn prewarm_fastfields_impl(searcher_ptr: jlong) -> anyhow::Result<()> 
     Ok(())
 }
 
+// =============================================================================
+// FIELD-SPECIFIC PREWARM FUNCTIONS
+// =============================================================================
+
+/// Field-specific term dictionary prewarming
+///
+/// Only preloads term dictionaries for the specified fields, reducing cache usage
+/// and prewarm time for schemas with many fields.
+pub async fn prewarm_term_dictionaries_for_fields(
+    searcher_ptr: jlong,
+    field_names: &HashSet<String>,
+) -> anyhow::Result<()> {
+    debug_println!("🔥 PREWARM_FIELDS: Starting term dictionary warmup for fields: {:?}", field_names);
+
+    let (searcher, schema) = with_arc_safe(searcher_ptr, |ctx: &Arc<CachedSearcherContext>| {
+        (ctx.cached_searcher.clone(), ctx.cached_index.schema())
+    }).ok_or_else(|| anyhow::anyhow!("Failed to access searcher context"))?;
+
+    // Find indexed text fields that match the filter
+    let indexed_fields: HashSet<tantivy::schema::Field> = schema.fields()
+        .filter_map(|(field, field_entry)| {
+            // Check if this field is in our filter
+            if !field_names.contains(field_entry.name()) {
+                return None;
+            }
+
+            match field_entry.field_type() {
+                FieldType::Str(text_options) => {
+                    if text_options.get_indexing_options().is_some() {
+                        debug_println!("🔥 PREWARM_FIELDS: Found matching indexed text field: {}", field_entry.name());
+                        Some(field)
+                    } else {
+                        debug_println!("⚠️ PREWARM_FIELDS: Field '{}' is not indexed", field_entry.name());
+                        None
+                    }
+                },
+                FieldType::JsonObject(json_options) => {
+                    if json_options.get_text_indexing_options().is_some() {
+                        debug_println!("🔥 PREWARM_FIELDS: Found matching indexed JSON field: {}", field_entry.name());
+                        Some(field)
+                    } else {
+                        debug_println!("⚠️ PREWARM_FIELDS: JSON field '{}' has no text indexing", field_entry.name());
+                        None
+                    }
+                },
+                _ => {
+                    debug_println!("⚠️ PREWARM_FIELDS: Field '{}' is not a text/JSON field", field_entry.name());
+                    None
+                }
+            }
+        })
+        .collect();
+
+    if indexed_fields.is_empty() {
+        debug_println!("⚠️ PREWARM_FIELDS: No matching indexed fields found for: {:?}", field_names);
+        return Ok(());
+    }
+
+    debug_println!("🔥 PREWARM_FIELDS: Warming term dictionaries for {} fields across {} segments",
+                   indexed_fields.len(), searcher.segment_readers().len());
+
+    let mut warm_up_futures = Vec::new();
+
+    for field in &indexed_fields {
+        for segment_reader in searcher.segment_readers() {
+            match segment_reader.inverted_index(*field) {
+                Ok(inverted_index) => {
+                    let inverted_index = inverted_index.clone();
+                    warm_up_futures.push(async move {
+                        let dict = inverted_index.terms();
+                        dict.warm_up_dictionary().await
+                    });
+                },
+                Err(e) => {
+                    debug_println!("⚠️ PREWARM_FIELDS: Failed to get inverted index: {}", e);
+                }
+            }
+        }
+    }
+
+    debug_println!("🔥 PREWARM_FIELDS: Executing {} warmup operations", warm_up_futures.len());
+
+    let results = futures::future::join_all(warm_up_futures).await;
+    let success_count = results.iter().filter(|r| r.is_ok()).count();
+    let failure_count = results.len() - success_count;
+
+    debug_println!("✅ PREWARM_FIELDS: Term dictionary warmup complete - {} success, {} failures",
+                   success_count, failure_count);
+
+    if success_count > 0 || failure_count == 0 {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!("All field-specific warmup operations failed"))
+    }
+}
+
+/// Field-specific postings prewarming
+pub async fn prewarm_postings_for_fields(
+    searcher_ptr: jlong,
+    field_names: &HashSet<String>,
+) -> anyhow::Result<()> {
+    debug_println!("🔥 PREWARM_FIELDS: Starting postings warmup for fields: {:?}", field_names);
+
+    let (searcher, schema) = with_arc_safe(searcher_ptr, |ctx: &Arc<CachedSearcherContext>| {
+        (ctx.cached_searcher.clone(), ctx.cached_index.schema())
+    }).ok_or_else(|| anyhow::anyhow!("Failed to access searcher context"))?;
+
+    let indexed_fields: HashSet<tantivy::schema::Field> = schema.fields()
+        .filter_map(|(field, field_entry)| {
+            if !field_names.contains(field_entry.name()) {
+                return None;
+            }
+
+            match field_entry.field_type() {
+                FieldType::Str(text_options) => {
+                    if text_options.get_indexing_options().is_some() {
+                        Some(field)
+                    } else {
+                        None
+                    }
+                },
+                FieldType::JsonObject(json_options) => {
+                    if json_options.get_text_indexing_options().is_some() {
+                        Some(field)
+                    } else {
+                        None
+                    }
+                },
+                _ => None,
+            }
+        })
+        .collect();
+
+    if indexed_fields.is_empty() {
+        debug_println!("⚠️ PREWARM_FIELDS: No matching indexed fields found for postings");
+        return Ok(());
+    }
+
+    debug_println!("🔥 PREWARM_FIELDS: Warming postings for {} fields", indexed_fields.len());
+
+    let mut warm_up_futures = Vec::new();
+    for field in &indexed_fields {
+        for segment_reader in searcher.segment_readers() {
+            match segment_reader.inverted_index(*field) {
+                Ok(inverted_index) => {
+                    let inverted_index = inverted_index.clone();
+                    warm_up_futures.push(async move {
+                        inverted_index.warm_postings_full(false).await
+                    });
+                },
+                Err(e) => {
+                    debug_println!("⚠️ PREWARM_FIELDS: Failed to get inverted index: {}", e);
+                }
+            }
+        }
+    }
+
+    let results = futures::future::join_all(warm_up_futures).await;
+    let success_count = results.iter().filter(|r| r.is_ok()).count();
+    let failure_count = results.len() - success_count;
+
+    debug_println!("✅ PREWARM_FIELDS: Postings warmup complete - {} success, {} failures",
+                   success_count, failure_count);
+
+    if success_count > 0 || failure_count == 0 {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!("All field-specific postings warmup operations failed"))
+    }
+}
+
+/// Field-specific fieldnorms prewarming
+pub async fn prewarm_fieldnorms_for_fields(
+    searcher_ptr: jlong,
+    field_names: &HashSet<String>,
+) -> anyhow::Result<()> {
+    debug_println!("🔥 PREWARM_FIELDS: Starting fieldnorms warmup for fields: {:?}", field_names);
+
+    let searcher = with_arc_safe(searcher_ptr, |ctx: &Arc<CachedSearcherContext>| {
+        ctx.cached_searcher.clone()
+    }).ok_or_else(|| anyhow::anyhow!("Failed to access searcher context"))?;
+
+    let schema = searcher.schema();
+    let mut warmed_count = 0;
+
+    for (field, field_entry) in schema.fields() {
+        // Only process fields in our filter
+        if !field_names.contains(field_entry.name()) {
+            continue;
+        }
+
+        // Only text fields have field norms
+        if matches!(field_entry.field_type(), FieldType::Str(_)) {
+            for segment_reader in searcher.segment_readers() {
+                if let Ok(Some(_fieldnorm_reader)) = segment_reader.fieldnorms_readers().get_field(field) {
+                    debug_println!("🔥 PREWARM_FIELDS: Warmed fieldnorms for field '{}'", field_entry.name());
+                    warmed_count += 1;
+                }
+            }
+        } else {
+            debug_println!("⚠️ PREWARM_FIELDS: Field '{}' is not a text field (no fieldnorms)", field_entry.name());
+        }
+    }
+
+    debug_println!("✅ PREWARM_FIELDS: Fieldnorms warmup complete - warmed {} readers", warmed_count);
+    Ok(())
+}
+
+/// Field-specific fast fields prewarming
+pub async fn prewarm_fastfields_for_fields(
+    searcher_ptr: jlong,
+    field_names: &HashSet<String>,
+) -> anyhow::Result<()> {
+    debug_println!("🔥 PREWARM_FIELDS: Starting fast fields warmup for fields: {:?}", field_names);
+
+    let (searcher, schema) = with_arc_safe(searcher_ptr, |ctx: &Arc<CachedSearcherContext>| {
+        (ctx.cached_searcher.clone(), ctx.cached_index.schema())
+    }).ok_or_else(|| anyhow::anyhow!("Failed to access searcher context"))?;
+
+    // Find fast fields that match the filter
+    let fast_fields: Vec<(tantivy::schema::Field, String)> = schema.fields()
+        .filter_map(|(field, field_entry)| {
+            if !field_names.contains(field_entry.name()) {
+                return None;
+            }
+
+            if field_entry.is_fast() {
+                debug_println!("🔥 PREWARM_FIELDS: Found matching fast field: {}", field_entry.name());
+                Some((field, field_entry.name().to_string()))
+            } else {
+                debug_println!("⚠️ PREWARM_FIELDS: Field '{}' is not a fast field", field_entry.name());
+                None
+            }
+        })
+        .collect();
+
+    if fast_fields.is_empty() {
+        debug_println!("⚠️ PREWARM_FIELDS: No matching fast fields found");
+        return Ok(());
+    }
+
+    debug_println!("🔥 PREWARM_FIELDS: Warming {} fast fields", fast_fields.len());
+
+    let mut warm_up_futures = Vec::new();
+
+    for segment_reader in searcher.segment_readers() {
+        let fast_field_reader = segment_reader.fast_fields().clone();
+        for (field, field_name) in &fast_fields {
+            let field_entry = schema.get_field_entry(*field);
+            let fast_field_reader = fast_field_reader.clone();
+            let field_name = field_name.clone();
+
+            warm_up_futures.push(async move {
+                match field_entry.field_type() {
+                    FieldType::U64(_) => { let _ = fast_field_reader.u64(&field_name); },
+                    FieldType::I64(_) => { let _ = fast_field_reader.i64(&field_name); },
+                    FieldType::F64(_) => { let _ = fast_field_reader.f64(&field_name); },
+                    FieldType::Bool(_) => { let _ = fast_field_reader.bool(&field_name); },
+                    FieldType::Date(_) => { let _ = fast_field_reader.date(&field_name); },
+                    FieldType::Bytes(_) => { let _ = fast_field_reader.bytes(&field_name); },
+                    _ => {}
+                }
+                Ok::<(), anyhow::Error>(())
+            });
+        }
+    }
+
+    let results = futures::future::join_all(warm_up_futures).await;
+    let success_count = results.iter().filter(|r| r.is_ok()).count();
+
+    debug_println!("✅ PREWARM_FIELDS: Fast fields warmup complete - {} operations", success_count);
+    Ok(())
+}
+
+// =============================================================================
+// ALL-FIELDS PREWARM FUNCTIONS (original implementations)
+// =============================================================================
+
 /// Async implementation of store (document storage) prewarming
 ///
 /// This reads the entire .store file for each segment into cache,
