@@ -1158,10 +1158,6 @@ System.out.println("Cache misses: " + stats.getMisses());
 System.out.println("Evictions: " + stats.getEvictions());
 System.out.println("Size: " + stats.getSizeBytes() + " bytes");
 
-// Preload components for faster queries
-List<String> components = List.of("postings", "fast_fields", "fieldnorms");
-searcher.preloadComponents(components);
-
 // Check what's cached
 Map<String, Boolean> status = searcher.getComponentCacheStatus();
 status.forEach((component, cached) ->
@@ -1170,6 +1166,85 @@ status.forEach((component, cached) ->
 // Evict components to free memory
 searcher.evictComponents(List.of("postings"));
 ```
+
+### Component Prewarming
+
+Prewarming loads index components into the cache before queries execute, eliminating cache misses and reducing latency:
+
+```java
+try (SplitSearcher searcher = cacheManager.createSplitSearcher(splitUrl, metadata)) {
+    // Prewarm all search-critical components
+    searcher.preloadComponents(
+        SplitSearcher.IndexComponent.TERM,      // Term dictionaries (FST)
+        SplitSearcher.IndexComponent.POSTINGS,  // Posting lists
+        SplitSearcher.IndexComponent.FIELDNORM, // Field norms for scoring
+        SplitSearcher.IndexComponent.FASTFIELD, // Fast fields for sorting/filtering
+        SplitSearcher.IndexComponent.STORE      // Document storage for retrieval
+    ).join();
+
+    // Now all queries have zero cache misses for prewarmed components
+    SearchResult result = searcher.search(query, 10);
+}
+```
+
+**Available Components:**
+
+| Component | Description | When to Prewarm |
+|-----------|-------------|-----------------|
+| `TERM` | Term dictionaries (FST) | Diverse term queries, autocomplete, aggregations |
+| `POSTINGS` | Term posting lists | High-volume term queries |
+| `FIELDNORM` | Field norm data for scoring | Relevance scoring optimization |
+| `FASTFIELD` | Fast field data for sorting/filtering | Range queries, sorting, faceting |
+| `STORE` | Document storage (stored field data) | Document retrieval heavy workloads |
+
+**Recommended Prewarm Strategies:**
+
+```java
+// Search workloads (without document retrieval)
+searcher.preloadComponents(
+    SplitSearcher.IndexComponent.TERM,
+    SplitSearcher.IndexComponent.POSTINGS,
+    SplitSearcher.IndexComponent.FIELDNORM,
+    SplitSearcher.IndexComponent.FASTFIELD
+).join();
+
+// Complete prewarm (including document retrieval)
+searcher.preloadComponents(
+    SplitSearcher.IndexComponent.TERM,
+    SplitSearcher.IndexComponent.POSTINGS,
+    SplitSearcher.IndexComponent.FIELDNORM,
+    SplitSearcher.IndexComponent.FASTFIELD,
+    SplitSearcher.IndexComponent.STORE
+).join();
+
+// Async prewarm while doing other initialization
+CompletableFuture<Void> prewarmFuture = searcher.preloadComponents(
+    SplitSearcher.IndexComponent.TERM
+);
+initializeOtherComponents();  // Do other work
+prewarmFuture.join();         // Wait for prewarm
+```
+
+**Validating Prewarm Effectiveness:**
+
+```java
+// Before prewarm
+var statsBeforePrewarm = searcher.getCacheStats();
+long missesBeforePrewarm = statsBeforePrewarm.getMissCount();
+
+// Prewarm
+searcher.preloadComponents(SplitSearcher.IndexComponent.TERM).join();
+
+// Query
+searcher.search(query, 10);
+
+// Verify zero new cache misses
+var statsAfterQuery = searcher.getCacheStats();
+long newMisses = statsAfterQuery.getMissCount() - missesBeforePrewarm;
+assert newMisses == 0 : "Prewarm should eliminate cache misses";
+```
+
+For detailed documentation, see [Term Prewarm Developer Guide](docs/TERM_PREWARM_DEVELOPER_GUIDE.md).
 
 ### SearcherCache Monitoring
 

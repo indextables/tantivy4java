@@ -23,10 +23,11 @@ public class WarmupAPITest {
         assertNotNull(SplitSearcher.IndexComponent.POSTINGS);
         assertNotNull(SplitSearcher.IndexComponent.POSITIONS);
         assertNotNull(SplitSearcher.IndexComponent.FIELDNORM);
-        
+        assertNotNull(SplitSearcher.IndexComponent.TERM);
+
         // Verify IndexComponent enum values
         SplitSearcher.IndexComponent[] components = SplitSearcher.IndexComponent.values();
-        assertEquals(6, components.length, "Should have 6 index components");
+        assertEquals(7, components.length, "Should have 7 index components");
     }
 
     @Test
