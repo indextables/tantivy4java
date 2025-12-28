@@ -75,12 +75,12 @@ SplitCacheManager.CacheConfig cacheConfig = new SplitCacheManager.CacheConfig("p
 **📝 TODO: Feature Enhancements:**
 - **Auto-lowercase term queries for "default" tokenizer** - Currently users must manually lowercase search terms when querying fields using the "default" tokenizer (which lowercases during indexing). Future enhancement: automatically lowercase SplitTermQuery and Query.termQuery() values when the target field uses "default" tokenizer, to match Tantivy's behavior and improve developer experience.
 
-**⚠️ SplitSearcher Aggregation Implementation Status:**
+**✅ SplitSearcher Aggregation Implementation Status:**
 - **✅ TermsAggregation** - Fully implemented and working
-- **❌ DateHistogramAggregation** - Not implemented in native layer. Aggregation JSON is generated correctly but returns empty results.
-- **❌ HistogramAggregation** - Not implemented in native layer. Causes native panic when executed.
+- **✅ HistogramAggregation** - Fully implemented with arbitrary bucket sizes, extended_bounds, hard_bounds, keyed, and sub-aggregation support
+- **✅ DateHistogramAggregation** - Fully implemented with fixed_interval (ms, s, m, h, d), offset, hard_bounds, min_doc_count, keyed, and sub-aggregation support
 - **❌ RangeAggregation** - Not implemented in native layer. Returns empty aggregation map.
-- **Note**: All aggregation types work correctly with the standard Searcher API, but SplitSearcher (for Quickwit split files) only supports TermsAggregation currently.
+- **Note**: Terms, Histogram, and DateHistogram aggregations work correctly with SplitSearcher for Quickwit split files.
 
 **📊 Test Coverage Analysis:**
 - **Core Functionality**: 100% passing (20+ critical tests)

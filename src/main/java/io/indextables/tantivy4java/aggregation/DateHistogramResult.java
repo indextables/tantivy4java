@@ -1,6 +1,8 @@
 package io.indextables.tantivy4java.aggregation;
 
+import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 
 /**
  * Result of a date histogram aggregation containing time-based buckets.
@@ -50,11 +52,32 @@ public class DateHistogramResult implements AggregationResult {
         private final double key;
         private final String keyAsString;
         private final long docCount;
+        private final Map<String, AggregationResult> subAggregations;
 
+        /**
+         * Creates a date histogram bucket without sub-aggregations.
+         */
         public DateHistogramBucket(double key, String keyAsString, long docCount) {
             this.key = key;
             this.keyAsString = keyAsString;
             this.docCount = docCount;
+            this.subAggregations = Collections.emptyMap();
+        }
+
+        /**
+         * Creates a date histogram bucket with sub-aggregations.
+         *
+         * @param key The bucket key (milliseconds since epoch)
+         * @param keyAsString The formatted timestamp string (RFC3339)
+         * @param docCount The document count in this bucket
+         * @param subAggregations Map of sub-aggregation results
+         */
+        public DateHistogramBucket(double key, String keyAsString, long docCount,
+                                   Map<String, AggregationResult> subAggregations) {
+            this.key = key;
+            this.keyAsString = keyAsString;
+            this.docCount = docCount;
+            this.subAggregations = subAggregations != null ? subAggregations : Collections.emptyMap();
         }
 
         /**
@@ -65,7 +88,7 @@ public class DateHistogramResult implements AggregationResult {
         }
 
         /**
-         * Gets the formatted timestamp key as a string.
+         * Gets the formatted timestamp key as a string (RFC3339 format).
          */
         public String getKeyAsString() {
             return keyAsString;
@@ -78,10 +101,33 @@ public class DateHistogramResult implements AggregationResult {
             return docCount;
         }
 
+        /**
+         * Gets the sub-aggregations for this bucket.
+         */
+        public Map<String, AggregationResult> getSubAggregations() {
+            return subAggregations;
+        }
+
+        /**
+         * Gets a specific sub-aggregation by name.
+         *
+         * @param name The sub-aggregation name
+         * @param type The expected result type
+         * @return The sub-aggregation result, or null if not found
+         */
+        @SuppressWarnings("unchecked")
+        public <T extends AggregationResult> T getSubAggregation(String name, Class<T> type) {
+            AggregationResult result = subAggregations.get(name);
+            if (result != null && type.isInstance(result)) {
+                return (T) result;
+            }
+            return null;
+        }
+
         @Override
         public String toString() {
-            return String.format("DateHistogramBucket{key=%.0f, keyAsString='%s', docCount=%d}",
-                               key, keyAsString, docCount);
+            return String.format("DateHistogramBucket{key=%.0f, keyAsString='%s', docCount=%d, subAggs=%d}",
+                               key, keyAsString, docCount, subAggregations.size());
         }
     }
 }
