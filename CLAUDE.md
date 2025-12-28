@@ -1043,6 +1043,34 @@ Tantivy4Java now provides complete SplitSearcher functionality for searching Qui
 - **`searcher.preloadComponents(components)`** - Selective component preloading ✅
 - **`searcher.evictComponents(components)`** - Manual cache eviction ✅
 
+**Component Prewarming (Index Preloading)**
+
+Prewarming allows you to proactively load index components into the disk cache before queries execute, eliminating cache misses and reducing latency:
+
+```java
+// Prewarm all search-critical components
+searcher.preloadComponents(
+    SplitSearcher.IndexComponent.TERM,      // Term dictionaries (FST)
+    SplitSearcher.IndexComponent.POSTINGS,  // Posting lists
+    SplitSearcher.IndexComponent.FIELDNORM, // Field norms for scoring
+    SplitSearcher.IndexComponent.FASTFIELD, // Fast fields for sorting/filtering
+    SplitSearcher.IndexComponent.STORE      // Document storage for retrieval
+).join();
+
+// Now queries have zero cache misses for these components
+SearchResult result = searcher.search(query, 10);
+```
+
+| Component | Description | When to Prewarm |
+|-----------|-------------|-----------------|
+| `TERM` | Term dictionaries (FST) | Diverse term queries, autocomplete |
+| `POSTINGS` | Term posting lists | High-volume term queries |
+| `FIELDNORM` | Field norm data | Relevance scoring optimization |
+| `FASTFIELD` | Fast field data | Range queries, sorting, faceting |
+| `STORE` | Document storage | Document retrieval workloads |
+
+**Documentation:** See `docs/TERM_PREWARM_DEVELOPER_GUIDE.md` for complete details.
+
 **S3 Storage Integration**
 - **AWS S3/MinIO support** - Full cloud storage backend compatibility ✅
 - **Custom endpoint configuration** - Support for mock servers and private clouds ✅

@@ -50,7 +50,10 @@ public class SplitSearcher implements AutoCloseable {
     
     
     /**
-     * Index components that can be preloaded for optimal performance
+     * Index components that can be preloaded for optimal performance.
+     *
+     * Preloading components before search can significantly improve latency by
+     * fetching data in larger chunks rather than on-demand byte-range requests.
      */
     public enum IndexComponent {
         SCHEMA,      // Schema and field metadata
@@ -58,7 +61,8 @@ public class SplitSearcher implements AutoCloseable {
         FASTFIELD,   // Fast field data for sorting/filtering
         POSTINGS,    // Term postings lists
         POSITIONS,   // Term positions for phrase queries
-        FIELDNORM    // Field norm data for scoring
+        FIELDNORM,   // Field norm data for scoring
+        TERM         // Term dictionaries (FST) - preloads entire FST for all indexed fields
     }
     
     /**

@@ -2579,17 +2579,170 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_getS
     }
 }
 
+/// Preload index components into cache for improved search performance.
+///
+/// This implements Quickwit's warm_up_term_dict_fields() pattern for the TERM component,
+/// which preloads entire term dictionaries (FSTs) into the disk cache. Once cached,
+/// sub-range requests for different terms are served from the cached data via get_coalesced().
+///
+/// Components supported:
+/// - TERM: Preloads term dictionaries for all indexed text fields
+/// - (Other components currently no-op, can be extended in future)
 #[no_mangle]
 pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_preloadComponentsNative(
-    mut _env: JNIEnv,
+    mut env: JNIEnv,
     _class: JClass,
-    _searcher_ptr: jlong,
-    _components: jobject,
+    searcher_ptr: jlong,
+    components: jobject,
 ) -> jboolean {
-    // For now, just return success (1) to allow warmup to complete
-    debug_println!("RUST DEBUG: preloadComponentsNative called - returning success");
-    1 // true
+    debug_println!("🔥 PREWARM: preloadComponentsNative called with pointer: {}", searcher_ptr);
+
+    if searcher_ptr == 0 {
+        debug_println!("❌ PREWARM: Invalid searcher pointer (0)");
+        return 0;
+    }
+
+    // Parse the IndexComponent array from Java to determine what to prewarm
+    let components_set = match parse_index_components(&mut env, components) {
+        Ok(set) => set,
+        Err(e) => {
+            debug_println!("❌ PREWARM: Failed to parse components: {}", e);
+            return 0;
+        }
+    };
+
+    debug_println!("🔥 PREWARM: Requested components: {:?}", components_set);
+
+    // Check which components are requested
+    let prewarm_term = components_set.contains("TERM");
+    let prewarm_postings = components_set.contains("POSTINGS");
+    let prewarm_fieldnorm = components_set.contains("FIELDNORM");
+    let prewarm_fastfield = components_set.contains("FASTFIELD");
+    let prewarm_store = components_set.contains("STORE");
+
+    if !prewarm_term && !prewarm_postings && !prewarm_fieldnorm && !prewarm_fastfield && !prewarm_store {
+        debug_println!("🔥 PREWARM: No supported components requested, returning success");
+        return 1; // Success - nothing to do
+    }
+
+    // Perform the warmup using async runtime
+    match block_on_operation(async move {
+        let mut errors = Vec::new();
+
+        // Prewarm TERM component (FST/term dictionaries)
+        if prewarm_term {
+            debug_println!("🔥 PREWARM: Warming up TERM component (FST)...");
+            if let Err(e) = crate::prewarm::prewarm_term_dictionaries_impl(searcher_ptr).await {
+                debug_println!("⚠️ PREWARM: TERM warmup failed: {}", e);
+                errors.push(format!("TERM: {}", e));
+            } else {
+                debug_println!("✅ PREWARM: TERM warmup completed");
+            }
+        }
+
+        // Prewarm POSTINGS component
+        if prewarm_postings {
+            debug_println!("🔥 PREWARM: Warming up POSTINGS component...");
+            if let Err(e) = crate::prewarm::prewarm_postings_impl(searcher_ptr).await {
+                debug_println!("⚠️ PREWARM: POSTINGS warmup failed: {}", e);
+                errors.push(format!("POSTINGS: {}", e));
+            } else {
+                debug_println!("✅ PREWARM: POSTINGS warmup completed");
+            }
+        }
+
+        // Prewarm FIELDNORM component
+        if prewarm_fieldnorm {
+            debug_println!("🔥 PREWARM: Warming up FIELDNORM component...");
+            if let Err(e) = crate::prewarm::prewarm_fieldnorms_impl(searcher_ptr).await {
+                debug_println!("⚠️ PREWARM: FIELDNORM warmup failed: {}", e);
+                errors.push(format!("FIELDNORM: {}", e));
+            } else {
+                debug_println!("✅ PREWARM: FIELDNORM warmup completed");
+            }
+        }
+
+        // Prewarm FASTFIELD component
+        if prewarm_fastfield {
+            debug_println!("🔥 PREWARM: Warming up FASTFIELD component...");
+            if let Err(e) = crate::prewarm::prewarm_fastfields_impl(searcher_ptr).await {
+                debug_println!("⚠️ PREWARM: FASTFIELD warmup failed: {}", e);
+                errors.push(format!("FASTFIELD: {}", e));
+            } else {
+                debug_println!("✅ PREWARM: FASTFIELD warmup completed");
+            }
+        }
+
+        // Prewarm STORE component (document storage)
+        if prewarm_store {
+            debug_println!("🔥 PREWARM: Warming up STORE component (document storage)...");
+            if let Err(e) = crate::prewarm::prewarm_store_impl(searcher_ptr).await {
+                debug_println!("⚠️ PREWARM: STORE warmup failed: {}", e);
+                errors.push(format!("STORE: {}", e));
+            } else {
+                debug_println!("✅ PREWARM: STORE warmup completed");
+            }
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!("Some warmups failed: {}", errors.join(", ")))
+        }
+    }) {
+        Ok(_) => {
+            debug_println!("✅ PREWARM: All requested components warmed up successfully");
+            1 // success
+        },
+        Err(e) => {
+            debug_println!("❌ PREWARM: Component warmup failed: {}", e);
+            0 // failure
+        }
+    }
 }
+
+/// Parse the Java IndexComponent[] array into a HashSet of component names
+fn parse_index_components(env: &mut JNIEnv, components: jobject) -> anyhow::Result<std::collections::HashSet<String>> {
+    use jni::objects::JObjectArray;
+
+    let mut result = std::collections::HashSet::new();
+
+    if components.is_null() {
+        return Ok(result);
+    }
+
+    let array = unsafe { JObjectArray::from_raw(components) };
+    let length = env.get_array_length(&array)
+        .map_err(|e| anyhow::anyhow!("Failed to get array length: {}", e))?;
+
+    for i in 0..length {
+        let element = env.get_object_array_element(&array, i)
+            .map_err(|e| anyhow::anyhow!("Failed to get array element {}: {}", i, e))?;
+
+        if element.is_null() {
+            continue;
+        }
+
+        // Get the enum name using Enum.name() method
+        let name_obj = env.call_method(&element, "name", "()Ljava/lang/String;", &[])
+            .map_err(|e| anyhow::anyhow!("Failed to call name() on enum: {}", e))?
+            .l()
+            .map_err(|e| anyhow::anyhow!("Failed to get string from name(): {}", e))?;
+
+        let name_jstring = JString::from(name_obj);
+        let name: String = env.get_string(&name_jstring)
+            .map_err(|e| anyhow::anyhow!("Failed to convert JString: {}", e))?
+            .into();
+
+        debug_println!("🔥 PREWARM: Parsed component: {}", name);
+        result.insert(name);
+    }
+
+    Ok(result)
+}
+
+// Prewarm implementations moved to crate::prewarm module
+
 /// Replacement for Java_io_indextables_tantivy4java_split_SplitSearcher_getComponentCacheStatusNative
 /// Simple implementation that returns an empty HashMap
 #[no_mangle]
@@ -3994,21 +4147,21 @@ async fn perform_real_quickwit_search_with_aggregations(
 
 /// Clean searcher context struct to replace complex tuple approach
 /// Uses Arc wrappers for non-Clone types to enable struct-based management
-struct CachedSearcherContext {
-    standalone_searcher: std::sync::Arc<StandaloneSearcher>,
+pub(crate) struct CachedSearcherContext {
+    pub(crate) standalone_searcher: std::sync::Arc<StandaloneSearcher>,
     // ✅ CRITICAL FIX: Removed runtime field - using shared global runtime instead
-    split_uri: String,
-    aws_config: std::collections::HashMap<String, String>,
-    footer_start: u64,
-    footer_end: u64,
-    doc_mapping_json: Option<String>,
-    cached_storage: std::sync::Arc<dyn Storage>,
-    cached_index: std::sync::Arc<tantivy::Index>,
-    cached_searcher: std::sync::Arc<tantivy::Searcher>,
+    pub(crate) split_uri: String,
+    pub(crate) aws_config: std::collections::HashMap<String, String>,
+    pub(crate) footer_start: u64,
+    pub(crate) footer_end: u64,
+    pub(crate) doc_mapping_json: Option<String>,
+    pub(crate) cached_storage: std::sync::Arc<dyn Storage>,
+    pub(crate) cached_index: std::sync::Arc<tantivy::Index>,
+    pub(crate) cached_searcher: std::sync::Arc<tantivy::Searcher>,
     // 🚀 BATCH OPTIMIZATION FIX: Store ByteRangeCache and bundle file offsets
     // This allows prefetch to populate the same cache that doc_async uses
-    byte_range_cache: Option<ByteRangeCache>,
-    bundle_file_offsets: std::collections::HashMap<std::path::PathBuf, std::ops::Range<u64>>,
+    pub(crate) byte_range_cache: Option<ByteRangeCache>,
+    pub(crate) bundle_file_offsets: std::collections::HashMap<std::path::PathBuf, std::ops::Range<u64>>,
 }
 
 // Dead code removed - perform_real_quickwit_doc_retrieval function was not called anywhere
