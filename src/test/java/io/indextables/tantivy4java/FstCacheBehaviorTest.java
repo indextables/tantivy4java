@@ -734,16 +734,17 @@ public class FstCacheBehaviorTest {
                 SplitSearcher.IndexComponent.FASTFIELD
             ).join();
 
-            long prewarmTimeMs = (System.nanoTime() - prewarmStart) / 1_000_000;
+            long prewarmTimeNs = System.nanoTime() - prewarmStart;
+            long prewarmTimeMs = prewarmTimeNs / 1_000_000;
 
             var afterPrewarmStats = searcher.getCacheStats();
-            System.out.println("   Prewarm completed in " + prewarmTimeMs + " ms");
+            System.out.println("   Prewarm completed in " + prewarmTimeMs + " ms (" + prewarmTimeNs + " ns)");
             System.out.println("   Cache size after prewarm: " + afterPrewarmStats.getTotalSize() + " bytes");
             System.out.println("   Total cache operations: " + afterPrewarmStats.getMissCount() + " misses, " +
                              afterPrewarmStats.getHitCount() + " hits\n");
 
-            // Verify no exceptions occurred and prewarm completed
-            assertTrue(prewarmTimeMs > 0, "Prewarm should have taken some time");
+            // Verify prewarm completed (time > 0 in nanoseconds - sub-millisecond completion is OK when cached)
+            assertTrue(prewarmTimeNs > 0, "Prewarm should have completed");
             assertTrue(afterPrewarmStats.getTotalSize() >= initialStats.getTotalSize(),
                 "Cache size should increase after prewarm");
 

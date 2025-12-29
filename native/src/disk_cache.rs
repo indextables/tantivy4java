@@ -488,6 +488,8 @@ enum WriteRequest {
         split_id: String,
     },
     SyncManifest,
+    /// Flush all pending writes and signal completion via the oneshot channel
+    Flush(tokio::sync::oneshot::Sender<()>),
     Shutdown,
 }
 
@@ -1163,6 +1165,33 @@ impl L2DiskCache {
         Ok(())
     }
 
+    /// Flush all pending writes to disk and wait for completion (async version).
+    ///
+    /// This method blocks until all previously queued Put requests have been
+    /// processed by the background writer. Use this to ensure data is persisted
+    /// before reading from the cache.
+    pub async fn flush_async(&self) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if self.write_tx.send(WriteRequest::Flush(tx)).is_ok() {
+            // Wait asynchronously for the flush to complete
+            let _ = rx.await;
+        }
+    }
+
+    /// Flush all pending writes to disk and wait for completion (blocking version).
+    ///
+    /// This method should only be called from a non-async context (e.g., JNI callbacks).
+    /// For async contexts, use `flush_async()` instead.
+    ///
+    /// Note: Calling this from within a tokio async context will panic.
+    pub fn flush_blocking(&self) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if self.write_tx.send(WriteRequest::Flush(tx)).is_ok() {
+            // Block until the flush is processed
+            let _ = rx.blocking_recv();
+        }
+    }
+
     /// Background writer thread (static version using Weak reference)
     fn background_writer_static(
         mut rx: mpsc::UnboundedReceiver<WriteRequest>,
@@ -1211,6 +1240,15 @@ impl L2DiskCache {
                         if let Err(e) = cache.do_sync_manifest() {
                             debug_println!("Disk cache manifest sync error: {}", e);
                         }
+                    }
+                    WriteRequest::Flush(tx) => {
+                        // Sync manifest to disk before signaling completion
+                        // This ensures all cached data is discoverable after process restart
+                        if let Err(e) = cache.do_sync_manifest() {
+                            debug_println!("Disk cache manifest sync error during flush: {}", e);
+                        }
+                        // All previous requests have been processed, signal completion
+                        let _ = tx.send(());
                     }
                     WriteRequest::Shutdown => break,
                 }

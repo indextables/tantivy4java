@@ -405,7 +405,7 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_
                     mmap_cache_size: 0, // Use default (1024)
                 };
 
-                debug_println!("RUST DEBUG: Calling set_disk_cache");
+                debug_println!("RUST DEBUG: Calling set_disk_cache with path: {}", path);
                 manager.set_disk_cache(disk_config);
                 debug_println!("RUST DEBUG: set_disk_cache complete");
             } else {
@@ -1100,4 +1100,76 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_
         },
         None => 0,
     }
+}
+
+// =====================================================================
+// Global Storage Download Metrics
+// =====================================================================
+// These functions expose global storage download counters to Java for
+// programmatic verification of caching behavior in tests.
+// =====================================================================
+
+use crate::global_cache::{get_storage_download_metrics, reset_storage_download_metrics};
+
+/// Get total storage downloads (all sources)
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_nativeGetStorageDownloadCount(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jlong {
+    get_storage_download_metrics().total_downloads as jlong
+}
+
+/// Get total bytes downloaded (all sources)
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_nativeGetStorageDownloadBytes(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jlong {
+    get_storage_download_metrics().total_bytes as jlong
+}
+
+/// Get storage downloads during prewarm operations
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_nativeGetStoragePrewarmDownloadCount(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jlong {
+    get_storage_download_metrics().prewarm_downloads as jlong
+}
+
+/// Get bytes downloaded during prewarm operations
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_nativeGetStoragePrewarmDownloadBytes(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jlong {
+    get_storage_download_metrics().prewarm_bytes as jlong
+}
+
+/// Get storage downloads during query operations (L3 cache misses)
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_nativeGetStorageQueryDownloadCount(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jlong {
+    get_storage_download_metrics().query_downloads as jlong
+}
+
+/// Get bytes downloaded during query operations
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_nativeGetStorageQueryDownloadBytes(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jlong {
+    get_storage_download_metrics().query_bytes as jlong
+}
+
+/// Reset all storage download metrics (useful between tests)
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_nativeResetStorageDownloadMetrics(
+    _env: JNIEnv,
+    _class: JClass,
+) {
+    reset_storage_download_metrics();
 }

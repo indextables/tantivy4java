@@ -1251,6 +1251,18 @@ public class SplitCacheManager implements AutoCloseable {
     private static native boolean nativeIsDiskCacheEnabled(long ptr);
     private static native boolean nativeEvictSplitFromDiskCache(long ptr, String splitUri);
 
+    // ========================================
+    // Storage Download Metrics Native Methods
+    // ========================================
+    // Global counters for programmatic verification of S3/storage downloads
+    static native long nativeGetStorageDownloadCount();
+    static native long nativeGetStorageDownloadBytes();
+    static native long nativeGetStoragePrewarmDownloadCount();
+    static native long nativeGetStoragePrewarmDownloadBytes();
+    static native long nativeGetStorageQueryDownloadCount();
+    static native long nativeGetStorageQueryDownloadBytes();
+    static native void nativeResetStorageDownloadMetrics();
+
     /**
      * Get global batch optimization metrics.
      *
@@ -1441,6 +1453,133 @@ public class SplitCacheManager implements AutoCloseable {
      */
     public static void resetObjectStorageRequestStats() {
         nativeResetObjectStorageRequestStats();
+    }
+
+    // ========================================
+    // Storage Download Metrics API
+    // ========================================
+    // Global counters to programmatically verify S3/storage download behavior.
+    // Tracks downloads separately for prewarm vs query operations.
+
+    /**
+     * Storage download metrics for programmatic verification.
+     *
+     * <p>This class tracks actual storage downloads (S3, Azure, file) separately for
+     * prewarm and query operations. Use this to verify that:
+     * <ul>
+     *   <li>Prewarm populates the cache without redundant downloads</li>
+     *   <li>Queries use cached data (zero query downloads after prewarm)</li>
+     *   <li>Cache key mismatches are detected (prewarm + query downloads for same data)</li>
+     * </ul>
+     *
+     * <p><strong>Example Test Usage:</strong>
+     * <pre>{@code
+     * // Reset counters at start of test
+     * SplitCacheManager.resetStorageDownloadMetrics();
+     *
+     * // Prewarm the split
+     * searcher.preloadComponents(PrewarmComponent.ALL);
+     *
+     * StorageDownloadMetrics afterPrewarm = SplitCacheManager.getStorageDownloadMetrics();
+     * System.out.println("Prewarm downloads: " + afterPrewarm.getPrewarmDownloads());
+     *
+     * // Run query
+     * searcher.search(query, 10);
+     *
+     * StorageDownloadMetrics afterQuery = SplitCacheManager.getStorageDownloadMetrics();
+     * assertEquals(0, afterQuery.getQueryDownloads(), "Queries should use cached data!");
+     * }</pre>
+     */
+    public static class StorageDownloadMetrics {
+        private final long totalDownloads;
+        private final long totalBytes;
+        private final long prewarmDownloads;
+        private final long prewarmBytes;
+        private final long queryDownloads;
+        private final long queryBytes;
+
+        public StorageDownloadMetrics(
+                long totalDownloads, long totalBytes,
+                long prewarmDownloads, long prewarmBytes,
+                long queryDownloads, long queryBytes) {
+            this.totalDownloads = totalDownloads;
+            this.totalBytes = totalBytes;
+            this.prewarmDownloads = prewarmDownloads;
+            this.prewarmBytes = prewarmBytes;
+            this.queryDownloads = queryDownloads;
+            this.queryBytes = queryBytes;
+        }
+
+        /** Total storage downloads (all sources) */
+        public long getTotalDownloads() { return totalDownloads; }
+
+        /** Total bytes downloaded (all sources) */
+        public long getTotalBytes() { return totalBytes; }
+
+        /** Downloads during prewarm operations */
+        public long getPrewarmDownloads() { return prewarmDownloads; }
+
+        /** Bytes downloaded during prewarm */
+        public long getPrewarmBytes() { return prewarmBytes; }
+
+        /** Downloads during query operations (L3 cache misses) */
+        public long getQueryDownloads() { return queryDownloads; }
+
+        /** Bytes downloaded during queries */
+        public long getQueryBytes() { return queryBytes; }
+
+        /** Returns true if any query downloads occurred (indicates cache miss) */
+        public boolean hasQueryDownloads() { return queryDownloads > 0; }
+
+        /** Returns true if prewarm was fully effective (no query downloads after prewarm) */
+        public boolean isPrewarmEffective() { return prewarmDownloads > 0 && queryDownloads == 0; }
+
+        /** Formatted summary string */
+        public String getSummary() {
+            return String.format(
+                "Downloads: %d total (%d bytes), %d prewarm (%d bytes), %d query (%d bytes)",
+                totalDownloads, totalBytes,
+                prewarmDownloads, prewarmBytes,
+                queryDownloads, queryBytes
+            );
+        }
+
+        @Override
+        public String toString() {
+            return getSummary();
+        }
+    }
+
+    /**
+     * Get current storage download metrics.
+     *
+     * <p>Returns a snapshot of all storage download counters. These counters track
+     * actual downloads from remote storage (S3, Azure, file), separated by operation type.
+     *
+     * @return current storage download metrics
+     * @see #resetStorageDownloadMetrics()
+     */
+    public static StorageDownloadMetrics getStorageDownloadMetrics() {
+        return new StorageDownloadMetrics(
+            nativeGetStorageDownloadCount(),
+            nativeGetStorageDownloadBytes(),
+            nativeGetStoragePrewarmDownloadCount(),
+            nativeGetStoragePrewarmDownloadBytes(),
+            nativeGetStorageQueryDownloadCount(),
+            nativeGetStorageQueryDownloadBytes()
+        );
+    }
+
+    /**
+     * Reset all storage download metrics.
+     *
+     * <p>Resets all counters to zero. Use this at the start of tests to get
+     * accurate per-test measurements.
+     *
+     * @see #getStorageDownloadMetrics()
+     */
+    public static void resetStorageDownloadMetrics() {
+        nativeResetStorageDownloadMetrics();
     }
 
     // ========================================
