@@ -998,8 +998,16 @@ impl L2DiskCache {
     ) -> CoalesceResult {
         let split_key = CacheManifest::split_key(storage_loc, split_id);
 
-        // First, try exact match (fast path)
-        if let Some(data) = self.get(storage_loc, split_id, component, Some(requested_range.clone())) {
+        // First, try exact match (fast path) - use get_subrange to avoid copying entire file
+        // Even if the requested range exactly matches the cached range, we use mmap-based
+        // sub-range extraction which only copies the requested bytes
+        if let Some(data) = self.get_subrange(
+            storage_loc,
+            split_id,
+            component,
+            requested_range.clone(),  // cached range = requested range for exact match
+            requested_range.clone(),  // requested sub-range = same
+        ) {
             return CoalesceResult::hit(data, requested_range);
         }
 
