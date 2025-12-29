@@ -618,14 +618,28 @@ impl L2DiskCache {
             return false;
         }
 
-        // Component-aware compression decisions
+        // Component-aware compression decisions based on internal Tantivy encoding
+        // AND access patterns:
+        //
+        // Already compressed (skip - would waste CPU):
+        //   - .store: LZ4/Zstd compressed in 16KB blocks
+        //   - .term:  Zstd-compressed sstable blocks
+        //
+        // Block-access patterns (skip - decompressing whole file for block access is terrible):
+        //   - .idx/.pos: Postings accessed in 128-doc blocks via skip lists
+        //                With millions of docs, a 10MB file would need full decompression
+        //                just to read a 512-byte block. Bitpacking already compacts the data.
+        //
+        // Random-access patterns:
+        //   - .fast: Accessed by doc_id, same decompression problem as postings
+        //
         match component {
-            // Small/hot data - skip compression
+            // Small/hot data - skip compression for access speed
             "footer" | "metadata" | "fieldnorm" => false,
-            // Fast fields - only compress large ones (often numeric/compact)
-            "fast" => data_size > 64 * 1024,
-            // Good compression candidates
-            "term" | "idx" | "pos" => true,
+            // Already compressed by Tantivy - don't double compress
+            "store" | "term" => false,
+            // Block/random access patterns - whole-file decompression would kill performance
+            "idx" | "pos" | "fast" => false,
             // Default: compress if reasonably large
             _ => data_size > 16 * 1024,
         }
@@ -1356,23 +1370,33 @@ mod tests {
         };
         let cache = L2DiskCache::new(config).unwrap();
 
-        // Small data - no compression
-        assert!(!cache.should_compress("term", 100));
-        assert!(!cache.should_compress("idx", 1000));
+        // Small data - no compression regardless of component
+        assert!(!cache.should_compress("idx", 100));
+        assert!(!cache.should_compress("pos", 1000));
 
         // Footer/metadata - never compress
         assert!(!cache.should_compress("footer", 10000));
         assert!(!cache.should_compress("metadata", 10000));
         assert!(!cache.should_compress("fieldnorm", 10000));
 
-        // Fast fields - only large ones
-        assert!(!cache.should_compress("fast", 50000));
-        assert!(cache.should_compress("fast", 100000));
+        // Store files - already LZ4/Zstd compressed by Tantivy, never double-compress
+        assert!(!cache.should_compress("store", 10000));
+        assert!(!cache.should_compress("store", 1000000)); // Even large store files
 
-        // Term/idx/pos - compress if above min size
-        assert!(cache.should_compress("term", 5000));
-        assert!(cache.should_compress("idx", 5000));
-        assert!(cache.should_compress("pos", 5000));
+        // Term files - already Zstd compressed (sstable), never double-compress
+        assert!(!cache.should_compress("term", 10000));
+        assert!(!cache.should_compress("term", 1000000)); // Even large term files
+
+        // idx/pos - block-access patterns, whole-file decompression would be terrible
+        // With millions of docs, a 10MB file needs full decompress for 512-byte block access
+        assert!(!cache.should_compress("idx", 5000));
+        assert!(!cache.should_compress("idx", 10_000_000)); // Even large posting files
+        assert!(!cache.should_compress("pos", 5000));
+        assert!(!cache.should_compress("pos", 10_000_000));
+
+        // Fast fields - random access by doc_id, same decompression problem
+        assert!(!cache.should_compress("fast", 50000));
+        assert!(!cache.should_compress("fast", 100000));
     }
 
     #[test]
