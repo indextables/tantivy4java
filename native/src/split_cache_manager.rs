@@ -402,6 +402,7 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_
                     compression: CompressionAlgorithm::from_ordinal(compression_ordinal),
                     min_compress_size,
                     manifest_sync_interval_secs: manifest_sync_interval,
+                    mmap_cache_size: 0, // Use default (1024)
                 };
 
                 debug_println!("RUST DEBUG: Calling set_disk_cache");

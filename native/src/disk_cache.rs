@@ -13,6 +13,7 @@
 
 use std::collections::HashMap;
 use std::cmp::{max, min};
+use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::ops::Range;
@@ -23,6 +24,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fs2::available_space;
 use lz4_flex::{compress_prepend_size, decompress_size_prepended};
+use memmap2::Mmap;
 
 use crate::debug_println;
 use serde::{Deserialize, Serialize};
@@ -31,6 +33,11 @@ use tokio::sync::mpsc;
 
 /// Subdirectory name for the disk cache within the root path
 const CACHE_SUBDIR: &str = "tantivy4java_slicecache";
+
+/// Default maximum number of memory-mapped files to keep open.
+/// Conservative default that works on most systems, but can be configured higher.
+/// Production systems with high fd limits (65536+) can safely use 2048-4096.
+const DEFAULT_MMAP_CACHE_SIZE: usize = 1024;
 
 /// Compression algorithm for cached data
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -69,6 +76,10 @@ pub struct DiskCacheConfig {
     pub min_compress_size: usize,
     /// Sync manifest every N seconds (0 = on every write)
     pub manifest_sync_interval_secs: u64,
+    /// Maximum number of memory-mapped files to cache (0 = use default)
+    /// Higher values use more file descriptors but improve random access performance.
+    /// Production systems with high fd limits can safely use 2048-4096.
+    pub mmap_cache_size: usize,
 }
 
 impl Default for DiskCacheConfig {
@@ -79,6 +90,7 @@ impl Default for DiskCacheConfig {
             compression: CompressionAlgorithm::Lz4,
             min_compress_size: 4096, // 4KB
             manifest_sync_interval_secs: 30,
+            mmap_cache_size: DEFAULT_MMAP_CACHE_SIZE,
         }
     }
 }
@@ -479,6 +491,94 @@ enum WriteRequest {
     Shutdown,
 }
 
+// ============================================================================
+// MMAP CACHE - Fast random access via memory-mapped files
+// ============================================================================
+
+/// LRU cache of memory-mapped files for fast random access reads.
+///
+/// Instead of open/read/close for every cache hit, we keep files memory-mapped.
+/// Random access becomes just pointer indexing + potential page fault.
+/// The OS kernel manages the page cache efficiently.
+struct MmapCache {
+    /// Map from file path to memory-mapped region
+    maps: HashMap<PathBuf, Arc<Mmap>>,
+    /// LRU order tracking (front = oldest, back = newest)
+    lru_order: VecDeque<PathBuf>,
+    /// Maximum number of mappings to keep
+    max_size: usize,
+}
+
+impl MmapCache {
+    fn new(max_size: usize) -> Self {
+        Self {
+            maps: HashMap::with_capacity(max_size),
+            lru_order: VecDeque::with_capacity(max_size),
+            max_size,
+        }
+    }
+
+    /// Get or create a memory mapping for the given file path.
+    /// Returns Arc<Mmap> so the mapping can be used while the cache is unlocked.
+    fn get_or_map(&mut self, path: &Path) -> io::Result<Arc<Mmap>> {
+        // Check if already mapped
+        if self.maps.contains_key(path) {
+            // Move to back of LRU (most recently used)
+            self.touch_lru(path);
+            return Ok(Arc::clone(self.maps.get(path).unwrap()));
+        }
+
+        // Evict oldest if at capacity
+        while self.maps.len() >= self.max_size {
+            if let Some(oldest_path) = self.lru_order.pop_front() {
+                self.maps.remove(&oldest_path);
+                debug_println!("📤 MMAP_CACHE: Evicted {:?}", oldest_path);
+            }
+        }
+
+        // Create new mapping
+        let file = File::open(path)?;
+        let mmap = unsafe { Mmap::map(&file)? };
+        let mmap = Arc::new(mmap);
+
+        // Add to cache
+        self.maps.insert(path.to_path_buf(), Arc::clone(&mmap));
+        self.lru_order.push_back(path.to_path_buf());
+
+        debug_println!("📥 MMAP_CACHE: Mapped {:?} ({} bytes)", path, mmap.len());
+        Ok(mmap)
+    }
+
+    /// Move a path to the back of the LRU order (mark as recently used)
+    fn touch_lru(&mut self, path: &Path) {
+        // Remove from current position
+        if let Some(pos) = self.lru_order.iter().position(|p| p == path) {
+            self.lru_order.remove(pos);
+        }
+        // Add to back (most recently used)
+        self.lru_order.push_back(path.to_path_buf());
+    }
+
+    /// Remove a specific path from the cache (e.g., when file is deleted)
+    fn remove(&mut self, path: &Path) {
+        self.maps.remove(path);
+        if let Some(pos) = self.lru_order.iter().position(|p| p == path) {
+            self.lru_order.remove(pos);
+        }
+    }
+
+    /// Clear all mappings
+    fn clear(&mut self) {
+        self.maps.clear();
+        self.lru_order.clear();
+    }
+
+    /// Get cache statistics
+    fn stats(&self) -> (usize, usize) {
+        (self.maps.len(), self.max_size)
+    }
+}
+
 /// L2 Disk Cache implementation
 pub struct L2DiskCache {
     config: DiskCacheConfig,
@@ -486,6 +586,8 @@ pub struct L2DiskCache {
     /// In-memory state for fast range coalescing (split_key -> SplitState)
     split_states: RwLock<HashMap<String, SplitState>>,
     lru_table: Mutex<SplitLruTable>,
+    /// Memory-mapped file cache for fast random access
+    mmap_cache: Mutex<MmapCache>,
     write_tx: mpsc::UnboundedSender<WriteRequest>,
     total_bytes: AtomicU64,
     max_bytes: u64,
@@ -524,11 +626,19 @@ impl L2DiskCache {
         let (write_tx, write_rx) = mpsc::unbounded_channel();
         let shutdown_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
+        // Determine mmap cache size (use default if 0)
+        let mmap_size = if config.mmap_cache_size > 0 {
+            config.mmap_cache_size
+        } else {
+            DEFAULT_MMAP_CACHE_SIZE
+        };
+
         let cache = Arc::new(Self {
             config: config.clone(),
             manifest: RwLock::new(manifest),
             split_states: RwLock::new(split_states),
             lru_table: Mutex::new(SplitLruTable::new()),
+            mmap_cache: Mutex::new(MmapCache::new(mmap_size)),
             write_tx,
             total_bytes: AtomicU64::new(total_bytes),
             max_bytes,
@@ -744,6 +854,10 @@ impl L2DiskCache {
     }
 
     /// Get cached data (synchronous read from disk)
+    ///
+    /// For uncompressed files, uses memory-mapped I/O for fast random access.
+    /// The OS kernel manages the page cache efficiently, and repeated access
+    /// to the same file region avoids syscalls entirely.
     pub fn get(
         &self,
         storage_loc: &str,
@@ -761,7 +875,7 @@ impl L2DiskCache {
             split.components.get(&comp_key)?.clone()
         };
 
-        // Read file from disk
+        // Get file path
         let file_path = self.component_path(
             storage_loc,
             split_id,
@@ -770,12 +884,24 @@ impl L2DiskCache {
             entry.compression,
         );
 
-        let mut file = File::open(&file_path).ok()?;
-        let mut data = Vec::with_capacity(entry.disk_size_bytes as usize);
-        file.read_to_end(&mut data).ok()?;
-
-        // Decompress if needed
-        let uncompressed = Self::decompress_data(&data, entry.compression).ok()?;
+        // For uncompressed files, use memory-mapped I/O (fast random access)
+        // For compressed files, fall back to read-all + decompress
+        let data = if entry.compression == CompressionAlgorithm::None {
+            // Fast path: mmap for uncompressed files
+            let mmap = {
+                let mut mmap_cache = self.mmap_cache.lock().ok()?;
+                mmap_cache.get_or_map(&file_path).ok()?
+            };
+            // Return a copy of the mapped data
+            // (OwnedBytes requires owned data, but mmap access is still fast)
+            mmap.to_vec()
+        } else {
+            // Slow path: read entire file for compressed data
+            let mut file = File::open(&file_path).ok()?;
+            let mut data = Vec::with_capacity(entry.disk_size_bytes as usize);
+            file.read_to_end(&mut data).ok()?;
+            Self::decompress_data(&data, entry.compression).ok()?
+        };
 
         // Update LRU access time
         if let Ok(mut lru) = self.lru_table.lock() {
@@ -786,7 +912,72 @@ impl L2DiskCache {
             }
         }
 
-        Some(OwnedBytes::new(uncompressed))
+        Some(OwnedBytes::new(data))
+    }
+
+    /// Get a sub-range from a cached file using mmap (fast path for random access).
+    ///
+    /// This is optimized for the common case where we cached [0..file_len] during prewarm,
+    /// but queries request smaller sub-ranges like [offset..offset+block_size].
+    /// Instead of loading the entire file, we mmap it and return just the requested slice.
+    pub fn get_subrange(
+        &self,
+        storage_loc: &str,
+        split_id: &str,
+        component: &str,
+        cached_range: Range<u64>,
+        requested_range: Range<u64>,
+    ) -> Option<OwnedBytes> {
+        let split_key = CacheManifest::split_key(storage_loc, split_id);
+        let comp_key = CacheManifest::component_key(component, Some(cached_range.clone()));
+
+        // Check manifest for entry
+        let entry = {
+            let manifest = self.manifest.read().ok()?;
+            let split = manifest.splits.get(&split_key)?;
+            split.components.get(&comp_key)?.clone()
+        };
+
+        // Only use fast path for uncompressed files
+        if entry.compression != CompressionAlgorithm::None {
+            // Fall back to full load + slice for compressed files
+            let full_data = self.get(storage_loc, split_id, component, Some(cached_range.clone()))?;
+            let offset = (requested_range.start - cached_range.start) as usize;
+            let len = (requested_range.end - requested_range.start) as usize;
+            if offset + len <= full_data.len() {
+                return Some(OwnedBytes::new(full_data[offset..offset + len].to_vec()));
+            }
+            return None;
+        }
+
+        // Fast path: mmap and extract just the requested slice
+        let file_path = self.component_path(
+            storage_loc,
+            split_id,
+            component,
+            Some(cached_range.clone()),
+            entry.compression,
+        );
+
+        let mmap = {
+            let mut mmap_cache = self.mmap_cache.lock().ok()?;
+            mmap_cache.get_or_map(&file_path).ok()?
+        };
+
+        // Calculate offset within the cached file
+        let offset = (requested_range.start - cached_range.start) as usize;
+        let len = (requested_range.end - requested_range.start) as usize;
+
+        if offset + len > mmap.len() {
+            debug_println!(
+                "⚠️ L2_CACHE: Sub-range out of bounds: offset={} len={} file_len={}",
+                offset, len, mmap.len()
+            );
+            return None;
+        }
+
+        // Return just the requested slice (fast - only copies the slice, not entire file)
+        Some(OwnedBytes::new(mmap[offset..offset + len].to_vec()))
     }
 
     /// Get cached data with range coalescing
@@ -859,25 +1050,19 @@ impl L2DiskCache {
 
             // Overlap with this cached range
             if let Some(overlap) = cached_range.overlap_with(requested_range.start, requested_range.end) {
-                // Load the cached data
-                let _cache_key = &cached_range.cache_key;
-
-                // Parse the byte range from cache key (format: component_start-end)
-                if let Some(data) = self.get(storage_loc, split_id, component,
-                    Some(cached_range.start..cached_range.end)) {
-
-                    // Extract just the portion we need
-                    let offset_in_cache = (overlap.start - cached_range.start) as usize;
-                    let len = (overlap.end - overlap.start) as usize;
-
-                    if offset_in_cache + len <= data.len() {
-                        let slice = &data.as_slice()[offset_in_cache..offset_in_cache + len];
-                        cached_segments.push(CachedSegment {
-                            range: overlap.clone(),
-                            data: OwnedBytes::new(slice.to_vec()),
-                        });
-                        cached_bytes += len as u64;
-                    }
+                // Use fast sub-range extraction via mmap (avoids loading entire file)
+                if let Some(data) = self.get_subrange(
+                    storage_loc,
+                    split_id,
+                    component,
+                    cached_range.start..cached_range.end,  // cached range
+                    overlap.clone(),                        // requested sub-range
+                ) {
+                    cached_segments.push(CachedSegment {
+                        range: overlap.clone(),
+                        data,
+                    });
+                    cached_bytes += (overlap.end - overlap.start) as u64;
                 }
 
                 cursor = max(cursor, overlap.end);
@@ -1768,11 +1953,12 @@ mod tests {
         // Highly compressible data (repeated pattern)
         let data: Vec<u8> = (0..50000).map(|i| (i % 10) as u8).collect();
 
-        cache.put("s3://bucket", "split-001", "term", None, &data);
+        // Use "other" component which still gets compressed (not term/store/idx/pos/fast)
+        cache.put("s3://bucket", "split-001", "other", None, &data);
         std::thread::sleep(Duration::from_millis(100));
 
         // Verify data is retrievable
-        let retrieved = cache.get("s3://bucket", "split-001", "term", None);
+        let retrieved = cache.get("s3://bucket", "split-001", "other", None);
         assert!(retrieved.is_some());
         assert_eq!(retrieved.unwrap().as_slice(), data.as_slice());
 

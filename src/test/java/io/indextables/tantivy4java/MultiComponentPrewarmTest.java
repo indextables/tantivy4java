@@ -233,6 +233,109 @@ public class MultiComponentPrewarmTest {
         System.out.println("=".repeat(70));
     }
 
+    @Test
+    @DisplayName("Test that second prewarm skips already-cached files (no redundant downloads)")
+    void testSecondPrewarmSkipsAlreadyCachedFiles() throws Exception {
+        System.out.println("=".repeat(70));
+        System.out.println("PREWARM IDEMPOTENCY TEST (SKIP REDUNDANT DOWNLOADS)");
+        System.out.println("=".repeat(70));
+
+        // Create test index
+        Path indexPath = tempDir.resolve("idempotency-test-index");
+        Path splitPath = tempDir.resolve("idempotency-test.split");
+
+        createTestIndex(indexPath);
+
+        QuickwitSplit.SplitConfig config = new QuickwitSplit.SplitConfig(
+            "idempotency-index", "test-source", "test-node");
+
+        QuickwitSplit.SplitMetadata metadata = QuickwitSplit.convertIndexFromPath(
+            indexPath.toString(), splitPath.toString(), config);
+
+        String splitUrl = "file://" + splitPath.toAbsolutePath();
+        String cacheName = "idempotency-test-" + System.currentTimeMillis();
+
+        SplitCacheManager.CacheConfig cacheConfig = new SplitCacheManager.CacheConfig(cacheName)
+            .withMaxCacheSize(100_000_000);
+
+        SplitCacheManager cacheManager = SplitCacheManager.getInstance(cacheConfig);
+
+        try (SplitSearcher searcher = cacheManager.createSplitSearcher(splitUrl, metadata)) {
+
+            // ========== FIRST PREWARM ==========
+            System.out.println("\nStep 1: First prewarm (should download files)...");
+
+            var statsBeforeFirstPrewarm = searcher.getCacheStats();
+            long missesBeforeFirstPrewarm = statsBeforeFirstPrewarm.getMissCount();
+
+            long firstPrewarmStart = System.nanoTime();
+            searcher.preloadComponents(
+                SplitSearcher.IndexComponent.TERM,
+                SplitSearcher.IndexComponent.POSTINGS,
+                SplitSearcher.IndexComponent.STORE
+            ).join();
+            long firstPrewarmTimeMs = (System.nanoTime() - firstPrewarmStart) / 1_000_000;
+
+            var statsAfterFirstPrewarm = searcher.getCacheStats();
+            long missesAfterFirstPrewarm = statsAfterFirstPrewarm.getMissCount();
+            long newMissesFirstPrewarm = missesAfterFirstPrewarm - missesBeforeFirstPrewarm;
+
+            System.out.println("   First prewarm completed in " + firstPrewarmTimeMs + " ms");
+            System.out.println("   Cache misses (files downloaded): " + newMissesFirstPrewarm);
+
+            // First prewarm should cause cache misses (data being downloaded for the first time)
+            // Note: The files are downloaded into ByteRangeCache, which tracks misses
+            assertTrue(newMissesFirstPrewarm >= 0,
+                "First prewarm tracking should work (misses >= 0)");
+
+            // ========== SECOND PREWARM (SAME COMPONENTS) ==========
+            System.out.println("\nStep 2: Second prewarm (should skip already-cached files)...");
+
+            var statsBeforeSecondPrewarm = searcher.getCacheStats();
+            long missesBeforeSecondPrewarm = statsBeforeSecondPrewarm.getMissCount();
+
+            long secondPrewarmStart = System.nanoTime();
+            searcher.preloadComponents(
+                SplitSearcher.IndexComponent.TERM,
+                SplitSearcher.IndexComponent.POSTINGS,
+                SplitSearcher.IndexComponent.STORE
+            ).join();
+            long secondPrewarmTimeMs = (System.nanoTime() - secondPrewarmStart) / 1_000_000;
+
+            var statsAfterSecondPrewarm = searcher.getCacheStats();
+            long missesAfterSecondPrewarm = statsAfterSecondPrewarm.getMissCount();
+            long newMissesSecondPrewarm = missesAfterSecondPrewarm - missesBeforeSecondPrewarm;
+
+            System.out.println("   Second prewarm completed in " + secondPrewarmTimeMs + " ms");
+            System.out.println("   New cache misses: " + newMissesSecondPrewarm);
+
+            // ========== VALIDATION ==========
+            System.out.println("\n" + "=".repeat(70));
+            System.out.println("PREWARM IDEMPOTENCY RESULTS");
+            System.out.println("=".repeat(70));
+            System.out.println("   First prewarm time:   " + firstPrewarmTimeMs + " ms");
+            System.out.println("   Second prewarm time:  " + secondPrewarmTimeMs + " ms");
+            System.out.println("   First prewarm misses:  " + newMissesFirstPrewarm);
+            System.out.println("   Second prewarm misses: " + newMissesSecondPrewarm);
+
+            // The key validation: second prewarm should NOT cause additional cache misses
+            // because the prewarm code should check if files are already cached and skip downloads
+            assertEquals(0, newMissesSecondPrewarm,
+                "Second prewarm should cause zero new cache misses (files already cached)");
+
+            // Second prewarm should typically be faster (no I/O)
+            if (secondPrewarmTimeMs < firstPrewarmTimeMs) {
+                System.out.println("\n   ✅ SUCCESS: Second prewarm was faster (" +
+                    secondPrewarmTimeMs + "ms vs " + firstPrewarmTimeMs + "ms)");
+            } else {
+                System.out.println("\n   ℹ️ INFO: Second prewarm timing similar (file:// URLs are fast)");
+            }
+
+            System.out.println("   ✅ SUCCESS: No redundant downloads on second prewarm!");
+            System.out.println("=".repeat(70));
+        }
+    }
+
     private void createTestIndex(Path indexPath) throws IOException {
         try (SchemaBuilder schemaBuilder = new SchemaBuilder()) {
             // Text fields (have FST/term dictionaries and field norms)

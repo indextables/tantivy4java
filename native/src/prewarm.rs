@@ -94,16 +94,26 @@ async fn cache_files_by_extension(
     debug_println!("🔥 PREWARM_CACHE: Found {} .{} files to cache", files.len(), extension);
 
     let mut warm_up_futures = Vec::new();
+    let mut already_cached_count = 0;
 
     for (inner_path, bundle_range) in files {
+        let bundle_start = bundle_range.start as usize;
+        let bundle_end = bundle_range.end as usize;
+        let file_length = bundle_end - bundle_start;
+        let inner_range = 0..file_length;
+
+        // Check if data is already cached - skip download if so
+        if byte_range_cache.get_slice(&inner_path, inner_range.clone()).is_some() {
+            debug_println!("⏭️ PREWARM_CACHE: Skipping '{}' ({} bytes) - already cached",
+                          inner_path.display(), file_length);
+            already_cached_count += 1;
+            continue;
+        }
+
         let storage = storage.clone();
         let split_path = split_path.clone();
         let inner_path = inner_path.clone();
         let byte_range_cache = byte_range_cache.clone();
-
-        let bundle_start = bundle_range.start as usize;
-        let bundle_end = bundle_range.end as usize;
-        let file_length = bundle_end - bundle_start;
 
         debug_println!("🔥 PREWARM_CACHE: Queuing '{}' ({} bytes)", inner_path.display(), file_length);
 
@@ -126,8 +136,14 @@ async fn cache_files_by_extension(
     }
 
     let results = futures::future::join_all(warm_up_futures).await;
-    let success_count = results.iter().filter(|r| r.is_ok()).count();
-    let failure_count = results.len() - success_count;
+    let downloaded_count = results.iter().filter(|r| r.is_ok()).count();
+    let failure_count = results.len() - downloaded_count;
+
+    // Success = already cached + newly downloaded
+    let success_count = already_cached_count + downloaded_count;
+
+    debug_println!("🔥 PREWARM_CACHE: .{} files - {} already cached, {} downloaded, {} failed",
+                   extension, already_cached_count, downloaded_count, failure_count);
 
     (success_count, failure_count)
 }
@@ -688,17 +704,27 @@ pub async fn prewarm_store_impl(searcher_ptr: jlong) -> anyhow::Result<()> {
     debug_println!("🔥 PREWARM_STORE: Found {} .store files to warm", store_files.len());
 
     let mut warm_up_futures = Vec::new();
+    let mut already_cached_count = 0;
 
     for (inner_path, bundle_range) in store_files {
-        let storage = storage.clone();
-        let split_path = split_path.clone();
-        let inner_path = inner_path.clone();
-        let byte_range_cache = byte_range_cache.clone();
-
         // Bundle range is the absolute byte range within the split file
         let bundle_start = bundle_range.start as usize;
         let bundle_end = bundle_range.end as usize;
         let file_length = bundle_end - bundle_start;
+        let inner_range = 0..file_length;
+
+        // Check if data is already cached - skip download if so
+        if byte_range_cache.get_slice(&inner_path, inner_range.clone()).is_some() {
+            debug_println!("⏭️ PREWARM_STORE: Skipping '{}' ({} bytes) - already cached",
+                          inner_path.display(), file_length);
+            already_cached_count += 1;
+            continue;
+        }
+
+        let storage = storage.clone();
+        let split_path = split_path.clone();
+        let inner_path = inner_path.clone();
+        let byte_range_cache = byte_range_cache.clone();
 
         debug_println!("🔥 PREWARM_STORE: Queuing warmup for '{}' ({} bytes from split at {}..{})",
                        inner_path.display(), file_length, bundle_start, bundle_end);
@@ -731,10 +757,14 @@ pub async fn prewarm_store_impl(searcher_ptr: jlong) -> anyhow::Result<()> {
     debug_println!("🔥 PREWARM_STORE: Executing {} warmup operations in parallel", warm_up_futures.len());
 
     let results = futures::future::join_all(warm_up_futures).await;
-    let success_count = results.iter().filter(|r| r.is_ok()).count();
-    let failure_count = results.len() - success_count;
+    let downloaded_count = results.iter().filter(|r| r.is_ok()).count();
+    let failure_count = results.len() - downloaded_count;
 
-    debug_println!("✅ PREWARM_STORE: Completed - {} success, {} failures", success_count, failure_count);
+    // Success = already cached + newly downloaded
+    let success_count = already_cached_count + downloaded_count;
+
+    debug_println!("✅ PREWARM_STORE: Completed - {} already cached, {} downloaded, {} failures",
+                   already_cached_count, downloaded_count, failure_count);
 
     if success_count > 0 || failure_count == 0 {
         Ok(())
