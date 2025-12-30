@@ -389,6 +389,15 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_
                 _ => 30, // 30 seconds default
             };
 
+            // Extract disableL1Cache flag for debugging
+            let disable_l1_cache = match env.call_method(&tiered_config_obj, "isDisableL1Cache", "()Z", &[]) {
+                Ok(result) => result.z().unwrap_or(false),
+                _ => false,
+            };
+
+            // Set the global flag for L1 cache disabling
+            crate::global_cache::set_disable_l1_cache(disable_l1_cache);
+
             // Create disk cache config if we have a path
             debug_println!("RUST DEBUG: disk_path is_some={}", disk_path.is_some());
             if let Some(path) = disk_path {

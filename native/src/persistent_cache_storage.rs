@@ -220,13 +220,15 @@ impl Storage for StorageWithPersistentCache {
     }
 
     async fn get_slice(&self, path: &Path, byte_range: Range<usize>) -> StorageResult<OwnedBytes> {
-        debug_println!("🔍 TIERED_CACHE: get_slice for {:?} range {:?}", path, byte_range);
-
         let component = Self::extract_component(path);
         let requested_range = byte_range.start as u64..byte_range.end as u64;
 
-        debug_println!("🔍 L2_COALESCE: Checking disk cache with coalescing - storage_loc={}, split_id={}, component={}, range={:?}",
+        // DETAILED DEBUG: Show exact cache key components being used for queries
+        // Compare these with PREWARM_CACHE_KEY output to find mismatches
+        eprintln!("🔑 QUERY_CACHE_KEY: storage_loc='{}', split_id='{}', component='{}', range={:?}",
                  self.storage_loc, self.split_id, component, requested_range);
+        eprintln!("   📁 Path file_name: {:?}", path.file_name());
+        eprintln!("   📂 Full path: {:?}", path);
 
         // Check L2 disk cache with range COALESCING
         let coalesce_result = self.disk_cache.get_coalesced(
@@ -238,13 +240,13 @@ impl Storage for StorageWithPersistentCache {
 
         if coalesce_result.fully_cached {
             // Complete cache hit - combine cached segments
-            debug_println!("✅ L2_HIT: Fully cached ({} bytes)", coalesce_result.cached_bytes);
+            eprintln!("✅ L2_HIT: Fully cached ({} bytes)", coalesce_result.cached_bytes);
             self.stats.l2_hits.fetch_add(1, Ordering::Relaxed);
 
             return Ok(Self::combine_segments(&coalesce_result.cached_segments, &requested_range));
         } else if !coalesce_result.gaps.is_empty() && coalesce_result.cached_bytes > 0 {
             // Partial cache hit - fetch only the gaps from S3
-            debug_println!("🔶 L2_PARTIAL: {} bytes cached, {} bytes to fetch ({} gaps)",
+            eprintln!("🔶 L2_PARTIAL: {} bytes cached, {} bytes to fetch ({} gaps)",
                      coalesce_result.cached_bytes, coalesce_result.gap_bytes, coalesce_result.gaps.len());
             self.stats.l2_partial_hits.fetch_add(1, Ordering::Relaxed);
             self.stats.l3_bytes_saved.fetch_add(coalesce_result.cached_bytes, Ordering::Relaxed);
@@ -258,7 +260,7 @@ impl Storage for StorageWithPersistentCache {
         }
 
         // Complete miss - fetch full range from S3
-        debug_println!("❌ CACHE_MISS: Fetching full range from storage (L3) for {:?}", path);
+        eprintln!("❌ L2_MISS: Fetching full range from storage (L3) for component='{}', range={:?}", component, requested_range);
         self.stats.l3_fetches.fetch_add(1, Ordering::Relaxed);
 
         let bytes = self.storage.get_slice(path, byte_range.clone()).await?;
@@ -268,7 +270,7 @@ impl Storage for StorageWithPersistentCache {
 
         // Cache in L2 disk cache
         let disk_range = byte_range.start as u64..byte_range.end as u64;
-        debug_println!("💾 L2_STORE: Writing to disk cache - storage_loc={}, split_id={}, component={}, range={:?}, size={}",
+        eprintln!("💾 L2_STORE: Writing to disk cache - storage_loc={}, split_id={}, component={}, range={:?}, size={}",
                  self.storage_loc, self.split_id, component, disk_range, bytes.len());
         self.disk_cache.put(&self.storage_loc, &self.split_id, &component, Some(disk_range), bytes.as_slice());
 

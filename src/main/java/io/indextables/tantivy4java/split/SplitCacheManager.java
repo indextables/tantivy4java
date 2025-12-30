@@ -448,6 +448,7 @@ public class SplitCacheManager implements AutoCloseable {
         private CompressionAlgorithm compression = CompressionAlgorithm.LZ4;
         private int minCompressSizeBytes = 4096;  // Skip compression below 4KB
         private int manifestSyncIntervalSecs = 30;  // Sync manifest every 30 seconds
+        private boolean disableL1Cache = false;  // Debugging: disable L1 ByteRangeCache
 
         /**
          * Set the disk cache directory path.
@@ -537,12 +538,37 @@ public class SplitCacheManager implements AutoCloseable {
             return this;
         }
 
+        /**
+         * Disable the L1 ByteRangeCache (in-memory cache) for debugging.
+         *
+         * <p>When enabled, all storage requests bypass the L1 memory cache and go directly
+         * to L2 disk cache or L3 remote storage. This helps debug cache key mismatches
+         * between prewarm and query operations.
+         *
+         * <p><b>Debug Usage:</b>
+         * <pre>{@code
+         * TieredCacheConfig config = new TieredCacheConfig()
+         *     .withDiskCachePath("/tmp/cache")
+         *     .withDisableL1Cache(true);  // Bypass memory cache for debugging
+         *
+         * // Run with TANTIVY4JAVA_DEBUG=1 to see cache key details
+         * }</pre>
+         *
+         * @param disable true to disable L1 cache, false to use normally
+         * @return this TieredCacheConfig for method chaining
+         */
+        public TieredCacheConfig withDisableL1Cache(boolean disable) {
+            this.disableL1Cache = disable;
+            return this;
+        }
+
         // Getters
         public String getDiskCachePath() { return diskCachePath; }
         public long getMaxDiskSizeBytes() { return maxDiskSizeBytes; }
         public CompressionAlgorithm getCompression() { return compression; }
         public int getMinCompressSizeBytes() { return minCompressSizeBytes; }
         public int getManifestSyncIntervalSecs() { return manifestSyncIntervalSecs; }
+        public boolean isDisableL1Cache() { return disableL1Cache; }
 
         /**
          * Convert compression algorithm to ordinal for native layer.

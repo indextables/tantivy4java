@@ -942,10 +942,21 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_crea
 
                         // 🚀 BATCH OPTIMIZATION FIX: Create ByteRangeCache for prefetch optimization
                         // This cache will be shared between prefetch_ranges and doc_async (via CachingDirectory)
-                        let byte_range_cache = ByteRangeCache::with_infinite_capacity(
-                            &STORAGE_METRICS.shortlived_cache,
-                        );
-                        debug_println!("🚀 BATCH_OPT: Created ByteRangeCache for prefetch optimization");
+                        //
+                        // DEBUGGING: L1 cache can be disabled via TieredCacheConfig.withDisableL1Cache(true)
+                        // to help debug cache key mismatches between prewarm and query operations.
+                        let disable_l1_cache = crate::global_cache::is_l1_cache_disabled();
+                        eprintln!("🔍 L1_CHECK: is_l1_cache_disabled() = {}", disable_l1_cache);
+                        let (byte_range_cache, byte_range_cache_for_open): (Option<ByteRangeCache>, Option<ByteRangeCache>) = if disable_l1_cache {
+                            eprintln!("⚠️ L1_CACHE_DISABLED: ByteRangeCache set to None - all reads go to L2 disk cache / L3 storage");
+                            (None, None)
+                        } else {
+                            let cache = ByteRangeCache::with_infinite_capacity(
+                                &STORAGE_METRICS.shortlived_cache,
+                            );
+                            eprintln!("🚀 L1_CACHE_ENABLED: Created ByteRangeCache for prefetch optimization");
+                            (Some(cache.clone()), Some(cache))
+                        };
 
                         // 🚀 OPTIMIZATION: Call open_index_with_caches FIRST to populate split_footer_cache
                         // This eliminates redundant footer fetches when we parse bundle offsets below
@@ -956,7 +967,7 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_crea
                             resolved_storage.clone(),
                             &split_metadata,
                             None, // tokenizer_manager
-                            Some(byte_range_cache.clone()),  // 🚀 Pass ByteRangeCache for prefetch optimization
+                            byte_range_cache_for_open,  // 🚀 Pass ByteRangeCache for prefetch optimization (None if disabled)
                         ).await;
 
                         // 🚀 BATCH OPTIMIZATION FIX: Parse bundle file offsets from footer (now cached in split_footer_cache!)
@@ -1025,7 +1036,8 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_crea
                                 cached_index: std::sync::Arc::new(cached_index),
                                 cached_searcher,
                                 // 🚀 BATCH OPTIMIZATION FIX: Store ByteRangeCache and bundle file offsets
-                                byte_range_cache: Some(byte_range_cache),
+                                // Note: byte_range_cache is None if L1 cache is disabled for debugging
+                                byte_range_cache,
                                 bundle_file_offsets,
                             };
 
@@ -2758,6 +2770,10 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_prel
             "POSTINGS" => {
                 debug_println!("🔥 PREWARM_FIELDS: Warming up POSTINGS for specific fields...");
                 crate::prewarm::prewarm_postings_for_fields(searcher_ptr, &field_filter).await
+            },
+            "POSITIONS" => {
+                debug_println!("🔥 PREWARM_FIELDS: Warming up POSITIONS for specific fields...");
+                crate::prewarm::prewarm_positions_for_fields(searcher_ptr, &field_filter).await
             },
             "FIELDNORM" => {
                 debug_println!("🔥 PREWARM_FIELDS: Warming up FIELDNORM for specific fields...");

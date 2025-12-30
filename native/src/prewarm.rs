@@ -178,7 +178,7 @@ async fn cache_files_by_extension(
         // NOT with inner path and relative range, which was causing cache key mismatches!
         let cache_range = bundle_start as u64..bundle_end as u64;
 
-        debug_println!("🔑 PREWARM_CACHE_CHECK: storage_loc='{}', split_id='{}', component='{}', range={:?}",
+        eprintln!("🔑 PREWARM_CACHE_KEY: storage_loc='{}', split_id='{}', component='{}', range={:?}",
                       storage_loc, split_id, storage_component, cache_range);
 
         // Check if data is already in L2 disk cache - skip download if so
@@ -587,6 +587,95 @@ pub async fn prewarm_postings_for_fields(
         Ok(())
     } else {
         Err(anyhow::anyhow!("All field-specific postings warmup operations failed"))
+    }
+}
+
+/// Field-specific positions prewarming
+///
+/// This warms up the position data (.pos files) for the specified fields.
+/// Positions are needed for phrase queries and are separate from postings.
+pub async fn prewarm_positions_for_fields(
+    searcher_ptr: jlong,
+    field_names: &HashSet<String>,
+) -> anyhow::Result<()> {
+    debug_println!("🔥 PREWARM_FIELDS: Starting positions warmup for fields: {:?}", field_names);
+
+    let (searcher, schema) = with_arc_safe(searcher_ptr, |ctx: &Arc<CachedSearcherContext>| {
+        (ctx.cached_searcher.clone(), ctx.cached_index.schema())
+    }).ok_or_else(|| anyhow::anyhow!("Failed to access searcher context"))?;
+
+    // Find all indexed fields that have positions (text fields with positions enabled)
+    let indexed_fields: HashSet<tantivy::schema::Field> = schema.fields()
+        .filter_map(|(field, field_entry)| {
+            if !field_names.contains(field_entry.name()) {
+                return None;
+            }
+
+            match field_entry.field_type() {
+                FieldType::Str(text_options) => {
+                    if let Some(indexing_options) = text_options.get_indexing_options() {
+                        // Only fields with positions enabled
+                        if indexing_options.index_option().has_positions() {
+                            Some(field)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                },
+                FieldType::JsonObject(json_options) => {
+                    if let Some(text_indexing) = json_options.get_text_indexing_options() {
+                        if text_indexing.index_option().has_positions() {
+                            Some(field)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                },
+                _ => None,
+            }
+        })
+        .collect();
+
+    if indexed_fields.is_empty() {
+        debug_println!("⚠️ PREWARM_FIELDS: No matching fields with positions found");
+        return Ok(());
+    }
+
+    debug_println!("🔥 PREWARM_FIELDS: Warming positions for {} fields", indexed_fields.len());
+
+    let mut warm_up_futures = Vec::new();
+    for field in &indexed_fields {
+        for segment_reader in searcher.segment_readers() {
+            match segment_reader.inverted_index(*field) {
+                Ok(inverted_index) => {
+                    let inverted_index = inverted_index.clone();
+                    // true = include positions data
+                    warm_up_futures.push(async move {
+                        inverted_index.warm_postings_full(true).await
+                    });
+                },
+                Err(e) => {
+                    debug_println!("⚠️ PREWARM_FIELDS: Failed to get inverted index: {}", e);
+                }
+            }
+        }
+    }
+
+    let results = futures::future::join_all(warm_up_futures).await;
+    let success_count = results.iter().filter(|r| r.is_ok()).count();
+    let failure_count = results.len() - success_count;
+
+    debug_println!("✅ PREWARM_FIELDS: Positions warmup complete - {} success, {} failures",
+                   success_count, failure_count);
+
+    if success_count > 0 || failure_count == 0 {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!("All field-specific positions warmup operations failed"))
     }
 }
 

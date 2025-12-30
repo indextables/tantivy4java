@@ -756,8 +756,10 @@ impl L2DiskCache {
             "store" | "term" => false,
             // Block/random access patterns - whole-file decompression would kill performance
             "idx" | "pos" | "fast" => false,
-            // Default: compress if reasonably large
-            _ => data_size > 16 * 1024,
+            // Default: NO compression - unknown components (like split file byte ranges) are
+            // likely already compressed or have random-access patterns. Safe default is no
+            // compression to avoid decompression overhead on sub-range reads.
+            _ => false,
         }
     }
 

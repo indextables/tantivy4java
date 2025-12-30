@@ -565,6 +565,34 @@ fn get_disk_cache_holder() -> &'static std::sync::RwLock<Option<Arc<L2DiskCache>
     GLOBAL_DISK_CACHE.get_or_init(|| std::sync::RwLock::new(None))
 }
 
+/// Global flag to disable L1 ByteRangeCache for debugging
+/// When true, all storage requests bypass L1 memory cache and go to L2 disk cache / L3 storage
+static DISABLE_L1_CACHE: OnceLock<std::sync::RwLock<bool>> = OnceLock::new();
+
+fn get_disable_l1_cache_holder() -> &'static std::sync::RwLock<bool> {
+    DISABLE_L1_CACHE.get_or_init(|| std::sync::RwLock::new(false))
+}
+
+/// Set whether to disable L1 ByteRangeCache (called by SplitCacheManager from TieredCacheConfig)
+pub fn set_disable_l1_cache(disable: bool) {
+    let holder = get_disable_l1_cache_holder();
+    let mut guard = holder.write().unwrap();
+    if disable {
+        eprintln!("⚠️ L1_CACHE_DISABLED: ByteRangeCache disabled for debugging via TieredCacheConfig");
+        eprintln!("   All storage requests will bypass L1 memory cache and go to L2 disk cache / L3 storage");
+    } else {
+        eprintln!("🟢 L1_CACHE_ENABLED: ByteRangeCache enabled (normal operation)");
+    }
+    *guard = disable;
+}
+
+/// Check if L1 ByteRangeCache is disabled
+pub fn is_l1_cache_disabled() -> bool {
+    let holder = get_disable_l1_cache_holder();
+    let guard = holder.read().unwrap();
+    *guard
+}
+
 /// Set the global L2 disk cache (called by SplitCacheManager when TieredCacheConfig is provided)
 pub fn set_global_disk_cache(cache: Arc<L2DiskCache>) {
     let holder = get_disk_cache_holder();
