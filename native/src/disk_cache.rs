@@ -611,12 +611,16 @@ impl L2DiskCache {
         let cache_dir = Self::cache_dir(&config.root_path);
         fs::create_dir_all(&cache_dir)?;
 
+        debug_println!("🔵 L2DiskCache::new() - cache_dir={:?}", cache_dir);
+
         // Calculate max size
         let max_bytes = config.effective_max_size()?;
 
         // Load or create manifest
         let manifest = Self::load_manifest(&cache_dir)?;
         let total_bytes = manifest.total_bytes;
+        debug_println!("🔵 L2DiskCache::new() - manifest loaded: {} splits, {} total_bytes",
+                 manifest.splits.len(), total_bytes);
 
         // Build split states from manifest for fast coalescing
         let mut split_states = HashMap::new();

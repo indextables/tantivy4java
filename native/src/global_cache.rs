@@ -569,7 +569,7 @@ fn get_disk_cache_holder() -> &'static std::sync::RwLock<Option<Arc<L2DiskCache>
 pub fn set_global_disk_cache(cache: Arc<L2DiskCache>) {
     let holder = get_disk_cache_holder();
     let mut guard = holder.write().unwrap();
-    debug_println!("RUST DEBUG: Setting global L2 disk cache");
+    debug_println!("🟢 SET_GLOBAL_DISK_CACHE: Setting global L2 disk cache");
     *guard = Some(cache);
 }
 
@@ -578,7 +578,7 @@ pub fn set_global_disk_cache(cache: Arc<L2DiskCache>) {
 pub fn clear_global_disk_cache() {
     let holder = get_disk_cache_holder();
     let mut guard = holder.write().unwrap();
-    debug_println!("RUST DEBUG: Clearing global L2 disk cache");
+    debug_println!("🔴 CLEAR_GLOBAL_DISK_CACHE: Clearing global L2 disk cache");
     *guard = None;
 }
 
@@ -640,12 +640,19 @@ pub fn get_global_disk_cache() -> Option<Arc<L2DiskCache>> {
     let holder = get_disk_cache_holder();
     let guard = holder.read().unwrap();
     if let Some(ref cache) = *guard {
+        debug_println!("🟢 GET_GLOBAL_DISK_CACHE: Found dynamic disk cache");
         return Some(cache.clone());
     }
     drop(guard);
 
     // Fall back to the components' disk_cache
-    get_global_components().disk_cache.clone()
+    let result = get_global_components().disk_cache.clone();
+    if result.is_some() {
+        debug_println!("🟢 GET_GLOBAL_DISK_CACHE: Found components disk cache");
+    } else {
+        debug_println!("🔴 GET_GLOBAL_DISK_CACHE: No disk cache configured - WILL HIT S3!");
+    }
+    result
 }
 
 // =====================================================================

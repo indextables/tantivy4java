@@ -169,6 +169,62 @@ public class RealAzureDiskCacheTest {
     }
 
     @Test
+    @Order(0)
+    void testCountersNonZeroWithoutDiskCache() throws Exception {
+        System.out.println("\n=== Test 0: Verify Azure Request Counters (NO Disk Cache) ===");
+
+        // 🎯 This test verifies the OBJECT_STORAGE_REQUEST_COUNT counters work correctly
+        // WITHOUT disk cache - should show non-zero requests to Azure
+
+        // Create cache manager WITHOUT disk cache
+        SplitCacheManager.CacheConfig cacheConfig =
+            new SplitCacheManager.CacheConfig("azure-no-disk-cache-" + System.currentTimeMillis())
+                .withMaxCacheSize(50_000_000) // 50MB L1 only, NO disk cache
+                .withAzureCredentials(getStorageAccount(), getAccountKey());
+                // NOTE: No .withTieredCache() - no disk cache!
+
+        // Reset counters before test
+        SplitCacheManager.resetObjectStorageRequestStats();
+        long requestsBefore = SplitCacheManager.getObjectStorageRequestCount();
+        long bytesBefore = SplitCacheManager.getObjectStorageBytesFetched();
+        System.out.println("   Azure counters reset: requests=" + requestsBefore + ", bytes=" + bytesBefore);
+
+        try (SplitCacheManager cacheManager = SplitCacheManager.getInstance(cacheConfig)) {
+            try (SplitSearcher searcher = cacheManager.createSplitSearcher(splitAzureUrl, splitMetadata)) {
+                // Search to trigger Azure requests
+                SplitQuery query = searcher.parseQuery("content:searchable");
+                SearchResult result = searcher.search(query, 10);
+
+                assertTrue(result.getHits().size() > 0, "Should find documents");
+                System.out.println("   Found " + result.getHits().size() + " documents");
+
+                // Retrieve a document
+                if (!result.getHits().isEmpty()) {
+                    try (Document doc = searcher.doc(result.getHits().get(0).getDocAddress())) {
+                        assertNotNull(doc.getFirst("title"));
+                        System.out.println("   Retrieved document: " + doc.getFirst("title"));
+                    }
+                }
+            }
+        }
+
+        // 🎯 CRITICAL: Verify counters show NON-ZERO - proves they work correctly
+        long requestsAfter = SplitCacheManager.getObjectStorageRequestCount();
+        long bytesAfter = SplitCacheManager.getObjectStorageBytesFetched();
+        System.out.println("   Azure counters after query: requests=" + requestsAfter + ", bytes=" + bytesAfter);
+
+        assertTrue(requestsAfter > requestsBefore,
+            "🚨 COUNTER FAILURE: Expected non-zero Azure requests but got " + (requestsAfter - requestsBefore) +
+            ". Counters may not be working correctly!");
+        assertTrue(bytesAfter > bytesBefore,
+            "🚨 COUNTER FAILURE: Expected non-zero bytes from Azure but got " + (bytesAfter - bytesBefore) +
+            ". Counters may not be working correctly!");
+
+        System.out.println("✅ Azure request counters verified: " + (requestsAfter - requestsBefore) +
+            " requests, " + (bytesAfter - bytesBefore) + " bytes fetched from Azure");
+    }
+
+    @Test
     @Order(1)
     void testDiskCachePopulation() throws Exception {
         System.out.println("\n=== Test 1: Azure Disk Cache Population ===");
@@ -243,6 +299,12 @@ public class RealAzureDiskCacheTest {
                 .withTieredCache(tieredConfig);
 
         try (SplitCacheManager cacheManager = SplitCacheManager.getInstance(cacheConfig)) {
+            // 🎯 CRITICAL: Reset Azure request counters BEFORE query to verify disk cache is used
+            SplitCacheManager.resetObjectStorageRequestStats();
+            long requestsBefore = SplitCacheManager.getObjectStorageRequestCount();
+            long bytesBefore = SplitCacheManager.getObjectStorageBytesFetched();
+            System.out.println("   Azure request counters reset: requests=" + requestsBefore + ", bytes=" + bytesBefore);
+
             try (SplitSearcher searcher = cacheManager.createSplitSearcher(splitAzureUrl, splitMetadata)) {
                 // Search again - should hit disk cache
                 SplitQuery query = searcher.parseQuery("content:searchable");
@@ -260,6 +322,18 @@ public class RealAzureDiskCacheTest {
                 }
             }
 
+            // 🎯 CRITICAL: Verify NO Azure requests were made - all data served from disk cache
+            long requestsAfter = SplitCacheManager.getObjectStorageRequestCount();
+            long bytesAfter = SplitCacheManager.getObjectStorageBytesFetched();
+            System.out.println("   Azure requests after query: requests=" + requestsAfter + ", bytes=" + bytesAfter);
+
+            assertEquals(0, requestsAfter - requestsBefore,
+                "🚨 DISK CACHE FAILURE: Expected 0 Azure requests but got " + (requestsAfter - requestsBefore) +
+                ". Data should be served from L2 disk cache, not from Azure!");
+            assertEquals(0, bytesAfter - bytesBefore,
+                "🚨 DISK CACHE FAILURE: Expected 0 bytes from Azure but got " + (bytesAfter - bytesBefore) +
+                ". Data should be served from L2 disk cache!");
+
             // Verify disk cache stats show data
             SplitCacheManager.DiskCacheStats stats = cacheManager.getDiskCacheStats();
             if (stats != null) {
@@ -267,7 +341,7 @@ public class RealAzureDiskCacheTest {
             }
         }
 
-        System.out.println("✅ Azure disk cache persistence test passed");
+        System.out.println("✅ Azure disk cache persistence test passed - ZERO Azure requests!");
     }
 
     @Test

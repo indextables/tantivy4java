@@ -449,9 +449,15 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_
         if let Some(cache_name_arc) = crate::utils::jlong_to_arc::<String>(ptr) {
             // Check if this manager has a disk cache and clear caches
             if let Some(manager) = managers.get(&*cache_name_arc) {
-                if manager.disk_cache.is_some() {
+                if let Some(disk_cache) = &manager.disk_cache {
+                    // 🔧 CRITICAL FIX: Flush all pending writes BEFORE clearing references
+                    // This ensures the background writer can still access the cache to write data
+                    debug_println!("🔵 FLUSH: Flushing disk cache for '{}' before cleanup", *cache_name_arc);
+                    disk_cache.flush_blocking();
+                    debug_println!("🔵 FLUSH: Disk cache flush complete for '{}'", *cache_name_arc);
+
                     debug_println!("RUST DEBUG: Clearing caches for cache '{}' with disk cache", *cache_name_arc);
-                    // Clear searcher cache first - this releases Arc<Searcher> which holds
+                    // Clear searcher cache - this releases Arc<Searcher> which holds
                     // references to StorageWithPersistentCache -> L2DiskCache
                     crate::split_searcher_replacement::clear_searcher_cache();
                     // Then clear the global disk cache reference
