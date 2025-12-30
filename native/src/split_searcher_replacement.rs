@@ -160,6 +160,9 @@ const BYTES_PER_DOCUMENT: usize = 50;
 const MAX_ACCEPTABLE_GAPS: usize = 3;
 const PREFETCH_ADJACENT_THRESHOLD: f64 = 0.8; // 80% cache hit rate triggers prefetch
 
+// Note: L1 cache capacity is now managed in global_cache.rs via get_or_create_global_l1_cache()
+// Default is 256MB, configurable via TANTIVY4JAVA_L1_CACHE_MB environment variable
+
 /// Extract split metadata for adaptive memory allocation
 /// Returns (num_docs, file_size_bytes) if available from split metadata
 fn extract_split_metadata_for_allocation(split_uri: &str) -> Option<(usize, usize)> {
@@ -940,23 +943,19 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_crea
                             num_docs: 0,
                         };
 
-                        // 🚀 BATCH OPTIMIZATION FIX: Create ByteRangeCache for prefetch optimization
-                        // This cache will be shared between prefetch_ranges and doc_async (via CachingDirectory)
+                        // 🚀 BATCH OPTIMIZATION FIX: Use SHARED global ByteRangeCache for all splits
+                        // This provides memory-efficient caching - one bounded 256MB cache shared by all splits
+                        // instead of per-split caches that could exhaust memory.
                         //
                         // DEBUGGING: L1 cache can be disabled via TieredCacheConfig.withDisableL1Cache(true)
                         // to help debug cache key mismatches between prewarm and query operations.
-                        let disable_l1_cache = crate::global_cache::is_l1_cache_disabled();
-                        eprintln!("🔍 L1_CHECK: is_l1_cache_disabled() = {}", disable_l1_cache);
-                        let (byte_range_cache, byte_range_cache_for_open): (Option<ByteRangeCache>, Option<ByteRangeCache>) = if disable_l1_cache {
-                            eprintln!("⚠️ L1_CACHE_DISABLED: ByteRangeCache set to None - all reads go to L2 disk cache / L3 storage");
-                            (None, None)
+                        let byte_range_cache = crate::global_cache::get_or_create_global_l1_cache();
+                        let byte_range_cache_for_open = byte_range_cache.clone();
+                        if byte_range_cache.is_some() {
+                            eprintln!("🚀 L1_CACHE_ENABLED: Using shared global ByteRangeCache");
                         } else {
-                            let cache = ByteRangeCache::with_infinite_capacity(
-                                &STORAGE_METRICS.shortlived_cache,
-                            );
-                            eprintln!("🚀 L1_CACHE_ENABLED: Created ByteRangeCache for prefetch optimization");
-                            (Some(cache.clone()), Some(cache))
-                        };
+                            eprintln!("⚠️ L1_CACHE_DISABLED: ByteRangeCache set to None - all reads go to L2 disk cache / L3 storage");
+                        }
 
                         // 🚀 OPTIMIZATION: Call open_index_with_caches FIRST to populate split_footer_cache
                         // This eliminates redundant footer fetches when we parse bundle offsets below
@@ -4320,6 +4319,19 @@ pub(crate) struct CachedSearcherContext {
     // This allows prefetch to populate the same cache that doc_async uses
     pub(crate) byte_range_cache: Option<ByteRangeCache>,
     pub(crate) bundle_file_offsets: std::collections::HashMap<std::path::PathBuf, std::ops::Range<u64>>,
+}
+
+impl CachedSearcherContext {
+    /// Clear the L1 ByteRangeCache to free memory.
+    ///
+    /// This should be called after prewarm operations to prevent unbounded memory growth.
+    /// The prewarmed data is safely persisted in L2 disk cache, so clearing L1 is safe.
+    /// Subsequent queries will populate L1 on-demand from L2.
+    pub fn clear_l1_cache(&self) {
+        if let Some(cache) = &self.byte_range_cache {
+            cache.clear();
+        }
+    }
 }
 
 // Dead code removed - perform_real_quickwit_doc_retrieval function was not called anywhere

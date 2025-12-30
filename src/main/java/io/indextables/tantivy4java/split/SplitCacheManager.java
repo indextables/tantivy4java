@@ -1289,6 +1289,18 @@ public class SplitCacheManager implements AutoCloseable {
     static native long nativeGetStorageQueryDownloadBytes();
     static native void nativeResetStorageDownloadMetrics();
 
+    // ========================================
+    // L1 ByteRangeCache Statistics Native Methods
+    // ========================================
+    static native long nativeGetL1CacheSize();
+    static native long nativeGetL1CacheCapacity();
+    static native long nativeGetL1CacheEvictions();
+    static native long nativeGetL1CacheEvictedBytes();
+    static native long nativeGetL1CacheHits();
+    static native long nativeGetL1CacheMisses();
+    static native void nativeClearL1Cache();
+    static native void nativeResetL1Cache();
+
     /**
      * Get global batch optimization metrics.
      *
@@ -1730,6 +1742,144 @@ public class SplitCacheManager implements AutoCloseable {
             return String.format(
                 "DiskCacheStats{totalBytes=%d, maxBytes=%d, usage=%.1f%%, splits=%d, components=%d}",
                 totalBytes, maxBytes, getUsagePercent(), splitCount, componentCount
+            );
+        }
+    }
+
+    // ========================================
+    // L1 Cache Statistics API
+    // ========================================
+
+    /**
+     * Get L1 cache (ByteRangeCache) statistics.
+     *
+     * <p>The L1 cache is the in-memory cache layer that provides fastest access to
+     * recently accessed data. It is bounded by the capacity configured via
+     * {@link CacheConfig#withMaxCacheSize(long)} and automatically evicts entries
+     * when capacity is exceeded.
+     *
+     * <p><strong>Example Usage:</strong>
+     * <pre>{@code
+     * L1CacheStats stats = SplitCacheManager.getL1CacheStats();
+     * System.out.println("L1 Cache Usage: " + stats.getSizeBytes() + " / " + stats.getCapacityBytes());
+     * System.out.println("Hit Rate: " + stats.getHitRate() + "%");
+     * System.out.println("Total Evictions: " + stats.getEvictions());
+     * }</pre>
+     *
+     * @return L1 cache statistics snapshot
+     */
+    public static L1CacheStats getL1CacheStats() {
+        return new L1CacheStats(
+            nativeGetL1CacheSize(),
+            nativeGetL1CacheCapacity(),
+            nativeGetL1CacheHits(),
+            nativeGetL1CacheMisses(),
+            nativeGetL1CacheEvictions(),
+            nativeGetL1CacheEvictedBytes()
+        );
+    }
+
+    /**
+     * Clear the L1 cache (ByteRangeCache).
+     *
+     * <p>This frees all memory used by the L1 cache. Data is still available in
+     * the L2 disk cache and will be reloaded on demand.
+     */
+    public static void clearL1Cache() {
+        nativeClearL1Cache();
+    }
+
+    /**
+     * Reset the L1 cache to allow reinitialization with new capacity.
+     *
+     * <p>This is primarily for testing scenarios where you need to change the L1
+     * cache capacity between tests. In production, you typically configure the
+     * capacity once via {@link CacheConfig#withMaxCacheSize(long)}.
+     *
+     * <p>After calling this method, the next {@link SplitCacheManager#getInstance(CacheConfig)}
+     * call will create a new L1 cache with the capacity from the new CacheConfig.
+     */
+    public static void resetL1Cache() {
+        nativeResetL1Cache();
+    }
+
+    /**
+     * L1 cache (ByteRangeCache) statistics.
+     *
+     * <p>The L1 cache is a bounded in-memory cache that automatically evicts entries
+     * when the configured capacity is exceeded. This prevents OOM during large prewarm
+     * operations while still providing fast access to recently used data.
+     *
+     * <p><b>Key Metrics:</b>
+     * <ul>
+     *   <li><b>sizeBytes</b> - Current memory usage in bytes</li>
+     *   <li><b>capacityBytes</b> - Maximum allowed size (configured via withMaxCacheSize)</li>
+     *   <li><b>evictions</b> - Number of times the cache was cleared due to capacity exceeded</li>
+     *   <li><b>evictedBytes</b> - Total bytes evicted from the cache</li>
+     *   <li><b>hits/misses</b> - Cache access statistics for hit rate calculation</li>
+     * </ul>
+     */
+    public static class L1CacheStats {
+        private final long sizeBytes;
+        private final long capacityBytes;
+        private final long hits;
+        private final long misses;
+        private final long evictions;
+        private final long evictedBytes;
+
+        L1CacheStats(long sizeBytes, long capacityBytes, long hits, long misses,
+                     long evictions, long evictedBytes) {
+            this.sizeBytes = sizeBytes;
+            this.capacityBytes = capacityBytes;
+            this.hits = hits;
+            this.misses = misses;
+            this.evictions = evictions;
+            this.evictedBytes = evictedBytes;
+        }
+
+        /** Current size of L1 cache in bytes. */
+        public long getSizeBytes() { return sizeBytes; }
+
+        /** Maximum capacity of L1 cache in bytes (0 if unlimited). */
+        public long getCapacityBytes() { return capacityBytes; }
+
+        /** Number of cache hits. */
+        public long getHits() { return hits; }
+
+        /** Number of cache misses. */
+        public long getMisses() { return misses; }
+
+        /** Number of items evicted from the cache. */
+        public long getEvictions() { return evictions; }
+
+        /** Total bytes evicted from the cache. */
+        public long getEvictedBytes() { return evictedBytes; }
+
+        /** Total cache accesses (hits + misses). */
+        public long getTotalAccesses() { return hits + misses; }
+
+        /**
+         * Cache hit rate as percentage (0-100).
+         * Returns 0 if no accesses have been recorded.
+         */
+        public double getHitRate() {
+            long total = getTotalAccesses();
+            return total == 0 ? 0.0 : (hits * 100.0 / total);
+        }
+
+        /**
+         * Cache usage as percentage (0-100).
+         * Returns 0 if capacity is 0 (unlimited).
+         */
+        public double getUsagePercent() {
+            return capacityBytes == 0 ? 0.0 : (sizeBytes * 100.0 / capacityBytes);
+        }
+
+        @Override
+        public String toString() {
+            return String.format(
+                "L1CacheStats{size=%d, capacity=%d, usage=%.1f%%, hits=%d, misses=%d, hitRate=%.1f%%, evictions=%d, evictedBytes=%d}",
+                sizeBytes, capacityBytes, getUsagePercent(), hits, misses, getHitRate(), evictions, evictedBytes
             );
         }
     }

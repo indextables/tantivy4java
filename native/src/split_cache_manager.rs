@@ -54,6 +54,10 @@ impl GlobalSplitCacheManager {
         // All async operations should use the shared global runtime via QuickwitRuntimeManager
         debug_println!("🔧 RUNTIME_FIX: Eliminating separate Tokio runtime to prevent deadlocks");
 
+        // Set the L1 cache capacity from Java's CacheConfig.withMaxCacheSize()
+        // This ensures the global shared L1 cache uses the Java-configured size
+        crate::global_cache::set_l1_cache_capacity(max_cache_size);
+
         // Note: We're using the global caches from GLOBAL_SEARCHER_COMPONENTS
         // This ensures all split cache managers share the same underlying caches
         // following Quickwit's architecture pattern
@@ -1115,6 +1119,85 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_
         },
         None => 0,
     }
+}
+
+// =====================================================================
+// L1 ByteRangeCache Statistics JNI Methods
+// =====================================================================
+// These functions expose the global shared L1 cache statistics to Java
+// for monitoring and testing cache eviction behavior.
+// =====================================================================
+
+/// Get the current size of the global L1 cache in bytes
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_nativeGetL1CacheSize(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jlong {
+    crate::global_cache::get_global_l1_cache_size() as jlong
+}
+
+/// Get the configured capacity of the global L1 cache in bytes
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_nativeGetL1CacheCapacity(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jlong {
+    crate::global_cache::get_global_l1_cache_capacity() as jlong
+}
+
+/// Get the number of items evicted from the L1 cache (from Quickwit's shortlived_cache metrics)
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_nativeGetL1CacheEvictions(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jlong {
+    quickwit_storage::STORAGE_METRICS.shortlived_cache.evict_num_items.get() as jlong
+}
+
+/// Get the total bytes evicted from the L1 cache
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_nativeGetL1CacheEvictedBytes(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jlong {
+    quickwit_storage::STORAGE_METRICS.shortlived_cache.evict_num_bytes.get() as jlong
+}
+
+/// Get the number of cache hits in the L1 cache
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_nativeGetL1CacheHits(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jlong {
+    quickwit_storage::STORAGE_METRICS.shortlived_cache.hits_num_items.get() as jlong
+}
+
+/// Get the number of cache misses in the L1 cache
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_nativeGetL1CacheMisses(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jlong {
+    quickwit_storage::STORAGE_METRICS.shortlived_cache.misses_num_items.get() as jlong
+}
+
+/// Clear the global L1 cache
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_nativeClearL1Cache(
+    _env: JNIEnv,
+    _class: JClass,
+) {
+    crate::global_cache::clear_global_l1_cache();
+}
+
+/// Reset the global L1 cache (for testing - allows reinitialization with new capacity)
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_nativeResetL1Cache(
+    _env: JNIEnv,
+    _class: JClass,
+) {
+    crate::global_cache::reset_global_l1_cache();
 }
 
 // =====================================================================

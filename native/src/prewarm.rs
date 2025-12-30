@@ -53,9 +53,23 @@ use tantivy::schema::FieldType;
 
 use crate::debug_println;
 use crate::disk_cache::L2DiskCache;
-use crate::global_cache::get_global_disk_cache;
+use crate::global_cache::{get_global_disk_cache, clear_global_l1_cache};
 use crate::split_searcher_replacement::CachedSearcherContext;
 use crate::utils::with_arc_safe;
+
+/// Clear global L1 ByteRangeCache after prewarm to prevent memory exhaustion.
+///
+/// This can be called after prewarm operations complete to release memory.
+/// The prewarmed data is safely persisted in L2 disk cache, so clearing L1 is safe.
+/// Subsequent queries will populate L1 on-demand from L2 (disk cache hits).
+///
+/// Note: Since L1 is now bounded with auto-eviction (256MB default), this is optional
+/// but still useful for reclaiming memory immediately after large prewarm operations.
+pub fn clear_l1_cache_after_prewarm(_searcher_ptr: jlong) {
+    // Clear the global shared L1 cache (no longer per-searcher)
+    clear_global_l1_cache();
+    debug_println!("🧹 PREWARM_L1_CLEAR: Global L1 ByteRangeCache cleared after prewarm");
+}
 
 /// Parse split URI into (storage_loc, split_id) for L2 disk cache keys.
 ///
@@ -88,19 +102,22 @@ fn parse_split_uri(split_uri: &str) -> (String, String) {
 
 /// Helper function to cache all files with a given extension from the bundle.
 ///
-/// This implements DISK-ONLY caching to prevent memory exhaustion during prewarm.
-/// Data is written ONLY to L2DiskCache - NEVER to L1 memory cache.
+/// This implements DISK-ONLY caching as the primary prewarm strategy.
+/// Data is written ONLY to L2DiskCache - bypassing L1 memory cache.
 ///
 /// # Memory-Safe Prewarm Design
 ///
-/// The L1 ByteRangeCache uses `with_infinite_capacity()` and never evicts entries.
-/// When prewarming many segments, writing to L1 would eventually exhaust RAM.
-/// By writing ONLY to L2DiskCache, we:
-/// 1. Populate persistent disk cache for fast reads
-/// 2. Avoid memory exhaustion from unbounded L1 growth
+/// The L1 ByteRangeCache now uses bounded capacity with automatic eviction when full.
+/// However, for large prewarm operations, we still prefer writing directly to L2DiskCache:
+/// 1. Populate persistent disk cache for fast reads across JVM restarts
+/// 2. Avoid L1 churn during bulk prewarm operations
 /// 3. Allow subsequent searches to find data in L2 and populate L1 on-demand
 ///
-/// **IMPORTANT**: If no disk cache is configured, prewarm is a NO-OP to prevent OOM.
+/// Note: L1 is now bounded (default 256MB, configurable via TANTIVY4JAVA_L1_CACHE_MB)
+/// and will auto-evict when full, so OOM is no longer a risk. However, direct L2
+/// writes are still preferred for prewarm efficiency.
+///
+/// **IMPORTANT**: If no disk cache is configured, prewarm is a NO-OP.
 /// Configure TieredCacheConfig with a disk cache path to enable prewarm functionality.
 ///
 /// # Arguments
@@ -788,18 +805,17 @@ pub async fn prewarm_fastfields_for_fields(
 
 /// Async implementation of store (document storage) prewarming
 ///
-/// This uses DISK-ONLY caching to prevent memory exhaustion:
+/// This uses DISK-ONLY caching as the primary prewarm strategy:
 /// 1. Read entire .store files from the bundle into L2 disk cache
 /// 2. Cache with component path and byte range (0..file_length)
 /// 3. L2DiskCache serves sub-range queries via mmap for efficiency
 ///
 /// # Memory-Safe Prewarm Design
 ///
-/// When prewarming many segments, writing to L1 memory cache would exhaust RAM
-/// since ByteRangeCache uses `with_infinite_capacity()` and never evicts.
-/// By writing directly to L2DiskCache, we:
-/// 1. Populate persistent disk cache for fast document retrieval
-/// 2. Avoid memory exhaustion from unbounded L1 growth
+/// The L1 ByteRangeCache is now bounded (256MB default, configurable) with auto-eviction.
+/// However, for large prewarm operations, we still prefer writing directly to L2DiskCache:
+/// 1. Populate persistent disk cache for fast document retrieval across JVM restarts
+/// 2. Avoid L1 churn during bulk prewarm operations
 /// 3. Allow subsequent document fetches to find data in L2 and populate L1 on-demand
 pub async fn prewarm_store_impl(searcher_ptr: jlong) -> anyhow::Result<()> {
     debug_println!("🔥 PREWARM_STORE: Starting document store warmup (disk-only caching)");
