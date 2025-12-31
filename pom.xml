@@ -6,7 +6,7 @@
 
     <groupId>io.indextables</groupId>
     <artifactId>tantivy4java</artifactId>
-    <version>0.26.10</version>
+    <version>0.26.11</version>
     <packaging>jar</packaging>
 
     <name>Tantivy4Java Experimental</name>

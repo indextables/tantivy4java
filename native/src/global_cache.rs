@@ -588,7 +588,7 @@ fn get_configured_capacity_holder() -> &'static std::sync::RwLock<Option<u64>> {
 pub fn set_l1_cache_capacity(capacity_bytes: u64) {
     let holder = get_configured_capacity_holder();
     let mut guard = holder.write().unwrap();
-    eprintln!("⚙️ L1_CACHE_CONFIG: Setting L1 cache capacity from Java: {} MB", capacity_bytes / 1024 / 1024);
+    debug_println!("⚙️ L1_CACHE_CONFIG: Setting L1 cache capacity from Java: {} MB", capacity_bytes / 1024 / 1024);
     *guard = Some(capacity_bytes);
 }
 
@@ -607,7 +607,7 @@ pub fn reset_global_l1_cache() {
         let holder = get_l1_cache_holder();
         let mut guard = holder.write().unwrap();
         if guard.is_some() {
-            eprintln!("🔄 L1_CACHE_RESET: Resetting global L1 cache (will be recreated on next access)");
+            debug_println!("🔄 L1_CACHE_RESET: Resetting global L1 cache (will be recreated on next access)");
         }
         *guard = None;
     }
@@ -644,7 +644,7 @@ pub fn get_or_create_global_l1_cache() -> Option<ByteRangeCache> {
         capacity,
         &quickwit_storage::STORAGE_METRICS.shortlived_cache,
     );
-    eprintln!("🚀 GLOBAL_L1_CACHE: Created shared ByteRangeCache with {} MB capacity", capacity / 1024 / 1024);
+    debug_println!("🚀 GLOBAL_L1_CACHE: Created shared ByteRangeCache with {} MB capacity", capacity / 1024 / 1024);
     *guard = Some(cache.clone());
     Some(cache)
 }
@@ -658,7 +658,7 @@ fn get_l1_cache_capacity_bytes() -> u64 {
     let holder = get_configured_capacity_holder();
     if let Ok(guard) = holder.read() {
         if let Some(capacity) = *guard {
-            eprintln!("⚙️ L1_CACHE_CONFIG: Using Java-configured capacity: {} MB", capacity / 1024 / 1024);
+            debug_println!("⚙️ L1_CACHE_CONFIG: Using Java-configured capacity: {} MB", capacity / 1024 / 1024);
             return capacity;
         }
     }
@@ -667,15 +667,15 @@ fn get_l1_cache_capacity_bytes() -> u64 {
     if let Ok(env_mb) = std::env::var("TANTIVY4JAVA_L1_CACHE_MB") {
         if let Ok(mb) = env_mb.parse::<u64>() {
             if mb > 0 && mb <= 8192 { // Reasonable bounds: 1MB to 8GB
-                eprintln!("⚙️ L1_CACHE_CONFIG: Using env var capacity: {} MB", mb);
+                debug_println!("⚙️ L1_CACHE_CONFIG: Using env var capacity: {} MB", mb);
                 return mb * 1024 * 1024;
             }
-            eprintln!("⚠️ L1_CACHE_CONFIG: Invalid TANTIVY4JAVA_L1_CACHE_MB value: {}, using default", env_mb);
+            debug_println!("⚠️ L1_CACHE_CONFIG: Invalid TANTIVY4JAVA_L1_CACHE_MB value: {}, using default", env_mb);
         }
     }
 
     // Priority 3: Default
-    eprintln!("⚙️ L1_CACHE_CONFIG: Using default capacity: {} MB", DEFAULT_L1_CACHE_CAPACITY_MB);
+    debug_println!("⚙️ L1_CACHE_CONFIG: Using default capacity: {} MB", DEFAULT_L1_CACHE_CAPACITY_MB);
     DEFAULT_L1_CACHE_CAPACITY_MB * 1024 * 1024
 }
 
@@ -724,10 +724,10 @@ pub fn set_disable_l1_cache(disable: bool) {
     let holder = get_disable_l1_cache_holder();
     let mut guard = holder.write().unwrap();
     if disable {
-        eprintln!("⚠️ L1_CACHE_DISABLED: ByteRangeCache disabled for debugging via TieredCacheConfig");
-        eprintln!("   All storage requests will bypass L1 memory cache and go to L2 disk cache / L3 storage");
+        debug_println!("⚠️ L1_CACHE_DISABLED: ByteRangeCache disabled for debugging via TieredCacheConfig");
+        debug_println!("   All storage requests will bypass L1 memory cache and go to L2 disk cache / L3 storage");
     } else {
-        eprintln!("🟢 L1_CACHE_ENABLED: ByteRangeCache enabled (normal operation)");
+        debug_println!("🟢 L1_CACHE_ENABLED: ByteRangeCache enabled (normal operation)");
     }
     *guard = disable;
 }

@@ -195,7 +195,7 @@ async fn cache_files_by_extension(
         // NOT with inner path and relative range, which was causing cache key mismatches!
         let cache_range = bundle_start as u64..bundle_end as u64;
 
-        eprintln!("🔑 PREWARM_CACHE_KEY: storage_loc='{}', split_id='{}', component='{}', range={:?}",
+        debug_println!("🔑 PREWARM_CACHE_KEY: storage_loc='{}', split_id='{}', component='{}', range={:?}",
                       storage_loc, split_id, storage_component, cache_range);
 
         // Check if data is already in L2 disk cache - skip download if so

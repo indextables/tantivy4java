@@ -29,7 +29,8 @@ use memmap2::Mmap;
 use crate::debug_println;
 use serde::{Deserialize, Serialize};
 use tantivy::directory::OwnedBytes;
-use tokio::sync::mpsc;
+// Use std::sync::mpsc for the write queue - it works from both sync and async contexts.
+// tokio::sync::mpsc::blocking_send() panics from async context, so we can't use it.
 
 /// Subdirectory name for the disk cache within the root path
 const CACHE_SUBDIR: &str = "tantivy4java_slicecache";
@@ -590,7 +591,10 @@ pub struct L2DiskCache {
     lru_table: Mutex<SplitLruTable>,
     /// Memory-mapped file cache for fast random access
     mmap_cache: Mutex<MmapCache>,
-    write_tx: mpsc::UnboundedSender<WriteRequest>,
+    /// Bounded channel to prevent OOM during bulk prewarm operations.
+    /// When queue is full, put() blocks until there's room (backpressure).
+    /// Uses std::sync::mpsc which works from both sync and async contexts.
+    write_tx: std::sync::mpsc::SyncSender<WriteRequest>,
     total_bytes: AtomicU64,
     max_bytes: u64,
     /// Shutdown flag for background threads
@@ -628,8 +632,17 @@ impl L2DiskCache {
             split_states.insert(split_key.clone(), SplitState::from_entry(split_entry));
         }
 
-        // Create background writer channel
-        let (write_tx, write_rx) = mpsc::unbounded_channel();
+        // Create BOUNDED background writer channel to prevent OOM during bulk prewarm.
+        // When queue fills up, put() will block (backpressure), throttling downloads
+        // to match disk write speed.
+        //
+        // Queue size rationale for large splits (5GB+):
+        // - Individual components can be 500MB-2GB each
+        // - 16 items × 500MB = 8GB max queued memory
+        // - Small enough to prevent OOM, large enough for write batching
+        // Uses std::sync::mpsc::sync_channel which works from both sync and async contexts.
+        const WRITE_QUEUE_CAPACITY: usize = 16;
+        let (write_tx, write_rx) = std::sync::mpsc::sync_channel(WRITE_QUEUE_CAPACITY);
         let shutdown_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         // Determine mmap cache size (use default if 0)
@@ -1127,7 +1140,9 @@ impl L2DiskCache {
             self.trigger_eviction((self.max_bytes * 90) / 100);
         }
 
-        // Send to background writer
+        // Send to background writer with BACKPRESSURE.
+        // SyncSender::send() blocks if the queue is full, throttling downloads
+        // to match disk write speed. This prevents OOM during bulk prewarm.
         let _ = self.write_tx.send(WriteRequest::Put {
             storage_loc: storage_loc.to_string(),
             split_id: split_id.to_string(),
@@ -1173,11 +1188,15 @@ impl L2DiskCache {
 
     /// Flush all pending writes to disk and wait for completion (async version).
     ///
-    /// This method blocks until all previously queued Put requests have been
-    /// processed by the background writer. Use this to ensure data is persisted
-    /// before reading from the cache.
+    /// This method blocks (in an async-friendly way) until all previously queued
+    /// Put requests have been processed by the background writer. Use this to
+    /// ensure data is persisted before reading from the cache.
+    ///
+    /// Note: Since we use std::sync::mpsc for backpressure, the send is synchronous.
+    /// The async wait is only for the completion signal.
     pub async fn flush_async(&self) {
         let (tx, rx) = tokio::sync::oneshot::channel();
+        // SyncSender::send() is synchronous and blocking (provides backpressure)
         if self.write_tx.send(WriteRequest::Flush(tx)).is_ok() {
             // Wait asynchronously for the flush to complete
             let _ = rx.await;
@@ -1186,80 +1205,136 @@ impl L2DiskCache {
 
     /// Flush all pending writes to disk and wait for completion (blocking version).
     ///
-    /// This method should only be called from a non-async context (e.g., JNI callbacks).
-    /// For async contexts, use `flush_async()` instead.
-    ///
-    /// Note: Calling this from within a tokio async context will panic.
+    /// This method can be called from any context (sync or async) since we use
+    /// std::sync::mpsc channels internally.
     pub fn flush_blocking(&self) {
         let (tx, rx) = tokio::sync::oneshot::channel();
+        // SyncSender::send() is synchronous and blocking (provides backpressure)
         if self.write_tx.send(WriteRequest::Flush(tx)).is_ok() {
             // Block until the flush is processed
             let _ = rx.blocking_recv();
         }
     }
 
-    /// Background writer thread (static version using Weak reference)
+    /// Background writer thread with parallel async I/O
+    ///
+    /// Uses std::sync::mpsc::Receiver for bounded channel with backpressure.
+    /// Spawns async write tasks on a tokio runtime with num_cpus worker threads.
+    /// A semaphore limits concurrent writes to num_cpus for optimal parallelism.
+    ///
+    /// Backpressure flow:
+    /// 1. Sender calls put() → sync_channel.send() blocks if queue full
+    /// 2. This thread recv()s requests from the bounded queue
+    /// 3. Before spawning write task, acquires semaphore permit
+    /// 4. If all writers busy, blocks on semaphore → recv loop stalls
+    /// 5. Bounded channel fills up → senders block
     fn background_writer_static(
-        mut rx: mpsc::UnboundedReceiver<WriteRequest>,
+        rx: std::sync::mpsc::Receiver<WriteRequest>,
         cache_weak: std::sync::Weak<Self>,
     ) {
-        let runtime = tokio::runtime::Builder::new_current_thread()
+        let num_writers = num_cpus::get();
+        debug_println!("🚀 L2DiskCache: Starting {} parallel async writers", num_writers);
+
+        // Create tokio runtime with num_cpus worker threads for parallel async I/O
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(num_writers)
+            .thread_name("disk-cache-writer")
             .enable_all()
             .build()
             .expect("Failed to create tokio runtime for disk cache");
 
-        runtime.block_on(async {
-            while let Some(req) = rx.recv().await {
-                // Try to upgrade weak reference - if cache is dropped, exit
-                let cache = match cache_weak.upgrade() {
-                    Some(c) => c,
-                    None => break,
-                };
+        // Semaphore limits concurrent writes to num_cpus
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(num_writers));
 
-                match req {
-                    WriteRequest::Put {
-                        storage_loc,
-                        split_id,
-                        component,
-                        byte_range,
-                        data,
-                    } => {
-                        if let Err(e) = cache.do_put(
-                            &storage_loc,
-                            &split_id,
-                            &component,
-                            byte_range.map(|r| r.start..r.end),
-                            &data,
-                        ) {
+        // Process requests - blocking recv is fine since this is a dedicated thread
+        while let Ok(req) = rx.recv() {
+            let cache = match cache_weak.upgrade() {
+                Some(c) => c,
+                None => break,
+            };
+
+            match req {
+                WriteRequest::Put {
+                    storage_loc,
+                    split_id,
+                    component,
+                    byte_range,
+                    data,
+                } => {
+                    // Acquire permit BEFORE spawning - blocks if all writers busy
+                    // This provides backpressure: when blocked here, recv loop stalls,
+                    // bounded channel fills, and senders block on put()
+                    let permit = match runtime.block_on(semaphore.clone().acquire_owned()) {
+                        Ok(p) => p,
+                        Err(_) => continue, // Semaphore closed
+                    };
+
+                    // Spawn async write task
+                    runtime.spawn(async move {
+                        if let Err(e) = cache
+                            .do_put_async(
+                                &storage_loc,
+                                &split_id,
+                                &component,
+                                byte_range.map(|r| r.start..r.end),
+                                &data,
+                            )
+                            .await
+                        {
                             debug_println!("Disk cache write error: {}", e);
                         }
-                    }
-                    WriteRequest::Evict {
-                        storage_loc,
-                        split_id,
-                    } => {
-                        if let Err(e) = cache.do_evict(&storage_loc, &split_id) {
+                        drop(permit); // Release permit when write completes
+                    });
+                }
+                WriteRequest::Evict {
+                    storage_loc,
+                    split_id,
+                } => {
+                    // Eviction can run in parallel too
+                    let permit = match runtime.block_on(semaphore.clone().acquire_owned()) {
+                        Ok(p) => p,
+                        Err(_) => continue,
+                    };
+
+                    runtime.spawn(async move {
+                        if let Err(e) = cache.do_evict_async(&storage_loc, &split_id).await {
                             debug_println!("Disk cache evict error: {}", e);
                         }
+                        drop(permit);
+                    });
+                }
+                WriteRequest::SyncManifest => {
+                    // Manifest sync is quick, run synchronously
+                    if let Err(e) = cache.do_sync_manifest() {
+                        debug_println!("Disk cache manifest sync error: {}", e);
                     }
-                    WriteRequest::SyncManifest => {
-                        if let Err(e) = cache.do_sync_manifest() {
-                            debug_println!("Disk cache manifest sync error: {}", e);
-                        }
-                    }
-                    WriteRequest::Flush(tx) => {
-                        // Sync manifest to disk before signaling completion
-                        // This ensures all cached data is discoverable after process restart
+                }
+                WriteRequest::Flush(tx) => {
+                    // Wait for ALL pending writes to complete by acquiring all permits
+                    runtime.block_on(async {
+                        let _all_permits = semaphore
+                            .acquire_many(num_writers as u32)
+                            .await
+                            .expect("Semaphore closed during flush");
+
+                        // Now all writes are complete, sync manifest
                         if let Err(e) = cache.do_sync_manifest() {
                             debug_println!("Disk cache manifest sync error during flush: {}", e);
                         }
-                        // All previous requests have been processed, signal completion
+
+                        // Signal completion
                         let _ = tx.send(());
-                    }
-                    WriteRequest::Shutdown => break,
+                    });
                 }
+                WriteRequest::Shutdown => break,
             }
+        }
+
+        // Graceful shutdown: wait for all pending writes to complete
+        runtime.block_on(async {
+            let _ = semaphore.acquire_many(num_writers as u32).await;
         });
+        debug_println!("🛑 L2DiskCache: Writer thread shutdown complete");
     }
 
     /// Actually write data to disk
@@ -1445,6 +1520,181 @@ impl L2DiskCache {
         Ok(())
     }
 
+    /// Async version of do_put using tokio::fs for parallel I/O
+    async fn do_put_async(
+        &self,
+        storage_loc: &str,
+        split_id: &str,
+        component: &str,
+        byte_range: Option<Range<u64>>,
+        data: &[u8],
+    ) -> io::Result<()> {
+        use tokio::io::AsyncWriteExt;
+
+        // Compress if appropriate (CPU-bound, but fast)
+        let (compressed, compression) = self.compress_data(component, data);
+
+        // Create split directory
+        let split_dir = self.split_dir(storage_loc, split_id);
+        tokio::fs::create_dir_all(&split_dir).await?;
+
+        // Write to temp file then rename (atomic)
+        let final_path = self.component_path(
+            storage_loc,
+            split_id,
+            component,
+            byte_range.clone(),
+            compression,
+        );
+        let temp_path = final_path.with_extension("tmp");
+
+        // Async file write
+        {
+            let mut file = tokio::fs::File::create(&temp_path).await?;
+            file.write_all(&compressed).await?;
+            file.sync_all().await?;
+        }
+
+        tokio::fs::rename(&temp_path, &final_path).await?;
+
+        // Update manifest (sync - needs locking, but fast)
+        let split_key = CacheManifest::split_key(storage_loc, split_id);
+        let comp_key = CacheManifest::component_key(component, byte_range.clone());
+        let disk_size = compressed.len() as u64;
+        let uncompressed_size = data.len() as u64;
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let entry = ComponentEntry {
+            file_name: final_path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .to_string(),
+            uncompressed_size_bytes: uncompressed_size,
+            disk_size_bytes: disk_size,
+            compression,
+            component: component.to_string(),
+            byte_range: byte_range.as_ref().map(|r| (r.start, r.end)),
+            created_at: now,
+        };
+
+        {
+            let mut manifest = self.manifest.write().unwrap();
+
+            if !manifest.splits.contains_key(&split_key) {
+                manifest.splits.insert(
+                    split_key.clone(),
+                    SplitEntry {
+                        split_id: split_id.to_string(),
+                        storage_loc: storage_loc.to_string(),
+                        total_size_bytes: 0,
+                        last_accessed: now,
+                        components: HashMap::new(),
+                    },
+                );
+            }
+
+            let old_disk_size = manifest
+                .splits
+                .get(&split_key)
+                .and_then(|s| s.components.get(&comp_key))
+                .map(|c| c.disk_size_bytes)
+                .unwrap_or(0);
+
+            if old_disk_size > 0 {
+                manifest.total_bytes = manifest.total_bytes.saturating_sub(old_disk_size);
+                self.total_bytes.fetch_sub(old_disk_size, Ordering::Relaxed);
+            }
+
+            if let Some(split) = manifest.splits.get_mut(&split_key) {
+                if old_disk_size > 0 {
+                    split.total_size_bytes = split.total_size_bytes.saturating_sub(old_disk_size);
+                }
+                split.components.insert(comp_key, entry);
+                split.total_size_bytes += disk_size;
+                split.last_accessed = now;
+            }
+
+            manifest.total_bytes += disk_size;
+        }
+
+        self.total_bytes.fetch_add(disk_size, Ordering::Relaxed);
+
+        // Update range index
+        if let Some(ref range) = byte_range {
+            if let Ok(mut states) = self.split_states.write() {
+                let state = states
+                    .entry(split_key.clone())
+                    .or_insert_with(SplitState::new);
+
+                let index = state.get_or_create_index(component);
+                let comp_key = CacheManifest::component_key(component, byte_range.clone());
+
+                index.remove(&comp_key);
+                index.insert(CachedRange {
+                    start: range.start,
+                    end: range.end,
+                    cache_key: comp_key,
+                    compression,
+                });
+            }
+        }
+
+        // Update LRU
+        if let Ok(mut lru) = self.lru_table.lock() {
+            if let Ok(manifest) = self.manifest.read() {
+                if let Some(split) = manifest.splits.get(&split_key) {
+                    lru.touch(&split_key, split.total_size_bytes);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Async version of do_evict using tokio::fs
+    async fn do_evict_async(&self, storage_loc: &str, split_id: &str) -> io::Result<()> {
+        let split_key = CacheManifest::split_key(storage_loc, split_id);
+        let split_dir = self.split_dir(storage_loc, split_id);
+
+        let size_to_remove = {
+            let manifest = self.manifest.read().unwrap();
+            manifest
+                .splits
+                .get(&split_key)
+                .map(|s| s.total_size_bytes)
+                .unwrap_or(0)
+        };
+
+        // Async directory removal
+        if tokio::fs::try_exists(&split_dir).await.unwrap_or(false) {
+            tokio::fs::remove_dir_all(&split_dir).await?;
+        }
+
+        // Update manifest (sync - fast)
+        {
+            let mut manifest = self.manifest.write().unwrap();
+            manifest.splits.remove(&split_key);
+            manifest.total_bytes = manifest.total_bytes.saturating_sub(size_to_remove);
+        }
+
+        self.total_bytes.fetch_sub(size_to_remove, Ordering::Relaxed);
+
+        if let Ok(mut states) = self.split_states.write() {
+            states.remove(&split_key);
+        }
+
+        if let Ok(mut lru) = self.lru_table.lock() {
+            lru.remove(&split_key);
+        }
+
+        Ok(())
+    }
+
     /// Actually sync manifest to disk
     fn do_sync_manifest(&self) -> io::Result<()> {
         let cache_dir = Self::cache_dir(&self.config.root_path);
@@ -1558,9 +1808,10 @@ impl Drop for L2DiskCache {
         // Signal shutdown to timer thread
         self.shutdown_flag.store(true, Ordering::SeqCst);
 
-        // Signal shutdown to writer thread and sync manifest first
-        let _ = self.write_tx.send(WriteRequest::SyncManifest);
-        let _ = self.write_tx.send(WriteRequest::Shutdown);
+        // Signal shutdown to writer thread and sync manifest first.
+        // Use try_send() to avoid blocking during Drop - if queue is full, shutdown anyway.
+        let _ = self.write_tx.try_send(WriteRequest::SyncManifest);
+        let _ = self.write_tx.try_send(WriteRequest::Shutdown);
 
         // Wait for background threads to process shutdown and release file handles
         // This is needed for test cleanup - JUnit @TempDir needs files to be closed
@@ -1991,37 +2242,11 @@ mod tests {
         assert_eq!(total_found, 20, "All entries should be cached");
     }
 
-    #[test]
-    fn test_large_data_compression_ratio() {
-        let temp_dir = TempDir::new().unwrap();
-        let config = DiskCacheConfig {
-            root_path: temp_dir.path().to_path_buf(),
-            compression: CompressionAlgorithm::Lz4,
-            min_compress_size: 1000,
-            ..Default::default()
-        };
-        let cache = L2DiskCache::new(config).unwrap();
-
-        // Highly compressible data (repeated pattern)
-        let data: Vec<u8> = (0..50000).map(|i| (i % 10) as u8).collect();
-
-        // Use "other" component which still gets compressed (not term/store/idx/pos/fast)
-        cache.put("s3://bucket", "split-001", "other", None, &data);
-        std::thread::sleep(Duration::from_millis(100));
-
-        // Verify data is retrievable
-        let retrieved = cache.get("s3://bucket", "split-001", "other", None);
-        assert!(retrieved.is_some());
-        assert_eq!(retrieved.unwrap().as_slice(), data.as_slice());
-
-        // Check that compressed size is less than original
-        let total_bytes = cache.get_total_bytes();
-        assert!(
-            total_bytes < 50000,
-            "Compressed size {} should be less than original 50000",
-            total_bytes
-        );
-    }
+    // NOTE: test_large_data_compression_ratio was removed because compression
+    // was intentionally disabled for all components. Tantivy components are either:
+    // - Already internally compressed (store, term)
+    // - Block-accessed (idx, pos, fast) where whole-file decompression hurts performance
+    // See should_compress() for details.
 
     #[test]
     fn test_multiple_byte_ranges_same_component() {

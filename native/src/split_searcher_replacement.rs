@@ -952,9 +952,9 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_crea
                         let byte_range_cache = crate::global_cache::get_or_create_global_l1_cache();
                         let byte_range_cache_for_open = byte_range_cache.clone();
                         if byte_range_cache.is_some() {
-                            eprintln!("🚀 L1_CACHE_ENABLED: Using shared global ByteRangeCache");
+                            debug_println!("🚀 L1_CACHE_ENABLED: Using shared global ByteRangeCache");
                         } else {
-                            eprintln!("⚠️ L1_CACHE_DISABLED: ByteRangeCache set to None - all reads go to L2 disk cache / L3 storage");
+                            debug_println!("⚠️ L1_CACHE_DISABLED: ByteRangeCache set to None - all reads go to L2 disk cache / L3 storage");
                         }
 
                         // 🚀 OPTIMIZATION: Call open_index_with_caches FIRST to populate split_footer_cache

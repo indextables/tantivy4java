@@ -432,19 +432,34 @@ public class PrewarmCacheValidationTest {
             "Disk cache path should be a directory: " + cacheDir);
 
         // List all files in the cache directory recursively
+        // Handle race conditions with async disk cache writers (files may be renamed during walk)
         List<Path> cachedFiles = new ArrayList<>();
-        Files.walk(cacheDir)
-            .filter(Files::isRegularFile)
-            .forEach(cachedFiles::add);
+        try {
+            Files.walk(cacheDir)
+                .filter(p -> {
+                    try {
+                        return Files.isRegularFile(p) && !p.toString().endsWith(".tmp");
+                    } catch (Exception e) {
+                        return false; // File was renamed/deleted during walk
+                    }
+                })
+                .forEach(cachedFiles::add);
+        } catch (java.io.UncheckedIOException e) {
+            System.out.println("   (cache listing interrupted by concurrent writes)");
+        }
 
         System.out.println("   Disk cache directory: " + cacheDir);
         System.out.println("   Found " + cachedFiles.size() + " cached files:");
 
         long totalCacheSize = 0;
         for (Path file : cachedFiles) {
-            long fileSize = Files.size(file);
-            totalCacheSize += fileSize;
-            System.out.println("      - " + cacheDir.relativize(file) + " (" + fileSize + " bytes)");
+            try {
+                long fileSize = Files.size(file);
+                totalCacheSize += fileSize;
+                System.out.println("      - " + cacheDir.relativize(file) + " (" + fileSize + " bytes)");
+            } catch (java.nio.file.NoSuchFileException e) {
+                // File was renamed/deleted - skip it
+            }
         }
 
         System.out.println("   Total disk cache size: " + totalCacheSize + " bytes");
