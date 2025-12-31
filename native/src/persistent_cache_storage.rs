@@ -23,6 +23,7 @@ use tokio::io::AsyncRead;
 
 use crate::debug_println;
 use crate::disk_cache::{L2DiskCache, CoalesceResult, CachedSegment};
+use crate::global_cache::record_query_download;
 
 /// Statistics for L2 disk cache with coalescing
 #[derive(Debug, Default)]
@@ -168,6 +169,9 @@ impl StorageWithPersistentCache {
             let gap_usize = gap.start as usize..gap.end as usize;
             let gap_data = self.storage.get_slice(path, gap_usize).await?;
 
+            // Record download metrics for programmatic verification
+            record_query_download(gap_data.len() as u64);
+
             // Insert gap data into result buffer
             let offset_in_result = (gap.start - requested.start) as usize;
             let len = gap_data.len();
@@ -216,13 +220,15 @@ impl Storage for StorageWithPersistentCache {
     }
 
     async fn get_slice(&self, path: &Path, byte_range: Range<usize>) -> StorageResult<OwnedBytes> {
-        debug_println!("🔍 TIERED_CACHE: get_slice for {:?} range {:?}", path, byte_range);
-
         let component = Self::extract_component(path);
         let requested_range = byte_range.start as u64..byte_range.end as u64;
 
-        debug_println!("🔍 L2_COALESCE: Checking disk cache with coalescing - storage_loc={}, split_id={}, component={}, range={:?}",
+        // DETAILED DEBUG: Show exact cache key components being used for queries
+        // Compare these with PREWARM_CACHE_KEY output to find mismatches
+        debug_println!("🔑 QUERY_CACHE_KEY: storage_loc='{}', split_id='{}', component='{}', range={:?}",
                  self.storage_loc, self.split_id, component, requested_range);
+        debug_println!("   📁 Path file_name: {:?}", path.file_name());
+        debug_println!("   📂 Full path: {:?}", path);
 
         // Check L2 disk cache with range COALESCING
         let coalesce_result = self.disk_cache.get_coalesced(
@@ -254,10 +260,13 @@ impl Storage for StorageWithPersistentCache {
         }
 
         // Complete miss - fetch full range from S3
-        debug_println!("❌ CACHE_MISS: Fetching full range from storage (L3) for {:?}", path);
+        debug_println!("❌ L2_MISS: Fetching full range from storage (L3) for component='{}', range={:?}", component, requested_range);
         self.stats.l3_fetches.fetch_add(1, Ordering::Relaxed);
 
         let bytes = self.storage.get_slice(path, byte_range.clone()).await?;
+
+        // Record download metrics for programmatic verification
+        record_query_download(bytes.len() as u64);
 
         // Cache in L2 disk cache
         let disk_range = byte_range.start as u64..byte_range.end as u64;

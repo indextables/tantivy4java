@@ -565,11 +565,185 @@ fn get_disk_cache_holder() -> &'static std::sync::RwLock<Option<Arc<L2DiskCache>
     GLOBAL_DISK_CACHE.get_or_init(|| std::sync::RwLock::new(None))
 }
 
+use quickwit_storage::ByteRangeCache;
+
+/// Global L1 ByteRangeCache shared across all SplitSearcher instances
+/// This provides memory-efficient caching - one bounded cache instead of per-split caches
+static GLOBAL_L1_CACHE: OnceLock<std::sync::RwLock<Option<ByteRangeCache>>> = OnceLock::new();
+
+/// Configured L1 cache capacity from Java CacheConfig.withMaxCacheSize()
+/// This is set when SplitCacheManager is created and used instead of default/env values
+static CONFIGURED_L1_CACHE_CAPACITY: OnceLock<std::sync::RwLock<Option<u64>>> = OnceLock::new();
+
+fn get_l1_cache_holder() -> &'static std::sync::RwLock<Option<ByteRangeCache>> {
+    GLOBAL_L1_CACHE.get_or_init(|| std::sync::RwLock::new(None))
+}
+
+fn get_configured_capacity_holder() -> &'static std::sync::RwLock<Option<u64>> {
+    CONFIGURED_L1_CACHE_CAPACITY.get_or_init(|| std::sync::RwLock::new(None))
+}
+
+/// Set the L1 cache capacity from Java CacheConfig.withMaxCacheSize()
+/// This should be called when SplitCacheManager is created
+pub fn set_l1_cache_capacity(capacity_bytes: u64) {
+    let holder = get_configured_capacity_holder();
+    let mut guard = holder.write().unwrap();
+    debug_println!("⚙️ L1_CACHE_CONFIG: Setting L1 cache capacity from Java: {} MB", capacity_bytes / 1024 / 1024);
+    *guard = Some(capacity_bytes);
+}
+
+/// Reset the L1 cache to allow reinitialization with new capacity
+/// This is useful for testing scenarios where you need to change the L1 capacity
+pub fn reset_global_l1_cache() {
+    // First clear the configured capacity
+    {
+        let holder = get_configured_capacity_holder();
+        let mut guard = holder.write().unwrap();
+        *guard = None;
+    }
+
+    // Then clear the cache itself (will be recreated on next access)
+    {
+        let holder = get_l1_cache_holder();
+        let mut guard = holder.write().unwrap();
+        if guard.is_some() {
+            debug_println!("🔄 L1_CACHE_RESET: Resetting global L1 cache (will be recreated on next access)");
+        }
+        *guard = None;
+    }
+}
+
+/// Get or create the global shared L1 ByteRangeCache
+/// Creates the cache lazily on first access with configurable capacity
+pub fn get_or_create_global_l1_cache() -> Option<ByteRangeCache> {
+    // Return None if L1 is disabled
+    if is_l1_cache_disabled() {
+        return None;
+    }
+
+    let holder = get_l1_cache_holder();
+
+    // Fast path: check if already initialized
+    {
+        let guard = holder.read().unwrap();
+        if let Some(cache) = guard.as_ref() {
+            return Some(cache.clone());
+        }
+    }
+
+    // Slow path: initialize the cache
+    let mut guard = holder.write().unwrap();
+    // Double-check after acquiring write lock
+    if let Some(cache) = guard.as_ref() {
+        return Some(cache.clone());
+    }
+
+    // Create bounded L1 cache with configurable capacity
+    let capacity = get_l1_cache_capacity_bytes();
+    let cache = ByteRangeCache::with_capacity(
+        capacity,
+        &quickwit_storage::STORAGE_METRICS.shortlived_cache,
+    );
+    debug_println!("🚀 GLOBAL_L1_CACHE: Created shared ByteRangeCache with {} MB capacity", capacity / 1024 / 1024);
+    *guard = Some(cache.clone());
+    Some(cache)
+}
+
+/// Get the configured L1 cache capacity in bytes
+/// Priority: 1) Java CacheConfig.withMaxCacheSize(), 2) TANTIVY4JAVA_L1_CACHE_MB env var, 3) 256MB default
+fn get_l1_cache_capacity_bytes() -> u64 {
+    const DEFAULT_L1_CACHE_CAPACITY_MB: u64 = 256;
+
+    // Priority 1: Check if Java configured a capacity via CacheConfig.withMaxCacheSize()
+    let holder = get_configured_capacity_holder();
+    if let Ok(guard) = holder.read() {
+        if let Some(capacity) = *guard {
+            debug_println!("⚙️ L1_CACHE_CONFIG: Using Java-configured capacity: {} MB", capacity / 1024 / 1024);
+            return capacity;
+        }
+    }
+
+    // Priority 2: Check environment variable
+    if let Ok(env_mb) = std::env::var("TANTIVY4JAVA_L1_CACHE_MB") {
+        if let Ok(mb) = env_mb.parse::<u64>() {
+            if mb > 0 && mb <= 8192 { // Reasonable bounds: 1MB to 8GB
+                debug_println!("⚙️ L1_CACHE_CONFIG: Using env var capacity: {} MB", mb);
+                return mb * 1024 * 1024;
+            }
+            debug_println!("⚠️ L1_CACHE_CONFIG: Invalid TANTIVY4JAVA_L1_CACHE_MB value: {}, using default", env_mb);
+        }
+    }
+
+    // Priority 3: Default
+    debug_println!("⚙️ L1_CACHE_CONFIG: Using default capacity: {} MB", DEFAULT_L1_CACHE_CAPACITY_MB);
+    DEFAULT_L1_CACHE_CAPACITY_MB * 1024 * 1024
+}
+
+/// Clear the global L1 cache (called after prewarm to free memory)
+pub fn clear_global_l1_cache() {
+    let holder = get_l1_cache_holder();
+    let guard = holder.read().unwrap();
+    if let Some(cache) = guard.as_ref() {
+        cache.clear();
+        debug_println!("🧹 GLOBAL_L1_CACHE: Cleared L1 ByteRangeCache");
+    }
+}
+
+/// Get the current size of the global L1 cache in bytes
+pub fn get_global_l1_cache_size() -> u64 {
+    let holder = get_l1_cache_holder();
+    if let Ok(guard) = holder.read() {
+        if let Some(cache) = guard.as_ref() {
+            return cache.get_num_bytes();
+        }
+    }
+    0
+}
+
+/// Get the configured capacity of the global L1 cache in bytes
+pub fn get_global_l1_cache_capacity() -> u64 {
+    let holder = get_l1_cache_holder();
+    if let Ok(guard) = holder.read() {
+        if let Some(cache) = guard.as_ref() {
+            return cache.get_capacity().unwrap_or(0);
+        }
+    }
+    0
+}
+
+/// Global flag to disable L1 ByteRangeCache for debugging
+/// When true, all storage requests bypass L1 memory cache and go to L2 disk cache / L3 storage
+static DISABLE_L1_CACHE: OnceLock<std::sync::RwLock<bool>> = OnceLock::new();
+
+fn get_disable_l1_cache_holder() -> &'static std::sync::RwLock<bool> {
+    DISABLE_L1_CACHE.get_or_init(|| std::sync::RwLock::new(false))
+}
+
+/// Set whether to disable L1 ByteRangeCache (called by SplitCacheManager from TieredCacheConfig)
+pub fn set_disable_l1_cache(disable: bool) {
+    let holder = get_disable_l1_cache_holder();
+    let mut guard = holder.write().unwrap();
+    if disable {
+        debug_println!("⚠️ L1_CACHE_DISABLED: ByteRangeCache disabled for debugging via TieredCacheConfig");
+        debug_println!("   All storage requests will bypass L1 memory cache and go to L2 disk cache / L3 storage");
+    } else {
+        debug_println!("🟢 L1_CACHE_ENABLED: ByteRangeCache enabled (normal operation)");
+    }
+    *guard = disable;
+}
+
+/// Check if L1 ByteRangeCache is disabled
+pub fn is_l1_cache_disabled() -> bool {
+    let holder = get_disable_l1_cache_holder();
+    let guard = holder.read().unwrap();
+    *guard
+}
+
 /// Set the global L2 disk cache (called by SplitCacheManager when TieredCacheConfig is provided)
 pub fn set_global_disk_cache(cache: Arc<L2DiskCache>) {
     let holder = get_disk_cache_holder();
     let mut guard = holder.write().unwrap();
-    debug_println!("RUST DEBUG: Setting global L2 disk cache");
+    debug_println!("🟢 SET_GLOBAL_DISK_CACHE: Setting global L2 disk cache");
     *guard = Some(cache);
 }
 
@@ -578,7 +752,7 @@ pub fn set_global_disk_cache(cache: Arc<L2DiskCache>) {
 pub fn clear_global_disk_cache() {
     let holder = get_disk_cache_holder();
     let mut guard = holder.write().unwrap();
-    debug_println!("RUST DEBUG: Clearing global L2 disk cache");
+    debug_println!("🔴 CLEAR_GLOBAL_DISK_CACHE: Clearing global L2 disk cache");
     *guard = None;
 }
 
@@ -640,10 +814,120 @@ pub fn get_global_disk_cache() -> Option<Arc<L2DiskCache>> {
     let holder = get_disk_cache_holder();
     let guard = holder.read().unwrap();
     if let Some(ref cache) = *guard {
+        debug_println!("🟢 GET_GLOBAL_DISK_CACHE: Found dynamic disk cache");
         return Some(cache.clone());
     }
     drop(guard);
 
     // Fall back to the components' disk_cache
-    get_global_components().disk_cache.clone()
+    let result = get_global_components().disk_cache.clone();
+    if result.is_some() {
+        debug_println!("🟢 GET_GLOBAL_DISK_CACHE: Found components disk cache");
+    } else {
+        debug_println!("🔴 GET_GLOBAL_DISK_CACHE: No disk cache configured - WILL HIT S3!");
+    }
+    result
+}
+
+// =====================================================================
+// Global S3/Storage Download Metrics
+// =====================================================================
+// These metrics track all remote storage downloads for debugging and
+// verification of caching behavior. They are incremented from:
+// - persistent_cache_storage.rs (StorageWithPersistentCache) on L3 fetch
+// - prewarm.rs on data download during prewarm operations
+//
+// Use get_storage_download_metrics() to retrieve current counts and
+// reset_storage_download_metrics() to reset counters between tests.
+// =====================================================================
+
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Global counters for storage download metrics
+static STORAGE_DOWNLOAD_COUNT: AtomicU64 = AtomicU64::new(0);
+static STORAGE_DOWNLOAD_BYTES: AtomicU64 = AtomicU64::new(0);
+static STORAGE_DOWNLOAD_PREWARM_COUNT: AtomicU64 = AtomicU64::new(0);
+static STORAGE_DOWNLOAD_PREWARM_BYTES: AtomicU64 = AtomicU64::new(0);
+static STORAGE_DOWNLOAD_QUERY_COUNT: AtomicU64 = AtomicU64::new(0);
+static STORAGE_DOWNLOAD_QUERY_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Storage download metrics snapshot
+#[derive(Debug, Clone, Default)]
+pub struct StorageDownloadMetrics {
+    /// Total number of storage downloads (all sources)
+    pub total_downloads: u64,
+    /// Total bytes downloaded (all sources)
+    pub total_bytes: u64,
+    /// Downloads during prewarm operations
+    pub prewarm_downloads: u64,
+    /// Bytes downloaded during prewarm operations
+    pub prewarm_bytes: u64,
+    /// Downloads during query operations (L3 cache misses)
+    pub query_downloads: u64,
+    /// Bytes downloaded during query operations
+    pub query_bytes: u64,
+}
+
+impl StorageDownloadMetrics {
+    /// Returns true if there were any downloads
+    pub fn has_downloads(&self) -> bool {
+        self.total_downloads > 0
+    }
+
+    /// Returns formatted summary string
+    pub fn summary(&self) -> String {
+        format!(
+            "Downloads: {} total ({} bytes), {} prewarm ({} bytes), {} query ({} bytes)",
+            self.total_downloads, self.total_bytes,
+            self.prewarm_downloads, self.prewarm_bytes,
+            self.query_downloads, self.query_bytes
+        )
+    }
+}
+
+/// Record a storage download from prewarm operations
+pub fn record_prewarm_download(bytes: u64) {
+    STORAGE_DOWNLOAD_COUNT.fetch_add(1, Ordering::Relaxed);
+    STORAGE_DOWNLOAD_BYTES.fetch_add(bytes, Ordering::Relaxed);
+    STORAGE_DOWNLOAD_PREWARM_COUNT.fetch_add(1, Ordering::Relaxed);
+    STORAGE_DOWNLOAD_PREWARM_BYTES.fetch_add(bytes, Ordering::Relaxed);
+    debug_println!("📊 METRIC: Prewarm download recorded: {} bytes (total prewarm: {} downloads, {} bytes)",
+        bytes,
+        STORAGE_DOWNLOAD_PREWARM_COUNT.load(Ordering::Relaxed),
+        STORAGE_DOWNLOAD_PREWARM_BYTES.load(Ordering::Relaxed));
+}
+
+/// Record a storage download from query operations (L3 cache miss)
+pub fn record_query_download(bytes: u64) {
+    STORAGE_DOWNLOAD_COUNT.fetch_add(1, Ordering::Relaxed);
+    STORAGE_DOWNLOAD_BYTES.fetch_add(bytes, Ordering::Relaxed);
+    STORAGE_DOWNLOAD_QUERY_COUNT.fetch_add(1, Ordering::Relaxed);
+    STORAGE_DOWNLOAD_QUERY_BYTES.fetch_add(bytes, Ordering::Relaxed);
+    debug_println!("📊 METRIC: Query download recorded: {} bytes (total query: {} downloads, {} bytes)",
+        bytes,
+        STORAGE_DOWNLOAD_QUERY_COUNT.load(Ordering::Relaxed),
+        STORAGE_DOWNLOAD_QUERY_BYTES.load(Ordering::Relaxed));
+}
+
+/// Get current storage download metrics
+pub fn get_storage_download_metrics() -> StorageDownloadMetrics {
+    StorageDownloadMetrics {
+        total_downloads: STORAGE_DOWNLOAD_COUNT.load(Ordering::Relaxed),
+        total_bytes: STORAGE_DOWNLOAD_BYTES.load(Ordering::Relaxed),
+        prewarm_downloads: STORAGE_DOWNLOAD_PREWARM_COUNT.load(Ordering::Relaxed),
+        prewarm_bytes: STORAGE_DOWNLOAD_PREWARM_BYTES.load(Ordering::Relaxed),
+        query_downloads: STORAGE_DOWNLOAD_QUERY_COUNT.load(Ordering::Relaxed),
+        query_bytes: STORAGE_DOWNLOAD_QUERY_BYTES.load(Ordering::Relaxed),
+    }
+}
+
+/// Reset all storage download metrics (useful between tests)
+pub fn reset_storage_download_metrics() {
+    STORAGE_DOWNLOAD_COUNT.store(0, Ordering::Relaxed);
+    STORAGE_DOWNLOAD_BYTES.store(0, Ordering::Relaxed);
+    STORAGE_DOWNLOAD_PREWARM_COUNT.store(0, Ordering::Relaxed);
+    STORAGE_DOWNLOAD_PREWARM_BYTES.store(0, Ordering::Relaxed);
+    STORAGE_DOWNLOAD_QUERY_COUNT.store(0, Ordering::Relaxed);
+    STORAGE_DOWNLOAD_QUERY_BYTES.store(0, Ordering::Relaxed);
+    debug_println!("📊 METRIC: Storage download metrics reset");
 }

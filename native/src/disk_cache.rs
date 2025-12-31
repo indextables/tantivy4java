@@ -13,6 +13,7 @@
 
 use std::collections::HashMap;
 use std::cmp::{max, min};
+use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::ops::Range;
@@ -23,14 +24,21 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fs2::available_space;
 use lz4_flex::{compress_prepend_size, decompress_size_prepended};
+use memmap2::Mmap;
 
 use crate::debug_println;
 use serde::{Deserialize, Serialize};
 use tantivy::directory::OwnedBytes;
-use tokio::sync::mpsc;
+// Use std::sync::mpsc for the write queue - it works from both sync and async contexts.
+// tokio::sync::mpsc::blocking_send() panics from async context, so we can't use it.
 
 /// Subdirectory name for the disk cache within the root path
 const CACHE_SUBDIR: &str = "tantivy4java_slicecache";
+
+/// Default maximum number of memory-mapped files to keep open.
+/// Conservative default that works on most systems, but can be configured higher.
+/// Production systems with high fd limits (65536+) can safely use 2048-4096.
+const DEFAULT_MMAP_CACHE_SIZE: usize = 1024;
 
 /// Compression algorithm for cached data
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -69,6 +77,10 @@ pub struct DiskCacheConfig {
     pub min_compress_size: usize,
     /// Sync manifest every N seconds (0 = on every write)
     pub manifest_sync_interval_secs: u64,
+    /// Maximum number of memory-mapped files to cache (0 = use default)
+    /// Higher values use more file descriptors but improve random access performance.
+    /// Production systems with high fd limits can safely use 2048-4096.
+    pub mmap_cache_size: usize,
 }
 
 impl Default for DiskCacheConfig {
@@ -79,6 +91,7 @@ impl Default for DiskCacheConfig {
             compression: CompressionAlgorithm::Lz4,
             min_compress_size: 4096, // 4KB
             manifest_sync_interval_secs: 30,
+            mmap_cache_size: DEFAULT_MMAP_CACHE_SIZE,
         }
     }
 }
@@ -476,7 +489,97 @@ enum WriteRequest {
         split_id: String,
     },
     SyncManifest,
+    /// Flush all pending writes and signal completion via the oneshot channel
+    Flush(tokio::sync::oneshot::Sender<()>),
     Shutdown,
+}
+
+// ============================================================================
+// MMAP CACHE - Fast random access via memory-mapped files
+// ============================================================================
+
+/// LRU cache of memory-mapped files for fast random access reads.
+///
+/// Instead of open/read/close for every cache hit, we keep files memory-mapped.
+/// Random access becomes just pointer indexing + potential page fault.
+/// The OS kernel manages the page cache efficiently.
+struct MmapCache {
+    /// Map from file path to memory-mapped region
+    maps: HashMap<PathBuf, Arc<Mmap>>,
+    /// LRU order tracking (front = oldest, back = newest)
+    lru_order: VecDeque<PathBuf>,
+    /// Maximum number of mappings to keep
+    max_size: usize,
+}
+
+impl MmapCache {
+    fn new(max_size: usize) -> Self {
+        Self {
+            maps: HashMap::with_capacity(max_size),
+            lru_order: VecDeque::with_capacity(max_size),
+            max_size,
+        }
+    }
+
+    /// Get or create a memory mapping for the given file path.
+    /// Returns Arc<Mmap> so the mapping can be used while the cache is unlocked.
+    fn get_or_map(&mut self, path: &Path) -> io::Result<Arc<Mmap>> {
+        // Check if already mapped
+        if self.maps.contains_key(path) {
+            // Move to back of LRU (most recently used)
+            self.touch_lru(path);
+            return Ok(Arc::clone(self.maps.get(path).unwrap()));
+        }
+
+        // Evict oldest if at capacity
+        while self.maps.len() >= self.max_size {
+            if let Some(oldest_path) = self.lru_order.pop_front() {
+                self.maps.remove(&oldest_path);
+                debug_println!("📤 MMAP_CACHE: Evicted {:?}", oldest_path);
+            }
+        }
+
+        // Create new mapping
+        let file = File::open(path)?;
+        let mmap = unsafe { Mmap::map(&file)? };
+        let mmap = Arc::new(mmap);
+
+        // Add to cache
+        self.maps.insert(path.to_path_buf(), Arc::clone(&mmap));
+        self.lru_order.push_back(path.to_path_buf());
+
+        debug_println!("📥 MMAP_CACHE: Mapped {:?} ({} bytes)", path, mmap.len());
+        Ok(mmap)
+    }
+
+    /// Move a path to the back of the LRU order (mark as recently used)
+    fn touch_lru(&mut self, path: &Path) {
+        // Remove from current position
+        if let Some(pos) = self.lru_order.iter().position(|p| p == path) {
+            self.lru_order.remove(pos);
+        }
+        // Add to back (most recently used)
+        self.lru_order.push_back(path.to_path_buf());
+    }
+
+    /// Remove a specific path from the cache (e.g., when file is deleted)
+    fn remove(&mut self, path: &Path) {
+        self.maps.remove(path);
+        if let Some(pos) = self.lru_order.iter().position(|p| p == path) {
+            self.lru_order.remove(pos);
+        }
+    }
+
+    /// Clear all mappings
+    fn clear(&mut self) {
+        self.maps.clear();
+        self.lru_order.clear();
+    }
+
+    /// Get cache statistics
+    fn stats(&self) -> (usize, usize) {
+        (self.maps.len(), self.max_size)
+    }
 }
 
 /// L2 Disk Cache implementation
@@ -486,7 +589,12 @@ pub struct L2DiskCache {
     /// In-memory state for fast range coalescing (split_key -> SplitState)
     split_states: RwLock<HashMap<String, SplitState>>,
     lru_table: Mutex<SplitLruTable>,
-    write_tx: mpsc::UnboundedSender<WriteRequest>,
+    /// Memory-mapped file cache for fast random access
+    mmap_cache: Mutex<MmapCache>,
+    /// Bounded channel to prevent OOM during bulk prewarm operations.
+    /// When queue is full, put() blocks until there's room (backpressure).
+    /// Uses std::sync::mpsc which works from both sync and async contexts.
+    write_tx: std::sync::mpsc::SyncSender<WriteRequest>,
     total_bytes: AtomicU64,
     max_bytes: u64,
     /// Shutdown flag for background threads
@@ -507,12 +615,16 @@ impl L2DiskCache {
         let cache_dir = Self::cache_dir(&config.root_path);
         fs::create_dir_all(&cache_dir)?;
 
+        debug_println!("🔵 L2DiskCache::new() - cache_dir={:?}", cache_dir);
+
         // Calculate max size
         let max_bytes = config.effective_max_size()?;
 
         // Load or create manifest
         let manifest = Self::load_manifest(&cache_dir)?;
         let total_bytes = manifest.total_bytes;
+        debug_println!("🔵 L2DiskCache::new() - manifest loaded: {} splits, {} total_bytes",
+                 manifest.splits.len(), total_bytes);
 
         // Build split states from manifest for fast coalescing
         let mut split_states = HashMap::new();
@@ -520,15 +632,32 @@ impl L2DiskCache {
             split_states.insert(split_key.clone(), SplitState::from_entry(split_entry));
         }
 
-        // Create background writer channel
-        let (write_tx, write_rx) = mpsc::unbounded_channel();
+        // Create BOUNDED background writer channel to prevent OOM during bulk prewarm.
+        // When queue fills up, put() will block (backpressure), throttling downloads
+        // to match disk write speed.
+        //
+        // Queue size rationale for large splits (5GB+):
+        // - Individual components can be 500MB-2GB each
+        // - 16 items × 500MB = 8GB max queued memory
+        // - Small enough to prevent OOM, large enough for write batching
+        // Uses std::sync::mpsc::sync_channel which works from both sync and async contexts.
+        const WRITE_QUEUE_CAPACITY: usize = 16;
+        let (write_tx, write_rx) = std::sync::mpsc::sync_channel(WRITE_QUEUE_CAPACITY);
         let shutdown_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        // Determine mmap cache size (use default if 0)
+        let mmap_size = if config.mmap_cache_size > 0 {
+            config.mmap_cache_size
+        } else {
+            DEFAULT_MMAP_CACHE_SIZE
+        };
 
         let cache = Arc::new(Self {
             config: config.clone(),
             manifest: RwLock::new(manifest),
             split_states: RwLock::new(split_states),
             lru_table: Mutex::new(SplitLruTable::new()),
+            mmap_cache: Mutex::new(MmapCache::new(mmap_size)),
             write_tx,
             total_bytes: AtomicU64::new(total_bytes),
             max_bytes,
@@ -618,16 +747,32 @@ impl L2DiskCache {
             return false;
         }
 
-        // Component-aware compression decisions
+        // Component-aware compression decisions based on internal Tantivy encoding
+        // AND access patterns:
+        //
+        // Already compressed (skip - would waste CPU):
+        //   - .store: LZ4/Zstd compressed in 16KB blocks
+        //   - .term:  Zstd-compressed sstable blocks
+        //
+        // Block-access patterns (skip - decompressing whole file for block access is terrible):
+        //   - .idx/.pos: Postings accessed in 128-doc blocks via skip lists
+        //                With millions of docs, a 10MB file would need full decompression
+        //                just to read a 512-byte block. Bitpacking already compacts the data.
+        //
+        // Random-access patterns:
+        //   - .fast: Accessed by doc_id, same decompression problem as postings
+        //
         match component {
-            // Small/hot data - skip compression
+            // Small/hot data - skip compression for access speed
             "footer" | "metadata" | "fieldnorm" => false,
-            // Fast fields - only compress large ones (often numeric/compact)
-            "fast" => data_size > 64 * 1024,
-            // Good compression candidates
-            "term" | "idx" | "pos" => true,
-            // Default: compress if reasonably large
-            _ => data_size > 16 * 1024,
+            // Already compressed by Tantivy - don't double compress
+            "store" | "term" => false,
+            // Block/random access patterns - whole-file decompression would kill performance
+            "idx" | "pos" | "fast" => false,
+            // Default: NO compression - unknown components (like split file byte ranges) are
+            // likely already compressed or have random-access patterns. Safe default is no
+            // compression to avoid decompression overhead on sub-range reads.
+            _ => false,
         }
     }
 
@@ -730,6 +875,10 @@ impl L2DiskCache {
     }
 
     /// Get cached data (synchronous read from disk)
+    ///
+    /// For uncompressed files, uses memory-mapped I/O for fast random access.
+    /// The OS kernel manages the page cache efficiently, and repeated access
+    /// to the same file region avoids syscalls entirely.
     pub fn get(
         &self,
         storage_loc: &str,
@@ -747,7 +896,7 @@ impl L2DiskCache {
             split.components.get(&comp_key)?.clone()
         };
 
-        // Read file from disk
+        // Get file path
         let file_path = self.component_path(
             storage_loc,
             split_id,
@@ -756,12 +905,24 @@ impl L2DiskCache {
             entry.compression,
         );
 
-        let mut file = File::open(&file_path).ok()?;
-        let mut data = Vec::with_capacity(entry.disk_size_bytes as usize);
-        file.read_to_end(&mut data).ok()?;
-
-        // Decompress if needed
-        let uncompressed = Self::decompress_data(&data, entry.compression).ok()?;
+        // For uncompressed files, use memory-mapped I/O (fast random access)
+        // For compressed files, fall back to read-all + decompress
+        let data = if entry.compression == CompressionAlgorithm::None {
+            // Fast path: mmap for uncompressed files
+            let mmap = {
+                let mut mmap_cache = self.mmap_cache.lock().ok()?;
+                mmap_cache.get_or_map(&file_path).ok()?
+            };
+            // Return a copy of the mapped data
+            // (OwnedBytes requires owned data, but mmap access is still fast)
+            mmap.to_vec()
+        } else {
+            // Slow path: read entire file for compressed data
+            let mut file = File::open(&file_path).ok()?;
+            let mut data = Vec::with_capacity(entry.disk_size_bytes as usize);
+            file.read_to_end(&mut data).ok()?;
+            Self::decompress_data(&data, entry.compression).ok()?
+        };
 
         // Update LRU access time
         if let Ok(mut lru) = self.lru_table.lock() {
@@ -772,7 +933,72 @@ impl L2DiskCache {
             }
         }
 
-        Some(OwnedBytes::new(uncompressed))
+        Some(OwnedBytes::new(data))
+    }
+
+    /// Get a sub-range from a cached file using mmap (fast path for random access).
+    ///
+    /// This is optimized for the common case where we cached [0..file_len] during prewarm,
+    /// but queries request smaller sub-ranges like [offset..offset+block_size].
+    /// Instead of loading the entire file, we mmap it and return just the requested slice.
+    pub fn get_subrange(
+        &self,
+        storage_loc: &str,
+        split_id: &str,
+        component: &str,
+        cached_range: Range<u64>,
+        requested_range: Range<u64>,
+    ) -> Option<OwnedBytes> {
+        let split_key = CacheManifest::split_key(storage_loc, split_id);
+        let comp_key = CacheManifest::component_key(component, Some(cached_range.clone()));
+
+        // Check manifest for entry
+        let entry = {
+            let manifest = self.manifest.read().ok()?;
+            let split = manifest.splits.get(&split_key)?;
+            split.components.get(&comp_key)?.clone()
+        };
+
+        // Only use fast path for uncompressed files
+        if entry.compression != CompressionAlgorithm::None {
+            // Fall back to full load + slice for compressed files
+            let full_data = self.get(storage_loc, split_id, component, Some(cached_range.clone()))?;
+            let offset = (requested_range.start - cached_range.start) as usize;
+            let len = (requested_range.end - requested_range.start) as usize;
+            if offset + len <= full_data.len() {
+                return Some(OwnedBytes::new(full_data[offset..offset + len].to_vec()));
+            }
+            return None;
+        }
+
+        // Fast path: mmap and extract just the requested slice
+        let file_path = self.component_path(
+            storage_loc,
+            split_id,
+            component,
+            Some(cached_range.clone()),
+            entry.compression,
+        );
+
+        let mmap = {
+            let mut mmap_cache = self.mmap_cache.lock().ok()?;
+            mmap_cache.get_or_map(&file_path).ok()?
+        };
+
+        // Calculate offset within the cached file
+        let offset = (requested_range.start - cached_range.start) as usize;
+        let len = (requested_range.end - requested_range.start) as usize;
+
+        if offset + len > mmap.len() {
+            debug_println!(
+                "⚠️ L2_CACHE: Sub-range out of bounds: offset={} len={} file_len={}",
+                offset, len, mmap.len()
+            );
+            return None;
+        }
+
+        // Return just the requested slice (fast - only copies the slice, not entire file)
+        Some(OwnedBytes::new(mmap[offset..offset + len].to_vec()))
     }
 
     /// Get cached data with range coalescing
@@ -793,8 +1019,16 @@ impl L2DiskCache {
     ) -> CoalesceResult {
         let split_key = CacheManifest::split_key(storage_loc, split_id);
 
-        // First, try exact match (fast path)
-        if let Some(data) = self.get(storage_loc, split_id, component, Some(requested_range.clone())) {
+        // First, try exact match (fast path) - use get_subrange to avoid copying entire file
+        // Even if the requested range exactly matches the cached range, we use mmap-based
+        // sub-range extraction which only copies the requested bytes
+        if let Some(data) = self.get_subrange(
+            storage_loc,
+            split_id,
+            component,
+            requested_range.clone(),  // cached range = requested range for exact match
+            requested_range.clone(),  // requested sub-range = same
+        ) {
             return CoalesceResult::hit(data, requested_range);
         }
 
@@ -845,25 +1079,19 @@ impl L2DiskCache {
 
             // Overlap with this cached range
             if let Some(overlap) = cached_range.overlap_with(requested_range.start, requested_range.end) {
-                // Load the cached data
-                let _cache_key = &cached_range.cache_key;
-
-                // Parse the byte range from cache key (format: component_start-end)
-                if let Some(data) = self.get(storage_loc, split_id, component,
-                    Some(cached_range.start..cached_range.end)) {
-
-                    // Extract just the portion we need
-                    let offset_in_cache = (overlap.start - cached_range.start) as usize;
-                    let len = (overlap.end - overlap.start) as usize;
-
-                    if offset_in_cache + len <= data.len() {
-                        let slice = &data.as_slice()[offset_in_cache..offset_in_cache + len];
-                        cached_segments.push(CachedSegment {
-                            range: overlap.clone(),
-                            data: OwnedBytes::new(slice.to_vec()),
-                        });
-                        cached_bytes += len as u64;
-                    }
+                // Use fast sub-range extraction via mmap (avoids loading entire file)
+                if let Some(data) = self.get_subrange(
+                    storage_loc,
+                    split_id,
+                    component,
+                    cached_range.start..cached_range.end,  // cached range
+                    overlap.clone(),                        // requested sub-range
+                ) {
+                    cached_segments.push(CachedSegment {
+                        range: overlap.clone(),
+                        data,
+                    });
+                    cached_bytes += (overlap.end - overlap.start) as u64;
                 }
 
                 cursor = max(cursor, overlap.end);
@@ -912,7 +1140,9 @@ impl L2DiskCache {
             self.trigger_eviction((self.max_bytes * 90) / 100);
         }
 
-        // Send to background writer
+        // Send to background writer with BACKPRESSURE.
+        // SyncSender::send() blocks if the queue is full, throttling downloads
+        // to match disk write speed. This prevents OOM during bulk prewarm.
         let _ = self.write_tx.send(WriteRequest::Put {
             storage_loc: storage_loc.to_string(),
             split_id: split_id.to_string(),
@@ -956,59 +1186,155 @@ impl L2DiskCache {
         Ok(())
     }
 
-    /// Background writer thread (static version using Weak reference)
+    /// Flush all pending writes to disk and wait for completion (async version).
+    ///
+    /// This method blocks (in an async-friendly way) until all previously queued
+    /// Put requests have been processed by the background writer. Use this to
+    /// ensure data is persisted before reading from the cache.
+    ///
+    /// Note: Since we use std::sync::mpsc for backpressure, the send is synchronous.
+    /// The async wait is only for the completion signal.
+    pub async fn flush_async(&self) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        // SyncSender::send() is synchronous and blocking (provides backpressure)
+        if self.write_tx.send(WriteRequest::Flush(tx)).is_ok() {
+            // Wait asynchronously for the flush to complete
+            let _ = rx.await;
+        }
+    }
+
+    /// Flush all pending writes to disk and wait for completion (blocking version).
+    ///
+    /// This method can be called from any context (sync or async) since we use
+    /// std::sync::mpsc channels internally.
+    pub fn flush_blocking(&self) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        // SyncSender::send() is synchronous and blocking (provides backpressure)
+        if self.write_tx.send(WriteRequest::Flush(tx)).is_ok() {
+            // Block until the flush is processed
+            let _ = rx.blocking_recv();
+        }
+    }
+
+    /// Background writer thread with parallel async I/O
+    ///
+    /// Uses std::sync::mpsc::Receiver for bounded channel with backpressure.
+    /// Spawns async write tasks on a tokio runtime with num_cpus worker threads.
+    /// A semaphore limits concurrent writes to num_cpus for optimal parallelism.
+    ///
+    /// Backpressure flow:
+    /// 1. Sender calls put() → sync_channel.send() blocks if queue full
+    /// 2. This thread recv()s requests from the bounded queue
+    /// 3. Before spawning write task, acquires semaphore permit
+    /// 4. If all writers busy, blocks on semaphore → recv loop stalls
+    /// 5. Bounded channel fills up → senders block
     fn background_writer_static(
-        mut rx: mpsc::UnboundedReceiver<WriteRequest>,
+        rx: std::sync::mpsc::Receiver<WriteRequest>,
         cache_weak: std::sync::Weak<Self>,
     ) {
-        let runtime = tokio::runtime::Builder::new_current_thread()
+        let num_writers = num_cpus::get();
+        debug_println!("🚀 L2DiskCache: Starting {} parallel async writers", num_writers);
+
+        // Create tokio runtime with num_cpus worker threads for parallel async I/O
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(num_writers)
+            .thread_name("disk-cache-writer")
             .enable_all()
             .build()
             .expect("Failed to create tokio runtime for disk cache");
 
-        runtime.block_on(async {
-            while let Some(req) = rx.recv().await {
-                // Try to upgrade weak reference - if cache is dropped, exit
-                let cache = match cache_weak.upgrade() {
-                    Some(c) => c,
-                    None => break,
-                };
+        // Semaphore limits concurrent writes to num_cpus
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(num_writers));
 
-                match req {
-                    WriteRequest::Put {
-                        storage_loc,
-                        split_id,
-                        component,
-                        byte_range,
-                        data,
-                    } => {
-                        if let Err(e) = cache.do_put(
-                            &storage_loc,
-                            &split_id,
-                            &component,
-                            byte_range.map(|r| r.start..r.end),
-                            &data,
-                        ) {
+        // Process requests - blocking recv is fine since this is a dedicated thread
+        while let Ok(req) = rx.recv() {
+            let cache = match cache_weak.upgrade() {
+                Some(c) => c,
+                None => break,
+            };
+
+            match req {
+                WriteRequest::Put {
+                    storage_loc,
+                    split_id,
+                    component,
+                    byte_range,
+                    data,
+                } => {
+                    // Acquire permit BEFORE spawning - blocks if all writers busy
+                    // This provides backpressure: when blocked here, recv loop stalls,
+                    // bounded channel fills, and senders block on put()
+                    let permit = match runtime.block_on(semaphore.clone().acquire_owned()) {
+                        Ok(p) => p,
+                        Err(_) => continue, // Semaphore closed
+                    };
+
+                    // Spawn async write task
+                    runtime.spawn(async move {
+                        if let Err(e) = cache
+                            .do_put_async(
+                                &storage_loc,
+                                &split_id,
+                                &component,
+                                byte_range.map(|r| r.start..r.end),
+                                &data,
+                            )
+                            .await
+                        {
                             debug_println!("Disk cache write error: {}", e);
                         }
-                    }
-                    WriteRequest::Evict {
-                        storage_loc,
-                        split_id,
-                    } => {
-                        if let Err(e) = cache.do_evict(&storage_loc, &split_id) {
+                        drop(permit); // Release permit when write completes
+                    });
+                }
+                WriteRequest::Evict {
+                    storage_loc,
+                    split_id,
+                } => {
+                    // Eviction can run in parallel too
+                    let permit = match runtime.block_on(semaphore.clone().acquire_owned()) {
+                        Ok(p) => p,
+                        Err(_) => continue,
+                    };
+
+                    runtime.spawn(async move {
+                        if let Err(e) = cache.do_evict_async(&storage_loc, &split_id).await {
                             debug_println!("Disk cache evict error: {}", e);
                         }
-                    }
-                    WriteRequest::SyncManifest => {
-                        if let Err(e) = cache.do_sync_manifest() {
-                            debug_println!("Disk cache manifest sync error: {}", e);
-                        }
-                    }
-                    WriteRequest::Shutdown => break,
+                        drop(permit);
+                    });
                 }
+                WriteRequest::SyncManifest => {
+                    // Manifest sync is quick, run synchronously
+                    if let Err(e) = cache.do_sync_manifest() {
+                        debug_println!("Disk cache manifest sync error: {}", e);
+                    }
+                }
+                WriteRequest::Flush(tx) => {
+                    // Wait for ALL pending writes to complete by acquiring all permits
+                    runtime.block_on(async {
+                        let _all_permits = semaphore
+                            .acquire_many(num_writers as u32)
+                            .await
+                            .expect("Semaphore closed during flush");
+
+                        // Now all writes are complete, sync manifest
+                        if let Err(e) = cache.do_sync_manifest() {
+                            debug_println!("Disk cache manifest sync error during flush: {}", e);
+                        }
+
+                        // Signal completion
+                        let _ = tx.send(());
+                    });
+                }
+                WriteRequest::Shutdown => break,
             }
+        }
+
+        // Graceful shutdown: wait for all pending writes to complete
+        runtime.block_on(async {
+            let _ = semaphore.acquire_many(num_writers as u32).await;
         });
+        debug_println!("🛑 L2DiskCache: Writer thread shutdown complete");
     }
 
     /// Actually write data to disk
@@ -1194,6 +1520,181 @@ impl L2DiskCache {
         Ok(())
     }
 
+    /// Async version of do_put using tokio::fs for parallel I/O
+    async fn do_put_async(
+        &self,
+        storage_loc: &str,
+        split_id: &str,
+        component: &str,
+        byte_range: Option<Range<u64>>,
+        data: &[u8],
+    ) -> io::Result<()> {
+        use tokio::io::AsyncWriteExt;
+
+        // Compress if appropriate (CPU-bound, but fast)
+        let (compressed, compression) = self.compress_data(component, data);
+
+        // Create split directory
+        let split_dir = self.split_dir(storage_loc, split_id);
+        tokio::fs::create_dir_all(&split_dir).await?;
+
+        // Write to temp file then rename (atomic)
+        let final_path = self.component_path(
+            storage_loc,
+            split_id,
+            component,
+            byte_range.clone(),
+            compression,
+        );
+        let temp_path = final_path.with_extension("tmp");
+
+        // Async file write
+        {
+            let mut file = tokio::fs::File::create(&temp_path).await?;
+            file.write_all(&compressed).await?;
+            file.sync_all().await?;
+        }
+
+        tokio::fs::rename(&temp_path, &final_path).await?;
+
+        // Update manifest (sync - needs locking, but fast)
+        let split_key = CacheManifest::split_key(storage_loc, split_id);
+        let comp_key = CacheManifest::component_key(component, byte_range.clone());
+        let disk_size = compressed.len() as u64;
+        let uncompressed_size = data.len() as u64;
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let entry = ComponentEntry {
+            file_name: final_path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .to_string(),
+            uncompressed_size_bytes: uncompressed_size,
+            disk_size_bytes: disk_size,
+            compression,
+            component: component.to_string(),
+            byte_range: byte_range.as_ref().map(|r| (r.start, r.end)),
+            created_at: now,
+        };
+
+        {
+            let mut manifest = self.manifest.write().unwrap();
+
+            if !manifest.splits.contains_key(&split_key) {
+                manifest.splits.insert(
+                    split_key.clone(),
+                    SplitEntry {
+                        split_id: split_id.to_string(),
+                        storage_loc: storage_loc.to_string(),
+                        total_size_bytes: 0,
+                        last_accessed: now,
+                        components: HashMap::new(),
+                    },
+                );
+            }
+
+            let old_disk_size = manifest
+                .splits
+                .get(&split_key)
+                .and_then(|s| s.components.get(&comp_key))
+                .map(|c| c.disk_size_bytes)
+                .unwrap_or(0);
+
+            if old_disk_size > 0 {
+                manifest.total_bytes = manifest.total_bytes.saturating_sub(old_disk_size);
+                self.total_bytes.fetch_sub(old_disk_size, Ordering::Relaxed);
+            }
+
+            if let Some(split) = manifest.splits.get_mut(&split_key) {
+                if old_disk_size > 0 {
+                    split.total_size_bytes = split.total_size_bytes.saturating_sub(old_disk_size);
+                }
+                split.components.insert(comp_key, entry);
+                split.total_size_bytes += disk_size;
+                split.last_accessed = now;
+            }
+
+            manifest.total_bytes += disk_size;
+        }
+
+        self.total_bytes.fetch_add(disk_size, Ordering::Relaxed);
+
+        // Update range index
+        if let Some(ref range) = byte_range {
+            if let Ok(mut states) = self.split_states.write() {
+                let state = states
+                    .entry(split_key.clone())
+                    .or_insert_with(SplitState::new);
+
+                let index = state.get_or_create_index(component);
+                let comp_key = CacheManifest::component_key(component, byte_range.clone());
+
+                index.remove(&comp_key);
+                index.insert(CachedRange {
+                    start: range.start,
+                    end: range.end,
+                    cache_key: comp_key,
+                    compression,
+                });
+            }
+        }
+
+        // Update LRU
+        if let Ok(mut lru) = self.lru_table.lock() {
+            if let Ok(manifest) = self.manifest.read() {
+                if let Some(split) = manifest.splits.get(&split_key) {
+                    lru.touch(&split_key, split.total_size_bytes);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Async version of do_evict using tokio::fs
+    async fn do_evict_async(&self, storage_loc: &str, split_id: &str) -> io::Result<()> {
+        let split_key = CacheManifest::split_key(storage_loc, split_id);
+        let split_dir = self.split_dir(storage_loc, split_id);
+
+        let size_to_remove = {
+            let manifest = self.manifest.read().unwrap();
+            manifest
+                .splits
+                .get(&split_key)
+                .map(|s| s.total_size_bytes)
+                .unwrap_or(0)
+        };
+
+        // Async directory removal
+        if tokio::fs::try_exists(&split_dir).await.unwrap_or(false) {
+            tokio::fs::remove_dir_all(&split_dir).await?;
+        }
+
+        // Update manifest (sync - fast)
+        {
+            let mut manifest = self.manifest.write().unwrap();
+            manifest.splits.remove(&split_key);
+            manifest.total_bytes = manifest.total_bytes.saturating_sub(size_to_remove);
+        }
+
+        self.total_bytes.fetch_sub(size_to_remove, Ordering::Relaxed);
+
+        if let Ok(mut states) = self.split_states.write() {
+            states.remove(&split_key);
+        }
+
+        if let Ok(mut lru) = self.lru_table.lock() {
+            lru.remove(&split_key);
+        }
+
+        Ok(())
+    }
+
     /// Actually sync manifest to disk
     fn do_sync_manifest(&self) -> io::Result<()> {
         let cache_dir = Self::cache_dir(&self.config.root_path);
@@ -1307,9 +1808,10 @@ impl Drop for L2DiskCache {
         // Signal shutdown to timer thread
         self.shutdown_flag.store(true, Ordering::SeqCst);
 
-        // Signal shutdown to writer thread and sync manifest first
-        let _ = self.write_tx.send(WriteRequest::SyncManifest);
-        let _ = self.write_tx.send(WriteRequest::Shutdown);
+        // Signal shutdown to writer thread and sync manifest first.
+        // Use try_send() to avoid blocking during Drop - if queue is full, shutdown anyway.
+        let _ = self.write_tx.try_send(WriteRequest::SyncManifest);
+        let _ = self.write_tx.try_send(WriteRequest::Shutdown);
 
         // Wait for background threads to process shutdown and release file handles
         // This is needed for test cleanup - JUnit @TempDir needs files to be closed
@@ -1356,23 +1858,33 @@ mod tests {
         };
         let cache = L2DiskCache::new(config).unwrap();
 
-        // Small data - no compression
-        assert!(!cache.should_compress("term", 100));
-        assert!(!cache.should_compress("idx", 1000));
+        // Small data - no compression regardless of component
+        assert!(!cache.should_compress("idx", 100));
+        assert!(!cache.should_compress("pos", 1000));
 
         // Footer/metadata - never compress
         assert!(!cache.should_compress("footer", 10000));
         assert!(!cache.should_compress("metadata", 10000));
         assert!(!cache.should_compress("fieldnorm", 10000));
 
-        // Fast fields - only large ones
-        assert!(!cache.should_compress("fast", 50000));
-        assert!(cache.should_compress("fast", 100000));
+        // Store files - already LZ4/Zstd compressed by Tantivy, never double-compress
+        assert!(!cache.should_compress("store", 10000));
+        assert!(!cache.should_compress("store", 1000000)); // Even large store files
 
-        // Term/idx/pos - compress if above min size
-        assert!(cache.should_compress("term", 5000));
-        assert!(cache.should_compress("idx", 5000));
-        assert!(cache.should_compress("pos", 5000));
+        // Term files - already Zstd compressed (sstable), never double-compress
+        assert!(!cache.should_compress("term", 10000));
+        assert!(!cache.should_compress("term", 1000000)); // Even large term files
+
+        // idx/pos - block-access patterns, whole-file decompression would be terrible
+        // With millions of docs, a 10MB file needs full decompress for 512-byte block access
+        assert!(!cache.should_compress("idx", 5000));
+        assert!(!cache.should_compress("idx", 10_000_000)); // Even large posting files
+        assert!(!cache.should_compress("pos", 5000));
+        assert!(!cache.should_compress("pos", 10_000_000));
+
+        // Fast fields - random access by doc_id, same decompression problem
+        assert!(!cache.should_compress("fast", 50000));
+        assert!(!cache.should_compress("fast", 100000));
     }
 
     #[test]
@@ -1730,36 +2242,11 @@ mod tests {
         assert_eq!(total_found, 20, "All entries should be cached");
     }
 
-    #[test]
-    fn test_large_data_compression_ratio() {
-        let temp_dir = TempDir::new().unwrap();
-        let config = DiskCacheConfig {
-            root_path: temp_dir.path().to_path_buf(),
-            compression: CompressionAlgorithm::Lz4,
-            min_compress_size: 1000,
-            ..Default::default()
-        };
-        let cache = L2DiskCache::new(config).unwrap();
-
-        // Highly compressible data (repeated pattern)
-        let data: Vec<u8> = (0..50000).map(|i| (i % 10) as u8).collect();
-
-        cache.put("s3://bucket", "split-001", "term", None, &data);
-        std::thread::sleep(Duration::from_millis(100));
-
-        // Verify data is retrievable
-        let retrieved = cache.get("s3://bucket", "split-001", "term", None);
-        assert!(retrieved.is_some());
-        assert_eq!(retrieved.unwrap().as_slice(), data.as_slice());
-
-        // Check that compressed size is less than original
-        let total_bytes = cache.get_total_bytes();
-        assert!(
-            total_bytes < 50000,
-            "Compressed size {} should be less than original 50000",
-            total_bytes
-        );
-    }
+    // NOTE: test_large_data_compression_ratio was removed because compression
+    // was intentionally disabled for all components. Tantivy components are either:
+    // - Already internally compressed (store, term)
+    // - Block-accessed (idx, pos, fast) where whole-file decompression hurts performance
+    // See should_compress() for details.
 
     #[test]
     fn test_multiple_byte_ranges_same_component() {

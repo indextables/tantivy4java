@@ -187,6 +187,63 @@ public class RealS3DiskCacheTest {
     }
 
     @Test
+    @Order(0)
+    void testCountersNonZeroWithoutDiskCache() throws Exception {
+        System.out.println("\n=== Test 0: Verify S3 Request Counters (NO Disk Cache) ===");
+
+        // 🎯 This test verifies the OBJECT_STORAGE_REQUEST_COUNT counters work correctly
+        // WITHOUT disk cache - should show non-zero requests to S3
+
+        // Create cache manager WITHOUT disk cache
+        SplitCacheManager.CacheConfig cacheConfig =
+            new SplitCacheManager.CacheConfig("s3-no-disk-cache-" + System.currentTimeMillis())
+                .withMaxCacheSize(50_000_000) // 50MB L1 only, NO disk cache
+                .withAwsCredentials(getAccessKey(), getSecretKey())
+                .withAwsRegion(TEST_REGION);
+                // NOTE: No .withTieredCache() - no disk cache!
+
+        // Reset counters before test
+        SplitCacheManager.resetObjectStorageRequestStats();
+        long requestsBefore = SplitCacheManager.getObjectStorageRequestCount();
+        long bytesBefore = SplitCacheManager.getObjectStorageBytesFetched();
+        System.out.println("   S3 counters reset: requests=" + requestsBefore + ", bytes=" + bytesBefore);
+
+        try (SplitCacheManager cacheManager = SplitCacheManager.getInstance(cacheConfig)) {
+            try (SplitSearcher searcher = cacheManager.createSplitSearcher(splitS3Url, splitMetadata)) {
+                // Search to trigger S3 requests
+                SplitQuery query = searcher.parseQuery("content:searchable");
+                SearchResult result = searcher.search(query, 10);
+
+                assertTrue(result.getHits().size() > 0, "Should find documents");
+                System.out.println("   Found " + result.getHits().size() + " documents");
+
+                // Retrieve a document
+                if (!result.getHits().isEmpty()) {
+                    try (Document doc = searcher.doc(result.getHits().get(0).getDocAddress())) {
+                        assertNotNull(doc.getFirst("title"));
+                        System.out.println("   Retrieved document: " + doc.getFirst("title"));
+                    }
+                }
+            }
+        }
+
+        // 🎯 CRITICAL: Verify counters show NON-ZERO - proves they work correctly
+        long requestsAfter = SplitCacheManager.getObjectStorageRequestCount();
+        long bytesAfter = SplitCacheManager.getObjectStorageBytesFetched();
+        System.out.println("   S3 counters after query: requests=" + requestsAfter + ", bytes=" + bytesAfter);
+
+        assertTrue(requestsAfter > requestsBefore,
+            "🚨 COUNTER FAILURE: Expected non-zero S3 requests but got " + (requestsAfter - requestsBefore) +
+            ". Counters may not be working correctly!");
+        assertTrue(bytesAfter > bytesBefore,
+            "🚨 COUNTER FAILURE: Expected non-zero bytes from S3 but got " + (bytesAfter - bytesBefore) +
+            ". Counters may not be working correctly!");
+
+        System.out.println("✅ S3 request counters verified: " + (requestsAfter - requestsBefore) +
+            " requests, " + (bytesAfter - bytesBefore) + " bytes fetched from S3");
+    }
+
+    @Test
     @Order(1)
     void testDiskCachePopulation() throws Exception {
         System.out.println("\n=== Test 1: Disk Cache Population ===");
@@ -264,6 +321,12 @@ public class RealS3DiskCacheTest {
                 .withTieredCache(tieredConfig);
 
         try (SplitCacheManager cacheManager = SplitCacheManager.getInstance(cacheConfig)) {
+            // 🎯 CRITICAL: Reset S3 request counters BEFORE query to verify disk cache is used
+            SplitCacheManager.resetObjectStorageRequestStats();
+            long requestsBefore = SplitCacheManager.getObjectStorageRequestCount();
+            long bytesBefore = SplitCacheManager.getObjectStorageBytesFetched();
+            System.out.println("   S3 request counters reset: requests=" + requestsBefore + ", bytes=" + bytesBefore);
+
             try (SplitSearcher searcher = cacheManager.createSplitSearcher(splitS3Url, splitMetadata)) {
                 // Search again - should hit disk cache
                 SplitQuery query = searcher.parseQuery("content:searchable");
@@ -281,6 +344,18 @@ public class RealS3DiskCacheTest {
                 }
             }
 
+            // 🎯 CRITICAL: Verify NO S3 requests were made - all data served from disk cache
+            long requestsAfter = SplitCacheManager.getObjectStorageRequestCount();
+            long bytesAfter = SplitCacheManager.getObjectStorageBytesFetched();
+            System.out.println("   S3 requests after query: requests=" + requestsAfter + ", bytes=" + bytesAfter);
+
+            assertEquals(0, requestsAfter - requestsBefore,
+                "🚨 DISK CACHE FAILURE: Expected 0 S3 requests but got " + (requestsAfter - requestsBefore) +
+                ". Data should be served from L2 disk cache, not from S3!");
+            assertEquals(0, bytesAfter - bytesBefore,
+                "🚨 DISK CACHE FAILURE: Expected 0 bytes from S3 but got " + (bytesAfter - bytesBefore) +
+                ". Data should be served from L2 disk cache!");
+
             // Verify disk cache stats show data
             SplitCacheManager.DiskCacheStats stats = cacheManager.getDiskCacheStats();
             if (stats != null) {
@@ -288,7 +363,7 @@ public class RealS3DiskCacheTest {
             }
         }
 
-        System.out.println("✅ Disk cache persistence test passed");
+        System.out.println("✅ Disk cache persistence test passed - ZERO S3 requests!");
     }
 
     @Test

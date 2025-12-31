@@ -43,7 +43,43 @@ SplitCacheManager.CacheConfig cacheConfig = new SplitCacheManager.CacheConfig("p
 - **Eliminates Egress Costs**: Data served from local disk after first access
 - **Survives Restarts**: No need to re-download from cloud after JVM restart
 
-**📖 Documentation:** See `docs/L2_DISK_CACHE_GUIDE.md` for complete developer guide.
+**✅ Cross-Process Disk Cache Persistence (December 2025):**
+
+The L2 disk cache now properly persists data across JVM restarts, enabling queries in a new process to use cached data without re-downloading from S3/Azure.
+
+```java
+// Process 1: Prewarm and populate disk cache
+SplitCacheManager.TieredCacheConfig tieredConfig = new SplitCacheManager.TieredCacheConfig()
+    .withDiskCachePath("/shared/disk/cache")
+    .withMaxDiskSize(100_000_000_000L);
+
+try (SplitCacheManager cacheManager = SplitCacheManager.getInstance(cacheConfig)) {
+    try (SplitSearcher searcher = cacheManager.createSplitSearcher(splitUri, metadata)) {
+        // Prewarm downloads from S3/Azure and writes to disk cache
+        searcher.preloadComponents(
+            SplitSearcher.IndexComponent.TERM,
+            SplitSearcher.IndexComponent.POSTINGS,
+            SplitSearcher.IndexComponent.FASTFIELD
+        ).join();  // Flush ensures manifest is synced to disk
+    }
+}
+// Process exits - disk cache persists
+
+// Process 2: Queries served from disk cache with ZERO cloud downloads
+try (SplitCacheManager cacheManager2 = SplitCacheManager.getInstance(cacheConfig)) {
+    try (SplitSearcher searcher2 = cacheManager2.createSplitSearcher(splitUri, metadata)) {
+        // All queries read from disk cache - no S3/Azure downloads!
+        SearchResult result = searcher2.search(query, 10);
+    }
+}
+```
+
+**Key Implementation Details:**
+- **Consistent Cache Keys**: Prewarm and queries use identical bundle-level cache keys
+- **Manifest Sync on Flush**: `preloadComponents().join()` syncs manifest to disk before returning
+- **Memory-Safe Prewarm**: Data written only to L2 disk cache, not L1 memory (prevents OOM on large tables)
+
+**📖 Documentation:** See `docs/L2_DISK_CACHE_GUIDE.md` and `docs/DISK_CACHE_CROSS_PROCESS_FIX.md` for complete developer guides.
 
 ### **🚀 PREVIOUS BREAKTHROUGH: COMPLETE MEMORY ALLOCATION SYSTEM OVERHAUL (August 2025)**
 

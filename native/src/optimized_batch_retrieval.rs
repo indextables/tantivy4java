@@ -295,11 +295,14 @@ impl QuickwitPersistentCacheManager {
             .await
             .context("Failed to resolve cache storage URI")?;
 
-        let memory_cache = ByteRangeCache::with_infinite_capacity(
+        // 🚀 MEMORY SAFETY: Use bounded L1 cache with configured memory size
+        // Cache clears itself when capacity is exceeded - data is safe in L2 disk cache
+        let memory_cache = ByteRangeCache::with_capacity(
+            config.memory_cache_size as u64,
             &STORAGE_METRICS.shortlived_cache
         );
 
-        debug_println!("💾 QUICKWIT_CACHE_INIT: Initialized persistent cache with {}MB memory, storage: {}",
+        debug_println!("💾 QUICKWIT_CACHE_INIT: Initialized persistent cache with {}MB bounded memory, storage: {}",
                       config.memory_cache_size / (1024 * 1024),
                       config.cache_storage_uri);
 

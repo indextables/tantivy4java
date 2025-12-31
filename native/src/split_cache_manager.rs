@@ -54,6 +54,10 @@ impl GlobalSplitCacheManager {
         // All async operations should use the shared global runtime via QuickwitRuntimeManager
         debug_println!("🔧 RUNTIME_FIX: Eliminating separate Tokio runtime to prevent deadlocks");
 
+        // Set the L1 cache capacity from Java's CacheConfig.withMaxCacheSize()
+        // This ensures the global shared L1 cache uses the Java-configured size
+        crate::global_cache::set_l1_cache_capacity(max_cache_size);
+
         // Note: We're using the global caches from GLOBAL_SEARCHER_COMPONENTS
         // This ensures all split cache managers share the same underlying caches
         // following Quickwit's architecture pattern
@@ -389,6 +393,15 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_
                 _ => 30, // 30 seconds default
             };
 
+            // Extract disableL1Cache flag for debugging
+            let disable_l1_cache = match env.call_method(&tiered_config_obj, "isDisableL1Cache", "()Z", &[]) {
+                Ok(result) => result.z().unwrap_or(false),
+                _ => false,
+            };
+
+            // Set the global flag for L1 cache disabling
+            crate::global_cache::set_disable_l1_cache(disable_l1_cache);
+
             // Create disk cache config if we have a path
             debug_println!("RUST DEBUG: disk_path is_some={}", disk_path.is_some());
             if let Some(path) = disk_path {
@@ -402,9 +415,10 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_
                     compression: CompressionAlgorithm::from_ordinal(compression_ordinal),
                     min_compress_size,
                     manifest_sync_interval_secs: manifest_sync_interval,
+                    mmap_cache_size: 0, // Use default (1024)
                 };
 
-                debug_println!("RUST DEBUG: Calling set_disk_cache");
+                debug_println!("RUST DEBUG: Calling set_disk_cache with path: {}", path);
                 manager.set_disk_cache(disk_config);
                 debug_println!("RUST DEBUG: set_disk_cache complete");
             } else {
@@ -448,9 +462,15 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_
         if let Some(cache_name_arc) = crate::utils::jlong_to_arc::<String>(ptr) {
             // Check if this manager has a disk cache and clear caches
             if let Some(manager) = managers.get(&*cache_name_arc) {
-                if manager.disk_cache.is_some() {
+                if let Some(disk_cache) = &manager.disk_cache {
+                    // 🔧 CRITICAL FIX: Flush all pending writes BEFORE clearing references
+                    // This ensures the background writer can still access the cache to write data
+                    debug_println!("🔵 FLUSH: Flushing disk cache for '{}' before cleanup", *cache_name_arc);
+                    disk_cache.flush_blocking();
+                    debug_println!("🔵 FLUSH: Disk cache flush complete for '{}'", *cache_name_arc);
+
                     debug_println!("RUST DEBUG: Clearing caches for cache '{}' with disk cache", *cache_name_arc);
-                    // Clear searcher cache first - this releases Arc<Searcher> which holds
+                    // Clear searcher cache - this releases Arc<Searcher> which holds
                     // references to StorageWithPersistentCache -> L2DiskCache
                     crate::split_searcher_replacement::clear_searcher_cache();
                     // Then clear the global disk cache reference
@@ -1099,4 +1119,155 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_
         },
         None => 0,
     }
+}
+
+// =====================================================================
+// L1 ByteRangeCache Statistics JNI Methods
+// =====================================================================
+// These functions expose the global shared L1 cache statistics to Java
+// for monitoring and testing cache eviction behavior.
+// =====================================================================
+
+/// Get the current size of the global L1 cache in bytes
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_nativeGetL1CacheSize(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jlong {
+    crate::global_cache::get_global_l1_cache_size() as jlong
+}
+
+/// Get the configured capacity of the global L1 cache in bytes
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_nativeGetL1CacheCapacity(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jlong {
+    crate::global_cache::get_global_l1_cache_capacity() as jlong
+}
+
+/// Get the number of items evicted from the L1 cache (from Quickwit's shortlived_cache metrics)
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_nativeGetL1CacheEvictions(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jlong {
+    quickwit_storage::STORAGE_METRICS.shortlived_cache.evict_num_items.get() as jlong
+}
+
+/// Get the total bytes evicted from the L1 cache
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_nativeGetL1CacheEvictedBytes(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jlong {
+    quickwit_storage::STORAGE_METRICS.shortlived_cache.evict_num_bytes.get() as jlong
+}
+
+/// Get the number of cache hits in the L1 cache
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_nativeGetL1CacheHits(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jlong {
+    quickwit_storage::STORAGE_METRICS.shortlived_cache.hits_num_items.get() as jlong
+}
+
+/// Get the number of cache misses in the L1 cache
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_nativeGetL1CacheMisses(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jlong {
+    quickwit_storage::STORAGE_METRICS.shortlived_cache.misses_num_items.get() as jlong
+}
+
+/// Clear the global L1 cache
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_nativeClearL1Cache(
+    _env: JNIEnv,
+    _class: JClass,
+) {
+    crate::global_cache::clear_global_l1_cache();
+}
+
+/// Reset the global L1 cache (for testing - allows reinitialization with new capacity)
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_nativeResetL1Cache(
+    _env: JNIEnv,
+    _class: JClass,
+) {
+    crate::global_cache::reset_global_l1_cache();
+}
+
+// =====================================================================
+// Global Storage Download Metrics
+// =====================================================================
+// These functions expose global storage download counters to Java for
+// programmatic verification of caching behavior in tests.
+// =====================================================================
+
+use crate::global_cache::{get_storage_download_metrics, reset_storage_download_metrics};
+
+/// Get total storage downloads (all sources)
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_nativeGetStorageDownloadCount(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jlong {
+    get_storage_download_metrics().total_downloads as jlong
+}
+
+/// Get total bytes downloaded (all sources)
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_nativeGetStorageDownloadBytes(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jlong {
+    get_storage_download_metrics().total_bytes as jlong
+}
+
+/// Get storage downloads during prewarm operations
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_nativeGetStoragePrewarmDownloadCount(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jlong {
+    get_storage_download_metrics().prewarm_downloads as jlong
+}
+
+/// Get bytes downloaded during prewarm operations
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_nativeGetStoragePrewarmDownloadBytes(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jlong {
+    get_storage_download_metrics().prewarm_bytes as jlong
+}
+
+/// Get storage downloads during query operations (L3 cache misses)
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_nativeGetStorageQueryDownloadCount(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jlong {
+    get_storage_download_metrics().query_downloads as jlong
+}
+
+/// Get bytes downloaded during query operations
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_nativeGetStorageQueryDownloadBytes(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jlong {
+    get_storage_download_metrics().query_bytes as jlong
+}
+
+/// Reset all storage download metrics (useful between tests)
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_nativeResetStorageDownloadMetrics(
+    _env: JNIEnv,
+    _class: JClass,
+) {
+    reset_storage_download_metrics();
 }

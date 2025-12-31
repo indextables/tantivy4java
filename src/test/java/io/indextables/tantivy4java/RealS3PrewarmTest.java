@@ -330,6 +330,93 @@ public class RealS3PrewarmTest {
         }
     }
 
+    @Test
+    @Order(4)
+    @DisplayName("Step 4: Test STORE prewarm works correctly on S3")
+    void step4_testStorePrewarm() throws Exception {
+        System.out.println("\n" + "=".repeat(70));
+        System.out.println("TESTING STORE PREWARM WITH S3");
+        System.out.println("=".repeat(70));
+
+        assertNotNull(splitS3Url, "Split S3 URL should be available");
+        assertNotNull(splitMetadata, "Split metadata should be available");
+
+        // Create cache manager with fresh cache
+        String cacheName = "s3-store-prewarm-test-" + System.currentTimeMillis();
+        SplitCacheManager.CacheConfig cacheConfig = new SplitCacheManager.CacheConfig(cacheName)
+            .withMaxCacheSize(500_000_000);
+
+        String accessKey = getAccessKey();
+        String secretKey = getSecretKey();
+        if (accessKey != null && secretKey != null) {
+            cacheConfig = cacheConfig.withAwsCredentials(accessKey, secretKey);
+        }
+        cacheConfig = cacheConfig.withAwsRegion(TEST_REGION);
+
+        SplitCacheManager cacheManager = SplitCacheManager.getInstance(cacheConfig);
+
+        try (SplitSearcher searcher = cacheManager.createSplitSearcher(splitS3Url, splitMetadata)) {
+
+            // Get initial stats
+            var initialStats = searcher.getCacheStats();
+            System.out.println("Initial cache: hits=" + initialStats.getHitCount() +
+                             ", misses=" + initialStats.getMissCount());
+
+            // PREWARM the STORE component - this is the critical test
+            System.out.println("\nPrewarming STORE component...");
+            long prewarmStart = System.nanoTime();
+
+            try {
+                searcher.preloadComponents(SplitSearcher.IndexComponent.STORE).join();
+                long prewarmTimeMs = (System.nanoTime() - prewarmStart) / 1_000_000;
+                System.out.println("STORE prewarm completed in " + prewarmTimeMs + " ms");
+
+                var afterPrewarmStats = searcher.getCacheStats();
+                System.out.println("Cache after prewarm: size=" + afterPrewarmStats.getTotalSize() + " bytes");
+
+                // Now retrieve some documents - should have minimal cache misses
+                System.out.println("\nRetrieving documents after STORE prewarm...");
+                long missesBeforeRetrieval = afterPrewarmStats.getMissCount();
+
+                // Query to get some documents
+                SplitQuery query = new SplitTermQuery("content", generatedTerms.get(0));
+                SearchResult result = searcher.search(query, 5);
+
+                int docCount = 0;
+                for (var hit : result.getHits()) {
+                    try (Document doc = searcher.doc(hit.getDocAddress())) {
+                        // Access the stored content field to trigger store read
+                        Object content = doc.getFirst("content");
+                        if (content != null) {
+                            docCount++;
+                        }
+                    }
+                }
+
+                var finalStats = searcher.getCacheStats();
+                long newStoreMisses = finalStats.getMissCount() - missesBeforeRetrieval;
+
+                System.out.println("   Retrieved " + docCount + " documents");
+                System.out.println("   New cache misses during retrieval: " + newStoreMisses);
+
+                System.out.println("\n" + "=".repeat(70));
+                System.out.println("STORE PREWARM TEST SUMMARY");
+                System.out.println("=".repeat(70));
+                System.out.println("   STORE prewarm: SUCCESS (no errors)");
+                System.out.println("   Documents retrieved: " + docCount);
+                System.out.println("   New cache misses: " + newStoreMisses);
+                System.out.println("=".repeat(70));
+
+            } catch (Exception e) {
+                long prewarmTimeMs = (System.nanoTime() - prewarmStart) / 1_000_000;
+                System.out.println("STORE prewarm FAILED after " + prewarmTimeMs + " ms");
+                System.out.println("Error: " + e.getMessage());
+                e.printStackTrace();
+                fail("STORE prewarm should not fail: " + e.getMessage());
+            }
+        }
+    }
+
     // Helper methods
 
     private static String generateRandomTerm() {

@@ -448,6 +448,7 @@ public class SplitCacheManager implements AutoCloseable {
         private CompressionAlgorithm compression = CompressionAlgorithm.LZ4;
         private int minCompressSizeBytes = 4096;  // Skip compression below 4KB
         private int manifestSyncIntervalSecs = 30;  // Sync manifest every 30 seconds
+        private boolean disableL1Cache = false;  // Debugging: disable L1 ByteRangeCache
 
         /**
          * Set the disk cache directory path.
@@ -537,12 +538,37 @@ public class SplitCacheManager implements AutoCloseable {
             return this;
         }
 
+        /**
+         * Disable the L1 ByteRangeCache (in-memory cache) for debugging.
+         *
+         * <p>When enabled, all storage requests bypass the L1 memory cache and go directly
+         * to L2 disk cache or L3 remote storage. This helps debug cache key mismatches
+         * between prewarm and query operations.
+         *
+         * <p><b>Debug Usage:</b>
+         * <pre>{@code
+         * TieredCacheConfig config = new TieredCacheConfig()
+         *     .withDiskCachePath("/tmp/cache")
+         *     .withDisableL1Cache(true);  // Bypass memory cache for debugging
+         *
+         * // Run with TANTIVY4JAVA_DEBUG=1 to see cache key details
+         * }</pre>
+         *
+         * @param disable true to disable L1 cache, false to use normally
+         * @return this TieredCacheConfig for method chaining
+         */
+        public TieredCacheConfig withDisableL1Cache(boolean disable) {
+            this.disableL1Cache = disable;
+            return this;
+        }
+
         // Getters
         public String getDiskCachePath() { return diskCachePath; }
         public long getMaxDiskSizeBytes() { return maxDiskSizeBytes; }
         public CompressionAlgorithm getCompression() { return compression; }
         public int getMinCompressSizeBytes() { return minCompressSizeBytes; }
         public int getManifestSyncIntervalSecs() { return manifestSyncIntervalSecs; }
+        public boolean isDisableL1Cache() { return disableL1Cache; }
 
         /**
          * Convert compression algorithm to ordinal for native layer.
@@ -1251,6 +1277,30 @@ public class SplitCacheManager implements AutoCloseable {
     private static native boolean nativeIsDiskCacheEnabled(long ptr);
     private static native boolean nativeEvictSplitFromDiskCache(long ptr, String splitUri);
 
+    // ========================================
+    // Storage Download Metrics Native Methods
+    // ========================================
+    // Global counters for programmatic verification of S3/storage downloads
+    static native long nativeGetStorageDownloadCount();
+    static native long nativeGetStorageDownloadBytes();
+    static native long nativeGetStoragePrewarmDownloadCount();
+    static native long nativeGetStoragePrewarmDownloadBytes();
+    static native long nativeGetStorageQueryDownloadCount();
+    static native long nativeGetStorageQueryDownloadBytes();
+    static native void nativeResetStorageDownloadMetrics();
+
+    // ========================================
+    // L1 ByteRangeCache Statistics Native Methods
+    // ========================================
+    static native long nativeGetL1CacheSize();
+    static native long nativeGetL1CacheCapacity();
+    static native long nativeGetL1CacheEvictions();
+    static native long nativeGetL1CacheEvictedBytes();
+    static native long nativeGetL1CacheHits();
+    static native long nativeGetL1CacheMisses();
+    static native void nativeClearL1Cache();
+    static native void nativeResetL1Cache();
+
     /**
      * Get global batch optimization metrics.
      *
@@ -1444,6 +1494,133 @@ public class SplitCacheManager implements AutoCloseable {
     }
 
     // ========================================
+    // Storage Download Metrics API
+    // ========================================
+    // Global counters to programmatically verify S3/storage download behavior.
+    // Tracks downloads separately for prewarm vs query operations.
+
+    /**
+     * Storage download metrics for programmatic verification.
+     *
+     * <p>This class tracks actual storage downloads (S3, Azure, file) separately for
+     * prewarm and query operations. Use this to verify that:
+     * <ul>
+     *   <li>Prewarm populates the cache without redundant downloads</li>
+     *   <li>Queries use cached data (zero query downloads after prewarm)</li>
+     *   <li>Cache key mismatches are detected (prewarm + query downloads for same data)</li>
+     * </ul>
+     *
+     * <p><strong>Example Test Usage:</strong>
+     * <pre>{@code
+     * // Reset counters at start of test
+     * SplitCacheManager.resetStorageDownloadMetrics();
+     *
+     * // Prewarm the split
+     * searcher.preloadComponents(PrewarmComponent.ALL);
+     *
+     * StorageDownloadMetrics afterPrewarm = SplitCacheManager.getStorageDownloadMetrics();
+     * System.out.println("Prewarm downloads: " + afterPrewarm.getPrewarmDownloads());
+     *
+     * // Run query
+     * searcher.search(query, 10);
+     *
+     * StorageDownloadMetrics afterQuery = SplitCacheManager.getStorageDownloadMetrics();
+     * assertEquals(0, afterQuery.getQueryDownloads(), "Queries should use cached data!");
+     * }</pre>
+     */
+    public static class StorageDownloadMetrics {
+        private final long totalDownloads;
+        private final long totalBytes;
+        private final long prewarmDownloads;
+        private final long prewarmBytes;
+        private final long queryDownloads;
+        private final long queryBytes;
+
+        public StorageDownloadMetrics(
+                long totalDownloads, long totalBytes,
+                long prewarmDownloads, long prewarmBytes,
+                long queryDownloads, long queryBytes) {
+            this.totalDownloads = totalDownloads;
+            this.totalBytes = totalBytes;
+            this.prewarmDownloads = prewarmDownloads;
+            this.prewarmBytes = prewarmBytes;
+            this.queryDownloads = queryDownloads;
+            this.queryBytes = queryBytes;
+        }
+
+        /** Total storage downloads (all sources) */
+        public long getTotalDownloads() { return totalDownloads; }
+
+        /** Total bytes downloaded (all sources) */
+        public long getTotalBytes() { return totalBytes; }
+
+        /** Downloads during prewarm operations */
+        public long getPrewarmDownloads() { return prewarmDownloads; }
+
+        /** Bytes downloaded during prewarm */
+        public long getPrewarmBytes() { return prewarmBytes; }
+
+        /** Downloads during query operations (L3 cache misses) */
+        public long getQueryDownloads() { return queryDownloads; }
+
+        /** Bytes downloaded during queries */
+        public long getQueryBytes() { return queryBytes; }
+
+        /** Returns true if any query downloads occurred (indicates cache miss) */
+        public boolean hasQueryDownloads() { return queryDownloads > 0; }
+
+        /** Returns true if prewarm was fully effective (no query downloads after prewarm) */
+        public boolean isPrewarmEffective() { return prewarmDownloads > 0 && queryDownloads == 0; }
+
+        /** Formatted summary string */
+        public String getSummary() {
+            return String.format(
+                "Downloads: %d total (%d bytes), %d prewarm (%d bytes), %d query (%d bytes)",
+                totalDownloads, totalBytes,
+                prewarmDownloads, prewarmBytes,
+                queryDownloads, queryBytes
+            );
+        }
+
+        @Override
+        public String toString() {
+            return getSummary();
+        }
+    }
+
+    /**
+     * Get current storage download metrics.
+     *
+     * <p>Returns a snapshot of all storage download counters. These counters track
+     * actual downloads from remote storage (S3, Azure, file), separated by operation type.
+     *
+     * @return current storage download metrics
+     * @see #resetStorageDownloadMetrics()
+     */
+    public static StorageDownloadMetrics getStorageDownloadMetrics() {
+        return new StorageDownloadMetrics(
+            nativeGetStorageDownloadCount(),
+            nativeGetStorageDownloadBytes(),
+            nativeGetStoragePrewarmDownloadCount(),
+            nativeGetStoragePrewarmDownloadBytes(),
+            nativeGetStorageQueryDownloadCount(),
+            nativeGetStorageQueryDownloadBytes()
+        );
+    }
+
+    /**
+     * Reset all storage download metrics.
+     *
+     * <p>Resets all counters to zero. Use this at the start of tests to get
+     * accurate per-test measurements.
+     *
+     * @see #getStorageDownloadMetrics()
+     */
+    public static void resetStorageDownloadMetrics() {
+        nativeResetStorageDownloadMetrics();
+    }
+
+    // ========================================
     // L2 Disk Cache Statistics API
     // ========================================
 
@@ -1565,6 +1742,144 @@ public class SplitCacheManager implements AutoCloseable {
             return String.format(
                 "DiskCacheStats{totalBytes=%d, maxBytes=%d, usage=%.1f%%, splits=%d, components=%d}",
                 totalBytes, maxBytes, getUsagePercent(), splitCount, componentCount
+            );
+        }
+    }
+
+    // ========================================
+    // L1 Cache Statistics API
+    // ========================================
+
+    /**
+     * Get L1 cache (ByteRangeCache) statistics.
+     *
+     * <p>The L1 cache is the in-memory cache layer that provides fastest access to
+     * recently accessed data. It is bounded by the capacity configured via
+     * {@link CacheConfig#withMaxCacheSize(long)} and automatically evicts entries
+     * when capacity is exceeded.
+     *
+     * <p><strong>Example Usage:</strong>
+     * <pre>{@code
+     * L1CacheStats stats = SplitCacheManager.getL1CacheStats();
+     * System.out.println("L1 Cache Usage: " + stats.getSizeBytes() + " / " + stats.getCapacityBytes());
+     * System.out.println("Hit Rate: " + stats.getHitRate() + "%");
+     * System.out.println("Total Evictions: " + stats.getEvictions());
+     * }</pre>
+     *
+     * @return L1 cache statistics snapshot
+     */
+    public static L1CacheStats getL1CacheStats() {
+        return new L1CacheStats(
+            nativeGetL1CacheSize(),
+            nativeGetL1CacheCapacity(),
+            nativeGetL1CacheHits(),
+            nativeGetL1CacheMisses(),
+            nativeGetL1CacheEvictions(),
+            nativeGetL1CacheEvictedBytes()
+        );
+    }
+
+    /**
+     * Clear the L1 cache (ByteRangeCache).
+     *
+     * <p>This frees all memory used by the L1 cache. Data is still available in
+     * the L2 disk cache and will be reloaded on demand.
+     */
+    public static void clearL1Cache() {
+        nativeClearL1Cache();
+    }
+
+    /**
+     * Reset the L1 cache to allow reinitialization with new capacity.
+     *
+     * <p>This is primarily for testing scenarios where you need to change the L1
+     * cache capacity between tests. In production, you typically configure the
+     * capacity once via {@link CacheConfig#withMaxCacheSize(long)}.
+     *
+     * <p>After calling this method, the next {@link SplitCacheManager#getInstance(CacheConfig)}
+     * call will create a new L1 cache with the capacity from the new CacheConfig.
+     */
+    public static void resetL1Cache() {
+        nativeResetL1Cache();
+    }
+
+    /**
+     * L1 cache (ByteRangeCache) statistics.
+     *
+     * <p>The L1 cache is a bounded in-memory cache that automatically evicts entries
+     * when the configured capacity is exceeded. This prevents OOM during large prewarm
+     * operations while still providing fast access to recently used data.
+     *
+     * <p><b>Key Metrics:</b>
+     * <ul>
+     *   <li><b>sizeBytes</b> - Current memory usage in bytes</li>
+     *   <li><b>capacityBytes</b> - Maximum allowed size (configured via withMaxCacheSize)</li>
+     *   <li><b>evictions</b> - Number of times the cache was cleared due to capacity exceeded</li>
+     *   <li><b>evictedBytes</b> - Total bytes evicted from the cache</li>
+     *   <li><b>hits/misses</b> - Cache access statistics for hit rate calculation</li>
+     * </ul>
+     */
+    public static class L1CacheStats {
+        private final long sizeBytes;
+        private final long capacityBytes;
+        private final long hits;
+        private final long misses;
+        private final long evictions;
+        private final long evictedBytes;
+
+        L1CacheStats(long sizeBytes, long capacityBytes, long hits, long misses,
+                     long evictions, long evictedBytes) {
+            this.sizeBytes = sizeBytes;
+            this.capacityBytes = capacityBytes;
+            this.hits = hits;
+            this.misses = misses;
+            this.evictions = evictions;
+            this.evictedBytes = evictedBytes;
+        }
+
+        /** Current size of L1 cache in bytes. */
+        public long getSizeBytes() { return sizeBytes; }
+
+        /** Maximum capacity of L1 cache in bytes (0 if unlimited). */
+        public long getCapacityBytes() { return capacityBytes; }
+
+        /** Number of cache hits. */
+        public long getHits() { return hits; }
+
+        /** Number of cache misses. */
+        public long getMisses() { return misses; }
+
+        /** Number of items evicted from the cache. */
+        public long getEvictions() { return evictions; }
+
+        /** Total bytes evicted from the cache. */
+        public long getEvictedBytes() { return evictedBytes; }
+
+        /** Total cache accesses (hits + misses). */
+        public long getTotalAccesses() { return hits + misses; }
+
+        /**
+         * Cache hit rate as percentage (0-100).
+         * Returns 0 if no accesses have been recorded.
+         */
+        public double getHitRate() {
+            long total = getTotalAccesses();
+            return total == 0 ? 0.0 : (hits * 100.0 / total);
+        }
+
+        /**
+         * Cache usage as percentage (0-100).
+         * Returns 0 if capacity is 0 (unlimited).
+         */
+        public double getUsagePercent() {
+            return capacityBytes == 0 ? 0.0 : (sizeBytes * 100.0 / capacityBytes);
+        }
+
+        @Override
+        public String toString() {
+            return String.format(
+                "L1CacheStats{size=%d, capacity=%d, usage=%.1f%%, hits=%d, misses=%d, hitRate=%.1f%%, evictions=%d, evictedBytes=%d}",
+                sizeBytes, capacityBytes, getUsagePercent(), hits, misses, getHitRate(), evictions, evictedBytes
             );
         }
     }

@@ -1379,8 +1379,51 @@ if (stats != null) {
 - **LRU eviction** - Automatic eviction at 95% capacity (to 90%)
 - **Smart compression** - Automatically skips small data and numeric fields
 - **Crash recovery** - Manifest persistence with backup for recovery
+- **Cross-process persistence** - Cache survives JVM restarts with zero re-downloads
 
-For detailed documentation, see [L2 Disk Cache Developer Guide](docs/L2_DISK_CACHE_GUIDE.md).
+### Cross-Process Disk Cache Persistence
+
+The L2 disk cache properly persists data across JVM restarts. Data prewarmed in one process is immediately available to subsequent processes without re-downloading from S3/Azure:
+
+```java
+// Process 1: Prewarm and populate disk cache
+SplitCacheManager.TieredCacheConfig tieredConfig = new SplitCacheManager.TieredCacheConfig()
+    .withDiskCachePath("/shared/disk/cache")
+    .withMaxDiskSize(100_000_000_000L);
+
+SplitCacheManager.CacheConfig cacheConfig = new SplitCacheManager.CacheConfig("cache")
+    .withMaxCacheSize(500_000_000)
+    .withAwsCredentials(accessKey, secretKey)
+    .withAwsRegion("us-east-1")
+    .withTieredCache(tieredConfig);
+
+try (SplitCacheManager cacheManager = SplitCacheManager.getInstance(cacheConfig)) {
+    try (SplitSearcher searcher = cacheManager.createSplitSearcher(splitUri, metadata)) {
+        // Prewarm downloads from S3/Azure and writes to disk cache
+        searcher.preloadComponents(
+            SplitSearcher.IndexComponent.TERM,
+            SplitSearcher.IndexComponent.POSTINGS,
+            SplitSearcher.IndexComponent.FASTFIELD
+        ).join();  // join() ensures manifest is synced to disk
+    }
+}
+// Process exits - disk cache persists on disk
+
+// Process 2 (after JVM restart): Queries served from disk cache
+try (SplitCacheManager cacheManager = SplitCacheManager.getInstance(cacheConfig)) {
+    try (SplitSearcher searcher = cacheManager.createSplitSearcher(splitUri, metadata)) {
+        // ZERO S3/Azure downloads - all data served from disk cache!
+        SearchResult result = searcher.search(query, 10);
+    }
+}
+```
+
+**Important notes:**
+- Always call `.join()` after `preloadComponents()` to ensure manifest is synced to disk
+- Use the same `diskCachePath` across processes to share cached data
+- Prewarm writes only to L2 disk cache (not L1 memory) to prevent OOM on large tables
+
+For detailed documentation, see [L2 Disk Cache Developer Guide](docs/L2_DISK_CACHE_GUIDE.md) and [Cross-Process Fix](docs/DISK_CACHE_CROSS_PROCESS_FIX.md).
 
 ---
 

@@ -429,11 +429,64 @@ public class SplitSearcher implements AutoCloseable {
     }
     
     /**
-     * Asynchronously preload specified components into cache
+     * Asynchronously preload specified components into cache for ALL fields.
+     *
+     * This preloads the specified component types for every applicable field in the schema.
+     * For field-specific preloading (to reduce cache usage and prewarm time), use
+     * {@link #preloadFields(IndexComponent, String...)} instead.
+     *
+     * @param components The component types to preload (TERM, POSTINGS, FIELDNORM, FASTFIELD, STORE)
+     * @return CompletableFuture that completes when preloading is finished
      */
     public CompletableFuture<Void> preloadComponents(IndexComponent... components) {
         return CompletableFuture.runAsync(() -> {
             preloadComponentsNative(nativePtr, components);
+        });
+    }
+
+    /**
+     * Asynchronously preload a specific component for only the specified fields.
+     *
+     * This allows fine-grained control over which fields are preloaded, reducing cache usage
+     * and prewarm time compared to {@link #preloadComponents(IndexComponent...)} which
+     * preloads all fields.
+     *
+     * <p>Example usage:</p>
+     * <pre>{@code
+     * // Prewarm term dictionaries only for 'title' and 'content' fields
+     * searcher.preloadFields(IndexComponent.TERM, "title", "content").join();
+     *
+     * // Prewarm fast fields only for 'timestamp' and 'score' fields
+     * searcher.preloadFields(IndexComponent.FASTFIELD, "timestamp", "score").join();
+     *
+     * // Prewarm multiple components for specific fields
+     * CompletableFuture.allOf(
+     *     searcher.preloadFields(IndexComponent.TERM, "title", "content"),
+     *     searcher.preloadFields(IndexComponent.FASTFIELD, "timestamp"),
+     *     searcher.preloadFields(IndexComponent.POSTINGS, "content")
+     * ).join();
+     * }</pre>
+     *
+     * <p>Supported components for field-specific preloading:</p>
+     * <ul>
+     *   <li><b>TERM</b> - Term dictionaries (FST) for specified text/JSON fields</li>
+     *   <li><b>POSTINGS</b> - Posting lists for specified text/JSON fields</li>
+     *   <li><b>FIELDNORM</b> - Field norms for specified text fields</li>
+     *   <li><b>FASTFIELD</b> - Fast field data for specified fast fields</li>
+     *   <li><b>STORE</b> - Not field-specific (preloads all document storage)</li>
+     * </ul>
+     *
+     * @param component The component type to preload
+     * @param fieldNames The specific field names to preload (must exist in schema)
+     * @return CompletableFuture that completes when preloading is finished
+     * @throws IllegalArgumentException if fieldNames is empty or contains invalid field names
+     */
+    public CompletableFuture<Void> preloadFields(IndexComponent component, String... fieldNames) {
+        if (fieldNames == null || fieldNames.length == 0) {
+            throw new IllegalArgumentException("At least one field name must be specified");
+        }
+        return CompletableFuture.runAsync(() -> {
+            preloadFieldsNative(nativePtr, component, fieldNames);
         });
     }
     
@@ -636,6 +689,7 @@ public class SplitSearcher implements AutoCloseable {
     private static native byte[] docsBulkNative(long nativePtr, int[] segments, int[] docIds);
     private static native List<Document> parseBulkDocsNative(java.nio.ByteBuffer buffer);
     private static native void preloadComponentsNative(long nativePtr, IndexComponent[] components);
+    private static native void preloadFieldsNative(long nativePtr, IndexComponent component, String[] fieldNames);
     private static native void warmupQueryNative(long nativePtr, long queryPtr);
     private static native WarmupStats warmupQueryAdvancedNative(long nativePtr, long queryPtr, IndexComponent[] components, boolean enableParallel);
     private static native CacheStats getCacheStatsNative(long nativePtr);
