@@ -3156,10 +3156,167 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_getS
     _env: JNIEnv, _class: JClass, _searcher_ptr: jlong
 ) -> jstring { std::ptr::null_mut() }
 
+/// Get split metadata including component sizes from bundle footer
+/// Returns SplitMetadata object with:
+/// - splitId: The split identifier
+/// - totalSize: Total size of all components
+/// - hotCacheSize: Size of hotcache (from footer)
+/// - numComponents: Number of component files
+/// - componentSizes: Map<String, Long> of file path -> size in bytes
 #[no_mangle]
 pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_getSplitMetadataNative(
-    _env: JNIEnv, _class: JClass, _searcher_ptr: jlong
-) -> jobject { std::ptr::null_mut() }
+    mut env: JNIEnv, _class: JClass, searcher_ptr: jlong
+) -> jobject {
+    // Get the searcher context
+    let result = with_arc_safe(searcher_ptr, |ctx: &Arc<CachedSearcherContext>| {
+        let bundle_offsets = &ctx.bundle_file_offsets;
+
+        // Calculate component sizes from ranges
+        let mut component_sizes: Vec<(String, u64)> = bundle_offsets
+            .iter()
+            .map(|(path, range)| {
+                let path_str = path.to_string_lossy().to_string();
+                let size = range.end - range.start;
+                (path_str, size)
+            })
+            .collect();
+        component_sizes.sort_by(|a, b| a.0.cmp(&b.0));
+
+        // Calculate total size
+        let total_size: u64 = component_sizes.iter().map(|(_, s)| *s).sum();
+
+        // Get split ID from URI
+        let split_id = ctx.split_uri
+            .rsplit('/')
+            .next()
+            .unwrap_or(&ctx.split_uri)
+            .trim_end_matches(".split")
+            .to_string();
+
+        // Hotcache size from footer
+        let hotcache_size = ctx.footer_end - ctx.footer_start;
+
+        (split_id, total_size, hotcache_size, component_sizes)
+    });
+
+    let (split_id, total_size, hotcache_size, component_sizes) = match result {
+        Some(data) => data,
+        None => {
+            to_java_exception(&mut env, &anyhow::anyhow!("Failed to access searcher context"));
+            return std::ptr::null_mut();
+        }
+    };
+
+    // Create Java HashMap for component sizes
+    let hash_map = match env.new_object("java/util/HashMap", "()V", &[]) {
+        Ok(m) => m,
+        Err(e) => {
+            to_java_exception(&mut env, &anyhow::anyhow!("Failed to create HashMap: {}", e));
+            return std::ptr::null_mut();
+        }
+    };
+
+    // Populate the HashMap
+    for (path, size) in &component_sizes {
+        let j_path = match env.new_string(path) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let j_size = match env.new_object("java/lang/Long", "(J)V", &[jni::objects::JValue::Long(*size as i64)]) {
+            Ok(l) => l,
+            Err(_) => continue,
+        };
+        let _ = env.call_method(
+            &hash_map,
+            "put",
+            "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+            &[(&j_path).into(), (&j_size).into()]
+        );
+    }
+
+    // Create SplitMetadata object
+    let j_split_id = match env.new_string(&split_id) {
+        Ok(s) => s,
+        Err(e) => {
+            to_java_exception(&mut env, &anyhow::anyhow!("Failed to create split ID string: {}", e));
+            return std::ptr::null_mut();
+        }
+    };
+
+    let metadata = match env.new_object(
+        "io/indextables/tantivy4java/split/SplitSearcher$SplitMetadata",
+        "(Ljava/lang/String;JJILjava/util/Map;)V",
+        &[
+            (&j_split_id).into(),
+            jni::objects::JValue::Long(total_size as i64),
+            jni::objects::JValue::Long(hotcache_size as i64),
+            jni::objects::JValue::Int(component_sizes.len() as i32),
+            (&hash_map).into(),
+        ]
+    ) {
+        Ok(m) => m,
+        Err(e) => {
+            to_java_exception(&mut env, &anyhow::anyhow!("Failed to create SplitMetadata: {}", e));
+            return std::ptr::null_mut();
+        }
+    };
+
+    metadata.into_raw()
+}
+
+/// Get per-field component sizes (e.g., "score.fastfield" -> 133, "content.fieldnorm" -> 50)
+///
+/// Returns a Java Map<String, Long> with keys like "field_name.component" and values as sizes in bytes.
+/// Components include: fastfield, fieldnorm
+///
+/// This is async and uses the prewarm module's get_per_field_component_sizes function.
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_getPerFieldComponentSizesNative(
+    mut env: JNIEnv, _class: JClass, searcher_ptr: jlong
+) -> jobject {
+    use crate::prewarm::get_per_field_component_sizes;
+
+    debug_println!("📊 JNI: getPerFieldComponentSizesNative called");
+
+    // Execute async function using block_on_operation
+    let field_sizes = match block_on_operation(get_per_field_component_sizes(searcher_ptr)) {
+        Ok(sizes) => sizes,
+        Err(e) => {
+            to_java_exception(&mut env, &anyhow::anyhow!("Failed to get per-field sizes: {}", e));
+            return std::ptr::null_mut();
+        }
+    };
+
+    // Create Java HashMap
+    let hash_map = match env.new_object("java/util/HashMap", "()V", &[]) {
+        Ok(m) => m,
+        Err(e) => {
+            to_java_exception(&mut env, &anyhow::anyhow!("Failed to create HashMap: {}", e));
+            return std::ptr::null_mut();
+        }
+    };
+
+    // Populate the HashMap
+    for (key, size) in &field_sizes {
+        let j_key = match env.new_string(key) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let j_size = match env.new_object("java/lang/Long", "(J)V", &[jni::objects::JValue::Long(*size as i64)]) {
+            Ok(l) => l,
+            Err(_) => continue,
+        };
+        let _ = env.call_method(
+            &hash_map,
+            "put",
+            "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+            &[(&j_key).into(), (&j_size).into()]
+        );
+    }
+
+    debug_println!("📊 JNI: getPerFieldComponentSizesNative returning {} entries", field_sizes.len());
+    hash_map.into_raw()
+}
 
 #[no_mangle]
 pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_getLoadingStatsNative(

@@ -1246,6 +1246,53 @@ assert newMisses == 0 : "Prewarm should eliminate cache misses";
 
 For detailed documentation, see [Term Prewarm Developer Guide](docs/TERM_PREWARM_DEVELOPER_GUIDE.md).
 
+#### Field-Specific Prewarm
+
+For finer control, you can prewarm specific fields instead of entire components:
+
+```java
+// Prewarm only specific fields for fast field access
+searcher.preloadFields(SplitSearcher.IndexComponent.FASTFIELD, "score").join();
+searcher.preloadFields(SplitSearcher.IndexComponent.FASTFIELD, "timestamp").join();
+
+// Prewarm fieldnorms for specific text fields
+searcher.preloadFields(SplitSearcher.IndexComponent.FIELDNORM, "title").join();
+searcher.preloadFields(SplitSearcher.IndexComponent.FIELDNORM, "content").join();
+```
+
+This is useful when you only need certain fields for your query workload and want to minimize cache usage.
+
+### Per-Field Component Sizes
+
+Get precise size information at the field+component level for capacity planning and prewarm validation:
+
+```java
+// Get per-field component sizes
+Map<String, Long> fieldSizes = searcher.getPerFieldComponentSizes();
+
+// Example output:
+// score.fastfield: 107 bytes
+// id.fastfield: 30 bytes
+// title.fieldnorm: 100 bytes
+// content.fieldnorm: 100 bytes
+
+for (Map.Entry<String, Long> entry : fieldSizes.entrySet()) {
+    System.out.println(entry.getKey() + ": " + entry.getValue() + " bytes");
+}
+
+// Validate prewarm operations
+long expectedSize = fieldSizes.getOrDefault("score.fastfield", 0L);
+long bytesBefore = cacheManager.getComprehensiveCacheStats().getByteRangeCache().getSizeBytes();
+searcher.preloadFields(SplitSearcher.IndexComponent.FASTFIELD, "score").join();
+long bytesAfter = cacheManager.getComprehensiveCacheStats().getByteRangeCache().getSizeBytes();
+long downloaded = bytesAfter - bytesBefore;
+
+assert downloaded > 0 : "Prewarm should download data";
+assert downloaded <= expectedSize * 2 : "Downloaded bytes should be bounded";
+```
+
+For detailed component sizes documentation, see [Component Sizes Developer Guide](docs/COMPONENT_SIZES_DEVELOPER_GUIDE.md).
+
 ### SearcherCache Monitoring
 
 The internal SearcherCache is an LRU cache (default: 1000 entries) that stores Tantivy searcher objects for efficient document retrieval. Monitor these statistics to detect memory issues and optimize cache performance:
