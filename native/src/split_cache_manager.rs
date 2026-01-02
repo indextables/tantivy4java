@@ -576,7 +576,11 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_
     
     // 🚀 COMPREHENSIVE CACHE METRICS: Access real Quickwit storage metrics
     let storage_metrics = &quickwit_storage::STORAGE_METRICS;
-    
+
+    // Debug: Print the actual values being returned
+    let byte_range_size = storage_metrics.shortlived_cache.in_cache_num_bytes.get();
+    println!("📊 NATIVE getComprehensiveCacheStatsNative: ByteRangeCache.in_cache_num_bytes = {}", byte_range_size);
+
     // Create 2D array: [cache_type][metrics] where metrics = [hits, misses, evictions, sizeBytes]
     let per_cache_metrics = vec![
         // ByteRangeCache metrics (shortlived_cache)
@@ -584,7 +588,7 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_
             storage_metrics.shortlived_cache.hits_num_items.get() as jlong,
             storage_metrics.shortlived_cache.misses_num_items.get() as jlong,
             storage_metrics.shortlived_cache.evict_num_items.get() as jlong,
-            storage_metrics.shortlived_cache.in_cache_num_bytes.get() as jlong,
+            byte_range_size as jlong,
         ],
         // FooterCache metrics (split_footer_cache)
         vec![

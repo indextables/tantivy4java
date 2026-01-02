@@ -407,6 +407,116 @@ public class DiskCachePrewarmAggregationTest {
         }
     }
 
+    @Test
+    @DisplayName("FASTFIELD prewarm enables zero-download aggregations for ALL fast fields")
+    void testFastFieldPrewarmForAggregations() throws Exception {
+        System.out.println("=".repeat(80));
+        System.out.println("FASTFIELD PREWARM FOR ZERO-DOWNLOAD AGGREGATIONS");
+        System.out.println("=".repeat(80));
+        System.out.println("This test verifies that prewarming FASTFIELD enables zero downloads");
+        System.out.println("for aggregation queries on ANY fast field in the split.");
+        System.out.println();
+        System.out.println("NOTE: Tantivy stores all fast fields together in .fast files,");
+        System.out.println("so prewarming FASTFIELD for any field prewarms ALL fast fields.");
+        System.out.println();
+
+        // Step 1: Create test split
+        Path indexPath = tempDir.resolve("fastfield-agg-index");
+        Path splitPath = tempDir.resolve("fastfield-agg.split");
+        Path diskCachePath = tempDir.resolve("fastfield-agg-cache");
+        Files.createDirectories(diskCachePath);
+
+        createTestIndexWithNumericFields(indexPath);
+
+        QuickwitSplit.SplitConfig splitConfig = new QuickwitSplit.SplitConfig(
+            "fastfield-agg", "test-source", "test-node");
+        QuickwitSplit.SplitMetadata metadata = QuickwitSplit.convertIndexFromPath(
+            indexPath.toString(), splitPath.toString(), splitConfig);
+
+        String splitUrl = "file://" + splitPath.toAbsolutePath();
+
+        // Configure cache with disk tier
+        SplitCacheManager.TieredCacheConfig tieredConfig = new SplitCacheManager.TieredCacheConfig()
+            .withDiskCachePath(diskCachePath.toString())
+            .withMaxDiskSize(100_000_000);
+
+        SplitCacheManager.CacheConfig cacheConfig = new SplitCacheManager.CacheConfig(
+            "fastfield-agg-" + System.currentTimeMillis())
+            .withMaxCacheSize(10_000_000)
+            .withTieredCache(tieredConfig);
+
+        try (SplitCacheManager cacheManager = SplitCacheManager.getInstance(cacheConfig);
+             SplitSearcher searcher = cacheManager.createSplitSearcher(splitUrl, metadata)) {
+
+            // Step 2: Prewarm FASTFIELD (all fast fields are stored together)
+            System.out.println("\nStep 1: Prewarming FASTFIELD component...");
+
+            var statsBeforePrewarm = searcher.getCacheStats();
+            long missesBeforePrewarm = statsBeforePrewarm.getMissCount();
+
+            // Prewarm the fast field data
+            searcher.preloadFields(SplitSearcher.IndexComponent.FASTFIELD, "score").join();
+
+            var statsAfterPrewarm = searcher.getCacheStats();
+            long missesAfterPrewarm = statsAfterPrewarm.getMissCount();
+            long prewarmMisses = missesAfterPrewarm - missesBeforePrewarm;
+
+            System.out.println("   Prewarm downloads (cache misses): " + prewarmMisses);
+
+            // Step 3: Run aggregation on 'score' field
+            System.out.println("\nStep 2: Running stats aggregation on 'score' field...");
+
+            var statsBeforeAgg1 = searcher.getCacheStats();
+            long missesBeforeAgg1 = statsBeforeAgg1.getMissCount();
+
+            SplitQuery query = new SplitMatchAllQuery();
+            StatsAggregation scoreStats = new StatsAggregation("score_stats", "score");
+            SearchResult result = searcher.search(query, 0, "score_stats", scoreStats);
+
+            var statsAfterAgg1 = searcher.getCacheStats();
+            long agg1Misses = statsAfterAgg1.getMissCount() - missesBeforeAgg1;
+
+            StatsResult stats = (StatsResult) result.getAggregation("score_stats");
+            System.out.println("   Aggregation result: count=" + stats.getCount() +
+                             ", avg=" + String.format("%.2f", stats.getAverage()) +
+                             ", min=" + stats.getMin() + ", max=" + stats.getMax());
+            System.out.println("   Downloads during aggregation: " + agg1Misses);
+
+            // Step 4: Run aggregation on 'response_time' field (also prewarmed)
+            System.out.println("\nStep 3: Running stats aggregation on 'response_time' field...");
+            System.out.println("   (Should ALSO have zero downloads - all fast fields prewarmed together)");
+
+            var statsBeforeAgg2 = searcher.getCacheStats();
+            long missesBeforeAgg2 = statsBeforeAgg2.getMissCount();
+
+            StatsAggregation responseStats = new StatsAggregation("response_stats", "response_time");
+            SearchResult result2 = searcher.search(query, 0, "response_stats", responseStats);
+
+            var statsAfterAgg2 = searcher.getCacheStats();
+            long agg2Misses = statsAfterAgg2.getMissCount() - missesBeforeAgg2;
+
+            StatsResult responseStatsResult = (StatsResult) result2.getAggregation("response_stats");
+            System.out.println("   Aggregation result: count=" + responseStatsResult.getCount() +
+                             ", avg=" + String.format("%.2f", responseStatsResult.getAverage()));
+            System.out.println("   Downloads during aggregation: " + agg2Misses);
+
+            // Step 5: Verify ALL aggregations had zero downloads
+            System.out.println("\n" + "=".repeat(80));
+            System.out.println("RESULTS");
+            System.out.println("=".repeat(80));
+            System.out.println("   'score' field aggregation downloads: " + agg1Misses);
+            System.out.println("   'response_time' field aggregation downloads: " + agg2Misses);
+
+            assertEquals(0, agg1Misses,
+                "Aggregation on 'score' should have ZERO downloads after FASTFIELD prewarm");
+            assertEquals(0, agg2Misses,
+                "Aggregation on 'response_time' should have ZERO downloads after FASTFIELD prewarm");
+
+            System.out.println("\n   ✅ SUCCESS: FASTFIELD prewarm enables zero-download aggregations!");
+            System.out.println("   ✅ All fast field aggregations had 0 downloads");
+        }
+    }
+
     private void createTestIndexWithNumericFields(Path indexPath) throws Exception {
         try (SchemaBuilder schemaBuilder = new SchemaBuilder()) {
             // Text fields

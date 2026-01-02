@@ -81,6 +81,41 @@ try (SplitCacheManager cacheManager2 = SplitCacheManager.getInstance(cacheConfig
 
 **📖 Documentation:** See `docs/L2_DISK_CACHE_GUIDE.md` and `docs/DISK_CACHE_CROSS_PROCESS_FIX.md` for complete developer guides.
 
+### **🚀 NEW BREAKTHROUGH: FIELD-SPECIFIC PREWARM AND PER-FIELD COMPONENT SIZES (January 2026)**
+
+**✅ Field-Specific Prewarm Implementation:**
+- **✅ FASTFIELD Field-Specific Prewarm** - `preloadFields(FASTFIELD, "fieldname")` now correctly reads column data
+- **✅ FIELDNORM Field-Specific Prewarm** - `preloadFields(FIELDNORM, "fieldname")` now correctly reads fieldnorm data
+- **✅ Comprehensive Regression Tests** - `FieldSpecificPrewarmRegressionTest` validates all component types
+
+**✅ Per-Field Component Sizes API:**
+- **✅ `getPerFieldComponentSizes()` API** - Returns `Map<String, Long>` with field+component sizes
+- **✅ Format**: `{"score.fastfield": 107, "id.fastfield": 30, "title.fieldnorm": 100}`
+- **✅ Enables precise prewarm validation** - Know exactly how many bytes to expect per field
+- **✅ Storage capacity planning** - Plan cache sizes based on actual field data sizes
+
+**Usage Example:**
+```java
+// Get per-field component sizes
+Map<String, Long> fieldSizes = searcher.getPerFieldComponentSizes();
+
+// Example output:
+// score.fastfield: 107 bytes
+// id.fastfield: 30 bytes
+// title.fieldnorm: 100 bytes
+// content.fieldnorm: 100 bytes
+
+// Prewarm specific fields only
+searcher.preloadFields(SplitSearcher.IndexComponent.FASTFIELD, "score").join();
+searcher.preloadFields(SplitSearcher.IndexComponent.FIELDNORM, "title").join();
+
+// Validate prewarm downloaded expected bytes
+long expectedSize = fieldSizes.get("score.fastfield");
+// ... verify cache stats show approximately expectedSize bytes downloaded
+```
+
+**📖 Documentation:** See `docs/COMPONENT_SIZES_DEVELOPER_GUIDE.md` for complete developer guide.
+
 ### **🚀 PREVIOUS BREAKTHROUGH: COMPLETE MEMORY ALLOCATION SYSTEM OVERHAUL (August 2025)**
 
 **✅ Production-Grade Memory Management Implementation:**

@@ -50,6 +50,7 @@ use std::ops::Range;
 use jni::sys::jlong;
 use quickwit_storage::Storage;
 use tantivy::schema::FieldType;
+use tantivy::HasLen;
 
 use crate::debug_println;
 use crate::disk_cache::L2DiskCache;
@@ -697,96 +698,162 @@ pub async fn prewarm_positions_for_fields(
 }
 
 /// Field-specific fieldnorms prewarming
+///
+/// Uses the same pattern as Quickwit's `warm_up_fieldnorms` function:
+/// 1. Get inner file handle using `fieldnorm_readers.get_inner_file().open_read(field)`
+/// 2. Read the actual bytes using `file_handle.read_bytes_async().await`
+///
+/// This ensures the fieldnorm data is actually read into cache.
 pub async fn prewarm_fieldnorms_for_fields(
     searcher_ptr: jlong,
     field_names: &HashSet<String>,
 ) -> anyhow::Result<()> {
-    debug_println!("🔥 PREWARM_FIELDS: Starting fieldnorms warmup for fields: {:?}", field_names);
+    debug_println!("🔥 PREWARM_FIELDNORMS: Starting fieldnorms warmup for fields: {:?}", field_names);
 
     let searcher = with_arc_safe(searcher_ptr, |ctx: &Arc<CachedSearcherContext>| {
         ctx.cached_searcher.clone()
     }).ok_or_else(|| anyhow::anyhow!("Failed to access searcher context"))?;
 
     let schema = searcher.schema();
-    let mut warmed_count = 0;
 
-    for (field, field_entry) in schema.fields() {
-        // Only process fields in our filter
-        if !field_names.contains(field_entry.name()) {
-            continue;
-        }
-
-        // Only text fields have field norms
-        if matches!(field_entry.field_type(), FieldType::Str(_)) {
-            for segment_reader in searcher.segment_readers() {
-                if let Ok(Some(_fieldnorm_reader)) = segment_reader.fieldnorms_readers().get_field(field) {
-                    debug_println!("🔥 PREWARM_FIELDS: Warmed fieldnorms for field '{}'", field_entry.name());
-                    warmed_count += 1;
-                }
-            }
-        } else {
-            debug_println!("⚠️ PREWARM_FIELDS: Field '{}' is not a text field (no fieldnorms)", field_entry.name());
-        }
-    }
-
-    debug_println!("✅ PREWARM_FIELDS: Fieldnorms warmup complete - warmed {} readers", warmed_count);
-    Ok(())
-}
-
-/// Field-specific fast fields prewarming
-pub async fn prewarm_fastfields_for_fields(
-    searcher_ptr: jlong,
-    field_names: &HashSet<String>,
-) -> anyhow::Result<()> {
-    debug_println!("🔥 PREWARM_FIELDS: Starting fast fields warmup for fields: {:?}", field_names);
-
-    let (searcher, schema) = with_arc_safe(searcher_ptr, |ctx: &Arc<CachedSearcherContext>| {
-        (ctx.cached_searcher.clone(), ctx.cached_index.schema())
-    }).ok_or_else(|| anyhow::anyhow!("Failed to access searcher context"))?;
-
-    // Find fast fields that match the filter
-    let fast_fields: Vec<(tantivy::schema::Field, String)> = schema.fields()
+    // Find text fields that match the filter (only text fields have fieldnorms)
+    let matching_fields: Vec<tantivy::schema::Field> = schema.fields()
         .filter_map(|(field, field_entry)| {
             if !field_names.contains(field_entry.name()) {
                 return None;
             }
 
-            if field_entry.is_fast() {
-                debug_println!("🔥 PREWARM_FIELDS: Found matching fast field: {}", field_entry.name());
-                Some((field, field_entry.name().to_string()))
+            if matches!(field_entry.field_type(), FieldType::Str(_)) {
+                debug_println!("🔥 PREWARM_FIELDNORMS: Found matching text field: {}", field_entry.name());
+                Some(field)
             } else {
-                debug_println!("⚠️ PREWARM_FIELDS: Field '{}' is not a fast field", field_entry.name());
+                debug_println!("⚠️ PREWARM_FIELDNORMS: Field '{}' is not a text field (no fieldnorms)", field_entry.name());
                 None
             }
         })
         .collect();
 
-    if fast_fields.is_empty() {
-        debug_println!("⚠️ PREWARM_FIELDS: No matching fast fields found");
+    if matching_fields.is_empty() {
+        debug_println!("⚠️ PREWARM_FIELDNORMS: No matching text fields found");
         return Ok(());
     }
 
-    debug_println!("🔥 PREWARM_FIELDS: Warming {} fast fields", fast_fields.len());
+    debug_println!("🔥 PREWARM_FIELDNORMS: Warming fieldnorms for {} fields across {} segments",
+                   matching_fields.len(), searcher.segment_readers().len());
 
     let mut warm_up_futures = Vec::new();
 
-    for segment_reader in searcher.segment_readers() {
-        let fast_field_reader = segment_reader.fast_fields().clone();
-        for (field, field_name) in &fast_fields {
-            let field_entry = schema.get_field_entry(*field);
+    for field in &matching_fields {
+        for segment_reader in searcher.segment_readers() {
+            let fieldnorm_readers = segment_reader.fieldnorms_readers();
+            // Use Quickwit's pattern: get_inner_file().open_read(field) + read_bytes_async()
+            if let Some(file_handle) = fieldnorm_readers.get_inner_file().open_read(*field) {
+                warm_up_futures.push(async move {
+                    let bytes = file_handle.read_bytes_async().await
+                        .map_err(|e| anyhow::anyhow!("Failed to read fieldnorm bytes: {}", e))?;
+                    debug_println!("🔥 PREWARM_FIELDNORMS: Read {} bytes for fieldnorm", bytes.len());
+                    Ok::<(), anyhow::Error>(())
+                });
+            }
+        }
+    }
+
+    let results = futures::future::join_all(warm_up_futures).await;
+    let success_count = results.iter().filter(|r| r.is_ok()).count();
+    let failure_count = results.len() - success_count;
+
+    // Log any failures
+    for result in &results {
+        if let Err(e) = result {
+            debug_println!("⚠️ PREWARM_FIELDNORMS: Warmup error: {}", e);
+        }
+    }
+
+    debug_println!("✅ PREWARM_FIELDNORMS: Fieldnorms warmup complete - {} success, {} failures",
+                   success_count, failure_count);
+
+    // Fieldnorms are optional, so don't fail if none found
+    Ok(())
+}
+
+/// Field-specific fast fields prewarming
+///
+/// Uses the same pattern as Quickwit's `warm_up_fastfield` function:
+/// 1. Get column handles using `list_dynamic_column_handles(field_name)`
+/// 2. Read the actual bytes using `col.file_slice().read_bytes_async().await`
+///
+/// This ensures the column data is actually read into cache, not just creating
+/// lazy column readers.
+pub async fn prewarm_fastfields_for_fields(
+    searcher_ptr: jlong,
+    field_names: &HashSet<String>,
+) -> anyhow::Result<()> {
+    debug_println!("🔥 PREWARM_FASTFIELDS: Starting fast fields warmup for fields: {:?}", field_names);
+
+    let searcher = with_arc_safe(searcher_ptr, |ctx: &Arc<CachedSearcherContext>| {
+        ctx.cached_searcher.clone()
+    }).ok_or_else(|| anyhow::anyhow!("Failed to access searcher context"))?;
+
+    let schema = searcher.schema();
+
+    // Find fast fields that match the filter
+    let matching_fields: Vec<String> = schema.fields()
+        .filter_map(|(_field, field_entry)| {
+            if !field_names.contains(field_entry.name()) {
+                return None;
+            }
+
+            if field_entry.is_fast() {
+                debug_println!("🔥 PREWARM_FASTFIELDS: Found matching fast field: {}", field_entry.name());
+                Some(field_entry.name().to_string())
+            } else {
+                debug_println!("⚠️ PREWARM_FASTFIELDS: Field '{}' is not a fast field", field_entry.name());
+                None
+            }
+        })
+        .collect();
+
+    if matching_fields.is_empty() {
+        debug_println!("⚠️ PREWARM_FASTFIELDS: No matching fast fields found");
+        return Ok(());
+    }
+
+    debug_println!("🔥 PREWARM_FASTFIELDS: Warming {} fast fields across {} segments",
+                   matching_fields.len(), searcher.segment_readers().len());
+
+    let mut warm_up_futures = Vec::new();
+
+    for (seg_idx, segment_reader) in searcher.segment_readers().iter().enumerate() {
+        let fast_field_reader = segment_reader.fast_fields();
+
+        for field_name in &matching_fields {
             let fast_field_reader = fast_field_reader.clone();
             let field_name = field_name.clone();
+            let seg_idx = seg_idx;
 
+            // Use Quickwit's pattern: list_dynamic_column_handles + read_bytes_async
             warm_up_futures.push(async move {
-                match field_entry.field_type() {
-                    FieldType::U64(_) => { let _ = fast_field_reader.u64(&field_name); },
-                    FieldType::I64(_) => { let _ = fast_field_reader.i64(&field_name); },
-                    FieldType::F64(_) => { let _ = fast_field_reader.f64(&field_name); },
-                    FieldType::Bool(_) => { let _ = fast_field_reader.bool(&field_name); },
-                    FieldType::Date(_) => { let _ = fast_field_reader.date(&field_name); },
-                    FieldType::Bytes(_) => { let _ = fast_field_reader.bytes(&field_name); },
-                    _ => {}
+                // Get column handles for this field
+                let columns = fast_field_reader
+                    .list_dynamic_column_handles(&field_name)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("Failed to list column handles for '{}': {}", field_name, e))?;
+
+                debug_println!("🔥 PREWARM_FASTFIELDS: Field '{}' segment {} has {} column(s)",
+                               field_name, seg_idx, columns.len());
+
+                // Read the actual bytes from each column (triggers I/O)
+                for (col_idx, col) in columns.iter().enumerate() {
+                    let file_slice = col.file_slice();
+                    let slice_len = file_slice.len();
+                    debug_println!("🔥 PREWARM_FASTFIELDS: Field '{}' seg {} col {} file_slice.len()={} bytes",
+                                   field_name, seg_idx, col_idx, slice_len);
+                    let bytes = file_slice.read_bytes_async().await
+                        .map_err(|e| anyhow::anyhow!("Failed to read bytes for '{}': {}", field_name, e))?;
+                    debug_println!("🔥 PREWARM_FASTFIELDS: Field '{}' seg {} col {} read {} bytes",
+                                   field_name, seg_idx, col_idx, bytes.len());
                 }
+
                 Ok::<(), anyhow::Error>(())
             });
         }
@@ -794,9 +861,127 @@ pub async fn prewarm_fastfields_for_fields(
 
     let results = futures::future::join_all(warm_up_futures).await;
     let success_count = results.iter().filter(|r| r.is_ok()).count();
+    let failure_count = results.len() - success_count;
 
-    debug_println!("✅ PREWARM_FIELDS: Fast fields warmup complete - {} operations", success_count);
-    Ok(())
+    // Log any failures
+    for result in &results {
+        if let Err(e) = result {
+            debug_println!("⚠️ PREWARM_FASTFIELDS: Warmup error: {}", e);
+        }
+    }
+
+    debug_println!("✅ PREWARM_FASTFIELDS: Fast fields warmup complete - {} success, {} failures",
+                   success_count, failure_count);
+
+    if success_count > 0 || failure_count == 0 {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!("All fast field warmup operations failed"))
+    }
+}
+
+// =============================================================================
+// PER-FIELD COMPONENT SIZE CALCULATION
+// =============================================================================
+
+/// Calculate per-field component sizes for all fields in the index.
+///
+/// Returns a map of "field_name.component" -> size in bytes, where component is one of:
+/// - "fastfield" - fast field column size (from list_dynamic_column_handles)
+/// - "fieldnorm" - field norm size (from fieldnorm_readers)
+///
+/// Note: Term dictionary, postings, and positions sizes require reading the data
+/// and are calculated during prewarm operations. Store is document-level, not field-level.
+pub async fn get_per_field_component_sizes(
+    searcher_ptr: jlong,
+) -> anyhow::Result<std::collections::HashMap<String, u64>> {
+    debug_println!("📊 COMPONENT_SIZES: Calculating per-field component sizes");
+
+    let searcher = with_arc_safe(searcher_ptr, |ctx: &Arc<CachedSearcherContext>| {
+        ctx.cached_searcher.clone()
+    }).ok_or_else(|| anyhow::anyhow!("Failed to access searcher context"))?;
+
+    let schema = searcher.schema();
+    let mut field_sizes: HashMap<String, u64> = HashMap::new();
+
+    // Iterate through all fields in the schema
+    for (field, field_entry) in schema.fields() {
+        let field_name = field_entry.name().to_string();
+
+        // Fast fields - get column sizes using list_dynamic_column_handles
+        if field_entry.is_fast() {
+            let mut total_fast_size = 0u64;
+            for (seg_idx, segment_reader) in searcher.segment_readers().iter().enumerate() {
+                let fast_field_reader = segment_reader.fast_fields();
+                if let Ok(columns) = fast_field_reader.list_dynamic_column_handles(&field_name).await {
+                    debug_println!("📊 COMPONENT_SIZES: {}.fastfield segment {} has {} column(s)",
+                                   field_name, seg_idx, columns.len());
+                    for (col_idx, col) in columns.iter().enumerate() {
+                        // file_slice() returns a FileSlice, HasLen trait provides len()
+                        let col_size = col.file_slice().len() as u64;
+                        debug_println!("📊 COMPONENT_SIZES: {}.fastfield segment {} column {} size: {} bytes",
+                                       field_name, seg_idx, col_idx, col_size);
+                        total_fast_size += col_size;
+                    }
+                }
+            }
+            if total_fast_size > 0 {
+                field_sizes.insert(format!("{}.fastfield", field_name), total_fast_size);
+                debug_println!("📊 COMPONENT_SIZES: {}.fastfield = {} bytes (total)", field_name, total_fast_size);
+            }
+        }
+
+        // Text fields - get fieldnorm, term, postings, and positions sizes
+        // Use file_slice.len() to get size WITHOUT reading data (avoids cache pollution)
+        match field_entry.field_type() {
+            FieldType::Str(text_options) => {
+                // Fieldnorm sizes
+                let mut fieldnorm_size = 0u64;
+                for segment_reader in searcher.segment_readers() {
+                    let fieldnorm_readers = segment_reader.fieldnorms_readers();
+                    // open_read returns FileSlice, use .len() to get size without reading
+                    if let Some(file_slice) = fieldnorm_readers.get_inner_file().open_read(field) {
+                        fieldnorm_size += file_slice.len() as u64;
+                    }
+                }
+                if fieldnorm_size > 0 {
+                    field_sizes.insert(format!("{}.fieldnorm", field_name), fieldnorm_size);
+                    debug_println!("📊 COMPONENT_SIZES: {}.fieldnorm = {} bytes", field_name, fieldnorm_size);
+                }
+
+                // Note: TERM, POSTINGS, POSITIONS sizes require modifications to Tantivy fork
+                // to expose file slice lengths. For now, these are validated via download metrics
+                // during prewarm (first call > 0, second call == 0).
+            },
+            FieldType::JsonObject(json_options) => {
+                if json_options.get_text_indexing_options().is_some() {
+                    let mut fieldnorm_size = 0u64;
+                    for segment_reader in searcher.segment_readers() {
+                        let fieldnorm_readers = segment_reader.fieldnorms_readers();
+                        // open_read returns FileSlice, use .len() to get size without reading
+                        if let Some(file_slice) = fieldnorm_readers.get_inner_file().open_read(field) {
+                            fieldnorm_size += file_slice.len() as u64;
+                        }
+                    }
+                    if fieldnorm_size > 0 {
+                        field_sizes.insert(format!("{}.fieldnorm", field_name), fieldnorm_size);
+                    }
+
+                    // Note: TERM, POSTINGS, POSITIONS per-field sizes are not exposed by Tantivy API.
+                    // These components exist at the inverted index level but the file slice lengths
+                    // are private fields in InvertedIndexReader. Prewarm validation for these components
+                    // must use storage download metrics (first call > 0, second call == 0) rather than
+                    // exact size matching.
+                }
+            },
+            _ => {
+                // Other field types (numeric, etc.) - only fast fields matter
+            }
+        }
+    }
+
+    debug_println!("📊 COMPONENT_SIZES: Calculated {} per-field component sizes", field_sizes.len());
+    Ok(field_sizes)
 }
 
 // =============================================================================

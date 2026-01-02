@@ -614,7 +614,24 @@ public class SplitSearcher implements AutoCloseable {
     public SplitMetadata getSplitMetadata() {
         return getSplitMetadataNative(nativePtr);
     }
-    
+
+    /**
+     * Get per-field component sizes.
+     *
+     * Returns a map with keys like "field_name.component" and values as sizes in bytes.
+     * Components include:
+     * - "fastfield" - fast field column size for numeric/date fields
+     * - "fieldnorm" - field norm size for text fields
+     *
+     * Example: {"score.fastfield": 133, "content.fieldnorm": 50, "title.fieldnorm": 48}
+     *
+     * @return Map of "field_name.component" to size in bytes
+     */
+    public Map<String, Long> getPerFieldComponentSizes() {
+        Map<String, Long> result = getPerFieldComponentSizesNative(nativePtr);
+        return result != null ? result : new HashMap<>();
+    }
+
     public static class SplitMetadata {
         private final String splitId;
         private final long totalSize;
@@ -699,6 +716,7 @@ public class SplitSearcher implements AutoCloseable {
     private static native List<String> listSplitFilesNative(long nativePtr);
     private static native boolean validateSplitNative(long nativePtr);
     private static native SplitMetadata getSplitMetadataNative(long nativePtr);
+    private static native Map<String, Long> getPerFieldComponentSizesNative(long nativePtr);
     private static native List<String> tokenizeNative(long nativePtr, String fieldName, String text);
     private static native void closeNative(long nativePtr);
 }
