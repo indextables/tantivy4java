@@ -517,6 +517,154 @@ public class DiskCachePrewarmAggregationTest {
         }
     }
 
+    @Test
+    @DisplayName("Compare: aggregation WITHOUT prewarm downloads, WITH prewarm does not")
+    void testAggregationDownloadsWithoutPrewarmButNotWith() throws Exception {
+        System.out.println("=".repeat(80));
+        System.out.println("AGGREGATION DOWNLOAD COMPARISON: WITHOUT vs WITH PREWARM");
+        System.out.println("=".repeat(80));
+        System.out.println("This test explicitly validates:");
+        System.out.println("  1. WITHOUT prewarm: aggregation DOES download data (cache misses > 0)");
+        System.out.println("  2. WITH prewarm: aggregation does NOT download data (cache misses == 0)");
+        System.out.println();
+
+        // Create shared test split
+        Path indexPath = tempDir.resolve("compare-test-index");
+        Path splitPath = tempDir.resolve("compare-test.split");
+
+        createTestIndexWithNumericFields(indexPath);
+
+        QuickwitSplit.SplitConfig splitConfig = new QuickwitSplit.SplitConfig(
+            "compare-test", "test-source", "test-node");
+        QuickwitSplit.SplitMetadata metadata = QuickwitSplit.convertIndexFromPath(
+            indexPath.toString(), splitPath.toString(), splitConfig);
+
+        String splitUrl = "file://" + splitPath.toAbsolutePath();
+
+        // ========================================================================
+        // SCENARIO A: WITHOUT PREWARM - Aggregation should cause downloads
+        // ========================================================================
+        System.out.println("\n" + "-".repeat(80));
+        System.out.println("SCENARIO A: Aggregation WITHOUT prewarm");
+        System.out.println("-".repeat(80));
+
+        Path diskCacheA = tempDir.resolve("cache-no-prewarm");
+        Files.createDirectories(diskCacheA);
+
+        SplitCacheManager.TieredCacheConfig tieredConfigA = new SplitCacheManager.TieredCacheConfig()
+            .withDiskCachePath(diskCacheA.toString())
+            .withMaxDiskSize(100_000_000);
+
+        SplitCacheManager.CacheConfig cacheConfigA = new SplitCacheManager.CacheConfig(
+            "no-prewarm-" + System.currentTimeMillis())
+            .withMaxCacheSize(10_000_000)
+            .withTieredCache(tieredConfigA);
+
+        long downloadsWithoutPrewarm;
+        try (SplitCacheManager cacheManagerA = SplitCacheManager.getInstance(cacheConfigA);
+             SplitSearcher searcherA = cacheManagerA.createSplitSearcher(splitUrl, metadata)) {
+
+            // Reset download metrics
+            SplitCacheManager.resetStorageDownloadMetrics();
+
+            // Run aggregation WITHOUT any prewarm
+            System.out.println("Running stats aggregation on 'score' field (NO prewarm)...");
+            SplitQuery query = new SplitMatchAllQuery();
+            StatsAggregation statsAgg = new StatsAggregation("score_stats", "score");
+            SearchResult result = searcherA.search(query, 0, "score_stats", statsAgg);
+
+            // Get download metrics
+            downloadsWithoutPrewarm = SplitCacheManager.getStorageDownloadMetrics().getTotalBytes();
+
+            StatsResult stats = (StatsResult) result.getAggregation("score_stats");
+            System.out.println("  Result: count=" + stats.getCount() +
+                             ", avg=" + String.format("%.2f", stats.getAverage()) +
+                             ", min=" + stats.getMin() + ", max=" + stats.getMax());
+            System.out.println("  Downloads (bytes): " + downloadsWithoutPrewarm);
+        }
+
+        // ========================================================================
+        // SCENARIO B: WITH PREWARM - Aggregation should NOT cause downloads
+        // ========================================================================
+        System.out.println("\n" + "-".repeat(80));
+        System.out.println("SCENARIO B: Aggregation WITH prewarm");
+        System.out.println("-".repeat(80));
+
+        Path diskCacheB = tempDir.resolve("cache-with-prewarm");
+        Files.createDirectories(diskCacheB);
+
+        SplitCacheManager.TieredCacheConfig tieredConfigB = new SplitCacheManager.TieredCacheConfig()
+            .withDiskCachePath(diskCacheB.toString())
+            .withMaxDiskSize(100_000_000);
+
+        SplitCacheManager.CacheConfig cacheConfigB = new SplitCacheManager.CacheConfig(
+            "with-prewarm-" + System.currentTimeMillis())
+            .withMaxCacheSize(10_000_000)
+            .withTieredCache(tieredConfigB);
+
+        long downloadsForPrewarm;
+        long downloadsAfterPrewarm;
+        try (SplitCacheManager cacheManagerB = SplitCacheManager.getInstance(cacheConfigB);
+             SplitSearcher searcherB = cacheManagerB.createSplitSearcher(splitUrl, metadata)) {
+
+            // Step 1: Prewarm FASTFIELD (required for aggregations)
+            System.out.println("Step 1: Prewarming FASTFIELD component...");
+            SplitCacheManager.resetStorageDownloadMetrics();
+
+            searcherB.preloadComponents(SplitSearcher.IndexComponent.FASTFIELD).join();
+
+            downloadsForPrewarm = SplitCacheManager.getStorageDownloadMetrics().getTotalBytes();
+            System.out.println("  Prewarm downloads (bytes): " + downloadsForPrewarm);
+
+            // Step 2: Run aggregation AFTER prewarm
+            System.out.println("\nStep 2: Running stats aggregation on 'score' field (AFTER prewarm)...");
+            SplitCacheManager.resetStorageDownloadMetrics();
+
+            SplitQuery query = new SplitMatchAllQuery();
+            StatsAggregation statsAgg = new StatsAggregation("score_stats", "score");
+            SearchResult result = searcherB.search(query, 0, "score_stats", statsAgg);
+
+            downloadsAfterPrewarm = SplitCacheManager.getStorageDownloadMetrics().getTotalBytes();
+
+            StatsResult stats = (StatsResult) result.getAggregation("score_stats");
+            System.out.println("  Result: count=" + stats.getCount() +
+                             ", avg=" + String.format("%.2f", stats.getAverage()) +
+                             ", min=" + stats.getMin() + ", max=" + stats.getMax());
+            System.out.println("  Downloads (bytes): " + downloadsAfterPrewarm);
+        }
+
+        // ========================================================================
+        // RESULTS AND ASSERTIONS
+        // ========================================================================
+        System.out.println("\n" + "=".repeat(80));
+        System.out.println("RESULTS COMPARISON");
+        System.out.println("=".repeat(80));
+        System.out.println("  WITHOUT prewarm - aggregation downloads: " + downloadsWithoutPrewarm + " bytes");
+        System.out.println("  WITH prewarm    - prewarm downloads:     " + downloadsForPrewarm + " bytes");
+        System.out.println("  WITH prewarm    - aggregation downloads: " + downloadsAfterPrewarm + " bytes");
+        System.out.println();
+
+        // Assertion 1: WITHOUT prewarm, aggregation MUST download data
+        assertTrue(downloadsWithoutPrewarm > 0,
+            "WITHOUT prewarm: Aggregation should download data. Got: " + downloadsWithoutPrewarm + " bytes");
+
+        // Assertion 2: WITH prewarm, prewarm itself downloads data
+        assertTrue(downloadsForPrewarm > 0,
+            "Prewarm should download data. Got: " + downloadsForPrewarm + " bytes");
+
+        // Assertion 3: WITH prewarm, aggregation should NOT download data
+        assertEquals(0, downloadsAfterPrewarm,
+            "WITH prewarm: Aggregation should NOT download any data. Got: " + downloadsAfterPrewarm + " bytes");
+
+        System.out.println("  ✅ ASSERTION 1 PASSED: WITHOUT prewarm, aggregation downloaded " +
+                          downloadsWithoutPrewarm + " bytes");
+        System.out.println("  ✅ ASSERTION 2 PASSED: Prewarm downloaded " + downloadsForPrewarm + " bytes");
+        System.out.println("  ✅ ASSERTION 3 PASSED: WITH prewarm, aggregation downloaded 0 bytes");
+        System.out.println();
+        System.out.println("  🎯 CONCLUSION: Prewarm eliminates aggregation downloads!");
+        System.out.println("=".repeat(80));
+    }
+
     private void createTestIndexWithNumericFields(Path indexPath) throws Exception {
         try (SchemaBuilder schemaBuilder = new SchemaBuilder()) {
             // Text fields
