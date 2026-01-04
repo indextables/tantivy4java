@@ -1,0 +1,190 @@
+// background.rs - Background writer and manifest sync
+// Extracted from mod.rs during refactoring
+
+use std::ops::Range;
+use std::sync::Arc;
+use std::time::Duration;
+
+use crate::debug_println;
+
+use super::L2DiskCache;
+
+/// Background write request
+pub(crate) enum WriteRequest {
+    Put {
+        storage_loc: String,
+        split_id: String,
+        component: String,
+        byte_range: Option<Range<u64>>,
+        data: Vec<u8>,
+    },
+    Evict {
+        storage_loc: String,
+        split_id: String,
+    },
+    SyncManifest,
+    /// Flush all pending writes and signal completion via the oneshot channel
+    Flush(tokio::sync::oneshot::Sender<()>),
+    Shutdown,
+}
+
+impl L2DiskCache {
+    /// Background writer thread with parallel async I/O
+    ///
+    /// Uses std::sync::mpsc::Receiver for bounded channel with backpressure.
+    /// Spawns async write tasks on a tokio runtime with num_cpus worker threads.
+    /// A semaphore limits concurrent writes to num_cpus for optimal parallelism.
+    ///
+    /// Backpressure flow:
+    /// 1. Sender calls put() → sync_channel.send() blocks if queue full
+    /// 2. This thread recv()s requests from the bounded queue
+    /// 3. Before spawning write task, acquires semaphore permit
+    /// 4. If all writers busy, blocks on semaphore → recv loop stalls
+    /// 5. Bounded channel fills up → senders block
+    pub(crate) fn background_writer_static(
+        rx: std::sync::mpsc::Receiver<WriteRequest>,
+        cache_weak: std::sync::Weak<Self>,
+    ) {
+        let num_writers = num_cpus::get();
+        debug_println!("🚀 L2DiskCache: Starting {} parallel async writers", num_writers);
+
+        // Create tokio runtime with num_cpus worker threads for parallel async I/O
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(num_writers)
+            .thread_name("disk-cache-writer")
+            .enable_all()
+            .build()
+            .expect("Failed to create tokio runtime for disk cache");
+
+        // Semaphore limits concurrent writes to num_cpus
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(num_writers));
+
+        // Process requests - blocking recv is fine since this is a dedicated thread
+        while let Ok(req) = rx.recv() {
+            let cache = match cache_weak.upgrade() {
+                Some(c) => c,
+                None => break,
+            };
+
+            match req {
+                WriteRequest::Put {
+                    storage_loc,
+                    split_id,
+                    component,
+                    byte_range,
+                    data,
+                } => {
+                    // Acquire permit BEFORE spawning - blocks if all writers busy
+                    // This provides backpressure: when blocked here, recv loop stalls,
+                    // bounded channel fills, and senders block on put()
+                    let permit = match runtime.block_on(semaphore.clone().acquire_owned()) {
+                        Ok(p) => p,
+                        Err(_) => continue, // Semaphore closed
+                    };
+
+                    // Spawn async write task
+                    runtime.spawn(async move {
+                        if let Err(e) = cache
+                            .do_put_async(
+                                &storage_loc,
+                                &split_id,
+                                &component,
+                                byte_range.map(|r| r.start..r.end),
+                                &data,
+                            )
+                            .await
+                        {
+                            debug_println!("Disk cache write error: {}", e);
+                        }
+                        drop(permit); // Release permit when write completes
+                    });
+                }
+                WriteRequest::Evict {
+                    storage_loc,
+                    split_id,
+                } => {
+                    // Eviction can run in parallel too
+                    let permit = match runtime.block_on(semaphore.clone().acquire_owned()) {
+                        Ok(p) => p,
+                        Err(_) => continue,
+                    };
+
+                    runtime.spawn(async move {
+                        if let Err(e) = cache.do_evict_async(&storage_loc, &split_id).await {
+                            debug_println!("Disk cache evict error: {}", e);
+                        }
+                        drop(permit);
+                    });
+                }
+                WriteRequest::SyncManifest => {
+                    // Manifest sync is quick, run synchronously
+                    if let Err(e) = cache.do_sync_manifest() {
+                        debug_println!("Disk cache manifest sync error: {}", e);
+                    }
+                }
+                WriteRequest::Flush(tx) => {
+                    // Wait for ALL pending writes to complete by acquiring all permits
+                    runtime.block_on(async {
+                        let _all_permits = semaphore
+                            .acquire_many(num_writers as u32)
+                            .await
+                            .expect("Semaphore closed during flush");
+
+                        // Now all writes are complete, sync manifest
+                        if let Err(e) = cache.do_sync_manifest() {
+                            debug_println!("Disk cache manifest sync error during flush: {}", e);
+                        }
+
+                        // Signal completion
+                        let _ = tx.send(());
+                    });
+                }
+                WriteRequest::Shutdown => break,
+            }
+        }
+
+        // Graceful shutdown: wait for all pending writes to complete
+        runtime.block_on(async {
+            let _ = semaphore.acquire_many(num_writers as u32).await;
+        });
+        debug_println!("🛑 L2DiskCache: Writer thread shutdown complete");
+    }
+
+    /// Manifest sync timer (static version using Weak reference and shutdown flag)
+    pub(crate) fn manifest_sync_timer_static(
+        cache_weak: std::sync::Weak<Self>,
+        shutdown_flag: Arc<std::sync::atomic::AtomicBool>,
+        interval_secs: u64,
+    ) {
+        use std::sync::atomic::Ordering;
+
+        let interval = Duration::from_secs(interval_secs);
+        loop {
+            // Check shutdown flag before sleeping
+            if shutdown_flag.load(Ordering::Relaxed) {
+                break;
+            }
+
+            std::thread::sleep(std::time::Duration::from_millis(100));
+
+            // Check shutdown flag after sleeping (in smaller increments)
+            let mut elapsed = std::time::Duration::from_millis(100);
+            while elapsed < interval {
+                if shutdown_flag.load(Ordering::Relaxed) {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                elapsed += std::time::Duration::from_millis(100);
+            }
+
+            // Try to upgrade weak reference - if cache is dropped, exit
+            if let Some(cache) = cache_weak.upgrade() {
+                if let Err(e) = cache.sync_manifest() {
+                    debug_println!("Manifest sync timer error: {}", e);
+                }
+            } else {
+                break;
+            }
+        }
+    }
+}
