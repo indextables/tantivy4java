@@ -540,7 +540,7 @@ fn retrieve_documents_batch_from_split_optimized(
     mut doc_addresses: Vec<tantivy::DocAddress>,
 ) -> Result<Vec<jobject>, anyhow::Error> {
     use crate::utils::with_arc_safe;
-    use crate::simple_batch_optimization::{SimpleBatchOptimizer, SimpleBatchConfig};
+    use crate::batch_retrieval::simple::{SimpleBatchOptimizer, SimpleBatchConfig};
 
     use std::sync::Arc;
 
@@ -606,7 +606,7 @@ fn retrieve_documents_batch_from_split_optimized(
                                 let prefetch_result = if let Some(cache) = byte_range_cache {
                                     debug_println!("🚀 BATCH_OPT: Using prefetch_ranges_with_cache (OPTIMIZED)");
                                     debug_println!("🔍 TRACE: Calling prefetch_ranges_with_cache with {} bundle offsets", bundle_file_offsets.len());
-                                    crate::simple_batch_optimization::prefetch_ranges_with_cache(
+                                    crate::batch_retrieval::simple::prefetch_ranges_with_cache(
                                         ranges.clone(),
                                         storage_resolver.clone(),
                                         split_uri,
