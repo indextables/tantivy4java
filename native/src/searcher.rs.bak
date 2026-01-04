@@ -878,7 +878,7 @@ pub extern "system" fn Java_io_indextables_tantivy4java_result_SearchResult_nati
         |search_results_arc| search_results_arc.as_ref().clone()
     ) {
         results
-    } else if let Some(results) = with_arc_safe::<crate::split_searcher::EnhancedSearchResult, Vec<(f32, tantivy::DocAddress)>>(
+    } else if let Some(results) = with_arc_safe::<crate::split_searcher_jni::EnhancedSearchResult, Vec<(f32, tantivy::DocAddress)>>(
         _ptr,
         |enhanced_result_arc| enhanced_result_arc.hits.clone()
     ) {
@@ -954,7 +954,7 @@ pub extern "system" fn Java_io_indextables_tantivy4java_result_SearchResult_nati
         }
     ) {
         has_aggs
-    } else if let Some(has_aggs) = with_arc_safe::<crate::split_searcher::EnhancedSearchResult, bool>(
+    } else if let Some(has_aggs) = with_arc_safe::<crate::split_searcher_jni::EnhancedSearchResult, bool>(
         ptr,
         |enhanced_result_arc| {
             let has_aggs = enhanced_result_arc.aggregation_results.is_some();
@@ -1002,7 +1002,7 @@ pub extern "system" fn Java_io_indextables_tantivy4java_result_SearchResult_nati
         }
     ) {
         has_aggs
-    } else if let Some(has_aggs) = with_arc_safe::<crate::split_searcher::EnhancedSearchResult, bool>(
+    } else if let Some(has_aggs) = with_arc_safe::<crate::split_searcher_jni::EnhancedSearchResult, bool>(
         ptr,
         |enhanced_result_arc| {
             let has_aggs = enhanced_result_arc.aggregation_results.is_some();
@@ -1022,7 +1022,7 @@ pub extern "system" fn Java_io_indextables_tantivy4java_result_SearchResult_nati
     if has_aggregations {
         debug_println!("RUST DEBUG: has_aggregations=true, extracting aggregation results");
         // Extract and deserialize aggregation results
-        let aggregation_map_result = with_arc_safe::<crate::split_searcher::EnhancedSearchResult, jobject>(
+        let aggregation_map_result = with_arc_safe::<crate::split_searcher_jni::EnhancedSearchResult, jobject>(
             ptr,
             |enhanced_result_arc| {
                 debug_println!("RUST DEBUG: Inside enhanced_result_arc callback");
@@ -1093,7 +1093,7 @@ pub extern "system" fn Java_io_indextables_tantivy4java_result_SearchResult_nati
     ) {
         Some(result)
     } else {
-        with_arc_safe::<crate::split_searcher::EnhancedSearchResult, jobject>(
+        with_arc_safe::<crate::split_searcher_jni::EnhancedSearchResult, jobject>(
             ptr,
             |enhanced_result_arc| {
                 if let Some(ref intermediate_agg_bytes) = enhanced_result_arc.aggregation_results {
@@ -1127,7 +1127,7 @@ fn deserialize_aggregation_results(
     debug_println!("RUST DEBUG: deserialize_aggregation_results called with {} bytes", intermediate_agg_bytes.len());
 
     // Get the aggregation request JSON from the enhanced result to know what aggregations were requested
-    let aggregation_json = with_arc_safe::<crate::split_searcher::EnhancedSearchResult, String>(
+    let aggregation_json = with_arc_safe::<crate::split_searcher_jni::EnhancedSearchResult, String>(
         ptr,
         |enhanced_result_arc| {
             enhanced_result_arc.aggregation_json.clone().unwrap_or_default()
