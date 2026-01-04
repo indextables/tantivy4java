@@ -472,7 +472,7 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_
                     debug_println!("RUST DEBUG: Clearing caches for cache '{}' with disk cache", *cache_name_arc);
                     // Clear searcher cache - this releases Arc<Searcher> which holds
                     // references to StorageWithPersistentCache -> L2DiskCache
-                    crate::split_searcher_replacement::clear_searcher_cache();
+                    crate::split_searcher::clear_searcher_cache();
                     // Then clear the global disk cache reference
                     crate::global_cache::clear_global_disk_cache();
                 }
@@ -878,7 +878,7 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_
 // Searcher Cache Statistics JNI Methods
 // ===================================
 
-use crate::split_searcher_replacement::{SEARCHER_CACHE_HITS, SEARCHER_CACHE_MISSES, SEARCHER_CACHE_EVICTIONS};
+use crate::split_searcher::{SEARCHER_CACHE_HITS, SEARCHER_CACHE_MISSES, SEARCHER_CACHE_EVICTIONS};
 
 #[no_mangle]
 pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_nativeGetSearcherCacheHits(
