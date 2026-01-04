@@ -15,7 +15,7 @@ use tantivy::aggregation::AggregationLimitsGuard;
 use tempfile::TempDir;
 use tokio::sync::Semaphore;
 
-use crate::cache_debug::{debug_arc_string_cache_identity, debug_cache_summary};
+use super::cache_debug::{debug_arc_string_cache_identity, debug_cache_summary};
 use crate::debug_println;
 use crate::disk_cache::L2DiskCache;
 

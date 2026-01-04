@@ -6,6 +6,7 @@
 //
 // Extracted from global_cache.rs during refactoring for better maintainability.
 
+mod cache_debug;  // Enhanced cache debugging and monitoring utilities
 mod components;
 mod config;
 mod l1_cache;

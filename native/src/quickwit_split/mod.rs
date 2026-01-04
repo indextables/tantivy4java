@@ -3,8 +3,11 @@ use jni::JNIEnv;
 use crate::debug_println;
 use crate::runtime_manager::QuickwitRuntimeManager;
 
+/// Types for standalone merge binary
+pub mod merge_types;
+
 // Re-export types for standalone usage
-pub use crate::merge_types::{MergeSplitConfig, SplitMetadata, MergeAwsConfig};
+pub use merge_types::{MergeSplitConfig, SplitMetadata, MergeAwsConfig};
 
 // Debug logging macro - controlled by TANTIVY4JAVA_DEBUG environment variable
 macro_rules! debug_log {

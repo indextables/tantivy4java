@@ -6,7 +6,7 @@ use jni::objects::{JClass, JString};
 use jni::sys::{jlong, jstring};
 use jni::JNIEnv;
 
-use crate::standalone_searcher::{StandaloneSearcher, StandaloneSearchConfig, SplitSearchMetadata};
+use super::searcher::{StandaloneSearcher, StandaloneSearchConfig, CacheConfig, ResourceConfig, TimeoutConfig, WarmupConfig, SplitSearchMetadata};
 use crate::utils::{arc_to_jlong, with_arc_safe, release_arc};
 use crate::common::to_java_exception;
 
@@ -42,20 +42,20 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_StandaloneSearcher
     max_concurrent_splits: jlong,
 ) -> jlong {
     let config = StandaloneSearchConfig {
-        cache: crate::standalone_searcher::CacheConfig {
+        cache: CacheConfig {
             fast_field_cache_capacity: bytesize::ByteSize::mb(fast_field_cache_mb as u64),
             split_footer_cache_capacity: bytesize::ByteSize::mb(split_footer_cache_mb as u64),
             partial_request_cache_capacity: bytesize::ByteSize::mb(64), // default
         },
-        resources: crate::standalone_searcher::ResourceConfig {
+        resources: ResourceConfig {
             max_concurrent_splits: max_concurrent_splits as usize,
             aggregation_memory_limit: bytesize::ByteSize::mb(500),
             aggregation_bucket_limit: 65000,
         },
-        timeouts: crate::standalone_searcher::TimeoutConfig {
+        timeouts: TimeoutConfig {
             request_timeout: std::time::Duration::from_secs(30),
         },
-        warmup: crate::standalone_searcher::WarmupConfig {
+        warmup: WarmupConfig {
             memory_budget: bytesize::ByteSize::gb(100),
             split_initial_allocation: bytesize::ByteSize::gb(1),
         },
