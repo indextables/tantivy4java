@@ -55,7 +55,7 @@ use tantivy::HasLen;
 use crate::debug_println;
 use crate::disk_cache::L2DiskCache;
 use crate::global_cache::{get_global_disk_cache, clear_global_l1_cache};
-use crate::split_searcher_replacement::CachedSearcherContext;
+use crate::split_searcher::CachedSearcherContext;
 use crate::utils::with_arc_safe;
 
 /// Clear global L1 ByteRangeCache after prewarm to prevent memory exhaustion.
@@ -519,7 +519,7 @@ pub async fn prewarm_term_dictionaries_for_fields(
 
     debug_println!("🔥 PREWARM_FIELDS: Executing {} warmup operations", warm_up_futures.len());
 
-    let results = futures::future::join_all(warm_up_futures).await;
+    let results: Vec<std::io::Result<()>> = futures::future::join_all(warm_up_futures).await;
     let success_count = results.iter().filter(|r| r.is_ok()).count();
     let failure_count = results.len() - success_count;
 
@@ -594,7 +594,7 @@ pub async fn prewarm_postings_for_fields(
         }
     }
 
-    let results = futures::future::join_all(warm_up_futures).await;
+    let results: Vec<std::io::Result<()>> = futures::future::join_all(warm_up_futures).await;
     let success_count = results.iter().filter(|r| r.is_ok()).count();
     let failure_count = results.len() - success_count;
 
@@ -683,7 +683,7 @@ pub async fn prewarm_positions_for_fields(
         }
     }
 
-    let results = futures::future::join_all(warm_up_futures).await;
+    let results: Vec<std::io::Result<()>> = futures::future::join_all(warm_up_futures).await;
     let success_count = results.iter().filter(|r| r.is_ok()).count();
     let failure_count = results.len() - success_count;
 

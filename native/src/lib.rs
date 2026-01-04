@@ -37,10 +37,9 @@ pub mod quickwit_split;
 pub mod merge_types;  // Types for standalone merge binary
 mod standalone_searcher;  // Clean standalone searcher implementation
 mod standalone_searcher_jni;  // JNI bindings for standalone searcher
-mod split_searcher_replacement;  // Replacement SplitSearcher JNI methods using StandaloneSearcher
+mod split_searcher;  // Replacement SplitSearcher JNI methods using StandaloneSearcher
 mod prewarm;  // Index component prewarming (TERM, POSTINGS, FIELDNORM, FASTFIELD, STORE)
 mod split_query;  // SplitQuery Java objects and native conversion using Quickwit libraries
-// mod split_searcher;  // Legacy implementation (now disabled)
 mod split_cache_manager;  // Global cache manager following Quickwit patterns
 // mod split_searcher_simple;  // Disabled to avoid conflicts
 mod test_query_parser;  // Test module for query parser debugging
