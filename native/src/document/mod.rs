@@ -30,6 +30,7 @@
 //! - `jni_add_fields` - JNI functions for adding field values to documents
 //! - `helpers` - Helper functions for date conversion and document creation
 
+mod doc_address;
 mod helpers;
 mod jni_add_fields;
 mod jni_getters;

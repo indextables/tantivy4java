@@ -18,6 +18,7 @@
  */
 
 // Submodules - organized by functionality
+// mod query_conversion;   // Disabled in favor of split_query approach
 pub mod wildcard;        // Wildcard query pattern processing
 pub mod extraction;      // Java value extraction helpers
 pub mod snippet;         // SnippetGenerator and Snippet JNI
