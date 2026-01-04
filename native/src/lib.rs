@@ -48,7 +48,7 @@ mod extract_helpers;
 mod global_cache;  // Global cache infrastructure following Quickwit's pattern
 mod disk_cache;  // L2 tiered disk cache with intelligent compression
 mod persistent_cache_storage;  // Tiered cache integration with memory + disk
-mod simple_batch_optimization;  // Priority 1: Simplified batch optimization with range consolidation
+mod batch_retrieval;  // Batch document retrieval (optimized + simple implementations)
 
 pub use schema::*;
 pub use document::*;
