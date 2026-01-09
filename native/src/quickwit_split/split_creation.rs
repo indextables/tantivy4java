@@ -161,8 +161,8 @@ pub async fn create_quickwit_split(
         debug_log!("✅ OFFICIAL API: Will include file: {}", file_path.display());
     }
 
-    // ✅ STEP 2: Generate hotcache using memory-bounded mmap-only approach
-    // This eliminates O(index_size) heap allocation that occurred with CachingDirectory
+    // ✅ STEP 2: Generate hotcache using memory-bounded mmap-only implementation
+    // Uses write_hotcache_mmap to avoid O(index_size) heap allocation from CachingDirectory
     let mmap_directory = MmapDirectory::open(index_dir)?;
     let hotcache = {
         let mut hotcache_buffer = Vec::new();
