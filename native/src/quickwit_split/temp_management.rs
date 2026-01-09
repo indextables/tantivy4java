@@ -3,11 +3,23 @@
 // Contains: extract_split_to_directory_impl, create_temp_directory functions, ExtractedSplit
 
 use std::path::{Path, PathBuf};
+use std::io::Write;
 use tempfile as temp;
 use anyhow::{anyhow, Result};
 use tantivy::directory::Directory;
+use tantivy::HasLen;  // Required for FileSlice::len()
 
 use crate::debug_println;
+
+/// Chunk size for streaming file copies - 16MB provides good balance between
+/// memory usage and I/O efficiency for large splits (avg 4GB).
+/// For a 4GB file: 256 read operations vs 4096 with 1MB chunks.
+/// Quickwit uses 100MB chunks for S3, but we use smaller for local extraction.
+const STREAMING_CHUNK_SIZE: usize = 16_777_216;  // 16MB
+
+/// Threshold below which we use atomic read/write (faster for small files)
+/// Most segment metadata files (meta.json, .fieldnorm) are under 1MB
+const SMALL_FILE_THRESHOLD: usize = 1_048_576;  // 1MB
 use quickwit_indexing::open_index;
 use super::split_utils::{create_quickwit_tokenizer_manager, get_tantivy_directory_from_split_bundle_full_access};
 use super::resilient_ops;
@@ -17,6 +29,61 @@ macro_rules! debug_log {
     ($($arg:tt)*) => {
         debug_println!("DEBUG: {}", format!($($arg)*))
     };
+}
+
+/// Stream-copy a file from source directory to destination directory.
+/// Uses bounded memory chunks (1MB) instead of loading entire file into memory.
+///
+/// For small files (< 64KB), uses atomic read/write for efficiency.
+/// For large files, streams in chunks to prevent memory spikes.
+///
+/// Returns the number of bytes copied.
+fn streaming_copy_file(
+    source_dir: &dyn Directory,
+    dest_dir: &dyn Directory,
+    file_path: &Path,
+) -> Result<u64> {
+    // Open source file slice (lazy - no data loaded yet)
+    let file_slice = source_dir.open_read(file_path)?;
+    let file_len = file_slice.len() as usize;
+
+    // For small files, use atomic operations (simpler and faster)
+    if file_len <= SMALL_FILE_THRESHOLD {
+        debug_log!("📄 Small file ({} bytes), using atomic copy for {:?}", file_len, file_path);
+        let data = source_dir.atomic_read(file_path)?;
+        dest_dir.atomic_write(file_path, &data)?;
+        return Ok(file_len as u64);
+    }
+
+    // For large files, stream in chunks to bound memory usage
+    debug_log!("📦 Large file ({} bytes), streaming in {} byte chunks for {:?}",
+               file_len, STREAMING_CHUNK_SIZE, file_path);
+
+    // Open destination file for writing
+    let mut writer = dest_dir.open_write(file_path)?;
+
+    let mut bytes_copied = 0u64;
+    let mut offset = 0usize;
+
+    while offset < file_len {
+        let chunk_end = std::cmp::min(offset + STREAMING_CHUNK_SIZE, file_len);
+
+        // Read chunk using FileSlice::read_bytes_slice()
+        // This returns OwnedBytes which is a lightweight view into the underlying data
+        let chunk_data = file_slice.read_bytes_slice(offset..chunk_end)?;
+
+        // Write chunk to destination
+        writer.write_all(chunk_data.as_slice())?;
+
+        bytes_copied += (chunk_end - offset) as u64;
+        offset = chunk_end;
+    }
+
+    writer.flush()?;
+    // WritePtr auto-terminates on drop
+
+    debug_log!("✅ Streamed {} bytes for {:?}", bytes_copied, file_path);
+    Ok(bytes_copied)
 }
 
 /// Represents an extracted split with its temporary directory and metadata
@@ -81,14 +148,19 @@ pub fn extract_split_to_directory_impl(split_path: &Path, output_dir: &Path) -> 
         }
     };
 
-    // Copy all segment files and meta.json
+    // Copy all segment files and meta.json using streaming to avoid memory spikes
     let mut copied_files = 0;
+    let mut total_bytes = 0u64;
 
-    // Copy meta.json
+    // Copy meta.json (small file, will use atomic copy internally)
     if bundle_directory.exists(Path::new("meta.json"))? {
         debug_log!("Copying meta.json");
-        let meta_data = bundle_directory.atomic_read(Path::new("meta.json"))?;
-        output_directory.atomic_write(Path::new("meta.json"), &meta_data)?;
+        let bytes = streaming_copy_file(
+            bundle_directory.as_ref(),
+            &output_directory,
+            Path::new("meta.json")
+        )?;
+        total_bytes += bytes;
         copied_files += 1;
     }
 
@@ -111,14 +183,19 @@ pub fn extract_split_to_directory_impl(split_path: &Path, output_dir: &Path) -> 
             let file_path = Path::new(&file_pattern);
             if bundle_directory.exists(file_path)? {
                 debug_log!("Copying file: {}", file_pattern);
-                let file_data = bundle_directory.atomic_read(file_path)?;
-                output_directory.atomic_write(file_path, &file_data)?;
+                // Use streaming copy to avoid memory spikes for large segment files
+                let bytes = streaming_copy_file(
+                    bundle_directory.as_ref(),
+                    &output_directory,
+                    file_path
+                )?;
+                total_bytes += bytes;
                 copied_files += 1;
             }
         }
     }
 
-    debug_log!("Successfully extracted split to directory (copied {} files)", copied_files);
+    debug_log!("✅ Successfully extracted split to directory (copied {} files, {} bytes total)", copied_files, total_bytes);
     Ok(())
 }
 
