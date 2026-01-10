@@ -4,12 +4,63 @@
 //           calculate_optimal_batch_size, create_merged_split_file
 
 use std::collections::{BTreeSet, HashMap};
+use std::io;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Result};
+use async_trait::async_trait;
+use aws_sdk_s3::primitives::{ByteStream, FsBuilder, Length};
 
 use quickwit_common::uri::{Uri, Protocol};
 use quickwit_indexing::open_index;
+use quickwit_storage::PutPayload;
+
+/// Streaming file payload for memory-efficient cloud uploads.
+/// Unlike Vec<u8>, this streams directly from disk without loading into heap.
+#[derive(Clone)]
+struct StreamingFilePayload {
+    path: PathBuf,
+    len: u64,
+}
+
+/// Helper trait for cloning PutPayload
+trait PutPayloadClone {
+    fn box_clone(&self) -> Box<dyn PutPayload>;
+}
+
+impl<T> PutPayloadClone for T
+where T: 'static + PutPayload + Clone
+{
+    fn box_clone(&self) -> Box<dyn PutPayload> {
+        Box::new(self.clone())
+    }
+}
+
+#[async_trait]
+impl PutPayload for StreamingFilePayload {
+    fn len(&self) -> u64 {
+        self.len
+    }
+
+    async fn range_byte_stream(&self, range: Range<u64>) -> io::Result<ByteStream> {
+        assert!(!range.is_empty());
+        assert!(range.end <= self.len);
+
+        let len = range.end - range.start;
+        let mut fs_builder = FsBuilder::new().path(&self.path);
+
+        if range.start > 0 {
+            fs_builder = fs_builder.offset(range.start);
+        }
+        fs_builder = fs_builder.length(Length::Exact(len));
+
+        fs_builder
+            .build()
+            .await
+            .map_err(|error| io::Error::other(format!("failed to create byte stream: {error}")))
+    }
+}
 
 use crate::debug_println;
 use crate::runtime_manager::QuickwitRuntimeManager;
@@ -87,40 +138,23 @@ pub async fn upload_split_to_s3_impl(local_split_path: &Path, s3_url: &str, conf
     let storage = storage_resolver.resolve(&storage_uri).await
         .map_err(|e| anyhow!("Failed to resolve storage for '{}': {}", s3_url, e))?;
 
-    // FIXED: Use memory mapping for file upload instead of loading entire file into RAM
-    let file = std::fs::File::open(local_split_path)
-        .map_err(|e| anyhow!("Failed to open local split file {:?}: {}", local_split_path, e))?;
-
-    let file_size = file.metadata()
+    // ✅ MEMORY OPTIMIZATION: Use streaming upload instead of loading entire file into memory
+    // This reduces memory usage from O(file_size) to O(chunk_size) for S3/Azure uploads
+    let file_size = std::fs::metadata(local_split_path)
         .map_err(|e| anyhow!("Failed to get file metadata: {}", e))?
-        .len() as usize;
+        .len();
 
-    debug_log!("✅ MEMORY FIX: Uploading {} bytes using memory mapping", file_size);
+    debug_log!("✅ STREAMING UPLOAD: Uploading {} bytes ({} MB) using streaming (zero heap copy)",
+               file_size, file_size / 1_000_000);
 
-    let mmap = unsafe {
-        memmap2::Mmap::map(&file)
-            .map_err(|e| anyhow!("Failed to memory map split file: {}", e))?
+    // Create a streaming file payload - this streams from disk, no heap allocation
+    let file_payload = StreamingFilePayload {
+        path: local_split_path.to_path_buf(),
+        len: file_size,
     };
 
-    // ⚠️ MEMORY CONSTRAINT: S3 PutPayload API requires Vec<u8>, cannot use lazy loading here
-    // However, we optimize by checking file size and providing clear warnings
-    const LARGE_FILE_THRESHOLD: usize = 100_000_000; // 100MB
-
-    if file_size > LARGE_FILE_THRESHOLD {
-        debug_log!("⚠️ LARGE FILE WARNING: Uploading {} MB file will use ~{} MB memory",
-                   file_size / 1_000_000, (file_size * 2) / 1_000_000);
-        debug_log!("   Consider splitting into smaller chunks if memory is constrained");
-    } else {
-        debug_log!("📤 S3 UPLOAD: File size {} MB is within acceptable range for memory usage",
-                   file_size / 1_000_000);
-    }
-
-    let file_data = mmap.to_vec();
-    debug_log!("📤 S3 UPLOAD: Copying {} bytes for S3 upload (unavoidable due to PutPayload API)",
-               file_data.len());
-
-    storage.put(Path::new(&file_name), Box::new(file_data)).await
-    .map_err(|e| anyhow!("Failed to upload split to S3: {}", e))?;
+    storage.put(Path::new(&file_name), Box::new(file_payload)).await
+        .map_err(|e| anyhow!("Failed to upload split to cloud storage: {}", e))?;
 
     debug_log!("Successfully uploaded {} bytes to S3: {}", file_size, s3_url);
     Ok(())

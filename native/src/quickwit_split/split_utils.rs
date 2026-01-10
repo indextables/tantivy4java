@@ -43,10 +43,11 @@ pub fn get_split_file_list(split_path: &str) -> Result<Vec<PathBuf>> {
     let file = std::fs::File::open(split_path)
         .map_err(|e| anyhow!("Failed to open split file: {}", e))?;
     let mmap = unsafe { memmap2::Mmap::map(&file)? };
-    let mmap_arc = std::sync::Arc::new(mmap);
 
     // Create a FileSlice from the mmap handle (lazy - no data copied to heap)
-    let mmap_handle = MmapFileHandle { mmap: mmap_arc };
+    // ✅ MEMORY OPTIMIZATION: MmapFileHandle::new wraps the mmap in OwnedBytes for zero-copy reads
+    // Mmap is moved into OwnedBytes, which keeps it alive - no Arc needed
+    let mmap_handle = MmapFileHandle::new(mmap);
     let file_slice = FileSlice::new(std::sync::Arc::new(mmap_handle));
 
     // Use split_footer to extract body_and_bundle_metadata (only reads footer length bytes)
@@ -77,10 +78,11 @@ pub fn open_split_with_quickwit_native(split_path: &str) -> Result<(tantivy::Ind
     let file = std::fs::File::open(split_path)
         .map_err(|e| anyhow!("Failed to open split file: {}", e))?;
     let mmap = unsafe { memmap2::Mmap::map(&file)? };
-    let mmap_arc = std::sync::Arc::new(mmap);
 
     // Create a file handle that uses the memory map
-    let mmap_handle = MmapFileHandle { mmap: mmap_arc };
+    // ✅ MEMORY OPTIMIZATION: MmapFileHandle::new wraps the mmap in OwnedBytes for zero-copy reads
+    // Mmap is moved into OwnedBytes, which keeps it alive - no Arc needed
+    let mmap_handle = MmapFileHandle::new(mmap);
     let file_slice = FileSlice::new(std::sync::Arc::new(mmap_handle));
 
     // Open as BundleDirectory (Quickwit's native approach)
@@ -112,10 +114,11 @@ pub fn get_tantivy_directory_from_split_bundle_full_access(split_path: &str) -> 
     let file = std::fs::File::open(split_path)
         .map_err(|e| anyhow!("Failed to open split file: {}", e))?;
     let mmap = unsafe { memmap2::Mmap::map(&file)? };
-    let mmap_arc = std::sync::Arc::new(mmap);
 
     // Create a file handle that uses the memory map
-    let mmap_handle = MmapFileHandle { mmap: mmap_arc.clone() };
+    // ✅ MEMORY OPTIMIZATION: MmapFileHandle::new wraps the mmap in OwnedBytes for zero-copy reads
+    // Mmap is moved into OwnedBytes, which keeps it alive - no Arc needed
+    let mmap_handle = MmapFileHandle::new(mmap);
 
     // Create FileSlice from our memory-mapped handle
     let file_slice = FileSlice::new(std::sync::Arc::new(mmap_handle));

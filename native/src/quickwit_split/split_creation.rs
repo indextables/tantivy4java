@@ -3,6 +3,7 @@
 // Contains: FooterOffsets struct, create_quickwit_split function
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::{Context, Result};
 use tokio::io::AsyncWriteExt;
@@ -18,6 +19,81 @@ macro_rules! debug_log {
     ($($arg:tt)*) => {
         debug_println!("DEBUG: {}", format!($($arg)*))
     };
+}
+
+// Memory profiling - controlled by TANTIVY4JAVA_MEMORY_PROFILE environment variable
+static MEMORY_PROFILE_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+static HOTCACHE_BYTES_COPIED: AtomicUsize = AtomicUsize::new(0);
+static HOTCACHE_FILES_PROCESSED: AtomicUsize = AtomicUsize::new(0);
+
+pub fn is_memory_profile_enabled() -> bool {
+    *MEMORY_PROFILE_ENABLED.get_or_init(|| {
+        std::env::var("TANTIVY4JAVA_MEMORY_PROFILE").map(|v| v == "1").unwrap_or(false)
+    })
+}
+
+macro_rules! memory_profile {
+    ($($arg:tt)*) => {
+        if is_memory_profile_enabled() {
+            eprintln!("📊 MEMORY_PROFILE: {}", format!($($arg)*));
+        }
+    };
+}
+
+/// Get current process RSS (Resident Set Size) in bytes on supported platforms
+fn get_rss_bytes() -> Option<usize> {
+    #[cfg(target_os = "macos")]
+    {
+        use std::mem::MaybeUninit;
+        let mut rusage = MaybeUninit::<libc::rusage>::uninit();
+        let ret = unsafe { libc::getrusage(libc::RUSAGE_SELF, rusage.as_mut_ptr()) };
+        if ret == 0 {
+            let rusage = unsafe { rusage.assume_init() };
+            // On macOS, ru_maxrss is in bytes
+            Some(rusage.ru_maxrss as usize)
+        } else {
+            None
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // Read from /proc/self/statm
+        if let Ok(statm) = std::fs::read_to_string("/proc/self/statm") {
+            let parts: Vec<&str> = statm.split_whitespace().collect();
+            if parts.len() >= 2 {
+                // Second field is RSS in pages
+                if let Ok(pages) = parts[1].parse::<usize>() {
+                    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize };
+                    return Some(pages * page_size);
+                }
+            }
+        }
+        None
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        None
+    }
+}
+
+fn format_bytes(bytes: usize) -> String {
+    if bytes >= 1024 * 1024 * 1024 {
+        format!("{:.2} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+    } else if bytes >= 1024 * 1024 {
+        format!("{:.2} MB", bytes as f64 / (1024.0 * 1024.0))
+    } else if bytes >= 1024 {
+        format!("{:.2} KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{} bytes", bytes)
+    }
+}
+
+pub fn log_memory_checkpoint(label: &str) {
+    if is_memory_profile_enabled() {
+        if let Some(rss) = get_rss_bytes() {
+            memory_profile!("[{}] Process RSS: {}", label, format_bytes(rss));
+        }
+    }
 }
 
 /// Footer offset information for lazy loading optimization
@@ -49,6 +125,11 @@ pub fn write_hotcache_mmap<W: std::io::Write>(
     use tantivy::HasLen;
 
     debug_log!("🔧 MEMORY-BOUNDED HOTCACHE: Using mmap-only reads (no CachingDirectory)");
+    log_memory_checkpoint("hotcache_start");
+
+    // Reset counters for this hotcache generation
+    HOTCACHE_BYTES_COPIED.store(0, Ordering::SeqCst);
+    HOTCACHE_FILES_PROCESSED.store(0, Ordering::SeqCst);
 
     // ✅ KEY DIFFERENCE: Use DebugProxyDirectory directly on MmapDirectory
     // NO CachingDirectory wrapper - reads stay mmap-backed (zero heap copy)
@@ -62,6 +143,8 @@ pub fn write_hotcache_mmap<W: std::io::Write>(
         .try_into()?;
     let searcher = reader.searcher();
 
+    log_memory_checkpoint("hotcache_after_index_open");
+
     // Touch all indexed fields to record what needs to be in hotcache
     // Data is read via mmap (no heap allocation)
     for (field, field_entry) in schema.fields() {
@@ -73,10 +156,15 @@ pub fn write_hotcache_mmap<W: std::io::Write>(
         }
     }
 
+    log_memory_checkpoint("hotcache_after_field_touch");
+
     // Collect what was read (just metadata, not data)
     let mut cache_builder = StaticDirectoryCacheBuilder::default();
     let read_operations = debug_proxy_directory.drain_read_operations();
     let mut per_file_slices: HashMap<std::path::PathBuf, HashSet<std::ops::Range<usize>>> = HashMap::default();
+
+    // Track total bytes that WILL be copied
+    let mut total_bytes_to_copy: usize = 0;
 
     for read_op in read_operations {
         per_file_slices
@@ -87,6 +175,24 @@ pub fn write_hotcache_mmap<W: std::io::Write>(
 
     debug_log!("🔧 MEMORY-BOUNDED HOTCACHE: Collected {} files with read operations", per_file_slices.len());
 
+    // First pass: calculate total bytes that will be copied
+    if is_memory_profile_enabled() {
+        for (file_path, intervals) in &per_file_slices {
+            let file_path_str = file_path.to_string_lossy();
+            for byte_range in intervals {
+                let len = byte_range.len();
+                if file_path_str.ends_with("store")
+                    || file_path_str.ends_with("term")
+                    || len < 10_000_000
+                {
+                    total_bytes_to_copy += len;
+                }
+            }
+        }
+        memory_profile!("Total bytes to copy to hotcache: {} ({} files)",
+            format_bytes(total_bytes_to_copy), per_file_slices.len());
+    }
+
     // Build hotcache by reading slices directly from mmap (zero-copy read)
     let index_files = list_index_files(&index)?;
     for file_path in index_files {
@@ -96,6 +202,8 @@ pub fn write_hotcache_mmap<W: std::io::Write>(
         }
         let file_slice = file_slice_res?;
         let file_cache_builder = cache_builder.add_file(&file_path, file_slice.len() as u64);
+
+        let mut file_bytes_copied: usize = 0;
 
         if let Some(intervals) = per_file_slices.get(&file_path) {
             for byte_range in intervals {
@@ -108,14 +216,37 @@ pub fn write_hotcache_mmap<W: std::io::Write>(
                 {
                     // ✅ Direct mmap read - data comes from OS page cache, not heap
                     let bytes = file_slice.read_bytes_slice(byte_range.clone())?;
+
+                    // Track this copy for profiling
+                    file_bytes_copied += bytes.len();
+                    HOTCACHE_BYTES_COPIED.fetch_add(bytes.len(), Ordering::SeqCst);
+
+                    // THIS IS THE COPY - add_bytes copies to internal Vec
                     file_cache_builder.add_bytes(bytes.as_slice(), byte_range.start);
                 }
             }
         }
+
+        if is_memory_profile_enabled() && file_bytes_copied > 0 {
+            memory_profile!("  File '{}': copied {} to hotcache (file total: {})",
+                file_path.display(),
+                format_bytes(file_bytes_copied),
+                format_bytes(file_slice.len()));
+            HOTCACHE_FILES_PROCESSED.fetch_add(1, Ordering::SeqCst);
+        }
     }
+
+    log_memory_checkpoint("hotcache_after_add_bytes");
+
+    let total_copied = HOTCACHE_BYTES_COPIED.load(Ordering::SeqCst);
+    let files_processed = HOTCACHE_FILES_PROCESSED.load(Ordering::SeqCst);
+    memory_profile!("Hotcache add_bytes complete: {} total from {} files",
+        format_bytes(total_copied), files_processed);
 
     cache_builder.write(output)?;
     output.flush()?;
+
+    log_memory_checkpoint("hotcache_after_write");
 
     debug_log!("✅ MEMORY-BOUNDED HOTCACHE: Generation complete");
     Ok(())
@@ -134,6 +265,8 @@ pub async fn create_quickwit_split(
 
     debug_log!("🔧 OFFICIAL API: Using Quickwit's SplitPayloadBuilder for proper split creation");
     debug_log!("create_quickwit_split called with output_path: {:?}", output_path);
+
+    log_memory_checkpoint("split_creation_start");
 
     // ✅ Function is already called from async context, no need for separate runtime
     // ✅ STEP 1: Collect all Tantivy index files first
@@ -163,6 +296,8 @@ pub async fn create_quickwit_split(
 
     // ✅ STEP 2: Generate hotcache using memory-bounded mmap-only implementation
     // Uses write_hotcache_mmap to avoid O(index_size) heap allocation from CachingDirectory
+    log_memory_checkpoint("before_hotcache_generation");
+
     let mmap_directory = MmapDirectory::open(index_dir)?;
     let hotcache = {
         let mut hotcache_buffer = Vec::new();
@@ -172,20 +307,30 @@ pub async fn create_quickwit_split(
             .map_err(|e| anyhow::anyhow!("Failed to generate hotcache: {}", e))?;
 
         debug_log!("✅ MEMORY-BOUNDED: Generated {} bytes of hotcache", hotcache_buffer.len());
+        memory_profile!("Hotcache buffer size: {}", format_bytes(hotcache_buffer.len()));
         hotcache_buffer
     };
+
+    log_memory_checkpoint("after_hotcache_generation");
 
     // ✅ STEP 3: Create empty serialized split fields (for now)
     let serialized_split_fields = Vec::new();
     debug_log!("✅ OFFICIAL API: Using empty serialized split fields");
 
     // ✅ STEP 4: Create split payload using official API
+    // NOTE: SplitPayloadBuilder.get_split_payload() creates a FilePayload that streams
+    // index files from disk. The hotcache is stored in memory in the payload's footer.
     debug_log!("✅ OFFICIAL API: Creating split payload with official get_split_payload()");
+    log_memory_checkpoint("before_split_payload_builder");
+
     let split_payload = SplitPayloadBuilder::get_split_payload(
         &file_entries,
         &serialized_split_fields,
         &hotcache
     )?;
+
+    log_memory_checkpoint("after_split_payload_builder");
+    memory_profile!("SplitPayloadBuilder created - total payload size: {}", format_bytes(split_payload.len() as usize));
 
     // ✅ STEP 5: Write payload to output file using streaming I/O to minimize memory usage
     // Memory reduction: Instead of loading entire split into memory (O(file_size)),
@@ -196,11 +341,14 @@ pub async fn create_quickwit_split(
               config.enable_streaming_io);
     let total_size = split_payload.len();
 
+    log_memory_checkpoint("before_payload_write");
+
     let bytes_written = if config.enable_streaming_io && total_size > config.streaming_chunk_size {
         // ✅ MEMORY OPTIMIZATION: Stream payload in chunks instead of loading entire file
         // This reduces peak memory from O(file_size) to O(chunk_size)
         debug_log!("✅ STREAMING WRITE: Writing {} bytes in {} byte chunks",
                   total_size, config.streaming_chunk_size);
+        memory_profile!("Using STREAMING write mode (chunk_size: {})", format_bytes(config.streaming_chunk_size as usize));
 
         let output_file = tokio::fs::File::create(output_path).await
             .context("Failed to create output file for streaming write")?;
@@ -257,10 +405,19 @@ pub async fn create_quickwit_split(
         // Fallback for small files or when streaming is disabled
         debug_log!("✅ DIRECT WRITE: File size {} < chunk size {}, using read_all()",
                   total_size, config.streaming_chunk_size);
+        memory_profile!("Using DIRECT write mode (read_all) - THIS LOADS ENTIRE PAYLOAD INTO MEMORY!");
+        log_memory_checkpoint("before_read_all");
+
         let payload_bytes = split_payload.read_all().await?;
+
+        log_memory_checkpoint("after_read_all");
+        memory_profile!("read_all() loaded {} into heap", format_bytes(payload_bytes.len()));
+
         std::fs::write(output_path, &payload_bytes)?;
         payload_bytes.len() as u64
     };
+
+    log_memory_checkpoint("after_payload_write");
 
     debug_log!("✅ PAYLOAD WRITTEN: Successfully wrote split file: {:?} ({} bytes total, {} written)",
               output_path, total_size, bytes_written);
@@ -350,6 +507,18 @@ pub async fn create_quickwit_split(
         hotcache_start_offset,
         hotcache_length,
     };
+
+    log_memory_checkpoint("split_creation_complete");
+
+    // Summary of memory profiling
+    if is_memory_profile_enabled() {
+        let hotcache_copied = HOTCACHE_BYTES_COPIED.load(Ordering::SeqCst);
+        memory_profile!("=== SPLIT CREATION MEMORY SUMMARY ===");
+        memory_profile!("  Hotcache bytes copied via add_bytes(): {}", format_bytes(hotcache_copied));
+        memory_profile!("  Final hotcache size in split: {}", format_bytes(hotcache_length as usize));
+        memory_profile!("  Total split file size: {}", format_bytes(file_len as usize));
+        memory_profile!("=========================================");
+    }
 
     debug_log!("✅ OFFICIAL API: Split creation completed successfully with proper Quickwit format");
     Ok(footer_offsets)

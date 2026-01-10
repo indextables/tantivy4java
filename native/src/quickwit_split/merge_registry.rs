@@ -56,31 +56,74 @@ pub(crate) static GLOBAL_DOWNLOAD_SEMAPHORE: LazyLock<tokio::sync::Semaphore> = 
     tokio::sync::Semaphore::new(max_global_downloads)
 });
 
+/// Wrapper around Mmap that implements StableDeref for use with OwnedBytes
+///
+/// SAFETY: Mmap's backing memory remains at a stable address for its entire lifetime.
+/// The pointer returned by Deref remains valid and stable as long as the Mmap exists.
+struct StableMmap(memmap2::Mmap);
+
+impl std::ops::Deref for StableMmap {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+// SAFETY: Mmap guarantees that the memory address remains stable for its entire lifetime.
+// The kernel maps the file into a fixed virtual address range that doesn't move.
+unsafe impl stable_deref_trait::StableDeref for StableMmap {}
+
+// Debug impl for StableMmap
+impl std::fmt::Debug for StableMmap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StableMmap")
+            .field("len", &self.0.len())
+            .finish()
+    }
+}
+
 /// Memory-efficient FileHandle implementation that provides lazy access to memory-mapped files
 /// This avoids loading the entire file into a Vec, significantly reducing memory usage
+///
+/// ✅ MEMORY OPTIMIZATION: Returns OwnedBytes that directly reference the mmap without copying.
+/// For a 7GB store segment, this means ZERO heap allocation instead of 7GB.
 #[derive(Debug)]
 pub(crate) struct MmapFileHandle {
-    pub mmap: std::sync::Arc<memmap2::Mmap>,
+    /// The memory-mapped file wrapped in OwnedBytes for zero-copy slicing
+    owned_bytes: tantivy::directory::OwnedBytes,
+}
+
+impl MmapFileHandle {
+    /// Create a new MmapFileHandle from a Mmap
+    /// The OwnedBytes wraps the mmap directly - no data is copied
+    pub fn new(mmap: memmap2::Mmap) -> Self {
+        // Wrap in StableMmap to satisfy StableDeref trait requirement
+        let stable_mmap = StableMmap(mmap);
+        // OwnedBytes::new takes ownership of the StableMmap without copying any data
+        // The Mmap stays alive inside OwnedBytes as long as this handle exists
+        let owned_bytes = tantivy::directory::OwnedBytes::new(stable_mmap);
+        Self { owned_bytes }
+    }
 }
 
 impl tantivy::HasLen for MmapFileHandle {
     fn len(&self) -> usize {
-        self.mmap.len()
+        self.owned_bytes.len()
     }
 }
 
 impl FileHandle for MmapFileHandle {
     fn read_bytes(&self, range: std::ops::Range<usize>) -> std::io::Result<tantivy::directory::OwnedBytes> {
-        if range.end > self.mmap.len() {
+        if range.end > self.owned_bytes.len() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                format!("Range end {} exceeds file size {}", range.end, self.mmap.len()),
+                format!("Range end {} exceeds file size {}", range.end, self.owned_bytes.len()),
             ));
         }
 
-        // Only copy the requested range, not the entire file
-        let slice = &self.mmap[range];
-        Ok(tantivy::directory::OwnedBytes::new(slice.to_vec()))
+        // ✅ ZERO-COPY: OwnedBytes::slice returns a view into the mmap without copying
+        // This is the critical fix - for a 7GB range, NO heap allocation occurs
+        Ok(self.owned_bytes.slice(range))
     }
 }
 
