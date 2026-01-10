@@ -5207,6 +5207,7 @@ version = "0.24.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "aws-sdk-s3",
  "base64 0.22.1",
  "bytesize",
  "chrono",
@@ -5234,6 +5235,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "stable_deref_trait",
  "tantivy",
  "tempfile",
  "time",

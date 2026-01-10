@@ -27,32 +27,41 @@ pub fn create_quickwit_tokenizer_manager() -> TokenizerManager {
         .clone()
 }
 
-/// Get file list from split using Quickwit's native functions
-/// This uses the same approach as BundleDirectory::get_stats_split but filters out hotcache
-/// Note: hotcache is metadata added by get_stats_split but not accessible via BundleDirectory::open_read()
+/// Get file list from split using Quickwit's native functions with memory-efficient mmap
+/// Uses memory-mapped file access to avoid loading entire 4GB split into heap memory.
+/// Only reads the footer metadata (typically a few KB) to get the file list.
 pub fn get_split_file_list(split_path: &str) -> Result<Vec<PathBuf>> {
-    use quickwit_directories::BundleDirectory;
-    use tantivy::directory::OwnedBytes;
+    use quickwit_directories::split_footer;
+    use quickwit_storage::BundleStorageFileOffsets;
+    use tantivy::directory::FileSlice;
+    use super::merge_registry::MmapFileHandle;
 
-    debug_log!("🔧 QUICKWIT NATIVE: Getting file list from split: {}", split_path);
+    debug_log!("🔧 QUICKWIT NATIVE: Getting file list from split (mmap-backed): {}", split_path);
 
-    // Read split file data
-    let split_data = std::fs::read(split_path)
-        .map_err(|e| anyhow!("Failed to read split file: {}", e))?;
+    // ✅ MEMORY OPTIMIZATION: Use mmap instead of std::fs::read to avoid loading entire file into heap
+    // For a 4GB split, this saves ~4GB of heap allocation
+    let file = std::fs::File::open(split_path)
+        .map_err(|e| anyhow!("Failed to open split file: {}", e))?;
+    let mmap = unsafe { memmap2::Mmap::map(&file)? };
 
-    let owned_bytes = OwnedBytes::new(split_data);
-    let files_and_sizes = BundleDirectory::get_stats_split(owned_bytes)
-        .map_err(|e| anyhow!("Failed to get split stats: {}", e))?;
+    // Create a FileSlice from the mmap handle (lazy - no data copied to heap)
+    // ✅ MEMORY OPTIMIZATION: MmapFileHandle::new wraps the mmap in OwnedBytes for zero-copy reads
+    // Mmap is moved into OwnedBytes, which keeps it alive - no Arc needed
+    let mmap_handle = MmapFileHandle::new(mmap);
+    let file_slice = FileSlice::new(std::sync::Arc::new(mmap_handle));
 
-    // Filter out "hotcache" since it's not a readable file in BundleDirectory
-    // hotcache is metadata added by get_stats_split but not accessible via open_read()
-    let file_list: Vec<PathBuf> = files_and_sizes
-        .into_iter()
-        .filter(|(path, _size)| path.to_string_lossy() != "hotcache")
-        .map(|(path, _size)| path)
-        .collect();
+    // Use split_footer to extract body_and_bundle_metadata (only reads footer length bytes)
+    let (body_and_bundle_metadata, _hotcache) = split_footer(file_slice)
+        .map_err(|e| anyhow!("Failed to read split footer: {}", e))?;
 
-    debug_log!("✅ QUICKWIT NATIVE: Found {} readable files in split (hotcache excluded)", file_list.len());
+    // Open file offsets from metadata (only reads the JSON metadata, typically a few KB)
+    let file_offsets = BundleStorageFileOffsets::open(body_and_bundle_metadata)
+        .map_err(|e| anyhow!("Failed to parse bundle file offsets: {}", e))?;
+
+    // Get file list from offsets (no hotcache in file_offsets.files)
+    let file_list: Vec<PathBuf> = file_offsets.files.keys().cloned().collect();
+
+    debug_log!("✅ QUICKWIT NATIVE: Found {} files in split (mmap-backed, zero heap allocation)", file_list.len());
     Ok(file_list)
 }
 
@@ -69,10 +78,11 @@ pub fn open_split_with_quickwit_native(split_path: &str) -> Result<(tantivy::Ind
     let file = std::fs::File::open(split_path)
         .map_err(|e| anyhow!("Failed to open split file: {}", e))?;
     let mmap = unsafe { memmap2::Mmap::map(&file)? };
-    let mmap_arc = std::sync::Arc::new(mmap);
 
     // Create a file handle that uses the memory map
-    let mmap_handle = MmapFileHandle { mmap: mmap_arc };
+    // ✅ MEMORY OPTIMIZATION: MmapFileHandle::new wraps the mmap in OwnedBytes for zero-copy reads
+    // Mmap is moved into OwnedBytes, which keeps it alive - no Arc needed
+    let mmap_handle = MmapFileHandle::new(mmap);
     let file_slice = FileSlice::new(std::sync::Arc::new(mmap_handle));
 
     // Open as BundleDirectory (Quickwit's native approach)
@@ -104,10 +114,11 @@ pub fn get_tantivy_directory_from_split_bundle_full_access(split_path: &str) -> 
     let file = std::fs::File::open(split_path)
         .map_err(|e| anyhow!("Failed to open split file: {}", e))?;
     let mmap = unsafe { memmap2::Mmap::map(&file)? };
-    let mmap_arc = std::sync::Arc::new(mmap);
 
     // Create a file handle that uses the memory map
-    let mmap_handle = MmapFileHandle { mmap: mmap_arc.clone() };
+    // ✅ MEMORY OPTIMIZATION: MmapFileHandle::new wraps the mmap in OwnedBytes for zero-copy reads
+    // Mmap is moved into OwnedBytes, which keeps it alive - no Arc needed
+    let mmap_handle = MmapFileHandle::new(mmap);
 
     // Create FileSlice from our memory-mapped handle
     let file_slice = FileSlice::new(std::sync::Arc::new(mmap_handle));

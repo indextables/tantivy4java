@@ -27,7 +27,7 @@ use serde::{Serialize, Deserialize};
 // Quickwit imports
 use quickwit_storage::{PutPayload, SplitPayloadBuilder};
 use quickwit_indexing::open_index;
-use quickwit_directories::write_hotcache;
+// write_hotcache replaced by write_hotcache_mmap in split_creation.rs for memory efficiency
 use tokio::io::AsyncWriteExt;
 
 use crate::utils::{jstring_to_string, string_to_jstring};
