@@ -34,8 +34,8 @@ pub use metrics::{
 
 // Re-export from storage_resolver
 pub use storage_resolver::{
-    get_configured_storage_resolver, get_configured_storage_resolver_async, tracked_storage_resolve,
-    GLOBAL_STORAGE_RESOLVER,
+    generate_storage_cache_key, get_configured_storage_resolver, get_configured_storage_resolver_async,
+    tracked_storage_resolve, GLOBAL_STORAGE_RESOLVER,
 };
 
 // =====================================================================
@@ -56,6 +56,16 @@ static GLOBAL_SEARCHER_COMPONENTS: OnceLock<Arc<GlobalSearcherComponents>> = Onc
 
 /// Global cached SearcherContext - the ACTUAL shared instance that should be reused
 static GLOBAL_SEARCHER_CONTEXT: OnceLock<Arc<SearcherContext>> = OnceLock::new();
+
+/// Credential-specific SearcherContext cache
+/// This ensures that different credentials get separate caches, preventing the security issue
+/// where data loaded with valid credentials could be served to requests with invalid credentials.
+/// Key: credential cache key (from generate_storage_cache_key), Value: SearcherContext
+static CREDENTIAL_SEARCHER_CONTEXTS: OnceLock<std::sync::Mutex<std::collections::HashMap<String, Arc<SearcherContext>>>> = OnceLock::new();
+
+fn get_credential_contexts_holder() -> &'static std::sync::Mutex<std::collections::HashMap<String, Arc<SearcherContext>>> {
+    CREDENTIAL_SEARCHER_CONTEXTS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
 
 /// Global L2 disk cache that can be set by SplitCacheManager
 /// This is separate from GlobalSearcherComponents to allow dynamic configuration
@@ -147,6 +157,59 @@ pub fn get_global_searcher_context() -> Arc<SearcherContext> {
         &context.split_footer_cache as *const _
     );
     context.clone()
+}
+
+/// Get a credential-specific SearcherContext
+/// This creates separate SearcherContext instances per credential set, ensuring that
+/// cached data from one credential set is not served to another credential set.
+/// This is critical for multi-tenant security.
+pub fn get_credential_searcher_context(credential_key: &str) -> Arc<SearcherContext> {
+    debug_println!(
+        "🔐 CREDENTIAL_CONTEXT: Getting SearcherContext for credential key: {}",
+        credential_key
+    );
+
+    // Check if we already have a context for this credential key
+    {
+        let cache = get_credential_contexts_holder().lock().unwrap();
+        if let Some(context) = cache.get(credential_key) {
+            debug_println!(
+                "🔐 CREDENTIAL_CONTEXT_HIT: Reusing SearcherContext for key: {} at {:p}",
+                credential_key,
+                Arc::as_ptr(context)
+            );
+            return context.clone();
+        }
+    }
+
+    // Create a new SearcherContext for this credential key
+    debug_println!(
+        "🔐 CREDENTIAL_CONTEXT_MISS: Creating new SearcherContext for key: {}",
+        credential_key
+    );
+    let components = get_global_components();
+    let context = components.create_searcher_context(SearcherConfig::default());
+    debug_println!(
+        "🔐 CREDENTIAL_CONTEXT_CREATED: New SearcherContext at {:p} for key: {}",
+        Arc::as_ptr(&context),
+        credential_key
+    );
+
+    // Cache it
+    {
+        let mut cache = get_credential_contexts_holder().lock().unwrap();
+        // Double-check in case another thread created it
+        if let Some(existing) = cache.get(credential_key) {
+            debug_println!(
+                "🔐 CREDENTIAL_CONTEXT_RACE: Another thread created context, using existing at {:p}",
+                Arc::as_ptr(existing)
+            );
+            return existing.clone();
+        }
+        cache.insert(credential_key.to_string(), context.clone());
+    }
+
+    context
 }
 
 /// Get a SearcherContext with custom configuration but using global caches

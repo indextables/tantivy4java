@@ -11,6 +11,52 @@ use tokio::sync::RwLock as TokioRwLock;
 
 use crate::debug_println;
 
+/// Generate a cache key for storage resolver that includes all credential components.
+/// This ensures different credentials result in different cached StorageResolver instances.
+///
+/// The key includes:
+/// - For S3: region, endpoint, full access_key_id, force_path_style, and a hash of secret+session_token
+/// - For Azure: account_name and a hash of access_key+bearer_token
+///
+/// Sensitive credentials (secrets, tokens) are hashed to avoid leaking to logs while still
+/// ensuring different credentials produce different cache keys.
+pub fn generate_storage_cache_key(
+    s3_config: Option<&S3StorageConfig>,
+    azure_config: Option<&AzureStorageConfig>,
+) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    if let Some(s3) = s3_config {
+        let mut hasher = DefaultHasher::new();
+        s3.secret_access_key.hash(&mut hasher);
+        s3.session_token.hash(&mut hasher);
+        let cred_hash = hasher.finish();
+
+        format!(
+            "s3:{}:{}:{}:{}:{:x}",
+            s3.region.as_deref().unwrap_or("default"),
+            s3.endpoint.as_deref().unwrap_or("default"),
+            s3.access_key_id.as_deref().unwrap_or("none"),
+            s3.force_path_style_access,
+            cred_hash
+        )
+    } else if let Some(az) = azure_config {
+        let mut hasher = DefaultHasher::new();
+        az.access_key.hash(&mut hasher);
+        az.bearer_token.hash(&mut hasher);
+        let cred_hash = hasher.finish();
+
+        format!(
+            "azure:{}:{:x}",
+            az.account_name.as_deref().unwrap_or("default"),
+            cred_hash
+        )
+    } else {
+        "global".to_string()
+    }
+}
+
 /// Global StorageResolver instance following Quickwit's pattern
 /// This is a singleton that is shared across all searcher instances
 pub static GLOBAL_STORAGE_RESOLVER: Lazy<StorageResolver> = Lazy::new(|| {
@@ -92,27 +138,8 @@ pub async fn get_configured_storage_resolver_async(
         std::sync::atomic::AtomicU32::new(1);
 
     if let Some(s3_config) = s3_config_opt {
-        // Create a cache key from S3 configuration
-        // NOTE: We may also need to add "user id" later for multi-tenant scenarios
-        let cache_key = format!(
-            "{}:{}:{}:{}",
-            s3_config
-                .region
-                .as_ref()
-                .map(|r| r.as_str())
-                .unwrap_or("default"),
-            s3_config
-                .endpoint
-                .as_ref()
-                .map(|e| e.as_str())
-                .unwrap_or("default"),
-            s3_config
-                .access_key_id
-                .as_ref()
-                .map(|k| &k[..8])
-                .unwrap_or("none"), // First 8 chars for security
-            s3_config.force_path_style_access
-        );
+        // Create a cache key that includes ALL credential components
+        let cache_key = generate_storage_cache_key(Some(&s3_config), None);
 
         // ✅ FIXED: Use async tokio RwLock to prevent deadlocks in async context
         // Initialize cache if needed
@@ -177,20 +204,8 @@ pub async fn get_configured_storage_resolver_async(
 
         resolver
     } else if let Some(azure_config) = azure_config_opt {
-        // ✅ NEW AZURE LOGIC - EXACT S3 PATTERN
-        let cache_key = format!(
-            "azure:{}:{}",
-            azure_config
-                .account_name
-                .as_ref()
-                .map(|n| n.as_str())
-                .unwrap_or("default"),
-            azure_config
-                .access_key
-                .as_ref()
-                .map(|k| &k[..8.min(k.len())]) // First 8 chars for security
-                .unwrap_or("none")
-        );
+        // Create a cache key that includes ALL credential components
+        let cache_key = generate_storage_cache_key(None, Some(&azure_config));
 
         let cache = CONFIGURED_STORAGE_RESOLVERS
             .get_or_init(|| TokioRwLock::new(HashMap::new()));
@@ -284,27 +299,8 @@ pub fn get_configured_storage_resolver(
         std::sync::atomic::AtomicU32::new(1);
 
     if let Some(s3_config) = s3_config_opt {
-        // Create a cache key from S3 configuration
-        // NOTE: We may also need to add "user id" later for multi-tenant scenarios
-        let cache_key = format!(
-            "{}:{}:{}:{}",
-            s3_config
-                .region
-                .as_ref()
-                .map(|r| r.as_str())
-                .unwrap_or("default"),
-            s3_config
-                .endpoint
-                .as_ref()
-                .map(|e| e.as_str())
-                .unwrap_or("default"),
-            s3_config
-                .access_key_id
-                .as_ref()
-                .map(|k| &k[..8])
-                .unwrap_or("none"), // First 8 chars for security
-            s3_config.force_path_style_access
-        );
+        // Create a cache key that includes ALL credential components
+        let cache_key = generate_storage_cache_key(Some(&s3_config), None);
 
         // Try to get from sync cache (simple mutex approach)
         {
@@ -364,20 +360,8 @@ pub fn get_configured_storage_resolver(
 
         resolver
     } else if let Some(azure_config) = azure_config_opt {
-        // ✅ SAME PATTERN as async but with std::sync::Mutex
-        let cache_key = format!(
-            "azure:{}:{}",
-            azure_config
-                .account_name
-                .as_ref()
-                .map(|n| n.as_str())
-                .unwrap_or("default"),
-            azure_config
-                .access_key
-                .as_ref()
-                .map(|k| &k[..8.min(k.len())]) // First 8 chars for security
-                .unwrap_or("none")
-        );
+        // Create a cache key that includes ALL credential components
+        let cache_key = generate_storage_cache_key(None, Some(&azure_config));
 
         // Try to get from sync cache
         {

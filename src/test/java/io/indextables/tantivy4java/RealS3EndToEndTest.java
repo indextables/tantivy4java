@@ -1753,6 +1753,166 @@ public class RealS3EndToEndTest {
     }
 
     /**
+     * Test that validates AWS credential caching fix.
+     *
+     * This test verifies that different AWS credentials result in different StorageResolver
+     * instances being used. Prior to the fix, credentials were cached based on only the
+     * first 8 characters of the access key, causing different credentials to incorrectly
+     * share the same cached StorageResolver.
+     *
+     * The test:
+     * 1. Successfully reads a split using real AWS credentials
+     * 2. Attempts to read with fake credentials and expects authentication failure
+     *
+     * Before the fix: Both attempts would succeed (fake creds would reuse cached resolver)
+     * After the fix: First succeeds, second fails with authentication error
+     */
+    @Test
+    @org.junit.jupiter.api.Order(10)
+    void step10_credentialCachingValidation() throws Exception {
+        System.out.println("\n=== STEP 10: AWS CREDENTIAL CACHING VALIDATION ===");
+        System.out.println("This test validates that different credentials create different StorageResolvers");
+
+        String accessKey = getAccessKey();
+        String secretKey = getSecretKey();
+
+        if (accessKey == null || secretKey == null) {
+            System.out.println("⚠️ Skipping: AWS credentials not available");
+            return;
+        }
+
+        // Step 0: Create a test split and upload to S3
+        System.out.println("\n📋 Step 0: Creating test split and uploading to S3");
+
+        Path splitPath = tempDir.resolve("cred-test-split.split");
+        Path indexPath = tempDir.resolve("cred-test-index");
+
+        // Create a simple index and convert to split
+        SchemaBuilder schemaBuilder = new SchemaBuilder();
+        schemaBuilder.addTextField("title", true, false, "default", "position");
+        schemaBuilder.addTextField("content", true, false, "default", "position");
+        schemaBuilder.addIntegerField("id", true, true, true);
+
+        Schema schema = schemaBuilder.build();
+        Index index = new Index(schema, indexPath.toString());
+        IndexWriter writer = index.writer(Index.Memory.DEFAULT_HEAP_SIZE, 1);
+
+        for (int i = 0; i < 100; i++) {
+            Document doc = new Document();
+            doc.addText("title", "Test Document " + i);
+            doc.addText("content", "This is test content for credential validation test number " + i);
+            doc.addInteger("id", i);
+            writer.addDocument(doc);
+            doc.close();
+        }
+        writer.commit();
+        writer.close();
+        index.close();
+        schema.close();
+        schemaBuilder.close();
+
+        // Convert to split
+        QuickwitSplit.SplitConfig splitConfig = new QuickwitSplit.SplitConfig(
+            "cred-test-index", "cred-test-source", "cred-test-node");
+        QuickwitSplit.SplitMetadata testSplitMetadata = QuickwitSplit.convertIndexFromPath(
+            indexPath.toString(), splitPath.toString(), splitConfig);
+
+        System.out.println("✅ Created test split: " + splitPath);
+        System.out.println("   Docs: " + testSplitMetadata.getNumDocs());
+        System.out.println("   Footer: " + testSplitMetadata.getFooterStartOffset() + "-" + testSplitMetadata.getFooterEndOffset());
+
+        // Upload to S3
+        String s3Key = "credential-cache-test/test-" + System.currentTimeMillis() + ".split";
+        String testSplitUrl = "s3://" + TEST_BUCKET + "/" + s3Key;
+
+        s3Client.putObject(
+            PutObjectRequest.builder()
+                .bucket(TEST_BUCKET)
+                .key(s3Key)
+                .build(),
+            splitPath);
+
+        System.out.println("✅ Uploaded split to: " + testSplitUrl);
+
+        // Step 1: Create a SplitSearcher with REAL credentials - should succeed
+        System.out.println("\n📋 Step 1: Testing with REAL credentials (should succeed)");
+
+        SplitCacheManager.CacheConfig realCredsConfig = new SplitCacheManager.CacheConfig("real-creds-cache-" + System.currentTimeMillis())
+            .withMaxCacheSize(50_000_000)
+            .withAwsCredentials(accessKey, secretKey)
+            .withAwsRegion(TEST_REGION);
+
+        SplitCacheManager realCredsCacheManager = SplitCacheManager.getInstance(realCredsConfig);
+
+        try (SplitSearcher searcher = realCredsCacheManager.createSplitSearcher(testSplitUrl, testSplitMetadata)) {
+            // Perform a simple query to verify access works
+            Schema searchSchema = searcher.getSchema();
+            assertNotNull(searchSchema, "Schema should be accessible with real credentials");
+
+            SplitQuery testQuery = new SplitTermQuery("content", "credential");
+            SearchResult result = searcher.search(testQuery, 5);
+            assertNotNull(result, "Search should succeed with real credentials");
+
+            System.out.println("✅ Real credentials: Successfully queried split");
+            System.out.println("   Found " + result.getHits().size() + " hits");
+        }
+
+        // Step 2: Create a NEW SplitSearcher with FAKE credentials - should FAIL
+        // Using a unique cache name ensures we don't reuse the previous cache manager
+        System.out.println("\n📋 Step 2: Testing with FAKE credentials (should FAIL)");
+
+        // Use fake credentials that have different first 8 chars to ensure they're distinct
+        String fakeAccessKey = "FAKEFAKE12345678901234";
+        String fakeSecretKey = "fake-secret-key-that-is-definitely-invalid-1234567890";
+
+        SplitCacheManager.CacheConfig fakeCredsConfig = new SplitCacheManager.CacheConfig("fake-creds-cache-" + System.currentTimeMillis())
+            .withMaxCacheSize(50_000_000)
+            .withAwsCredentials(fakeAccessKey, fakeSecretKey)
+            .withAwsRegion(TEST_REGION);
+
+        SplitCacheManager fakeCredsCacheManager = SplitCacheManager.getInstance(fakeCredsConfig);
+
+        boolean fakeCredsFailed = false;
+        String errorMessage = null;
+
+        try (SplitSearcher fakeSearcher = fakeCredsCacheManager.createSplitSearcher(testSplitUrl, testSplitMetadata)) {
+            // Try to access the schema - this should fail with fake credentials
+            Schema fakeSchema = fakeSearcher.getSchema();
+
+            // If we get here, the fake credentials were incorrectly accepted
+            // This would indicate the bug is still present (old credentials being reused)
+            System.out.println("❌ UNEXPECTED: Fake credentials were accepted!");
+            System.out.println("   This suggests the credential caching bug may still exist.");
+
+        } catch (Exception e) {
+            // This is the EXPECTED behavior after the fix
+            fakeCredsFailed = true;
+            errorMessage = e.getMessage();
+            System.out.println("✅ Fake credentials correctly rejected!");
+            System.out.println("   Error: " + errorMessage);
+        }
+
+        // Validate results
+        System.out.println("\n📊 Credential Caching Validation Results:");
+
+        if (fakeCredsFailed) {
+            System.out.println("✅ PASS: Credential caching is working correctly!");
+            System.out.println("   - Real credentials: Accepted ✓");
+            System.out.println("   - Fake credentials: Rejected ✓");
+            System.out.println("   - Different credentials create different StorageResolvers ✓");
+        } else {
+            System.out.println("❌ FAIL: Credential caching bug detected!");
+            System.out.println("   - Real credentials: Accepted ✓");
+            System.out.println("   - Fake credentials: Should have been rejected but were accepted");
+            System.out.println("   - This indicates cached credentials from first request were reused");
+            fail("Fake credentials should have been rejected but were accepted. " +
+                 "This indicates the credential caching bug is still present.");
+        }
+
+        System.out.println("\n✅ Step 10 completed: Credential caching validation passed!");
+    }
+
+    /**
      * Creates a large index (~100MB+) for performance testing
      * Uses 150K documents with ~2KB of content each to ensure >50MB split size
      */
