@@ -372,9 +372,29 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_crea
 
                     // Follow Quickwit pattern: open index once and cache it
                     // 🚀 BATCH OPTIMIZATION FIX: Create ByteRangeCache and parse bundle metadata
+                    // Generate credential key for credential-specific SearcherContext
+                    // This prevents cached data from one credential set being served to another
+                    let credential_key = if aws_config.contains_key("access_key") {
+                        let mut s3_config_for_key = quickwit_config::S3StorageConfig::default();
+                        s3_config_for_key.access_key_id = aws_config.get("access_key").cloned();
+                        s3_config_for_key.secret_access_key = aws_config.get("secret_key").cloned();
+                        s3_config_for_key.session_token = aws_config.get("session_token").cloned();
+                        s3_config_for_key.region = aws_config.get("region").cloned();
+                        crate::global_cache::generate_storage_cache_key(Some(&s3_config_for_key), None)
+                    } else if azure_config.contains_key("account_name") {
+                        let azure_config_for_key = quickwit_config::AzureStorageConfig {
+                            account_name: azure_config.get("account_name").cloned(),
+                            access_key: azure_config.get("access_key").cloned(),
+                            bearer_token: azure_config.get("bearer_token").cloned(),
+                        };
+                        crate::global_cache::generate_storage_cache_key(None, Some(&azure_config_for_key))
+                    } else {
+                        "global".to_string()
+                    };
+
                     let (opened_index, byte_range_cache, bundle_file_offsets) = runtime.handle().block_on(async {
                         use quickwit_proto::search::SplitIdAndFooterOffsets;
-                        use crate::global_cache::get_global_searcher_context;
+                        use crate::global_cache::get_credential_searcher_context;
 
                         let split_filename = if let Some(last_slash_pos) = split_uri.rfind('/') {
                             &split_uri[last_slash_pos + 1..]
@@ -412,7 +432,9 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_crea
 
                         // 🚀 OPTIMIZATION: Call open_index_with_caches FIRST to populate split_footer_cache
                         // This eliminates redundant footer fetches when we parse bundle offsets below
-                        let searcher_context_global = get_global_searcher_context();
+                        // 🔐 SECURITY FIX: Use credential-specific SearcherContext to prevent cached data
+                        // from one credential set being served to another credential set
+                        let searcher_context_global = get_credential_searcher_context(&credential_key);
 
                         let result = quickwit_search::open_index_with_caches(
                             &searcher_context_global,
