@@ -3,10 +3,47 @@
 // This module provides a singleton runtime manager that eliminates sync-in-async deadlocks
 // by providing proper async-first patterns for JNI bridge operations with Quickwit.
 
-use std::sync::{Arc, OnceLock, atomic::{AtomicBool, AtomicUsize, Ordering}};
+use std::sync::{Arc, OnceLock, Mutex, atomic::{AtomicBool, AtomicUsize, Ordering}};
 use tokio::runtime::{Runtime, Handle};
+use tokio::sync::Semaphore;
 use std::future::Future;
 use crate::debug_println;
+
+/// Runtime configuration that can be set before first use
+#[derive(Clone, Debug)]
+pub struct RuntimeConfig {
+    /// Number of Tokio worker threads (default: num_cpus)
+    pub worker_threads: usize,
+    /// Maximum concurrent downloads across all merge operations (default: num_cpus)
+    pub max_concurrent_downloads: usize,
+    /// Maximum concurrent uploads across all merge operations (default: num_cpus)
+    pub max_concurrent_uploads: usize,
+}
+
+impl Default for RuntimeConfig {
+    fn default() -> Self {
+        let num_cpus = num_cpus::get();
+        Self {
+            worker_threads: num_cpus,
+            max_concurrent_downloads: num_cpus,
+            max_concurrent_uploads: num_cpus,
+        }
+    }
+}
+
+/// Global configuration that must be set before runtime initialization
+static RUNTIME_CONFIG: OnceLock<RuntimeConfig> = OnceLock::new();
+
+/// Set runtime configuration before first use
+/// Returns false if configuration was already set (runtime already initialized)
+pub fn configure_runtime(config: RuntimeConfig) -> bool {
+    RUNTIME_CONFIG.set(config).is_ok()
+}
+
+/// Get the current runtime configuration
+pub fn get_runtime_config() -> &'static RuntimeConfig {
+    RUNTIME_CONFIG.get_or_init(RuntimeConfig::default)
+}
 
 /// Global singleton runtime manager for all Quickwit async operations
 pub struct QuickwitRuntimeManager {
@@ -16,21 +53,33 @@ pub struct QuickwitRuntimeManager {
     is_shutting_down: AtomicBool,
     /// Count of active searchers to prevent premature shutdown
     active_searcher_count: AtomicUsize,
+    /// Global semaphore for limiting concurrent uploads
+    upload_semaphore: Arc<Semaphore>,
+    /// Global semaphore for limiting concurrent downloads
+    download_semaphore: Arc<Semaphore>,
+    /// Configuration used to create this runtime
+    config: RuntimeConfig,
 }
 
 impl QuickwitRuntimeManager {
-    /// Create a new runtime manager with optimal configuration
+    /// Create a new runtime manager with the global configuration
     fn new() -> anyhow::Result<Self> {
-        debug_println!("🚀 RUNTIME_MANAGER: Creating new QuickwitRuntimeManager");
+        let config = get_runtime_config().clone();
 
-        // Create multi-threaded runtime optimized for I/O operations
+        debug_println!("🚀 RUNTIME_MANAGER: Creating QuickwitRuntimeManager with {} worker threads, {} max downloads, {} max uploads",
+                      config.worker_threads, config.max_concurrent_downloads, config.max_concurrent_uploads);
+
+        // Create multi-threaded runtime with configurable worker threads
         let runtime = Arc::new(
             tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(4) // Optimal for mixed I/O and CPU workloads
+                .worker_threads(config.worker_threads)
                 .thread_name("quickwit-runtime")
                 .enable_all() // Enable I/O and time drivers
                 .build()?
         );
+
+        let upload_semaphore = Arc::new(Semaphore::new(config.max_concurrent_uploads));
+        let download_semaphore = Arc::new(Semaphore::new(config.max_concurrent_downloads));
 
         debug_println!("✅ RUNTIME_MANAGER: QuickwitRuntimeManager created successfully");
 
@@ -38,6 +87,9 @@ impl QuickwitRuntimeManager {
             runtime,
             is_shutting_down: AtomicBool::new(false),
             active_searcher_count: AtomicUsize::new(0),
+            upload_semaphore,
+            download_semaphore,
+            config,
         })
     }
 
@@ -52,6 +104,21 @@ impl QuickwitRuntimeManager {
 
             manager
         })
+    }
+
+    /// Get the upload semaphore for limiting concurrent uploads
+    pub fn upload_semaphore(&self) -> &Arc<Semaphore> {
+        &self.upload_semaphore
+    }
+
+    /// Get the download semaphore for limiting concurrent downloads
+    pub fn download_semaphore(&self) -> &Arc<Semaphore> {
+        &self.download_semaphore
+    }
+
+    /// Get the current configuration
+    pub fn config(&self) -> &RuntimeConfig {
+        &self.config
     }
 
     // Removed: block_on_search - replaced with thread-safe block_on that doesn't use jobject
@@ -164,6 +231,88 @@ pub extern "C" fn Java_io_indextables_tantivy4java_config_RuntimeManager_shutdow
     manager.shutdown_with_timeout(timeout_seconds as u64);
 
     debug_println!("✅ JNI: Graceful shutdown completed");
+}
+
+/// JNI function to configure the runtime before first use
+/// Must be called before any other tantivy4java operations
+/// Returns true if configuration was applied, false if runtime was already initialized
+#[no_mangle]
+pub extern "C" fn Java_io_indextables_tantivy4java_split_merge_QuickwitSplit_00024MergeConfig_configureGlobalConcurrencyNative(
+    _env: jni::JNIEnv,
+    _class: jni::objects::JClass,
+    worker_threads: jni::sys::jint,
+    max_concurrent_downloads: jni::sys::jint,
+    max_concurrent_uploads: jni::sys::jint,
+) -> jni::sys::jboolean {
+    let worker_threads = if worker_threads <= 0 {
+        num_cpus::get()
+    } else {
+        worker_threads as usize
+    };
+
+    let max_concurrent_downloads = if max_concurrent_downloads <= 0 {
+        num_cpus::get()
+    } else {
+        max_concurrent_downloads as usize
+    };
+
+    let max_concurrent_uploads = if max_concurrent_uploads <= 0 {
+        num_cpus::get()
+    } else {
+        max_concurrent_uploads as usize
+    };
+
+    debug_println!("📞 JNI: Configuring runtime with {} worker threads, {} max downloads, {} max uploads",
+                  worker_threads, max_concurrent_downloads, max_concurrent_uploads);
+
+    let config = RuntimeConfig {
+        worker_threads,
+        max_concurrent_downloads,
+        max_concurrent_uploads,
+    };
+
+    let success = configure_runtime(config);
+
+    if success {
+        debug_println!("✅ JNI: Runtime configuration applied successfully");
+    } else {
+        debug_println!("⚠️ JNI: Runtime already initialized, configuration ignored");
+    }
+
+    if success { 1 } else { 0 }
+}
+
+/// JNI function to get the current runtime configuration
+#[no_mangle]
+pub extern "C" fn Java_io_indextables_tantivy4java_split_merge_QuickwitSplit_00024MergeConfig_getGlobalWorkerThreadsNative(
+    _env: jni::JNIEnv,
+    _class: jni::objects::JClass,
+) -> jni::sys::jint {
+    get_runtime_config().worker_threads as jni::sys::jint
+}
+
+#[no_mangle]
+pub extern "C" fn Java_io_indextables_tantivy4java_split_merge_QuickwitSplit_00024MergeConfig_getGlobalMaxConcurrentDownloadsNative(
+    _env: jni::JNIEnv,
+    _class: jni::objects::JClass,
+) -> jni::sys::jint {
+    get_runtime_config().max_concurrent_downloads as jni::sys::jint
+}
+
+#[no_mangle]
+pub extern "C" fn Java_io_indextables_tantivy4java_split_merge_QuickwitSplit_00024MergeConfig_getGlobalMaxConcurrentUploadsNative(
+    _env: jni::JNIEnv,
+    _class: jni::objects::JClass,
+) -> jni::sys::jint {
+    get_runtime_config().max_concurrent_uploads as jni::sys::jint
+}
+
+#[no_mangle]
+pub extern "C" fn Java_io_indextables_tantivy4java_split_merge_QuickwitSplit_00024MergeConfig_getDefaultThreadCountNative(
+    _env: jni::JNIEnv,
+    _class: jni::objects::JClass,
+) -> jni::sys::jint {
+    num_cpus::get() as jni::sys::jint
 }
 
 // Removed: block_on_search_operation - replaced with thread-safe alternatives

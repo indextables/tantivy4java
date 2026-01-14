@@ -81,7 +81,12 @@ pub async fn upload_split_to_s3_impl(local_split_path: &Path, s3_url: &str, conf
     use quickwit_config::{AzureStorageConfig, S3StorageConfig};
     use std::str::FromStr;
 
-    debug_log!("Starting cloud storage upload from {:?} to {}", local_split_path, s3_url);
+    // Acquire upload semaphore to limit concurrent uploads and prevent thread starvation
+    let upload_semaphore = QuickwitRuntimeManager::global().upload_semaphore();
+    let _upload_permit = upload_semaphore.acquire().await
+        .map_err(|e| anyhow!("Failed to acquire upload permit: {}", e))?;
+
+    debug_log!("Starting cloud storage upload from {:?} to {} (upload permit acquired)", local_split_path, s3_url);
 
     // Parse the URI (could be S3 or Azure)
     let storage_url_uri = Uri::from_str(s3_url)?;

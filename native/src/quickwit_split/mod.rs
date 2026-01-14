@@ -7,7 +7,7 @@ use crate::runtime_manager::QuickwitRuntimeManager;
 pub mod merge_types;
 
 // Re-export types for standalone usage
-pub use merge_types::{MergeSplitConfig, SplitMetadata, MergeAwsConfig};
+pub use merge_types::{MergeSplitConfig, SplitMetadata, MergeAwsConfig, SkippedSplit};
 
 // Debug logging macro - controlled by TANTIVY4JAVA_DEBUG environment variable
 macro_rules! debug_log {
@@ -132,7 +132,7 @@ pub struct QuickwitSplitMetadata {
     pub doc_mapping_json: Option<String>,    // JSON representation of the doc mapping
 
     // Skipped splits for merge operations with parsing failures
-    pub skipped_splits: Vec<String>,         // URLs/paths of splits that failed to parse
+    pub skipped_splits: Vec<merge_types::SkippedSplit>,  // Splits that failed with reasons
 }
 
 impl SplitConfig {
@@ -269,18 +269,33 @@ fn create_java_split_metadata<'a>(env: &mut JNIEnv<'a>, split_metadata: &Quickwi
         JObject::null().into()
     };
 
-    // Create ArrayList for skipped splits
+    // Create ArrayList for skipped splits with reasons
     let array_list_class = env.find_class("java/util/ArrayList")?;
     let skipped_splits_list = env.new_object(&array_list_class, "()V", &[])?;
 
-    // Add skipped splits to the list
+    // Find the SkippedSplit class for creating detailed skip information
+    let skipped_split_class = env.find_class("io/indextables/tantivy4java/split/merge/QuickwitSplit$SkippedSplit")?;
+
+    // Add skipped splits to the list with their reasons
     for skipped_split in &split_metadata.skipped_splits {
-        let skipped_split_jstring = string_to_jstring(env, skipped_split)?;
+        let url_jstring = string_to_jstring(env, &skipped_split.url)?;
+        let reason_jstring = string_to_jstring(env, &skipped_split.reason)?;
+
+        // Create SkippedSplit Java object
+        let skipped_split_obj = env.new_object(
+            &skipped_split_class,
+            "(Ljava/lang/String;Ljava/lang/String;)V",
+            &[
+                JValue::Object(&url_jstring.into()),
+                JValue::Object(&reason_jstring.into()),
+            ],
+        )?;
+
         env.call_method(
             &skipped_splits_list,
             "add",
             "(Ljava/lang/Object;)Z",
-            &[JValue::Object(&skipped_split_jstring.into())],
+            &[JValue::Object(&skipped_split_obj)],
         )?;
     }
 
@@ -288,7 +303,7 @@ fn create_java_split_metadata<'a>(env: &mut JNIEnv<'a>, split_metadata: &Quickwi
     // (String splitId, String indexUid, long partitionId, String sourceId, String nodeId,
     //  long numDocs, long uncompressedSizeBytes, Instant timeRangeStart, Instant timeRangeEnd,
     //  long createTimestamp, String maturity, Set<String> tags, long footerStartOffset,
-    //  long footerEndOffset, long deleteOpstamp, int numMergeOps, String docMappingUid, String docMappingJson, List<String> skippedSplits)
+    //  long footerEndOffset, long deleteOpstamp, int numMergeOps, String docMappingUid, String docMappingJson, List<SkippedSplit> skippedSplits)
     let metadata_obj = env.new_object(
         &split_metadata_class,
         "(Ljava/lang/String;Ljava/lang/String;JLjava/lang/String;Ljava/lang/String;JJLjava/time/Instant;Ljava/time/Instant;JLjava/lang/String;Ljava/util/Set;JJJILjava/lang/String;Ljava/lang/String;Ljava/util/List;)V",

@@ -20,6 +20,22 @@ pub struct MergeAwsConfig {
     pub force_path_style: bool,
 }
 
+/// Information about a split that was skipped during merge
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkippedSplit {
+    pub url: String,       // The URL/path of the split that was skipped
+    pub reason: String,    // Human-readable reason why it was skipped
+}
+
+impl SkippedSplit {
+    pub fn new(url: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self {
+            url: url.into(),
+            reason: reason.into(),
+        }
+    }
+}
+
 /// Metadata about a split after merge
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SplitMetadata {
@@ -30,7 +46,7 @@ pub struct SplitMetadata {
     pub time_range_end: Option<i64>,
     pub create_timestamp: u64,
     pub footer_offsets: Option<(u64, u64)>,
-    pub skipped_splits: Vec<String>,  // URLs/paths of splits that were skipped due to corruption or errors
+    pub skipped_splits: Vec<SkippedSplit>,  // Splits that were skipped with reasons
 }
 
 impl SplitMetadata {
