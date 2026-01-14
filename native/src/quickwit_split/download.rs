@@ -10,9 +10,10 @@ use quickwit_storage::{Storage, StorageResolver};
 use quickwit_common::uri::{Uri, Protocol};
 
 use crate::debug_println;
+use crate::runtime_manager::QuickwitRuntimeManager;
 use super::merge_config::InternalMergeConfig;
 use super::temp_management::{ExtractedSplit, extract_split_to_directory_impl, create_temp_directory_with_base};
-use super::merge_registry::GLOBAL_DOWNLOAD_SEMAPHORE;
+use super::merge_types::SkippedSplit;
 
 // Debug logging macro - controlled by TANTIVY4JAVA_DEBUG environment variable
 macro_rules! debug_log {
@@ -24,21 +25,22 @@ macro_rules! debug_log {
 /// ⚡ PARALLEL SPLIT DOWNLOADING AND EXTRACTION
 /// Downloads and extracts multiple splits concurrently for maximum performance
 /// Uses connection pooling and resource management to prevent overwhelming
+/// Returns (successful_splits, skipped_splits) where skipped_splits includes reasons for each skip
 pub async fn download_and_extract_splits_parallel(
     split_urls: &[String],
     merge_id: &str,
     config: &InternalMergeConfig,
-) -> Result<(Vec<ExtractedSplit>, Vec<String>)> {
+) -> Result<(Vec<ExtractedSplit>, Vec<SkippedSplit>)> {
     use futures::future::join_all;
     use std::sync::Arc;
 
     debug_log!("🚀 Starting parallel download of {} splits with merge_id: {}", split_urls.len(), merge_id);
 
-    // FIXED: Use global semaphore to limit downloads across ALL merge operations
+    // Use runtime manager's download semaphore to limit downloads across ALL merge operations
     // This prevents overwhelming the system when multiple merges run simultaneously
-    let download_semaphore = &*GLOBAL_DOWNLOAD_SEMAPHORE;
+    let download_semaphore = QuickwitRuntimeManager::global().download_semaphore();
     let available_permits = download_semaphore.available_permits();
-    debug_log!("✅ GLOBAL DOWNLOAD LIMIT: Using global download semaphore ({} permits available)", available_permits);
+    debug_log!("✅ GLOBAL DOWNLOAD LIMIT: Using runtime download semaphore ({} permits available)", available_permits);
 
     // ✅ MEMORY OPTIMIZATION: Optional per-operation limit for very large splits
     // If max_concurrent_splits is set, create additional local semaphore
@@ -57,6 +59,9 @@ pub async fn download_and_extract_splits_parallel(
     let shared_config = Arc::new(config.clone());
     let merge_id_arc: Arc<str> = Arc::from(merge_id);
 
+    // Get download semaphore from runtime manager
+    let global_download_semaphore = Arc::clone(QuickwitRuntimeManager::global().download_semaphore());
+
     // Create download tasks for each split
     let download_tasks: Vec<_> = split_urls
     .iter()
@@ -67,10 +72,11 @@ pub async fn download_and_extract_splits_parallel(
         let config = Arc::clone(&shared_config);
         let storage_resolver = Arc::clone(&shared_storage_resolver);
         let local_limit_clone = local_limit.clone();
+        let download_semaphore = Arc::clone(&global_download_semaphore);
 
         async move {
             // Acquire semaphore permit to limit concurrent downloads globally
-            let _global_permit = GLOBAL_DOWNLOAD_SEMAPHORE.acquire().await
+            let _global_permit = download_semaphore.acquire().await
                 .map_err(|e| anyhow!("Failed to acquire global download permit: {}", e))?;
 
             // ✅ MEMORY OPTIMIZATION: Also acquire local permit if per-operation limit configured
@@ -102,7 +108,7 @@ pub async fn download_and_extract_splits_parallel(
 
     // Separate successful downloads from failed ones
     let mut successful_splits = Vec::new();
-    let mut skipped_splits = Vec::new();
+    let mut skipped_splits: Vec<SkippedSplit> = Vec::new();
 
     for (i, result) in results.into_iter().enumerate() {
         match result {
@@ -112,7 +118,10 @@ pub async fn download_and_extract_splits_parallel(
             Ok(None) => {
                 let split_url = &split_urls[i];
                 debug_log!("⚠️ Split {} skipped: {}", i, split_url);
-                skipped_splits.push(split_url.clone());
+                skipped_splits.push(SkippedSplit::new(
+                    split_url.clone(),
+                    "Download returned empty result (possible corruption or arithmetic error)"
+                ));
             }
             Err(e) => {
                 let split_url = &split_urls[i];
@@ -125,7 +134,7 @@ pub async fn download_and_extract_splits_parallel(
                 }
 
                 debug_log!("🚨 Split {} failed: {} (Error: {})", i, split_url, e);
-                skipped_splits.push(split_url.clone());
+                skipped_splits.push(SkippedSplit::new(split_url.clone(), error_msg));
             }
         }
     }

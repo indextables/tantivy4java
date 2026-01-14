@@ -131,6 +131,31 @@ public class QuickwitSplit {
     }
 
     /**
+     * Information about a split that was skipped during merge operations.
+     * Contains the URL/path of the skipped split and the reason for skipping.
+     */
+    public static class SkippedSplit {
+        private final String url;
+        private final String reason;
+
+        public SkippedSplit(String url, String reason) {
+            this.url = url;
+            this.reason = reason;
+        }
+
+        /** Returns the URL or path of the skipped split. */
+        public String getUrl() { return url; }
+
+        /** Returns the reason why this split was skipped (e.g., corruption, parsing error). */
+        public String getReason() { return reason; }
+
+        @Override
+        public String toString() {
+            return "SkippedSplit{url='" + url + "', reason='" + reason + "'}";
+        }
+    }
+
+    /**
      * Metadata about a created split.
      */
     public static class SplitMetadata {
@@ -162,17 +187,17 @@ public class QuickwitSplit {
         private final String docMappingJson;     // DEPRECATED: Use docMappingUid instead
 
         // Custom fields (for merge operations with parsing failures)
-        private final List<String> skippedSplits;  // URLs/paths of splits that failed to parse
+        private final List<SkippedSplit> skippedSplits;  // Splits that failed to parse with reasons
 
         /**
-         * Full constructor with all Quickwit-compatible fields.
+         * Full constructor with all Quickwit-compatible fields and detailed skip information.
          */
         public SplitMetadata(String splitId, String indexUid, long partitionId, String sourceId,
                            String nodeId, long numDocs, long uncompressedSizeBytes,
                            Instant timeRangeStart, Instant timeRangeEnd, long createTimestamp,
                            String maturity, Set<String> tags, long footerStartOffset, long footerEndOffset,
                            long deleteOpstamp, int numMergeOps, String docMappingUid, String docMappingJson,
-                           List<String> skippedSplits) {
+                           List<SkippedSplit> skippedSplits) {
             // Core Quickwit fields
             this.splitId = splitId;
             this.indexUid = indexUid;
@@ -211,7 +236,7 @@ public class QuickwitSplit {
                            long deleteOpstamp, int numMergeOps,
                            long footerStartOffset, long footerEndOffset,
                            long hotcacheStartOffset, long hotcacheLength, String docMappingJson,
-                           List<String> skippedSplits) {
+                           List<SkippedSplit> skippedSplits) {
             // Call new constructor with default Quickwit values
             this(splitId, "unknown-index", 0L, "unknown-source", "unknown-node",
                  numDocs, uncompressedSizeBytes, timeRangeStart, timeRangeEnd,
@@ -281,8 +306,27 @@ public class QuickwitSplit {
             return docMappingJson;  // Return for tokenization performance needs
         }
 
-        // Skipped splits getter (for merge operations)
-        public List<String> getSkippedSplits() { return new ArrayList<>(skippedSplits); }
+        // Skipped splits getters (for merge operations)
+
+        /**
+         * Returns detailed information about splits that were skipped during merge operations.
+         * Each SkippedSplit contains the URL/path and the reason for skipping.
+         */
+        public List<SkippedSplit> getSkippedSplitsDetailed() {
+            return new ArrayList<>(skippedSplits);
+        }
+
+        /**
+         * Returns just the URLs/paths of splits that were skipped during merge operations.
+         * For more detail including the reason for each skip, use {@link #getSkippedSplitsDetailed()}.
+         */
+        public List<String> getSkippedSplits() {
+            List<String> urls = new ArrayList<>(skippedSplits.size());
+            for (SkippedSplit s : skippedSplits) {
+                urls.add(s.getUrl());
+            }
+            return urls;
+        }
 
         // Convenience methods
         public boolean hasFooterOffsets() {
@@ -943,6 +987,155 @@ public class QuickwitSplit {
                 return new MergeConfig(this);
             }
         }
+
+        // ============================================================
+        // Global Concurrency Configuration (static methods)
+        // ============================================================
+
+        /**
+         * Configure global concurrency settings for all merge operations.
+         *
+         * <p>These settings control the native Tokio runtime and global semaphores
+         * that limit concurrent I/O operations across ALL merge operations.
+         * Configuration must be applied before any merge operations are performed.</p>
+         *
+         * <h3>Example Usage:</h3>
+         * <pre>{@code
+         * // Configure at application startup
+         * MergeConfig.configureGlobalConcurrency()
+         *     .workerThreads(16)
+         *     .maxConcurrentDownloads(32)
+         *     .maxConcurrentUploads(16)
+         *     .apply();
+         *
+         * // Then use MergeConfig normally for per-merge settings
+         * MergeConfig config = MergeConfig.builder()
+         *     .indexUid("my-index")
+         *     .sourceId("source")
+         *     .nodeId("node")
+         *     .awsConfig(aws)
+         *     .build();
+         * }</pre>
+         *
+         * @return a builder for global concurrency configuration
+         * @since 0.28.0
+         */
+        public static GlobalConcurrencyBuilder configureGlobalConcurrency() {
+            return new GlobalConcurrencyBuilder();
+        }
+
+        /**
+         * Gets the default thread count (number of CPU cores on this system).
+         * @since 0.28.0
+         */
+        public static int getDefaultThreadCount() {
+            return getDefaultThreadCountNative();
+        }
+
+        /**
+         * Gets the currently configured number of worker threads.
+         * @since 0.28.0
+         */
+        public static int getGlobalWorkerThreads() {
+            return getGlobalWorkerThreadsNative();
+        }
+
+        /**
+         * Gets the currently configured maximum concurrent downloads.
+         * @since 0.28.0
+         */
+        public static int getGlobalMaxConcurrentDownloads() {
+            return getGlobalMaxConcurrentDownloadsNative();
+        }
+
+        /**
+         * Gets the currently configured maximum concurrent uploads.
+         * @since 0.28.0
+         */
+        public static int getGlobalMaxConcurrentUploads() {
+            return getGlobalMaxConcurrentUploadsNative();
+        }
+
+        /**
+         * Builder for global concurrency configuration.
+         *
+         * <p>All settings default to the number of CPU cores on the system.
+         * A value of 0 or negative means "use default" (num_cpus).</p>
+         *
+         * @since 0.28.0
+         */
+        public static class GlobalConcurrencyBuilder {
+            private int workerThreads = 0;           // 0 = use default (num_cpus)
+            private int maxConcurrentDownloads = 0;  // 0 = use default (num_cpus)
+            private int maxConcurrentUploads = 0;    // 0 = use default (num_cpus)
+
+            private GlobalConcurrencyBuilder() {}
+
+            /**
+             * Sets the number of Tokio worker threads for async I/O operations.
+             *
+             * <p>These threads handle all async I/O including downloads, uploads,
+             * and storage access. A value of 0 or negative uses the default
+             * (number of CPU cores).</p>
+             *
+             * @param threads number of worker threads, or 0 for default
+             * @return this builder
+             */
+            public GlobalConcurrencyBuilder workerThreads(int threads) {
+                this.workerThreads = threads;
+                return this;
+            }
+
+            /**
+             * Sets the maximum number of concurrent split downloads.
+             *
+             * <p>This limits how many splits can be downloaded simultaneously
+             * across ALL merge operations. A value of 0 or negative uses the
+             * default (number of CPU cores).</p>
+             *
+             * @param maxDownloads maximum concurrent downloads, or 0 for default
+             * @return this builder
+             */
+            public GlobalConcurrencyBuilder maxConcurrentDownloads(int maxDownloads) {
+                this.maxConcurrentDownloads = maxDownloads;
+                return this;
+            }
+
+            /**
+             * Sets the maximum number of concurrent split uploads.
+             *
+             * <p>This limits how many merged splits can be uploaded simultaneously
+             * to cloud storage across ALL merge operations. A value of 0 or negative
+             * uses the default (number of CPU cores).</p>
+             *
+             * @param maxUploads maximum concurrent uploads, or 0 for default
+             * @return this builder
+             */
+            public GlobalConcurrencyBuilder maxConcurrentUploads(int maxUploads) {
+                this.maxConcurrentUploads = maxUploads;
+                return this;
+            }
+
+            /**
+             * Applies this configuration to the native runtime.
+             *
+             * <p>This must be called before any merge operations are performed.
+             * Can only be called once; subsequent calls will return false and
+             * have no effect.</p>
+             *
+             * @return true if configuration was applied, false if runtime was already initialized
+             */
+            public boolean apply() {
+                return configureGlobalConcurrencyNative(workerThreads, maxConcurrentDownloads, maxConcurrentUploads);
+            }
+        }
+
+        // Native methods for global concurrency configuration
+        private static native boolean configureGlobalConcurrencyNative(int workerThreads, int maxConcurrentDownloads, int maxConcurrentUploads);
+        private static native int getGlobalWorkerThreadsNative();
+        private static native int getGlobalMaxConcurrentDownloadsNative();
+        private static native int getGlobalMaxConcurrentUploadsNative();
+        private static native int getDefaultThreadCountNative();
     }
 
     /**

@@ -39,6 +39,7 @@ use super::download::download_and_extract_splits_parallel;
 use super::{is_configuration_error, create_merged_split_file, upload_split_to_s3, estimate_peak_memory_usage};
 use super::resilient_ops;
 use super::json_discovery::extract_doc_mapping_from_index;
+use super::merge_types::SkippedSplit;
 
 // Debug logging macro - controlled by TANTIVY4JAVA_DEBUG environment variable
 macro_rules! debug_log {
@@ -125,13 +126,17 @@ pub fn merge_splits_impl(split_urls: &[String], output_path: &str, config: &Inte
             // If it's not a configuration error, treat all splits as skipped
             debug_log!("🔧 DOWNLOAD FAILURE RECOVERY: Treating all {} splits as skipped due to non-configuration system failure", split_urls.len());
 
-                let all_skipped: Vec<String> = split_urls.iter().cloned().collect();
+                let all_skipped: Vec<SkippedSplit> = split_urls.iter()
+                    .map(|url| SkippedSplit::new(url.clone(), error_msg.clone()))
+                    .collect();
                 (Vec::new(), all_skipped)
             }
         },
         Err(_panic) => {
             debug_log!("🚨 THREAD PANIC: Download thread panicked, treating all splits as failed");
-            let all_skipped: Vec<String> = split_urls.iter().cloned().collect();
+            let all_skipped: Vec<SkippedSplit> = split_urls.iter()
+                .map(|url| SkippedSplit::new(url.clone(), "Download thread panicked"))
+                .collect();
             (Vec::new(), all_skipped)
         }
     }}; // Close the `let (extracted_splits, mut skipped_splits) = {` block
@@ -172,13 +177,13 @@ pub fn merge_splits_impl(split_urls: &[String], output_path: &str, config: &Inte
             debug_log!("⚠️ SPLIT PROCESSING ERROR: Skipping split {} due to error: {}", split_url, error_msg);
             debug_log!("🔧 ERROR SKIP: Split {} has processing error - continuing with remaining splits", split_url);
             debug_log!("🔧 ERROR DETAILS: {}", error_msg);
-            skipped_splits.push(split_url.clone());
+            skipped_splits.push(SkippedSplit::new(split_url.clone(), error_msg));
             continue;
         },
         Err(_panic_info) => {
             debug_log!("🚨 PANIC CAUGHT: Split {} caused panic during processing - skipping gracefully", split_url);
             debug_log!("🔧 PANIC SKIP: Split {} has panic error - continuing with remaining splits", split_url);
-            skipped_splits.push(split_url.clone());
+            skipped_splits.push(SkippedSplit::new(split_url.clone(), "Panic during split processing"));
             continue;
         }
     };
@@ -219,7 +224,7 @@ pub fn merge_splits_impl(split_urls: &[String], output_path: &str, config: &Inte
             debug_log!("⚠️ SPLIT FINALIZATION ERROR: Skipping split {} due to finalization error: {}", split_url, error_msg);
             debug_log!("🔧 FINALIZATION ERROR DETAILS: {}", error_msg);
 
-            skipped_splits.push(split_url.clone());
+            skipped_splits.push(SkippedSplit::new(split_url.clone(), format!("Finalization error: {}", error_msg)));
             continue; // Skip this split and continue with others
         }
     };
@@ -284,7 +289,8 @@ pub fn merge_splits_impl(split_urls: &[String], output_path: &str, config: &Inte
     }
 
     if !skipped_splits.is_empty() {
-        debug_log!("⚠️ PARTIAL MERGE WARNING: Proceeding with {} valid splits, {} skipped due to corruption: {:?}", valid_splits, skipped_splits.len(), skipped_splits);
+        let skipped_urls: Vec<&str> = skipped_splits.iter().map(|s| s.url.as_str()).collect();
+        debug_log!("⚠️ PARTIAL MERGE WARNING: Proceeding with {} valid splits, {} skipped: {:?}", valid_splits, skipped_splits.len(), skipped_urls);
     }
 
     // 2. Set up output directory with sequential access optimization
@@ -458,9 +464,9 @@ pub fn merge_splits_impl(split_urls: &[String], output_path: &str, config: &Inte
 
     // Report skipped splits if any
     if !skipped_splits.is_empty() {
-        debug_log!("⚠️ MERGE WARNING: {} splits were skipped due to metadata parsing failures:", skipped_splits.len());
-        for (i, skipped_url) in skipped_splits.iter().enumerate() {
-            debug_log!("   {}. {}", i + 1, skipped_url);
+        debug_log!("⚠️ MERGE WARNING: {} splits were skipped:", skipped_splits.len());
+        for (i, skipped) in skipped_splits.iter().enumerate() {
+            debug_log!("   {}. {} - Reason: {}", i + 1, skipped.url, skipped.reason);
         }
     }
 
