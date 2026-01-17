@@ -96,6 +96,7 @@ public class SplitCacheManager implements AutoCloseable {
     private final long nativePtr;
     private final Map<String, String> awsConfig;
     private final Map<String, String> azureConfig;
+    private final BatchOptimizationConfig batchOptimization;
 
     /**
      * Configuration for shared cache across multiple splits
@@ -726,6 +727,10 @@ public class SplitCacheManager implements AutoCloseable {
         this.totalCacheSize = new AtomicLong(0);
         this.awsConfig = new HashMap<>(config.getAwsConfig());
         this.azureConfig = new HashMap<>(config.getAzureConfig());
+        // Store batch optimization config, using balanced default if not specified
+        this.batchOptimization = config.getBatchOptimization() != null
+                ? config.getBatchOptimization()
+                : BatchOptimizationConfig.balanced();
         this.nativePtr = createNativeCacheManager(config);
     }
     
@@ -1889,4 +1894,15 @@ public class SplitCacheManager implements AutoCloseable {
     String getCacheKey() { return cacheKey; }
     long getMaxCacheSize() { return maxCacheSize; }
     long getNativePtr() { return nativePtr; }
+
+    /**
+     * Get the batch optimization configuration for this cache manager.
+     *
+     * <p>This configuration controls threshold-based method selection for batch
+     * document retrieval. When the number of documents exceeds the byteBufferThreshold,
+     * the byte buffer protocol is used to reduce JNI overhead.
+     *
+     * @return batch optimization configuration (never null)
+     */
+    public BatchOptimizationConfig getBatchConfig() { return batchOptimization; }
 }

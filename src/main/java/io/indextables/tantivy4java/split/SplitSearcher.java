@@ -1,12 +1,14 @@
 package io.indextables.tantivy4java.split;
 
+import io.indextables.tantivy4java.batch.BatchDocumentReader;
 import io.indextables.tantivy4java.core.DocAddress;
 
 import io.indextables.tantivy4java.core.Document;
 import io.indextables.tantivy4java.core.Schema;
 import io.indextables.tantivy4java.query.Query;
 import io.indextables.tantivy4java.result.SearchResult;
-import io.indextables.tantivy4java.core.Tantivy;import java.nio.file.Path;
+import io.indextables.tantivy4java.core.Tantivy;
+import java.nio.file.Path;
 import java.time.Duration;
 import java.util.*;
 import java.util.concurrent.CompletableFuture;
@@ -356,28 +358,211 @@ public class SplitSearcher implements AutoCloseable {
      * Retrieve multiple documents by their addresses in a single batch operation.
      * This is significantly more efficient than calling doc() multiple times,
      * especially for large numbers of documents.
-     * 
+     *
+     * <p>This method automatically selects the optimal retrieval method based on
+     * the batch size and the configured byteBufferThreshold:
+     * <ul>
+     *   <li>Below threshold: Uses traditional Document[] method (lower setup overhead)</li>
+     *   <li>At/above threshold: Uses byte buffer protocol (lower JNI overhead for large batches)</li>
+     * </ul>
+     *
      * @param docAddresses List of document addresses
      * @return List of documents in the same order as the input addresses
      */
     public List<Document> docBatch(List<DocAddress> docAddresses) {
+        return docBatch(docAddresses, null);
+    }
+
+    /**
+     * Retrieve multiple documents by their addresses, optionally filtering to specific fields.
+     *
+     * <p>This method automatically selects the optimal retrieval strategy based on batch size:
+     * <ul>
+     *   <li>Below threshold: Uses traditional Document[] method (lower setup overhead)</li>
+     *   <li>At/above threshold: Uses byte buffer protocol (lower JNI overhead for large batches)</li>
+     * </ul>
+     *
+     * <p>When field names are specified, only those fields are included in the returned documents.
+     * This can improve performance when you only need a subset of fields.
+     *
+     * @param docAddresses List of document addresses
+     * @param fieldNames Set of field names to include, or null to include all fields
+     * @return List of documents in the same order as the input addresses
+     */
+    public List<Document> docBatch(List<DocAddress> docAddresses, Set<String> fieldNames) {
         if (docAddresses == null || docAddresses.isEmpty()) {
             return new ArrayList<>();
         }
-        
-        // Convert to arrays for JNI transfer
+
+        // Get threshold from cache manager configuration
+        int threshold = cacheManager.getBatchConfig().getByteBufferThreshold();
+
+        if (docAddresses.size() >= threshold) {
+            // Use byte buffer protocol for large batches (reduces JNI overhead)
+            return docBatchViaByteBuffer(docAddresses, fieldNames);
+        } else {
+            // Use traditional Document[] method for small batches
+            return docBatchViaObjects(docAddresses, fieldNames);
+        }
+    }
+
+    /**
+     * Retrieve documents using the traditional Document[] method.
+     * Used for small batches where the byte buffer serialization overhead isn't worth it.
+     */
+    private List<Document> docBatchViaObjects(List<DocAddress> docAddresses, Set<String> fieldNames) {
         int[] segments = new int[docAddresses.size()];
         int[] docIds = new int[docAddresses.size()];
-        
+
         for (int i = 0; i < docAddresses.size(); i++) {
             DocAddress addr = docAddresses.get(i);
             segments[i] = addr.getSegmentOrd();
             docIds[i] = addr.getDoc();
         }
-        
-        // Call native batch retrieval
+
         Document[] docs = docBatchNative(nativePtr, segments, docIds);
+
+        // If field filtering is requested, filter each document
+        if (fieldNames != null && !fieldNames.isEmpty()) {
+            List<Document> filtered = new ArrayList<>(docs.length);
+            for (Document doc : docs) {
+                if (doc != null) {
+                    filtered.add(filterDocumentFields(doc, fieldNames));
+                }
+            }
+            return filtered;
+        }
+
         return Arrays.asList(docs);
+    }
+
+    /**
+     * Filter a document to only include specified fields.
+     * Returns a new Document containing only the requested fields.
+     */
+    private Document filterDocumentFields(Document doc, Set<String> fieldNames) {
+        Map<String, List<Object>> allFields = doc.toMap();
+        Map<String, Object> filtered = new HashMap<>();
+        for (String fieldName : fieldNames) {
+            if (allFields.containsKey(fieldName)) {
+                List<Object> values = allFields.get(fieldName);
+                if (values.size() == 1) {
+                    filtered.put(fieldName, values.get(0));
+                } else {
+                    filtered.put(fieldName, values);
+                }
+            }
+        }
+        return buildDocumentFromMap(filtered);
+    }
+
+    /**
+     * Build a Document from a map using individual add methods.
+     * This avoids using Document.fromMap() which requires unimplemented native methods.
+     */
+    private Document buildDocumentFromMap(Map<String, Object> fields) {
+        Document doc = new Document();
+        for (Map.Entry<String, Object> entry : fields.entrySet()) {
+            String fieldName = entry.getKey();
+            Object value = entry.getValue();
+            addValueToDocument(doc, fieldName, value);
+        }
+        return doc;
+    }
+
+    /**
+     * Add a value to a document, handling different types and multi-values.
+     */
+    @SuppressWarnings("unchecked")
+    private void addValueToDocument(Document doc, String fieldName, Object value) {
+        if (value instanceof List) {
+            // Multi-value field
+            for (Object v : (List<Object>) value) {
+                addSingleValueToDocument(doc, fieldName, v);
+            }
+        } else {
+            addSingleValueToDocument(doc, fieldName, value);
+        }
+    }
+
+    /**
+     * Add a single value to a document based on its type.
+     */
+    private void addSingleValueToDocument(Document doc, String fieldName, Object value) {
+        if (value == null) {
+            return;
+        }
+        if (value instanceof String) {
+            doc.addText(fieldName, (String) value);
+        } else if (value instanceof Long) {
+            // Could be Integer, Unsigned, or Date (epoch nanos)
+            // Default to Integer since we can't distinguish
+            doc.addInteger(fieldName, (Long) value);
+        } else if (value instanceof Integer) {
+            doc.addInteger(fieldName, ((Integer) value).longValue());
+        } else if (value instanceof Double) {
+            doc.addFloat(fieldName, (Double) value);
+        } else if (value instanceof Float) {
+            doc.addFloat(fieldName, ((Float) value).doubleValue());
+        } else if (value instanceof Boolean) {
+            doc.addBoolean(fieldName, (Boolean) value);
+        } else if (value instanceof byte[]) {
+            doc.addBytes(fieldName, (byte[]) value);
+        } else if (value instanceof java.time.LocalDateTime) {
+            doc.addDate(fieldName, (java.time.LocalDateTime) value);
+        } else {
+            // Unknown type - convert to string
+            doc.addText(fieldName, value.toString());
+        }
+    }
+
+    /**
+     * Retrieve documents using the byte buffer protocol.
+     * Used for large batches where the reduced JNI overhead outweighs serialization costs.
+     *
+     * <p>This method retrieves all documents in a single byte buffer from the native layer,
+     * then parses them on the Java side. The advantage is significantly reduced JNI overhead
+     * when retrieving many documents.
+     *
+     * <p>When field names are specified, filtering is performed on the native side before
+     * serialization, reducing both bandwidth and parsing overhead.
+     */
+    private List<Document> docBatchViaByteBuffer(List<DocAddress> docAddresses, Set<String> fieldNames) {
+        // Convert to arrays for JNI transfer
+        int[] segments = new int[docAddresses.size()];
+        int[] docIds = new int[docAddresses.size()];
+
+        for (int i = 0; i < docAddresses.size(); i++) {
+            DocAddress addr = docAddresses.get(i);
+            segments[i] = addr.getSegmentOrd();
+            docIds[i] = addr.getDoc();
+        }
+
+        // Use native-side filtering when field names are specified
+        byte[] result;
+        if (fieldNames != null && !fieldNames.isEmpty()) {
+            String[] fieldNamesArray = fieldNames.toArray(new String[0]);
+            result = docsBulkNativeWithFields(nativePtr, segments, docIds, fieldNamesArray);
+        } else {
+            result = docsBulkNative(nativePtr, segments, docIds);
+        }
+
+        if (result == null) {
+            return new ArrayList<>();
+        }
+
+        java.nio.ByteBuffer buffer = java.nio.ByteBuffer.wrap(result);
+
+        // Parse the byte buffer into maps for efficient Document creation
+        BatchDocumentReader reader = new BatchDocumentReader();
+        List<Map<String, Object>> docMaps = reader.parseToMaps(buffer);
+
+        // Convert parsed maps to Document objects (no Java-side filtering needed when native filtering was used)
+        List<Document> docs = new ArrayList<>(docMaps.size());
+        for (Map<String, Object> docMap : docMaps) {
+            docs.add(buildDocumentFromMap(docMap));
+        }
+        return docs;
     }
     
     /**
@@ -704,6 +889,7 @@ public class SplitSearcher implements AutoCloseable {
     private static native Document docNative(long nativePtr, int segment, int docId);
     private static native Document[] docBatchNative(long nativePtr, int[] segments, int[] docIds);
     private static native byte[] docsBulkNative(long nativePtr, int[] segments, int[] docIds);
+    private static native byte[] docsBulkNativeWithFields(long nativePtr, int[] segments, int[] docIds, String[] fieldNames);
     private static native List<Document> parseBulkDocsNative(java.nio.ByteBuffer buffer);
     private static native void preloadComponentsNative(long nativePtr, IndexComponent[] components);
     private static native void preloadFieldsNative(long nativePtr, IndexComponent component, String[] fieldNames);

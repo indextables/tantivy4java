@@ -111,6 +111,22 @@ public class BatchOptimizationConfig {
     private boolean enabled = true;
 
     /**
+     * Minimum number of documents to use byte buffer protocol for batch retrieval.
+     *
+     * <p>Below this threshold, the traditional Document[] method is used.
+     * Above this threshold, the byte buffer protocol reduces JNI overhead by
+     * returning all documents in a single serialized buffer instead of creating
+     * individual Document JNI objects.
+     *
+     * <p><b>Benchmark Results:</b> ByteBuffer protocol is 2-12x faster than the
+     * traditional JNI method across all tested scenarios (1-5000 docs, 5-600 fields).
+     * The speedup increases with more documents and fields.
+     *
+     * <p><b>Default:</b> 1 (always use ByteBuffer protocol, as it is always faster)</p>
+     */
+    private int byteBufferThreshold = 1;
+
+    /**
      * Creates a configuration with default (balanced) settings.
      */
     public BatchOptimizationConfig() {
@@ -223,6 +239,10 @@ public class BatchOptimizationConfig {
         return enabled;
     }
 
+    public int getByteBufferThreshold() {
+        return byteBufferThreshold;
+    }
+
     // Fluent setters
 
     /**
@@ -296,6 +316,25 @@ public class BatchOptimizationConfig {
         return this;
     }
 
+    /**
+     * Sets the minimum number of documents to use byte buffer protocol.
+     *
+     * <p>Below this threshold, the traditional Document[] method is used.
+     * Above this threshold, documents are returned in a serialized byte buffer
+     * to reduce JNI overhead.
+     *
+     * @param threshold minimum document count to use byte buffer (must be >= 1)
+     * @return this configuration for method chaining
+     * @throws IllegalArgumentException if threshold < 1
+     */
+    public BatchOptimizationConfig setByteBufferThreshold(int threshold) {
+        if (threshold < 1) {
+            throw new IllegalArgumentException("byteBufferThreshold must be at least 1, got: " + threshold);
+        }
+        this.byteBufferThreshold = threshold;
+        return this;
+    }
+
     @Override
     public String toString() {
         return "BatchOptimizationConfig{" +
@@ -304,6 +343,7 @@ public class BatchOptimizationConfig {
                 ", gapTolerance=" + (gapTolerance / 1024) + "KB" +
                 ", minDocsForOptimization=" + minDocsForOptimization +
                 ", maxConcurrentPrefetch=" + maxConcurrentPrefetch +
+                ", byteBufferThreshold=" + byteBufferThreshold +
                 '}';
     }
 
@@ -324,6 +364,9 @@ public class BatchOptimizationConfig {
         }
         if (maxConcurrentPrefetch <= 0) {
             throw new IllegalStateException("maxConcurrentPrefetch must be positive");
+        }
+        if (byteBufferThreshold < 1) {
+            throw new IllegalStateException("byteBufferThreshold must be at least 1");
         }
         if (maxRangeSize > 100 * 1024 * 1024) {
             throw new IllegalStateException(
