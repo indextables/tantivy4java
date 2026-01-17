@@ -3,17 +3,21 @@
 // Contains: nativeSearch, nativeDoc, nativeDocBatch, nativeGetNumDocs,
 //           nativeGetNumSegments, nativeGetSegmentIds, nativeClose
 
-use jni::objects::{JClass, JString, JObject};
-use jni::sys::{jlong, jboolean, jint, jobject};
+use jni::objects::{JClass, JString, JObject, JObjectArray};
+use jni::sys::{jlong, jboolean, jint, jobject, jbyteArray};
 use jni::JNIEnv;
 use jni::sys::jlongArray as JLongArray;
 
 use tantivy::{Searcher as TantivySearcher, DocAddress as TantivyDocAddress};
 use tantivy::query::Query as TantivyQuery;
 use std::sync::{Arc, Mutex};
+use std::collections::HashSet;
 
 use crate::utils::{handle_error, with_arc_safe, arc_to_jlong, release_arc};
 use crate::document::{RetrievedDocument, DocumentWrapper};
+use crate::split_searcher::document_retrieval::batch_serialization::{
+    serialize_documents_to_buffer, serialize_documents_to_buffer_with_filter,
+};
 
 // Helper function to extract segment IDs from Java List<String>
 pub(crate) fn extract_segment_ids(env: &mut JNIEnv, list_obj: &JObject) -> Result<Vec<String>, String> {
@@ -307,6 +311,173 @@ pub extern "system" fn Java_io_indextables_tantivy4java_core_Searcher_nativeDocB
         },
         None => {
             handle_error(&mut env, "Invalid Searcher pointer");
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Bulk document retrieval returning a serialized byte buffer instead of JNI Document objects.
+/// This reduces JNI overhead for large batch retrievals by returning all documents in a single
+/// byte buffer that can be parsed on the Java side.
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_core_Searcher_nativeDocBatchBulk(
+    mut env: JNIEnv,
+    _class: JClass,
+    searcher_ptr: jlong,
+    doc_address_ptrs: JLongArray,
+) -> jbyteArray {
+    retrieve_docs_as_buffer(&mut env, searcher_ptr, doc_address_ptrs, None)
+}
+
+/// Bulk document retrieval with field filtering.
+/// Same as nativeDocBatchBulk but only serializes the specified fields.
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_core_Searcher_nativeDocBatchBulkWithFields(
+    mut env: JNIEnv,
+    _class: JClass,
+    searcher_ptr: jlong,
+    doc_address_ptrs: JLongArray,
+    field_names: JObjectArray,
+) -> jbyteArray {
+    // Extract field names from Java String array
+    let field_filter: HashSet<String> = match extract_field_names(&mut env, &field_names) {
+        Ok(names) => names,
+        Err(e) => {
+            handle_error(&mut env, &e);
+            return std::ptr::null_mut();
+        }
+    };
+
+    retrieve_docs_as_buffer(&mut env, searcher_ptr, doc_address_ptrs, Some(field_filter))
+}
+
+/// Helper function to extract field names from a Java String array
+fn extract_field_names(env: &mut JNIEnv, field_names: &JObjectArray) -> Result<HashSet<String>, String> {
+    let len = env.get_array_length(field_names)
+        .map_err(|e| format!("Failed to get field_names array length: {}", e))? as usize;
+
+    let mut filter = HashSet::with_capacity(len);
+    for i in 0..len {
+        let field_name_obj = env.get_object_array_element(field_names, i as i32)
+            .map_err(|e| format!("Failed to get field name at index {}: {}", i, e))?;
+        let field_name_jstring = jni::objects::JString::from(field_name_obj);
+        let field_name_str: String = env.get_string(&field_name_jstring)
+            .map_err(|e| format!("Failed to convert field name at index {}: {}", i, e))?
+            .into();
+        filter.insert(field_name_str);
+    }
+    Ok(filter)
+}
+
+/// Core implementation for bulk document retrieval as byte buffer
+fn retrieve_docs_as_buffer(
+    env: &mut JNIEnv,
+    searcher_ptr: jlong,
+    doc_address_ptrs: JLongArray,
+    field_filter: Option<HashSet<String>>,
+) -> jbyteArray {
+    // Convert JNI array to proper JArray type
+    let doc_addresses_array = unsafe { jni::objects::JLongArray::from_raw(doc_address_ptrs) };
+
+    // Get the array of document address pointers
+    let array_len = match env.get_array_length(&doc_addresses_array) {
+        Ok(len) => len as usize,
+        Err(e) => {
+            handle_error(env, &format!("Failed to get array length: {}", e));
+            return std::ptr::null_mut();
+        }
+    };
+
+    let mut addresses = vec![0i64; array_len];
+    if let Err(e) = env.get_long_array_region(&doc_addresses_array, 0, &mut addresses) {
+        handle_error(env, &format!("Failed to get array elements: {}", e));
+        return std::ptr::null_mut();
+    }
+
+    // Convert to Vec of DocAddress objects
+    let mut tantivy_addresses = Vec::new();
+    for &addr_ptr in addresses.iter() {
+        let tantivy_doc_address = match with_arc_safe::<TantivyDocAddress, Option<TantivyDocAddress>>(addr_ptr, |doc_address| {
+            Some(**doc_address)
+        }) {
+            Some(Some(addr)) => addr,
+            _ => {
+                handle_error(env, &format!("Invalid DocAddress pointer at index {}", tantivy_addresses.len()));
+                return std::ptr::null_mut();
+            }
+        };
+        tantivy_addresses.push(tantivy_doc_address);
+    }
+
+    // Get the searcher and retrieve documents
+    let result = with_arc_safe::<Mutex<TantivySearcher>, Result<Vec<u8>, String>>(
+        searcher_ptr,
+        |searcher_mutex| {
+            let searcher = searcher_mutex.lock().unwrap();
+            let schema = searcher.schema().clone();
+
+            // Sort addresses by segment for better cache locality
+            let mut indexed_addresses: Vec<(usize, TantivyDocAddress)> = tantivy_addresses
+                .into_iter()
+                .enumerate()
+                .collect();
+            indexed_addresses.sort_by_key(|(_, addr)| (addr.segment_ord, addr.doc_id));
+
+            // Retrieve all documents efficiently
+            let mut documents = vec![None; indexed_addresses.len()];
+            for (original_index, addr) in indexed_addresses {
+                match searcher.doc(addr) {
+                    Ok(doc) => documents[original_index] = Some(doc),
+                    Err(e) => return Err(format!("Failed to retrieve document at index {}: {}", original_index, e)),
+                }
+            }
+
+            // Convert Option<Document> to Document, returning error if any failed
+            let documents: Result<Vec<_>, _> = documents
+                .into_iter()
+                .enumerate()
+                .map(|(i, opt)| opt.ok_or_else(|| format!("Document at index {} was not retrieved", i)))
+                .collect();
+
+            let documents = documents?;
+
+            // Prepare documents with schema for serialization
+            let docs_with_schema: Vec<(tantivy::schema::TantivyDocument, tantivy::schema::Schema)> =
+                documents.into_iter().map(|doc| (doc, schema.clone())).collect();
+
+            // Serialize to byte buffer with optional field filtering
+            let filter_ref = field_filter.as_ref();
+            serialize_documents_to_buffer_with_filter(&docs_with_schema, filter_ref)
+                .map_err(|e| format!("Failed to serialize documents: {}", e))
+        }
+    );
+
+    match result {
+        Some(Ok(buffer)) => {
+            // Create Java byte array
+            match env.new_byte_array(buffer.len() as i32) {
+                Ok(byte_array) => {
+                    // Copy data to Java array
+                    let byte_slice: &[i8] =
+                        unsafe { std::slice::from_raw_parts(buffer.as_ptr() as *const i8, buffer.len()) };
+                    if let Err(e) = env.set_byte_array_region(&byte_array, 0, byte_slice) {
+                        handle_error(env, &format!("Failed to set byte array data: {}", e));
+                        return std::ptr::null_mut();
+                    }
+                    byte_array.into_raw()
+                }
+                Err(e) => {
+                    handle_error(env, &format!("Failed to create byte array: {}", e));
+                    std::ptr::null_mut()
+                }
+            }
+        }
+        Some(Err(err)) => {
+            handle_error(env, &err);
+            std::ptr::null_mut()
+        }
+        None => {
+            handle_error(env, "Invalid Searcher pointer");
             std::ptr::null_mut()
         }
     }

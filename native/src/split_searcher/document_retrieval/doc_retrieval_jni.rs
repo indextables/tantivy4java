@@ -630,30 +630,66 @@ fn retrieve_documents_as_tantivy_docs(
 
                 // Apply batch optimization (same as docBatchNative)
                 let optimizer = SimpleBatchOptimizer::new(SimpleBatchConfig::default());
+                let doc_count = doc_addresses.len();
 
-                if optimizer.should_optimize(doc_addresses.len()) {
+                // Count unique segments for metrics
+                let num_segments = {
+                    let mut segments: std::collections::HashSet<u32> = std::collections::HashSet::new();
+                    for addr in &doc_addresses {
+                        segments.insert(addr.segment_ord);
+                    }
+                    segments.len()
+                };
+
+                if optimizer.should_optimize(doc_count) {
                     debug_println!(
                         "🚀 BULK_RETRIEVAL: Starting range consolidation for {} documents",
-                        doc_addresses.len()
+                        doc_count
                     );
 
                     if let Ok(ranges) = optimizer.consolidate_ranges(&doc_addresses, &cached_searcher) {
                         debug_println!(
                             "🚀 BULK_RETRIEVAL: Consolidated {} docs → {} ranges",
-                            doc_addresses.len(),
+                            doc_count,
                             ranges.len()
                         );
 
-                        // Prefetch ranges
+                        // Prefetch ranges and record metrics
                         if let Some(cache) = byte_range_cache {
-                            let _ = crate::batch_retrieval::simple::prefetch_ranges_with_cache(
+                            match crate::batch_retrieval::simple::prefetch_ranges_with_cache(
                                 ranges.clone(),
                                 storage_resolver.clone(),
                                 split_uri,
                                 cache,
                                 bundle_file_offsets,
                             )
-                            .await;
+                            .await {
+                                Ok(stats) => {
+                                    debug_println!(
+                                        "🚀 BULK_RETRIEVAL SUCCESS: Prefetched {} ranges, {} bytes in {}ms",
+                                        stats.ranges_fetched,
+                                        stats.bytes_fetched,
+                                        stats.duration_ms
+                                    );
+
+                                    // Record batch optimization metrics
+                                    let bytes_wasted = 0; // TODO: Calculate actual gap bytes
+                                    crate::split_cache_manager::record_batch_metrics(
+                                        None, // cache_name not available in this context
+                                        doc_count,
+                                        &stats,
+                                        num_segments,
+                                        bytes_wasted,
+                                    );
+                                }
+                                Err(e) => {
+                                    debug_println!(
+                                        "⚠️ BULK_RETRIEVAL: Prefetch failed (continuing with normal retrieval): {}",
+                                        e
+                                    );
+                                    // Non-fatal: continue with normal doc_async which will fetch on-demand
+                                }
+                            }
                         }
                     }
                 }

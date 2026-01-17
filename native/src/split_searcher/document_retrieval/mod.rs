@@ -2,7 +2,7 @@
 // Refactored into submodules during P3 refactoring phase
 
 mod batch_doc_retrieval;
-mod batch_serialization;
+pub mod batch_serialization;
 mod doc_retrieval_jni;
 mod single_doc_retrieval;
 

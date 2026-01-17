@@ -23,9 +23,12 @@ import io.indextables.tantivy4java.query.Query;
 import io.indextables.tantivy4java.result.SearchResult;
 import io.indextables.tantivy4java.query.Order;
 import io.indextables.tantivy4java.aggregation.*;
+import io.indextables.tantivy4java.batch.BatchDocumentReader;
+import java.nio.ByteBuffer;
 import java.util.Map;
 import java.util.List;
 import java.util.ArrayList;
+import java.util.Set;
 
 /**
  * Searcher for querying a Tantivy index.
@@ -134,34 +137,112 @@ public class Searcher implements AutoCloseable {
      * Get multiple documents by their addresses in a single batch operation.
      * This is significantly more efficient than calling doc() multiple times,
      * especially for large numbers of documents.
-     * 
+     *
+     * Uses ByteBuffer protocol for efficient JNI transfer (8-12x faster than object-based).
+     *
      * @param docAddresses List of document addresses
      * @return List of documents in the same order as the input addresses
      */
     public List<Document> docBatch(List<DocAddress> docAddresses) {
+        return docBatch(docAddresses, null);
+    }
+
+    /**
+     * Get multiple documents by their addresses with optional field filtering.
+     * Only the specified fields will be included in the returned documents.
+     *
+     * Uses ByteBuffer protocol for efficient JNI transfer (8-12x faster than object-based).
+     * Field filtering happens on the native side for maximum efficiency.
+     *
+     * @param docAddresses List of document addresses
+     * @param fieldNames Set of field names to include (null or empty means all fields)
+     * @return List of documents in the same order as the input addresses
+     */
+    public List<Document> docBatch(List<DocAddress> docAddresses, Set<String> fieldNames) {
         if (closed) {
             throw new IllegalStateException("Searcher has been closed");
         }
         if (docAddresses == null || docAddresses.isEmpty()) {
             return new ArrayList<>();
         }
-        
+
         // Convert DocAddress list to array of native pointers
         long[] addressPtrs = new long[docAddresses.size()];
         for (int i = 0; i < docAddresses.size(); i++) {
             addressPtrs[i] = docAddresses.get(i).getNativePtr();
         }
-        
-        // Call native batch retrieval method
-        long[] docPtrs = nativeDocBatch(nativePtr, addressPtrs);
-        
-        // Convert native document pointers to Document objects
-        List<Document> documents = new ArrayList<>(docPtrs.length);
-        for (long ptr : docPtrs) {
-            documents.add(new Document(ptr));
+
+        // Call native bulk retrieval method (returns serialized byte buffer)
+        byte[] buffer;
+        if (fieldNames != null && !fieldNames.isEmpty()) {
+            String[] fieldNamesArray = fieldNames.toArray(new String[0]);
+            buffer = nativeDocBatchBulkWithFields(nativePtr, addressPtrs, fieldNamesArray);
+        } else {
+            buffer = nativeDocBatchBulk(nativePtr, addressPtrs);
         }
-        
-        return documents;
+
+        if (buffer == null || buffer.length == 0) {
+            return new ArrayList<>();
+        }
+
+        // Parse the byte buffer into maps, then convert to Document objects
+        BatchDocumentReader reader = new BatchDocumentReader();
+        List<Map<String, Object>> docMaps = reader.parseToMaps(ByteBuffer.wrap(buffer));
+
+        List<Document> docs = new ArrayList<>(docMaps.size());
+        for (Map<String, Object> docMap : docMaps) {
+            docs.add(buildDocumentFromMap(docMap));
+        }
+        return docs;
+    }
+
+    /**
+     * Build a Document from a map using individual add methods.
+     * This avoids using Document.fromMap() which requires unimplemented native methods.
+     */
+    private Document buildDocumentFromMap(Map<String, Object> fields) {
+        Document doc = new Document();
+        for (Map.Entry<String, Object> entry : fields.entrySet()) {
+            String fieldName = entry.getKey();
+            Object value = entry.getValue();
+            addValueToDocument(doc, fieldName, value);
+        }
+        return doc;
+    }
+
+    @SuppressWarnings("unchecked")
+    private void addValueToDocument(Document doc, String fieldName, Object value) {
+        if (value instanceof List) {
+            for (Object v : (List<Object>) value) {
+                addSingleValueToDocument(doc, fieldName, v);
+            }
+        } else {
+            addSingleValueToDocument(doc, fieldName, value);
+        }
+    }
+
+    private void addSingleValueToDocument(Document doc, String fieldName, Object value) {
+        if (value == null) return;
+        if (value instanceof String) {
+            doc.addText(fieldName, (String) value);
+        } else if (value instanceof Long) {
+            doc.addInteger(fieldName, (Long) value);
+        } else if (value instanceof Integer) {
+            doc.addInteger(fieldName, ((Integer) value).longValue());
+        } else if (value instanceof Double) {
+            doc.addFloat(fieldName, (Double) value);
+        } else if (value instanceof Float) {
+            doc.addFloat(fieldName, ((Float) value).doubleValue());
+        } else if (value instanceof Boolean) {
+            doc.addBoolean(fieldName, (Boolean) value);
+        } else if (value instanceof byte[]) {
+            doc.addBytes(fieldName, (byte[]) value);
+        } else if (value instanceof java.time.LocalDateTime) {
+            doc.addDate(fieldName, (java.time.LocalDateTime) value);
+        } else {
+            // Fall back to string representation
+            doc.addText(fieldName, value.toString());
+        }
     }
 
     /**
@@ -218,6 +299,8 @@ public class Searcher implements AutoCloseable {
     private static native int nativeGetNumSegments(long ptr);
     private static native long nativeDoc(long ptr, long docAddressPtr);
     private static native long[] nativeDocBatch(long ptr, long[] docAddressPtrs);
+    private static native byte[] nativeDocBatchBulk(long ptr, long[] docAddressPtrs);
+    private static native byte[] nativeDocBatchBulkWithFields(long ptr, long[] docAddressPtrs, String[] fieldNames);
     private static native int nativeDocFreq(long ptr, String fieldName, Object fieldValue);
     private static native List<String> nativeGetSegmentIds(long ptr);
     private static native void nativeClose(long ptr);
