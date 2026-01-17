@@ -218,21 +218,7 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_getP
 pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_getLoadingStatsNative(
     _env: JNIEnv, _class: JClass, _searcher_ptr: jlong
 ) -> jobject { std::ptr::null_mut() }
-/// Stub implementation for docsBulkNative - focusing on docBatchNative optimization
-/// The main performance improvement comes from the optimized docBatchNative method
-#[no_mangle]
-pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_docsBulkNative(
-    mut env: JNIEnv,
-    _class: JClass,
-    _searcher_ptr: jlong,
-    _segments: jni::sys::jintArray,
-    _doc_ids: jni::sys::jintArray,
-) -> jobject {
-    // For now, return null - the main optimization is in docBatchNative
-    // This method is not currently used by the test, but docBatch is
-    to_java_exception(&mut env, &anyhow::anyhow!("docsBulkNative not implemented - use docBatch for optimized bulk retrieval"));
-    std::ptr::null_mut()
-}
+// docsBulkNative is now implemented in document_retrieval/doc_retrieval_jni.rs
 /// Stub implementation for parseBulkDocsNative - focusing on docBatch optimization
 #[no_mangle]
 pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_parseBulkDocsNative(

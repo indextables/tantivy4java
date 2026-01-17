@@ -243,9 +243,12 @@ pub fn retrieve_documents_batch_from_split_optimized(
                     });
 
                     // Execute concurrent batch retrieval with cached searcher
+                    // IMPORTANT: Use buffered() NOT buffer_unordered() to maintain document order.
+                    // buffer_unordered() returns results in completion order, which corrupts the
+                    // document-to-address mapping and causes data corruption (wrong field values).
                     use futures::stream::{StreamExt, TryStreamExt};
                     let doc_ptrs: Vec<jobject> = futures::stream::iter(doc_futures)
-                        .buffer_unordered(BASE_CONCURRENT_REQUESTS) // Keep base concurrency for stream processing
+                        .buffered(BASE_CONCURRENT_REQUESTS)
                         .try_collect::<Vec<_>>()
                         .await
                         .map_err(|e| {
@@ -509,9 +512,12 @@ pub fn retrieve_documents_batch_from_split_optimized(
                     });
 
                     // ✅ QUICKWIT CONCURRENT EXECUTION: Process up to BASE_CONCURRENT_REQUESTS simultaneously
+                    // IMPORTANT: Use buffered() NOT buffer_unordered() to maintain document order.
+                    // buffer_unordered() returns results in completion order, which corrupts the
+                    // document-to-address mapping and causes data corruption (wrong field values).
                     use futures::stream::{StreamExt, TryStreamExt};
                     let doc_ptrs: Vec<jobject> = futures::stream::iter(doc_futures)
-                        .buffer_unordered(BASE_CONCURRENT_REQUESTS) // Quickwit's concurrent processing pattern
+                        .buffered(BASE_CONCURRENT_REQUESTS)
                         .try_collect::<Vec<_>>()
                         .await
                         .map_err(|e| {

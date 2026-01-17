@@ -21,6 +21,8 @@ package io.indextables.tantivy4java.batch;
 
 import io.indextables.tantivy4java.util.Facet;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import io.indextables.tantivy4java.core.Schema;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
@@ -37,8 +39,9 @@ import java.util.Map;
  * immediately but instead collects field data for later batch processing.
  */
 public class BatchDocument {
+    private static final ObjectMapper JSON_MAPPER = new ObjectMapper();
     private final Map<String, List<FieldValue>> fields = new HashMap<>();
-    
+
     /**
      * Create a new empty batch document.
      */
@@ -168,11 +171,23 @@ public class BatchDocument {
     
     /**
      * Add a JSON value to a field.
+     * If the value is a Map or Collection, it will be serialized to a JSON string.
+     * If the value is already a String, it is assumed to be valid JSON.
      * @param fieldName Field name
-     * @param value Object to be serialized as JSON
+     * @param value Object to be serialized as JSON (Map, Collection, or JSON string)
      */
     public void addJson(String fieldName, Object value) {
-        addFieldValue(fieldName, FieldType.JSON, value);
+        String jsonString;
+        if (value instanceof String) {
+            jsonString = (String) value;
+        } else {
+            try {
+                jsonString = JSON_MAPPER.writeValueAsString(value);
+            } catch (JsonProcessingException e) {
+                throw new RuntimeException("Failed to serialize value to JSON: " + e.getMessage(), e);
+            }
+        }
+        addFieldValue(fieldName, FieldType.JSON, jsonString);
     }
     
     /**

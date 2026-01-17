@@ -27,8 +27,13 @@ import java.util.Map;
 /**
  * Represents a document in a Tantivy index.
  * Documents are collections of field values that can be indexed and searched.
+ *
+ * <p>This class implements {@link DocumentView} for read-only access to field values.
+ * For batch document retrieval operations, consider using the byte buffer protocol
+ * which returns {@link MapBackedDocument} instances that implement the same interface
+ * without JNI overhead.
  */
-public class Document implements AutoCloseable {
+public class Document implements DocumentView {
     static {
         Tantivy.initialize();
     }

@@ -21,6 +21,8 @@ package io.indextables.tantivy4java.batch;
 
 import io.indextables.tantivy4java.util.Facet;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import io.indextables.tantivy4java.core.IndexWriter;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
@@ -80,7 +82,8 @@ import java.util.Map;
 public class BatchDocumentBuilder implements AutoCloseable {
     private static final int MAGIC_NUMBER = 0x54414E54; // "TANT" in ASCII
     private static final int INITIAL_CAPACITY = 8192; // 8KB initial buffer
-    
+    private static final ObjectMapper JSON_MAPPER = new ObjectMapper();
+
     private final List<BatchDocument> documents = new ArrayList<>();
     private int estimatedSize = 0;
     private IndexWriter associatedWriter = null;
