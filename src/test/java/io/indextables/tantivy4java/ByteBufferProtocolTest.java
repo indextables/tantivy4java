@@ -232,13 +232,10 @@ public class ByteBufferProtocolTest {
             for (Map<String, Object> doc : docs) {
                 Object value = doc.get("date_field");
                 assertNotNull(value, "Date field should not be null");
-                // Date is returned as Long (epoch nanos)
-                assertTrue(value instanceof Number, "Date field should be Number (epoch nanos), got: " + value.getClass());
-                long nanos = ((Number) value).longValue();
-                // Convert back to LocalDateTime and verify it's in the expected range
-                java.time.Instant instant = java.time.Instant.ofEpochSecond(
-                        nanos / 1_000_000_000L, (int) (nanos % 1_000_000_000L));
-                java.time.LocalDateTime retrieved = java.time.LocalDateTime.ofInstant(instant, java.time.ZoneOffset.UTC);
+                // Date is returned as LocalDateTime (preserves type information)
+                assertTrue(value instanceof java.time.LocalDateTime,
+                        "Date field should be LocalDateTime, got: " + value.getClass());
+                java.time.LocalDateTime retrieved = (java.time.LocalDateTime) value;
                 // Should be between baseTime-99days and baseTime
                 assertTrue(retrieved.isBefore(baseTime.plusDays(1)) && retrieved.isAfter(baseTime.minusDays(100)),
                         "Date should be in expected range, got: " + retrieved);
@@ -651,15 +648,12 @@ public class ByteBufferProtocolTest {
                 Object idxValue = doc.get("index");
 
                 assertNotNull(tsValue, "Timestamp should not be null");
-                assertTrue(tsValue instanceof Number, "Timestamp should be Number (epoch nanos)");
+                // Timestamp is returned as LocalDateTime (preserves type information)
+                assertTrue(tsValue instanceof java.time.LocalDateTime,
+                        "Timestamp should be LocalDateTime, got: " + tsValue.getClass());
 
-                long nanos = ((Number) tsValue).longValue();
+                java.time.LocalDateTime retrieved = (java.time.LocalDateTime) tsValue;
                 int index = ((Number) idxValue).intValue();
-
-                // Convert back to LocalDateTime
-                java.time.Instant instant = java.time.Instant.ofEpochSecond(
-                        nanos / 1_000_000_000L, (int) (nanos % 1_000_000_000L));
-                java.time.LocalDateTime retrieved = java.time.LocalDateTime.ofInstant(instant, java.time.ZoneOffset.UTC);
 
                 java.time.LocalDateTime expected = testTimes[index % testTimes.length];
 

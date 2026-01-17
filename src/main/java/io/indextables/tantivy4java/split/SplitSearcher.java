@@ -4,6 +4,7 @@ import io.indextables.tantivy4java.batch.BatchDocumentReader;
 import io.indextables.tantivy4java.core.DocAddress;
 
 import io.indextables.tantivy4java.core.Document;
+import io.indextables.tantivy4java.core.MapBackedDocument;
 import io.indextables.tantivy4java.core.Schema;
 import io.indextables.tantivy4java.query.Query;
 import io.indextables.tantivy4java.result.SearchResult;
@@ -366,6 +367,11 @@ public class SplitSearcher implements AutoCloseable {
      *   <li>At/above threshold: Uses byte buffer protocol (lower JNI overhead for large batches)</li>
      * </ul>
      *
+     * <p>For the byte buffer path, this returns {@link MapBackedDocument} instances
+     * (pure Java, zero JNI calls for field access). For the object path, this returns
+     * native-backed {@link Document} instances. Both extend Document, so this is
+     * fully backwards compatible.
+     *
      * @param docAddresses List of document addresses
      * @return List of documents in the same order as the input addresses
      */
@@ -384,6 +390,11 @@ public class SplitSearcher implements AutoCloseable {
      *
      * <p>When field names are specified, only those fields are included in the returned documents.
      * This can improve performance when you only need a subset of fields.
+     *
+     * <p>For the byte buffer path, this returns {@link MapBackedDocument} instances
+     * (pure Java, zero JNI calls for field access). For the object path, this returns
+     * native-backed {@link Document} instances. Both extend Document, so this is
+     * fully backwards compatible.
      *
      * @param docAddresses List of document addresses
      * @param fieldNames Set of field names to include, or null to include all fields
@@ -409,6 +420,7 @@ public class SplitSearcher implements AutoCloseable {
     /**
      * Retrieve documents using the traditional Document[] method.
      * Used for small batches where the byte buffer serialization overhead isn't worth it.
+     * Returns native-backed Document instances.
      */
     private List<Document> docBatchViaObjects(List<DocAddress> docAddresses, Set<String> fieldNames) {
         int[] segments = new int[docAddresses.size()];
@@ -438,7 +450,8 @@ public class SplitSearcher implements AutoCloseable {
 
     /**
      * Filter a document to only include specified fields.
-     * Returns a new Document containing only the requested fields.
+     * Returns a new MapBackedDocument containing only the requested fields.
+     * This avoids JNI overhead by using pure Java document representation.
      */
     private Document filterDocumentFields(Document doc, Set<String> fieldNames) {
         Map<String, List<Object>> allFields = doc.toMap();
@@ -453,7 +466,8 @@ public class SplitSearcher implements AutoCloseable {
                 }
             }
         }
-        return buildDocumentFromMap(filtered);
+        // Use MapBackedDocument (extends Document) to avoid JNI overhead
+        return new MapBackedDocument(filtered);
     }
 
     /**
@@ -521,11 +535,14 @@ public class SplitSearcher implements AutoCloseable {
      * Used for large batches where the reduced JNI overhead outweighs serialization costs.
      *
      * <p>This method retrieves all documents in a single byte buffer from the native layer,
-     * then parses them on the Java side. The advantage is significantly reduced JNI overhead
-     * when retrieving many documents.
+     * then parses them on the Java side using MapBackedDocument to avoid any JNI calls.
      *
      * <p>When field names are specified, filtering is performed on the native side before
      * serialization, reducing both bandwidth and parsing overhead.
+     *
+     * <p><b>Performance:</b> This method eliminates the 2×N×M JNI calls that would otherwise
+     * occur when using Document objects (N documents × M fields for storing, plus N×M for reading).
+     * Instead, all document data stays in pure Java after the single ByteBuffer transfer.
      */
     private List<Document> docBatchViaByteBuffer(List<DocAddress> docAddresses, Set<String> fieldNames) {
         // Convert to arrays for JNI transfer
@@ -553,14 +570,16 @@ public class SplitSearcher implements AutoCloseable {
 
         java.nio.ByteBuffer buffer = java.nio.ByteBuffer.wrap(result);
 
-        // Parse the byte buffer into maps for efficient Document creation
+        // Parse the byte buffer into maps
         BatchDocumentReader reader = new BatchDocumentReader();
         List<Map<String, Object>> docMaps = reader.parseToMaps(buffer);
 
-        // Convert parsed maps to Document objects (no Java-side filtering needed when native filtering was used)
+        // Wrap each map in MapBackedDocument - ZERO JNI calls!
+        // This is the key optimization: MapBackedDocument extends Document but is pure Java,
+        // so subsequent getFirst() calls don't cross the JNI boundary.
         List<Document> docs = new ArrayList<>(docMaps.size());
         for (Map<String, Object> docMap : docMaps) {
-            docs.add(buildDocumentFromMap(docMap));
+            docs.add(new MapBackedDocument(docMap));
         }
         return docs;
     }

@@ -140,6 +140,9 @@ public class Searcher implements AutoCloseable {
      *
      * Uses ByteBuffer protocol for efficient JNI transfer (8-12x faster than object-based).
      *
+     * <p>This returns {@link MapBackedDocument} instances (pure Java, zero JNI calls for
+     * field access). Since MapBackedDocument extends Document, this is fully backwards compatible.
+     *
      * @param docAddresses List of document addresses
      * @return List of documents in the same order as the input addresses
      */
@@ -153,6 +156,13 @@ public class Searcher implements AutoCloseable {
      *
      * Uses ByteBuffer protocol for efficient JNI transfer (8-12x faster than object-based).
      * Field filtering happens on the native side for maximum efficiency.
+     *
+     * <p>This returns {@link MapBackedDocument} instances (pure Java, zero JNI calls for
+     * field access). Since MapBackedDocument extends Document, this is fully backwards compatible.
+     *
+     * <p><b>Performance:</b> This method eliminates the 2×N×M JNI calls that would otherwise
+     * occur when using Document objects (N documents × M fields for storing, plus N×M for reading).
+     * Instead, all document data stays in pure Java after the single ByteBuffer transfer.
      *
      * @param docAddresses List of document addresses
      * @param fieldNames Set of field names to include (null or empty means all fields)
@@ -185,65 +195,22 @@ public class Searcher implements AutoCloseable {
             return new ArrayList<>();
         }
 
-        // Parse the byte buffer into maps, then convert to Document objects
+        // Parse the byte buffer into maps
         BatchDocumentReader reader = new BatchDocumentReader();
         List<Map<String, Object>> docMaps = reader.parseToMaps(ByteBuffer.wrap(buffer));
 
+        // Wrap each map in MapBackedDocument - ZERO JNI calls!
+        // This is the key optimization: MapBackedDocument extends Document but is pure Java,
+        // so subsequent getFirst() calls don't cross the JNI boundary.
         List<Document> docs = new ArrayList<>(docMaps.size());
         for (Map<String, Object> docMap : docMaps) {
-            docs.add(buildDocumentFromMap(docMap));
+            docs.add(new MapBackedDocument(docMap));
         }
         return docs;
     }
 
-    /**
-     * Build a Document from a map using individual add methods.
-     * This avoids using Document.fromMap() which requires unimplemented native methods.
-     */
-    private Document buildDocumentFromMap(Map<String, Object> fields) {
-        Document doc = new Document();
-        for (Map.Entry<String, Object> entry : fields.entrySet()) {
-            String fieldName = entry.getKey();
-            Object value = entry.getValue();
-            addValueToDocument(doc, fieldName, value);
-        }
-        return doc;
-    }
-
-    @SuppressWarnings("unchecked")
-    private void addValueToDocument(Document doc, String fieldName, Object value) {
-        if (value instanceof List) {
-            for (Object v : (List<Object>) value) {
-                addSingleValueToDocument(doc, fieldName, v);
-            }
-        } else {
-            addSingleValueToDocument(doc, fieldName, value);
-        }
-    }
-
-    private void addSingleValueToDocument(Document doc, String fieldName, Object value) {
-        if (value == null) return;
-        if (value instanceof String) {
-            doc.addText(fieldName, (String) value);
-        } else if (value instanceof Long) {
-            doc.addInteger(fieldName, (Long) value);
-        } else if (value instanceof Integer) {
-            doc.addInteger(fieldName, ((Integer) value).longValue());
-        } else if (value instanceof Double) {
-            doc.addFloat(fieldName, (Double) value);
-        } else if (value instanceof Float) {
-            doc.addFloat(fieldName, ((Float) value).doubleValue());
-        } else if (value instanceof Boolean) {
-            doc.addBoolean(fieldName, (Boolean) value);
-        } else if (value instanceof byte[]) {
-            doc.addBytes(fieldName, (byte[]) value);
-        } else if (value instanceof java.time.LocalDateTime) {
-            doc.addDate(fieldName, (java.time.LocalDateTime) value);
-        } else {
-            // Fall back to string representation
-            doc.addText(fieldName, value.toString());
-        }
-    }
+    // Note: buildDocumentFromMap and helper methods removed - no longer needed
+    // since we now use MapBackedDocument which wraps the map directly without JNI calls
 
     /**
      * Get the document frequency for a field value.

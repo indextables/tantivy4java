@@ -719,8 +719,11 @@ fn retrieve_documents_as_tantivy_docs(
                 });
 
                 use futures::stream::{StreamExt, TryStreamExt};
+                // IMPORTANT: Use buffered() NOT buffer_unordered() to maintain document order.
+                // buffer_unordered() returns results in completion order, which corrupts the
+                // document-to-address mapping and causes data corruption (wrong field values).
                 let docs: Vec<tantivy::schema::TantivyDocument> = futures::stream::iter(doc_futures)
-                    .buffer_unordered(BASE_CONCURRENT_REQUESTS)
+                    .buffered(BASE_CONCURRENT_REQUESTS)
                     .try_collect::<Vec<_>>()
                     .await?;
 

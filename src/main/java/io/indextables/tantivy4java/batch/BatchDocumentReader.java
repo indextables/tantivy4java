@@ -197,16 +197,18 @@ public class BatchDocumentReader {
 
     /**
      * Convert field values to interoperable types.
-     * - LocalDateTime -> epoch nanoseconds (Long)
-     * - Other types unchanged
+     *
+     * Note: LocalDateTime is NOT converted to epoch nanoseconds.
+     * This preserves type information so consumers can correctly handle dates.
+     * Previously, converting to Long (nanoseconds) caused confusion because
+     * some code assumed microseconds, resulting in timestamps off by 1000x.
+     *
+     * With MapBackedDocument, the LocalDateTime is returned directly from
+     * getFirst(), allowing proper date handling.
      */
     private Object convertValue(Object value) {
-        if (value instanceof LocalDateTime) {
-            LocalDateTime dt = (LocalDateTime) value;
-            long epochSecond = dt.toEpochSecond(ZoneOffset.UTC);
-            int nano = dt.getNano();
-            return epochSecond * 1_000_000_000L + nano;
-        }
+        // Keep all types as-is - don't lose type information
+        // LocalDateTime stays as LocalDateTime for proper date handling
         return value;
     }
 
