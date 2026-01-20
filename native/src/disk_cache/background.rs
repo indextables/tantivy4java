@@ -84,7 +84,7 @@ impl L2DiskCache {
 
                     // Spawn async write task
                     runtime.spawn(async move {
-                        if let Err(e) = cache
+                        match cache
                             .do_put_async(
                                 &storage_loc,
                                 &split_id,
@@ -94,7 +94,13 @@ impl L2DiskCache {
                             )
                             .await
                         {
-                            debug_println!("Disk cache write error: {}", e);
+                            Ok(()) => {
+                                // Mark manifest dirty so timer will sync it
+                                cache.mark_dirty();
+                            }
+                            Err(e) => {
+                                debug_println!("Disk cache write error: {}", e);
+                            }
                         }
                         drop(permit); // Release permit when write completes
                     });
@@ -110,8 +116,13 @@ impl L2DiskCache {
                     };
 
                     runtime.spawn(async move {
-                        if let Err(e) = cache.do_evict_async(&storage_loc, &split_id).await {
-                            debug_println!("Disk cache evict error: {}", e);
+                        match cache.do_evict_async(&storage_loc, &split_id).await {
+                            Ok(()) => {
+                                cache.mark_dirty();
+                            }
+                            Err(e) => {
+                                debug_println!("Disk cache evict error: {}", e);
+                            }
                         }
                         drop(permit);
                     });
@@ -150,40 +161,41 @@ impl L2DiskCache {
         debug_println!("🛑 L2DiskCache: Writer thread shutdown complete");
     }
 
-    /// Manifest sync timer (static version using Weak reference and shutdown flag)
+    /// Manifest sync timer - checks every second, syncs if dirty (non-blocking)
+    ///
+    /// This replaces the old interval-based approach with a dirty-flag approach:
+    /// - Checks every 1 second (fast response to changes)
+    /// - Only syncs if manifest has uncommitted changes
+    /// - Non-blocking: doesn't wait for pending writes
     pub(crate) fn manifest_sync_timer_static(
         cache_weak: std::sync::Weak<Self>,
         shutdown_flag: Arc<std::sync::atomic::AtomicBool>,
-        interval_secs: u64,
+        dirty_flag: Arc<std::sync::atomic::AtomicBool>,
     ) {
         use std::sync::atomic::Ordering;
 
-        let interval = Duration::from_secs(interval_secs);
         loop {
-            // Check shutdown flag before sleeping
-            if shutdown_flag.load(Ordering::Relaxed) {
-                break;
-            }
-
-            std::thread::sleep(std::time::Duration::from_millis(100));
-
-            // Check shutdown flag after sleeping (in smaller increments)
-            let mut elapsed = std::time::Duration::from_millis(100);
-            while elapsed < interval {
+            // Sleep for 1 second (check in 100ms increments for faster shutdown response)
+            for _ in 0..10 {
                 if shutdown_flag.load(Ordering::Relaxed) {
                     return;
                 }
-                std::thread::sleep(std::time::Duration::from_millis(100));
-                elapsed += std::time::Duration::from_millis(100);
+                std::thread::sleep(Duration::from_millis(100));
             }
 
-            // Try to upgrade weak reference - if cache is dropped, exit
-            if let Some(cache) = cache_weak.upgrade() {
-                if let Err(e) = cache.sync_manifest() {
-                    debug_println!("Manifest sync timer error: {}", e);
+            // Check if manifest is dirty
+            if dirty_flag.swap(false, Ordering::AcqRel) {
+                // Try to upgrade weak reference - if cache is dropped, exit
+                if let Some(cache) = cache_weak.upgrade() {
+                    debug_println!("📝 MANIFEST_SYNC: Dirty flag set, syncing manifest...");
+                    if let Err(e) = cache.do_sync_manifest() {
+                        debug_println!("Manifest sync timer error: {}", e);
+                    } else {
+                        debug_println!("✅ MANIFEST_SYNC: Manifest synced successfully");
+                    }
+                } else {
+                    break;
                 }
-            } else {
-                break;
             }
         }
     }

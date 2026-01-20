@@ -76,6 +76,8 @@ pub struct L2DiskCache {
     shutdown_flag: Arc<std::sync::atomic::AtomicBool>,
     /// Thread handles for cleanup
     thread_handles: Mutex<Vec<std::thread::JoinHandle<()>>>,
+    /// Dirty flag - set when manifest has uncommitted changes
+    manifest_dirty: Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[allow(dead_code)]
@@ -115,6 +117,8 @@ impl L2DiskCache {
             DEFAULT_MMAP_CACHE_SIZE
         };
 
+        let manifest_dirty = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
         let cache = Arc::new(Self {
             config: config.clone(),
             manifest: RwLock::new(manifest),
@@ -126,6 +130,7 @@ impl L2DiskCache {
             max_bytes,
             shutdown_flag: Arc::clone(&shutdown_flag),
             thread_handles: Mutex::new(Vec::new()),
+            manifest_dirty: Arc::clone(&manifest_dirty),
         });
 
         // Start background writer (uses Weak reference - doesn't prevent Drop)
@@ -138,14 +143,14 @@ impl L2DiskCache {
             handles.push(writer_handle);
         }
 
-        // Start manifest sync timer if interval > 0
-        if config.manifest_sync_interval_secs > 0 {
+        // Start manifest sync timer - checks every second, syncs if dirty
+        {
             let shutdown_flag_clone = Arc::clone(&shutdown_flag);
             let cache_weak = Arc::downgrade(&cache);
-            let interval_secs = config.manifest_sync_interval_secs;
+            let dirty_flag = Arc::clone(&manifest_dirty);
 
             let timer_handle = std::thread::spawn(move || {
-                Self::manifest_sync_timer_static(cache_weak, shutdown_flag_clone, interval_secs);
+                Self::manifest_sync_timer_static(cache_weak, shutdown_flag_clone, dirty_flag);
             });
 
             if let Ok(mut handles) = cache.thread_handles.lock() {
@@ -345,6 +350,17 @@ impl L2DiskCache {
     pub fn sync_manifest(&self) -> io::Result<()> {
         let _ = self.write_tx.send(WriteRequest::SyncManifest);
         Ok(())
+    }
+
+    /// Mark manifest as dirty (has uncommitted changes)
+    pub fn mark_dirty(&self) {
+        self.manifest_dirty.store(true, Ordering::Release);
+    }
+
+    /// Check if manifest is dirty and clear the flag atomically
+    /// Returns true if it was dirty
+    pub fn check_and_clear_dirty(&self) -> bool {
+        self.manifest_dirty.swap(false, Ordering::AcqRel)
     }
 
     /// Flush all pending writes to disk and wait for completion (async version).

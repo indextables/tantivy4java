@@ -268,6 +268,10 @@ public class PrewarmCacheValidationTest {
             long firstPrewarmBytes = afterFirstPrewarm.getTotalBytes();
             System.out.println("   ✓ First prewarm downloaded " + firstPrewarmDownloads + " chunks (" + firstPrewarmBytes + " bytes)");
 
+            // Wait for background disk cache writes and manifest sync (timer runs every 1 second)
+            System.out.println("   Waiting 2 seconds for async disk cache writes and manifest sync...");
+            Thread.sleep(2000);
+
             // STEP 2.5: Validate disk cache files exist
             System.out.println("\n[STEP 2.5] Validating disk cache files exist on disk...");
             validateDiskCacheFiles(diskCachePath, splitUri);
