@@ -219,6 +219,30 @@ impl L2DiskCache {
         )
     }
 
+    /// Check if data exists in the cache WITHOUT reading or copying it.
+    ///
+    /// This is a lightweight O(1) manifest lookup. Use this for existence checks
+    /// instead of `get().is_some()` which performs expensive file I/O.
+    ///
+    /// # Performance
+    /// - `exists()`: ~1μs (manifest lookup only)
+    /// - `get().is_some()`: ~50-100ms for large files (opens file, mmaps, copies entire contents)
+    pub fn exists(
+        &self,
+        storage_loc: &str,
+        split_id: &str,
+        component: &str,
+        byte_range: Option<Range<u64>>,
+    ) -> bool {
+        get_ops::exists(
+            &self.manifest,
+            storage_loc,
+            split_id,
+            component,
+            byte_range,
+        )
+    }
+
     /// Get a sub-range from a cached file using mmap (fast path for random access).
     pub fn get_subrange(
         &self,
