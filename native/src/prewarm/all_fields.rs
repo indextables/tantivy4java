@@ -367,17 +367,9 @@ pub async fn prewarm_store_impl(searcher_ptr: jlong) -> anyhow::Result<()> {
     // Success = already cached + newly downloaded
     let success_count = already_cached_count + downloaded_count;
 
-    // CRITICAL: Flush disk cache to ensure all async writes complete before returning.
-    // This prevents race conditions where subsequent cache lookups miss data that's
-    // still being written by the background writer thread.
-    if downloaded_count > 0 {
-        debug_println!(
-            "🔄 PREWARM_STORE_FLUSH: Flushing disk cache to ensure {} downloads are persisted",
-            downloaded_count
-        );
-        disk_cache.flush_async().await;
-        debug_println!("✅ PREWARM_STORE_FLUSH: Disk cache flush complete");
-    }
+    // NOTE: We no longer flush here - the background timer syncs every 1 second when dirty.
+    // This allows parallel prewarms to run without serializing on flush.
+    // The manifest_dirty flag is set by the background writer after each successful write.
 
     debug_println!(
         "✅ PREWARM_STORE: Completed - {} already cached, {} downloaded, {} failures",
