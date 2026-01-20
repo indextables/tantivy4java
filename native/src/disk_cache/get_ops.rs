@@ -21,6 +21,37 @@ use super::path_helpers::component_path;
 use super::range_index::{CachedRange, CachedSegment, CoalesceResult};
 use super::types::{CompressionAlgorithm, DiskCacheConfig};
 
+/// Check if data exists in the cache WITHOUT reading or copying it.
+///
+/// This is a lightweight operation that only checks the manifest.
+/// Use this for existence checks instead of `get().is_some()` to avoid
+/// expensive file I/O and memory copies.
+///
+/// Performance: O(1) manifest lookup vs O(n) file read for `get()`
+pub fn exists(
+    manifest: &RwLock<CacheManifest>,
+    storage_loc: &str,
+    split_id: &str,
+    component: &str,
+    byte_range: Option<Range<u64>>,
+) -> bool {
+    let split_key = CacheManifest::split_key(storage_loc, split_id);
+    let comp_key = CacheManifest::component_key(component, byte_range);
+
+    // Only check manifest - no file I/O
+    let manifest = match manifest.read() {
+        Ok(m) => m,
+        Err(_) => return false,
+    };
+
+    let split = match manifest.splits.get(&split_key) {
+        Some(s) => s,
+        None => return false,
+    };
+
+    split.components.contains_key(&comp_key)
+}
+
 /// Get cached data (synchronous read from disk)
 ///
 /// For uncompressed files, uses memory-mapped I/O for fast random access.

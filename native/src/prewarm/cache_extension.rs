@@ -132,15 +132,15 @@ pub(crate) async fn cache_files_by_extension(
 
         // Check if data is already in L2 disk cache - skip download if so
         // Uses the same key format as StorageWithPersistentCache
-        if disk_cache
-            .get(
-                &storage_loc,
-                &split_id,
-                &storage_component,
-                Some(cache_range.clone()),
-            )
-            .is_some()
-        {
+        // IMPORTANT: Use exists() instead of get().is_some() to avoid expensive file I/O!
+        // get() copies the entire file contents just to check if it exists, while
+        // exists() only checks the manifest (O(1) vs O(file_size))
+        if disk_cache.exists(
+            &storage_loc,
+            &split_id,
+            &storage_component,
+            Some(cache_range.clone()),
+        ) {
             debug_println!(
                 "⏭️ PREWARM_DISK: Skipping '{}' ({} bytes) - already in disk cache (range {:?})",
                 inner_path.display(),

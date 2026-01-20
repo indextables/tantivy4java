@@ -295,9 +295,15 @@ pub async fn prewarm_store_impl(searcher_ptr: jlong) -> anyhow::Result<()> {
         let cache_range = bundle_range.start..bundle_range.end;
 
         // Check if data is already cached in L2 disk cache - skip download if so
-        let already_cached = disk_cache
-            .get(&storage_loc, &split_id, &component, Some(cache_range.clone()))
-            .is_some();
+        // IMPORTANT: Use exists() instead of get().is_some() to avoid expensive file I/O!
+        // get() copies the entire file contents just to check existence, while
+        // exists() only checks the manifest (O(1) vs O(file_size))
+        let already_cached = disk_cache.exists(
+            &storage_loc,
+            &split_id,
+            &component,
+            Some(cache_range.clone()),
+        );
 
         if already_cached {
             debug_println!(
