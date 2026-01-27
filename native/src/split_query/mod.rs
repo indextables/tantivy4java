@@ -169,7 +169,7 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitRangeQuery_to
 
 /// Parse a query string into a SplitQuery using Quickwit's query parser
 #[no_mangle]
-pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitQuery_parseQuery(
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitQuery_nativeParseQuery(
     mut env: JNIEnv,
     _class: JClass,
     query_string: JString,

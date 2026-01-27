@@ -31,18 +31,23 @@ public abstract class SplitQuery {
     /**
      * Parse a query string into a SplitQuery using Quickwit's query parser.
      * This leverages Quickwit's proven query parsing logic.
-     * 
+     *
      * @param queryString The query string to parse (e.g., "title:hello", "age:[1 TO 100]")
      * @param schema The schema to validate field names against
      * @param defaultSearchFields Default fields to search if no field is specified
      * @return A SplitQuery that can be used with SplitSearcher
      */
-    public static native SplitQuery parseQuery(String queryString, Schema schema, String[] defaultSearchFields);
-    
+    public static SplitQuery parseQuery(String queryString, Schema schema, String[] defaultSearchFields) {
+        return nativeParseQuery(queryString, schema.getNativePtr(), defaultSearchFields);
+    }
+
     /**
      * Parse a query string with default search fields from schema.
      */
     public static SplitQuery parseQuery(String queryString, Schema schema) {
         return parseQuery(queryString, schema, new String[0]);
     }
+
+    // Native method that takes the schema pointer directly
+    private static native SplitQuery nativeParseQuery(String queryString, long schemaPtr, String[] defaultSearchFields);
 }

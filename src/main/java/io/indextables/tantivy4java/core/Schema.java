@@ -39,6 +39,56 @@ public class Schema implements AutoCloseable {
     }
 
     /**
+     * Creates a Schema from a JSON doc mapping string.
+     *
+     * The JSON should be an array of field mappings with the following structure:
+     * <pre>
+     * [
+     *   {"name": "title", "type": "text", "stored": true, "indexed": true, "tokenizer": "default"},
+     *   {"name": "count", "type": "i64", "stored": true, "indexed": true, "fast": true},
+     *   {"name": "price", "type": "f64", "stored": true, "fast": true},
+     *   {"name": "active", "type": "bool", "stored": true, "indexed": true},
+     *   {"name": "data", "type": "object", "stored": true, "indexed": true, "expand_dots": true}
+     * ]
+     * </pre>
+     *
+     * Supported field types:
+     * <ul>
+     *   <li><b>text</b> - Text fields with tokenization</li>
+     *   <li><b>i64</b> - 64-bit signed integers</li>
+     *   <li><b>f64</b> - 64-bit floating point numbers</li>
+     *   <li><b>bool</b> - Boolean values</li>
+     *   <li><b>object</b> - JSON objects</li>
+     * </ul>
+     *
+     * Field options:
+     * <ul>
+     *   <li><b>name</b> (required) - Field name</li>
+     *   <li><b>type</b> (required) - Field type (text, i64, f64, bool, object)</li>
+     *   <li><b>stored</b> (optional, default: false) - Whether the field value is stored</li>
+     *   <li><b>indexed</b> (optional, default: false) - Whether the field is indexed for search</li>
+     *   <li><b>fast</b> (optional, default: false) - Whether the field has fast field access</li>
+     *   <li><b>tokenizer</b> (optional, default: "default") - Tokenizer for text fields</li>
+     *   <li><b>fast_tokenizer</b> (optional) - Tokenizer for fast fields (object type only)</li>
+     *   <li><b>expand_dots</b> (optional, default: false) - Expand dots in JSON paths (object type only)</li>
+     * </ul>
+     *
+     * @param json The JSON doc mapping string
+     * @return A new Schema instance
+     * @throws IllegalArgumentException if the JSON is invalid or cannot be parsed
+     */
+    public static Schema fromDocMappingJson(String json) {
+        if (json == null || json.isEmpty()) {
+            throw new IllegalArgumentException("JSON doc mapping cannot be null or empty");
+        }
+        long ptr = nativeFromDocMappingJson(json);
+        if (ptr == 0) {
+            throw new IllegalArgumentException("Failed to create schema from JSON doc mapping");
+        }
+        return new Schema(ptr);
+    }
+
+    /**
      * Get the native pointer for JNI operations.
      * @return Native pointer
      */
@@ -195,6 +245,7 @@ public class Schema implements AutoCloseable {
     }
 
     // Native method declarations
+    private static native long nativeFromDocMappingJson(String json);
     private static native void nativeClose(long nativePtr);
     private static native List<String> nativeGetFieldNames(long nativePtr);
     private static native FieldInfo nativeGetFieldInfo(long nativePtr, String fieldName);
