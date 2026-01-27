@@ -9,7 +9,52 @@ use jni::JNIEnv;
 use tantivy::schema::FieldType as TantivyFieldType;
 use crate::utils::{handle_error, with_arc_safe, arc_to_jlong, release_arc};
 use crate::debug_println;
+use crate::split_searcher::schema_creation::create_schema_from_doc_mapping;
 use std::sync::Arc;
+
+/// Create a Schema from a JSON doc mapping string.
+///
+/// The JSON should be an array of field mappings with the following structure:
+/// ```json
+/// [
+///   {"name": "title", "type": "text", "stored": true, "indexed": true, "tokenizer": "default"},
+///   {"name": "count", "type": "i64", "stored": true, "indexed": true, "fast": true},
+///   {"name": "price", "type": "f64", "stored": true, "fast": true},
+///   {"name": "active", "type": "bool", "stored": true, "indexed": true},
+///   {"name": "data", "type": "object", "stored": true, "indexed": true}
+/// ]
+/// ```
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_core_Schema_nativeFromDocMappingJson(
+    mut env: JNIEnv,
+    _class: JClass,
+    json: JString,
+) -> jlong {
+    // Extract the JSON string
+    let json_str: String = match env.get_string(&json) {
+        Ok(s) => s.into(),
+        Err(e) => {
+            handle_error(&mut env, &format!("Invalid JSON string: {}", e));
+            return 0;
+        }
+    };
+
+    debug_println!("RUST DEBUG: nativeFromDocMappingJson called with JSON: {}", json_str);
+
+    // Parse the JSON and create the schema
+    match create_schema_from_doc_mapping(&json_str) {
+        Ok(schema) => {
+            debug_println!("RUST DEBUG: Successfully created schema with {} fields", schema.num_fields());
+            // Wrap in Arc and register
+            let schema_arc = Arc::new(schema);
+            arc_to_jlong(schema_arc)
+        }
+        Err(e) => {
+            handle_error(&mut env, &format!("Failed to create schema from JSON: {}", e));
+            0
+        }
+    }
+}
 
 #[no_mangle]
 pub extern "system" fn Java_io_indextables_tantivy4java_core_Schema_nativeClose(
