@@ -327,3 +327,117 @@ pub fn extract_fields_from_schema(schema: &tantivy::schema::Schema) -> Result<Ve
     );
     Ok(text_fields)
 }
+
+/// Extract all unique field names from a QueryAst
+pub fn extract_fields_from_query_ast(query_ast: &QueryAst) -> std::collections::HashSet<String> {
+    let mut fields = std::collections::HashSet::new();
+    collect_fields_recursive(query_ast, &mut fields);
+    fields
+}
+
+/// Recursively collect field names from QueryAst
+fn collect_fields_recursive(query_ast: &QueryAst, fields: &mut std::collections::HashSet<String>) {
+    match query_ast {
+        QueryAst::Term(term_query) => {
+            fields.insert(term_query.field.clone());
+        }
+        QueryAst::TermSet(term_set_query) => {
+            // TermSetQuery has terms_per_field: HashMap<String, BTreeSet<String>>
+            for field_name in term_set_query.terms_per_field.keys() {
+                fields.insert(field_name.clone());
+            }
+        }
+        QueryAst::FullText(full_text_query) => {
+            fields.insert(full_text_query.field.clone());
+        }
+        QueryAst::PhrasePrefix(phrase_prefix_query) => {
+            fields.insert(phrase_prefix_query.field.clone());
+        }
+        QueryAst::Range(range_query) => {
+            fields.insert(range_query.field.clone());
+        }
+        QueryAst::FieldPresence(field_presence_query) => {
+            fields.insert(field_presence_query.field.clone());
+        }
+        QueryAst::Wildcard(wildcard_query) => {
+            fields.insert(wildcard_query.field.clone());
+        }
+        QueryAst::Regex(regex_query) => {
+            fields.insert(regex_query.field.clone());
+        }
+        QueryAst::Bool(bool_query) => {
+            for sub_query in bool_query.must.iter()
+                .chain(bool_query.should.iter())
+                .chain(bool_query.must_not.iter())
+                .chain(bool_query.filter.iter())
+            {
+                collect_fields_recursive(sub_query, fields);
+            }
+        }
+        QueryAst::Boost { underlying, .. } => {
+            collect_fields_recursive(underlying, fields);
+        }
+        QueryAst::UserInput(_) => {
+            // UserInput queries contain unparsed text, fields are not known until parsed
+        }
+        QueryAst::MatchAll | QueryAst::MatchNone => {
+            // No fields for match_all/match_none
+        }
+    }
+}
+
+/// Count the number of unique fields in a parsed query
+pub fn count_query_fields(
+    env: &mut JNIEnv,
+    query_string: JString,
+    schema_ptr: jni::sys::jlong,
+    default_search_fields: jobject,
+) -> Result<usize> {
+    debug_println!("RUST DEBUG: count_query_fields called");
+
+    // Get the query string
+    let query_str: String = env.get_string(&query_string)?.into();
+
+    debug_println!(
+        "RUST DEBUG: Counting fields for query: '{}' with schema_ptr: {}",
+        query_str,
+        schema_ptr
+    );
+
+    // Extract default search fields from JNI
+    let mut default_fields_vec = extract_default_search_fields(env, default_search_fields)?;
+
+    // If default fields is empty, extract ALL indexed text fields from schema
+    if default_fields_vec.is_empty() {
+        default_fields_vec = extract_text_fields_from_schema(env, schema_ptr)?;
+    }
+
+    // Parse the query using Quickwit's parser
+    let default_fields_option = if default_fields_vec.is_empty() {
+        None
+    } else {
+        Some(default_fields_vec.clone())
+    };
+
+    let query_ast = query_ast_from_user_text(&query_str, default_fields_option.clone());
+
+    let parse_fields = match &default_fields_option {
+        Some(fields) => fields,
+        None => &Vec::new(),
+    };
+
+    let parsed_ast = query_ast.parse_user_query(parse_fields)
+        .map_err(|e| anyhow!("Failed to parse query '{}': {}", query_str, e))?;
+
+    // Extract unique fields from the parsed query
+    let fields = extract_fields_from_query_ast(&parsed_ast);
+
+    debug_println!(
+        "RUST DEBUG: Query '{}' impacts {} fields: {:?}",
+        query_str,
+        fields.len(),
+        fields
+    );
+
+    Ok(fields.len())
+}

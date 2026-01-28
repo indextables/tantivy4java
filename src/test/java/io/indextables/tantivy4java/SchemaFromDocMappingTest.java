@@ -138,6 +138,83 @@ public class SchemaFromDocMappingTest {
     }
 
     @Test
+    @DisplayName("SplitQuery.parseQuery - error handling for invalid queries")
+    public void testParseQueryErrorHandling() {
+        System.out.println("=== Testing SplitQuery.parseQuery() error handling ===");
+
+        String json = "[\n" +
+            "  {\"name\": \"title\", \"type\": \"text\", \"stored\": true, \"indexed\": true, \"tokenizer\": \"default\"},\n" +
+            "  {\"name\": \"count\", \"type\": \"i64\", \"stored\": true, \"indexed\": true, \"fast\": true}\n" +
+            "]";
+
+        try (Schema schema = Schema.fromDocMappingJson(json)) {
+            // Test malformed query syntax - unclosed parenthesis
+            RuntimeException ex1 = assertThrows(RuntimeException.class, () -> {
+                SplitQuery.parseQuery("title:(unclosed", schema);
+            }, "Should throw for unclosed parenthesis");
+            System.out.println("Error for unclosed parenthesis: " + ex1.getMessage());
+            assertNotNull(ex1.getMessage(), "Exception should have a message");
+            assertTrue(ex1.getMessage().length() > 10, "Error message should be descriptive");
+
+            // Test malformed range query - unclosed bracket
+            RuntimeException ex2 = assertThrows(RuntimeException.class, () -> {
+                SplitQuery.parseQuery("count:[10 TO", schema);
+            }, "Should throw for malformed range query");
+            System.out.println("Error for malformed range: " + ex2.getMessage());
+            assertNotNull(ex2.getMessage(), "Exception should have a message");
+
+            System.out.println("Parse query error handling tests passed!");
+        }
+    }
+
+    @Test
+    @DisplayName("SplitQuery.countQueryFields - count fields impacted by query")
+    public void testCountQueryFields() {
+        System.out.println("=== Testing SplitQuery.countQueryFields() ===");
+
+        String json = "[\n" +
+            "  {\"name\": \"title\", \"type\": \"text\", \"stored\": true, \"indexed\": true, \"tokenizer\": \"default\"},\n" +
+            "  {\"name\": \"body\", \"type\": \"text\", \"stored\": true, \"indexed\": true},\n" +
+            "  {\"name\": \"author\", \"type\": \"text\", \"stored\": true, \"indexed\": true},\n" +
+            "  {\"name\": \"year\", \"type\": \"i64\", \"stored\": true, \"indexed\": true, \"fast\": true}\n" +
+            "]";
+
+        try (Schema schema = Schema.fromDocMappingJson(json)) {
+            // Single field query
+            int count1 = SplitQuery.countQueryFields("title:hello", schema);
+            assertEquals(1, count1, "Single field query should impact 1 field");
+            System.out.println("Query 'title:hello' impacts " + count1 + " field(s)");
+
+            // Two field query with AND
+            int count2 = SplitQuery.countQueryFields("title:hello AND body:world", schema);
+            assertEquals(2, count2, "Two field AND query should impact 2 fields");
+            System.out.println("Query 'title:hello AND body:world' impacts " + count2 + " field(s)");
+
+            // Query with same field twice should count as 1
+            int count3 = SplitQuery.countQueryFields("title:hello AND title:world", schema);
+            assertEquals(1, count3, "Same field twice should still count as 1");
+            System.out.println("Query 'title:hello AND title:world' impacts " + count3 + " field(s)");
+
+            // Range query on numeric field
+            int count4 = SplitQuery.countQueryFields("year:[2020 TO 2024]", schema);
+            assertEquals(1, count4, "Range query should impact 1 field");
+            System.out.println("Query 'year:[2020 TO 2024]' impacts " + count4 + " field(s)");
+
+            // Mixed text and numeric fields
+            int count5 = SplitQuery.countQueryFields("title:test AND year:[2020 TO 2024]", schema);
+            assertEquals(2, count5, "Mixed query should impact 2 fields");
+            System.out.println("Query 'title:test AND year:[2020 TO 2024]' impacts " + count5 + " field(s)");
+
+            // Query without field specification uses default fields (all text fields)
+            int count6 = SplitQuery.countQueryFields("searchterm", schema);
+            System.out.println("Query 'searchterm' (no field) impacts " + count6 + " field(s)");
+            assertTrue(count6 >= 1, "Unfielded query should impact at least 1 default field");
+
+            System.out.println("countQueryFields tests passed!");
+        }
+    }
+
+    @Test
     @DisplayName("Schema from JSON - field introspection")
     public void testFieldIntrospection() {
         System.out.println("=== Testing field introspection on schema from JSON ===");
