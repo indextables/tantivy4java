@@ -7,8 +7,9 @@ pub mod schema_cache;
 
 // Re-exports from submodules
 pub use parse_query::{
-    create_split_parsed_query, create_split_query_from_ast, extract_default_search_fields,
-    extract_fields_from_schema, extract_text_fields_from_schema, parse_query_string,
+    count_query_fields, create_split_parsed_query, create_split_query_from_ast,
+    extract_default_search_fields, extract_fields_from_query_ast, extract_fields_from_schema,
+    extract_text_fields_from_schema, parse_query_string,
 };
 pub use query_converters::{
     convert_boolean_query_to_ast, convert_boolean_query_to_query_ast,
@@ -167,6 +168,32 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitRangeQuery_to
     }
 }
 
+/// Count the number of unique fields impacted by a query
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitQuery_nativeCountQueryFields(
+    mut env: JNIEnv,
+    _class: JClass,
+    query_string: JString,
+    schema_ptr: jlong,
+    default_search_fields: jobject,
+) -> jni::sys::jint {
+    debug_println!("🚀 ENTRY: nativeCountQueryFields called");
+
+    let result = count_query_fields(&mut env, query_string, schema_ptr, default_search_fields);
+
+    match result {
+        Ok(count) => {
+            debug_println!("🚀 SUCCESS: Query impacts {} fields", count);
+            count as jni::sys::jint
+        }
+        Err(e) => {
+            debug_println!("🚀 ERROR: Error counting query fields: {}", e);
+            crate::common::to_java_exception(&mut env, &e);
+            -1
+        }
+    }
+}
+
 /// Parse a query string into a SplitQuery using Quickwit's query parser
 #[no_mangle]
 pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitQuery_nativeParseQuery(
@@ -192,7 +219,8 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitQuery_nativeP
         }
         Err(e) => {
             debug_println!("🚀 ERROR: Error parsing query string: {}", e);
-            // Return null on error
+            // Throw exception with the error message so user knows what went wrong
+            crate::common::to_java_exception(&mut env, &e);
             std::ptr::null_mut()
         }
     }
