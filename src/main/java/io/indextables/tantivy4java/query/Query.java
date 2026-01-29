@@ -370,7 +370,9 @@ public class Query implements AutoCloseable {
      *
      * <p>Checks whether a specific JSON path exists in documents, regardless
      * of its value. Useful for filtering documents that have a particular
-     * nested field.
+     * nested field. By default, also matches if any subpath exists.
+     *
+     * <p>The JSON field MUST be configured as a FAST field (use JsonObjectOptions.full()).
      *
      * <p>Example:
      * <pre>
@@ -381,9 +383,70 @@ public class Query implements AutoCloseable {
      * @param fieldName JSON field name
      * @param jsonPath JSONPath to check for existence
      * @return New Query instance
+     * @throws RuntimeException if the field is not a fast field
      */
     public static Query jsonExistsQuery(Schema schema, String fieldName, String jsonPath) {
         long ptr = nativeJsonExistsQuery(schema.getNativePtr(), fieldName, jsonPath);
+        return new Query(ptr);
+    }
+
+    /**
+     * Create a JSON exists query with control over subpath matching.
+     *
+     * <p>When checkSubpaths is true, the query matches documents where any subpath
+     * under the specified path exists. When false, only exact path matches count.
+     *
+     * <p>The JSON field MUST be configured as a FAST field (use JsonObjectOptions.full()).
+     *
+     * <p>Example:
+     * <pre>
+     * // Match if user.email exists exactly
+     * Query exact = Query.jsonExistsQuery(schema, "attributes", "user.email", false);
+     *
+     * // Match if user or any user.* subfield exists
+     * Query withSubpaths = Query.jsonExistsQuery(schema, "attributes", "user", true);
+     * </pre>
+     *
+     * @param schema Schema for field validation
+     * @param fieldName JSON field name
+     * @param jsonPath JSONPath to check for existence
+     * @param checkSubpaths If true, also match if any subpath exists
+     * @return New Query instance
+     * @throws RuntimeException if the field is not a fast field
+     */
+    public static Query jsonExistsQuery(Schema schema, String fieldName, String jsonPath, boolean checkSubpaths) {
+        long ptr = nativeJsonExistsQueryWithSubpaths(schema.getNativePtr(), fieldName, jsonPath, checkSubpaths);
+        return new Query(ptr);
+    }
+
+    /**
+     * Create an exists query to check if a field has any non-null value.
+     *
+     * <p>Matches documents where the specified field contains at least one indexed value.
+     * This is equivalent to an IS NOT NULL check in SQL.
+     *
+     * <p>IMPORTANT: The field MUST be configured as a FAST field in the schema.
+     * For text fields, use FAST flag. For JSON fields, use JsonObjectOptions.full().
+     *
+     * <p>Example:
+     * <pre>
+     * // IS NOT NULL check
+     * Query exists = Query.existsQuery(schema, "email");
+     *
+     * // IS NULL check (using boolean negation)
+     * Query isNull = Query.booleanQuery(Arrays.asList(
+     *     new Query.OccurQuery(Occur.MUST, Query.allQuery()),
+     *     new Query.OccurQuery(Occur.MUST_NOT, Query.existsQuery(schema, "email"))
+     * ));
+     * </pre>
+     *
+     * @param schema Schema for field validation
+     * @param fieldName Field name to check for existence
+     * @return New Query instance matching documents where field exists
+     * @throws RuntimeException if the field is not a fast field
+     */
+    public static Query existsQuery(Schema schema, String fieldName) {
+        long ptr = nativeExistsQuery(schema.getNativePtr(), fieldName);
         return new Query(ptr);
     }
 
@@ -463,6 +526,8 @@ public class Query implements AutoCloseable {
     private static native long nativeJsonTermQuery(long schemaPtr, String fieldName, String jsonPath, Object termValue);
     private static native long nativeJsonRangeQuery(long schemaPtr, String fieldName, String jsonPath, Object lowerBound, Object upperBound, boolean includeLower, boolean includeUpper);
     private static native long nativeJsonExistsQuery(long schemaPtr, String fieldName, String jsonPath);
+    private static native long nativeJsonExistsQueryWithSubpaths(long schemaPtr, String fieldName, String jsonPath, boolean checkSubpaths);
+    private static native long nativeExistsQuery(long schemaPtr, String fieldName);
     private static native long nativeExplain(long queryPtr, long searcherPtr, long docAddressPtr);
     private static native String nativeToString(long queryPtr);
     private static native void nativeClose(long ptr);
