@@ -820,16 +820,40 @@ public class SplitSearcher implements AutoCloseable {
     }
 
     /**
-     * Get per-field component sizes.
+     * Get per-field component sizes for all fields in the index.
      *
-     * Returns a map with keys like "field_name.component" and values as sizes in bytes.
-     * Components include:
-     * - "fastfield" - fast field column size for numeric/date fields
-     * - "fieldnorm" - field norm size for text fields
+     * <p>Returns a map with keys like "field_name.component" and values as sizes in bytes.
+     * Uses a hybrid approach combining bundle file offsets with async reader APIs.</p>
      *
-     * Example: {"score.fastfield": 133, "content.fieldnorm": 50, "title.fieldnorm": 48}
+     * <p>Per-field components (precise per-field sizes):</p>
+     * <ul>
+     *   <li>"fastfield" - fast field column size (for sorting/filtering)</li>
+     *   <li>"fieldnorm" - field norm size (for scoring)</li>
+     * </ul>
      *
-     * @return Map of "field_name.component" to size in bytes
+     * <p>Segment-level totals (aggregated across all fields):</p>
+     * <ul>
+     *   <li>"_term_total" - total term dictionary (FST) size</li>
+     *   <li>"_postings_total" - total posting lists size</li>
+     *   <li>"_positions_total" - total term positions size</li>
+     *   <li>"_store" - total document store size</li>
+     * </ul>
+     *
+     * <p>Example output:</p>
+     * <pre>{@code
+     * {
+     *   "score.fastfield": 256,
+     *   "id.fastfield": 128,
+     *   "content.fieldnorm": 512,
+     *   "title.fieldnorm": 256,
+     *   "_term_total": 2048,
+     *   "_postings_total": 4096,
+     *   "_positions_total": 1024,
+     *   "_store": 8192
+     * }
+     * }</pre>
+     *
+     * @return Map of "field_name.component" or "_component_total" to size in bytes
      */
     public Map<String, Long> getPerFieldComponentSizes() {
         Map<String, Long> result = getPerFieldComponentSizesNative(nativePtr);
