@@ -6,7 +6,7 @@ use std::ops::Bound;
 use anyhow::{anyhow, Result};
 use jni::objects::{JObject, JString, JValue};
 use jni::JNIEnv;
-use quickwit_query::query_ast::QueryAst;
+use quickwit_query::query_ast::{QueryAst, FieldPresenceQuery};
 use quickwit_query::JsonLiteral;
 
 use crate::debug_println;
@@ -368,6 +368,10 @@ pub fn convert_split_query_to_ast(env: &mut JNIEnv, query_obj: &JObject) -> Resu
             // Create QueryAst directly using native Quickwit structures
             convert_phrase_query_to_query_ast(env, query_obj)
         }
+        "io.indextables.tantivy4java.split.SplitExistsQuery" => {
+            // Create QueryAst using FieldPresenceQuery for exists checks
+            convert_exists_query_to_query_ast(env, query_obj)
+        }
         _ => Err(anyhow!("Unsupported SplitQuery type: {}", class_name)),
     }
 }
@@ -497,4 +501,32 @@ pub fn convert_json_literal_to_value(literal: JsonLiteral) -> serde_json::Value 
         JsonLiteral::Number(n) => serde_json::Value::Number(n),
         JsonLiteral::Bool(b) => serde_json::Value::Bool(b),
     }
+}
+
+// Wrapper function for JNI layer - converts to JSON string
+pub fn convert_exists_query_to_ast(env: &mut JNIEnv, obj: &JObject) -> Result<String> {
+    let query_ast = convert_exists_query_to_query_ast(env, obj)?;
+    convert_query_ast_to_json_string(query_ast)
+}
+
+pub fn convert_exists_query_to_query_ast(env: &mut JNIEnv, obj: &JObject) -> Result<QueryAst> {
+    // Extract field from Java SplitExistsQuery object
+    let field_obj = env
+        .get_field(obj, "field", "Ljava/lang/String;")
+        .map_err(|e| anyhow!("Failed to get field: {}", e))?;
+
+    let field_jstring: JString = field_obj.l()?.into();
+    let field: String = env.get_string(&field_jstring)?.into();
+
+    debug_println!(
+        "RUST DEBUG: SplitExistsQuery - field: '{}'",
+        field
+    );
+
+    // Create proper Quickwit QueryAst using FieldPresenceQuery
+    let field_presence_query = FieldPresenceQuery { field };
+    let query_ast = QueryAst::FieldPresence(field_presence_query);
+
+    debug_println!("RUST DEBUG: Created FieldPresenceQuery QueryAst using native Quickwit structures");
+    Ok(query_ast)
 }

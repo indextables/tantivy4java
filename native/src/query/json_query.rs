@@ -5,7 +5,7 @@
 use jni::objects::{JClass, JString, JObject};
 use jni::sys::{jlong, jboolean, jobject};
 use jni::JNIEnv;
-use tantivy::query::{Query as TantivyQuery, TermQuery, AllQuery, RangeQuery};
+use tantivy::query::{Query as TantivyQuery, TermQuery, RangeQuery, ExistsQuery};
 use tantivy::schema::{Schema, Term, IndexRecordOption};
 use std::ops::Bound;
 use std::sync::Arc;
@@ -231,6 +231,18 @@ pub extern "system" fn Java_io_indextables_tantivy4java_query_Query_nativeJsonRa
     }
 }
 
+/// Creates a JSON ExistsQuery to check if a JSON path has any non-null value.
+/// Uses json_subpaths=true by default to match any subpath under the specified path.
+///
+/// The JSON field MUST be configured as a FAST field in the schema.
+///
+/// # Arguments
+/// * `schema_ptr` - Pointer to the Schema object
+/// * `field_name` - Name of the JSON field
+/// * `json_path` - JSON path within the field (e.g., "user.name")
+///
+/// # Returns
+/// * Pointer to the created Query object, or 0 on error
 #[no_mangle]
 pub extern "system" fn Java_io_indextables_tantivy4java_query_Query_nativeJsonExistsQuery(
     mut env: JNIEnv,
@@ -271,15 +283,115 @@ pub extern "system" fn Java_io_indextables_tantivy4java_query_Query_nativeJsonEx
             _ => return Err(format!("Field '{}' is not a JSON field", field_name_str)),
         }
 
-        // Create exists query - this checks if the JSON path exists
-        // We use a wildcard/all query on the specific JSON path
-        // The full path format is: field_name.json_path
-        let _full_path = format!("{}.{}", field_name_str, json_path_str);
+        // Verify field is fast (required by ExistsQuery)
+        if !field_type.is_fast() {
+            return Err(format!(
+                "JSON field '{}' is not a fast field. ExistsQuery requires fast fields. \
+                Use JsonObjectOptions.full() or add FAST flag when creating the field.",
+                field_name_str
+            ));
+        }
 
-        // For exists query, we can use AllQuery as a placeholder
-        // In a full implementation, this would be a proper JSON exists query
-        // For now, return AllQuery to allow compilation
-        let query = AllQuery;
+        // Build full path: field_name.json_path (or just field_name if path is empty)
+        let full_path = if json_path_str.is_empty() {
+            field_name_str.clone()
+        } else {
+            format!("{}.{}", field_name_str, json_path_str)
+        };
+
+        // Create ExistsQuery with json_subpaths=true to match subpaths
+        let query = ExistsQuery::new(full_path, true);
+        Ok(Box::new(query) as Box<dyn TantivyQuery>)
+    });
+
+    match result {
+        Some(Ok(query)) => {
+            let query_arc = Arc::new(query);
+            arc_to_jlong(query_arc)
+        },
+        Some(Err(err)) => {
+            handle_error(&mut env, &err);
+            0
+        },
+        None => {
+            handle_error(&mut env, "Invalid schema pointer");
+            0
+        }
+    }
+}
+
+/// Creates a JSON ExistsQuery with control over subpath matching behavior.
+///
+/// When check_subpaths is true, the query will match if ANY subpath under the
+/// specified path exists. When false, only exact path matches are considered.
+///
+/// # Arguments
+/// * `schema_ptr` - Pointer to the Schema object
+/// * `field_name` - Name of the JSON field
+/// * `json_path` - JSON path within the field (e.g., "user.name")
+/// * `check_subpaths` - If true, matches if any subpath exists
+///
+/// # Returns
+/// * Pointer to the created Query object, or 0 on error
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_query_Query_nativeJsonExistsQueryWithSubpaths(
+    mut env: JNIEnv,
+    _class: JClass,
+    schema_ptr: jlong,
+    field_name: JString,
+    json_path: JString,
+    check_subpaths: jboolean,
+) -> jlong {
+    let field_name_str: String = match env.get_string(&field_name) {
+        Ok(s) => s.into(),
+        Err(_) => {
+            handle_error(&mut env, "Invalid field name");
+            return 0;
+        }
+    };
+
+    let json_path_str: String = match env.get_string(&json_path) {
+        Ok(s) => s.into(),
+        Err(_) => {
+            handle_error(&mut env, "Invalid JSON path");
+            return 0;
+        }
+    };
+
+    let result = with_arc_safe::<Schema, Result<Box<dyn TantivyQuery>, String>>(schema_ptr, |schema_arc| {
+        let schema = schema_arc.as_ref();
+
+        // Get field by name
+        let field = match schema.get_field(&field_name_str) {
+            Ok(f) => f,
+            Err(_) => return Err(format!("Field '{}' not found in schema", field_name_str)),
+        };
+
+        // Validate field is JSON type
+        let field_type = schema.get_field_entry(field).field_type();
+        match field_type {
+            tantivy::schema::FieldType::JsonObject(_) => {},
+            _ => return Err(format!("Field '{}' is not a JSON field", field_name_str)),
+        }
+
+        // Verify field is fast (required by ExistsQuery)
+        if !field_type.is_fast() {
+            return Err(format!(
+                "JSON field '{}' is not a fast field. ExistsQuery requires fast fields. \
+                Use JsonObjectOptions.full() or add FAST flag when creating the field.",
+                field_name_str
+            ));
+        }
+
+        // Build full path: field_name.json_path (or just field_name if path is empty)
+        let full_path = if json_path_str.is_empty() {
+            field_name_str.clone()
+        } else {
+            format!("{}.{}", field_name_str, json_path_str)
+        };
+
+        // Create ExistsQuery with the specified subpaths behavior
+        let query = ExistsQuery::new(full_path, check_subpaths != 0);
         Ok(Box::new(query) as Box<dyn TantivyQuery>)
     });
 

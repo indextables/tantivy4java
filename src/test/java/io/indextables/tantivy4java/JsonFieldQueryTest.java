@@ -143,9 +143,9 @@ public class JsonFieldQueryTest {
 
     @Test
     public void testJsonExistsQuery() {
-        // Create schema with JSON field
+        // Create schema with JSON field - MUST use full() for ExistsQuery (requires FAST)
         try (SchemaBuilder builder = new SchemaBuilder()) {
-            Field jsonField = builder.addJsonField("data", JsonObjectOptions.storedAndIndexed());
+            Field jsonField = builder.addJsonField("data", JsonObjectOptions.full());
 
             try (Schema schema = builder.build()) {
                 // Create RAM index
@@ -180,10 +180,9 @@ public class JsonFieldQueryTest {
 
                         SearchResult result = searcher.search(query, 10);
 
-                        // Verify query executes (simplified implementation returns AllQuery)
+                        // ExistsQuery now properly filters - only doc1 has email field
                         assertNotNull(result, "Search result should not be null");
-                        // Note: In simplified implementation, this returns all documents
-                        assertTrue(result.getHits().size() > 0, "Should return results");
+                        assertEquals(1, result.getHits().size(), "Only Alice's document has email field");
                     }
                 }
             }

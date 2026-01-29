@@ -13,6 +13,7 @@ pub use parse_query::{
 };
 pub use query_converters::{
     convert_boolean_query_to_ast, convert_boolean_query_to_query_ast,
+    convert_exists_query_to_ast, convert_exists_query_to_query_ast,
     convert_json_literal_to_value, convert_phrase_query_to_ast, convert_phrase_query_to_query_ast,
     convert_query_ast_to_json_string, convert_query_list, convert_range_query_to_ast,
     convert_range_query_to_query_ast, convert_split_query_to_ast, convert_split_query_to_json,
@@ -251,6 +252,39 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitPhraseQuery_t
         Err(e) => {
             debug_println!(
                 "RUST DEBUG: Error converting SplitPhraseQuery to QueryAst: {}",
+                e
+            );
+            crate::common::to_java_exception(&mut env, &e);
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Convert a SplitExistsQuery to QueryAst JSON (FOR TESTING ONLY - Production should use SplitSearcher.search() directly)
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitExistsQuery_toQueryAstJson(
+    mut env: JNIEnv,
+    obj: JObject,
+) -> jstring {
+    let result = convert_exists_query_to_ast(&mut env, &obj);
+    match result {
+        Ok(json) => match env.new_string(json) {
+            Ok(jstring) => jstring.into_raw(),
+            Err(e) => {
+                debug_println!(
+                    "RUST DEBUG: Failed to create JString from QueryAst JSON: {}",
+                    e
+                );
+                crate::common::to_java_exception(
+                    &mut env,
+                    &anyhow::anyhow!("Failed to create JString from QueryAst JSON: {}", e),
+                );
+                std::ptr::null_mut()
+            }
+        },
+        Err(e) => {
+            debug_println!(
+                "RUST DEBUG: Error converting SplitExistsQuery to QueryAst: {}",
                 e
             );
             crate::common::to_java_exception(&mut env, &e);

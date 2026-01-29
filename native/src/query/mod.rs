@@ -25,3 +25,4 @@ pub mod snippet;         // SnippetGenerator and Snippet JNI
 pub mod json_query;      // JSON field query JNI
 pub mod jni_core;        // Core Query JNI (term, fuzzy, phrase, boolean)
 pub mod jni_advanced;    // Advanced Query JNI (regex, wildcard, range, utility)
+pub mod exists_query;    // ExistsQuery JNI (IS NOT NULL / IS NULL)
