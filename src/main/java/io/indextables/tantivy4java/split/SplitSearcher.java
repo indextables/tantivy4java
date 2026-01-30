@@ -957,4 +957,52 @@ public class SplitSearcher implements AutoCloseable {
     private static native Map<String, Long> getPerFieldComponentSizesNative(long nativePtr);
     private static native List<String> tokenizeNative(long nativePtr, String fieldName, String text);
     private static native void closeNative(long nativePtr);
+
+    // Smart Wildcard Optimization Statistics (for testing/monitoring)
+    private static native void resetSmartWildcardStats();
+    private static native long getQueriesAnalyzed();
+    private static native long getQueriesOptimizable();
+    private static native long getShortCircuitsTriggered();
+
+    /**
+     * Statistics for Smart Wildcard AST Skipping optimization.
+     * Used for testing and monitoring the optimization's effectiveness.
+     */
+    public static class SmartWildcardStats {
+        public final long queriesAnalyzed;
+        public final long queriesOptimizable;
+        public final long shortCircuitsTriggered;
+
+        public SmartWildcardStats(long queriesAnalyzed, long queriesOptimizable, long shortCircuitsTriggered) {
+            this.queriesAnalyzed = queriesAnalyzed;
+            this.queriesOptimizable = queriesOptimizable;
+            this.shortCircuitsTriggered = shortCircuitsTriggered;
+        }
+
+        @Override
+        public String toString() {
+            return String.format("SmartWildcardStats{analyzed=%d, optimizable=%d, shortCircuits=%d}",
+                queriesAnalyzed, queriesOptimizable, shortCircuitsTriggered);
+        }
+    }
+
+    /**
+     * Reset smart wildcard optimization statistics counters.
+     * Useful for isolating statistics in tests.
+     */
+    public static void resetWildcardOptimizationStats() {
+        resetSmartWildcardStats();
+    }
+
+    /**
+     * Get current smart wildcard optimization statistics.
+     * @return Statistics object with counters for analyzed, optimizable, and short-circuited queries
+     */
+    public static SmartWildcardStats getWildcardOptimizationStats() {
+        return new SmartWildcardStats(
+            getQueriesAnalyzed(),
+            getQueriesOptimizable(),
+            getShortCircuitsTriggered()
+        );
+    }
 }

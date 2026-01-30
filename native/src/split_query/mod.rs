@@ -8,11 +8,15 @@ pub mod schema_cache;
 pub mod wildcard_analysis;
 
 // Re-exports from submodules
+// Note: Some types (QueryAnalysis, QueryCost, SmartWildcardStats) are re-exported for public API
+// but not directly used in this module, hence the allow attribute.
+#[allow(unused_imports)]
 pub use parse_query::{
     count_query_fields, create_split_parsed_query, create_split_query_from_ast,
     extract_default_search_fields, extract_fields_from_query_ast, extract_fields_from_schema,
     extract_text_fields_from_schema, parse_query_string,
 };
+#[allow(unused_imports)]
 pub use query_converters::{
     convert_boolean_query_to_ast, convert_boolean_query_to_query_ast,
     convert_exists_query_to_ast, convert_exists_query_to_query_ast,
@@ -21,15 +25,22 @@ pub use query_converters::{
     convert_range_query_to_query_ast, convert_split_query_to_ast, convert_split_query_to_json,
     convert_term_query_to_ast, convert_term_query_to_query_ast,
 };
+#[allow(unused_imports)]
 pub use schema_cache::{
     clear_split_schema_cache, get_searcher_schema, get_split_schema, remove_searcher_schema,
     store_searcher_schema, store_split_schema, SEARCHER_SCHEMA_MAPPING, SPLIT_SCHEMA_CACHE,
 };
+#[allow(unused_imports)]
 pub use wildcard_analysis::{
     convert_wildcard_query_to_ast, convert_wildcard_query_to_query_ast,
     is_expensive_wildcard_pattern,
 };
-pub use query_optimizer::{analyze_query_ast_json, QueryAnalysis, QueryCost};
+#[allow(unused_imports)]
+pub use query_optimizer::{
+    analyze_query_ast_json, QueryAnalysis, QueryCost, SmartWildcardStats,
+    get_smart_wildcard_stats, reset_smart_wildcard_stats,
+    increment_queries_analyzed, increment_queries_optimizable, increment_short_circuits_triggered,
+};
 
 use jni::objects::{JClass, JObject, JString};
 use jni::sys::{jlong, jobject, jstring};
@@ -298,4 +309,44 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitExistsQuery_t
             std::ptr::null_mut()
         }
     }
+}
+
+// =====================================================================
+// Smart Wildcard Statistics JNI Functions
+// =====================================================================
+
+/// Reset smart wildcard optimization statistics (for testing)
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_resetSmartWildcardStats(
+    _env: JNIEnv,
+    _class: JClass,
+) {
+    reset_smart_wildcard_stats();
+}
+
+/// Get number of queries analyzed for optimization
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_getQueriesAnalyzed(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jlong {
+    get_smart_wildcard_stats().queries_analyzed as jlong
+}
+
+/// Get number of queries that were optimizable
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_getQueriesOptimizable(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jlong {
+    get_smart_wildcard_stats().queries_optimizable as jlong
+}
+
+/// Get number of times short-circuit was triggered
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_getShortCircuitsTriggered(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jlong {
+    get_smart_wildcard_stats().short_circuits_triggered as jlong
 }

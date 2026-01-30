@@ -44,7 +44,12 @@ pub async fn perform_search_async_impl_leaf_response(
     // scoring, not execution order.
 
     let effective_query_json = if let Ok(analysis) = crate::split_query::analyze_query_ast_json(&query_json) {
+        // Track that we analyzed this query
+        crate::split_query::increment_queries_analyzed();
+
         if analysis.can_optimize {
+            // Track that this query was optimizable
+            crate::split_query::increment_queries_optimizable();
             debug_println!("🚀 SMART_WILDCARD: Query is optimizable - has expensive wildcard + cheap filters");
 
             if let Some(ref cheap_filter_json) = analysis.cheap_filter_json {
@@ -66,6 +71,8 @@ pub async fn perform_search_async_impl_leaf_response(
 
                 match cheap_result {
                     Ok(result) if result.num_hits == 0 => {
+                        // Track that we short-circuited
+                        crate::split_query::increment_short_circuits_triggered();
                         debug_println!("✅ SMART_WILDCARD: SHORT-CIRCUIT! Cheap filter returned 0 results");
                         debug_println!("✅ SMART_WILDCARD: Skipping expensive wildcard evaluation entirely");
 
