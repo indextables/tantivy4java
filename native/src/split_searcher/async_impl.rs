@@ -34,11 +34,16 @@ pub async fn perform_search_async_impl_leaf_response(
     debug_println!("🔍 ASYNC_IMPL: Extracted searcher context, performing search on split: {}", context.split_uri);
 
     // ========================================================================
-    // Smart Wildcard AST Skipping Optimization
+    // Smart Wildcard AST Skipping Optimization (Phase 1)
     // ========================================================================
-    // Analyze query for expensive wildcard patterns that can be short-circuited
-    // by evaluating cheap filters first.
-    if let Ok(analysis) = crate::split_query::analyze_query_ast_json(&query_json) {
+    // Short-circuit when cheap filter returns 0 results - skip expensive wildcard entirely
+    //
+    // Note: Phase 2 (query restructuring) was investigated but provides no benefit because
+    // Tantivy's AutomatonWeight materializes ALL matching docs into a BitSet during scorer()
+    // creation, before any intersection happens. Moving clauses to filter only affects
+    // scoring, not execution order.
+
+    let effective_query_json = if let Ok(analysis) = crate::split_query::analyze_query_ast_json(&query_json) {
         if analysis.can_optimize {
             debug_println!("🚀 SMART_WILDCARD: Query is optimizable - has expensive wildcard + cheap filters");
 
@@ -77,17 +82,24 @@ pub async fn perform_search_async_impl_leaf_response(
                     }
                     Ok(result) => {
                         debug_println!("🚀 SMART_WILDCARD: Cheap filter matched {} docs, proceeding with full query", result.num_hits);
+                        query_json.clone()
                     }
                     Err(e) => {
                         debug_println!("⚠️ SMART_WILDCARD: Cheap filter failed ({}), falling back to full query", e);
+                        query_json.clone()
                     }
                 }
+            } else {
+                query_json.clone()
             }
         } else {
             debug_println!("🔍 SMART_WILDCARD: Query not optimizable (expensive={}, cheap_filters={})",
                 analysis.has_expensive_wildcard, analysis.has_cheap_filters);
+            query_json.clone()
         }
-    }
+    } else {
+        query_json.clone()
+    };
     // ========================================================================
     // End of Smart Wildcard Optimization
     // ========================================================================
@@ -102,7 +114,7 @@ pub async fn perform_search_async_impl_leaf_response(
         context.cached_storage.clone(),
         context.cached_searcher.clone(),
         context.cached_index.clone(),
-        &query_json,
+        &effective_query_json,
         limit as usize,
     ).await?;
 
