@@ -109,6 +109,22 @@ pub extern "system" fn Java_io_indextables_tantivy4java_result_SearchResult_nati
     release_arc(ptr);
 }
 
+/// Create an empty SearchResult for short-circuit optimization.
+/// This is used when filters return zero results and expensive queries can be skipped.
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_result_SearchResult_nativeCreateEmpty(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jlong {
+    // Create an empty EnhancedSearchResult
+    let empty_result = crate::split_searcher::EnhancedSearchResult {
+        hits: Vec::new(),
+        aggregation_results: None,
+        aggregation_json: None,
+    };
+    arc_to_jlong(Arc::new(empty_result))
+}
+
 #[no_mangle]
 pub extern "system" fn Java_io_indextables_tantivy4java_result_SearchResult_nativeHasAggregations(
     mut env: JNIEnv,

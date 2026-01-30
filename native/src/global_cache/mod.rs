@@ -54,8 +54,13 @@ use crate::disk_cache::L2DiskCache;
 /// This ensures only one instance is ever created across all Spark tasks/executors
 static GLOBAL_SEARCHER_COMPONENTS: OnceLock<Arc<GlobalSearcherComponents>> = OnceLock::new();
 
-/// Global cached SearcherContext - the ACTUAL shared instance that should be reused
-static GLOBAL_SEARCHER_CONTEXT: OnceLock<Arc<SearcherContext>> = OnceLock::new();
+/// Global cached SearcherContext - using RwLock<Option<...>> pattern to allow reset for test isolation
+/// The OnceLock holds the RwLock, which holds an Option that can be cleared
+static GLOBAL_SEARCHER_CONTEXT: OnceLock<std::sync::RwLock<Option<Arc<SearcherContext>>>> = OnceLock::new();
+
+fn get_searcher_context_holder() -> &'static std::sync::RwLock<Option<Arc<SearcherContext>>> {
+    GLOBAL_SEARCHER_CONTEXT.get_or_init(|| std::sync::RwLock::new(None))
+}
 
 /// Credential-specific SearcherContext cache
 /// This ensures that different credentials get separate caches, preventing the security issue
@@ -123,40 +128,83 @@ pub fn get_global_components() -> &'static Arc<GlobalSearcherComponents> {
 
 /// Get the global SearcherContext
 /// CRITICAL FIX: Return the SAME SearcherContext instance every time for true cache sharing
+/// Uses RwLock<Option<...>> pattern to allow reset for test isolation
 pub fn get_global_searcher_context() -> Arc<SearcherContext> {
     debug_println!(
         "🔍 CACHE ENTRY: get_global_searcher_context() called - using SHARED global caches"
     );
-    debug_println!(
-        "🔍 CACHE ENTRY: get_global_searcher_context() called - using SHARED global caches"
-    );
 
-    let context = GLOBAL_SEARCHER_CONTEXT.get_or_init(|| {
-        debug_println!("🔍 CACHE INIT: Creating THE SINGLE SHARED SearcherContext instance");
-        let components = get_global_components();
-        let context = components.create_searcher_context(SearcherConfig::default());
-        debug_println!(
-            "🔍 CACHE CREATED: THE SHARED SearcherContext created at {:p}",
-            Arc::as_ptr(&context)
-        );
-        debug_println!(
-            "🔍 CACHE IDENTITY: Split footer cache instance at: {:p}",
-            &context.split_footer_cache as *const _
-        );
-        context
-    });
+    let holder = get_searcher_context_holder();
 
-    let ref_count = Arc::strong_count(context);
+    // First, try to get existing context with read lock (fast path)
+    {
+        let guard = holder.read().unwrap();
+        if let Some(ref context) = *guard {
+            let ref_count = Arc::strong_count(context);
+            debug_println!(
+                "🔍 CACHE REUSE: Returning SHARED SearcherContext at {:p}, ref_count: {}",
+                Arc::as_ptr(context),
+                ref_count
+            );
+            return context.clone();
+        }
+    }
+
+    // Need to create - acquire write lock
+    let mut guard = holder.write().unwrap();
+
+    // Double-check after acquiring write lock
+    if let Some(ref context) = *guard {
+        debug_println!(
+            "🔍 CACHE REUSE: Another thread created context, returning {:p}",
+            Arc::as_ptr(context)
+        );
+        return context.clone();
+    }
+
+    // Create new context
+    debug_println!("🔍 CACHE INIT: Creating THE SINGLE SHARED SearcherContext instance");
+    let components = get_global_components();
+    let context = components.create_searcher_context(SearcherConfig::default());
     debug_println!(
-        "🔍 CACHE REUSE: Returning SHARED SearcherContext at {:p}, ref_count: {}",
-        Arc::as_ptr(context),
-        ref_count
+        "🔍 CACHE CREATED: THE SHARED SearcherContext created at {:p}",
+        Arc::as_ptr(&context)
     );
     debug_println!(
-        "🔍 CACHE IDENTITY: Reusing split footer cache instance at: {:p}",
+        "🔍 CACHE IDENTITY: Split footer cache instance at: {:p}",
         &context.split_footer_cache as *const _
     );
-    context.clone()
+
+    *guard = Some(context.clone());
+    context
+}
+
+/// Clear the global SearcherContext - called when last cache manager is closed
+/// This is critical for test isolation to prevent cached data from leaking between tests
+pub fn clear_global_searcher_context() {
+    debug_println!("🧹 CLEAR_GLOBAL_SEARCHER_CONTEXT: Clearing global searcher context");
+
+    let holder = get_searcher_context_holder();
+    let mut guard = holder.write().unwrap();
+    if guard.is_some() {
+        *guard = None;
+        debug_println!("🧹 CLEAR_GLOBAL_SEARCHER_CONTEXT: Context cleared");
+    } else {
+        debug_println!("🧹 CLEAR_GLOBAL_SEARCHER_CONTEXT: Context was already None");
+    }
+}
+
+/// Clear all credential-specific SearcherContexts - called when last cache manager is closed
+/// This is critical for test isolation to prevent cached data from leaking between tests
+pub fn clear_credential_contexts() {
+    debug_println!("🧹 CLEAR_CREDENTIAL_CONTEXTS: Clearing all credential-specific contexts");
+
+    let holder = get_credential_contexts_holder();
+    let mut cache = holder.lock().unwrap();
+    let count = cache.len();
+    cache.clear();
+
+    debug_println!("🧹 CLEAR_CREDENTIAL_CONTEXTS: Cleared {} credential contexts", count);
 }
 
 /// Get a credential-specific SearcherContext

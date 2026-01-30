@@ -44,6 +44,16 @@ public class SearchResult implements AutoCloseable {
     }
 
     /**
+     * Create an empty search result with no hits and no aggregations.
+     * This is used for short-circuit optimization when filters return zero results.
+     *
+     * @return An empty SearchResult
+     */
+    public static SearchResult empty() {
+        return new SearchResult(nativeCreateEmpty());
+    }
+
+    /**
      * Get the search hits (score, DocAddress pairs).
      * @return List of search hits
      */
@@ -129,4 +139,5 @@ public class SearchResult implements AutoCloseable {
     private static native Map<String, AggregationResult> nativeGetAggregations(long ptr);
     private static native AggregationResult nativeGetAggregation(long ptr, String name);
     private static native void nativeClose(long ptr);
+    private static native long nativeCreateEmpty();
 }

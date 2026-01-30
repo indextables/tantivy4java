@@ -113,3 +113,31 @@ pub fn remove_searcher_schema(searcher_ptr: jlong) -> bool {
         false
     }
 }
+
+/// Clear all cached schemas - called when last cache manager is closed
+/// This is critical for test isolation to prevent schema data from leaking between tests
+pub fn clear_split_schema_cache() {
+    debug_println!("RUST DEBUG: 🧹 CLEAR_SPLIT_SCHEMA_CACHE: Clearing all cached schemas");
+
+    // Clear split schema cache
+    {
+        let mut cache = SPLIT_SCHEMA_CACHE.lock().unwrap();
+        let count = cache.len();
+        cache.clear();
+        debug_println!("RUST DEBUG: 🧹 Cleared {} entries from SPLIT_SCHEMA_CACHE", count);
+    }
+
+    // Clear searcher schema mapping
+    {
+        let mut mapping = SEARCHER_SCHEMA_MAPPING.lock().unwrap();
+        let count = mapping.len();
+        // Release all schema Arcs before clearing
+        for (_searcher_ptr, schema_ptr) in mapping.iter() {
+            crate::utils::release_arc(*schema_ptr);
+        }
+        mapping.clear();
+        debug_println!("RUST DEBUG: 🧹 Cleared {} entries from SEARCHER_SCHEMA_MAPPING", count);
+    }
+
+    debug_println!("RUST DEBUG: 🧹 CLEAR_SPLIT_SCHEMA_CACHE: Complete");
+}
