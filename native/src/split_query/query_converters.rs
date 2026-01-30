@@ -372,6 +372,10 @@ pub fn convert_split_query_to_ast(env: &mut JNIEnv, query_obj: &JObject) -> Resu
             // Create QueryAst using FieldPresenceQuery for exists checks
             convert_exists_query_to_query_ast(env, query_obj)
         }
+        "io.indextables.tantivy4java.split.SplitWildcardQuery" => {
+            // Create QueryAst for wildcard pattern matching
+            super::wildcard_analysis::convert_wildcard_query_to_query_ast(env, query_obj)
+        }
         _ => Err(anyhow!("Unsupported SplitQuery type: {}", class_name)),
     }
 }

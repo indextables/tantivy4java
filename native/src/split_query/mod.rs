@@ -3,7 +3,9 @@
 
 pub mod parse_query;
 pub mod query_converters;
+pub mod query_optimizer;
 pub mod schema_cache;
+pub mod wildcard_analysis;
 
 // Re-exports from submodules
 pub use parse_query::{
@@ -23,6 +25,11 @@ pub use schema_cache::{
     get_searcher_schema, get_split_schema, remove_searcher_schema, store_searcher_schema,
     store_split_schema, SEARCHER_SCHEMA_MAPPING, SPLIT_SCHEMA_CACHE,
 };
+pub use wildcard_analysis::{
+    convert_wildcard_query_to_ast, convert_wildcard_query_to_query_ast,
+    is_expensive_wildcard_pattern,
+};
+pub use query_optimizer::{analyze_query_ast_json, QueryAnalysis, QueryCost};
 
 use jni::objects::{JClass, JObject, JString};
 use jni::sys::{jlong, jobject, jstring};

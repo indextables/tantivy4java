@@ -13,6 +13,7 @@ use quickwit_storage::Storage;
 
 // Thread-safe async implementation function for search operations
 /// Thread-safe async implementation that returns LeafSearchResponse directly (no JSON marshalling)
+/// Includes Smart Wildcard AST Skipping optimization for expensive wildcard patterns
 pub async fn perform_search_async_impl_leaf_response(
     searcher_ptr: jlong,
     query_json: String,
@@ -31,6 +32,65 @@ pub async fn perform_search_async_impl_leaf_response(
     let context = searcher_context.as_ref();
 
     debug_println!("🔍 ASYNC_IMPL: Extracted searcher context, performing search on split: {}", context.split_uri);
+
+    // ========================================================================
+    // Smart Wildcard AST Skipping Optimization
+    // ========================================================================
+    // Analyze query for expensive wildcard patterns that can be short-circuited
+    // by evaluating cheap filters first.
+    if let Ok(analysis) = crate::split_query::analyze_query_ast_json(&query_json) {
+        if analysis.can_optimize {
+            debug_println!("🚀 SMART_WILDCARD: Query is optimizable - has expensive wildcard + cheap filters");
+
+            if let Some(ref cheap_filter_json) = analysis.cheap_filter_json {
+                debug_println!("🚀 SMART_WILDCARD: Running cheap filter first: {}", cheap_filter_json);
+
+                // Run cheap filter with limit=1 to check if any documents match
+                let cheap_result = perform_real_quickwit_search(
+                    &context.split_uri,
+                    &context.aws_config,
+                    context.footer_start,
+                    context.footer_end,
+                    &context.doc_mapping_json,
+                    context.cached_storage.clone(),
+                    context.cached_searcher.clone(),
+                    context.cached_index.clone(),
+                    cheap_filter_json,
+                    1, // Only need to know if at least 1 doc matches
+                ).await;
+
+                match cheap_result {
+                    Ok(result) if result.num_hits == 0 => {
+                        debug_println!("✅ SMART_WILDCARD: SHORT-CIRCUIT! Cheap filter returned 0 results");
+                        debug_println!("✅ SMART_WILDCARD: Skipping expensive wildcard evaluation entirely");
+
+                        // Return empty result - no need to evaluate expensive wildcard
+                        return Ok(quickwit_proto::search::LeafSearchResponse {
+                            num_hits: 0,
+                            partial_hits: Vec::new(),
+                            failed_splits: Vec::new(),
+                            num_attempted_splits: 1,
+                            num_successful_splits: 1,
+                            intermediate_aggregation_result: None,
+                            resource_stats: None,
+                        });
+                    }
+                    Ok(result) => {
+                        debug_println!("🚀 SMART_WILDCARD: Cheap filter matched {} docs, proceeding with full query", result.num_hits);
+                    }
+                    Err(e) => {
+                        debug_println!("⚠️ SMART_WILDCARD: Cheap filter failed ({}), falling back to full query", e);
+                    }
+                }
+            }
+        } else {
+            debug_println!("🔍 SMART_WILDCARD: Query not optimizable (expensive={}, cheap_filters={})",
+                analysis.has_expensive_wildcard, analysis.has_cheap_filters);
+        }
+    }
+    // ========================================================================
+    // End of Smart Wildcard Optimization
+    // ========================================================================
 
     // Use Quickwit's real search functionality with cached searcher following their patterns
     let search_result = perform_real_quickwit_search(

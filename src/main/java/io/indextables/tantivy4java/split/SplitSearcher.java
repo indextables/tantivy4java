@@ -260,6 +260,12 @@ public class SplitSearcher implements AutoCloseable {
      * This method converts the SplitQuery to Quickwit's QueryAst format and uses
      * Quickwit's proven search algorithms for optimal performance.
      *
+     * <p><b>Smart Wildcard Optimization:</b>
+     * When a query contains expensive wildcard patterns (leading wildcards like "*foo"
+     * or multi-wildcards like "*foo*bar*") combined with cheap filters (term queries,
+     * range queries), this method will first evaluate the cheap filters to potentially
+     * short-circuit the expensive wildcard evaluation.
+     *
      * @param splitQuery The query to execute (use parseQuery() to create from string)
      * @param limit Maximum number of results to return
      * @return SearchResult containing matching documents and their scores
@@ -273,7 +279,10 @@ public class SplitSearcher implements AutoCloseable {
         }
 
         try {
-            // Pass SplitQuery object directly to native layer for efficient QueryAst conversion
+            // Smart Wildcard Optimization is handled transparently in the native Rust layer.
+            // The native layer analyzes QueryAst for expensive wildcards combined with cheap filters,
+            // and automatically short-circuits when the cheap filter returns zero results.
+            // This applies to ALL query types: programmatic queries AND parseQuery() results.
             return searchWithSplitQuery(nativePtr, splitQuery, limit);
         } catch (Exception e) {
             throw new RuntimeException("Search failed: " + e.getMessage(), e);
