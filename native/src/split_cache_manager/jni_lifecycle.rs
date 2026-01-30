@@ -249,6 +249,9 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_
         );
     }
 
+    // Increment active manager count for test isolation tracking
+    super::manager::increment_manager_count();
+
     // Use Arc registry for safe memory management
     let cache_name_arc = Arc::new(cache_name);
     crate::utils::arc_to_jlong(cache_name_arc)
@@ -266,7 +269,7 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_
 
         // Use Arc registry to find cache name, then remove from managers
         if let Some(cache_name_arc) = crate::utils::jlong_to_arc::<String>(ptr) {
-            // Check if this manager has a disk cache and clear caches
+            // Check if this manager has a disk cache and flush before cleanup
             if let Some(manager) = managers.get(&*cache_name_arc) {
                 if let Some(disk_cache) = &manager.disk_cache {
                     // 🔧 CRITICAL FIX: Flush all pending writes BEFORE clearing references
@@ -280,21 +283,32 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_
                         "🔵 FLUSH: Disk cache flush complete for '{}'",
                         *cache_name_arc
                     );
-
-                    debug_println!(
-                        "RUST DEBUG: Clearing caches for cache '{}' with disk cache",
-                        *cache_name_arc
-                    );
-                    // Clear searcher cache - this releases Arc<Searcher> which holds
-                    // references to StorageWithPersistentCache -> L2DiskCache
-                    crate::split_searcher::clear_searcher_cache();
-                    // Then clear the global disk cache reference
-                    crate::global_cache::clear_global_disk_cache();
                 }
             }
+
+            // Remove batch metrics for this cache
+            {
+                let mut batch_metrics = BATCH_METRICS.lock().unwrap();
+                batch_metrics.remove(&*cache_name_arc);
+                debug_println!(
+                    "RUST DEBUG: Removed batch optimization metrics for cache '{}'",
+                    *cache_name_arc
+                );
+            }
+
             managers.remove(&*cache_name_arc);
             // Release the Arc from registry
             crate::utils::release_arc(ptr);
+
+            // Decrement manager count and clear all global caches if this was the last manager
+            // This is critical for test isolation - prevents data leaking between tests
+            let was_last = super::manager::decrement_manager_count_and_maybe_cleanup();
+            if was_last {
+                debug_println!(
+                    "🧹 CLOSE: Last cache manager '{}' closed - all global caches cleared",
+                    *cache_name_arc
+                );
+            }
         }
     }
 }

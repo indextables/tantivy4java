@@ -283,6 +283,62 @@ lazy_static::lazy_static! {
         Arc::new(BatchOptimizationMetrics::new());
 }
 
+/// Counter for active cache managers - used to determine when to clear global caches
+/// When counter goes from 1 to 0 (last manager closed), all global caches are cleared
+/// This is critical for test isolation
+pub static ACTIVE_MANAGER_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Increment active manager count - called when a new cache manager is created
+pub fn increment_manager_count() {
+    let old_count = ACTIVE_MANAGER_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    debug_println!("🔢 MANAGER_COUNT: Incremented from {} to {}", old_count, old_count + 1);
+}
+
+/// Decrement active manager count and clear global caches if this was the last manager
+/// Returns true if global caches were cleared (this was the last manager)
+pub fn decrement_manager_count_and_maybe_cleanup() -> bool {
+    let old_count = ACTIVE_MANAGER_COUNT.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    debug_println!("🔢 MANAGER_COUNT: Decremented from {} to {}", old_count, old_count - 1);
+
+    if old_count == 1 {
+        // This was the last manager - clear all global caches for test isolation
+        debug_println!("🧹 MANAGER_COUNT: Last manager closed, clearing all global caches");
+        clear_all_global_caches();
+        true
+    } else {
+        false
+    }
+}
+
+/// Clear all global caches - called when last cache manager is closed
+/// This is critical for test isolation to prevent data leaking between tests
+fn clear_all_global_caches() {
+    debug_println!("🧹 CLEAR_ALL_GLOBAL_CACHES: Starting global cache cleanup");
+
+    // 1. Clear split schema cache
+    crate::split_query::clear_split_schema_cache();
+
+    // 2. Clear global searcher context (holds leaf_search_cache, split_footer_cache, etc.)
+    crate::global_cache::clear_global_searcher_context();
+
+    // 3. Clear credential-specific contexts
+    crate::global_cache::clear_credential_contexts();
+
+    // 4. Clear searcher cache (LRU cache of Arc<Searcher>)
+    crate::split_searcher::clear_searcher_cache();
+
+    // 5. Clear global disk cache reference
+    crate::global_cache::clear_global_disk_cache();
+
+    // 6. Reset L1 cache (clear all entries)
+    crate::global_cache::reset_global_l1_cache();
+
+    // 7. Reset storage download metrics
+    crate::global_cache::reset_storage_download_metrics();
+
+    debug_println!("🧹 CLEAR_ALL_GLOBAL_CACHES: Complete");
+}
+
 /// Helper function to record batch optimization metrics
 pub fn record_batch_metrics(
     cache_name: Option<&str>,

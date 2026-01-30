@@ -8,7 +8,8 @@ import io.indextables.tantivy4java.result.*;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.AfterAll;
-import org.junit.jupiter.api.TestInstance;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.DisplayName;
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -23,23 +24,26 @@ import java.util.UUID;
  *
  * Tests wildcard pattern matching in split files with various patterns.
  *
- * Uses @TestInstance(PER_CLASS) to share the cache manager and searcher
- * across all tests, avoiding repeated setup/teardown which causes crashes.
+ * Uses per-test lifecycle for cache manager and searcher to verify test isolation.
+ * The split file is created once in @BeforeAll for efficiency, but each test
+ * creates and destroys its own cache manager and searcher.
  */
 @DisplayName("SplitWildcardQuery Integration Tests")
-@TestInstance(TestInstance.Lifecycle.PER_CLASS)
 public class SplitWildcardQueryTest {
 
-    private String tempDir;
-    private String splitPath;
+    // Class-level state (created once)
+    private static String tempDir;
+    private static String splitPath;
+    private static Schema schema;
+    private static QuickwitSplit.SplitMetadata splitMetadata;
+
+    // Per-test state (created/destroyed for each test)
     private SplitSearcher splitSearcher;
     private SplitCacheManager cacheManager;
-    private Schema schema;
-    private QuickwitSplit.SplitMetadata splitMetadata;
 
     @BeforeAll
-    public void setUp() throws Exception {
-        System.out.println("=== Setting up SplitWildcardQuery Test ===");
+    public static void setUpClass() throws Exception {
+        System.out.println("=== Setting up SplitWildcardQuery Test (class-level) ===");
 
         // Create temp directory
         tempDir = "/tmp/split_wildcard_query_test_" + System.currentTimeMillis();
@@ -118,7 +122,14 @@ public class SplitWildcardQueryTest {
             "wildcard-test", "test-source", "test-node");
         splitMetadata = QuickwitSplit.convertIndexFromPath(indexPath, splitPath, config);
 
-        // Create cache manager and searcher with unique cache name per test run
+        System.out.println("=== Split created successfully ===");
+    }
+
+    @BeforeEach
+    public void setUp() throws Exception {
+        System.out.println("  --- Setting up test (creating cache manager and searcher) ---");
+
+        // Create cache manager and searcher with unique cache name per test
         String uniqueCacheName = "wildcard-test-cache-" + UUID.randomUUID().toString();
         SplitCacheManager.CacheConfig cacheConfig =
             new SplitCacheManager.CacheConfig(uniqueCacheName)
@@ -127,9 +138,9 @@ public class SplitWildcardQueryTest {
         splitSearcher = cacheManager.createSplitSearcher("file://" + splitPath, splitMetadata);
     }
 
-    @AfterAll
+    @AfterEach
     public void tearDown() {
-        System.out.println("=== Tearing down SplitWildcardQuery Test ===");
+        System.out.println("  --- Tearing down test (closing cache manager and searcher) ---");
 
         if (splitSearcher != null) {
             try {
@@ -137,6 +148,7 @@ public class SplitWildcardQueryTest {
             } catch (Exception e) {
                 System.err.println("Warning: Failed to close SplitSearcher: " + e.getMessage());
             }
+            splitSearcher = null;
         }
         if (cacheManager != null) {
             try {
@@ -144,7 +156,13 @@ public class SplitWildcardQueryTest {
             } catch (Exception e) {
                 System.err.println("Warning: Failed to close SplitCacheManager: " + e.getMessage());
             }
+            cacheManager = null;
         }
+    }
+
+    @AfterAll
+    public static void tearDownClass() {
+        System.out.println("=== Tearing down SplitWildcardQuery Test (class-level) ===");
 
         // Clean up temp directory
         if (tempDir != null) {

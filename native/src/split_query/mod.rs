@@ -22,8 +22,8 @@ pub use query_converters::{
     convert_term_query_to_ast, convert_term_query_to_query_ast,
 };
 pub use schema_cache::{
-    get_searcher_schema, get_split_schema, remove_searcher_schema, store_searcher_schema,
-    store_split_schema, SEARCHER_SCHEMA_MAPPING, SPLIT_SCHEMA_CACHE,
+    clear_split_schema_cache, get_searcher_schema, get_split_schema, remove_searcher_schema,
+    store_searcher_schema, store_split_schema, SEARCHER_SCHEMA_MAPPING, SPLIT_SCHEMA_CACHE,
 };
 pub use wildcard_analysis::{
     convert_wildcard_query_to_ast, convert_wildcard_query_to_query_ast,
