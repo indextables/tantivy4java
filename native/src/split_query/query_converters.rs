@@ -281,6 +281,16 @@ fn convert_range_bound(
                         JsonLiteral::String(value)
                     }
                 }
+                "ip" | "ipaddr" | "ip_addr" => {
+                    // For IP address range queries, pass as string
+                    // Quickwit's query execution handles IP parsing
+                    debug_println!(
+                        "RUST DEBUG: Field type '{}' with IP value '{}', passing as String",
+                        field_type,
+                        value
+                    );
+                    JsonLiteral::String(value)
+                }
                 _ => {
                     debug_println!(
                         "RUST DEBUG: Unknown field type '{}', defaulting to string",

@@ -197,6 +197,35 @@ pub extern "system" fn Java_io_indextables_tantivy4java_query_Query_nativeTermQu
                     return Err("Expected Long or Integer value for signed integer field".to_string());
                 }
             },
+            tantivy::schema::FieldType::IpAddr(_) => {
+                // Handle IP address fields
+                if field_value_obj.is_null() {
+                    return Err("Field value cannot be null for IP address field".to_string());
+                }
+
+                // Get string representation of IP address by calling toString()
+                let ip_string: String = match env.call_method(&field_value_obj, "toString", "()Ljava/lang/String;", &[]) {
+                    Ok(result) => {
+                        let string_obj = result.l().map_err(|e| format!("Failed to get string object: {}", e))?;
+                        env.get_string(&JString::from(string_obj))
+                            .map_err(|e| format!("Failed to get IP string value: {}", e))?
+                            .into()
+                    },
+                    Err(e) => return Err(format!("Failed to get IP address string: {}", e)),
+                };
+
+                // Parse IP address (handles both IPv4 and IPv6)
+                let ip_addr: std::net::IpAddr = ip_string.parse()
+                    .map_err(|_| format!("Invalid IP address format: {}", ip_string))?;
+
+                // Convert to IPv6 (Tantivy stores all IPs as IPv6 internally)
+                let ipv6 = match ip_addr {
+                    std::net::IpAddr::V4(ipv4) => ipv4.to_ipv6_mapped(),
+                    std::net::IpAddr::V6(ipv6) => ipv6,
+                };
+
+                Term::from_field_ip_addr(field, ipv6)
+            },
             _ => {
                 return Err(format!("Unsupported field type for term query: {:?}", field_type));
             }
