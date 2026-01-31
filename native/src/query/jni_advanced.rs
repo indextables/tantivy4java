@@ -488,7 +488,7 @@ pub extern "system" fn Java_io_indextables_tantivy4java_query_Query_nativeRangeQ
                         } else {
                             Bound::Unbounded
                         };
-                        
+
                         let upper = if !upper_bound.is_null() {
                             match extract_date_value(&mut env, &upper_bound) {
                                 Ok(val) => if include_upper != 0 { Bound::Included(val) } else { Bound::Excluded(val) },
@@ -497,7 +497,7 @@ pub extern "system" fn Java_io_indextables_tantivy4java_query_Query_nativeRangeQ
                         } else {
                             Bound::Unbounded
                         };
-                        
+
                         let lower_term = match lower {
                             Bound::Included(val) => Bound::Included(Term::from_field_date(field, val)),
                             Bound::Excluded(val) => Bound::Excluded(Term::from_field_date(field, val)),
@@ -512,6 +512,63 @@ pub extern "system" fn Java_io_indextables_tantivy4java_query_Query_nativeRangeQ
                         Ok(Box::new(range_query) as Box<dyn TantivyQuery>)
                     },
                     _ => Err(format!("Field '{}' is not a date field", field_name_str)),
+                }
+            },
+            10 => { // IP_ADDR (FieldType.IP_ADDR.getValue() == 10)
+                match actual_field_type {
+                    TantivyFieldType::IpAddr(_) => {
+                        // Helper to parse IP string and convert to IPv6
+                        fn parse_ip_to_ipv6(ip_str: &str) -> Result<std::net::Ipv6Addr, String> {
+                            let ip_addr: std::net::IpAddr = ip_str.parse()
+                                .map_err(|_| format!("Invalid IP address: {}", ip_str))?;
+                            Ok(match ip_addr {
+                                std::net::IpAddr::V4(v4) => v4.to_ipv6_mapped(),
+                                std::net::IpAddr::V6(v6) => v6,
+                            })
+                        }
+
+                        // Helper to extract IP string from Java object
+                        fn extract_ip_string(env: &mut JNIEnv, obj: &JObject) -> Result<String, String> {
+                            let result = env.call_method(obj, "toString", "()Ljava/lang/String;", &[])
+                                .map_err(|e| format!("Failed to call toString: {}", e))?;
+                            let string_obj = result.l()
+                                .map_err(|e| format!("Failed to get object: {}", e))?;
+                            env.get_string(&JString::from(string_obj))
+                                .map_err(|e| format!("Failed to get string: {}", e))
+                                .map(|s| s.into())
+                        }
+
+                        let lower = if !lower_bound.is_null() {
+                            let bound_string = extract_ip_string(&mut env, &lower_bound)?;
+                            let ipv6 = parse_ip_to_ipv6(&bound_string)?;
+                            if include_lower != 0 { Bound::Included(ipv6) } else { Bound::Excluded(ipv6) }
+                        } else {
+                            Bound::Unbounded
+                        };
+
+                        let upper = if !upper_bound.is_null() {
+                            let bound_string = extract_ip_string(&mut env, &upper_bound)?;
+                            let ipv6 = parse_ip_to_ipv6(&bound_string)?;
+                            if include_upper != 0 { Bound::Included(ipv6) } else { Bound::Excluded(ipv6) }
+                        } else {
+                            Bound::Unbounded
+                        };
+
+                        let lower_term = match lower {
+                            Bound::Included(ip) => Bound::Included(Term::from_field_ip_addr(field, ip)),
+                            Bound::Excluded(ip) => Bound::Excluded(Term::from_field_ip_addr(field, ip)),
+                            Bound::Unbounded => Bound::Unbounded,
+                        };
+                        let upper_term = match upper {
+                            Bound::Included(ip) => Bound::Included(Term::from_field_ip_addr(field, ip)),
+                            Bound::Excluded(ip) => Bound::Excluded(Term::from_field_ip_addr(field, ip)),
+                            Bound::Unbounded => Bound::Unbounded,
+                        };
+
+                        let range_query = RangeQuery::new(lower_term, upper_term);
+                        Ok(Box::new(range_query) as Box<dyn TantivyQuery>)
+                    },
+                    _ => Err(format!("Field '{}' is not an IP address field", field_name_str)),
                 }
             },
             _ => Err(format!("Range queries not supported for field type: {}", field_type)),
