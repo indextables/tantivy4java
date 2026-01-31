@@ -20,6 +20,7 @@
 package io.indextables.tantivy4java.util;
 
 import io.indextables.tantivy4java.core.Tantivy;
+import io.indextables.tantivy4java.core.TokenLength;
 
 import java.util.List;
 
@@ -71,6 +72,31 @@ public class TextAnalyzer implements AutoCloseable {
     }
 
     /**
+     * Tokenize text using the specified Tantivy tokenizer with a custom max token length.
+     *
+     * <p>Tokens longer than the specified limit are filtered out during tokenization.
+     * This is useful for controlling which tokens are indexed and preventing excessively
+     * long tokens from bloating the index.
+     *
+     * <p>Common maxTokenLength values:
+     * <ul>
+     *   <li>{@link TokenLength#DEFAULT} (255) - Quickwit-compatible default</li>
+     *   <li>{@link TokenLength#LEGACY} (40) - Original tantivy4java default</li>
+     *   <li>{@link TokenLength#TANTIVY_MAX} (65,530) - Maximum supported</li>
+     * </ul>
+     *
+     * @param text Text to tokenize
+     * @param tokenizerName Name of the tokenizer ("default", "keyword", "whitespace", "raw", etc.)
+     * @param maxTokenLength Maximum token length in bytes (1 to 65,530)
+     * @return List of tokens
+     * @throws IllegalArgumentException if maxTokenLength is outside valid range
+     */
+    public static List<String> tokenize(String text, String tokenizerName, int maxTokenLength) {
+        TokenLength.validate(maxTokenLength);
+        return nativeTokenizeWithLimit(text, tokenizerName, maxTokenLength);
+    }
+
+    /**
      * Analyze text and return the resulting tokens.
      * @param text Text to analyze
      * @return List of tokens
@@ -105,6 +131,7 @@ public class TextAnalyzer implements AutoCloseable {
     // Native method declarations
     private static native long nativeCreateAnalyzer(String tokenizerName);
     private static native List<String> nativeTokenize(String text, String tokenizerName);
+    private static native List<String> nativeTokenizeWithLimit(String text, String tokenizerName, int maxTokenLength);
     private static native List<String> nativeAnalyze(long ptr, String text);
     private static native void nativeClose(long ptr);
 }
