@@ -57,12 +57,29 @@ public class SchemaBuilder implements AutoCloseable {
      * @param indexOption Index option for the field
      * @return This builder for method chaining
      */
-    public SchemaBuilder addTextField(String name, boolean stored, boolean fast, 
+    public SchemaBuilder addTextField(String name, boolean stored, boolean fast,
                                     String tokenizerName, String indexOption) {
+        return addTextField(name, stored, fast, tokenizerName, indexOption, TokenLength.DEFAULT);
+    }
+
+    /**
+     * Add a text field to the schema with configurable token length limit.
+     * @param name Field name
+     * @param stored Whether the field should be stored
+     * @param fast Whether the field should support fast access
+     * @param tokenizerName Tokenizer to use for this field
+     * @param indexOption Index option for the field
+     * @param maxTokenLength Maximum token length in bytes (tokens longer than this are filtered out)
+     * @return This builder for method chaining
+     * @throws IllegalArgumentException if maxTokenLength is outside valid range [1, 65530]
+     */
+    public SchemaBuilder addTextField(String name, boolean stored, boolean fast,
+                                    String tokenizerName, String indexOption, int maxTokenLength) {
         if (closed) {
             throw new IllegalStateException("SchemaBuilder has been closed");
         }
-        nativeAddTextField(nativePtr, name, stored, fast, tokenizerName, indexOption);
+        TokenLength.validate(maxTokenLength);
+        nativeAddTextField(nativePtr, name, stored, fast, tokenizerName, indexOption, maxTokenLength);
         return this;
     }
 
@@ -72,7 +89,38 @@ public class SchemaBuilder implements AutoCloseable {
      * @return This builder for method chaining
      */
     public SchemaBuilder addTextField(String name) {
-        return addTextField(name, false, false, "default", "position");
+        return addTextField(name, false, false, "default", "position", TokenLength.DEFAULT);
+    }
+
+    /**
+     * Add a text field to the schema using TextFieldIndexing configuration.
+     * @param name Field name
+     * @param stored Whether the field should be stored
+     * @param fast Whether the field should support fast access
+     * @param indexing Text field indexing configuration
+     * @return This builder for method chaining
+     */
+    public SchemaBuilder addTextField(String name, boolean stored, boolean fast,
+                                    TextFieldIndexing indexing) {
+        if (closed) {
+            throw new IllegalStateException("SchemaBuilder has been closed");
+        }
+        String indexOptionStr = indexOptionToString(indexing.getIndexOption());
+        nativeAddTextField(nativePtr, name, stored, fast, indexing.getTokenizerName(),
+                          indexOptionStr, indexing.getMaxTokenLength());
+        return this;
+    }
+
+    private String indexOptionToString(TextFieldIndexing.IndexOption option) {
+        switch (option) {
+            case BASIC:
+                return "basic";
+            case WITH_FREQS:
+                return "freq";
+            case WITH_FREQS_AND_POSITIONS:
+            default:
+                return "position";
+        }
     }
 
     /**
@@ -391,7 +439,7 @@ public class SchemaBuilder implements AutoCloseable {
     // Native method declarations
     private static native long nativeNew();
     private static native boolean nativeIsValidFieldName(String name);
-    private static native void nativeAddTextField(long ptr, String name, boolean stored, boolean fast, String tokenizerName, String indexOption);
+    private static native void nativeAddTextField(long ptr, String name, boolean stored, boolean fast, String tokenizerName, String indexOption, int maxTokenLength);
     private static native void nativeAddIntegerField(long ptr, String name, boolean stored, boolean indexed, boolean fast);
     private static native void nativeAddFloatField(long ptr, String name, boolean stored, boolean indexed, boolean fast);
     private static native void nativeAddUnsignedField(long ptr, String name, boolean stored, boolean indexed, boolean fast);

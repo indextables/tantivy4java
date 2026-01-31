@@ -8,7 +8,9 @@ use jni::sys::{jboolean, jlong, jint};
 use jni::JNIEnv;
 use tantivy::schema::{SchemaBuilder, TextOptions, NumericOptions, DateOptions, IpAddrOptions, JsonObjectOptions, BytesOptions};
 use tantivy::schema::{IndexRecordOption, TextFieldIndexing, DateTimePrecision};
+use tantivy::tokenizer::{SimpleTokenizer, WhitespaceTokenizer, RawTokenizer, LowerCaser, RemoveLongFilter, TextAnalyzer as TantivyAnalyzer};
 use crate::utils::{handle_error, with_arc_safe, arc_to_jlong, release_arc};
+use crate::text_analyzer::DEFAULT_MAX_TOKEN_LENGTH;
 use std::sync::{Arc, Mutex};
 
 #[no_mangle]
@@ -48,6 +50,7 @@ pub extern "system" fn Java_io_indextables_tantivy4java_core_SchemaBuilder_nativ
     _fast: jboolean,
     _tokenizer_name: JString,
     _index_option: JString,
+    max_token_length: jint,
 ) {
     let field_name: String = match env.get_string(&name) {
         Ok(s) => s.into(),
@@ -67,6 +70,21 @@ pub extern "system" fn Java_io_indextables_tantivy4java_core_SchemaBuilder_nativ
         Err(_) => "position".to_string(),
     };
 
+    // Use provided max_token_length, or default if not valid
+    let token_limit = if max_token_length > 0 {
+        max_token_length as usize
+    } else {
+        DEFAULT_MAX_TOKEN_LENGTH
+    };
+
+    // Create a unique tokenizer name that includes the token limit
+    // This ensures different limits get different tokenizers
+    let effective_tokenizer_name = if token_limit != DEFAULT_MAX_TOKEN_LENGTH {
+        format!("{}_limit_{}", tokenizer_name_str, token_limit)
+    } else {
+        tokenizer_name_str.clone()
+    };
+
     let result = with_arc_safe::<Mutex<SchemaBuilder>, Result<(), String>>(ptr, |builder_mutex| {
         let mut builder = builder_mutex.lock().unwrap();
         // Build text options
@@ -77,7 +95,7 @@ pub extern "system" fn Java_io_indextables_tantivy4java_core_SchemaBuilder_nativ
         }
 
         if _fast != 0 {
-            text_options = text_options.set_fast(Some(&tokenizer_name_str));
+            text_options = text_options.set_fast(Some(&effective_tokenizer_name));
         }
 
         // Text fields are indexed by default if they have tokenizer and index options
@@ -85,16 +103,16 @@ pub extern "system" fn Java_io_indextables_tantivy4java_core_SchemaBuilder_nativ
         if should_index {
             let indexing = match index_option_str.as_str() {
                 "position" => TextFieldIndexing::default()
-                    .set_tokenizer(&tokenizer_name_str)
+                    .set_tokenizer(&effective_tokenizer_name)
                     .set_index_option(IndexRecordOption::WithFreqsAndPositions),
                 "freq" => TextFieldIndexing::default()
-                    .set_tokenizer(&tokenizer_name_str)
+                    .set_tokenizer(&effective_tokenizer_name)
                     .set_index_option(IndexRecordOption::WithFreqs),
                 "basic" => TextFieldIndexing::default()
-                    .set_tokenizer(&tokenizer_name_str)
+                    .set_tokenizer(&effective_tokenizer_name)
                     .set_index_option(IndexRecordOption::Basic),
                 _ => TextFieldIndexing::default()
-                    .set_tokenizer(&tokenizer_name_str)
+                    .set_tokenizer(&effective_tokenizer_name)
                     .set_index_option(IndexRecordOption::WithFreqsAndPositions),
             };
 

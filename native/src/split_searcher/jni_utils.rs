@@ -300,7 +300,7 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_toke
                     match tokenizer_name {
                         "default" => {
                             tantivy::tokenizer::TextAnalyzer::builder(tantivy::tokenizer::SimpleTokenizer::default())
-                                .filter(tantivy::tokenizer::RemoveLongFilter::limit(40))
+                                .filter(tantivy::tokenizer::RemoveLongFilter::limit(255))
                                 .filter(tantivy::tokenizer::LowerCaser)
                                 .build()
                         },
@@ -323,7 +323,7 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_toke
                             // Default to simple tokenizer for unknown tokenizers
                             debug_println!("RUST DEBUG: Unknown tokenizer '{}', using default", tokenizer_name);
                             tantivy::tokenizer::TextAnalyzer::builder(tantivy::tokenizer::SimpleTokenizer::default())
-                                .filter(tantivy::tokenizer::RemoveLongFilter::limit(40))
+                                .filter(tantivy::tokenizer::RemoveLongFilter::limit(255))
                                 .filter(tantivy::tokenizer::LowerCaser)
                                 .build()
                         }
@@ -331,7 +331,7 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_toke
                 } else {
                     // No indexing options means it's not indexed, but we can still tokenize
                     tantivy::tokenizer::TextAnalyzer::builder(tantivy::tokenizer::SimpleTokenizer::default())
-                        .filter(tantivy::tokenizer::RemoveLongFilter::limit(40))
+                        .filter(tantivy::tokenizer::RemoveLongFilter::limit(255))
                         .filter(tantivy::tokenizer::LowerCaser)
                         .build()
                 }

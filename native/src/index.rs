@@ -24,7 +24,9 @@ use tantivy::{Index as TantivyIndex, IndexSettings, IndexWriter as TantivyIndexW
 use tantivy::schema::Schema;
 use tantivy::query::{Query as TantivyQuery, QueryParser};
 use tantivy::directory::MmapDirectory;
+use tantivy::tokenizer::{SimpleTokenizer, WhitespaceTokenizer, LowerCaser, RemoveLongFilter, TextAnalyzer as TantivyAnalyzer};
 use crate::utils::{handle_error, with_arc_safe, arc_to_jlong, release_arc};
+use crate::text_analyzer::DEFAULT_MAX_TOKEN_LENGTH;
 use std::sync::{Arc, Mutex};
 
 #[no_mangle]
@@ -45,16 +47,25 @@ pub extern "system" fn Java_io_indextables_tantivy4java_core_Index_nativeNew(
     
     let result = with_arc_safe::<Schema, Result<TantivyIndex, String>>(_schema_ptr, |schema_arc| {
         let schema = schema_arc.as_ref();
-        if path_str.is_empty() {
+        let index = if path_str.is_empty() {
             // Create in-memory index
-            Ok(TantivyIndex::create_in_ram(schema.clone()))
+            TantivyIndex::create_in_ram(schema.clone())
         } else {
             // Create index in directory - create directory if it doesn't exist
             std::fs::create_dir_all(&path_str).map_err(|e| format!("Failed to create directory '{}': {}", path_str, e))?;
             let dir = MmapDirectory::open(&path_str).map_err(|e| e.to_string())?;
             let settings = IndexSettings::default();
-            TantivyIndex::create(dir, schema.clone(), settings).map_err(|e| e.to_string())
-        }
+            TantivyIndex::create(dir, schema.clone(), settings).map_err(|e| e.to_string())?
+        };
+
+        // Register custom tokenizers with the default token length limit (255 bytes)
+        register_custom_tokenizers(&index, DEFAULT_MAX_TOKEN_LENGTH);
+
+        // Also scan the schema for any fields that use custom tokenizer names with limits
+        // and register those tokenizers as well
+        register_tokenizers_from_schema(&index, schema);
+
+        Ok(index)
     });
     
     match result {
@@ -91,7 +102,13 @@ pub extern "system" fn Java_io_indextables_tantivy4java_core_Index_nativeOpen(
     let result = match MmapDirectory::open(&path_str) {
         Ok(directory) => {
             match TantivyIndex::open(directory) {
-                Ok(index) => Ok(index),
+                Ok(index) => {
+                    // Register custom tokenizers with the default token length limit
+                    register_custom_tokenizers(&index, DEFAULT_MAX_TOKEN_LENGTH);
+                    // Register any custom limit tokenizers from schema
+                    register_tokenizers_from_schema(&index, &index.schema());
+                    Ok(index)
+                },
                 Err(e) => Err(format!("Failed to open index: {}", e)),
             }
         },
@@ -348,6 +365,99 @@ pub extern "system" fn Java_io_indextables_tantivy4java_core_Index_nativeParseQu
             0
         }
     }
+}
+
+/// Register custom tokenizers for a given token length limit
+fn register_custom_tokenizers(index: &TantivyIndex, max_token_length: usize) {
+    // Register default tokenizer with the specified limit
+    let default_analyzer = TantivyAnalyzer::builder(SimpleTokenizer::default())
+        .filter(LowerCaser)
+        .filter(RemoveLongFilter::limit(max_token_length))
+        .build();
+    index.tokenizers().register("default", default_analyzer);
+
+    // Register simple tokenizer with the specified limit
+    let simple_analyzer = TantivyAnalyzer::builder(SimpleTokenizer::default())
+        .filter(LowerCaser)
+        .filter(RemoveLongFilter::limit(max_token_length))
+        .build();
+    index.tokenizers().register("simple", simple_analyzer);
+
+    // Register whitespace tokenizer with the specified limit
+    let whitespace_analyzer = TantivyAnalyzer::builder(WhitespaceTokenizer::default())
+        .filter(LowerCaser)
+        .filter(RemoveLongFilter::limit(max_token_length))
+        .build();
+    index.tokenizers().register("whitespace", whitespace_analyzer);
+}
+
+/// Register tokenizers from schema field definitions
+/// This handles fields that specify custom token length limits via tokenizer names like "default_limit_40"
+fn register_tokenizers_from_schema(index: &TantivyIndex, schema: &Schema) {
+    use std::collections::HashSet;
+    let mut registered = HashSet::new();
+
+    for (_field, field_entry) in schema.fields() {
+        if let tantivy::schema::FieldType::Str(text_options) = field_entry.field_type() {
+            if let Some(indexing_options) = text_options.get_indexing_options() {
+                let tokenizer_name = indexing_options.tokenizer();
+
+                // Check if this is a custom limit tokenizer (e.g., "default_limit_40")
+                if tokenizer_name.contains("_limit_") && !registered.contains(tokenizer_name) {
+                    if let Some(limit) = parse_tokenizer_limit(tokenizer_name) {
+                        let base_tokenizer = extract_base_tokenizer(tokenizer_name);
+                        register_tokenizer_with_limit(index, tokenizer_name, &base_tokenizer, limit);
+                        registered.insert(tokenizer_name.to_string());
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Parse the token limit from a tokenizer name like "default_limit_40"
+fn parse_tokenizer_limit(name: &str) -> Option<usize> {
+    let parts: Vec<&str> = name.split("_limit_").collect();
+    if parts.len() == 2 {
+        parts[1].parse().ok()
+    } else {
+        None
+    }
+}
+
+/// Extract the base tokenizer name from a limit tokenizer name
+fn extract_base_tokenizer(name: &str) -> String {
+    if let Some(idx) = name.find("_limit_") {
+        name[..idx].to_string()
+    } else {
+        name.to_string()
+    }
+}
+
+/// Register a tokenizer with a specific limit
+fn register_tokenizer_with_limit(index: &TantivyIndex, name: &str, base: &str, limit: usize) {
+    let analyzer = match base {
+        "default" | "simple" => {
+            TantivyAnalyzer::builder(SimpleTokenizer::default())
+                .filter(LowerCaser)
+                .filter(RemoveLongFilter::limit(limit))
+                .build()
+        },
+        "whitespace" => {
+            TantivyAnalyzer::builder(WhitespaceTokenizer::default())
+                .filter(LowerCaser)
+                .filter(RemoveLongFilter::limit(limit))
+                .build()
+        },
+        _ => {
+            // Unknown base tokenizer, use default behavior
+            TantivyAnalyzer::builder(SimpleTokenizer::default())
+                .filter(LowerCaser)
+                .filter(RemoveLongFilter::limit(limit))
+                .build()
+        }
+    };
+    index.tokenizers().register(name, analyzer);
 }
 
 // Helper function to extract string list from Java List

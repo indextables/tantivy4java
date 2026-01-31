@@ -19,6 +19,7 @@ package io.indextables.tantivy4java.core;
 public class TextFieldIndexing {
     private String tokenizerName;
     private IndexOption indexOption;
+    private int maxTokenLength = TokenLength.DEFAULT;
 
     /**
      * Index options for text fields.
@@ -107,6 +108,30 @@ public class TextFieldIndexing {
     }
 
     /**
+     * Set the maximum token length limit.
+     *
+     * <p>Tokens longer than this limit will be filtered out during tokenization
+     * (not truncated). The default is {@link TokenLength#DEFAULT} (255 bytes),
+     * which is Quickwit-compatible.
+     *
+     * <p>Common values:
+     * <ul>
+     *   <li>{@link TokenLength#DEFAULT} (255) - Quickwit-compatible, good default</li>
+     *   <li>{@link TokenLength#LEGACY} (40) - Original tantivy4java default</li>
+     *   <li>{@link TokenLength#TANTIVY_MAX} (65,530) - Maximum supported by Tantivy</li>
+     * </ul>
+     *
+     * @param maxTokenLength Maximum token length in bytes (1 to 65,530)
+     * @return this TextFieldIndexing for method chaining
+     * @throws IllegalArgumentException if maxTokenLength is outside valid range
+     */
+    public TextFieldIndexing withMaxTokenLength(int maxTokenLength) {
+        TokenLength.validate(maxTokenLength);
+        this.maxTokenLength = maxTokenLength;
+        return this;
+    }
+
+    /**
      * Get the tokenizer name.
      *
      * @return Tokenizer name
@@ -131,6 +156,15 @@ public class TextFieldIndexing {
      */
     public int getIndexOptionCode() {
         return indexOption.getCode();
+    }
+
+    /**
+     * Get the maximum token length limit.
+     *
+     * @return Maximum token length in bytes
+     */
+    public int getMaxTokenLength() {
+        return maxTokenLength;
     }
 
     /**
@@ -186,6 +220,7 @@ public class TextFieldIndexing {
         return "TextFieldIndexing{" +
                 "tokenizerName='" + tokenizerName + '\'' +
                 ", indexOption=" + indexOption +
+                ", maxTokenLength=" + maxTokenLength +
                 '}';
     }
 }

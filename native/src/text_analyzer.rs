@@ -1,5 +1,5 @@
 use jni::objects::{JClass, JObject, JString, JValue};
-use jni::sys::{jlong, jobject};
+use jni::sys::{jlong, jint, jobject};
 use jni::JNIEnv;
 use tantivy::tokenizer::{
     SimpleTokenizer, WhitespaceTokenizer, RawTokenizer,
@@ -8,6 +8,14 @@ use tantivy::tokenizer::{
 
 use crate::utils::{handle_error, arc_to_jlong, release_arc, with_arc_safe};
 use std::sync::{Arc, Mutex};
+
+/// Default maximum token length (Quickwit-compatible: 255 bytes).
+/// Tokens longer than this limit are filtered out during tokenization.
+pub const DEFAULT_MAX_TOKEN_LENGTH: usize = 255;
+
+/// Legacy maximum token length (original tantivy4java default: 40 bytes).
+/// Use this for backward compatibility with older indices.
+pub const LEGACY_MAX_TOKEN_LENGTH: usize = 40;
 
 /// Create a text analyzer with the specified tokenizer
 #[no_mangle]
@@ -81,6 +89,58 @@ pub extern "system" fn Java_io_indextables_tantivy4java_util_TextAnalyzer_native
     }
 }
 
+/// Tokenize text using the specified tokenizer with configurable max token length
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_util_TextAnalyzer_nativeTokenizeWithLimit(
+    mut env: JNIEnv,
+    _class: JClass,
+    text: JString,
+    tokenizer_name: JString,
+    max_token_length: jint,
+) -> jobject {
+    let text_str: String = match env.get_string(&text) {
+        Ok(s) => s.into(),
+        Err(e) => {
+            handle_error(&mut env, &format!("Failed to get text: {}", e));
+            return std::ptr::null_mut();
+        }
+    };
+
+    let tokenizer_name_str: String = match env.get_string(&tokenizer_name) {
+        Ok(s) => s.into(),
+        Err(e) => {
+            handle_error(&mut env, &format!("Failed to get tokenizer name: {}", e));
+            return std::ptr::null_mut();
+        }
+    };
+
+    let limit = if max_token_length > 0 {
+        max_token_length as usize
+    } else {
+        DEFAULT_MAX_TOKEN_LENGTH
+    };
+
+    let mut analyzer = match create_analyzer_with_limit(&tokenizer_name_str, limit) {
+        Ok(analyzer) => analyzer,
+        Err(e) => {
+            handle_error(&mut env, &format!("Failed to create analyzer: {}", e));
+            return std::ptr::null_mut();
+        }
+    };
+
+    // Tokenize the text
+    let tokens = tokenize_text(&mut analyzer, &text_str);
+
+    // Convert tokens to Java List<String>
+    match create_string_list(&mut env, tokens) {
+        Ok(list) => list.into_raw(),
+        Err(e) => {
+            handle_error(&mut env, &format!("Failed to create token list: {}", e));
+            std::ptr::null_mut()
+        }
+    }
+}
+
 /// Analyze text using the analyzer instance
 #[no_mangle]
 pub extern "system" fn Java_io_indextables_tantivy4java_util_TextAnalyzer_nativeAnalyze(
@@ -132,35 +192,50 @@ pub extern "system" fn Java_io_indextables_tantivy4java_util_TextAnalyzer_native
     release_arc(analyzer_ptr);
 }
 
-/// Create a text analyzer based on the tokenizer name
+/// Create a text analyzer based on the tokenizer name with default max token length.
 fn create_analyzer(tokenizer_name: &str) -> Result<TantivyAnalyzer, String> {
+    create_analyzer_with_limit(tokenizer_name, DEFAULT_MAX_TOKEN_LENGTH)
+}
+
+/// Create a text analyzer based on the tokenizer name with configurable max token length.
+///
+/// # Arguments
+/// * `tokenizer_name` - Name of the tokenizer ("default", "simple", "whitespace", "keyword", "raw")
+/// * `max_token_length` - Maximum token length in bytes. Tokens longer than this are filtered out.
+///
+/// # Returns
+/// A configured TextAnalyzer or an error message.
+pub fn create_analyzer_with_limit(tokenizer_name: &str, max_token_length: usize) -> Result<TantivyAnalyzer, String> {
     match tokenizer_name {
         "default" => {
-            // Default analyzer: simple tokenizer + lowercase + stop word removal
+            // Default analyzer: simple tokenizer + lowercase + remove long tokens
             Ok(TantivyAnalyzer::builder(SimpleTokenizer::default())
                 .filter(LowerCaser)
-                .filter(RemoveLongFilter::limit(40))
+                .filter(RemoveLongFilter::limit(max_token_length))
                 .build())
         },
         "simple" => {
-            // Simple tokenizer with lowercase
+            // Simple tokenizer with lowercase + remove long tokens
             Ok(TantivyAnalyzer::builder(SimpleTokenizer::default())
                 .filter(LowerCaser)
+                .filter(RemoveLongFilter::limit(max_token_length))
                 .build())
         },
         "keyword" => {
             // Keyword tokenizer (treats entire input as single token)
+            // No length filter - single token semantics
             Ok(TantivyAnalyzer::builder(RawTokenizer::default())
                 .build())
         },
         "whitespace" => {
-            // Whitespace tokenizer with lowercase
+            // Whitespace tokenizer with lowercase + remove long tokens
             Ok(TantivyAnalyzer::builder(WhitespaceTokenizer::default())
                 .filter(LowerCaser)
+                .filter(RemoveLongFilter::limit(max_token_length))
                 .build())
         },
         "raw" => {
-            // Raw tokenizer (no processing)
+            // Raw tokenizer (no processing, no length filter)
             Ok(TantivyAnalyzer::builder(RawTokenizer::default())
                 .build())
         },
