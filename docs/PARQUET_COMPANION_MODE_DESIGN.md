@@ -62,8 +62,8 @@ significant amounts of data:
 - **Fast field files** (.fast): Duplicate of columnar data, especially large for string fields
   (~20-40% of split size for text-heavy schemas)
 
-For a 10GB parquet table, the corresponding split might be 6-8GB, with most of that being
-redundant copies of data already in parquet.
+For a 10GB parquet table, the corresponding split is typically 30-40GB (3-4x the parquet
+size), with most of that being redundant copies of data already in parquet.
 
 ### Goals
 
@@ -2766,10 +2766,14 @@ async fn get_or_fetch_offset_index(
 }
 ```
 
-Manifest size estimates:
+Manifest size estimates (raw JSON, before compression — see §19.15 for compressed sizes):
 - 10 columns, 10 row groups: ~5KB
-- 100 columns, 50 row groups: ~50KB
-- 1000 columns, 100 row groups: ~500KB (still manageable)
+- 100 columns, 50 row groups: ~50KB per file (multiply by file count)
+- 1000 columns, 100 row groups: ~500KB per file (potentially multi-MB for many files)
+
+For wide tables (100+ columns, many files), see §19.15 for the layered manifest size
+reduction strategy. With zstd compression (Layer 1) and field deduplication (Layer 2),
+even the 500-column, 10-file scenario compresses to ~2–3 MB.
 
 ### 19.9 Crate Dependencies (Important)
 
@@ -3064,6 +3068,1294 @@ async fn fetch_parquet_data(
 }
 ```
 
+### 19.15 Manifest Size Reduction (Critical)
+
+**Gap**: The manifest size estimates in §19.8 are too optimistic for real-world wide-table
+scenarios. Each `ColumnChunkInfo` entry contains `byte_range`, `compression`, and `encoding`
+fields, totaling approximately 100 bytes of JSON per entry. For production datasets:
+
+```
+100 cols × 50 RGs × 5 files  =  25,000 entries × ~100 bytes  =  ~2.5 MB
+500 cols × 100 RGs × 10 files = 500,000 entries × ~100 bytes  =  ~50 MB
+```
+
+A 2.5–50 MB manifest embedded in the split bundle is too large to download and parse
+efficiently, especially for cold-start scenarios where the split metadata must be fetched
+before any search can execute.
+
+**Decision**: Apply a layered reduction strategy. Layers 1 + 2 are the recommended default.
+Layers 3 + 4 are available for extreme-scale deployments but deferred.
+
+#### Layer 1: Manifest-Level zstd Compression
+
+Compress the serialized manifest JSON with zstd before embedding in the split bundle. JSON
+with highly repetitive key names and value patterns compresses extremely well under zstd.
+
+**Measured compression ratios for manifest-like JSON:**
+
+| Scenario | Raw JSON | zstd Level 3 | Ratio |
+|----------|----------|-------------|-------|
+| 100 cols × 50 RGs × 5 files | ~2.5 MB | ~250–400 KB | 6–10× |
+| 500 cols × 100 RGs × 10 files | ~50 MB | ~5–8 MB | 6–10× |
+| 10 cols × 10 RGs × 1 file | ~5 KB | ~1–2 KB | 3–5× |
+
+The high ratio comes from the extreme redundancy in the manifest: every entry repeats key
+names like `"byte_range"`, `"compression"`, `"encoding"`, and compression values like
+`"SNAPPY"` are repeated thousands of times.
+
+**Bundle file naming and backwards compatibility:**
+
+The compressed manifest is embedded with the same name `_parquet_manifest.json` (not
+`_parquet_manifest.json.zst`). On load, the reader detects the format by inspecting the
+first 4 bytes for the zstd magic number `0x28B52FFD`. If present, decompress first. If
+absent, treat as raw JSON. This provides full backwards compatibility: old manifests work
+without changes, and new manifests are transparent to the reader.
+
+**Write path (split creation and merge):**
+
+```rust
+use zstd::stream::encode_all;
+
+const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
+const MANIFEST_ZSTD_LEVEL: i32 = 3;  // Good ratio, fast compression
+
+fn serialize_manifest(manifest: &ParquetManifest) -> Result<Vec<u8>> {
+    let json_bytes = serde_json::to_vec(manifest)?;
+
+    // Compress with zstd level 3 (good balance of speed and ratio)
+    let compressed = encode_all(json_bytes.as_slice(), MANIFEST_ZSTD_LEVEL)?;
+
+    // Only use compressed form if it actually saves space
+    // (small manifests may not benefit from compression overhead)
+    if compressed.len() < json_bytes.len() {
+        debug_println!(
+            "MANIFEST: Compressed {} bytes → {} bytes ({:.1}x ratio)",
+            json_bytes.len(), compressed.len(),
+            json_bytes.len() as f64 / compressed.len() as f64
+        );
+        Ok(compressed)
+    } else {
+        debug_println!(
+            "MANIFEST: Compression not beneficial ({} raw, {} compressed). Using raw JSON.",
+            json_bytes.len(), compressed.len()
+        );
+        Ok(json_bytes)
+    }
+}
+```
+
+**Read path (split opening):**
+
+```rust
+use zstd::stream::decode_all;
+
+fn deserialize_manifest(bytes: &[u8]) -> Result<ParquetManifest> {
+    let json_bytes = if bytes.len() >= 4 && bytes[0..4] == ZSTD_MAGIC {
+        // Compressed manifest — decompress first
+        decode_all(bytes)?
+    } else {
+        // Raw JSON manifest (backwards compatible with pre-compression manifests)
+        bytes.to_vec()
+    };
+
+    let manifest: ParquetManifest = serde_json::from_slice(&json_bytes)?;
+
+    // Version check (unchanged from §19.11)
+    if manifest.version > SUPPORTED_MANIFEST_VERSION {
+        return Err(anyhow!(
+            "Parquet manifest version {} not supported. Maximum supported: {}. \
+             Upgrade tantivy4java to read this split.",
+            manifest.version, SUPPORTED_MANIFEST_VERSION
+        ));
+    }
+
+    Ok(manifest)
+}
+```
+
+**No version bump required.** The zstd magic byte detection is independent of the manifest's
+internal `"version"` field. A version 1 manifest can be either raw JSON or zstd-compressed.
+
+**Crate dependency:**
+
+```toml
+[dependencies]
+zstd = "0.13"  # Pure Rust zstd implementation
+```
+
+If the `zstd` crate is too heavyweight, `lz4_flex` (pure Rust LZ4) is an alternative with
+faster decompression but a lower ratio (~3–5× vs 6–10×). zstd is preferred because its
+dictionary-aware compression is particularly effective on repetitive JSON.
+
+#### Layer 2: Remove Redundant Per-Row-Group Per-Column Fields
+
+The current `ColumnChunkInfo` stores `compression` and `encoding` per row group per column.
+These fields are already available from the parquet footer (which we lazy-fetch for OffsetIndex
+in §19.8). They do not need to be repeated for every row group of every column.
+
+**Resolution**: Remove `compression` and `encoding` from `ColumnChunkInfo`. Hoist them to
+`column_mapping` as `typical_compression` / `typical_encoding` (once per column, not per RG).
+
+**Updated `ColumnChunkInfo` struct:**
+
+```rust
+/// Minimal per-row-group per-column entry — byte range only.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ColumnChunkInfo {
+    /// [start_offset, end_offset) byte range within the parquet file
+    pub byte_range: [u64; 2],
+
+    // Deprecated: hoisted to column_mapping as typical_compression.
+    // Present in older manifests, absent in newer ones.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compression: Option<String>,
+
+    // Deprecated: hoisted to column_mapping as typical_encoding.
+    // Present in older manifests, absent in newer ones.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encoding: Option<String>,
+}
+```
+
+**Updated `column_mapping` with hoisted metadata:**
+
+```json
+"column_mapping": {
+    "title": {
+        "parquet_type": "BYTE_ARRAY",
+        "logical_type": "String",
+        "tantivy_type": "Str",
+        "typical_compression": "SNAPPY",
+        "typical_encoding": "RLE_DICTIONARY"
+    },
+    "score": {
+        "parquet_type": "DOUBLE",
+        "logical_type": null,
+        "tantivy_type": "F64",
+        "typical_compression": "UNCOMPRESSED",
+        "typical_encoding": "PLAIN"
+    }
+}
+```
+
+The `typical_compression` and `typical_encoding` fields are informational — extracted from
+the first row group of the first file during indexing. Useful for capacity planning and
+debug/diagnostic output. NOT authoritative per row group — the actual per-RG values are
+determined by arrow-rs at decode time from parquet page headers.
+
+**Size impact of Layers 1 + 2 combined:**
+
+| Scenario | Raw JSON (before) | With Layers 1+2 |
+|----------|-------------------|-----------------|
+| 10 cols × 10 RGs × 1 file | ~5 KB | ~1–2 KB |
+| 100 cols × 50 RGs × 5 files | ~2.5 MB | ~100–170 KB |
+| 500 cols × 100 RGs × 10 files | ~50 MB | ~2–3 MB |
+| 1000 cols × 100 RGs × 10 files | ~100 MB | ~4–6 MB |
+
+The critical threshold is ~5 MB compressed. Below this, the manifest is a small fraction of
+the split bundle size (typically 65–600+ MB). Above 5 MB, evaluate Layer 3.
+
+**Updated manifest example (Layers 1 + 2 applied):**
+
+```json
+{
+  "version": 1,
+  "fast_field_mode": "hybrid",
+
+  "segment_row_ranges": [
+    { "segment_ord": 0, "row_offset": 0, "num_rows": 100000 }
+  ],
+
+  "parquet_files": [
+    {
+      "relative_path": "data/part-00000.parquet",
+      "row_offset": 0,
+      "num_rows": 50000,
+      "file_size_bytes": 12345678,
+      "has_offset_index": true,
+      "row_groups": [
+        {
+          "ordinal": 0,
+          "num_rows": 10000,
+          "row_offset_in_file": 0,
+          "columns": {
+            "title": { "byte_range": [1024, 51200] },
+            "score": { "byte_range": [51200, 55300] }
+          }
+        }
+      ]
+    }
+  ],
+
+  "total_rows": 100000,
+
+  "column_mapping": {
+    "title": {
+      "parquet_type": "BYTE_ARRAY",
+      "logical_type": "String",
+      "tantivy_type": "Str",
+      "typical_compression": "SNAPPY",
+      "typical_encoding": "RLE_DICTIONARY"
+    },
+    "score": {
+      "parquet_type": "DOUBLE",
+      "logical_type": null,
+      "tantivy_type": "F64",
+      "typical_compression": "UNCOMPRESSED",
+      "typical_encoding": "PLAIN"
+    }
+  },
+
+  "parquet_storage_config": {
+    "credential_type": "aws",
+    "note": "Actual credentials provided at query time"
+  }
+}
+```
+
+Note: `compression` and `encoding` are absent from row group column entries. The JSON is then
+zstd-compressed before embedding in the split bundle.
+
+#### Layer 3: Columnar Manifest Layout (Deferred — Extreme Scale)
+
+For deployments exceeding 500 columns or 100 row groups per file, a column-centric layout
+eliminates repeated column names across row groups.
+
+**Current (row-group-centric):**
+
+```json
+"row_groups": [
+  { "ordinal": 0, "columns": { "title": {"byte_range": [1024, 51200]}, "score": {"byte_range": [51200, 55300]} } },
+  { "ordinal": 1, "columns": { "title": {"byte_range": [60000, 110000]}, "score": {"byte_range": [110000, 114100]} } }
+]
+```
+
+**Columnar (compact positional form):**
+
+```json
+"column_byte_ranges": {
+  "title":  [[1024, 51200], [60000, 110000]],
+  "score":  [[51200, 55300], [110000, 114100]]
+}
+```
+
+Column name appears once; row group ordinal implicit from array index. ~15–20 bytes per entry.
+
+**Trade-off**: This is a manifest format change requiring version bump to 2. Version 1 readers
+cannot parse the columnar layout. **Do NOT implement initially** — Layers 1+2 reduce the
+worst case to ~2–3 MB. Reserve Layer 3 for a future version if real-world manifests exceed
+5 MB compressed.
+
+#### Layer 4: Binary Serialization (Deferred — Extreme Scale)
+
+Replace JSON with MessagePack (~50–60% of JSON size) or bincode (~40–50%). Sacrifices human
+readability and debuggability. zstd compression on JSON already achieves comparable sizes
+because it eliminates the key name redundancy. **Do NOT implement** — marginal ~20–30%
+further reduction does not justify the loss of readability.
+
+#### Implementation Notes for Merge
+
+The manifest merge logic in `combine_parquet_manifests()` (§18) operates on deserialized
+`ParquetManifest` structs. Compression/decompression is applied only at the I/O boundary:
+
+1. **Extract**: Read bytes → `deserialize_manifest()` (detects zstd, decompresses) → struct
+2. **Merge**: Combine structs (unchanged logic from §18)
+3. **Write**: struct → `serialize_manifest()` (JSON + zstd) → write to temp dir
+
+Layers 1 and 2 are transparent to the merge pipeline.
+
+---
+
+### 19.16 User-Specified Min/Max Statistics Fields (Important)
+
+**Gap**: Users want to perform split-level query pruning — skipping entire splits whose data
+is outside a query's range. To do this, they need per-field min/max statistics computed at
+indexing time.
+
+**Decision**: Allow users to declare statistics fields at indexing time. Compute min/max/null_count
+from actual row data during the indexing loop (we already read every row, so this is trivial
+and more reliable than parquet column statistics, which are frequently missing). Return the
+statistics to the Java caller via `SplitMetadata` — the caller is responsible for storing and
+using them (e.g., in a metadata database for split-level pruning). Statistics are **not** stored
+in the manifest.
+
+#### Design Rationale: Statistics Outside the Manifest
+
+Statistics are returned to the Java caller rather than embedded in the manifest because:
+1. **Consumer-owned storage** — the caller stores statistics in their own metadata system
+   (database, catalog, etc.) alongside other split metadata they already manage
+2. **Flexible aggregation** — the caller can merge statistics across splits as needed for
+   their specific pruning strategy, without manifest format changes
+3. **No manifest bloat** — keeps the manifest focused on I/O routing (byte ranges, row offsets)
+4. **No merge complexity** — merge operations don't need to reconcile statistics from source
+   splits; the caller re-derives statistics from their metadata store if needed
+
+#### Java API Addition
+
+**`ParquetCompanionConfig` extension:**
+
+```java
+public class ParquetCompanionConfig {
+    // ... existing fields ...
+
+    // Fields for which min/max statistics will be computed during indexing.
+    private List<String> statisticsFields = new ArrayList<>();
+
+    // Max characters for Str field min/max values (default: 16).
+    // Truncation preserves pruning correctness (see string truncation semantics below).
+    private int statisticsTruncateLength = 16;
+
+    /**
+     * Declare fields for which min/max statistics should be computed at indexing
+     * time. Statistics are returned in SplitMetadata for the caller to store
+     * and use for split-level query pruning.
+     *
+     * Supported types: I64, F64, DateTime, Str, Bool.
+     * Json and Bytes types are rejected at configuration time.
+     *
+     * @param fields Field names to track. Must exist in the schema.
+     */
+    public ParquetCompanionConfig withStatisticsFields(String... fields) {
+        this.statisticsFields.addAll(Arrays.asList(fields));
+        return this;
+    }
+
+    /**
+     * Set the maximum character length for Str field min/max values.
+     * Default: 16. Min values are truncated (safe — truncated ≤ actual).
+     * Max values are truncated and ceiling-adjusted (safe — truncated ≥ actual).
+     */
+    public ParquetCompanionConfig withStatisticsTruncateLength(int length) {
+        this.statisticsTruncateLength = length;
+        return this;
+    }
+}
+```
+
+**`ColumnStatistics` value class:**
+
+```java
+/**
+ * Min/max/null_count statistics for a single column within a split.
+ * Computed at indexing time and returned to the caller for storage and use
+ * in split-level query pruning.
+ */
+public class ColumnStatistics {
+    private final String fieldName;
+    private final String fieldType;  // "I64", "F64", "DateTime", "Str", "Bool"
+
+    private final Long minLong;       // I64 columns
+    private final Long maxLong;
+    private final Double minDouble;   // F64 columns
+    private final Double maxDouble;
+    private final String minString;   // Str columns (truncated)
+    private final String maxString;   // Str columns (truncated + ceiling-adjusted)
+    private final Long minTimestampMicros;  // DateTime columns
+    private final Long maxTimestampMicros;
+    private final Boolean minBool;    // Bool columns
+    private final Boolean maxBool;
+    private final long nullCount;
+
+    // Typed accessors
+    public Long getMinLong() { return minLong; }
+    public Long getMaxLong() { return maxLong; }
+    public Double getMinDouble() { return minDouble; }
+    public Double getMaxDouble() { return maxDouble; }
+    public String getMinString() { return minString; }
+    public String getMaxString() { return maxString; }
+    public Long getMinTimestampMicros() { return minTimestampMicros; }
+    public Long getMaxTimestampMicros() { return maxTimestampMicros; }
+    public Boolean getMinBool() { return minBool; }
+    public Boolean getMaxBool() { return maxBool; }
+    public long getNullCount() { return nullCount; }
+    public String getFieldType() { return fieldType; }
+
+    /**
+     * Check whether a numeric range [queryMin, queryMax] overlaps with this
+     * column's [min, max]. Returns true if the split should be searched,
+     * false if the split can be pruned. Returns true (do not prune) if
+     * statistics are unavailable.
+     */
+    public boolean overlapsRange(double queryMin, double queryMax) {
+        if (minDouble != null && maxDouble != null) {
+            return !(maxDouble < queryMin || minDouble > queryMax);
+        }
+        if (minLong != null && maxLong != null) {
+            return !(maxLong < (long) queryMin || minLong > (long) queryMax);
+        }
+        return true;  // Cannot determine — do not prune
+    }
+
+    /**
+     * Check whether a timestamp range overlaps. Both bounds are microseconds
+     * since epoch.
+     */
+    public boolean overlapsTimestampRange(long queryMinMicros, long queryMaxMicros) {
+        if (minTimestampMicros != null && maxTimestampMicros != null) {
+            return !(maxTimestampMicros < queryMinMicros
+                     || minTimestampMicros > queryMaxMicros);
+        }
+        return true;
+    }
+}
+```
+
+**`SplitMetadata` extension:**
+
+```java
+public static class SplitMetadata {
+    // ... existing fields ...
+
+    // Per-column statistics computed at indexing time.
+    // Caller is responsible for storing these externally for split-level pruning.
+    private final Map<String, ColumnStatistics> columnStatistics;
+
+    /**
+     * Returns per-column statistics for fields declared via
+     * withStatisticsFields(). Empty map if none were declared.
+     * The caller should persist these statistics externally (e.g., in a
+     * metadata database) for use in split-level query pruning.
+     */
+    public Map<String, ColumnStatistics> getColumnStatistics() {
+        return Collections.unmodifiableMap(columnStatistics);
+    }
+}
+```
+
+#### Statistics Computation at Indexing Time
+
+Statistics are always computed from actual row data during the indexing loop. We already read
+every row to index it, so observing min/max/null_count adds negligible overhead. This approach
+is more reliable than parquet column statistics, which are frequently missing, and provides a
+single code path for both parquet and non-parquet sources.
+
+**Rust struct for JNI return (not stored in manifest):**
+
+```rust
+/// Per-column statistics computed during indexing.
+/// Returned to Java via JNI, NOT stored in the manifest.
+#[derive(Clone, Debug)]
+pub struct ColumnStatisticsResult {
+    pub field_type: String,  // "I64", "F64", "DateTime", "Str", "Bool"
+    pub min: serde_json::Value,
+    pub max: serde_json::Value,
+    pub null_count: u64,
+}
+```
+
+**Accumulator (runs inline during the indexing loop):**
+
+```rust
+/// Accumulates min/max/null_count for a single column during indexing.
+struct StatisticsAccumulator {
+    field_type: String,
+    truncate_length: usize,
+    min_i64: Option<i64>,
+    max_i64: Option<i64>,
+    min_f64: Option<f64>,
+    max_f64: Option<f64>,
+    min_str: Option<String>,
+    max_str: Option<String>,
+    min_bool: Option<bool>,
+    max_bool: Option<bool>,
+    null_count: u64,
+}
+
+impl StatisticsAccumulator {
+    fn new(field_type: &str, truncate_length: usize) -> Self {
+        Self {
+            field_type: field_type.to_string(),
+            truncate_length,
+            min_i64: None, max_i64: None,
+            min_f64: None, max_f64: None,
+            min_str: None, max_str: None,
+            min_bool: None, max_bool: None,
+            null_count: 0,
+        }
+    }
+
+    /// Called for each row value during the indexing loop.
+    fn observe_i64(&mut self, val: i64) {
+        self.min_i64 = Some(self.min_i64.map_or(val, |v| v.min(val)));
+        self.max_i64 = Some(self.max_i64.map_or(val, |v| v.max(val)));
+    }
+
+    fn observe_f64(&mut self, val: f64) {
+        if val.is_nan() { return; }  // NaN excluded — not comparable
+        self.min_f64 = Some(self.min_f64.map_or(val, |v| v.min(val)));
+        self.max_f64 = Some(self.max_f64.map_or(val, |v| v.max(val)));
+    }
+
+    fn observe_str(&mut self, val: &str) {
+        // Truncate for min: simple prefix truncation (truncated ≤ actual)
+        let truncated_for_min = if val.len() > self.truncate_length {
+            &val[..self.truncate_length]
+        } else {
+            val
+        };
+        self.min_str = Some(self.min_str.as_ref()
+            .map_or(truncated_for_min.to_string(),
+                    |v| std::cmp::min(v.clone(), truncated_for_min.to_string())));
+
+        // Truncate for max: prefix truncation + ceiling adjustment (truncated ≥ actual)
+        let truncated_for_max = if val.len() > self.truncate_length {
+            truncate_ceiling(&val[..self.truncate_length])
+        } else {
+            val.to_string()
+        };
+        self.max_str = Some(self.max_str.as_ref()
+            .map_or(truncated_for_max.clone(),
+                    |v| std::cmp::max(v.clone(), truncated_for_max)));
+    }
+
+    fn observe_bool(&mut self, val: bool) {
+        self.min_bool = Some(self.min_bool.map_or(val, |v| v && val));
+        self.max_bool = Some(self.max_bool.map_or(val, |v| v || val));
+    }
+
+    fn observe_null(&mut self) {
+        self.null_count += 1;
+    }
+
+    fn finalize(self) -> Option<ColumnStatisticsResult> {
+        match self.field_type.as_str() {
+            "I64" | "DateTime" => {
+                let min = self.min_i64?;
+                let max = self.max_i64?;
+                Some(ColumnStatisticsResult {
+                    field_type: self.field_type,
+                    min: serde_json::Value::Number(min.into()),
+                    max: serde_json::Value::Number(max.into()),
+                    null_count: self.null_count,
+                })
+            }
+            "F64" => {
+                let min = self.min_f64?;
+                let max = self.max_f64?;
+                Some(ColumnStatisticsResult {
+                    field_type: self.field_type,
+                    min: serde_json::json!(min),
+                    max: serde_json::json!(max),
+                    null_count: self.null_count,
+                })
+            }
+            "Str" => {
+                let min = self.min_str?;
+                let max = self.max_str?;
+                Some(ColumnStatisticsResult {
+                    field_type: self.field_type,
+                    min: serde_json::Value::String(min),
+                    max: serde_json::Value::String(max),
+                    null_count: self.null_count,
+                })
+            }
+            "Bool" => {
+                let min = self.min_bool?;
+                let max = self.max_bool?;
+                Some(ColumnStatisticsResult {
+                    field_type: self.field_type,
+                    min: serde_json::Value::Bool(min),
+                    max: serde_json::Value::Bool(max),
+                    null_count: self.null_count,
+                })
+            }
+            _ => None,
+        }
+    }
+}
+```
+
+#### String Truncation Semantics
+
+String min/max values are truncated to `statisticsTruncateLength` characters (default: 16)
+to keep the returned statistics compact. Truncation preserves pruning correctness: the
+truncated range always **contains** the actual range (may be slightly wider, causing fewer
+prunes but never false negatives).
+
+**Min value truncation**: Simple prefix truncation. A prefix is always ≤ the full string in
+lexicographic order, so `truncated_min ≤ actual_min`. Safe.
+
+**Max value truncation**: Prefix truncation + ceiling adjustment. Increment the last character
+of the truncated prefix so that `truncated_max ≥ actual_max`. This ensures no value in the
+actual data exceeds the truncated max.
+
+```rust
+/// Truncates a string and adjusts upward to create a ceiling bound.
+/// The returned string is guaranteed to be ≥ any string starting with `prefix`.
+///
+/// Example: "electronics" truncated to 4 → "elec" → ceiling "eled"
+///          (any string starting with "elec" is ≤ "eled")
+fn truncate_ceiling(prefix: &str) -> String {
+    let mut chars: Vec<char> = prefix.chars().collect();
+    // Walk backwards to find a character we can increment
+    while let Some(last) = chars.last() {
+        if *last < char::MAX {
+            let len = chars.len();
+            chars[len - 1] = char::from_u32(*last as u32 + 1).unwrap_or(char::MAX);
+            return chars.into_iter().collect();
+        }
+        chars.pop();  // Last char is MAX, carry to previous
+    }
+    // All chars were MAX — return a sentinel that sorts after everything
+    // In practice this never happens with real string data
+    prefix.to_string()
+}
+```
+
+**Examples:**
+
+| Actual Value | Truncate Length | Min (truncated) | Max (ceiling-adjusted) |
+|-------------|----------------|-----------------|----------------------|
+| `"electronics and gadgets"` | 16 | `"electronics and"` | `"electronics ane"` |
+| `"toys"` | 16 | `"toys"` (≤ 16 chars, no truncation) | `"toys"` |
+| `"a]very_long_category_name"` | 8 | `"a]very_l"` | `"a]very_m"` |
+
+#### Type Handling Table
+
+| Column Type | `field_type` | Value type in Java | Comparison | Notes |
+|-------------|-------------|-------------------|------------|-------|
+| I64 | `"I64"` | `Long` | Numeric | Standard integer comparison |
+| F64 | `"F64"` | `Double` | Numeric | NaN excluded from stats |
+| DateTime | `"DateTime"` | `Long` (micros) | Numeric | Microseconds since Unix epoch |
+| Str | `"Str"` | `String` | Lexicographic | Truncated to first N chars (default 16) |
+| Bool | `"Bool"` | `Boolean` | Boolean | Limited pruning utility (warning logged) |
+| Json | — | — | — | Not supported (no meaningful ordering) |
+| Bytes | — | — | — | Not supported (no meaningful ordering) |
+
+#### Validation Rules
+
+1. **Fields must exist in schema** — fail at config time with available field names listed.
+2. **Json and Bytes types rejected** — error at config time.
+3. **Bool fields produce warning** — min=false/max=true for mixed splits has limited pruning
+   utility. Warning is non-fatal.
+4. **NaN values in F64 excluded** — NaN is not comparable. If column contains only NaN,
+   statistics entry is omitted.
+5. **Empty columns produce no statistics** — if all values are null, entry is omitted.
+6. **`statisticsTruncateLength` must be ≥ 1** — validated at config time.
+
+```rust
+fn validate_statistics_fields(
+    fields: &[String],
+    column_mapping: &HashMap<String, ColumnMappingEntry>,
+) -> Result<()> {
+    for field_name in fields {
+        let mapping = column_mapping.get(field_name).ok_or_else(|| {
+            anyhow!(
+                "Statistics field '{}' not found in schema. Available fields: {:?}",
+                field_name, column_mapping.keys().collect::<Vec<_>>()
+            )
+        })?;
+        match mapping.tantivy_type.as_str() {
+            "Bool" => {
+                debug_println!(
+                    "STATS_WARN: Boolean field '{}' has limited pruning utility.",
+                    field_name
+                );
+            }
+            "Json" | "Bytes" => {
+                return Err(anyhow!(
+                    "Statistics field '{}' has type '{}' which does not support \
+                     min/max statistics. Supported: I64, F64, DateTime, Str, Bool.",
+                    field_name, mapping.tantivy_type
+                ));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+```
+
+#### End-to-End Usage Example
+
+```java
+// 1. At indexing time: declare statistics fields and create split
+ParquetCompanionConfig config = new ParquetCompanionConfig()
+    .withTableRoot("s3://data-lake/tables/sales/")
+    .withFastFieldMode(FastFieldMode.HYBRID)
+    .withStatisticsFields("price", "timestamp", "category")
+    .withStatisticsTruncateLength(16)  // default
+    .withParquetStorage(new ParquetStorageConfig()
+        .withAwsCredentials("key", "secret")
+        .withAwsRegion("us-east-1"));
+
+QuickwitSplit.SplitMetadata result = QuickwitSplit.createFromParquet(
+    parquetFiles, "/tmp/output/sales.split", splitConfig, config);
+
+// 2. Retrieve computed statistics from the result
+Map<String, ColumnStatistics> stats = result.getColumnStatistics();
+
+ColumnStatistics priceStats = stats.get("price");
+System.out.println("Price range: " + priceStats.getMinDouble()
+                   + " to " + priceStats.getMaxDouble());
+System.out.println("Price nulls: " + priceStats.getNullCount());
+
+ColumnStatistics catStats = stats.get("category");
+System.out.println("Category range: " + catStats.getMinString()
+                   + " to " + catStats.getMaxString());
+
+// 3. Store statistics externally (caller's responsibility)
+metadataDb.saveSplitStatistics(result.getSplitId(), stats);
+
+// 4. At query time: use stored statistics for split-level pruning
+double queryMinPrice = 50.0;
+double queryMaxPrice = 200.0;
+
+for (SplitInfo split : metadataDb.listSplits("sales-index")) {
+    Map<String, ColumnStatistics> splitStats = metadataDb.getSplitStatistics(split.getId());
+
+    ColumnStatistics ps = splitStats.get("price");
+    if (ps != null && !ps.overlapsRange(queryMinPrice, queryMaxPrice)) {
+        continue;  // Skip — this split's price range doesn't overlap
+    }
+
+    // Search this split
+    try (SplitSearcher searcher = cacheManager.createSplitSearcher(split.getUri())) {
+        SearchResult searchResult = searcher.search(query, 10);
+    }
+}
+```
+
+### 19.17 Parquet Name-Mapping Mode (Important)
+
+**Gap**: Some parquet files use **name-mapping mode** (also called "field ID mapping"), where
+the physical column names in the parquet file (e.g., `col_0`, `col_1`, `_c0`, `_c1`, or
+numeric IDs like `1`, `2`) do not match the logical schema column names (e.g., `price`,
+`timestamp`, `category`). This is common in:
+
+- **Apache Iceberg** tables — Iceberg uses field IDs in parquet files and maps them to logical
+  names via a schema stored in the Iceberg catalog metadata. The parquet file's key-value
+  metadata may contain an `iceberg.schema` entry with the full schema including field IDs.
+- **Apache Hive** tables with schema evolution — columns may be renamed in the metastore
+  without rewriting parquet files, so physical and logical names diverge.
+- **Spark** writes with `spark.sql.parquet.fieldId.write.enabled` — Spark writes field IDs
+  into the parquet schema and may use positional or ID-based column matching.
+
+**Problem**: Our current schema auto-derivation (§12) reads column names directly from the
+parquet file's schema. If the file uses name-mapping mode, we would index columns under
+their physical names (e.g., `col_0`) instead of their logical names (e.g., `price`). This
+means:
+1. The tantivy index would have fields like `col_0` instead of `price`
+2. Queries against logical field names would fail
+3. The manifest's `column_mapping` would use physical names, breaking the 1:1 name match
+   for aggregation field discovery (§19.7)
+
+**Decision**: Support both explicit Java-provided mappings and auto-detection from Iceberg
+metadata. Map by field ID (not just physical name). Require every column to be mapped when
+a mapping is active. Store physical column ordinals in the manifest for OffsetIndex lookup.
+Require a single mapping for all files in a split.
+
+#### Resolution Strategy: Two-Tier Name Resolution
+
+Name resolution operates in two tiers, in priority order:
+
+1. **Explicit Java-provided mapping** — the caller passes a field ID → logical name mapping
+   via `ParquetCompanionConfig`. This takes highest priority.
+2. **Auto-detection from `iceberg.schema`** — if no explicit mapping is provided, check the
+   parquet file's key-value metadata for an `iceberg.schema` entry. If found, parse the
+   Iceberg schema JSON and build the field ID → logical name mapping automatically.
+3. **No mapping (default)** — if neither is available, use physical column names as-is
+   (existing behavior).
+
+#### Java API
+
+**`ParquetCompanionConfig` additions:**
+
+```java
+public class ParquetCompanionConfig {
+    // ... existing fields ...
+
+    // Field ID → logical column name mapping for name-mapping mode.
+    // Key: parquet field ID (integer, from ColumnDescriptor.id())
+    // Value: logical column name for the tantivy index (e.g., "price")
+    // If empty and autoDetectNameMapping is true, mapping is derived from
+    // iceberg.schema metadata in the parquet file.
+    private Map<Integer, String> fieldIdMapping = new HashMap<>();
+
+    // Whether to auto-detect name-mapping mode from parquet file metadata.
+    // When true, checks for iceberg.schema key-value metadata and builds
+    // the field ID mapping automatically. Default: true.
+    private boolean autoDetectNameMapping = true;
+
+    /**
+     * Provide an explicit field ID to logical name mapping.
+     * Field IDs are integer identifiers stored in parquet schema metadata
+     * (e.g., Iceberg field IDs). When provided, this takes priority over
+     * auto-detection from iceberg.schema metadata.
+     *
+     * Every physical column in the parquet file MUST have a mapping entry.
+     * Unmapped columns cause an error at indexing time.
+     *
+     * @param fieldId The parquet field ID (from schema metadata)
+     * @param logicalName The column name to use in the tantivy index
+     */
+    public ParquetCompanionConfig withFieldIdMapping(int fieldId, String logicalName) {
+        this.fieldIdMapping.put(fieldId, logicalName);
+        return this;
+    }
+
+    /**
+     * Provide a complete field ID to logical name mapping.
+     * @param mapping Map of parquet field IDs to logical tantivy field names
+     */
+    public ParquetCompanionConfig withFieldIdMappings(Map<Integer, String> mapping) {
+        this.fieldIdMapping.putAll(mapping);
+        return this;
+    }
+
+    /**
+     * Enable or disable auto-detection of name-mapping mode from parquet
+     * file metadata (iceberg.schema). Default: true.
+     *
+     * When enabled and no explicit fieldIdMapping is provided, the system
+     * checks the first parquet file's key-value metadata for an
+     * iceberg.schema entry and builds the mapping automatically.
+     */
+    public ParquetCompanionConfig withAutoDetectNameMapping(boolean enabled) {
+        this.autoDetectNameMapping = enabled;
+        return this;
+    }
+}
+```
+
+**Usage with explicit Iceberg mapping (caller provides):**
+
+```java
+// Caller reads field IDs from Iceberg catalog
+Map<Integer, String> icebergMapping = icebergTable.schema().columns().stream()
+    .collect(Collectors.toMap(
+        col -> col.fieldId(),     // Parquet field ID (integer)
+        col -> col.name()         // Logical column name
+    ));
+
+ParquetCompanionConfig config = new ParquetCompanionConfig()
+    .withTableRoot("s3://warehouse/db/sales/data/")
+    .withFieldIdMappings(icebergMapping)
+    .withFastFieldMode(FastFieldMode.HYBRID);
+```
+
+**Usage with auto-detection (no explicit mapping needed):**
+
+```java
+// Auto-detection reads iceberg.schema from the parquet file's key-value metadata
+ParquetCompanionConfig config = new ParquetCompanionConfig()
+    .withTableRoot("s3://warehouse/db/sales/data/")
+    .withAutoDetectNameMapping(true)  // default — can be omitted
+    .withFastFieldMode(FastFieldMode.HYBRID);
+
+// If the parquet file contains iceberg.schema metadata, the mapping is
+// built automatically. If not, physical column names are used as-is.
+```
+
+#### Auto-Detection from `iceberg.schema`
+
+Iceberg writes a JSON-encoded schema into the parquet file's key-value metadata under the
+key `iceberg.schema`. This schema contains field IDs and logical names for all columns.
+
+**Example `iceberg.schema` value (from parquet key-value metadata):**
+
+```json
+{
+  "type": "struct",
+  "schema-id": 0,
+  "fields": [
+    {"id": 1, "name": "price", "required": false, "type": "double"},
+    {"id": 2, "name": "timestamp", "required": false, "type": "timestamptz"},
+    {"id": 3, "name": "category", "required": false, "type": "string"},
+    {"id": 4, "name": "product_id", "required": true, "type": "long"}
+  ]
+}
+```
+
+**Rust auto-detection logic:**
+
+```rust
+use serde::Deserialize;
+
+#[derive(Deserialize)]
+struct IcebergSchema {
+    fields: Vec<IcebergField>,
+}
+
+#[derive(Deserialize)]
+struct IcebergField {
+    id: i32,
+    name: String,
+    // Other fields (type, required, etc.) ignored for name mapping purposes
+}
+
+/// Attempt to extract field ID → logical name mapping from Iceberg metadata.
+/// Returns None if no iceberg.schema is found or if parsing fails.
+fn auto_detect_iceberg_mapping(
+    metadata: &parquet::file::metadata::FileMetaData,
+) -> Option<HashMap<i32, String>> {
+    let kv_metadata = metadata.key_value_metadata()?;
+
+    let iceberg_schema_json = kv_metadata.iter()
+        .find(|kv| kv.key == "iceberg.schema")
+        .and_then(|kv| kv.value.as_ref())?;
+
+    let schema: IcebergSchema = serde_json::from_str(iceberg_schema_json).ok()?;
+
+    let mapping: HashMap<i32, String> = schema.fields.iter()
+        .map(|f| (f.id, f.name.clone()))
+        .collect();
+
+    if mapping.is_empty() {
+        None
+    } else {
+        debug_println!(
+            "NAME_MAP: Auto-detected Iceberg schema with {} fields from parquet metadata",
+            mapping.len()
+        );
+        Some(mapping)
+    }
+}
+```
+
+#### Name Resolution During Schema Derivation
+
+The mapping is resolved and applied at the earliest point — during schema auto-derivation
+from the parquet file. All downstream code (indexing, manifest, aggregation field discovery)
+sees only logical names.
+
+```rust
+/// Resolves the field ID → logical name mapping from explicit config or auto-detection.
+/// Returns None if no mapping is needed (physical names are already logical names).
+fn resolve_name_mapping(
+    metadata: &parquet::file::metadata::FileMetaData,
+    explicit_mapping: &HashMap<i32, String>,  // From Java config
+    auto_detect: bool,
+) -> Result<Option<HashMap<i32, String>>> {
+    // Priority 1: Explicit mapping from Java caller
+    if !explicit_mapping.is_empty() {
+        debug_println!("NAME_MAP: Using explicit field ID mapping ({} entries)",
+                       explicit_mapping.len());
+        return Ok(Some(explicit_mapping.clone()));
+    }
+
+    // Priority 2: Auto-detect from iceberg.schema metadata
+    if auto_detect {
+        if let Some(mapping) = auto_detect_iceberg_mapping(metadata) {
+            return Ok(Some(mapping));
+        }
+    }
+
+    // Priority 3: No mapping — use physical names as-is
+    Ok(None)
+}
+
+/// Derives tantivy schema from parquet schema with name mapping applied.
+/// When a mapping is active, EVERY column must have a mapping entry.
+fn derive_tantivy_schema(
+    parquet_schema: &SchemaDescriptor,
+    name_mapping: Option<&HashMap<i32, String>>,  // field_id → logical_name
+    skip_fields: &HashSet<String>,
+) -> Result<(tantivy::Schema, Vec<ColumnOrdinalMapping>)> {
+    let mut builder = tantivy::SchemaBuilder::new();
+    let mut ordinal_mappings = Vec::new();
+
+    for (col_ordinal, col) in parquet_schema.columns().iter().enumerate() {
+        let physical_name = col.name();
+        let field_id = col.id();  // parquet field ID, if present
+
+        // Resolve logical name
+        let logical_name = if let Some(mapping) = name_mapping {
+            // Mapping is active — every column MUST be mapped
+            let id = field_id.ok_or_else(|| anyhow!(
+                "Column '{}' (ordinal {}) has no field ID in parquet schema, \
+                 but name mapping requires field IDs. Ensure parquet files \
+                 are written with field IDs enabled.",
+                physical_name, col_ordinal
+            ))?;
+
+            mapping.get(&id).ok_or_else(|| anyhow!(
+                "Column '{}' (field_id={}, ordinal={}) has no entry in the \
+                 name mapping. When name mapping is active, every column must \
+                 be mapped. Available mappings: {:?}",
+                physical_name, id, col_ordinal,
+                mapping.keys().collect::<Vec<_>>()
+            ))?
+            .as_str()
+        } else {
+            // No mapping — use physical name directly
+            physical_name
+        };
+
+        // Skip fields use logical names
+        if skip_fields.contains(logical_name) {
+            continue;
+        }
+
+        let tantivy_type = map_parquet_to_tantivy(col.physical_type(), col.logical_type());
+        builder.add_field(logical_name, tantivy_type);
+
+        // Record the physical ordinal for this logical name
+        ordinal_mappings.push(ColumnOrdinalMapping {
+            logical_name: logical_name.to_string(),
+            physical_ordinal: col_ordinal as u32,
+            field_id: field_id,
+        });
+    }
+
+    Ok((builder.build(), ordinal_mappings))
+}
+```
+
+#### Physical Column Ordinal in Manifest
+
+At query time, the parquet footer's `OffsetIndex` references columns by their physical
+ordinal position (0-based index in the parquet schema). Since the manifest stores everything
+under logical names, we need to bridge the gap. The `column_mapping` is extended with a
+`physical_ordinal` field.
+
+**Updated `column_mapping` with physical ordinal:**
+
+```json
+"column_mapping": {
+    "price": {
+        "parquet_type": "DOUBLE",
+        "logical_type": null,
+        "tantivy_type": "F64",
+        "typical_compression": "UNCOMPRESSED",
+        "typical_encoding": "PLAIN",
+        "physical_ordinal": 0,
+        "field_id": 1
+    },
+    "timestamp": {
+        "parquet_type": "INT64",
+        "logical_type": "Timestamp(MICROS,UTC)",
+        "tantivy_type": "DateTime",
+        "typical_compression": "SNAPPY",
+        "typical_encoding": "RLE_DICTIONARY",
+        "physical_ordinal": 1,
+        "field_id": 2
+    },
+    "category": {
+        "parquet_type": "BYTE_ARRAY",
+        "logical_type": "String",
+        "tantivy_type": "Str",
+        "typical_compression": "SNAPPY",
+        "typical_encoding": "RLE_DICTIONARY",
+        "physical_ordinal": 2,
+        "field_id": 3
+    }
+}
+```
+
+**Updated Rust struct:**
+
+```rust
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ColumnMappingEntry {
+    pub parquet_type: String,
+    pub logical_type: Option<String>,
+    pub tantivy_type: String,
+
+    // Hoisted from per-RG ColumnChunkInfo (§19.15 Layer 2)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub typical_compression: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub typical_encoding: Option<String>,
+
+    /// Physical column ordinal in the parquet file schema (0-based).
+    /// Used for OffsetIndex lookup at query time — the footer's OffsetIndex
+    /// references columns by ordinal, not by name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub physical_ordinal: Option<u32>,
+
+    /// Parquet field ID, if present. Used for name-mapping mode.
+    /// Absent for parquet files that don't use field IDs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub field_id: Option<i32>,
+}
+```
+
+**Usage at query time for OffsetIndex lookup:**
+
+```rust
+async fn get_or_fetch_offset_index(
+    &self,
+    file_entry: &ParquetFileEntry,
+    logical_col_name: &str,
+) -> Result<Vec<PageLocation>> {
+    // ... cache check omitted ...
+
+    let footer = self.fetch_parquet_footer(file_entry).await?;
+    let metadata = parse_parquet_metadata(&footer)?;
+
+    // Use physical_ordinal from column_mapping instead of name-based lookup
+    let col_mapping = self.manifest.column_mapping.get(logical_col_name)
+        .ok_or_else(|| anyhow!("Column '{}' not in manifest", logical_col_name))?;
+
+    let col_idx = col_mapping.physical_ordinal
+        .map(|ord| ord as usize)
+        .unwrap_or_else(|| {
+            // Fallback for old manifests without physical_ordinal:
+            // look up by name in the parquet schema
+            metadata.file_metadata().schema_descr()
+                .columns().iter()
+                .position(|c| c.name() == logical_col_name)
+                .unwrap_or(0)
+        });
+
+    let offset_index = metadata.offset_index()
+        .and_then(|oi| oi.get(0))  // row group (adjust for multi-RG)
+        .and_then(|rg_oi| rg_oi.get(col_idx))
+        .ok_or_else(|| anyhow!("No OffsetIndex for column '{}' (ordinal {})",
+                                logical_col_name, col_idx))?;
+
+    let page_locations = offset_index.page_locations().clone();
+    self.offset_index_cache.insert(cache_key, page_locations.clone());
+    Ok(page_locations)
+}
+```
+
+#### Strict Validation: Every Column Must Be Mapped
+
+When a name mapping is active (either explicit or auto-detected), every physical column in
+the parquet file must have a corresponding entry. This prevents silently indexing columns
+under their physical names (which would create an inconsistent index).
+
+```rust
+fn validate_name_mapping_completeness(
+    parquet_schema: &SchemaDescriptor,
+    mapping: &HashMap<i32, String>,
+    skip_fields: &HashSet<String>,
+) -> Result<()> {
+    let mut unmapped = Vec::new();
+
+    for col in parquet_schema.columns() {
+        let field_id = col.id().ok_or_else(|| anyhow!(
+            "Column '{}' has no field ID. Name mapping requires all columns \
+             to have field IDs in the parquet schema.",
+            col.name()
+        ))?;
+
+        if let Some(logical_name) = mapping.get(&field_id) {
+            if skip_fields.contains(logical_name.as_str()) {
+                continue;  // Skipped fields don't need validation
+            }
+        } else {
+            unmapped.push(format!("{}(field_id={})", col.name(), field_id));
+        }
+    }
+
+    if !unmapped.is_empty() {
+        return Err(anyhow!(
+            "Name mapping is incomplete. {} columns have no mapping entry: [{}]. \
+             When name mapping is active, every column must be mapped \
+             (or listed in skipFields).",
+            unmapped.len(),
+            unmapped.join(", ")
+        ));
+    }
+
+    Ok(())
+}
+```
+
+#### Single Mapping for All Files in a Split
+
+All parquet files in a split must use the same field ID → logical name mapping. This is
+validated at indexing time when processing multiple files:
+
+```rust
+fn validate_consistent_mapping_across_files(
+    parquet_files: &[ParquetFileMetadata],
+    mapping: &HashMap<i32, String>,
+) -> Result<()> {
+    // The first file's schema is used as the reference (already validated
+    // by schema validation in §12). For each subsequent file, verify that
+    // the same field IDs exist and map to the same logical names.
+    let first_file = &parquet_files[0];
+    let first_schema = &first_file.schema;
+
+    for (idx, file) in parquet_files.iter().enumerate().skip(1) {
+        for col in file.schema.columns() {
+            if let Some(field_id) = col.id() {
+                // Check that this field ID exists in the mapping
+                if !mapping.contains_key(&field_id) {
+                    return Err(anyhow!(
+                        "File '{}' (index {}) has column '{}' with field_id={} \
+                         which is not in the name mapping. All files in a split \
+                         must use the same mapping.",
+                        file.path, idx, col.name(), field_id
+                    ));
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+```
+
+If a user needs to combine parquet files with different schema evolutions (different field
+ID sets), they should create separate splits and merge them — the merge will combine the
+manifests while preserving each file's byte range data.
+
+#### Merge Handling
+
+When merging splits that use name mapping, the merged manifest inherits the `column_mapping`
+with `physical_ordinal` and `field_id` from the source splits. Merge validation (§18)
+already requires consistent schemas across source splits, which implicitly ensures
+consistent name mappings.
+
+The `physical_ordinal` values are per-file (they reference column positions within each
+parquet file), and since merge preserves the `parquet_files` array with per-file byte
+ranges, the ordinals remain valid. No adjustment is needed — unlike `row_offset` (which
+must be adjusted during merge), `physical_ordinal` is file-local and unchanged.
+
+```rust
+// In combine_parquet_manifests():
+// column_mapping is taken from the first source manifest (all must be consistent).
+// physical_ordinal and field_id values are preserved as-is.
+merged_manifest.column_mapping = first_manifest.column_mapping.clone();
+```
+
+**Merge validation addition:**
+
+```rust
+// Verify consistent column_mapping across all source splits
+for (idx, manifest) in source_manifests.iter().enumerate().skip(1) {
+    for (col_name, col_entry) in &manifest.column_mapping {
+        if let Some(first_entry) = first_manifest.column_mapping.get(col_name) {
+            if col_entry.physical_ordinal != first_entry.physical_ordinal {
+                return Err(anyhow!(
+                    "Cannot merge splits with different physical_ordinal for \
+                     column '{}': split 0 has ordinal {:?}, split {} has {:?}. \
+                     All splits must reference parquet files with the same schema.",
+                    col_name, first_entry.physical_ordinal, idx,
+                    col_entry.physical_ordinal
+                ));
+            }
+        }
+    }
+}
+```
+
+#### Testing Requirements
+
+1. **Explicit mapping test**: Create a parquet file with non-logical column names, provide
+   explicit field ID → name mapping, verify index uses logical names.
+2. **Auto-detection test**: Create a parquet file with `iceberg.schema` key-value metadata,
+   verify mapping is auto-detected and applied correctly.
+3. **Strict validation test**: Verify that incomplete mappings (missing columns) produce
+   clear errors listing the unmapped columns.
+4. **OffsetIndex test**: Create a split with name mapping, perform a surgical page-level
+   retrieval, verify the correct physical ordinal is used for OffsetIndex lookup.
+5. **Multi-file consistency test**: Create a split from multiple parquet files, verify that
+   all files are validated against the same mapping.
+6. **Merge test**: Merge two splits with name mapping, verify the merged manifest preserves
+   `physical_ordinal` and `field_id` correctly.
+7. **No-mapping fallback test**: Verify that parquet files without field IDs or
+   `iceberg.schema` metadata continue to work with physical column names (existing behavior).
+8. **Skip fields with mapping test**: Verify that `skipFields` works correctly with logical
+   names when name mapping is active.
+9. **Search test**: Full end-to-end: create split with name mapping → search by logical
+   field name → retrieve documents → verify field values.
+
 ---
 
 ## 20. Implementation Plan
@@ -3087,6 +4379,10 @@ async fn fetch_parquet_data(
 12. **Missing file policy**: FAIL/WARN configurable behavior (§19.14)
 13. **Java API**: ParquetCompanionConfig, ParquetStorageConfig, ParquetMissingFilePolicy,
     `nativeDocProjected()` JNI method (§17, §19.13)
+14. **Manifest zstd compression**: `serialize_manifest()` with zstd, `deserialize_manifest()`
+    with magic-byte detection for backwards compatibility (§19.15 Layer 1)
+15. **ColumnChunkInfo slimming**: Remove `compression`/`encoding` from per-RG entries, hoist
+    `typical_compression`/`typical_encoding` to `column_mapping` (§19.15 Layer 2)
 
 ### Phase 2: Fast Field Modes (Column<T> Adapter)
 
@@ -3117,6 +4413,11 @@ async fn fetch_parquet_data(
    rebuild `segment_row_ranges` for merged single-segment output
 8. **Merge validation**: No-deletion check, mode consistency check
 9. **Java API**: `QuickwitSplit.createFromParquet()`
+10. **Column statistics computation**: `StatisticsAccumulator` inline during indexing loop,
+    return `ColumnStatistics` map via `SplitMetadata` to Java caller (§19.16)
+11. **Statistics validation**: `validate_statistics_fields()` at configuration time (§19.16)
+12. **Column name mapping**: Apply physical-to-logical name mapping during schema
+    auto-derivation when provided (§19.17)
 
 ### Phase 4: Performance Optimization
 
@@ -3140,6 +4441,12 @@ async fn fetch_parquet_data(
 8. **Missing file tests**: FAIL and WARN policy behavior
 9. **Backwards compatibility tests**: Old splits without manifest, new splits with old code
 10. **Performance tests**: Latency benchmarks for all paths
+11. **Statistics tests**: Statistics computation from row data, string truncation/ceiling,
+    NaN handling, boolean warning, empty column omission (§19.16)
+12. **Compression tests**: Manifest zstd round-trip, magic-byte detection, backwards
+    compatibility with raw JSON manifests, Layer 2 field removal tolerance (§19.15)
+13. **Name mapping tests**: Physical-to-logical column name mapping, partial mappings,
+    OffsetIndex lookup with mapped names (§19.17)
 
 ---
 
@@ -3155,7 +4462,7 @@ async fn fetch_parquet_data(
 | 6 | Reuse existing StorageWithPersistentCache for parquet I/O | Zero new cache code; parquet gets L2 coalescing for free | Feb 2026 |
 | 7 | Parallel I/O via futures::future::try_join_all | Matches proven quickwit prewarm pattern | Feb 2026 |
 | 8 | Cross-column gap-fill coalescing (64KB default threshold) | Reduces S3 requests; extra bytes cached for future use | Feb 2026 |
-| 9 | Column-level metadata only in manifest; OffsetIndex fetched from footer on demand | Keeps manifest < 100KB for wide tables; footer fetch is single small read cached in L2 | Feb 2026 |
+| 9 | Column-level metadata only in manifest; OffsetIndex fetched from footer on demand | Keeps manifest small (see §19.15 for compression); footer fetch is single small read cached in L2 | Feb 2026 |
 | 10 | Three fast field modes (disabled/hybrid/parquet-only) | Flexibility: users choose storage-performance tradeoff | Feb 2026 |
 | 11 | Directory-level interception for fast field adapter | Zero tantivy/quickwit changes; transparent to all consumers | Feb 2026 |
 | 12 | ColumnarWriter transcode (parquet → tantivy format) | Uses tantivy public API; all aggregations work natively | Feb 2026 |
@@ -3184,6 +4491,17 @@ async fn fetch_parquet_data(
 | 35 | Manifest version field with forward-compatibility check | Enables future manifest format evolution without breaking older readers | Feb 2026 |
 | 36 | Multi-file indexing as primary path (single split, N parquet files) | Avoids merge entirely; schema validated across all files; simpler manifest | Feb 2026 |
 | 37 | Schema validation across all parquet files at indexing time | Fail fast on schema mismatches; prevents runtime errors during query | Feb 2026 |
+| 38 | zstd compression of manifest JSON with magic-byte detection on load | 6–10× compression on repetitive JSON; backwards compatible (raw JSON still readable); no version bump needed (§19.15) | Feb 2026 |
+| 39 | Remove compression/encoding from per-RG ColumnChunkInfo; hoist to column_mapping | Reduces per-entry from ~100 bytes to ~30–40 bytes; actual codec info available from parquet footer at query time (§19.15) | Feb 2026 |
+| 40 | Layers 3 (columnar layout) and 4 (binary serialization) deferred | Layers 1+2 reduce worst-case from ~50 MB to ~2–3 MB compressed; additional layers sacrifice readability/compatibility for marginal gains (§19.15) | Feb 2026 |
+| 41 | Per-field statistics (min/max/null_count) returned to Java caller, not stored in manifest | Caller stores statistics in their own metadata system; keeps manifest focused on I/O routing; avoids merge complexity (§19.16) | Feb 2026 |
+| 42 | Always compute statistics from actual row data during indexing, not from parquet column statistics | Parquet column statistics are frequently missing; we already read every row so overhead is negligible; single code path for all sources (§19.16) | Feb 2026 |
+| 43 | String statistics truncated to configurable length (default 16 chars) with ceiling-adjusted max | Keeps statistics compact; truncation preserves pruning correctness (wider bounds, never false negatives) (§19.16) | Feb 2026 |
+| 44 | NaN values excluded from F64 statistics | NaN breaks comparison semantics; excluding NaN ensures min/max are always valid for range comparison (§19.16) | Feb 2026 |
+| 45 | Field ID-based name mapping with auto-detection from iceberg.schema | Supports explicit Java mapping and auto-detection; field IDs (not physical names) are the mapping key; applied at schema derivation (§19.17) | Feb 2026 |
+| 46 | Every column must be mapped when name mapping is active | Prevents silently indexing columns under physical names; unmapped columns produce clear error listing available mappings (§19.17) | Feb 2026 |
+| 47 | Store physical_ordinal in column_mapping for OffsetIndex lookup | Footer's OffsetIndex uses ordinal position, not names; physical_ordinal bridges logical names to physical positions at query time (§19.17) | Feb 2026 |
+| 48 | Single name mapping for all files in a split | Validated at indexing time; different schema evolutions should use separate splits then merge (§19.17) | Feb 2026 |
 
 ---
 
