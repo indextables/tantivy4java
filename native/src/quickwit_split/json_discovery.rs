@@ -302,6 +302,15 @@ pub fn extract_doc_mapping_from_index(tantivy_index: &tantivy::Index) -> Result<
 
                 debug_log!("✅ Discovered {} sub-fields for JSON field '{}'", discovered_subfields.len(), field_name);
 
+                // Skip JSON/object fields with no discovered sub-fields — Quickwit DocMapper
+                // requires object types to have at least one field mapping. These fields
+                // (e.g. List<Utf8> mapped to JSON) still exist in the tantivy schema for
+                // indexing/storage but aren't needed in the doc mapping for aggregations.
+                if discovered_subfields.is_empty() {
+                    debug_log!("⚠️  Skipping JSON field '{}' from doc_mapping — no sub-fields discovered", field_name);
+                    continue;
+                }
+
                 let mut json_obj = serde_json::json!({
                     "name": field_name,
                     "type": "object",

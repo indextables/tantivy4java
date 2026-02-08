@@ -363,7 +363,56 @@ public class SplitSearcher implements AutoCloseable {
     public Document doc(DocAddress docAddress) {
         return docNative(nativePtr, docAddress.getSegmentOrd(), docAddress.getDoc());
     }
-    
+
+    /**
+     * Retrieve a document with projected fields from a parquet companion split.
+     * When the split has a parquet companion manifest, this retrieves document data
+     * directly from the external parquet files with column projection for efficiency.
+     *
+     * <p>If no fields are specified (null or empty), all fields are retrieved.
+     * If the split has no parquet companion, this falls back to standard retrieval.
+     *
+     * @param docAddress The document address obtained from search results
+     * @param fields Optional list of field names to project (null = all fields)
+     * @return JSON string of field values, e.g. {"name":"Alice","age":30}
+     */
+    public String docProjected(DocAddress docAddress, String... fields) {
+        return (String) nativeDocProjected(nativePtr, docAddress.getSegmentOrd(), docAddress.getDoc(),
+                fields != null && fields.length > 0 ? fields : null);
+    }
+
+    /**
+     * Batch projected document retrieval from parquet companion.
+     * Returns a JSON array as a byte array for efficient JNI boundary crossing.
+     * Each element is a JSON object of field-value pairs.
+     *
+     * <p>If the split has no parquet manifest, falls back to standard bulk retrieval.
+     *
+     * @param docAddresses Array of document addresses
+     * @param fields Optional list of field names to project (null = all fields)
+     * @return UTF-8 encoded JSON array bytes: [{"field":"value",...}, ...]
+     */
+    public byte[] docBatchProjected(DocAddress[] docAddresses, String... fields) {
+        int[] segments = new int[docAddresses.length];
+        int[] docIds = new int[docAddresses.length];
+        for (int i = 0; i < docAddresses.length; i++) {
+            segments[i] = docAddresses[i].getSegmentOrd();
+            docIds[i] = docAddresses[i].getDoc();
+        }
+        return nativeDocBatchProjected(nativePtr, segments, docIds,
+                fields != null && fields.length > 0 ? fields : null);
+    }
+
+    /**
+     * Check if this split has a parquet companion manifest.
+     * When true, document retrieval can be served from external parquet files.
+     *
+     * @return true if the split contains a parquet companion manifest
+     */
+    public boolean hasParquetCompanion() {
+        return nativeHasParquetManifest(nativePtr);
+    }
+
     /**
      * Retrieve multiple documents by their addresses in a single batch operation.
      * This is significantly more efficient than calling doc() multiple times,
@@ -702,7 +751,57 @@ public class SplitSearcher implements AutoCloseable {
             preloadFieldsNative(nativePtr, component, fieldNames);
         });
     }
-    
+
+    /**
+     * Prewarm parquet fast fields by transcoding specified columns from parquet data.
+     *
+     * <p>This method is only applicable when the split has a parquet companion manifest
+     * with {@code fast_field_mode != DISABLED}. It transcodes parquet columns into
+     * tantivy's columnar format and caches them for fast field access during
+     * aggregations and sorting.
+     *
+     * <p>After this call, aggregation queries that use fast fields will read from
+     * the transcoded parquet data instead of (or merged with) the native fast fields.
+     *
+     * @param columns Optional column names to transcode. Pass null or empty to transcode
+     *                all applicable columns based on the fast field mode.
+     * @return CompletableFuture that completes when transcoding is done
+     */
+    public CompletableFuture<Void> preloadParquetFastFields(String... columns) {
+        return CompletableFuture.runAsync(() -> {
+            nativePrewarmParquetFastFields(nativePtr, columns);
+        });
+    }
+
+    /**
+     * Pre-fetch parquet column pages into the storage cache (L2) for faster document retrieval.
+     *
+     * <p>Unlike {@link #preloadParquetFastFields} which transcodes columns for fast field access,
+     * this method warms the disk cache with raw parquet column pages. This improves subsequent
+     * document retrieval performance by eliminating cold cache misses.</p>
+     *
+     * @param columns Column names to prewarm, or empty/null for all columns
+     * @return CompletableFuture that completes when prewarm is finished
+     */
+    public CompletableFuture<Void> preloadParquetColumns(String... columns) {
+        return CompletableFuture.runAsync(() -> {
+            nativePrewarmParquetColumns(nativePtr, columns);
+        });
+    }
+
+    /**
+     * Get parquet retrieval statistics for this searcher.
+     *
+     * <p>Returns a JSON string containing metadata about the parquet companion configuration:
+     * total files, rows, row groups, columns, fast field mode, file sizes, etc.
+     * Returns null if this split does not have a parquet companion manifest.</p>
+     *
+     * @return JSON string with parquet stats, or null if no parquet manifest
+     */
+    public String getParquetRetrievalStats() {
+        return nativeGetParquetRetrievalStats(nativePtr);
+    }
+
     /**
      * Warmup system: Proactively fetch query-relevant components before search execution.
      * This implements Quickwit's sophisticated warmup optimization that analyzes queries
@@ -945,6 +1044,9 @@ public class SplitSearcher implements AutoCloseable {
     private static native List<Document> parseBulkDocsNative(java.nio.ByteBuffer buffer);
     private static native void preloadComponentsNative(long nativePtr, IndexComponent[] components);
     private static native void preloadFieldsNative(long nativePtr, IndexComponent component, String[] fieldNames);
+    private static native boolean nativePrewarmParquetFastFields(long nativePtr, String[] columns);
+    private static native boolean nativePrewarmParquetColumns(long nativePtr, String[] columns);
+    private static native String nativeGetParquetRetrievalStats(long nativePtr);
     private static native void warmupQueryNative(long nativePtr, long queryPtr);
     private static native WarmupStats warmupQueryAdvancedNative(long nativePtr, long queryPtr, IndexComponent[] components, boolean enableParallel);
     private static native CacheStats getCacheStatsNative(long nativePtr);
@@ -957,6 +1059,10 @@ public class SplitSearcher implements AutoCloseable {
     private static native Map<String, Long> getPerFieldComponentSizesNative(long nativePtr);
     private static native List<String> tokenizeNative(long nativePtr, String fieldName, String text);
     private static native void closeNative(long nativePtr);
+    // Parquet companion mode native methods
+    private static native boolean nativeHasParquetManifest(long nativePtr);
+    private static native Object nativeDocProjected(long nativePtr, int segment, int docId, String[] fields);
+    private static native byte[] nativeDocBatchProjected(long nativePtr, int[] segments, int[] docIds, String[] fields);
 
     // Smart Wildcard Optimization Statistics (for testing/monitoring)
     private static native void resetSmartWildcardStats();

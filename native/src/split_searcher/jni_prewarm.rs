@@ -277,6 +277,270 @@ fn parse_string_array(env: &mut JNIEnv, array_obj: jobject) -> anyhow::Result<Ve
     Ok(result)
 }
 
+/// Prewarm parquet fast fields by transcoding from parquet data.
+///
+/// This method transcodes the specified columns (or all applicable columns based on
+/// the manifest's FastFieldMode) from parquet into tantivy's columnar format and
+/// caches them in the ParquetAugmentedDirectory.
+///
+/// After this call, the tantivy searcher's fast field reads for these columns will
+/// be served from the transcoded cache.
+///
+/// # Arguments
+/// * `searcher_ptr` - Pointer to the CachedSearcherContext
+/// * `columns` - Java String[] of column names to transcode, or null for all applicable
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_nativePrewarmParquetFastFields(
+    mut env: JNIEnv,
+    _class: JClass,
+    searcher_ptr: jlong,
+    columns: jobject,
+) -> jboolean {
+    debug_println!("📊 PARQUET_PREWARM: nativePrewarmParquetFastFields called with pointer: {}", searcher_ptr);
+
+    if searcher_ptr == 0 {
+        debug_println!("❌ PARQUET_PREWARM: Invalid searcher pointer (0)");
+        return 0;
+    }
+
+    // Parse optional column names
+    let requested_columns: Option<Vec<String>> = if columns.is_null() {
+        None
+    } else {
+        match parse_string_array(&mut env, columns) {
+            Ok(cols) if cols.is_empty() => None,
+            Ok(cols) => Some(cols),
+            Err(e) => {
+                debug_println!("❌ PARQUET_PREWARM: Failed to parse column names: {}", e);
+                return 0;
+            }
+        }
+    };
+
+    debug_println!("📊 PARQUET_PREWARM: Requested columns: {:?}", requested_columns);
+
+    match block_on_operation(async move {
+        // Get the searcher context
+        let context = match crate::utils::jlong_to_arc::<super::types::CachedSearcherContext>(searcher_ptr) {
+            Some(ctx) => ctx,
+            None => return Err(anyhow::anyhow!("Invalid searcher pointer")),
+        };
+
+        // Check if augmented directory is available
+        let augmented_dir = match &context.augmented_directory {
+            Some(dir) => dir.clone(),
+            None => return Err(anyhow::anyhow!(
+                "No ParquetAugmentedDirectory configured. The split may not have a parquet manifest \
+                 with fast_field_mode != Disabled."
+            )),
+        };
+
+        // Find the segment .fast file paths from the index
+        let index = &context.cached_index;
+        let segment_metas = index.searchable_segment_metas()
+            .map_err(|e| anyhow::anyhow!("Failed to get segment metas: {}", e))?;
+
+        if segment_metas.is_empty() {
+            debug_println!("📊 PARQUET_PREWARM: No segments found");
+            return Ok(());
+        }
+
+        let cols_ref = requested_columns.as_deref();
+
+        for seg_meta in &segment_metas {
+            let fast_path = seg_meta.relative_path(tantivy::index::SegmentComponent::FastFields);
+            debug_println!(
+                "📊 PARQUET_PREWARM: Transcoding fast fields for segment {} -> {:?}",
+                seg_meta.id().uuid_string(), fast_path
+            );
+
+            augmented_dir.transcode_and_cache(
+                &fast_path,
+                cols_ref,
+            ).await
+            .map_err(|e| anyhow::anyhow!(
+                "Failed to transcode fast fields for segment {}: {}",
+                seg_meta.id().uuid_string(), e
+            ))?;
+        }
+
+        debug_println!("📊 PARQUET_PREWARM: All segments transcoded successfully");
+        Ok(())
+    }) {
+        Ok(_) => {
+            debug_println!("✅ PARQUET_PREWARM: Parquet fast field warmup completed successfully");
+            1
+        }
+        Err(e) => {
+            debug_println!("❌ PARQUET_PREWARM: Parquet fast field warmup failed: {}", e);
+            0
+        }
+    }
+}
+
+/// Prewarm parquet columns by pre-fetching their pages into the storage cache (L2).
+///
+/// This method pre-reads parquet column pages for the specified columns across all
+/// parquet files in the manifest, populating the disk cache for faster doc retrieval.
+///
+/// Unlike `nativePrewarmParquetFastFields` which transcodes for fast field access,
+/// this method focuses on warming the storage cache for document retrieval operations.
+///
+/// # Arguments
+/// * `searcher_ptr` - Pointer to the CachedSearcherContext
+/// * `columns` - Java String[] of column names to prewarm, or null for all columns
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_nativePrewarmParquetColumns(
+    mut env: JNIEnv,
+    _class: JClass,
+    searcher_ptr: jlong,
+    columns: jobject,
+) -> jboolean {
+    debug_println!("📊 PARQUET_COL_PREWARM: nativePrewarmParquetColumns called");
+
+    if searcher_ptr == 0 {
+        return 0;
+    }
+
+    let requested_columns: Option<Vec<String>> = if columns.is_null() {
+        None
+    } else {
+        match parse_string_array(&mut env, columns) {
+            Ok(cols) if cols.is_empty() => None,
+            Ok(cols) => Some(cols),
+            Err(e) => {
+                debug_println!("❌ PARQUET_COL_PREWARM: Failed to parse columns: {}", e);
+                return 0;
+            }
+        }
+    };
+
+    match block_on_operation(async move {
+        let context = match crate::utils::jlong_to_arc::<super::types::CachedSearcherContext>(searcher_ptr) {
+            Some(ctx) => ctx,
+            None => return Err(anyhow::anyhow!("Invalid searcher pointer")),
+        };
+
+        let manifest = match &context.parquet_manifest {
+            Some(m) => m.clone(),
+            None => return Err(anyhow::anyhow!("No parquet manifest available")),
+        };
+
+        let storage = match &context.parquet_storage {
+            Some(s) => s.clone(),
+            None => return Err(anyhow::anyhow!("No parquet storage configured")),
+        };
+
+        // Determine which columns to prewarm
+        let columns_to_warm: Vec<&crate::parquet_companion::ColumnMapping> = match &requested_columns {
+            Some(names) => manifest.column_mapping.iter()
+                .filter(|cm| names.contains(&cm.tantivy_field_name))
+                .collect(),
+            None => manifest.column_mapping.iter().collect(),
+        };
+
+        debug_println!(
+            "📊 PARQUET_COL_PREWARM: Warming {} columns across {} files",
+            columns_to_warm.len(), manifest.parquet_files.len()
+        );
+
+        // For each parquet file, read the column chunks to populate cache
+        for file_entry in &manifest.parquet_files {
+            let file_path = manifest.resolve_path(&file_entry.relative_path);
+
+            for rg in &file_entry.row_groups {
+                for col_info in &rg.columns {
+                    // Check if this column is one we want to prewarm
+                    let should_warm = columns_to_warm.iter()
+                        .any(|cm| cm.parquet_column_name == col_info.column_name);
+
+                    if !should_warm {
+                        continue;
+                    }
+
+                    // Read the column chunk data via storage (populates L2 cache)
+                    let start = col_info.data_page_offset as usize;
+                    let end = start + col_info.compressed_size as usize;
+                    let _data = storage.get_slice(
+                        &std::path::PathBuf::from(&file_path),
+                        start..end,
+                    ).await.map_err(|e| anyhow::anyhow!(
+                        "Failed to prewarm column '{}' in file '{}': {}",
+                        col_info.column_name, file_entry.relative_path, e
+                    ))?;
+
+                    debug_println!(
+                        "📊 PARQUET_COL_PREWARM: Warmed column '{}' rg={} ({} bytes)",
+                        col_info.column_name, rg.row_group_idx, col_info.compressed_size
+                    );
+                }
+            }
+        }
+
+        debug_println!("📊 PARQUET_COL_PREWARM: All columns warmed successfully");
+        Ok(())
+    }) {
+        Ok(_) => 1,
+        Err(e) => {
+            debug_println!("❌ PARQUET_COL_PREWARM: Failed: {}", e);
+            0
+        }
+    }
+}
+
+/// Get parquet retrieval statistics from the searcher context.
+/// Returns a JSON string with metrics, or null if not available.
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_nativeGetParquetRetrievalStats(
+    mut env: JNIEnv,
+    _class: JClass,
+    searcher_ptr: jlong,
+) -> jobject {
+    use jni::sys::jobject;
+    use crate::utils::string_to_jstring;
+
+    if searcher_ptr == 0 {
+        return std::ptr::null_mut();
+    }
+
+    let context = match crate::utils::jlong_to_arc::<super::types::CachedSearcherContext>(searcher_ptr) {
+        Some(ctx) => ctx,
+        None => return std::ptr::null_mut(),
+    };
+
+    let manifest = match &context.parquet_manifest {
+        Some(m) => m,
+        None => return std::ptr::null_mut(),
+    };
+
+    // Build stats JSON from manifest metadata
+    let stats = serde_json::json!({
+        "hasParquetManifest": true,
+        "totalFiles": manifest.parquet_files.len(),
+        "totalRows": manifest.total_rows,
+        "totalRowGroups": manifest.parquet_files.iter()
+            .map(|f| f.row_groups.len())
+            .sum::<usize>(),
+        "totalColumns": manifest.column_mapping.len(),
+        "fastFieldMode": format!("{:?}", manifest.fast_field_mode),
+        "tableRoot": &manifest.table_root,
+        "fileSizes": manifest.parquet_files.iter()
+            .map(|f| serde_json::json!({
+                "path": &f.relative_path,
+                "sizeBytes": f.file_size_bytes,
+                "numRows": f.num_rows,
+                "numRowGroups": f.row_groups.len(),
+            }))
+            .collect::<Vec<_>>(),
+    });
+
+    let json_str = serde_json::to_string(&stats).unwrap_or_default();
+    match string_to_jstring(&mut env, &json_str) {
+        Ok(jstr) => jstr.into_raw(),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
 /// Parse the Java IndexComponent[] array into a HashSet of component names
 fn parse_index_components(env: &mut JNIEnv, components: jobject) -> anyhow::Result<std::collections::HashSet<String>> {
     use jni::objects::JObjectArray;

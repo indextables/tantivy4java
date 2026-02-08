@@ -12,6 +12,8 @@ use quickwit_storage::{PutPayload, SplitPayloadBuilder};
 use quickwit_directories::{DebugProxyDirectory, StaticDirectoryCacheBuilder, list_index_files};
 
 use crate::debug_println;
+use crate::parquet_companion::manifest::ParquetManifest;
+use crate::parquet_companion::manifest_io::{serialize_manifest, MANIFEST_FILENAME};
 use super::{SplitConfig, QuickwitSplitMetadata};
 
 // Debug logging macro - controlled by TANTIVY4JAVA_DEBUG environment variable
@@ -252,13 +254,15 @@ pub fn write_hotcache_mmap<W: std::io::Write>(
     Ok(())
 }
 
-/// Create a Quickwit split file from a Tantivy index directory
+/// Create a Quickwit split file from a Tantivy index directory.
+/// If `parquet_manifest` is provided, it will be serialized and embedded in the split bundle.
 pub async fn create_quickwit_split(
     _tantivy_index: &tantivy::Index,
     index_dir: &PathBuf,
     output_path: &PathBuf,
     _split_metadata: &QuickwitSplitMetadata,
-    config: &SplitConfig
+    config: &SplitConfig,
+    parquet_manifest: Option<&ParquetManifest>,
 ) -> Result<FooterOffsets, anyhow::Error> {
     use tantivy::directory::MmapDirectory;
     use uuid::Uuid;
@@ -272,6 +276,16 @@ pub async fn create_quickwit_split(
     // ✅ STEP 1: Collect all Tantivy index files first
     let split_id = Uuid::new_v4().to_string();
     debug_log!("✅ OFFICIAL API: Creating split with split_id: {}", split_id);
+
+    // If a parquet manifest is provided, serialize and write it to the index directory
+    // so it gets picked up by the filesystem scan below (Design Decision #22)
+    if let Some(manifest) = parquet_manifest {
+        let manifest_bytes = serialize_manifest(manifest)?;
+        let manifest_path = index_dir.join(MANIFEST_FILENAME);
+        std::fs::write(&manifest_path, &manifest_bytes)
+            .context("Failed to write parquet manifest to index directory")?;
+        debug_log!("📦 PARQUET_COMPANION: Wrote {} bytes of manifest to {:?}", manifest_bytes.len(), manifest_path);
+    }
 
     // Get files from the directory by reading the filesystem
     let file_entries: Vec<_> = std::fs::read_dir(index_dir)?

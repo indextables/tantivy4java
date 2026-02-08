@@ -742,3 +742,309 @@ fn retrieve_documents_as_tantivy_docs(
         )),
     }
 }
+
+/// Check if the split has a parquet companion manifest
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_nativeHasParquetManifest(
+    _env: JNIEnv,
+    _class: JClass,
+    searcher_ptr: jlong,
+) -> jni::sys::jboolean {
+    if searcher_ptr == 0 {
+        return 0;
+    }
+
+    let has_manifest = with_arc_safe(searcher_ptr, |ctx: &Arc<CachedSearcherContext>| {
+        ctx.parquet_manifest.is_some()
+    })
+    .unwrap_or(false);
+
+    if has_manifest { 1 } else { 0 }
+}
+
+/// Projected document retrieval from parquet companion.
+/// Returns a JSON string of { field_name: value, ... } for the requested fields.
+/// If the split has no parquet manifest, falls back to standard retrieval.
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_nativeDocProjected(
+    mut env: JNIEnv,
+    _class: JClass,
+    searcher_ptr: jlong,
+    segment_ord: jint,
+    doc_id: jint,
+    field_names: jni::sys::jobjectArray,
+) -> jobject {
+    if searcher_ptr == 0 {
+        to_java_exception(&mut env, &anyhow::anyhow!("Invalid searcher pointer"));
+        return std::ptr::null_mut();
+    }
+
+    // Extract field names from Java String array
+    let projected_fields: Option<Vec<String>> = if field_names.is_null() {
+        None // null means retrieve all fields
+    } else {
+        let field_array = unsafe { jni::objects::JObjectArray::from_raw(field_names) };
+        match env.get_array_length(&field_array) {
+            Ok(len) => {
+                let mut fields = Vec::with_capacity(len as usize);
+                for i in 0..len {
+                    match env.get_object_array_element(&field_array, i) {
+                        Ok(field_obj) => {
+                            if !field_obj.is_null() {
+                                match env.get_string((&field_obj).into()) {
+                                    Ok(field_str) => fields.push(String::from(field_str)),
+                                    Err(e) => {
+                                        debug_println!("⚠️ PARQUET_DOC: Failed to get field name string at index {}: {}", i, e);
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            debug_println!("⚠️ PARQUET_DOC: Failed to get field name at index {}: {}", i, e);
+                        }
+                    }
+                }
+                Some(fields)
+            }
+            Err(e) => {
+                to_java_exception(&mut env, &anyhow::anyhow!("Failed to get field names array length: {}", e));
+                return std::ptr::null_mut();
+            }
+        }
+    };
+
+    debug_println!(
+        "📖 PARQUET_DOC: nativeDocProjected called - ptr:{}, seg:{}, doc:{}, fields:{:?}",
+        searcher_ptr, segment_ord, doc_id, projected_fields
+    );
+
+    // Check if this split has a parquet manifest
+    let has_manifest = with_arc_safe(searcher_ptr, |ctx: &Arc<CachedSearcherContext>| {
+        ctx.parquet_manifest.is_some()
+    })
+    .unwrap_or(false);
+
+    if !has_manifest {
+        // No parquet manifest - fall back to standard doc retrieval
+        debug_println!("📖 PARQUET_DOC: No parquet manifest, falling back to standard docNative");
+        return Java_io_indextables_tantivy4java_split_SplitSearcher_docNative(
+            env, _class, searcher_ptr, segment_ord, doc_id,
+        );
+    }
+
+    // Retrieve document from parquet via the manifest
+    let result = with_arc_safe(searcher_ptr, |ctx: &Arc<CachedSearcherContext>| {
+        let manifest = ctx.parquet_manifest.as_ref().unwrap();
+        // Use parquet_storage (rooted at table_root) for parquet file access
+        let storage = ctx.parquet_storage.as_ref()
+            .cloned()
+            .unwrap_or_else(|| ctx.cached_storage.clone());
+
+        let runtime = crate::runtime_manager::QuickwitRuntimeManager::global().handle();
+        let _guard = runtime.enter();
+
+        tokio::task::block_in_place(|| {
+            runtime.block_on(async {
+                crate::parquet_companion::doc_retrieval::retrieve_document_from_parquet(
+                    manifest,
+                    segment_ord as u32,
+                    doc_id as u32,
+                    projected_fields.as_deref(),
+                    &storage,
+                )
+                .await
+            })
+        })
+    });
+
+    match result {
+        Some(Ok(field_map)) => {
+            // Convert HashMap to JSON string for Java
+            match serde_json::to_string(&field_map) {
+                Ok(json_str) => {
+                    debug_println!("📖 PARQUET_DOC: Retrieved {} fields from parquet", field_map.len());
+                    match env.new_string(&json_str) {
+                        Ok(java_str) => java_str.into_raw(),
+                        Err(e) => {
+                            to_java_exception(&mut env, &anyhow::anyhow!("Failed to create Java string: {}", e));
+                            std::ptr::null_mut()
+                        }
+                    }
+                }
+                Err(e) => {
+                    to_java_exception(&mut env, &anyhow::anyhow!("Failed to serialize parquet document: {}", e));
+                    std::ptr::null_mut()
+                }
+            }
+        }
+        Some(Err(e)) => {
+            to_java_exception(&mut env, &anyhow::anyhow!("Parquet document retrieval failed: {}", e));
+            std::ptr::null_mut()
+        }
+        None => {
+            to_java_exception(&mut env, &anyhow::anyhow!("Searcher context not found"));
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Batch projected document retrieval from parquet companion, returning a byte buffer.
+/// Returns a JSON array of documents as a byte array for efficient JNI boundary crossing.
+/// Format: UTF-8 encoded JSON string: [{"field":"value",...}, {"field":"value",...}, ...]
+///
+/// If the split has no parquet manifest, falls back to standard bulk retrieval.
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_nativeDocBatchProjected(
+    mut env: JNIEnv,
+    _class: JClass,
+    searcher_ptr: jlong,
+    segments: jni::sys::jintArray,
+    doc_ids: jni::sys::jintArray,
+    field_names: jni::sys::jobjectArray,
+) -> jbyteArray {
+    if searcher_ptr == 0 {
+        to_java_exception(&mut env, &anyhow::anyhow!("Invalid searcher pointer"));
+        return std::ptr::null_mut();
+    }
+
+    // Check if this split has a parquet manifest
+    let has_manifest = with_arc_safe(searcher_ptr, |ctx: &Arc<CachedSearcherContext>| {
+        ctx.parquet_manifest.is_some()
+    })
+    .unwrap_or(false);
+
+    if !has_manifest {
+        // No parquet manifest - fall back to standard bulk retrieval with field filtering
+        // Fall back to standard bulk retrieval
+        return Java_io_indextables_tantivy4java_split_SplitSearcher_docsBulkNative(
+            env, _class, searcher_ptr, segments, doc_ids,
+        );
+    }
+
+    // Extract JNI arrays
+    let segments_array = unsafe { jni::objects::JIntArray::from_raw(segments) };
+    let doc_ids_array = unsafe { jni::objects::JIntArray::from_raw(doc_ids) };
+
+    let array_len = match env.get_array_length(&segments_array) {
+        Ok(len) => len as usize,
+        Err(e) => {
+            to_java_exception(&mut env, &anyhow::anyhow!("Failed to get segments array length: {}", e));
+            return std::ptr::null_mut();
+        }
+    };
+
+    let mut segments_vec = vec![0i32; array_len];
+    if let Err(e) = env.get_int_array_region(&segments_array, 0, &mut segments_vec) {
+        to_java_exception(&mut env, &anyhow::anyhow!("Failed to get segments array: {}", e));
+        return std::ptr::null_mut();
+    }
+    let segments_vec: Vec<u32> = segments_vec.iter().map(|&s| s as u32).collect();
+
+    let mut doc_ids_vec = vec![0i32; array_len];
+    if let Err(e) = env.get_int_array_region(&doc_ids_array, 0, &mut doc_ids_vec) {
+        to_java_exception(&mut env, &anyhow::anyhow!("Failed to get doc_ids array: {}", e));
+        return std::ptr::null_mut();
+    }
+    let doc_ids_vec: Vec<u32> = doc_ids_vec.iter().map(|&d| d as u32).collect();
+
+    // Extract field names
+    let projected_fields: Option<Vec<String>> = if field_names.is_null() {
+        None
+    } else {
+        let field_array = unsafe { jni::objects::JObjectArray::from_raw(field_names) };
+        match env.get_array_length(&field_array) {
+            Ok(len) => {
+                let mut fields = Vec::with_capacity(len as usize);
+                for i in 0..len {
+                    if let Ok(field_obj) = env.get_object_array_element(&field_array, i) {
+                        if !field_obj.is_null() {
+                            if let Ok(field_str) = env.get_string((&field_obj).into()) {
+                                fields.push(String::from(field_str));
+                            }
+                        }
+                    }
+                }
+                Some(fields)
+            }
+            Err(_) => None,
+        }
+    };
+
+    debug_println!(
+        "📖 PARQUET_BATCH: nativeDocBatchProjected called - {} docs, fields={:?}",
+        array_len, projected_fields
+    );
+
+    // Build doc addresses
+    let addresses: Vec<(u32, u32)> = segments_vec
+        .iter()
+        .zip(doc_ids_vec.iter())
+        .map(|(&seg, &doc)| (seg, doc))
+        .collect();
+
+    // Batch retrieve from parquet
+    let result = with_arc_safe(searcher_ptr, |ctx: &Arc<CachedSearcherContext>| {
+        let manifest = ctx.parquet_manifest.as_ref().unwrap();
+        // Use parquet_storage (rooted at table_root) for parquet file access
+        let storage = ctx.parquet_storage.as_ref()
+            .cloned()
+            .unwrap_or_else(|| ctx.cached_storage.clone());
+
+        let runtime = crate::runtime_manager::QuickwitRuntimeManager::global().handle();
+        let _guard = runtime.enter();
+
+        tokio::task::block_in_place(|| {
+            runtime.block_on(async {
+                crate::parquet_companion::doc_retrieval::batch_retrieve_from_parquet(
+                    &addresses,
+                    projected_fields.as_deref(),
+                    manifest,
+                    &storage,
+                )
+                .await
+            })
+        })
+    });
+
+    match result {
+        Some(Ok(documents)) => {
+            // Serialize as JSON array for efficient JNI crossing
+            match serde_json::to_vec(&documents) {
+                Ok(json_bytes) => {
+                    debug_println!(
+                        "📖 PARQUET_BATCH: Retrieved {} docs, serialized to {} bytes",
+                        documents.len(), json_bytes.len()
+                    );
+                    match env.new_byte_array(json_bytes.len() as i32) {
+                        Ok(byte_array) => {
+                            let byte_slice: &[i8] = unsafe {
+                                std::slice::from_raw_parts(json_bytes.as_ptr() as *const i8, json_bytes.len())
+                            };
+                            if let Err(e) = env.set_byte_array_region(&byte_array, 0, byte_slice) {
+                                to_java_exception(&mut env, &anyhow::anyhow!("Failed to set byte array data: {}", e));
+                                return std::ptr::null_mut();
+                            }
+                            byte_array.into_raw()
+                        }
+                        Err(e) => {
+                            to_java_exception(&mut env, &anyhow::anyhow!("Failed to create byte array: {}", e));
+                            std::ptr::null_mut()
+                        }
+                    }
+                }
+                Err(e) => {
+                    to_java_exception(&mut env, &anyhow::anyhow!("Failed to serialize parquet documents: {}", e));
+                    std::ptr::null_mut()
+                }
+            }
+        }
+        Some(Err(e)) => {
+            to_java_exception(&mut env, &anyhow::anyhow!("Parquet batch retrieval failed: {}", e));
+            std::ptr::null_mut()
+        }
+        None => {
+            to_java_exception(&mut env, &anyhow::anyhow!("Searcher context not found"));
+            std::ptr::null_mut()
+        }
+    }
+}

@@ -3,6 +3,7 @@
 // Contains: createNativeWithSharedCache, closeNative, validateSplitNative, getCacheStatsNative
 
 use std::sync::Arc;
+use std::str::FromStr;
 use jni::objects::{JClass, JString, JObject};
 use jni::sys::{jlong, jobject, jboolean};
 use jni::JNIEnv;
@@ -467,8 +468,194 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_crea
                     });
 
                     match opened_index {
-                        Ok((cached_index, _hot_directory)) => {
+                        Ok((initial_index, hot_directory)) => {
                             debug_println!("🔥 INDEX CACHED: Index opened once for reuse, cached for all operations");
+
+                            // Check for parquet companion manifest in the split bundle FIRST
+                            // (needed to decide whether to wrap directory with ParquetAugmentedDirectory)
+                            let parquet_manifest = {
+                                use crate::parquet_companion::manifest_io::MANIFEST_FILENAME;
+                                let manifest_path = std::path::PathBuf::from(MANIFEST_FILENAME);
+                                if bundle_file_offsets.contains_key(&manifest_path) {
+                                    debug_println!("📦 PARQUET_COMPANION: Found {} in split bundle, reading manifest...", MANIFEST_FILENAME);
+                                    // Read manifest bytes from the split file using the byte range
+                                    // from bundle_file_offsets (the HotDirectory only caches tantivy index files).
+                                    let manifest_result = runtime.handle().block_on(async {
+                                        let range = bundle_file_offsets.get(&manifest_path).unwrap().clone();
+                                        let split_path = std::path::Path::new(&split_uri).file_name()
+                                            .map(|f| std::path::PathBuf::from(f))
+                                            .unwrap_or_else(|| std::path::PathBuf::from(&split_uri));
+                                        let manifest_bytes = resolved_storage
+                                            .get_slice(&split_path, range.start as usize..range.end as usize).await
+                                            .map_err(|e| anyhow::anyhow!("Failed to read parquet manifest from split: {}", e))?;
+                                        crate::parquet_companion::manifest_io::deserialize_manifest(&manifest_bytes)
+                                    });
+                                    match manifest_result {
+                                        Ok(manifest) => {
+                                            debug_println!("📦 PARQUET_COMPANION: Successfully loaded manifest (version={}, {} files, fast_field_mode={:?})",
+                                                manifest.version, manifest.parquet_files.len(), manifest.fast_field_mode);
+                                            Some(std::sync::Arc::new(manifest))
+                                        }
+                                        Err(e) => {
+                                            debug_println!("⚠️ PARQUET_COMPANION: Failed to deserialize manifest: {}", e);
+                                            None
+                                        }
+                                    }
+                                } else {
+                                    debug_println!("📦 PARQUET_COMPANION: No {} found in split bundle (standard mode)", MANIFEST_FILENAME);
+                                    None
+                                }
+                            };
+
+                            // Phase 2: If parquet fast field mode is active, create the
+                            // ParquetAugmentedDirectory for later use during prewarm/aggregation.
+                            // We do NOT re-open the index — the initial_index already has the
+                            // correct inverted index for search. The augmented directory is only
+                            // needed to intercept .fast file reads during aggregation/prewarm.
+                            use crate::parquet_companion::manifest::FastFieldMode;
+                            let (cached_index, augmented_directory, split_overrides, parquet_meta_json, segment_fast_paths) = {
+                                let needs_augmented = parquet_manifest.as_ref()
+                                    .map(|m| m.fast_field_mode != FastFieldMode::Disabled)
+                                    .unwrap_or(false);
+
+                                if needs_augmented {
+                                    let manifest = parquet_manifest.as_ref().unwrap();
+                                    debug_println!("📦 PARQUET_COMPANION: Fast field mode {:?} active, re-opening index with all-fast schema",
+                                        manifest.fast_field_mode);
+
+                                    // Create the augmented directory first (wraps hot_directory).
+                                    // Pass split_storage + bundle offsets so it can read native .fast
+                                    // bytes via async storage (HotDirectory sync reads may fail).
+                                    let split_file_path = std::path::Path::new(&split_uri).file_name()
+                                        .map(|f| std::path::PathBuf::from(f))
+                                        .unwrap_or_else(|| std::path::PathBuf::from(&split_uri));
+                                    let augmented = crate::parquet_companion::augmented_directory::ParquetAugmentedDirectory::new(
+                                        std::sync::Arc::new(hot_directory.clone()),
+                                        manifest.fast_field_mode,
+                                        manifest.clone(),
+                                        resolved_storage.clone(),
+                                        resolved_storage.clone(),
+                                        bundle_file_offsets.clone(),
+                                        split_file_path,
+                                        split_uri.clone(),
+                                    );
+                                    let augmented_arc = std::sync::Arc::new(augmented);
+                                    debug_println!("📦 PARQUET_COMPANION: ParquetAugmentedDirectory created");
+
+                                    // Re-open the Index with all fields marked as fast in the schema.
+                                    // Uses Quickwit's UnionDirectory pattern: shadow meta.json with a
+                                    // RamDirectory containing a modified version where all fast flags are true.
+                                    let (final_index, overrides, parquet_meta_json_bytes, seg_fast_paths) = {
+                                        use tantivy::directory::{Directory, RamDirectory};
+                                        use quickwit_directories::UnionDirectory;
+
+                                        // Read original meta.json from the hot_directory
+                                        let original_meta = hot_directory.atomic_read(std::path::Path::new("meta.json"))
+                                            .map_err(|e| anyhow::anyhow!("Failed to read meta.json from split: {:?}", e));
+
+                                        match original_meta.and_then(|bytes| {
+                                            crate::parquet_companion::schema_derivation::promote_meta_json_all_fast(&bytes)
+                                                .map_err(|e| anyhow::anyhow!("Failed to promote meta.json all-fast: {}", e))
+                                        }) {
+                                            Ok(modified_meta) => {
+                                                // Drop the initial index to release ManagedDirectory lock
+                                                drop(initial_index);
+
+                                                // Shadow meta.json with the all-fast version via UnionDirectory
+                                                let shadow_dir = RamDirectory::default();
+                                                shadow_dir.atomic_write(
+                                                    std::path::Path::new("meta.json"),
+                                                    &modified_meta,
+                                                ).expect("RamDirectory atomic_write should not fail");
+
+                                                let union_dir = UnionDirectory::union_of(vec![
+                                                    Box::new(shadow_dir),
+                                                    Box::new(hot_directory.clone()),
+                                                ]);
+
+                                                match tantivy::Index::open(union_dir) {
+                                                    Ok(mut idx) => {
+                                                        idx.set_tokenizers(
+                                                            quickwit_query::get_quickwit_fastfield_normalizer_manager()
+                                                                .tantivy_manager()
+                                                                .clone(),
+                                                        );
+                                                        idx.set_fast_field_tokenizers(
+                                                            quickwit_query::get_quickwit_fastfield_normalizer_manager()
+                                                                .tantivy_manager()
+                                                                .clone(),
+                                                        );
+                                                        debug_println!("📦 PARQUET_COMPANION: Re-opened index with all-fast schema via UnionDirectory");
+
+                                                        // Lazy transcoding: do NOT pre-transcode all columns.
+                                                        // Instead, discover segment .fast paths and store them
+                                                        // for on-demand transcoding when queries need fast fields.
+                                                        let segment_metas = idx.searchable_segment_metas()
+                                                            .unwrap_or_default();
+                                                        let seg_fast_paths: Vec<std::path::PathBuf> = segment_metas.iter()
+                                                            .map(|m| m.relative_path(tantivy::index::SegmentComponent::FastFields))
+                                                            .collect();
+                                                        debug_println!(
+                                                            "📦 PARQUET_COMPANION: Discovered {} segment .fast paths for lazy transcoding",
+                                                            seg_fast_paths.len()
+                                                        );
+
+                                                        // Create SplitOverrides with meta_json only, empty fast_field_data.
+                                                        // Fast field data will be populated lazily per-query.
+                                                        let overrides = quickwit_search::SplitOverrides {
+                                                            meta_json: modified_meta.clone(),
+                                                            fast_field_data: std::collections::HashMap::new(),
+                                                        };
+                                                        (idx, Some(std::sync::Arc::new(overrides)), Some(modified_meta), seg_fast_paths)
+                                                    }
+                                                    Err(e) => {
+                                                        debug_println!("⚠️ PARQUET_COMPANION: Failed to re-open with all-fast schema: {}. This should not happen.", e);
+                                                        panic!("Failed to re-open split index with all-fast schema: {}", e);
+                                                    }
+                                                }
+                                            }
+                                            Err(e) => {
+                                                debug_println!("⚠️ PARQUET_COMPANION: Failed to promote meta.json: {}. Using original index.", e);
+                                                (initial_index, None, None, vec![])
+                                            }
+                                        }
+                                    };
+
+                                    debug_println!("📦 PARQUET_COMPANION: SplitOverrides ready (has_overrides={}), lazy transcoding enabled", overrides.is_some());
+                                    (final_index, Some(augmented_arc), overrides, parquet_meta_json_bytes, seg_fast_paths)
+                                } else {
+                                    (initial_index, None, None, None, vec![])
+                                }
+                            };
+
+                            // Phase 2b: Create parquet_storage for doc retrieval from parquet files.
+                            // The table_root from the manifest determines the storage root.
+                            let parquet_storage: Option<Arc<dyn Storage>> = if let Some(ref manifest) = parquet_manifest {
+                                let table_root = &manifest.table_root;
+                                // Convert local paths to file:// URIs for StorageResolver
+                                let table_uri = if table_root.contains("://") {
+                                    table_root.clone()
+                                } else {
+                                    format!("file://{}/", table_root.trim_end_matches('/'))
+                                };
+                                debug_println!("📦 PARQUET_COMPANION: Creating parquet storage for table_root='{}' (uri='{}')", table_root, table_uri);
+                                match runtime.handle().block_on(async {
+                                    quickwit_storage::StorageResolver::configured(&quickwit_config::StorageConfigs::default())
+                                        .resolve(&quickwit_common::uri::Uri::from_str(&table_uri).unwrap())
+                                        .await
+                                }) {
+                                    Ok(storage) => {
+                                        debug_println!("📦 PARQUET_COMPANION: Parquet storage created for '{}'", table_uri);
+                                        Some(storage)
+                                    }
+                                    Err(e) => {
+                                        debug_println!("⚠️ PARQUET_COMPANION: Failed to create parquet storage for '{}': {}", table_uri, e);
+                                        None
+                                    }
+                                }
+                            } else {
+                                None
+                            };
 
                             // Follow Quickwit's exact pattern: create index reader and cached searcher
                             // Extract metadata for enhanced memory allocation
@@ -491,7 +678,6 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_crea
                             debug_println!("🔥 SEARCHER CACHED: Created cached searcher following Quickwit's exact pattern for optimal cache reuse");
 
                             // ✅ FIX: Always use index.schema() for now - doc_mapping reconstruction has issues with dynamic JSON fields
-                            // Quickwit's DocMapper requires at least one field mapping for JSON/object fields, but Tantivy's dynamic JSON fields don't have predefined mappings
                             debug_println!("RUST DEBUG: 🔧 Using index.schema() directly (doc_mapping has compatibility issues with dynamic JSON fields)");
                             let schema = cached_index.schema();
                             let schema_ptr = crate::utils::arc_to_jlong(std::sync::Arc::new(schema));
@@ -500,7 +686,6 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_crea
                             // Create clean struct-based context instead of complex tuple
                             let cached_context = CachedSearcherContext {
                                 standalone_searcher: std::sync::Arc::new(searcher),
-                                // ✅ CRITICAL FIX: No longer storing runtime - using shared global runtime
                                 split_uri: split_uri.clone(),
                                 aws_config,
                                 footer_start: split_footer_start,
@@ -509,10 +694,15 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_crea
                                 cached_storage: resolved_storage,
                                 cached_index: std::sync::Arc::new(cached_index),
                                 cached_searcher,
-                                // 🚀 BATCH OPTIMIZATION FIX: Store ByteRangeCache and bundle file offsets
-                                // Note: byte_range_cache is None if L1 cache is disabled for debugging
                                 byte_range_cache,
                                 bundle_file_offsets,
+                                parquet_manifest,
+                                parquet_storage,
+                                augmented_directory,
+                                split_overrides,
+                                parquet_meta_json,
+                                transcoded_fast_columns: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+                                segment_fast_paths,
                             };
 
                             let searcher_context = std::sync::Arc::new(cached_context);

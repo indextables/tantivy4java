@@ -1,11 +1,12 @@
 // types.rs - Shared data structures for split_searcher module
 
-use std::sync::Arc;
-use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::ops::Range;
 use quickwit_storage::{Storage, ByteRangeCache};
 use crate::standalone_searcher::StandaloneSearcher;
+use crate::parquet_companion::manifest::ParquetManifest;
 
 /// Simple data structure to hold search results for JNI integration
 #[derive(Debug)]
@@ -47,6 +48,28 @@ pub(crate) struct CachedSearcherContext {
     // This allows prefetch to populate the same cache that doc_async uses
     pub(crate) byte_range_cache: Option<ByteRangeCache>,
     pub(crate) bundle_file_offsets: HashMap<PathBuf, Range<u64>>,
+    // Parquet companion mode: optional manifest for parquet-backed document retrieval
+    pub(crate) parquet_manifest: Option<Arc<ParquetManifest>>,
+    // Parquet companion mode: optional storage for accessing parquet files (used in Phase 2+)
+    #[allow(dead_code)]
+    pub(crate) parquet_storage: Option<Arc<dyn Storage>>,
+    // Phase 2: Optional augmented directory for fast field transcoding from parquet
+    pub(crate) augmented_directory: Option<Arc<crate::parquet_companion::augmented_directory::ParquetAugmentedDirectory>>,
+    // Parquet companion mode: split overrides (meta.json + fast field data)
+    // Used by aggregation/search path to shadow the split's files via UnionDirectory.
+    // The fast_field_data is populated lazily — only the columns needed by each query
+    // are transcoded on demand, not all columns upfront.
+    pub(crate) split_overrides: Option<std::sync::Arc<quickwit_search::SplitOverrides>>,
+    // Parquet companion mode: meta.json override bytes (all fields promoted to fast).
+    // Constant once set at searcher creation. Used to build fresh SplitOverrides per query.
+    pub(crate) parquet_meta_json: Option<Vec<u8>>,
+    // Parquet companion mode: tracks which fast field columns have been transcoded so far.
+    // Grows monotonically as new queries touch new columns. Protected by Mutex for
+    // thread-safe updates when concurrent queries need new columns.
+    pub(crate) transcoded_fast_columns: Arc<Mutex<HashSet<String>>>,
+    // Parquet companion mode: segment .fast file paths discovered at creation time.
+    // Used by lazy transcoding to know which segments need updated .fast files.
+    pub(crate) segment_fast_paths: Vec<PathBuf>,
 }
 
 impl CachedSearcherContext {

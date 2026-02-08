@@ -243,7 +243,8 @@ pub fn create_merged_split_file(merged_index_path: &Path, output_path: &str, met
                 &merged_index_path_clone,
                 &output_path_clone,
                 &metadata_clone,
-                &config_clone
+                &config_clone,
+                None, // No parquet manifest for standard merge
             ))
         }).join().map_err(|_| anyhow!("Split creation thread panicked"))??
     };

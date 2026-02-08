@@ -334,6 +334,28 @@ pub fn merge_splits_impl(split_urls: &[String], output_path: &str, config: &Inte
     ))?;
     debug_log!("Segment merge completed with {} documents", merged_docs);
 
+    // ✅ PARQUET COMPANION: Combine parquet manifests from source splits (if any)
+    // Must happen before temp dirs are dropped since manifests are in the extracted dirs
+    {
+        let source_paths: Vec<std::path::PathBuf> = temp_dirs.iter()
+            .map(|td| td.path().to_path_buf())
+            .collect();
+        let source_refs: Vec<&std::path::Path> = source_paths.iter()
+            .map(|p| p.as_path())
+            .collect();
+        match crate::parquet_companion::merge::combine_parquet_manifests(&source_refs, &output_temp_dir) {
+            Ok(Some(())) => {
+                debug_log!("📦 PARQUET_COMPANION: Combined parquet manifests from {} source splits into merged output", source_refs.len());
+            }
+            Ok(None) => {
+                debug_log!("📦 PARQUET_COMPANION: No parquet manifests found in source splits (standard merge)");
+            }
+            Err(e) => {
+                debug_log!("⚠️ PARQUET_COMPANION: Failed to combine parquet manifests: {} (continuing without manifest)", e);
+            }
+        }
+    }
+
     // ✅ MEMORY OPTIMIZATION: Early temp directory cleanup
     // Source split temp directories are no longer needed after merge completes
     // The merged data is now in output_temp_dir, so we can free the source temp dirs

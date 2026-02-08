@@ -195,6 +195,19 @@ pub fn extract_split_to_directory_impl(split_path: &Path, output_dir: &Path) -> 
         }
     }
 
+    // Copy parquet companion manifest if present
+    let manifest_path = Path::new(crate::parquet_companion::manifest_io::MANIFEST_FILENAME);
+    if bundle_directory.exists(manifest_path)? {
+        debug_log!("📦 PARQUET_COMPANION: Copying {} from split bundle", crate::parquet_companion::manifest_io::MANIFEST_FILENAME);
+        let bytes = streaming_copy_file(
+            bundle_directory.as_ref(),
+            &output_directory,
+            manifest_path
+        )?;
+        total_bytes += bytes;
+        copied_files += 1;
+    }
+
     debug_log!("✅ Successfully extracted split to directory (copied {} files, {} bytes total)", copied_files, total_bytes);
     Ok(())
 }

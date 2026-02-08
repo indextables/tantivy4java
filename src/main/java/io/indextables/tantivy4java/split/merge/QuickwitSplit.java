@@ -23,8 +23,11 @@ import io.indextables.tantivy4java.core.Tantivy;
 
 import io.indextables.tantivy4java.core.Index;
 import io.indextables.tantivy4java.config.FileSystemConfig;
+import io.indextables.tantivy4java.split.ColumnStatistics;
+import io.indextables.tantivy4java.split.ParquetCompanionConfig;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -188,6 +191,9 @@ public class QuickwitSplit {
 
         // Custom fields (for merge operations with parsing failures)
         private final List<SkippedSplit> skippedSplits;  // Splits that failed to parse with reasons
+
+        // Parquet companion mode: column statistics for split pruning
+        private Map<String, ColumnStatistics> columnStatistics;
 
         /**
          * Full constructor with all Quickwit-compatible fields and detailed skip information.
@@ -356,6 +362,21 @@ public class QuickwitSplit {
          */
         public boolean hasSkippedSplits() {
             return !skippedSplits.isEmpty();
+        }
+
+        /**
+         * Returns column statistics computed during parquet companion split creation.
+         * Returns null if no statistics were computed (non-parquet-companion split).
+         */
+        public Map<String, ColumnStatistics> getColumnStatistics() {
+            return columnStatistics;
+        }
+
+        /**
+         * Set column statistics (used internally by createFromParquet).
+         */
+        void setColumnStatistics(Map<String, ColumnStatistics> stats) {
+            this.columnStatistics = stats;
         }
 
         public long getMetadataSize() {
@@ -1139,6 +1160,72 @@ public class QuickwitSplit {
     }
 
     /**
+     * Create a Quickwit split from external parquet files (Parquet Companion Mode).
+     *
+     * <p>This creates a minimal split that references external parquet files for document
+     * storage. The split contains only the tantivy index (for search) and a parquet manifest
+     * (for document retrieval). This reduces split size by 80-90% compared to standard splits.
+     *
+     * <p>The pipeline:
+     * <ol>
+     *   <li>Reads parquet schema from the first file</li>
+     *   <li>Validates schema consistency across all files</li>
+     *   <li>Derives tantivy schema from parquet schema</li>
+     *   <li>Iterates rows and builds tantivy index</li>
+     *   <li>Computes column statistics for split pruning</li>
+     *   <li>Creates split with embedded parquet manifest</li>
+     * </ol>
+     *
+     * @param parquetFiles List of absolute paths to parquet files
+     * @param outputPath Path where the split file should be written (must end with .split)
+     * @param config Parquet companion configuration (table root, fast field mode, etc.)
+     * @return Metadata about the created split, including column statistics
+     * @throws IllegalArgumentException if validation fails
+     * @throws RuntimeException if split creation fails
+     */
+    @SuppressWarnings("unchecked")
+    public static SplitMetadata createFromParquet(List<String> parquetFiles, String outputPath,
+                                                   ParquetCompanionConfig config) {
+        if (parquetFiles == null || parquetFiles.isEmpty()) {
+            throw new IllegalArgumentException("Parquet file list cannot be null or empty");
+        }
+        if (outputPath == null || !outputPath.endsWith(".split")) {
+            throw new IllegalArgumentException("Output path must end with .split");
+        }
+        if (config == null) {
+            throw new IllegalArgumentException("Parquet companion config cannot be null");
+        }
+
+        String resolvedOutputPath = FileSystemConfig.hasGlobalRoot()
+                ? FileSystemConfig.resolvePath(outputPath) : outputPath;
+
+        // Build config JSON for native layer
+        String configJson = config.toIndexingConfigJson();
+
+        // Call native method - returns HashMap with "metadata" and "columnStatistics"
+        Map<String, Object> result = (Map<String, Object>) nativeCreateFromParquet(
+                parquetFiles, resolvedOutputPath, configJson);
+
+        if (result == null) {
+            throw new RuntimeException("createFromParquet returned null result");
+        }
+
+        SplitMetadata metadata = (SplitMetadata) result.get("metadata");
+        if (metadata == null) {
+            throw new RuntimeException("createFromParquet result missing metadata");
+        }
+
+        // Attach column statistics to metadata
+        Map<String, ColumnStatistics> stats =
+                (Map<String, ColumnStatistics>) result.get("columnStatistics");
+        if (stats != null) {
+            metadata.setColumnStatistics(stats);
+        }
+
+        return metadata;
+    }
+
+    /**
      * Merge multiple Quickwit splits into a single split file with full S3 remote support.
      * 
      * This function implements Quickwit's split merging functionality with comprehensive 
@@ -1268,4 +1355,35 @@ public class QuickwitSplit {
     private static native SplitMetadata nativeExtractSplit(String splitPath, String outputDir);
     private static native boolean nativeValidateSplit(String splitPath);
     private static native SplitMetadata nativeMergeSplits(List<String> splitUrls, String outputPath, MergeConfig config);
+    private static native Object nativeCreateFromParquet(List<String> parquetFiles, String outputPath, String configJson);
+
+    /**
+     * Test helper: create a parquet file with test data.
+     * Schema: id (i64), name (utf8), score (f64), active (bool).
+     * Rows: numRows rows with ids starting from idOffset.
+     */
+    public static native void nativeWriteTestParquet(String path, int numRows, long idOffset);
+
+    /**
+     * Test helper: write a parquet file with ALL data types including complex ones.
+     * Schema: id (i64), name (utf8), score (f64), active (bool),
+     *         created_at (timestamp micros), tags (list&lt;utf8&gt;),
+     *         address (struct{city:utf8, zip:utf8}), notes (utf8 nullable with nulls)
+     */
+    public static native void nativeWriteTestParquetComplex(String path, int numRows, long idOffset);
+
+    /**
+     * Test helper: write a parquet file with IP address columns (stored as UTF8 strings).
+     * Schema: id (i64), src_ip (utf8), dst_ip (utf8), port (i64), label (utf8)
+     */
+    public static native void nativeWriteTestParquetWithIps(String path, int numRows, long idOffset);
+
+    /**
+     * Test helper: write a parquet file covering ALL data types.
+     * Schema: id (i64), uint_val (u64), float_val (f64), bool_val (bool),
+     *         text_val (utf8), binary_val (binary), ts_val (timestamp_us),
+     *         date_val (date32), ip_val (utf8, for IP), tags (list<utf8>),
+     *         address (struct{city,zip}), props (map<utf8,utf8>)
+     */
+    public static native void nativeWriteTestParquetAllTypes(String path, int numRows, long idOffset);
 }
