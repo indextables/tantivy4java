@@ -228,7 +228,7 @@ public class ParquetCompanionConfig {
      */
     public Map<String, Object> toConfigMap() {
         Map<String, Object> map = new HashMap<>();
-        map.put("table_root", tableRoot);
+        map.put("parquet_table_root", tableRoot);
         map.put("fast_field_mode", fastFieldMode.name());
         map.put("missing_file_policy", missingFilePolicy.name());
         if (defaultRetrievalFields != null) {

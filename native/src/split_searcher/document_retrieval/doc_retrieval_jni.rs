@@ -839,6 +839,8 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_nati
         let storage = ctx.parquet_storage.as_ref()
             .cloned()
             .unwrap_or_else(|| ctx.cached_storage.clone());
+        let metadata_cache = &ctx.parquet_metadata_cache;
+        let byte_cache = &ctx.parquet_byte_range_cache;
 
         let runtime = crate::runtime_manager::QuickwitRuntimeManager::global().handle();
         let _guard = runtime.enter();
@@ -851,6 +853,8 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_nati
                     doc_id as u32,
                     projected_fields.as_deref(),
                     &storage,
+                    Some(metadata_cache),
+                    Some(byte_cache),
                 )
                 .await
             })
@@ -989,6 +993,8 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_nati
         let storage = ctx.parquet_storage.as_ref()
             .cloned()
             .unwrap_or_else(|| ctx.cached_storage.clone());
+        let metadata_cache = &ctx.parquet_metadata_cache;
+        let byte_cache = &ctx.parquet_byte_range_cache;
 
         let runtime = crate::runtime_manager::QuickwitRuntimeManager::global().handle();
         let _guard = runtime.enter();
@@ -1000,6 +1006,8 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_nati
                     projected_fields.as_deref(),
                     manifest,
                     &storage,
+                    Some(metadata_cache),
+                    Some(byte_cache),
                 )
                 .await
             })

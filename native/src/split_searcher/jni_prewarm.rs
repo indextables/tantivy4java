@@ -444,9 +444,13 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_nati
             columns_to_warm.len(), manifest.parquet_files.len()
         );
 
+        // Resolve parquet file paths using context's table_root (provided at read time)
+        let effective_root = context.parquet_table_root.as_deref()
+            .ok_or_else(|| anyhow::anyhow!("No parquet_table_root configured — required for parquet column prewarm"))?;
+
         // For each parquet file, read the column chunks to populate cache
         for file_entry in &manifest.parquet_files {
-            let file_path = manifest.resolve_path(&file_entry.relative_path);
+            let file_path = resolve_parquet_path(effective_root, &file_entry.relative_path);
 
             for rg in &file_entry.row_groups {
                 for col_info in &rg.columns {
@@ -523,7 +527,7 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_nati
             .sum::<usize>(),
         "totalColumns": manifest.column_mapping.len(),
         "fastFieldMode": format!("{:?}", manifest.fast_field_mode),
-        "tableRoot": &manifest.table_root,
+        "tableRoot": context.parquet_table_root.as_deref().unwrap_or(""),
         "fileSizes": manifest.parquet_files.iter()
             .map(|f| serde_json::json!({
                 "path": &f.relative_path,
@@ -538,6 +542,17 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_nati
     match string_to_jstring(&mut env, &json_str) {
         Ok(jstr) => jstr.into_raw(),
         Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// Resolve a relative parquet file path against the effective table root.
+/// If the path is already absolute or has a protocol, returns it as-is.
+fn resolve_parquet_path(table_root: &str, relative_path: &str) -> String {
+    if relative_path.starts_with('/') || relative_path.contains("://") {
+        relative_path.to_string()
+    } else {
+        let root = table_root.trim_end_matches('/');
+        format!("{}/{}", root, relative_path)
     }
 }
 

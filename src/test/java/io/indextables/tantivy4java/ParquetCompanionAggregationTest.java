@@ -86,7 +86,7 @@ public class ParquetCompanionAggregationTest {
                 splitFile.toString(), config);
 
         String splitUrl = "file://" + splitFile.toAbsolutePath();
-        SplitSearcher searcher = cacheManager.createSplitSearcher(splitUrl, metadata);
+        SplitSearcher searcher = cacheManager.createSplitSearcher(splitUrl, metadata, dir.toString());
 
         // Prewarm for HYBRID/PARQUET_ONLY so fast fields are available
         if (mode != ParquetCompanionConfig.FastFieldMode.DISABLED) {
@@ -904,7 +904,7 @@ public class ParquetCompanionAggregationTest {
         StatsAggregation statsAgg;
         double phase1Sum;
         try (SplitCacheManager cm = SplitCacheManager.getInstance(cacheConfig)) {
-            try (SplitSearcher s = cm.createSplitSearcher(splitUrl, metadata)) {
+            try (SplitSearcher s = cm.createSplitSearcher(splitUrl, metadata, dir.toString())) {
                 // Prewarm fast fields (triggers transcoding + L2 write)
                 s.preloadParquetFastFields("id", "score", "name", "active").join();
 
@@ -939,7 +939,7 @@ public class ParquetCompanionAggregationTest {
         cacheConfig2.withTieredCache(tieredConfig2);
 
         try (SplitCacheManager cm2 = SplitCacheManager.getInstance(cacheConfig2)) {
-            try (SplitSearcher s2 = cm2.createSplitSearcher(splitUrl, metadata)) {
+            try (SplitSearcher s2 = cm2.createSplitSearcher(splitUrl, metadata, dir.toString())) {
                 // Prewarm fast fields again — should hit L2 cache, no re-transcoding
                 s2.preloadParquetFastFields("id", "score", "name", "active").join();
 

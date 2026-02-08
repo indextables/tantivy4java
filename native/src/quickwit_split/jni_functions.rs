@@ -1104,3 +1104,118 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_merge_QuickwitSpli
         Ok(())
     });
 }
+
+/// JNI helper: create a parquet file with 10 realistic fields (4 numeric, 1 date, 1 IP, 5 UUID strings).
+/// Schema:
+///   num_1 (i64), num_2 (i64), num_3 (f64), num_4 (f64),
+///   created_at (timestamp_us),
+///   ip_addr (utf8 — IP addresses),
+///   uuid_1..uuid_5 (utf8 — unique UUIDs per row)
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_split_merge_QuickwitSplit_nativeWriteTestParquetWide(
+    mut env: JNIEnv,
+    _class: JClass,
+    path: JString,
+    num_rows: jni::sys::jint,
+    id_offset: jni::sys::jlong,
+) {
+    let _ = convert_throwable(&mut env, |env| {
+        let path_str = jstring_to_string(env, &path)?;
+
+        use arrow_array::*;
+        use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+        use parquet::arrow::ArrowWriter;
+        use std::sync::Arc;
+
+        let num = num_rows as usize;
+        let offset = id_offset as u64;
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("num_1", DataType::Int64, false),
+            Field::new("num_2", DataType::Int64, false),
+            Field::new("num_3", DataType::Float64, false),
+            Field::new("num_4", DataType::Float64, false),
+            Field::new("created_at", DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None), false),
+            Field::new("ip_addr", DataType::Utf8, false),
+            Field::new("uuid_1", DataType::Utf8, false),
+            Field::new("uuid_2", DataType::Utf8, false),
+            Field::new("uuid_3", DataType::Utf8, false),
+            Field::new("uuid_4", DataType::Utf8, false),
+            Field::new("uuid_5", DataType::Utf8, false),
+        ]));
+
+        // Simple deterministic hash for generating UUID-like strings
+        fn mix(seed: u64) -> u64 {
+            let mut h = seed;
+            h = h.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            h ^= h >> 33;
+            h = h.wrapping_mul(0xff51afd7ed558ccd);
+            h ^= h >> 33;
+            h
+        }
+
+        fn fake_uuid(row: u64, col: u64) -> String {
+            let a = mix(row.wrapping_mul(31).wrapping_add(col.wrapping_mul(1000003)));
+            let b = mix(a);
+            format!(
+                "{:08x}-{:04x}-4{:03x}-{:04x}-{:012x}",
+                (a >> 32) as u32,
+                (a >> 16) as u16,
+                a as u16 & 0x0FFF,
+                ((b >> 48) as u16 & 0x3FFF) | 0x8000,
+                b & 0xFFFF_FFFFFFFF
+            )
+        }
+
+        let num_1: Vec<i64> = (0..num).map(|i| (offset + i as u64) as i64).collect();
+        let num_2: Vec<i64> = (0..num).map(|i| ((i as i64 * 997) % 100_000) + 1).collect();
+        let num_3: Vec<f64> = (0..num).map(|i| (i as f64 * 3.14159) + 0.01).collect();
+        let num_4: Vec<f64> = (0..num).map(|i| ((i as f64 * 2.71828).sin() * 1000.0).round() / 100.0).collect();
+
+        // Timestamps: 2024-01-01 + i seconds
+        let base_ts: i64 = 1_704_067_200_000_000; // 2024-01-01T00:00:00Z in microseconds
+        let timestamps: Vec<i64> = (0..num).map(|i| base_ts + i as i64 * 1_000_000).collect();
+
+        // IP addresses: deterministic IPv4
+        let ips: Vec<String> = (0..num).map(|i| {
+            format!("{}.{}.{}.{}",
+                10 + (i / (256 * 256)) % 246,
+                (i / 256) % 256,
+                i % 256,
+                (i * 7 + 3) % 256)
+        }).collect();
+
+        // 5 UUID columns — each row x column produces a unique UUID
+        let uuid_1: Vec<String> = (0..num).map(|i| fake_uuid(offset + i as u64, 1)).collect();
+        let uuid_2: Vec<String> = (0..num).map(|i| fake_uuid(offset + i as u64, 2)).collect();
+        let uuid_3: Vec<String> = (0..num).map(|i| fake_uuid(offset + i as u64, 3)).collect();
+        let uuid_4: Vec<String> = (0..num).map(|i| fake_uuid(offset + i as u64, 4)).collect();
+        let uuid_5: Vec<String> = (0..num).map(|i| fake_uuid(offset + i as u64, 5)).collect();
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(num_1)),
+                Arc::new(Int64Array::from(num_2)),
+                Arc::new(Float64Array::from(num_3)),
+                Arc::new(Float64Array::from(num_4)),
+                Arc::new(TimestampMicrosecondArray::from(timestamps)),
+                Arc::new(StringArray::from(ips.iter().map(|s| s.as_str()).collect::<Vec<_>>())),
+                Arc::new(StringArray::from(uuid_1.iter().map(|s| s.as_str()).collect::<Vec<_>>())),
+                Arc::new(StringArray::from(uuid_2.iter().map(|s| s.as_str()).collect::<Vec<_>>())),
+                Arc::new(StringArray::from(uuid_3.iter().map(|s| s.as_str()).collect::<Vec<_>>())),
+                Arc::new(StringArray::from(uuid_4.iter().map(|s| s.as_str()).collect::<Vec<_>>())),
+                Arc::new(StringArray::from(uuid_5.iter().map(|s| s.as_str()).collect::<Vec<_>>())),
+            ],
+        ).map_err(|e| anyhow!("Failed to create wide RecordBatch: {}", e))?;
+
+        let file = std::fs::File::create(&path_str)
+            .map_err(|e| anyhow!("Failed to create file '{}': {}", path_str, e))?;
+        let mut writer = ArrowWriter::try_new(file, schema, None)
+            .map_err(|e| anyhow!("Failed to create ArrowWriter: {}", e))?;
+        writer.write(&batch).map_err(|e| anyhow!("write wide parquet: {}", e))?;
+        writer.close().map_err(|e| anyhow!("close wide parquet: {}", e))?;
+
+        Ok(())
+    });
+}

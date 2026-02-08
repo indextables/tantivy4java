@@ -1386,4 +1386,12 @@ public class QuickwitSplit {
      *         address (struct{city,zip}), props (map<utf8,utf8>)
      */
     public static native void nativeWriteTestParquetAllTypes(String path, int numRows, long idOffset);
+
+    /**
+     * Test helper: write a parquet file with 10 realistic fields.
+     * Schema: num_1 (i64), num_2 (i64), num_3 (f64), num_4 (f64),
+     *         created_at (timestamp_us), ip_addr (utf8 — IPs),
+     *         uuid_1..uuid_5 (utf8 — unique UUIDs per row)
+     */
+    public static native void nativeWriteTestParquetWide(String path, int numRows, long idOffset);
 }

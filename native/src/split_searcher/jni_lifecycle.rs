@@ -78,6 +78,9 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_crea
     let mut split_footer_start: u64 = 0;
     let mut split_footer_end: u64 = 0;
     let mut doc_mapping_json: Option<String> = None;
+    let mut parquet_table_root: Option<String> = None;
+    let mut parquet_aws_config: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut parquet_azure_config: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     
     if !split_config_map.is_null() {
         let split_config_jobject = unsafe { JObject::from_raw(split_config_map) };
@@ -204,6 +207,62 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_crea
                             debug_println!("RUST DEBUG: Extracted Azure bearer_token from Java config (length: {} chars)", token_len);
                         }
                     }
+                }
+            }
+        }
+
+        // Extract parquet_table_root (String) for parquet companion mode
+        if let Ok(ptr_obj) = env.call_method(&split_config_jobject, "get", "(Ljava/lang/Object;)Ljava/lang/Object;", &[(&env.new_string("parquet_table_root").unwrap()).into()]) {
+            let ptr_jobject = ptr_obj.l().unwrap();
+            if !ptr_jobject.is_null() {
+                if let Ok(ptr_str) = env.get_string((&ptr_jobject).into()) {
+                    let s: String = ptr_str.into();
+                    if !s.is_empty() {
+                        debug_println!("RUST DEBUG: Extracted parquet_table_root from Java config: {}", s);
+                        parquet_table_root = Some(s);
+                    }
+                }
+            }
+        }
+
+        // Extract parquet_aws_config (Map) for parquet file access credentials
+        if let Ok(pac_obj) = env.call_method(&split_config_jobject, "get", "(Ljava/lang/Object;)Ljava/lang/Object;", &[(&env.new_string("parquet_aws_config").unwrap()).into()]) {
+            let pac_jobject = pac_obj.l().unwrap();
+            if !pac_jobject.is_null() {
+                let pac_map = &pac_jobject;
+                for key in &["access_key", "secret_key", "session_token", "region", "endpoint"] {
+                    if let Ok(val_obj) = env.call_method(pac_map, "get", "(Ljava/lang/Object;)Ljava/lang/Object;", &[(&env.new_string(*key).unwrap()).into()]) {
+                        let val_jobject = val_obj.l().unwrap();
+                        if !val_jobject.is_null() {
+                            if let Ok(val_str) = env.get_string((&val_jobject).into()) {
+                                parquet_aws_config.insert(key.to_string(), val_str.into());
+                            }
+                        }
+                    }
+                }
+                if !parquet_aws_config.is_empty() {
+                    debug_println!("RUST DEBUG: Extracted parquet_aws_config with {} keys", parquet_aws_config.len());
+                }
+            }
+        }
+
+        // Extract parquet_azure_config (Map) for parquet file access credentials
+        if let Ok(paz_obj) = env.call_method(&split_config_jobject, "get", "(Ljava/lang/Object;)Ljava/lang/Object;", &[(&env.new_string("parquet_azure_config").unwrap()).into()]) {
+            let paz_jobject = paz_obj.l().unwrap();
+            if !paz_jobject.is_null() {
+                let paz_map = &paz_jobject;
+                for key in &["account_name", "access_key", "bearer_token"] {
+                    if let Ok(val_obj) = env.call_method(paz_map, "get", "(Ljava/lang/Object;)Ljava/lang/Object;", &[(&env.new_string(*key).unwrap()).into()]) {
+                        let val_jobject = val_obj.l().unwrap();
+                        if !val_jobject.is_null() {
+                            if let Ok(val_str) = env.get_string((&val_jobject).into()) {
+                                parquet_azure_config.insert(key.to_string(), val_str.into());
+                            }
+                        }
+                    }
+                }
+                if !parquet_azure_config.is_empty() {
+                    debug_println!("RUST DEBUG: Extracted parquet_azure_config with {} keys", parquet_azure_config.len());
                 }
             }
         }
@@ -513,6 +572,61 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_crea
                             // correct inverted index for search. The augmented directory is only
                             // needed to intercept .fast file reads during aggregation/prewarm.
                             use crate::parquet_companion::manifest::FastFieldMode;
+
+                            // Phase 2a: Create parquet_storage BEFORE the augmented directory,
+                            // so the augmented directory uses it for reading parquet files from
+                            // the correct table_root (which may be on S3/Azure).
+                            let effective_parquet_table_root: Option<String> = if parquet_manifest.is_some() {
+                                match &parquet_table_root {
+                                    Some(root) => Some(root.clone()),
+                                    None => {
+                                        debug_println!("⚠️ PARQUET_COMPANION: No parquet_table_root provided in config");
+                                        None
+                                    }
+                                }
+                            } else {
+                                None
+                            };
+
+                            let parquet_storage: Option<Arc<dyn Storage>> = if let Some(ref table_root) = effective_parquet_table_root {
+                                let pq_storage_config = {
+                                    use crate::parquet_companion::parquet_storage::ParquetStorageConfig;
+                                    let effective_aws = if !parquet_aws_config.is_empty() { &parquet_aws_config } else { &aws_config };
+                                    let effective_azure = if !parquet_azure_config.is_empty() { &parquet_azure_config } else { &azure_config };
+                                    ParquetStorageConfig {
+                                        aws_access_key: effective_aws.get("access_key").cloned(),
+                                        aws_secret_key: effective_aws.get("secret_key").cloned(),
+                                        aws_session_token: effective_aws.get("session_token").cloned(),
+                                        aws_region: effective_aws.get("region").cloned(),
+                                        aws_endpoint: effective_aws.get("endpoint").cloned(),
+                                        aws_force_path_style: effective_aws.get("path_style_access").map(|v| v == "true").unwrap_or(false),
+                                        azure_account_name: effective_azure.get("account_name").cloned(),
+                                        azure_access_key: effective_azure.get("access_key").cloned(),
+                                        azure_bearer_token: effective_azure.get("bearer_token").cloned(),
+                                    }
+                                };
+
+                                let table_uri = if table_root.contains("://") {
+                                    table_root.clone()
+                                } else {
+                                    format!("file://{}/", table_root.trim_end_matches('/'))
+                                };
+                                debug_println!("📦 PARQUET_COMPANION: Creating parquet storage for table_root='{}' (uri='{}')", table_root, table_uri);
+
+                                match crate::parquet_companion::parquet_storage::create_parquet_storage(&pq_storage_config, &table_uri) {
+                                    Ok(storage) => {
+                                        debug_println!("📦 PARQUET_COMPANION: Parquet storage created for '{}'", table_uri);
+                                        Some(storage)
+                                    }
+                                    Err(e) => {
+                                        debug_println!("⚠️ PARQUET_COMPANION: Failed to create parquet storage for '{}': {}", table_uri, e);
+                                        None
+                                    }
+                                }
+                            } else {
+                                None
+                            };
+
                             let (cached_index, augmented_directory, split_overrides, parquet_meta_json, segment_fast_paths) = {
                                 let needs_augmented = parquet_manifest.as_ref()
                                     .map(|m| m.fast_field_mode != FastFieldMode::Disabled)
@@ -523,17 +637,19 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_crea
                                     debug_println!("📦 PARQUET_COMPANION: Fast field mode {:?} active, re-opening index with all-fast schema",
                                         manifest.fast_field_mode);
 
-                                    // Create the augmented directory first (wraps hot_directory).
-                                    // Pass split_storage + bundle offsets so it can read native .fast
-                                    // bytes via async storage (HotDirectory sync reads may fail).
+                                    // Create the augmented directory (wraps hot_directory).
+                                    // Use parquet_storage for reading parquet files (rooted at table_root),
+                                    // and resolved_storage for reading native .fast bytes from the split bundle.
                                     let split_file_path = std::path::Path::new(&split_uri).file_name()
                                         .map(|f| std::path::PathBuf::from(f))
                                         .unwrap_or_else(|| std::path::PathBuf::from(&split_uri));
+                                    let pq_storage_for_augmented = parquet_storage.clone()
+                                        .unwrap_or_else(|| resolved_storage.clone());
                                     let augmented = crate::parquet_companion::augmented_directory::ParquetAugmentedDirectory::new(
                                         std::sync::Arc::new(hot_directory.clone()),
                                         manifest.fast_field_mode,
                                         manifest.clone(),
-                                        resolved_storage.clone(),
+                                        pq_storage_for_augmented,
                                         resolved_storage.clone(),
                                         bundle_file_offsets.clone(),
                                         split_file_path,
@@ -628,35 +744,6 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_crea
                                 }
                             };
 
-                            // Phase 2b: Create parquet_storage for doc retrieval from parquet files.
-                            // The table_root from the manifest determines the storage root.
-                            let parquet_storage: Option<Arc<dyn Storage>> = if let Some(ref manifest) = parquet_manifest {
-                                let table_root = &manifest.table_root;
-                                // Convert local paths to file:// URIs for StorageResolver
-                                let table_uri = if table_root.contains("://") {
-                                    table_root.clone()
-                                } else {
-                                    format!("file://{}/", table_root.trim_end_matches('/'))
-                                };
-                                debug_println!("📦 PARQUET_COMPANION: Creating parquet storage for table_root='{}' (uri='{}')", table_root, table_uri);
-                                match runtime.handle().block_on(async {
-                                    quickwit_storage::StorageResolver::configured(&quickwit_config::StorageConfigs::default())
-                                        .resolve(&quickwit_common::uri::Uri::from_str(&table_uri).unwrap())
-                                        .await
-                                }) {
-                                    Ok(storage) => {
-                                        debug_println!("📦 PARQUET_COMPANION: Parquet storage created for '{}'", table_uri);
-                                        Some(storage)
-                                    }
-                                    Err(e) => {
-                                        debug_println!("⚠️ PARQUET_COMPANION: Failed to create parquet storage for '{}': {}", table_uri, e);
-                                        None
-                                    }
-                                }
-                            } else {
-                                None
-                            };
-
                             // Follow Quickwit's exact pattern: create index reader and cached searcher
                             // Extract metadata for enhanced memory allocation
                             let split_metadata = extract_split_metadata_for_allocation(&split_uri);
@@ -697,12 +784,15 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_crea
                                 byte_range_cache,
                                 bundle_file_offsets,
                                 parquet_manifest,
+                                parquet_table_root: effective_parquet_table_root,
                                 parquet_storage,
                                 augmented_directory,
                                 split_overrides,
                                 parquet_meta_json,
                                 transcoded_fast_columns: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
                                 segment_fast_paths,
+                                parquet_metadata_cache: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+                                parquet_byte_range_cache: crate::parquet_companion::cached_reader::new_byte_range_cache(),
                             };
 
                             let searcher_context = std::sync::Arc::new(cached_context);

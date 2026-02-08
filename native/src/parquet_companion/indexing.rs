@@ -318,7 +318,7 @@ pub async fn create_split_from_parquet(
     // ── Step 11: Build manifest ─────────────────────────────────────────
     let manifest = ParquetManifest {
         version: SUPPORTED_MANIFEST_VERSION,
-        table_root: parquet_config.table_root.clone(),
+        table_root: String::new(), // Not persisted — provided at read time via config
         fast_field_mode: parquet_config.fast_field_mode,
         segment_row_ranges,
         parquet_files: parquet_file_entries,

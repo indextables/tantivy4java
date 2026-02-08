@@ -65,7 +65,7 @@ public class ParquetCompanionFastFieldStorageTest {
                 splitFile.toString(), config);
 
         String splitUrl = "file://" + splitFile.toAbsolutePath();
-        return cacheManager.createSplitSearcher(splitUrl, metadata);
+        return cacheManager.createSplitSearcher(splitUrl, metadata, dir.toString());
     }
 
     /**

@@ -122,7 +122,7 @@ pub fn combine_parquet_manifests(
     // Use first manifest's metadata as base
     let combined = ParquetManifest {
         version: SUPPORTED_MANIFEST_VERSION,
-        table_root: manifests[0].table_root.clone(),
+        table_root: String::new(), // Not persisted — provided at read time via config
         fast_field_mode: mode,
         segment_row_ranges: merged_segment_ranges,
         parquet_files: combined_files,

@@ -20,7 +20,7 @@ use parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder;
 
 use quickwit_storage::Storage;
 
-use super::cached_reader::CachedParquetReader;
+use super::cached_reader::{CachedParquetReader, ByteRangeCache};
 use super::docid_mapping::{translate_to_global_row, locate_row_in_file, group_doc_addresses_by_file};
 use super::manifest::ParquetManifest;
 
@@ -34,12 +34,15 @@ use crate::debug_println;
 /// * `doc_id` - Tantivy local document ID within the segment
 /// * `projected_fields` - Optional set of field names to retrieve (None = all)
 /// * `storage` - Storage instance for accessing parquet files
+/// * `metadata_cache` - Optional cache of parquet metadata per file path (avoids re-reading footer from S3)
 pub async fn retrieve_document_from_parquet(
     manifest: &ParquetManifest,
     segment_ord: u32,
     doc_id: u32,
     projected_fields: Option<&[String]>,
     storage: &Arc<dyn Storage>,
+    metadata_cache: Option<&std::sync::Arc<std::sync::Mutex<HashMap<std::path::PathBuf, std::sync::Arc<parquet::file::metadata::ParquetMetaData>>>>>,
+    byte_cache: Option<&ByteRangeCache>,
 ) -> Result<HashMap<String, serde_json::Value>> {
     let global_row = translate_to_global_row(segment_ord, doc_id, manifest)
         .map_err(|e| anyhow::anyhow!("{}", e))?;
@@ -56,16 +59,46 @@ pub async fn retrieve_document_from_parquet(
         segment_ord, doc_id, global_row, location.file_idx, parquet_path, location.row_in_file
     );
 
-    // Build projection mask based on requested fields
-    let reader = CachedParquetReader::new(
-        storage.clone(),
-        std::path::PathBuf::from(parquet_path),
-        file_entry.file_size_bytes,
-    );
+    // Check metadata cache first to avoid re-reading footer from S3/Azure
+    let path_buf = std::path::PathBuf::from(parquet_path);
+    let cached_meta = metadata_cache.and_then(|cache| {
+        cache.lock().ok().and_then(|guard| guard.get(&path_buf).cloned())
+    });
+
+    let reader = if let Some(meta) = cached_meta {
+        debug_println!("📖 PARQUET_DOC: Using cached metadata for {:?}", parquet_path);
+        CachedParquetReader::with_metadata(
+            storage.clone(),
+            path_buf.clone(),
+            file_entry.file_size_bytes,
+            meta,
+        )
+    } else {
+        CachedParquetReader::new(
+            storage.clone(),
+            path_buf.clone(),
+            file_entry.file_size_bytes,
+        )
+    };
+    let reader = if let Some(bc) = byte_cache {
+        reader.with_byte_cache(bc.clone())
+    } else {
+        reader
+    };
 
     let builder = ParquetRecordBatchStreamBuilder::new(reader)
         .await
         .context("Failed to create parquet stream builder")?;
+
+    // Cache the metadata for subsequent reads
+    if let Some(cache) = metadata_cache {
+        if let Ok(mut guard) = cache.lock() {
+            if !guard.contains_key(&path_buf) {
+                guard.insert(path_buf.clone(), builder.metadata().clone());
+                debug_println!("📖 PARQUET_DOC: Cached metadata for {:?}", parquet_path);
+            }
+        }
+    }
 
     let parquet_schema = builder.schema().clone();
 
@@ -102,8 +135,31 @@ pub async fn retrieve_document_from_parquet(
         builder
     };
 
-    // Use row selection to skip directly to the target row
-    let row_selection = build_row_selection_for_row(row_in_file, &file_entry.row_groups, &parquet_metadata);
+    // Step 1: Filter to only the target row group (avoids downloading column pages
+    // for ALL row groups — critical for large files on S3/Azure).
+    let rg_filter = compute_row_group_filter(&[row_in_file], &parquet_metadata);
+    let builder = if let Some(ref filter) = rg_filter {
+        let selected_rgs: Vec<usize> = filter
+            .iter()
+            .enumerate()
+            .filter(|(_, selected)| **selected)
+            .map(|(idx, _)| idx)
+            .collect();
+        debug_println!(
+            "📖 PARQUET_DOC: single-doc selecting row group(s) {:?} of {}",
+            selected_rgs, parquet_metadata.num_row_groups()
+        );
+        builder.with_row_groups(selected_rgs)
+    } else {
+        builder
+    };
+
+    // Step 2: Build RowSelection within the selected row group to skip to exact row
+    let row_selection = build_row_selection_for_rows_in_selected_groups(
+        &[row_in_file],
+        &parquet_metadata,
+        rg_filter.as_deref(),
+    );
     let builder = if let Some(selection) = row_selection {
         builder.with_row_selection(selection)
     } else {
@@ -139,6 +195,8 @@ pub async fn batch_retrieve_from_parquet(
     projected_fields: Option<&[String]>,
     manifest: &ParquetManifest,
     storage: &Arc<dyn Storage>,
+    metadata_cache: Option<&std::sync::Arc<std::sync::Mutex<HashMap<std::path::PathBuf, std::sync::Arc<parquet::file::metadata::ParquetMetaData>>>>>,
+    byte_cache: Option<&ByteRangeCache>,
 ) -> Result<Vec<HashMap<String, serde_json::Value>>> {
     let groups = group_doc_addresses_by_file(addresses, manifest)
         .map_err(|e| anyhow::anyhow!("{}", e))?;
@@ -153,6 +211,8 @@ pub async fn batch_retrieve_from_parquet(
             let manifest = manifest.clone();
             let projected_fields_owned: Option<Vec<String>> =
                 projected_fields.map(|f| f.to_vec());
+            let metadata_cache = metadata_cache.cloned();
+            let byte_cache = byte_cache.cloned();
 
             async move {
                 let file_entry = &manifest.parquet_files[file_idx];
@@ -164,15 +224,44 @@ pub async fn batch_retrieve_from_parquet(
                     file_idx, parquet_path, rows.len()
                 );
 
-                let reader = CachedParquetReader::new(
-                    storage.clone(),
-                    std::path::PathBuf::from(parquet_path),
-                    file_entry.file_size_bytes,
-                );
+                // Check metadata cache to avoid re-reading footer from S3/Azure
+                let path_buf = std::path::PathBuf::from(parquet_path);
+                let cached_meta = metadata_cache.as_ref().and_then(|cache| {
+                    cache.lock().ok().and_then(|guard| guard.get(&path_buf).cloned())
+                });
+
+                let reader = if let Some(meta) = cached_meta {
+                    CachedParquetReader::with_metadata(
+                        storage.clone(),
+                        path_buf.clone(),
+                        file_entry.file_size_bytes,
+                        meta,
+                    )
+                } else {
+                    CachedParquetReader::new(
+                        storage.clone(),
+                        path_buf.clone(),
+                        file_entry.file_size_bytes,
+                    )
+                };
+                let reader = if let Some(ref bc) = byte_cache {
+                    reader.with_byte_cache(bc.clone())
+                } else {
+                    reader
+                };
 
                 let builder = ParquetRecordBatchStreamBuilder::new(reader)
                     .await
                     .context("Failed to create parquet stream builder")?;
+
+                // Cache the metadata for subsequent reads
+                if let Some(cache) = &metadata_cache {
+                    if let Ok(mut guard) = cache.lock() {
+                        if !guard.contains_key(&path_buf) {
+                            guard.insert(path_buf.clone(), builder.metadata().clone());
+                        }
+                    }
+                }
 
                 let parquet_schema = builder.schema().clone();
                 let parquet_metadata = builder.metadata().clone();
@@ -672,20 +761,6 @@ fn arrow_json_value(array: &ArrayRef, row_idx: usize) -> serde_json::Value {
     }
 }
 
-/// Build a RowSelection that selects only the specified row in the file.
-/// Uses row group metadata to identify the target row group for efficient access.
-fn build_row_selection_for_row(
-    target_row: usize,
-    _row_groups: &[super::manifest::RowGroupEntry],
-    metadata: &parquet::file::metadata::ParquetMetaData,
-) -> Option<parquet::arrow::arrow_reader::RowSelection> {
-    // Delegate to the batch version with a single row
-    build_row_selection_for_rows_in_selected_groups(
-        &[target_row],
-        metadata,
-        None, // no row group filter for single-doc path (the with_row_groups is not set)
-    )
-}
 
 #[cfg(test)]
 mod tests {

@@ -124,7 +124,10 @@ pub struct ParquetStorageConfigMeta {
 pub struct ParquetManifest {
     /// Manifest format version
     pub version: u32,
-    /// Table root path (relative paths in parquet_files are resolved against this)
+    /// Table root path (relative paths in parquet_files are resolved against this).
+    /// No longer persisted at indexing time — provided at read time via config.
+    /// Defaults to empty string for backward compatibility with old manifests.
+    #[serde(default)]
     pub table_root: String,
     /// Fast field mode for this split
     pub fast_field_mode: FastFieldMode,

@@ -91,7 +91,7 @@ public class ParquetCompanionAllTypesTest {
         assertEquals(50, metadata.getNumDocs());
 
         String splitUrl = "file://" + dir.resolve("disabled.split").toAbsolutePath();
-        try (SplitSearcher searcher = cacheManager.createSplitSearcher(splitUrl, metadata)) {
+        try (SplitSearcher searcher = cacheManager.createSplitSearcher(splitUrl, metadata, dir.toString())) {
             Schema schema = searcher.getSchema();
             List<String> fields = schema.getFieldNames();
 
@@ -130,7 +130,7 @@ public class ParquetCompanionAllTypesTest {
         assertEquals(50, metadata.getNumDocs());
 
         String splitUrl = "file://" + dir.resolve("hybrid.split").toAbsolutePath();
-        try (SplitSearcher searcher = cacheManager.createSplitSearcher(splitUrl, metadata)) {
+        try (SplitSearcher searcher = cacheManager.createSplitSearcher(splitUrl, metadata, dir.toString())) {
             SplitQuery allQuery = searcher.parseQuery("*");
             SearchResult allResults = searcher.search(allQuery, 100);
             assertEquals(50, allResults.getHits().size());
@@ -151,7 +151,7 @@ public class ParquetCompanionAllTypesTest {
         assertEquals(50, metadata.getNumDocs());
 
         String splitUrl = "file://" + dir.resolve("pqonly.split").toAbsolutePath();
-        try (SplitSearcher searcher = cacheManager.createSplitSearcher(splitUrl, metadata)) {
+        try (SplitSearcher searcher = cacheManager.createSplitSearcher(splitUrl, metadata, dir.toString())) {
             SplitQuery allQuery = searcher.parseQuery("*");
             SearchResult allResults = searcher.search(allQuery, 100);
             assertEquals(50, allResults.getHits().size());
@@ -169,7 +169,7 @@ public class ParquetCompanionAllTypesTest {
                 ParquetCompanionConfig.FastFieldMode.DISABLED);
 
         String splitUrl = "file://" + dir.resolve("retrieve.split").toAbsolutePath();
-        try (SplitSearcher searcher = cacheManager.createSplitSearcher(splitUrl, metadata)) {
+        try (SplitSearcher searcher = cacheManager.createSplitSearcher(splitUrl, metadata, dir.toString())) {
             // Search for first doc
             SplitQuery query = new SplitTermQuery("text_val", "text_0");
             SearchResult results = searcher.search(query, 1);
@@ -215,7 +215,7 @@ public class ParquetCompanionAllTypesTest {
                 ParquetCompanionConfig.FastFieldMode.DISABLED);
 
         String splitUrl = "file://" + dir.resolve("batch.split").toAbsolutePath();
-        try (SplitSearcher searcher = cacheManager.createSplitSearcher(splitUrl, metadata)) {
+        try (SplitSearcher searcher = cacheManager.createSplitSearcher(splitUrl, metadata, dir.toString())) {
             SplitQuery query = searcher.parseQuery("*");
             SearchResult results = searcher.search(query, 10);
             assertTrue(results.getHits().size() >= 5);
@@ -261,7 +261,7 @@ public class ParquetCompanionAllTypesTest {
                 ParquetCompanionConfig.FastFieldMode.DISABLED);
 
         String splitUrl = "file://" + dir.resolve("batch_proj.split").toAbsolutePath();
-        try (SplitSearcher searcher = cacheManager.createSplitSearcher(splitUrl, metadata)) {
+        try (SplitSearcher searcher = cacheManager.createSplitSearcher(splitUrl, metadata, dir.toString())) {
             SplitQuery query = searcher.parseQuery("*");
             SearchResult results = searcher.search(query, 5);
             assertTrue(results.getHits().size() >= 3);
@@ -365,7 +365,7 @@ public class ParquetCompanionAllTypesTest {
                     splitFile.toString(), config);
 
             String splitUrl = "file://" + splitFile.toAbsolutePath();
-            try (SplitSearcher searcher = cacheManager.createSplitSearcher(splitUrl, metadata)) {
+            try (SplitSearcher searcher = cacheManager.createSplitSearcher(splitUrl, metadata, dir.toString())) {
                 if (mode != ParquetCompanionConfig.FastFieldMode.DISABLED) {
                     searcher.preloadParquetFastFields("id").join();
                 }
@@ -389,7 +389,7 @@ public class ParquetCompanionAllTypesTest {
                 ParquetCompanionConfig.FastFieldMode.PARQUET_ONLY);
 
         String splitUrl = "file://" + dir.resolve("ip_pqonly.split").toAbsolutePath();
-        try (SplitSearcher searcher = cacheManager.createSplitSearcher(splitUrl, metadata)) {
+        try (SplitSearcher searcher = cacheManager.createSplitSearcher(splitUrl, metadata, dir.toString())) {
             Schema schema = searcher.getSchema();
             assertTrue(schema.getFieldNames().contains("ip_val"));
 
@@ -431,7 +431,7 @@ public class ParquetCompanionAllTypesTest {
 
         // Search the merged split
         String splitUrl = "file://" + mergedFile.toAbsolutePath();
-        try (SplitSearcher searcher = cacheManager.createSplitSearcher(splitUrl, merged)) {
+        try (SplitSearcher searcher = cacheManager.createSplitSearcher(splitUrl, merged, dir.toString())) {
             SplitQuery allQuery = searcher.parseQuery("*");
             SearchResult results = searcher.search(allQuery, 100);
             assertEquals(60, results.getHits().size());
@@ -449,7 +449,7 @@ public class ParquetCompanionAllTypesTest {
                 ParquetCompanionConfig.FastFieldMode.PARQUET_ONLY);
 
         String splitUrl = "file://" + dir.resolve("prewarm_pq.split").toAbsolutePath();
-        try (SplitSearcher searcher = cacheManager.createSplitSearcher(splitUrl, metadata)) {
+        try (SplitSearcher searcher = cacheManager.createSplitSearcher(splitUrl, metadata, dir.toString())) {
             // Prewarm in PARQUET_ONLY — all fast fields come from parquet
             searcher.preloadParquetFastFields("id", "text_val").join();
 
@@ -470,7 +470,7 @@ public class ParquetCompanionAllTypesTest {
                 ParquetCompanionConfig.FastFieldMode.DISABLED);
 
         String splitUrl = "file://" + dir.resolve("batch_complex.split").toAbsolutePath();
-        try (SplitSearcher searcher = cacheManager.createSplitSearcher(splitUrl, metadata)) {
+        try (SplitSearcher searcher = cacheManager.createSplitSearcher(splitUrl, metadata, dir.toString())) {
             SplitQuery query = searcher.parseQuery("*");
             SearchResult results = searcher.search(query, 5);
 
@@ -515,7 +515,7 @@ public class ParquetCompanionAllTypesTest {
                 ParquetCompanionConfig.FastFieldMode.DISABLED);
 
         String splitUrl = "file://" + dir.resolve("batch_bin.split").toAbsolutePath();
-        try (SplitSearcher searcher = cacheManager.createSplitSearcher(splitUrl, metadata)) {
+        try (SplitSearcher searcher = cacheManager.createSplitSearcher(splitUrl, metadata, dir.toString())) {
             SplitQuery query = searcher.parseQuery("*");
             SearchResult results = searcher.search(query, 5);
 
@@ -550,7 +550,7 @@ public class ParquetCompanionAllTypesTest {
                 ParquetCompanionConfig.FastFieldMode.DISABLED);
 
         String splitUrl = "file://" + dir.resolve("batch_ts.split").toAbsolutePath();
-        try (SplitSearcher searcher = cacheManager.createSplitSearcher(splitUrl, metadata)) {
+        try (SplitSearcher searcher = cacheManager.createSplitSearcher(splitUrl, metadata, dir.toString())) {
             SplitQuery query = searcher.parseQuery("*");
             SearchResult results = searcher.search(query, 5);
 
@@ -629,7 +629,7 @@ public class ParquetCompanionAllTypesTest {
                 splitFile.toString(), config);
 
         String splitUrl = "file://" + splitFile.toAbsolutePath();
-        try (SplitSearcher searcher = cacheManager.createSplitSearcher(splitUrl, metadata)) {
+        try (SplitSearcher searcher = cacheManager.createSplitSearcher(splitUrl, metadata, dir.toString())) {
             Schema schema = searcher.getSchema();
             List<String> fields = schema.getFieldNames();
 
@@ -653,7 +653,7 @@ public class ParquetCompanionAllTypesTest {
                 ParquetCompanionConfig.FastFieldMode.HYBRID);
 
         String splitUrl = "file://" + dir.resolve("hist_u64.split").toAbsolutePath();
-        try (SplitSearcher searcher = cacheManager.createSplitSearcher(splitUrl, metadata)) {
+        try (SplitSearcher searcher = cacheManager.createSplitSearcher(splitUrl, metadata, dir.toString())) {
             searcher.preloadParquetFastFields("uint_val").join();
 
             HistogramAggregation agg = new HistogramAggregation("uint_hist", "uint_val", 100);
@@ -683,7 +683,7 @@ public class ParquetCompanionAllTypesTest {
                     Collections.singletonList(pq.toString()), sp.toString(), config);
 
             String splitUrl = "file://" + sp.toAbsolutePath();
-            try (SplitSearcher searcher = cacheManager.createSplitSearcher(splitUrl, meta)) {
+            try (SplitSearcher searcher = cacheManager.createSplitSearcher(splitUrl, meta, dir.toString())) {
                 if (mode != ParquetCompanionConfig.FastFieldMode.DISABLED) {
                     searcher.preloadParquetFastFields("text_val").join();
                 }
@@ -744,7 +744,7 @@ public class ParquetCompanionAllTypesTest {
                 ParquetCompanionConfig.FastFieldMode.DISABLED);
 
         String splitUrl = "file://" + dir.resolve("batch_u64.split").toAbsolutePath();
-        try (SplitSearcher searcher = cacheManager.createSplitSearcher(splitUrl, metadata)) {
+        try (SplitSearcher searcher = cacheManager.createSplitSearcher(splitUrl, metadata, dir.toString())) {
             SplitQuery query = searcher.parseQuery("*");
             SearchResult results = searcher.search(query, 5);
 

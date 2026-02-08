@@ -167,7 +167,8 @@ public class RealAzureParquetCompanionTest {
 
     private static SplitCacheManager createCacheManager(String name) {
         SplitCacheManager.CacheConfig config = new SplitCacheManager.CacheConfig(name)
-                .withMaxCacheSize(200_000_000);
+                .withMaxCacheSize(200_000_000)
+                .withParquetTableRoot(tempDir.toString());
         String sa = getStorageAccount(), ak = getAccountKey();
         if (sa != null && ak != null) {
             config = config.withAzureCredentials(sa, ak);

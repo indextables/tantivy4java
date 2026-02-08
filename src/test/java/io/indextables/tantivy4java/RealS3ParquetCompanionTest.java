@@ -190,7 +190,8 @@ public class RealS3ParquetCompanionTest {
 
     private static SplitCacheManager createCacheManager(String name) {
         SplitCacheManager.CacheConfig config = new SplitCacheManager.CacheConfig(name)
-                .withMaxCacheSize(200_000_000);
+                .withMaxCacheSize(200_000_000)
+                .withParquetTableRoot(tempDir.toString());
         String ak = getAccessKey(), sk = getSecretKey();
         if (ak != null && sk != null) {
             config = config.withAwsCredentials(ak, sk);
