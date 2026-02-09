@@ -62,7 +62,7 @@ async-trait = "0.1"  # For Storage trait implementation
 aws-sdk-s3 = "=1.62"  # For streaming file uploads (PutPayload implementation)
 
 # Parquet companion mode - enables minimal splits referencing external parquet files
-parquet = { version = "57", default-features = false, features = ["async", "arrow", "zstd", "lz4"] }
+parquet = { version = "57", default-features = false, features = ["async", "arrow", "zstd", "lz4", "snap", "flate2", "flate2-rust_backened"] }
 arrow = { version = "57", default-features = false, features = ["ffi"] }
 arrow-schema = "57"
 arrow-array = "57"

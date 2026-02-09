@@ -167,7 +167,17 @@ fn add_field_for_arrow_type(
             builder.add_text_field(name, opts);
         }
 
-        DataType::Binary | DataType::LargeBinary => {
+        DataType::Decimal128(_, _) | DataType::Decimal256(_, _) => {
+            // Decimal types: map to f64 for tantivy (lossy for very large values)
+            let mut opts = NumericOptions::default();
+            opts = opts.set_indexed();
+            if should_add_fast(config, name, data_type) {
+                opts = opts.set_fast();
+            }
+            builder.add_f64_field(name, opts);
+        }
+
+        DataType::Binary | DataType::LargeBinary | DataType::FixedSizeBinary(_) => {
             // Bytes: indexed only, no stored (parquet is the store)
             builder.add_bytes_field(name, INDEXED);
         }
@@ -229,6 +239,7 @@ fn should_add_fast(config: &SchemaDerivationConfig, field_name: &str, data_type:
                 | DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
                 | DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64
                 | DataType::Float32 | DataType::Float64
+                | DataType::Decimal128(_, _) | DataType::Decimal256(_, _)
                 | DataType::Timestamp(_, _) | DataType::Date32 | DataType::Date64
             )
         }
@@ -320,8 +331,9 @@ pub fn arrow_type_to_tantivy_type(data_type: &DataType) -> &'static str {
         DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => "I64",
         DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 => "U64",
         DataType::Float32 | DataType::Float64 => "F64",
+        DataType::Decimal128(_, _) | DataType::Decimal256(_, _) => "F64",
         DataType::Utf8 | DataType::LargeUtf8 => "Str",
-        DataType::Binary | DataType::LargeBinary => "Bytes",
+        DataType::Binary | DataType::LargeBinary | DataType::FixedSizeBinary(_) => "Bytes",
         DataType::Timestamp(_, _) | DataType::Date32 | DataType::Date64 => "Date",
         DataType::List(_) | DataType::LargeList(_) | DataType::Map(_, _) | DataType::Struct(_) => "Json",
         _ => "Unknown",
@@ -340,6 +352,8 @@ pub fn arrow_type_to_parquet_type(data_type: &DataType) -> &'static str {
         DataType::Float64 => "DOUBLE",
         DataType::Utf8 | DataType::LargeUtf8 => "BYTE_ARRAY",
         DataType::Binary | DataType::LargeBinary => "BYTE_ARRAY",
+        DataType::Decimal128(_, _) | DataType::Decimal256(_, _) => "FIXED_LEN_BYTE_ARRAY",
+        DataType::FixedSizeBinary(_) => "FIXED_LEN_BYTE_ARRAY",
         DataType::Timestamp(_, _) => "INT64",
         DataType::Date32 => "INT32",
         DataType::Date64 => "INT64",
@@ -758,6 +772,50 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(std::str::from_utf8(&result).unwrap()).unwrap();
         // Non-raw tokenizer text fields should NOT be promoted
         assert_eq!(parsed["schema"][0]["options"]["fast"], false);
+    }
+
+    #[test]
+    fn test_derive_schema_decimal_types() {
+        let arrow = ArrowSchema::new(vec![
+            Field::new("price", DataType::Decimal128(18, 2), true),
+            Field::new("big_val", DataType::Decimal256(38, 10), true),
+            Field::new("hash", DataType::FixedSizeBinary(16), true),
+        ]);
+        let config = SchemaDerivationConfig::default();
+        let schema = derive_tantivy_schema(&arrow, &config).unwrap();
+
+        // Decimal128/Decimal256 → F64
+        let price_field = schema.get_field("price").unwrap();
+        let price_entry = schema.get_field_entry(price_field);
+        assert!(
+            matches!(price_entry.field_type(), tantivy::schema::FieldType::F64(_)),
+            "Decimal128 should map to F64, got {:?}", price_entry.field_type()
+        );
+
+        let big_field = schema.get_field("big_val").unwrap();
+        let big_entry = schema.get_field_entry(big_field);
+        assert!(
+            matches!(big_entry.field_type(), tantivy::schema::FieldType::F64(_)),
+            "Decimal256 should map to F64, got {:?}", big_entry.field_type()
+        );
+
+        // FixedSizeBinary → Bytes
+        let hash_field = schema.get_field("hash").unwrap();
+        let hash_entry = schema.get_field_entry(hash_field);
+        assert!(
+            matches!(hash_entry.field_type(), tantivy::schema::FieldType::Bytes(_)),
+            "FixedSizeBinary should map to Bytes, got {:?}", hash_entry.field_type()
+        );
+
+        // Verify tantivy type mappings
+        assert_eq!(arrow_type_to_tantivy_type(&DataType::Decimal128(18, 2)), "F64");
+        assert_eq!(arrow_type_to_tantivy_type(&DataType::Decimal256(38, 10)), "F64");
+        assert_eq!(arrow_type_to_tantivy_type(&DataType::FixedSizeBinary(16)), "Bytes");
+
+        // Verify parquet type mappings
+        assert_eq!(arrow_type_to_parquet_type(&DataType::Decimal128(18, 2)), "FIXED_LEN_BYTE_ARRAY");
+        assert_eq!(arrow_type_to_parquet_type(&DataType::Decimal256(38, 10)), "FIXED_LEN_BYTE_ARRAY");
+        assert_eq!(arrow_type_to_parquet_type(&DataType::FixedSizeBinary(16)), "FIXED_LEN_BYTE_ARRAY");
     }
 
     #[test]

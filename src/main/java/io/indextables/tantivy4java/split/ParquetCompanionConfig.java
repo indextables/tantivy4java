@@ -111,6 +111,8 @@ public class ParquetCompanionConfig {
     private String indexUid = "parquet-index";
     private String sourceId = "parquet-source";
     private String nodeId = "parquet-node";
+    private long writerHeapSize = 256_000_000L;
+    private int readerBatchSize = 8192;
 
     /** Create a parquet companion config with the table root path. */
     public ParquetCompanionConfig(String tableRoot) {
@@ -207,6 +209,35 @@ public class ParquetCompanionConfig {
         return this;
     }
 
+    /**
+     * Set the tantivy writer heap size in bytes.
+     * Controls how much memory the indexer can use before flushing to disk.
+     * Larger values reduce the chance of creating multiple segments (which is
+     * important for maintaining the docid-to-parquet-row mapping) but use more RAM.
+     * Default: 256MB. Minimum: 15MB.
+     */
+    public ParquetCompanionConfig withWriterHeapSize(long heapSize) {
+        if (heapSize < 15_000_000L) {
+            throw new IllegalArgumentException(
+                "Writer heap size must be at least 15MB (15000000 bytes). Got: " + heapSize);
+        }
+        this.writerHeapSize = heapSize;
+        return this;
+    }
+
+    /**
+     * Set the number of rows per Arrow RecordBatch when reading parquet files.
+     * Larger batches reduce per-batch overhead but use more memory per batch.
+     * Default: 8192. Typical range: 1024 to 65536.
+     */
+    public ParquetCompanionConfig withReaderBatchSize(int batchSize) {
+        if (batchSize < 1) {
+            throw new IllegalArgumentException("Reader batch size must be at least 1. Got: " + batchSize);
+        }
+        this.readerBatchSize = batchSize;
+        return this;
+    }
+
     public String getTableRoot() { return tableRoot; }
     public FastFieldMode getFastFieldMode() { return fastFieldMode; }
     public ParquetStorageConfig getParquetStorage() { return parquetStorage; }
@@ -222,6 +253,8 @@ public class ParquetCompanionConfig {
     public String getIndexUid() { return indexUid; }
     public String getSourceId() { return sourceId; }
     public String getNodeId() { return nodeId; }
+    public long getWriterHeapSize() { return writerHeapSize; }
+    public int getReaderBatchSize() { return readerBatchSize; }
 
     /**
      * Convert this config to a map for passing through JNI.
@@ -259,6 +292,8 @@ public class ParquetCompanionConfig {
         sb.append(",\"node_id\":").append(jsonString(nodeId));
         sb.append(",\"statistics_truncate_length\":").append(statisticsTruncateLength);
         sb.append(",\"auto_detect_name_mapping\":").append(autoDetectNameMapping);
+        sb.append(",\"writer_heap_size\":").append(writerHeapSize);
+        sb.append(",\"reader_batch_size\":").append(readerBatchSize);
 
         if (statisticsFields != null && statisticsFields.length > 0) {
             sb.append(",\"statistics_fields\":[");

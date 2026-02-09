@@ -49,6 +49,14 @@ pub struct CreateFromParquetConfig {
     pub index_uid: String,
     pub source_id: String,
     pub node_id: String,
+    /// Tantivy writer heap size in bytes. Controls how much memory the indexer
+    /// can use before flushing to disk. Larger values reduce the chance of
+    /// creating multiple segments but use more RAM. Default: 256MB.
+    pub writer_heap_size: usize,
+    /// Number of rows per Arrow RecordBatch when reading parquet files.
+    /// Larger batches reduce per-batch overhead but use more memory.
+    /// Default: 8192.
+    pub reader_batch_size: usize,
 }
 
 impl Default for CreateFromParquetConfig {
@@ -64,6 +72,8 @@ impl Default for CreateFromParquetConfig {
             index_uid: "parquet-index".to_string(),
             source_id: "parquet-source".to_string(),
             node_id: "parquet-node".to_string(),
+            writer_heap_size: 256_000_000, // 256MB
+            reader_batch_size: 8192,
         }
     }
 }
@@ -95,14 +105,17 @@ pub async fn create_split_from_parquet(
     }
 
     // ── Step 1: Read schema from first parquet file ──────────────────────
-    let first_file_bytes = std::fs::read(&parquet_files[0])
-        .with_context(|| format!("Failed to read parquet file: {}", parquet_files[0]))?;
+    // Use File-based reader which reads only the footer via mmap/seek,
+    // avoiding loading the entire file into memory just for schema/metadata.
+    let first_file = std::fs::File::open(&parquet_files[0])
+        .with_context(|| format!("Failed to open parquet file: {}", parquet_files[0]))?;
 
-    let first_reader = ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(first_file_bytes.clone()))
-        .context("Failed to open first parquet file")?;
+    let first_reader = ParquetRecordBatchReaderBuilder::try_new(first_file)
+        .context("Failed to read first parquet file metadata")?;
 
     let arrow_schema = first_reader.schema().clone();
     let parquet_metadata = first_reader.metadata().clone();
+    drop(first_reader);
 
     debug_println!(
         "🏗️ CREATE_FROM_PARQUET: Primary schema has {} fields",
@@ -110,12 +123,14 @@ pub async fn create_split_from_parquet(
     );
 
     // ── Step 2: Validate schema consistency across all files ─────────────
+    // Use File-based reader which only reads the parquet footer (a few KB)
+    // instead of loading the entire file into memory just to check the schema.
     let mut file_schemas: Vec<ArrowSchema> = Vec::new();
     for file_path in &parquet_files[1..] {
-        let file_bytes = std::fs::read(file_path)
-            .with_context(|| format!("Failed to read parquet file: {}", file_path))?;
-        let reader = ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(file_bytes))
+        let file = std::fs::File::open(file_path)
             .with_context(|| format!("Failed to open parquet file: {}", file_path))?;
+        let reader = ParquetRecordBatchReaderBuilder::try_new(file)
+            .with_context(|| format!("Failed to read parquet metadata: {}", file_path))?;
         file_schemas.push(reader.schema().as_ref().clone());
     }
     validate_schema_consistency(&arrow_schema, &file_schemas)?;
@@ -166,8 +181,7 @@ pub async fn create_split_from_parquet(
     // in insertion order (matching parquet row order). Multi-threaded writers
     // distribute docs across threads, creating multiple segments with
     // non-deterministic ordering that breaks the docid-to-parquet-row mapping.
-    // Use 256MB heap to avoid mid-index flushes that would create multiple segments.
-    let mut writer = index.writer_with_num_threads(1, 256_000_000)
+    let mut writer = index.writer_with_num_threads(1, parquet_config.writer_heap_size)
         .context("Failed to create index writer")?;
 
     // ── Step 8: Initialize statistics accumulators ───────────────────────
@@ -187,11 +201,16 @@ pub async fn create_split_from_parquet(
     let mut total_rows: u64 = 0;
 
     for file_path in parquet_files {
-        let file_bytes = std::fs::read(file_path)
-            .with_context(|| format!("Failed to read parquet file: {}", file_path))?;
-        let file_size = file_bytes.len() as u64;
+        let file = std::fs::File::open(file_path)
+            .with_context(|| format!("Failed to open parquet file: {}", file_path))?;
+        let file_size = file.metadata()
+            .with_context(|| format!("Failed to stat parquet file: {}", file_path))?
+            .len();
 
-        let reader_builder = ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(file_bytes))
+        // Use File-based reader — parquet crate reads via mmap/seek so only
+        // the pages actually needed are loaded into memory, instead of reading
+        // the entire file upfront with std::fs::read().
+        let reader_builder = ParquetRecordBatchReaderBuilder::try_new(file)
             .with_context(|| format!("Failed to open parquet file: {}", file_path))?;
 
         let pq_metadata = reader_builder.metadata().clone();
@@ -243,10 +262,10 @@ pub async fn create_split_from_parquet(
             row_groups,
         });
 
-        // Re-open reader for iteration
-        let file_bytes2 = std::fs::read(file_path)?;
-        let reader = ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(file_bytes2))?
-            .with_batch_size(8192)
+        // Reuse the reader_builder (which already holds the file handle) instead
+        // of re-reading the file from disk.
+        let reader = reader_builder
+            .with_batch_size(parquet_config.reader_batch_size)
             .build()
             .context("Failed to build parquet reader")?;
 
@@ -632,6 +651,32 @@ fn add_arrow_value_to_doc(
             }
         }
 
+        DataType::Decimal128(_, scale) => {
+            let arr = array.as_any().downcast_ref::<Decimal128Array>().unwrap();
+            let raw = arr.value(row_idx); // i128 unscaled
+            let val = raw as f64 / 10f64.powi(*scale as i32);
+            doc.add_f64(field, val);
+            if let Some(acc) = accumulators.get_mut(field_name) {
+                acc.observe_f64(val);
+            }
+        }
+        DataType::Decimal256(_, scale) => {
+            let arr = array.as_any().downcast_ref::<Decimal256Array>().unwrap();
+            let raw = arr.value(row_idx); // i256
+            // Convert via string to preserve as much precision as possible
+            let val: f64 = raw.to_string().parse::<f64>().unwrap_or(0.0)
+                / 10f64.powi(*scale as i32);
+            doc.add_f64(field, val);
+            if let Some(acc) = accumulators.get_mut(field_name) {
+                acc.observe_f64(val);
+            }
+        }
+
+        DataType::FixedSizeBinary(_) => {
+            let arr = array.as_any().downcast_ref::<FixedSizeBinaryArray>().unwrap();
+            doc.add_bytes(field, arr.value(row_idx));
+        }
+
         DataType::List(_) | DataType::LargeList(_) | DataType::Map(_, _) | DataType::Struct(_) => {
             // Convert complex types to JSON, then to tantivy OwnedValue
             let json_value = convert_complex_to_json(array, row_idx)?;
@@ -727,6 +772,26 @@ fn convert_complex_to_json(array: &ArrayRef, row_idx: usize) -> Result<serde_jso
         DataType::Utf8 => {
             let arr = array.as_any().downcast_ref::<StringArray>().unwrap();
             Ok(serde_json::Value::String(arr.value(row_idx).to_string()))
+        }
+        DataType::Decimal128(_, scale) => {
+            let arr = array.as_any().downcast_ref::<Decimal128Array>().unwrap();
+            let raw = arr.value(row_idx) as f64;
+            let val = raw / 10f64.powi(*scale as i32);
+            Ok(serde_json::json!(val))
+        }
+        DataType::Decimal256(_, scale) => {
+            let arr = array.as_any().downcast_ref::<Decimal256Array>().unwrap();
+            let raw = arr.value(row_idx);
+            let val: f64 = raw.to_string().parse::<f64>().unwrap_or(0.0)
+                / 10f64.powi(*scale as i32);
+            Ok(serde_json::json!(val))
+        }
+        DataType::FixedSizeBinary(_) => {
+            let arr = array.as_any().downcast_ref::<FixedSizeBinaryArray>().unwrap();
+            Ok(serde_json::Value::String(base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                arr.value(row_idx),
+            )))
         }
 
         _ => Ok(serde_json::Value::Null),

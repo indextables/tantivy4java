@@ -533,9 +533,10 @@ fn copy_all_columns(
             DynamicColumn::Str(str_col) => {
                 // StrColumn implements Deref<Target=BytesColumn>, so ords() is available
                 let ords_col = str_col.ords();
+                let mut buf = String::new();
                 for doc_id in 0..num_rows {
                     for ord in ords_col.values_for_doc(doc_id) {
-                        let mut buf = String::new();
+                        buf.clear();
                         if str_col.ord_to_str(ord, &mut buf)? {
                             writer.record_str(doc_id, &col_name, &buf);
                         }
@@ -544,9 +545,10 @@ fn copy_all_columns(
             }
             DynamicColumn::Bytes(bytes_col) => {
                 let ords_col = bytes_col.ords();
+                let mut buf = Vec::new();
                 for doc_id in 0..num_rows {
                     for ord in ords_col.values_for_doc(doc_id) {
-                        let mut buf = Vec::new();
+                        buf.clear();
                         if bytes_col.ord_to_bytes(ord, &mut buf)? {
                             writer.record_bytes(doc_id, &col_name, &buf);
                         }

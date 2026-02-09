@@ -7,7 +7,6 @@
 // fetched for one doc retrieval are reused by subsequent retrievals without
 // additional S3/Azure round-trips.
 
-use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
@@ -24,14 +23,22 @@ use crate::debug_println;
 /// Cache key: (file_path, start_byte, end_byte)
 type ByteRangeCacheKey = (std::path::PathBuf, u64, u64);
 
+/// Max entries in the LRU byte-range cache. Each entry is typically a dictionary
+/// page (~800KB-1MB) or data page. 256 entries ≈ 256MB worst case.
+const MAX_BYTE_CACHE_ENTRIES: usize = 256;
+
 /// Shared byte-range cache across multiple CachedParquetReader instances.
 /// Caches fetched byte ranges (e.g. dictionary pages, data pages) to avoid
 /// redundant S3/Azure downloads when retrieving multiple docs from the same file.
-pub type ByteRangeCache = Arc<Mutex<HashMap<ByteRangeCacheKey, Bytes>>>;
+/// Uses LRU eviction to bound memory — least-recently-used entries are evicted
+/// when the cache exceeds MAX_BYTE_CACHE_ENTRIES.
+pub type ByteRangeCache = Arc<Mutex<lru::LruCache<ByteRangeCacheKey, Bytes>>>;
 
 /// Create a new empty byte-range cache.
 pub fn new_byte_range_cache() -> ByteRangeCache {
-    Arc::new(Mutex::new(HashMap::new()))
+    Arc::new(Mutex::new(lru::LruCache::new(
+        std::num::NonZeroUsize::new(MAX_BYTE_CACHE_ENTRIES).unwrap(),
+    )))
 }
 
 /// An AsyncFileReader that delegates to Quickwit's Storage trait.
@@ -102,7 +109,7 @@ impl CachedParquetReader {
         if let Some(ref cache) = self.byte_cache {
             let key = (self.path.clone(), range.start, range.end);
             if let Ok(mut guard) = cache.lock() {
-                guard.insert(key, bytes.clone());
+                guard.put(key, bytes.clone());
             }
         }
     }
@@ -152,7 +159,7 @@ impl AsyncFileReader for CachedParquetReader {
             if let Some(cache) = byte_cache {
                 let key = (path_for_cache, range.start, range.end);
                 if let Ok(mut guard) = cache.lock() {
-                    guard.insert(key, bytes.clone());
+                    guard.put(key, bytes.clone());
                 }
             }
 
@@ -226,7 +233,7 @@ impl AsyncFileReader for CachedParquetReader {
                         uncached_ranges[fetch_idx].end,
                     );
                     if let Ok(mut guard) = cache.lock() {
-                        guard.insert(key, bytes.clone());
+                        guard.put(key, bytes.clone());
                     }
                 }
 
@@ -379,7 +386,7 @@ async fn fetch_ranges_with_coalescing(
                         ))
                     })?;
 
-                let coalesced_vec = coalesced_bytes.to_vec();
+                let coalesced_shared = Bytes::from(coalesced_bytes.to_vec());
                 let results: Vec<(usize, Bytes)> = group
                     .members
                     .iter()
@@ -388,8 +395,8 @@ async fn fetch_ranges_with_coalescing(
                             (range.start - group.fetch_range.start) as usize;
                         let local_end =
                             (range.end - group.fetch_range.start) as usize;
-                        let slice = &coalesced_vec[local_start..local_end];
-                        (*original_idx, Bytes::copy_from_slice(slice))
+                        // Zero-copy slice — shares the same backing buffer
+                        (*original_idx, coalesced_shared.slice(local_start..local_end))
                     })
                     .collect();
 

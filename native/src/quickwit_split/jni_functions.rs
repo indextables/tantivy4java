@@ -507,6 +507,16 @@ fn parse_create_from_parquet_config(json_str: &str) -> anyhow::Result<CreateFrom
         .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
         .unwrap_or_default();
 
+    let writer_heap_size = parsed.get("writer_heap_size")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize)
+        .unwrap_or(256_000_000);
+
+    let reader_batch_size = parsed.get("reader_batch_size")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize)
+        .unwrap_or(8192);
+
     Ok(CreateFromParquetConfig {
         table_root,
         fast_field_mode,
@@ -523,6 +533,8 @@ fn parse_create_from_parquet_config(json_str: &str) -> anyhow::Result<CreateFrom
         index_uid,
         source_id,
         node_id,
+        writer_heap_size,
+        reader_batch_size,
     })
 }
 

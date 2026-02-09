@@ -344,16 +344,13 @@ pub async fn batch_retrieve_from_parquet(
                     file_idx, collected_rows.len(), rows.len()
                 );
 
-                // Return (original_index, row_data) pairs for reassembly
+                // Return (original_index, row_data) pairs for reassembly.
+                // Use drain() to move HashMaps instead of cloning them.
+                let mut drain_iter = collected_rows.drain(..);
                 let indexed_results: Vec<(usize, HashMap<String, serde_json::Value>)> = rows
                     .iter()
-                    .enumerate()
-                    .map(|(i, (original_idx, _))| {
-                        let data = if i < collected_rows.len() {
-                            collected_rows[i].clone()
-                        } else {
-                            HashMap::new()
-                        };
+                    .map(|(original_idx, _)| {
+                        let data = drain_iter.next().unwrap_or_default();
                         (*original_idx, data)
                     })
                     .collect();
@@ -694,12 +691,37 @@ fn arrow_value_to_json(array: &ArrayRef, row_idx: usize) -> Result<serde_json::V
             let arr = array.as_any().downcast_ref::<Date64Array>().unwrap();
             serde_json::json!(arr.value(row_idx) * 1_000i64) // millis → micros
         }
+        DataType::Decimal128(_, scale) => {
+            let arr = array.as_any().downcast_ref::<Decimal128Array>().unwrap();
+            let raw = arr.value(row_idx) as f64;
+            let val = raw / 10f64.powi(*scale as i32);
+            serde_json::json!(val)
+        }
+        DataType::Decimal256(_, scale) => {
+            // Decimal256 can exceed f64 precision — return as string representation
+            let arr = array.as_any().downcast_ref::<Decimal256Array>().unwrap();
+            let raw = arr.value(row_idx);
+            let unscaled = raw.to_string();
+            if *scale == 0 {
+                serde_json::Value::String(unscaled)
+            } else {
+                // Represent as "unscaled / 10^scale" in f64 string for JSON
+                let val: f64 = unscaled.parse::<f64>().unwrap_or(0.0)
+                    / 10f64.powi(*scale as i32);
+                serde_json::Value::String(val.to_string())
+            }
+        }
+        DataType::FixedSizeBinary(_) => {
+            let arr = array.as_any().downcast_ref::<FixedSizeBinaryArray>().unwrap();
+            serde_json::Value::String(base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                arr.value(row_idx),
+            ))
+        }
         DataType::List(_) | DataType::LargeList(_) | DataType::Map(_, _) | DataType::Struct(_) => {
-            // Complex types: serialize to JSON via arrow_json
+            // Complex types: convert directly to JSON Value (no serialize/deserialize roundtrip)
             let slice = array.slice(row_idx, 1);
-            let json_str = serde_json::to_string(&arrow_json_value(&slice, 0))
-                .unwrap_or_else(|_| "null".to_string());
-            serde_json::from_str(&json_str).unwrap_or(serde_json::Value::Null)
+            arrow_json_value(&slice, 0)
         }
         _ => {
             // Fallback: try string representation
