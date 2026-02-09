@@ -835,10 +835,17 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_nati
     // Retrieve document from parquet via the manifest
     let result = with_arc_safe(searcher_ptr, |ctx: &Arc<CachedSearcherContext>| {
         let manifest = ctx.parquet_manifest.as_ref().unwrap();
-        // Use parquet_storage (rooted at table_root) for parquet file access
-        let storage = ctx.parquet_storage.as_ref()
-            .cloned()
-            .unwrap_or_else(|| ctx.cached_storage.clone());
+        // Use parquet_storage (rooted at table_root) for parquet file access.
+        // If parquet_storage is None, parquet_table_root was not provided — return
+        // an explicit error instead of silently falling back to the wrong storage.
+        let storage = match ctx.parquet_storage.as_ref() {
+            Some(s) => s.clone(),
+            None => return Err(anyhow::anyhow!(
+                "Parquet companion split requires parquet_table_root to be set. \
+                 Pass the table root path as the 3rd argument to createSplitSearcher() \
+                 or configure it via CacheConfig.withParquetTableRoot()."
+            )),
+        };
         let metadata_cache = &ctx.parquet_metadata_cache;
         let byte_cache = &ctx.parquet_byte_range_cache;
 
@@ -989,10 +996,17 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_nati
     // Batch retrieve from parquet
     let result = with_arc_safe(searcher_ptr, |ctx: &Arc<CachedSearcherContext>| {
         let manifest = ctx.parquet_manifest.as_ref().unwrap();
-        // Use parquet_storage (rooted at table_root) for parquet file access
-        let storage = ctx.parquet_storage.as_ref()
-            .cloned()
-            .unwrap_or_else(|| ctx.cached_storage.clone());
+        // Use parquet_storage (rooted at table_root) for parquet file access.
+        // If parquet_storage is None, parquet_table_root was not provided — return
+        // an explicit error instead of silently falling back to the wrong storage.
+        let storage = match ctx.parquet_storage.as_ref() {
+            Some(s) => s.clone(),
+            None => return Err(anyhow::anyhow!(
+                "Parquet companion split requires parquet_table_root to be set. \
+                 Pass the table root path as the 3rd argument to createSplitSearcher() \
+                 or configure it via CacheConfig.withParquetTableRoot()."
+            )),
+        };
         let metadata_cache = &ctx.parquet_metadata_cache;
         let byte_cache = &ctx.parquet_byte_range_cache;
 
