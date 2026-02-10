@@ -11,6 +11,87 @@ use super::types::CachedSearcherContext;
 use super::searcher_cache::extract_split_id_from_uri;
 use quickwit_storage::Storage;
 
+/// Ensure that the fast field columns needed by a query are transcoded from parquet.
+///
+/// This is the core of the lazy transcoding model: instead of transcoding all columns
+/// at searcher creation time, we detect which columns each query needs (from aggregation
+/// and range query field references) and transcode only those on demand.
+///
+/// Returns fresh SplitOverrides with the current transcoded .fast data, or None if
+/// this is not a parquet companion split.
+pub(crate) async fn ensure_fast_fields_for_query(
+    context: &CachedSearcherContext,
+    query_json: &str,
+    aggregation_json: Option<&str>,
+) -> Option<quickwit_search::SplitOverrides> {
+    let augmented_dir = context.augmented_directory.as_ref()?;
+    let meta_json = context.parquet_meta_json.as_ref()?;
+
+    // Extract field names from query (range queries) and aggregation request
+    let needed_fields = crate::parquet_companion::field_extraction::extract_all_fast_field_names(
+        query_json, aggregation_json,
+    );
+
+    if needed_fields.is_empty() {
+        // No fast fields needed — return overrides with meta_json only (for schema override)
+        return Some(quickwit_search::SplitOverrides {
+            meta_json: meta_json.clone(),
+            fast_field_data: std::collections::HashMap::new(),
+        });
+    }
+
+    // Check which fields still need transcoding
+    let columns_to_add = {
+        let existing = context.transcoded_fast_columns.lock().unwrap();
+        let missing: Vec<String> = needed_fields.iter()
+            .filter(|f| !existing.contains(*f))
+            .cloned()
+            .collect();
+        missing
+    };
+
+    if !columns_to_add.is_empty() {
+        // Compute the full column set (existing + new)
+        let full_column_set: Vec<String> = {
+            let mut existing = context.transcoded_fast_columns.lock().unwrap();
+            for col in &columns_to_add {
+                existing.insert(col.clone());
+            }
+            existing.iter().cloned().collect()
+        };
+
+        debug_println!(
+            "📊 LAZY_TRANSCODE: Transcoding {} new columns ({:?}), total set: {:?}",
+            columns_to_add.len(), columns_to_add, full_column_set
+        );
+
+        // Transcode for each segment
+        for fast_path in &context.segment_fast_paths {
+            if let Err(e) = augmented_dir.transcode_and_cache(
+                fast_path,
+                Some(&full_column_set),
+            ).await {
+                debug_println!(
+                    "⚠️ LAZY_TRANSCODE: Failed to transcode columns for {:?}: {}",
+                    fast_path, e
+                );
+            }
+        }
+    }
+
+    // Build fresh SplitOverrides from the augmented directory's cache
+    let cache = augmented_dir.transcoded_cache.lock().unwrap();
+    let mut fast_field_data = std::collections::HashMap::new();
+    for (path, bytes) in cache.iter() {
+        fast_field_data.insert(path.clone(), bytes.to_vec());
+    }
+
+    Some(quickwit_search::SplitOverrides {
+        meta_json: meta_json.clone(),
+        fast_field_data,
+    })
+}
+
 // Thread-safe async implementation function for search operations
 /// Thread-safe async implementation that returns LeafSearchResponse directly (no JSON marshalling)
 /// Includes Smart Wildcard AST Skipping optimization for expensive wildcard patterns
@@ -67,6 +148,10 @@ pub async fn perform_search_async_impl_leaf_response(
                     context.cached_index.clone(),
                     cheap_filter_json,
                     1, // Only need to know if at least 1 doc matches
+                    context.split_overrides.as_ref().map(|o| quickwit_search::SplitOverrides {
+                        meta_json: o.meta_json.clone(),
+                        fast_field_data: o.fast_field_data.clone(),
+                    }),
                 ).await;
 
                 match cheap_result {
@@ -111,6 +196,16 @@ pub async fn perform_search_async_impl_leaf_response(
     // End of Smart Wildcard Optimization
     // ========================================================================
 
+    // Lazy transcoding: ensure fast fields needed by range queries are transcoded
+    let overrides = if context.augmented_directory.is_some() {
+        ensure_fast_fields_for_query(context, &effective_query_json, None).await
+    } else {
+        context.split_overrides.as_ref().map(|o| quickwit_search::SplitOverrides {
+            meta_json: o.meta_json.clone(),
+            fast_field_data: o.fast_field_data.clone(),
+        })
+    };
+
     // Use Quickwit's real search functionality with cached searcher following their patterns
     let search_result = perform_real_quickwit_search(
         &context.split_uri,
@@ -123,6 +218,7 @@ pub async fn perform_search_async_impl_leaf_response(
         context.cached_index.clone(),
         &effective_query_json,
         limit as usize,
+        overrides,
     ).await?;
 
     debug_println!("✅ ASYNC_IMPL: Search completed successfully with {} hits", search_result.num_hits);
@@ -349,6 +445,7 @@ async fn perform_real_quickwit_search(
     _cached_index: Arc<tantivy::Index>,
     query_json: &str,
     limit: usize,
+    overrides: Option<quickwit_search::SplitOverrides>,
 ) -> anyhow::Result<quickwit_proto::search::LeafSearchResponse> {
     debug_println!("🔍 REAL_QUICKWIT: Starting real Quickwit search implementation");
 
@@ -456,6 +553,7 @@ async fn perform_real_quickwit_search(
             split_filter,
             aggregations_limits,
             &mut search_permit,
+            overrides,
         )
     ).await;
 
@@ -502,6 +600,7 @@ pub async fn perform_real_quickwit_search_with_aggregations(
     query_json: &str,
     limit: usize,
     aggregation_request_json: Option<String>,
+    overrides: Option<quickwit_search::SplitOverrides>,
 ) -> anyhow::Result<quickwit_proto::search::LeafSearchResponse> {
     debug_println!("🔍 AGGREGATION_SEARCH: Starting real Quickwit search with aggregations");
 
@@ -616,6 +715,7 @@ pub async fn perform_real_quickwit_search_with_aggregations(
             split_filter,
             aggregations_limits,
             &mut search_permit,
+            overrides,
         )
     ).await;
 

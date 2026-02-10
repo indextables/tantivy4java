@@ -24,6 +24,7 @@ chrono = { version = "0.4.41", features = ["serde"] }
 time = { version = "0.3", features = ["macros"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0.142"
+crc32fast = "1.5"
 serde_yaml = "0.9"
 base64 = "0.22"
 futures = "0.3.31"
@@ -59,6 +60,14 @@ lz4_flex = "0.11"  # Pure Rust LZ4 for disk cache compression
 fs2 = "0.4"  # Disk space detection for cache auto-sizing
 async-trait = "0.1"  # For Storage trait implementation
 aws-sdk-s3 = "=1.62"  # For streaming file uploads (PutPayload implementation)
+
+# Parquet companion mode - enables minimal splits referencing external parquet files
+parquet = { version = "57", default-features = false, features = ["async", "arrow", "zstd", "lz4", "snap", "flate2", "flate2-rust_backened"] }
+arrow = { version = "57", default-features = false, features = ["ffi"] }
+arrow-schema = "57"
+arrow-array = "57"
+zstd = "0.13"
+bytes = "1"
 
 [build-dependencies]
 jni = "0.21.1"

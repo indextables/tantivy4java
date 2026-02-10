@@ -257,6 +257,20 @@ pub async fn perform_search_async_impl_leaf_response_with_aggregations(
 
     debug_println!("🔍 ASYNC_JNI: Extracted searcher context, performing search with aggregations on split: {}", context.split_uri);
 
+    // Lazy transcoding: ensure fast fields needed by aggregation + range queries are transcoded
+    let overrides = if context.augmented_directory.is_some() {
+        super::async_impl::ensure_fast_fields_for_query(
+            context,
+            &query_json,
+            aggregation_request_json.as_deref(),
+        ).await
+    } else {
+        context.split_overrides.as_ref().map(|o| quickwit_search::SplitOverrides {
+            meta_json: o.meta_json.clone(),
+            fast_field_data: o.fast_field_data.clone(),
+        })
+    };
+
     // Use the SAME working search functionality but with aggregations
     let search_result = perform_real_quickwit_search_with_aggregations(
         &context.split_uri,
@@ -270,6 +284,7 @@ pub async fn perform_search_async_impl_leaf_response_with_aggregations(
         &query_json,
         limit,
         aggregation_request_json,
+        overrides,
     ).await?;
 
     debug_println!("✅ ASYNC_JNI: Search with aggregations completed successfully with {} hits", search_result.num_hits);

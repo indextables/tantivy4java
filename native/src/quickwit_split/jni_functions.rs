@@ -2,7 +2,7 @@
 // Extracted from mod.rs during refactoring
 // Contains: All nativeXxx JNI functions for QuickwitSplit
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
 use anyhow::anyhow;
@@ -15,13 +15,17 @@ use tantivy::directory::Directory;
 use crate::debug_println;
 use crate::utils::{convert_throwable, jstring_to_string, string_to_jstring};
 use super::{
-    SplitConfig, QuickwitSplitMetadata,
+    SplitConfig, QuickwitSplitMetadata, QuickwitRuntimeManager,
     convert_index_from_path_impl, create_java_split_metadata,
 };
 use super::merge_config::{extract_merge_config, extract_string_list_from_jobject};
 use super::merge_impl::merge_splits_impl;
 use super::split_utils::{open_split_with_quickwit_native, get_split_file_list};
 use super::json_discovery::extract_doc_mapping_from_index;
+use crate::parquet_companion::indexing::{CreateFromParquetConfig, create_split_from_parquet};
+use crate::parquet_companion::manifest::FastFieldMode;
+use crate::parquet_companion::schema_derivation::SchemaDerivationConfig;
+use crate::parquet_companion::statistics::ColumnStatisticsResult;
 
 // Debug logging macro - controlled by TANTIVY4JAVA_DEBUG environment variable
 macro_rules! debug_log {
@@ -359,4 +363,871 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_merge_QuickwitSpli
     let metadata_obj = create_java_split_metadata(env, &merged_metadata)?;
     Ok(metadata_obj.into_raw())
     }).unwrap_or(std::ptr::null_mut())
+}
+
+/// JNI: Create a Quickwit split from external parquet files.
+/// Returns a HashMap<String, Object> with "metadata" (SplitMetadata) and "columnStatistics" (Map).
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_split_merge_QuickwitSplit_nativeCreateFromParquet(
+    mut env: JNIEnv,
+    _class: JClass,
+    parquet_files_list: JObject,
+    output_path: JString,
+    config_json: JString,
+) -> jobject {
+    convert_throwable(&mut env, |env| {
+    let output_path_str = jstring_to_string(env, &output_path)?;
+    let config_json_str = jstring_to_string(env, &config_json)?;
+
+    debug_log!("🏗️ JNI createFromParquet: output={}", output_path_str);
+
+    // Extract parquet file paths from Java List<String>
+    let parquet_files = extract_string_list_from_jobject(env, &parquet_files_list)?;
+
+    if parquet_files.is_empty() {
+        return Err(anyhow!("No parquet files provided"));
+    }
+
+    debug_log!("🏗️ JNI createFromParquet: {} parquet files", parquet_files.len());
+
+    // Parse config JSON
+    let parquet_config = parse_create_from_parquet_config(&config_json_str)?;
+
+    // Create a dummy storage (local filesystem, not used for local files)
+    let storage: std::sync::Arc<dyn quickwit_storage::Storage> =
+        std::sync::Arc::new(quickwit_storage::RamStorage::default());
+
+    // Run the async pipeline on the global runtime
+    let result = QuickwitRuntimeManager::global().handle().block_on(
+        create_split_from_parquet(&parquet_files, &output_path_str, &parquet_config, &storage)
+    )?;
+
+    debug_log!(
+        "🏗️ JNI createFromParquet: Split created with {} docs, {} statistics",
+        result.metadata.num_docs, result.column_statistics.len()
+    );
+
+    // Create the result HashMap
+    let hash_map_class = env.find_class("java/util/HashMap")?;
+    let result_map = env.new_object(&hash_map_class, "()V", &[])?;
+
+    // Add split metadata
+    let metadata_obj = create_java_split_metadata(env, &result.metadata)?;
+    let metadata_key = string_to_jstring(env, "metadata")?;
+    env.call_method(
+        &result_map,
+        "put",
+        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+        &[JValue::Object(&metadata_key.into()), JValue::Object(&metadata_obj)],
+    )?;
+
+    // Add column statistics as Map<String, ColumnStatistics>
+    let stats_map = create_java_column_statistics_map(env, &result.column_statistics)?;
+    let stats_key = string_to_jstring(env, "columnStatistics")?;
+    env.call_method(
+        &result_map,
+        "put",
+        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+        &[JValue::Object(&stats_key.into()), JValue::Object(&stats_map)],
+    )?;
+
+    Ok(result_map.into_raw())
+    }).unwrap_or(std::ptr::null_mut())
+}
+
+/// Parse the JSON config into a CreateFromParquetConfig.
+fn parse_create_from_parquet_config(json_str: &str) -> anyhow::Result<CreateFromParquetConfig> {
+    let parsed: serde_json::Value = serde_json::from_str(json_str)
+        .map_err(|e| anyhow!("Failed to parse parquet config JSON: {}", e))?;
+
+    let table_root = parsed.get("table_root")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let fast_field_mode = match parsed.get("fast_field_mode").and_then(|v| v.as_str()) {
+        Some("HYBRID") => FastFieldMode::Hybrid,
+        Some("PARQUET_ONLY") => FastFieldMode::ParquetOnly,
+        _ => FastFieldMode::Disabled,
+    };
+
+    let index_uid = parsed.get("index_uid")
+        .and_then(|v| v.as_str())
+        .unwrap_or("parquet-index")
+        .to_string();
+
+    let source_id = parsed.get("source_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("parquet-source")
+        .to_string();
+
+    let node_id = parsed.get("node_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("parquet-node")
+        .to_string();
+
+    let statistics_fields: Vec<String> = parsed.get("statistics_fields")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+
+    let statistics_truncate_length = parsed.get("statistics_truncate_length")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(256) as usize;
+
+    let skip_fields: HashSet<String> = parsed.get("skip_fields")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+
+    let tokenizer_overrides: HashMap<String, String> = parsed.get("tokenizer_overrides")
+        .and_then(|v| v.as_object())
+        .map(|obj| {
+            obj.iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let field_id_mapping: HashMap<String, String> = parsed.get("field_id_mapping")
+        .and_then(|v| v.as_object())
+        .map(|obj| {
+            obj.iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let auto_detect_name_mapping = parsed.get("auto_detect_name_mapping")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let ip_address_fields: HashSet<String> = parsed.get("ip_address_fields")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+
+    let writer_heap_size = parsed.get("writer_heap_size")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize)
+        .unwrap_or(256_000_000);
+
+    let reader_batch_size = parsed.get("reader_batch_size")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize)
+        .unwrap_or(8192);
+
+    Ok(CreateFromParquetConfig {
+        table_root,
+        fast_field_mode,
+        schema_config: SchemaDerivationConfig {
+            fast_field_mode,
+            skip_fields,
+            tokenizer_overrides,
+            ip_address_fields,
+        },
+        statistics_fields,
+        statistics_truncate_length,
+        field_id_mapping,
+        auto_detect_name_mapping,
+        index_uid,
+        source_id,
+        node_id,
+        writer_heap_size,
+        reader_batch_size,
+    })
+}
+
+/// Create a Java Map<String, ColumnStatistics> from Rust statistics results.
+fn create_java_column_statistics_map<'a>(
+    env: &mut JNIEnv<'a>,
+    stats: &[ColumnStatisticsResult],
+) -> anyhow::Result<JObject<'a>> {
+    let hash_map_class = env.find_class("java/util/HashMap")?;
+    let stats_map = env.new_object(&hash_map_class, "()V", &[])?;
+
+    let col_stats_class = env.find_class("io/indextables/tantivy4java/split/ColumnStatistics")?;
+
+    for stat in stats {
+        let field_name_jstr = string_to_jstring(env, &stat.field_name)?;
+        let field_type_jstr = string_to_jstring(env, &stat.field_type)?;
+
+        // Create ColumnStatistics(String fieldName, String fieldType)
+        let stat_obj = env.new_object(
+            &col_stats_class,
+            "(Ljava/lang/String;Ljava/lang/String;)V",
+            &[
+                JValue::Object(&field_name_jstr.into()),
+                JValue::Object(&field_type_jstr.into()),
+            ],
+        )?;
+
+        // Set nullable fields via setters
+        if let Some(v) = stat.min_long {
+            env.call_method(&stat_obj, "setMinLong", "(J)V", &[JValue::Long(v)])?;
+        }
+        if let Some(v) = stat.max_long {
+            env.call_method(&stat_obj, "setMaxLong", "(J)V", &[JValue::Long(v)])?;
+        }
+        if let Some(v) = stat.min_double {
+            env.call_method(&stat_obj, "setMinDouble", "(D)V", &[JValue::Double(v)])?;
+        }
+        if let Some(v) = stat.max_double {
+            env.call_method(&stat_obj, "setMaxDouble", "(D)V", &[JValue::Double(v)])?;
+        }
+        if let Some(ref v) = stat.min_string {
+            let jstr = string_to_jstring(env, v)?;
+            env.call_method(&stat_obj, "setMinString", "(Ljava/lang/String;)V",
+                &[JValue::Object(&jstr.into())])?;
+        }
+        if let Some(ref v) = stat.max_string {
+            let jstr = string_to_jstring(env, v)?;
+            env.call_method(&stat_obj, "setMaxString", "(Ljava/lang/String;)V",
+                &[JValue::Object(&jstr.into())])?;
+        }
+        if let Some(v) = stat.min_timestamp_micros {
+            env.call_method(&stat_obj, "setMinTimestampMicros", "(J)V", &[JValue::Long(v)])?;
+        }
+        if let Some(v) = stat.max_timestamp_micros {
+            env.call_method(&stat_obj, "setMaxTimestampMicros", "(J)V", &[JValue::Long(v)])?;
+        }
+        if let Some(v) = stat.min_bool {
+            env.call_method(&stat_obj, "setMinBool", "(Z)V", &[JValue::Bool(v as u8)])?;
+        }
+        if let Some(v) = stat.max_bool {
+            env.call_method(&stat_obj, "setMaxBool", "(Z)V", &[JValue::Bool(v as u8)])?;
+        }
+        env.call_method(&stat_obj, "setNullCount", "(J)V", &[JValue::Long(stat.null_count as i64)])?;
+
+        // Put into map
+        let key_jstr = string_to_jstring(env, &stat.field_name)?;
+        env.call_method(
+            &stats_map,
+            "put",
+            "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+            &[JValue::Object(&key_jstr.into()), JValue::Object(&stat_obj)],
+        )?;
+    }
+
+    Ok(stats_map)
+}
+
+/// JNI helper for tests: create a parquet file with test data.
+/// Schema: id (i64), name (utf8), score (f64), active (bool)
+/// Rows: num_rows rows, ids starting from id_offset.
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_split_merge_QuickwitSplit_nativeWriteTestParquet(
+    mut env: JNIEnv,
+    _class: JClass,
+    path: JString,
+    num_rows: jni::sys::jint,
+    id_offset: jni::sys::jlong,
+) {
+    convert_throwable(&mut env, |env| {
+        let path_str = jstring_to_string(env, &path)?;
+
+        use arrow_array::*;
+        use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+        use parquet::arrow::ArrowWriter;
+        use std::sync::Arc;
+
+        let num = num_rows as usize;
+        let offset = id_offset;
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+            Field::new("score", DataType::Float64, true),
+            Field::new("active", DataType::Boolean, true),
+        ]));
+
+        let ids: Vec<i64> = (0..num).map(|i| offset + i as i64).collect();
+        let names: Vec<String> = (0..num)
+            .map(|i| format!("item_{}", offset + i as i64))
+            .collect();
+        let scores: Vec<f64> = (0..num).map(|i| (i as f64) * 1.5 + 10.0).collect();
+        let actives: Vec<bool> = (0..num).map(|i| i % 2 == 0).collect();
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(ids)),
+                Arc::new(StringArray::from(
+                    names.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+                )),
+                Arc::new(Float64Array::from(scores)),
+                Arc::new(BooleanArray::from(actives)),
+            ],
+        )
+        .map_err(|e| anyhow!("Failed to create RecordBatch: {}", e))?;
+
+        let file = std::fs::File::create(&path_str)
+            .map_err(|e| anyhow!("Failed to create file '{}': {}", path_str, e))?;
+        let mut writer = ArrowWriter::try_new(file, schema, None)
+            .map_err(|e| anyhow!("Failed to create ArrowWriter: {}", e))?;
+        writer
+            .write(&batch)
+            .map_err(|e| anyhow!("Failed to write batch: {}", e))?;
+        writer
+            .close()
+            .map_err(|e| anyhow!("Failed to close writer: {}", e))?;
+
+        Ok(())
+    });
+}
+
+/// JNI helper for tests: create a parquet file with ALL data types including complex ones.
+/// Schema: id (i64), name (utf8), score (f64), active (bool),
+///         created_at (timestamp micros), tags (list<utf8>),
+///         address (struct{city:utf8, zip:utf8}), notes (utf8 nullable with nulls)
+/// Rows: num_rows rows, ids starting from id_offset.
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_split_merge_QuickwitSplit_nativeWriteTestParquetComplex(
+    mut env: JNIEnv,
+    _class: JClass,
+    path: JString,
+    num_rows: jni::sys::jint,
+    id_offset: jni::sys::jlong,
+) {
+    let _ = convert_throwable(&mut env, |env| {
+        let path_str = jstring_to_string(env, &path)?;
+
+        use arrow_array::*;
+        use arrow_array::builder::*;
+        use arrow_schema::{DataType, Field, Fields, Schema as ArrowSchema, TimeUnit};
+        use parquet::arrow::ArrowWriter;
+        use std::sync::Arc;
+
+        let num = num_rows as usize;
+        let offset = id_offset;
+
+        // Schema with all types
+        let tags_field = Field::new("item", DataType::Utf8, true);
+        let address_fields = Fields::from(vec![
+            Field::new("city", DataType::Utf8, true),
+            Field::new("zip", DataType::Utf8, true),
+        ]);
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+            Field::new("score", DataType::Float64, true),
+            Field::new("active", DataType::Boolean, true),
+            Field::new("created_at", DataType::Timestamp(TimeUnit::Microsecond, None), true),
+            Field::new("tags", DataType::List(Arc::new(tags_field)), true),
+            Field::new("address", DataType::Struct(address_fields.clone()), true),
+            Field::new("notes", DataType::Utf8, true),
+        ]));
+
+        // Build arrays
+        let ids: Vec<i64> = (0..num).map(|i| offset + i as i64).collect();
+        let names: Vec<String> = (0..num).map(|i| format!("item_{}", offset + i as i64)).collect();
+        let scores: Vec<f64> = (0..num).map(|i| (i as f64) * 1.5 + 10.0).collect();
+        let actives: Vec<bool> = (0..num).map(|i| i % 2 == 0).collect();
+
+        // Timestamps: 2024-01-01T00:00:00Z + i hours (in microseconds)
+        let base_ts: i64 = 1704067200_000_000; // 2024-01-01T00:00:00Z in micros
+        let timestamps: Vec<i64> = (0..num).map(|i| base_ts + (i as i64) * 3_600_000_000).collect();
+
+        // Tags: list of strings ["tag_a", "tag_b"] or ["tag_c"] alternating
+        let mut tags_builder = ListBuilder::new(StringBuilder::new());
+        for i in 0..num {
+            if i % 3 == 2 {
+                // Every 3rd row: null tags
+                tags_builder.append(false);
+            } else if i % 2 == 0 {
+                tags_builder.values().append_value(format!("tag_a_{}", i));
+                tags_builder.values().append_value(format!("tag_b_{}", i));
+                tags_builder.append(true);
+            } else {
+                tags_builder.values().append_value(format!("tag_c_{}", i));
+                tags_builder.append(true);
+            }
+        }
+        let tags_array = tags_builder.finish();
+
+        // Address: struct {city, zip}
+        let cities: Vec<Option<&str>> = (0..num).map(|i| {
+            match i % 3 {
+                0 => Some("New York"),
+                1 => Some("London"),
+                _ => Some("Tokyo"),
+            }
+        }).collect();
+        let zips: Vec<Option<&str>> = (0..num).map(|i| {
+            match i % 3 {
+                0 => Some("10001"),
+                1 => Some("EC1A"),
+                _ => Some("100-0001"),
+            }
+        }).collect();
+        let city_array = Arc::new(StringArray::from(cities)) as ArrayRef;
+        let zip_array = Arc::new(StringArray::from(zips)) as ArrayRef;
+        let address_array = StructArray::try_new(
+            address_fields,
+            vec![city_array, zip_array],
+            None, // all non-null
+        ).map_err(|e| anyhow!("Failed to create struct array: {}", e))?;
+
+        // Notes: nullable text, every other row is null
+        let notes: Vec<Option<String>> = (0..num).map(|i| {
+            if i % 2 == 0 {
+                Some(format!("Note for item {}", offset + i as i64))
+            } else {
+                None
+            }
+        }).collect();
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(ids)),
+                Arc::new(StringArray::from(names.iter().map(|s| s.as_str()).collect::<Vec<_>>())),
+                Arc::new(Float64Array::from(scores)),
+                Arc::new(BooleanArray::from(actives)),
+                Arc::new(TimestampMicrosecondArray::from(timestamps)),
+                Arc::new(tags_array),
+                Arc::new(address_array),
+                Arc::new(StringArray::from(notes)),
+            ],
+        ).map_err(|e| anyhow!("Failed to create RecordBatch: {}", e))?;
+
+        let file = std::fs::File::create(&path_str)
+            .map_err(|e| anyhow!("Failed to create file '{}': {}", path_str, e))?;
+        let mut writer = ArrowWriter::try_new(file, schema, None)
+            .map_err(|e| anyhow!("Failed to create ArrowWriter: {}", e))?;
+        writer.write(&batch).map_err(|e| anyhow!("Failed to write batch: {}", e))?;
+        writer.close().map_err(|e| anyhow!("Failed to close writer: {}", e))?;
+
+        Ok(())
+    });
+}
+
+/// JNI helper for tests: create a parquet file with IP address columns (stored as UTF8 strings).
+/// Schema: id (i64), src_ip (utf8), dst_ip (utf8), port (i64), label (utf8)
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_split_merge_QuickwitSplit_nativeWriteTestParquetWithIps(
+    mut env: JNIEnv,
+    _class: JClass,
+    path: JString,
+    num_rows: jni::sys::jint,
+    id_offset: jni::sys::jlong,
+) {
+    let _ = convert_throwable(&mut env, |env| {
+        let path_str = jstring_to_string(env, &path)?;
+
+        use arrow_array::*;
+        use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+        use parquet::arrow::ArrowWriter;
+        use std::sync::Arc;
+
+        let num = num_rows as usize;
+        let offset = id_offset;
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("src_ip", DataType::Utf8, false),
+            Field::new("dst_ip", DataType::Utf8, false),
+            Field::new("port", DataType::Int64, false),
+            Field::new("label", DataType::Utf8, true),
+        ]));
+
+        let ids: Vec<i64> = (0..num).map(|i| offset + i as i64).collect();
+        let src_ips: Vec<String> = (0..num)
+            .map(|i| format!("10.0.{}.{}", i / 256, i % 256))
+            .collect();
+        let dst_ips: Vec<String> = (0..num)
+            .map(|i| format!("192.168.{}.{}", i / 256, i % 256))
+            .collect();
+        let ports: Vec<i64> = (0..num).map(|i| 8000 + (i as i64 % 100)).collect();
+        let labels: Vec<String> = (0..num).map(|i| format!("conn_{}", i)).collect();
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(ids)),
+                Arc::new(StringArray::from(src_ips.iter().map(|s| s.as_str()).collect::<Vec<_>>())),
+                Arc::new(StringArray::from(dst_ips.iter().map(|s| s.as_str()).collect::<Vec<_>>())),
+                Arc::new(Int64Array::from(ports)),
+                Arc::new(StringArray::from(labels.iter().map(|s| s.as_str()).collect::<Vec<_>>())),
+            ],
+        ).map_err(|e| anyhow!("Failed to create RecordBatch: {}", e))?;
+
+        let file = std::fs::File::create(&path_str)
+            .map_err(|e| anyhow!("Failed to create file '{}': {}", path_str, e))?;
+        let mut writer = ArrowWriter::try_new(file, schema, None)
+            .map_err(|e| anyhow!("Failed to create ArrowWriter: {}", e))?;
+        writer.write(&batch).map_err(|e| anyhow!("Failed to write batch: {}", e))?;
+        writer.close().map_err(|e| anyhow!("Failed to close writer: {}", e))?;
+
+        Ok(())
+    });
+}
+
+/// JNI helper for tests: create a parquet file covering ALL data types.
+/// Schema:
+///   id (i64), uint_val (u64), float_val (f64), bool_val (bool),
+///   text_val (utf8), binary_val (binary), ts_val (timestamp_us),
+///   date_val (date32), ip_val (utf8, for IP), tags (list<utf8>),
+///   address (struct{city: utf8, zip: utf8}), props (map<utf8, utf8>)
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_split_merge_QuickwitSplit_nativeWriteTestParquetAllTypes(
+    mut env: JNIEnv,
+    _class: JClass,
+    path: JString,
+    num_rows: jni::sys::jint,
+    id_offset: jni::sys::jlong,
+) {
+    let _ = convert_throwable(&mut env, |env| {
+        let path_str = jstring_to_string(env, &path)?;
+
+        use arrow_array::*;
+        use arrow_array::builder::*;
+        use arrow_schema::{DataType, Field, Fields, Schema as ArrowSchema};
+        use parquet::arrow::ArrowWriter;
+        use std::sync::Arc;
+
+        let num = num_rows as usize;
+        let offset = id_offset;
+
+        // Map type: Map<Utf8, Utf8>
+        let map_field = Field::new(
+            "entries",
+            DataType::Struct(Fields::from(vec![
+                Field::new("keys", DataType::Utf8, false),
+                Field::new("values", DataType::Utf8, true),
+            ])),
+            false,
+        );
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            // Original 12 columns
+            Field::new("id", DataType::Int64, false),
+            Field::new("uint_val", DataType::UInt64, false),
+            Field::new("float_val", DataType::Float64, true),
+            Field::new("bool_val", DataType::Boolean, true),
+            Field::new("text_val", DataType::Utf8, false),
+            Field::new("binary_val", DataType::Binary, true),
+            Field::new("ts_val", DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None), true),
+            Field::new("date_val", DataType::Date32, true),
+            Field::new("ip_val", DataType::Utf8, false),
+            Field::new("tags", DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))), true),
+            Field::new("address", DataType::Struct(Fields::from(vec![
+                Field::new("city", DataType::Utf8, true),
+                Field::new("zip", DataType::Utf8, true),
+            ])), true),
+            Field::new("props", DataType::Map(Arc::new(map_field), false), true),
+            // 13 additional columns for wide-schema coverage (total: 25)
+            Field::new("description", DataType::Utf8, false),       // text for default tokenizer
+            Field::new("src_ip", DataType::Utf8, false),            // second IP field
+            Field::new("event_time", DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None), true),
+            Field::new("category", DataType::Utf8, false),          // categorical text (raw)
+            Field::new("status_code", DataType::Int32, true),       // i32→I64
+            Field::new("amount", DataType::Float64, true),          // financial amounts
+            Field::new("priority", DataType::Int16, true),          // i16→I64
+            Field::new("latitude", DataType::Float32, true),        // f32→F64
+            Field::new("longitude", DataType::Float32, true),       // f32→F64
+            Field::new("region", DataType::Utf8, false),            // region names (raw)
+            Field::new("is_active", DataType::Boolean, false),      // non-nullable bool
+            Field::new("retry_count", DataType::UInt32, true),      // u32→U64
+            Field::new("large_text", DataType::LargeUtf8, true),    // large utf8 variant
+        ]));
+
+        // id: sequential from offset
+        let ids: Vec<i64> = (0..num).map(|i| offset + i as i64).collect();
+        // uint_val: large unsigned values
+        let uints: Vec<u64> = (0..num).map(|i| 1_000_000_000u64 + i as u64 * 7).collect();
+        // float_val: with NaN on every 10th row, null on every 7th
+        let floats: Vec<Option<f64>> = (0..num).map(|i| {
+            if i % 7 == 6 { None }
+            else if i % 10 == 9 { Some(f64::NAN) }
+            else { Some(i as f64 * 2.5 + 0.1) }
+        }).collect();
+        // bool_val: alternating, null every 5th
+        let bools: Vec<Option<bool>> = (0..num).map(|i| {
+            if i % 5 == 4 { None } else { Some(i % 2 == 0) }
+        }).collect();
+        // text_val
+        let texts: Vec<String> = (0..num).map(|i| format!("text_{}", offset + i as i64)).collect();
+        // binary_val: raw bytes, null every 4th
+        let binaries: Vec<Option<Vec<u8>>> = (0..num).map(|i| {
+            if i % 4 == 3 { None }
+            else { Some(format!("bin_{}", i).into_bytes()) }
+        }).collect();
+        // ts_val: base 2024-01-01T00:00:00Z + i hours, null every 8th
+        let base_ts: i64 = 1_704_067_200_000_000; // 2024-01-01T00:00:00Z in microseconds
+        let timestamps: Vec<Option<i64>> = (0..num).map(|i| {
+            if i % 8 == 7 { None }
+            else { Some(base_ts + i as i64 * 3_600_000_000) }
+        }).collect();
+        // date_val: days since epoch, null every 6th
+        let dates: Vec<Option<i32>> = (0..num).map(|i| {
+            if i % 6 == 5 { None }
+            else { Some(19723 + i as i32) } // 2024-01-01 = day 19723
+        }).collect();
+        // ip_val: mix of IPv4 and IPv6
+        let ips: Vec<String> = (0..num).map(|i| {
+            if i % 3 == 2 {
+                format!("2001:db8::{:x}", i)
+            } else {
+                format!("10.0.{}.{}", i / 256, i % 256)
+            }
+        }).collect();
+
+        // Build list (tags) array
+        let mut list_builder = ListBuilder::new(StringBuilder::new());
+        for i in 0..num {
+            if i % 5 == 4 {
+                list_builder.append_null();
+            } else {
+                let values = list_builder.values();
+                values.append_value(format!("tag_{}", i % 3));
+                if i % 2 == 0 {
+                    values.append_value(format!("tag_extra_{}", i));
+                }
+                list_builder.append(true);
+            }
+        }
+        let tags_array = list_builder.finish();
+
+        // Build struct (address) array
+        let cities = ["New York", "London", "Tokyo", "Berlin", "Paris"];
+        let zips_arr = ["10001", "EC1A", "100-0001", "10115", "75001"];
+        let city_vec: Vec<Option<&str>> = (0..num).map(|i| {
+            if i % 9 == 8 { None } else { Some(cities[i % cities.len()]) }
+        }).collect();
+        let zip_vec: Vec<Option<&str>> = (0..num).map(|i| {
+            if i % 9 == 8 { None } else { Some(zips_arr[i % zips_arr.len()]) }
+        }).collect();
+        let struct_array = StructArray::from(vec![
+            (
+                Arc::new(Field::new("city", DataType::Utf8, true)),
+                Arc::new(StringArray::from(city_vec)) as ArrayRef,
+            ),
+            (
+                Arc::new(Field::new("zip", DataType::Utf8, true)),
+                Arc::new(StringArray::from(zip_vec)) as ArrayRef,
+            ),
+        ]);
+
+        // Build map (props) array: Map<Utf8, Utf8>
+        let mut map_builder = MapBuilder::new(
+            None,
+            StringBuilder::new(),
+            StringBuilder::new(),
+        );
+        for i in 0..num {
+            if i % 6 == 5 {
+                map_builder.append(false).unwrap(); // null map
+            } else {
+                map_builder.keys().append_value(format!("key_{}", i % 3));
+                map_builder.values().append_value(format!("val_{}", i));
+                if i % 2 == 0 {
+                    map_builder.keys().append_value("extra_key");
+                    map_builder.values().append_value(format!("extra_{}", i));
+                }
+                map_builder.append(true).unwrap();
+            }
+        }
+        let map_array = map_builder.finish();
+
+        // ── Build 13 additional columns ──
+        let descriptions: Vec<&str> = (0..num).map(|i| match i % 4 {
+            0 => "The quick brown fox jumps over the lazy dog",
+            1 => "A fast red car drove past the old house",
+            2 => "Searching for data in large distributed systems",
+            _ => "Performance testing with multiple column types",
+        }).collect();
+        let src_ips: Vec<String> = (0..num).map(|i| {
+            if i % 4 == 3 { format!("2001:db8:cafe::{:x}", i) }
+            else { format!("192.168.{}.{}", i / 256, i % 256) }
+        }).collect();
+        let event_base_ts: i64 = 1_706_745_600_000_000; // 2024-02-01T00:00:00Z
+        let event_times: Vec<Option<i64>> = (0..num).map(|i| {
+            if i % 10 == 9 { None }
+            else { Some(event_base_ts + i as i64 * 60_000_000) } // +1min each
+        }).collect();
+        let categories = ["electronics", "clothing", "food", "books", "sports"];
+        let cat_vals: Vec<&str> = (0..num).map(|i| categories[i % categories.len()]).collect();
+        let status_codes: Vec<Option<i32>> = (0..num).map(|i| {
+            if i % 12 == 11 { None } else { Some(match i % 5 { 0 => 200, 1 => 201, 2 => 404, 3 => 500, _ => 302 }) }
+        }).collect();
+        let amounts: Vec<Option<f64>> = (0..num).map(|i| {
+            if i % 11 == 10 { None } else { Some(i as f64 * 9.99 + 1.50) }
+        }).collect();
+        let priorities: Vec<Option<i16>> = (0..num).map(|i| {
+            if i % 15 == 14 { None } else { Some((i % 5) as i16 + 1) }
+        }).collect();
+        let latitudes: Vec<Option<f32>> = (0..num).map(|i| {
+            if i % 13 == 12 { None } else { Some(40.0 + (i as f32 * 0.01)) }
+        }).collect();
+        let longitudes: Vec<Option<f32>> = (0..num).map(|i| {
+            if i % 13 == 12 { None } else { Some(-74.0 + (i as f32 * 0.01)) }
+        }).collect();
+        let regions = ["us-east-1", "us-west-2", "eu-west-1", "ap-southeast-1", "sa-east-1"];
+        let region_vals: Vec<&str> = (0..num).map(|i| regions[i % regions.len()]).collect();
+        let is_actives: Vec<bool> = (0..num).map(|i| i % 3 != 0).collect();
+        let retry_counts: Vec<Option<u32>> = (0..num).map(|i| {
+            if i % 14 == 13 { None } else { Some((i % 4) as u32) }
+        }).collect();
+        let large_texts: Vec<Option<String>> = (0..num).map(|i| {
+            if i % 8 == 7 { None } else { Some(format!("Large text content for row {} with additional padding data for testing", i)) }
+        }).collect();
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(ids)),
+                Arc::new(UInt64Array::from(uints)),
+                Arc::new(Float64Array::from(floats)),
+                Arc::new(BooleanArray::from(bools)),
+                Arc::new(StringArray::from(texts.iter().map(|s| s.as_str()).collect::<Vec<_>>())),
+                Arc::new(BinaryArray::from(binaries.iter().map(|b| b.as_deref()).collect::<Vec<Option<&[u8]>>>())),
+                Arc::new(TimestampMicrosecondArray::from(timestamps)),
+                Arc::new(Date32Array::from(dates)),
+                Arc::new(StringArray::from(ips.iter().map(|s| s.as_str()).collect::<Vec<_>>())),
+                Arc::new(tags_array),
+                Arc::new(struct_array),
+                Arc::new(map_array),
+                // 13 new columns
+                Arc::new(StringArray::from(descriptions)),
+                Arc::new(StringArray::from(src_ips.iter().map(|s| s.as_str()).collect::<Vec<_>>())),
+                Arc::new(TimestampMicrosecondArray::from(event_times)),
+                Arc::new(StringArray::from(cat_vals)),
+                Arc::new(Int32Array::from(status_codes)),
+                Arc::new(Float64Array::from(amounts)),
+                Arc::new(Int16Array::from(priorities)),
+                Arc::new(Float32Array::from(latitudes)),
+                Arc::new(Float32Array::from(longitudes)),
+                Arc::new(StringArray::from(region_vals)),
+                Arc::new(BooleanArray::from(is_actives)),
+                Arc::new(UInt32Array::from(retry_counts)),
+                Arc::new(LargeStringArray::from(large_texts.iter().map(|s| s.as_deref()).collect::<Vec<Option<&str>>>())),
+            ],
+        ).map_err(|e| anyhow!("Failed to create RecordBatch: {}", e))?;
+
+        let file = std::fs::File::create(&path_str)
+            .map_err(|e| anyhow!("Failed to create file '{}': {}", path_str, e))?;
+        let mut writer = ArrowWriter::try_new(file, schema, None)
+            .map_err(|e| anyhow!("Failed to create ArrowWriter: {}", e))?;
+        writer.write(&batch).map_err(|e| anyhow!("Failed to write batch: {}", e))?;
+        writer.close().map_err(|e| anyhow!("Failed to close writer: {}", e))?;
+
+        Ok(())
+    });
+}
+
+/// JNI helper: create a parquet file with 10 realistic fields (4 numeric, 1 date, 1 IP, 5 UUID strings).
+/// Schema:
+///   num_1 (i64), num_2 (i64), num_3 (f64), num_4 (f64),
+///   created_at (timestamp_us),
+///   ip_addr (utf8 — IP addresses),
+///   uuid_1..uuid_5 (utf8 — unique UUIDs per row)
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_split_merge_QuickwitSplit_nativeWriteTestParquetWide(
+    mut env: JNIEnv,
+    _class: JClass,
+    path: JString,
+    num_rows: jni::sys::jint,
+    id_offset: jni::sys::jlong,
+) {
+    let _ = convert_throwable(&mut env, |env| {
+        let path_str = jstring_to_string(env, &path)?;
+
+        use arrow_array::*;
+        use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+        use parquet::arrow::ArrowWriter;
+        use std::sync::Arc;
+
+        let num = num_rows as usize;
+        let offset = id_offset as u64;
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("num_1", DataType::Int64, false),
+            Field::new("num_2", DataType::Int64, false),
+            Field::new("num_3", DataType::Float64, false),
+            Field::new("num_4", DataType::Float64, false),
+            Field::new("created_at", DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None), false),
+            Field::new("ip_addr", DataType::Utf8, false),
+            Field::new("uuid_1", DataType::Utf8, false),
+            Field::new("uuid_2", DataType::Utf8, false),
+            Field::new("uuid_3", DataType::Utf8, false),
+            Field::new("uuid_4", DataType::Utf8, false),
+            Field::new("uuid_5", DataType::Utf8, false),
+        ]));
+
+        // Simple deterministic hash for generating UUID-like strings
+        fn mix(seed: u64) -> u64 {
+            let mut h = seed;
+            h = h.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            h ^= h >> 33;
+            h = h.wrapping_mul(0xff51afd7ed558ccd);
+            h ^= h >> 33;
+            h
+        }
+
+        fn fake_uuid(row: u64, col: u64) -> String {
+            let a = mix(row.wrapping_mul(31).wrapping_add(col.wrapping_mul(1000003)));
+            let b = mix(a);
+            format!(
+                "{:08x}-{:04x}-4{:03x}-{:04x}-{:012x}",
+                (a >> 32) as u32,
+                (a >> 16) as u16,
+                a as u16 & 0x0FFF,
+                ((b >> 48) as u16 & 0x3FFF) | 0x8000,
+                b & 0xFFFF_FFFFFFFF
+            )
+        }
+
+        let num_1: Vec<i64> = (0..num).map(|i| (offset + i as u64) as i64).collect();
+        let num_2: Vec<i64> = (0..num).map(|i| ((i as i64 * 997) % 100_000) + 1).collect();
+        let num_3: Vec<f64> = (0..num).map(|i| (i as f64 * 3.14159) + 0.01).collect();
+        let num_4: Vec<f64> = (0..num).map(|i| ((i as f64 * 2.71828).sin() * 1000.0).round() / 100.0).collect();
+
+        // Timestamps: 2024-01-01 + i seconds
+        let base_ts: i64 = 1_704_067_200_000_000; // 2024-01-01T00:00:00Z in microseconds
+        let timestamps: Vec<i64> = (0..num).map(|i| base_ts + i as i64 * 1_000_000).collect();
+
+        // IP addresses: deterministic IPv4
+        let ips: Vec<String> = (0..num).map(|i| {
+            format!("{}.{}.{}.{}",
+                10 + (i / (256 * 256)) % 246,
+                (i / 256) % 256,
+                i % 256,
+                (i * 7 + 3) % 256)
+        }).collect();
+
+        // 5 UUID columns — each row x column produces a unique UUID
+        let uuid_1: Vec<String> = (0..num).map(|i| fake_uuid(offset + i as u64, 1)).collect();
+        let uuid_2: Vec<String> = (0..num).map(|i| fake_uuid(offset + i as u64, 2)).collect();
+        let uuid_3: Vec<String> = (0..num).map(|i| fake_uuid(offset + i as u64, 3)).collect();
+        let uuid_4: Vec<String> = (0..num).map(|i| fake_uuid(offset + i as u64, 4)).collect();
+        let uuid_5: Vec<String> = (0..num).map(|i| fake_uuid(offset + i as u64, 5)).collect();
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(num_1)),
+                Arc::new(Int64Array::from(num_2)),
+                Arc::new(Float64Array::from(num_3)),
+                Arc::new(Float64Array::from(num_4)),
+                Arc::new(TimestampMicrosecondArray::from(timestamps)),
+                Arc::new(StringArray::from(ips.iter().map(|s| s.as_str()).collect::<Vec<_>>())),
+                Arc::new(StringArray::from(uuid_1.iter().map(|s| s.as_str()).collect::<Vec<_>>())),
+                Arc::new(StringArray::from(uuid_2.iter().map(|s| s.as_str()).collect::<Vec<_>>())),
+                Arc::new(StringArray::from(uuid_3.iter().map(|s| s.as_str()).collect::<Vec<_>>())),
+                Arc::new(StringArray::from(uuid_4.iter().map(|s| s.as_str()).collect::<Vec<_>>())),
+                Arc::new(StringArray::from(uuid_5.iter().map(|s| s.as_str()).collect::<Vec<_>>())),
+            ],
+        ).map_err(|e| anyhow!("Failed to create wide RecordBatch: {}", e))?;
+
+        let file = std::fs::File::create(&path_str)
+            .map_err(|e| anyhow!("Failed to create file '{}': {}", path_str, e))?;
+        let mut writer = ArrowWriter::try_new(file, schema, None)
+            .map_err(|e| anyhow!("Failed to create ArrowWriter: {}", e))?;
+        writer.write(&batch).map_err(|e| anyhow!("write wide parquet: {}", e))?;
+        writer.close().map_err(|e| anyhow!("close wide parquet: {}", e))?;
+
+        Ok(())
+    });
 }

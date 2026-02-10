@@ -88,7 +88,7 @@ use split_utils::create_quickwit_tokenizer_manager;
 
 /// Configuration for split conversion passed from Java
 #[derive(Debug, Clone)]
-struct SplitConfig {
+pub(crate) struct SplitConfig {
     index_uid: String,
     source_id: String,
     node_id: String,
@@ -192,6 +192,24 @@ impl SplitConfig {
         enable_progress_tracking,
         enable_streaming_io,
     })
+    }
+}
+
+/// Create a default SplitConfig for use by parquet companion indexing pipeline.
+pub(crate) fn default_split_config(index_uid: &str, source_id: &str, node_id: &str) -> SplitConfig {
+    SplitConfig {
+        index_uid: index_uid.to_string(),
+        source_id: source_id.to_string(),
+        node_id: node_id.to_string(),
+        doc_mapping_uid: "default".to_string(),
+        partition_id: 0,
+        time_range_start: None,
+        time_range_end: None,
+        tags: BTreeSet::new(),
+        metadata: HashMap::new(),
+        streaming_chunk_size: 64_000_000,
+        enable_progress_tracking: false,
+        enable_streaming_io: true,
     }
 }
 
@@ -499,7 +517,7 @@ async fn convert_index_from_path_impl_async(index_path: &str, output_path: &str,
     split_metadata.doc_mapping_json = Some(doc_mapping_json);
     
     // Use Quickwit's split creation functionality and get footer offsets
-    let footer_offsets = create_quickwit_split(&tantivy_index, &index_dir, &PathBuf::from(output_path), &split_metadata, config).await?;
+    let footer_offsets = create_quickwit_split(&tantivy_index, &index_dir, &PathBuf::from(output_path), &split_metadata, config, None).await?;
     
     // Update split metadata with footer offsets for lazy loading optimization
     split_metadata.footer_start_offset = Some(footer_offsets.footer_start_offset);

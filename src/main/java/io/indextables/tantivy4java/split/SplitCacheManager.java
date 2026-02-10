@@ -97,6 +97,8 @@ public class SplitCacheManager implements AutoCloseable {
     private final Map<String, String> awsConfig;
     private final Map<String, String> azureConfig;
     private final BatchOptimizationConfig batchOptimization;
+    private final String parquetTableRoot;
+    private final ParquetCompanionConfig.ParquetStorageConfig parquetStorageConfig;
 
     /**
      * Configuration for shared cache across multiple splits
@@ -110,6 +112,8 @@ public class SplitCacheManager implements AutoCloseable {
         private Map<String, String> azureConfig = new HashMap<>();
         private Map<String, String> gcpConfig = new HashMap<>();
         private BatchOptimizationConfig batchOptimization = null; // null = use default when needed
+        private String parquetTableRoot = null;
+        private ParquetCompanionConfig.ParquetStorageConfig parquetStorageConfig = null;
 
         public CacheConfig(String cacheName) {
             this.cacheName = cacheName;
@@ -267,6 +271,35 @@ public class SplitCacheManager implements AutoCloseable {
             this.batchOptimization = batchOptimization;
             return this;
         }
+
+        /**
+         * Configure the table root path for parquet companion mode.
+         * This is where parquet files are located (local path, s3://, or azure://).
+         * Decoupled from the split — the same split can be used with parquet files
+         * at different locations.
+         *
+         * @param tableRoot root path for parquet files (e.g., "s3://bucket/tables/events/")
+         * @return this CacheConfig for method chaining
+         */
+        public CacheConfig withParquetTableRoot(String tableRoot) {
+            this.parquetTableRoot = tableRoot;
+            return this;
+        }
+
+        /**
+         * Configure separate storage credentials for accessing parquet files.
+         * If not set, the cache manager's AWS/Azure credentials are used as fallback.
+         *
+         * @param config parquet storage credentials
+         * @return this CacheConfig for method chaining
+         */
+        public CacheConfig withParquetStorage(ParquetCompanionConfig.ParquetStorageConfig config) {
+            this.parquetStorageConfig = config;
+            return this;
+        }
+
+        public String getParquetTableRoot() { return parquetTableRoot; }
+        public ParquetCompanionConfig.ParquetStorageConfig getParquetStorageConfig() { return parquetStorageConfig; }
 
         // Getters
         public String getCacheName() { return cacheName; }
@@ -731,6 +764,8 @@ public class SplitCacheManager implements AutoCloseable {
         this.batchOptimization = config.getBatchOptimization() != null
                 ? config.getBatchOptimization()
                 : BatchOptimizationConfig.balanced();
+        this.parquetTableRoot = config.getParquetTableRoot();
+        this.parquetStorageConfig = config.getParquetStorageConfig();
         this.nativePtr = createNativeCacheManager(config);
     }
     
@@ -842,7 +877,24 @@ public class SplitCacheManager implements AutoCloseable {
      * @return A SplitSearcher configured for optimized lazy loading
      * @throws IllegalArgumentException if metadata lacks footer offsets
      */
+    /**
+     * Create a SplitSearcher with a per-split parquet table root.
+     * This overload is used when different splits reference parquet files at different locations.
+     * The per-split table root takes precedence over the CacheConfig-level table root.
+     *
+     * @param splitPath Path or URI of the split file
+     * @param metadata Split metadata with footer offsets
+     * @param parquetTableRoot Base path for resolving parquet file locations (overrides CacheConfig setting)
+     */
+    public SplitSearcher createSplitSearcher(String splitPath, QuickwitSplit.SplitMetadata metadata, String parquetTableRoot) {
+        return createSplitSearcherInternal(splitPath, metadata, parquetTableRoot);
+    }
+
     public SplitSearcher createSplitSearcher(String splitPath, QuickwitSplit.SplitMetadata metadata) {
+        return createSplitSearcherInternal(splitPath, metadata, null);
+    }
+
+    private SplitSearcher createSplitSearcherInternal(String splitPath, QuickwitSplit.SplitMetadata metadata, String perSplitParquetTableRoot) {
         if (metadata == null) {
             throw new IllegalArgumentException(
                 "Split metadata is required for SplitSearcher creation. " +
@@ -868,6 +920,22 @@ public class SplitCacheManager implements AutoCloseable {
         }
         if (!this.azureConfig.isEmpty()) {
             splitConfig.put("azure_config", this.azureConfig);
+        }
+
+        // Parquet companion mode: pass table_root and storage credentials
+        // Per-split override takes precedence over CacheConfig-level setting
+        String effectiveTableRoot = (perSplitParquetTableRoot != null && !perSplitParquetTableRoot.isEmpty())
+                ? perSplitParquetTableRoot : this.parquetTableRoot;
+        if (effectiveTableRoot != null && !effectiveTableRoot.isEmpty()) {
+            splitConfig.put("parquet_table_root", effectiveTableRoot);
+        }
+        if (this.parquetStorageConfig != null) {
+            if (!this.parquetStorageConfig.getAwsConfig().isEmpty()) {
+                splitConfig.put("parquet_aws_config", this.parquetStorageConfig.getAwsConfig());
+            }
+            if (!this.parquetStorageConfig.getAzureConfig().isEmpty()) {
+                splitConfig.put("parquet_azure_config", this.parquetStorageConfig.getAzureConfig());
+            }
         }
 
         // Extract specific values for native layer compatibility (based on commit b53bf9d)

@@ -74,3 +74,6 @@ pub use component_sizes::get_per_field_component_sizes;
 // Unused internally but kept as public API for optional JNI use
 #[allow(unused_imports)]
 pub use helpers::clear_l1_cache_after_prewarm;
+
+// Re-export helpers module for crate-internal use (e.g. parquet_companion L2 caching)
+pub(crate) use helpers::parse_split_uri;

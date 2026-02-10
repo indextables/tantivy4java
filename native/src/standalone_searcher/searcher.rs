@@ -338,6 +338,7 @@ impl StandaloneSearcher {
             split_filter,
             aggregations_limits,
             search_permit,
+            None,
         ).await
         .with_context(|| format!("Failed to search split: {}", split_id))?;
         
