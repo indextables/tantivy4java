@@ -37,6 +37,9 @@ import java.util.Map;
  *
  * // Specific version
  * List<DeltaFileEntry> files = DeltaTableReader.listFiles("s3://bucket/delta_table", config, 42);
+ *
+ * // Compact mode — skip partition_values and has_deletion_vector for lightweight listing
+ * List<DeltaFileEntry> compact = DeltaTableReader.listFiles("s3://bucket/delta_table", config, true);
  * }</pre>
  */
 public class DeltaTableReader {
