@@ -150,5 +150,82 @@ public class DeltaTableReader {
         return entries;
     }
 
+    // --- Schema reading ---
+
+    /**
+     * Read the schema of a Delta table from its transaction log (latest version).
+     *
+     * <p>Returns a {@link DeltaTableSchema} containing the list of top-level columns
+     * with their Delta data types, nullability, and metadata, plus the raw schema JSON.
+     *
+     * @param tableUrl table location (local path, file://, s3://, or azure://)
+     * @return the Delta table schema
+     * @throws RuntimeException if the table cannot be read
+     */
+    public static DeltaTableSchema readSchema(String tableUrl) {
+        return readSchema(tableUrl, Collections.emptyMap(), -1);
+    }
+
+    /**
+     * Read the schema of a Delta table from its transaction log (latest version, with credentials).
+     *
+     * @param tableUrl table location
+     * @param config   credential and storage configuration (see class javadoc for keys)
+     * @return the Delta table schema
+     * @throws RuntimeException if the table cannot be read
+     */
+    public static DeltaTableSchema readSchema(String tableUrl, Map<String, String> config) {
+        return readSchema(tableUrl, config, -1);
+    }
+
+    /**
+     * Read the schema of a Delta table from its transaction log at a specific version.
+     *
+     * @param tableUrl table location
+     * @param config   credential and storage configuration
+     * @param version  snapshot version to read (-1 for latest)
+     * @return the Delta table schema
+     * @throws RuntimeException if the table cannot be read
+     */
+    public static DeltaTableSchema readSchema(String tableUrl, Map<String, String> config, long version) {
+        if (tableUrl == null || tableUrl.isEmpty()) {
+            throw new IllegalArgumentException("tableUrl must not be null or empty");
+        }
+
+        byte[] bytes = nativeReadSchema(tableUrl, version, config != null ? config : Collections.emptyMap());
+
+        // Parse TANT byte buffer
+        ByteBuffer buffer = ByteBuffer.wrap(bytes);
+        buffer.order(ByteOrder.nativeOrder());
+
+        BatchDocumentReader reader = new BatchDocumentReader();
+        List<Map<String, Object>> maps = reader.parseToMaps(buffer);
+
+        if (maps.isEmpty()) {
+            throw new RuntimeException("Empty schema response from native layer");
+        }
+
+        // First document is the header: schema_json, table_version, field_count
+        Map<String, Object> header = maps.get(0);
+        String schemaJson = (String) header.get("schema_json");
+        long tableVersion = toLong(header.get("table_version"));
+
+        // Remaining documents are field entries
+        List<DeltaSchemaField> fields = new ArrayList<>(maps.size() - 1);
+        for (int i = 1; i < maps.size(); i++) {
+            fields.add(DeltaSchemaField.fromMap(maps.get(i)));
+        }
+
+        return new DeltaTableSchema(fields, schemaJson, tableVersion);
+    }
+
+    private static long toLong(Object value) {
+        if (value instanceof Number) {
+            return ((Number) value).longValue();
+        }
+        return -1;
+    }
+
     private static native byte[] nativeListFiles(String tableUrl, long version, Map<String, String> config, boolean compact);
+    private static native byte[] nativeReadSchema(String tableUrl, long version, Map<String, String> config);
 }

@@ -9,6 +9,7 @@ use url::Url;
 
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::scan::state::ScanFile;
+use delta_kernel::schema::StructField;
 
 use crate::debug_println;
 use super::engine::{DeltaStorageConfig, create_engine};
@@ -88,6 +89,81 @@ pub fn list_delta_files(
     Ok((entries, actual_version))
 }
 
+/// A field in the Delta table schema.
+#[derive(Debug, Clone)]
+pub struct DeltaSchemaField {
+    /// Column name
+    pub name: String,
+    /// Delta type string (e.g. "string", "long", "integer", "boolean", "double",
+    /// "float", "short", "byte", "binary", "date", "timestamp", "timestamp_ntz",
+    /// or JSON for complex types like struct/array/map)
+    pub data_type: String,
+    /// Whether the column is nullable
+    pub nullable: bool,
+    /// Column metadata as JSON string
+    pub metadata: String,
+}
+
+impl DeltaSchemaField {
+    fn from_struct_field(field: &StructField) -> Self {
+        let data_type = serde_json::to_string(&field.data_type)
+            .unwrap_or_else(|_| "\"unknown\"".to_string());
+        // Strip surrounding quotes for primitive types (e.g. "\"string\"" → "string")
+        let data_type = if data_type.starts_with('"') && data_type.ends_with('"') {
+            data_type[1..data_type.len() - 1].to_string()
+        } else {
+            data_type
+        };
+        let metadata = serde_json::to_string(&field.metadata)
+            .unwrap_or_else(|_| "{}".to_string());
+        DeltaSchemaField {
+            name: field.name.clone(),
+            data_type,
+            nullable: field.nullable,
+            metadata,
+        }
+    }
+}
+
+/// Read the schema of a Delta table from its transaction log.
+///
+/// Returns `(fields, schema_json, actual_version)` where:
+/// - `fields` is the list of top-level columns with types
+/// - `schema_json` is the full Delta schema as a JSON string (for advanced callers)
+/// - `actual_version` is the resolved snapshot version
+pub fn read_delta_schema(
+    url_str: &str,
+    config: &DeltaStorageConfig,
+    version: Option<u64>,
+) -> Result<(Vec<DeltaSchemaField>, String, u64)> {
+    debug_println!("🔧 DELTA_SCHEMA: Reading schema for url={}, version={:?}", url_str, version);
+
+    let url = normalize_url(url_str)?;
+    let engine = create_engine(&url, config)?;
+
+    let snapshot = {
+        let mut builder = Snapshot::builder_for(url);
+        if let Some(v) = version {
+            builder = builder.at_version(v);
+        }
+        builder.build(&engine)?
+    };
+    let actual_version = snapshot.version();
+
+    let schema = snapshot.schema();
+    debug_println!("🔧 DELTA_SCHEMA: Schema has {} fields at version {}", schema.fields().count(), actual_version);
+
+    let fields: Vec<DeltaSchemaField> = schema
+        .fields()
+        .map(DeltaSchemaField::from_struct_field)
+        .collect();
+
+    let schema_json = serde_json::to_string(schema.as_ref())
+        .map_err(|e| anyhow::anyhow!("Failed to serialize schema: {}", e))?;
+
+    Ok((fields, schema_json, actual_version))
+}
+
 /// Normalize a table URL, converting bare paths to file:// URLs.
 ///
 /// IMPORTANT: The URL must end with a trailing slash so that `Url::join()`
@@ -151,6 +227,100 @@ mod tests {
         let url = normalize_url("file:///tmp/my_table").unwrap();
         let log_url = url.join("_delta_log/").unwrap();
         assert_eq!(log_url.as_str(), "file:///tmp/my_table/_delta_log/");
+    }
+
+    #[test]
+    fn test_read_delta_schema_local() {
+        // Create a minimal Delta table with a multi-field schema
+        let tmp = tempfile::tempdir().unwrap();
+        let table_dir = tmp.path().join("test_schema_delta");
+        let delta_log = table_dir.join("_delta_log");
+        std::fs::create_dir_all(&delta_log).unwrap();
+
+        let schema_string = r#"{"type":"struct","fields":[{"name":"id","type":"long","nullable":false,"metadata":{}},{"name":"name","type":"string","nullable":true,"metadata":{}},{"name":"score","type":"double","nullable":true,"metadata":{}},{"name":"active","type":"boolean","nullable":false,"metadata":{}}]}"#;
+        let commit0 = format!(
+            "{}\n{}\n{}",
+            r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#,
+            format!(r#"{{"metaData":{{"id":"schema-test","format":{{"provider":"parquet","options":{{}}}},"schemaString":"{}","partitionColumns":[],"configuration":{{}},"createdTime":1700000000000}}}}"#,
+                schema_string.replace('"', r#"\""#)),
+            r#"{"add":{"path":"data.parquet","partitionValues":{},"size":1000,"modificationTime":1700000000000,"dataChange":true}}"#,
+        );
+        std::fs::write(delta_log.join("00000000000000000000.json"), &commit0).unwrap();
+        std::fs::write(table_dir.join("data.parquet"), &[0u8]).unwrap();
+
+        let config = DeltaStorageConfig::default();
+        let (fields, schema_json, version) = read_delta_schema(
+            table_dir.to_str().unwrap(),
+            &config,
+            None,
+        ).unwrap();
+
+        assert_eq!(version, 0);
+        assert_eq!(fields.len(), 4);
+
+        // Check field names and types
+        assert_eq!(fields[0].name, "id");
+        assert_eq!(fields[0].data_type, "long");
+        assert!(!fields[0].nullable);
+
+        assert_eq!(fields[1].name, "name");
+        assert_eq!(fields[1].data_type, "string");
+        assert!(fields[1].nullable);
+
+        assert_eq!(fields[2].name, "score");
+        assert_eq!(fields[2].data_type, "double");
+        assert!(fields[2].nullable);
+
+        assert_eq!(fields[3].name, "active");
+        assert_eq!(fields[3].data_type, "boolean");
+        assert!(!fields[3].nullable);
+
+        // Verify the full schema JSON round-trips
+        assert!(schema_json.contains("\"type\":\"struct\""));
+        assert!(schema_json.contains("\"name\":\"id\""));
+        assert!(schema_json.contains("\"name\":\"score\""));
+    }
+
+    #[test]
+    fn test_read_delta_schema_complex_types() {
+        // Test schema with nested/complex types
+        let tmp = tempfile::tempdir().unwrap();
+        let table_dir = tmp.path().join("test_complex_schema");
+        let delta_log = table_dir.join("_delta_log");
+        std::fs::create_dir_all(&delta_log).unwrap();
+
+        let schema_string = r#"{"type":"struct","fields":[{"name":"id","type":"long","nullable":false,"metadata":{}},{"name":"tags","type":{"type":"array","elementType":"string","containsNull":true},"nullable":true,"metadata":{}},{"name":"props","type":{"type":"map","keyType":"string","valueType":"string","valueContainsNull":true},"nullable":true,"metadata":{}}]}"#;
+        let commit0 = format!(
+            "{}\n{}\n{}",
+            r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#,
+            format!(r#"{{"metaData":{{"id":"complex-test","format":{{"provider":"parquet","options":{{}}}},"schemaString":"{}","partitionColumns":[],"configuration":{{}},"createdTime":1700000000000}}}}"#,
+                schema_string.replace('"', r#"\""#)),
+            r#"{"add":{"path":"data.parquet","partitionValues":{},"size":1000,"modificationTime":1700000000000,"dataChange":true}}"#,
+        );
+        std::fs::write(delta_log.join("00000000000000000000.json"), &commit0).unwrap();
+        std::fs::write(table_dir.join("data.parquet"), &[0u8]).unwrap();
+
+        let config = DeltaStorageConfig::default();
+        let (fields, schema_json, _) = read_delta_schema(
+            table_dir.to_str().unwrap(),
+            &config,
+            None,
+        ).unwrap();
+
+        assert_eq!(fields.len(), 3);
+        assert_eq!(fields[0].name, "id");
+        assert_eq!(fields[0].data_type, "long");
+
+        // Complex types should be JSON strings
+        assert_eq!(fields[1].name, "tags");
+        assert!(fields[1].data_type.contains("array"), "expected array type, got: {}", fields[1].data_type);
+
+        assert_eq!(fields[2].name, "props");
+        assert!(fields[2].data_type.contains("map"), "expected map type, got: {}", fields[2].data_type);
+
+        // Full JSON should contain the complex types
+        assert!(schema_json.contains("array"));
+        assert!(schema_json.contains("map"));
     }
 
     #[test]

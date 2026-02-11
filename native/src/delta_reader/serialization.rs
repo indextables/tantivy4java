@@ -4,7 +4,7 @@
 // reusing the same binary format as batch document retrieval for efficient
 // Rust→Java transfer via BatchDocumentReader.parseToMaps().
 
-use super::scan::DeltaFileEntry;
+use super::scan::{DeltaFileEntry, DeltaSchemaField};
 
 /// Magic number for batch protocol validation ("TANT")
 const MAGIC_NUMBER: u32 = 0x54414E54;
@@ -87,6 +87,78 @@ fn serialize_entry(buf: &mut Vec<u8>, entry: &DeltaFileEntry, table_version: u64
     // table_version (INTEGER) — always included
     write_field_header(buf, "table_version", FIELD_TYPE_INTEGER, 1);
     buf.extend_from_slice(&(table_version as i64).to_ne_bytes());
+}
+
+/// Serialize a list of DeltaSchemaField plus the raw schema JSON into the TANT byte buffer format.
+///
+/// Produces a single "document" with fields:
+///   schema_json (TEXT) — the full Delta schema JSON
+///   table_version (INTEGER) — the resolved snapshot version
+///   field_count (INTEGER) — number of top-level columns
+///
+/// Followed by one document per field:
+///   name (TEXT), data_type (TEXT), nullable (BOOLEAN), metadata (TEXT/JSON)
+pub fn serialize_delta_schema(
+    fields: &[DeltaSchemaField],
+    schema_json: &str,
+    table_version: u64,
+) -> Vec<u8> {
+    let doc_count = 1 + fields.len(); // 1 header doc + N field docs
+    let estimated = 4 + doc_count * 200 + schema_json.len() + 12;
+    let mut buf = Vec::with_capacity(estimated);
+
+    // Header magic
+    buf.extend_from_slice(&MAGIC_NUMBER.to_ne_bytes());
+
+    let mut offsets = Vec::with_capacity(doc_count);
+
+    // Document 0: header with schema_json, table_version, field_count
+    offsets.push(buf.len() as u32);
+    {
+        let field_count: u16 = 3;
+        buf.extend_from_slice(&field_count.to_ne_bytes());
+
+        write_field_header(&mut buf, "schema_json", FIELD_TYPE_TEXT, 1);
+        write_string(&mut buf, schema_json);
+
+        write_field_header(&mut buf, "table_version", FIELD_TYPE_INTEGER, 1);
+        buf.extend_from_slice(&(table_version as i64).to_ne_bytes());
+
+        write_field_header(&mut buf, "field_count", FIELD_TYPE_INTEGER, 1);
+        buf.extend_from_slice(&(fields.len() as i64).to_ne_bytes());
+    }
+
+    // Documents 1..N: one per schema field
+    for field in fields {
+        offsets.push(buf.len() as u32);
+        let field_count: u16 = 4;
+        buf.extend_from_slice(&field_count.to_ne_bytes());
+
+        write_field_header(&mut buf, "name", FIELD_TYPE_TEXT, 1);
+        write_string(&mut buf, &field.name);
+
+        write_field_header(&mut buf, "data_type", FIELD_TYPE_TEXT, 1);
+        write_string(&mut buf, &field.data_type);
+
+        write_field_header(&mut buf, "nullable", FIELD_TYPE_BOOLEAN, 1);
+        buf.push(if field.nullable { 1 } else { 0 });
+
+        write_field_header(&mut buf, "metadata", FIELD_TYPE_TEXT, 1);
+        write_string(&mut buf, &field.metadata);
+    }
+
+    // Offset table
+    let offset_table_start = buf.len() as u32;
+    for offset in &offsets {
+        buf.extend_from_slice(&offset.to_ne_bytes());
+    }
+
+    // Footer: offset_table_pos + doc_count + magic
+    buf.extend_from_slice(&offset_table_start.to_ne_bytes());
+    buf.extend_from_slice(&(doc_count as u32).to_ne_bytes());
+    buf.extend_from_slice(&MAGIC_NUMBER.to_ne_bytes());
+
+    buf
 }
 
 fn write_field_header(buf: &mut Vec<u8>, name: &str, field_type: u8, value_count: u16) {
