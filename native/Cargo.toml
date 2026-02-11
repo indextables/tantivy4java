@@ -69,6 +69,11 @@ arrow-array = "57"
 zstd = "0.13"
 bytes = "1"
 
+# Delta Lake table file listing via delta-kernel-rs
+delta_kernel = { version = "0.19", features = ["default-engine-rustls", "arrow"] }
+object_store = { version = "0.12", features = ["aws", "azure"] }
+url = "2"
+
 [build-dependencies]
 jni = "0.21.1"
 
