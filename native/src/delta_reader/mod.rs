@@ -10,4 +10,4 @@ pub mod serialization;
 pub mod jni;
 
 pub use engine::DeltaStorageConfig;
-pub use scan::{DeltaFileEntry, list_delta_files};
+pub use scan::{DeltaFileEntry, DeltaSchemaField, list_delta_files, read_delta_schema};
