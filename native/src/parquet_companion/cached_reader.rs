@@ -27,6 +27,49 @@ type ByteRangeCacheKey = (std::path::PathBuf, u64, u64);
 /// page (~800KB-1MB) or data page. 256 entries ≈ 256MB worst case.
 const MAX_BYTE_CACHE_ENTRIES: usize = 256;
 
+/// Configuration for byte-range coalescing during parquet reads.
+///
+/// Controls how nearby byte ranges are merged into single fetch requests
+/// to reduce storage round-trips. Tuning matters especially for cloud
+/// storage (S3/Azure) where each GET request adds 50-100ms of latency.
+#[derive(Debug, Clone, Copy)]
+pub struct CoalesceConfig {
+    /// Maximum gap (in bytes) between ranges that will be merged into a
+    /// single fetch. Ranges separated by more than this are fetched
+    /// independently.
+    ///
+    /// For cloud storage (S3/Azure): 512KB is a good default — each GET has
+    /// ~50-100ms latency, so downloading 512KB of gap bytes to save a
+    /// round-trip is almost always worthwhile.
+    ///
+    /// For local storage: 64KB is sufficient since read latency is <0.1ms.
+    pub max_gap: u64,
+    /// Maximum total size (in bytes) of a single coalesced fetch request.
+    /// Prevents over-fetching when many small ranges span a very large
+    /// byte region. Once a coalesced group would exceed this size, a new
+    /// group is started.
+    pub max_total: u64,
+}
+
+impl Default for CoalesceConfig {
+    fn default() -> Self {
+        Self {
+            max_gap: 512 * 1024,       // 512 KB — good for cloud storage
+            max_total: 8 * 1024 * 1024, // 8 MB — prevents over-fetching
+        }
+    }
+}
+
+impl CoalesceConfig {
+    /// Config tuned for local/NVMe storage (smaller gap, lower latency).
+    pub fn local() -> Self {
+        Self {
+            max_gap: 64 * 1024,         // 64 KB
+            max_total: 8 * 1024 * 1024, // 8 MB
+        }
+    }
+}
+
 /// Shared byte-range cache across multiple CachedParquetReader instances.
 /// Caches fetched byte ranges (e.g. dictionary pages, data pages) to avoid
 /// redundant S3/Azure downloads when retrieving multiple docs from the same file.
@@ -50,6 +93,8 @@ pub struct CachedParquetReader {
     metadata: Option<Arc<ParquetMetaData>>,
     /// Optional shared byte-range cache for dictionary/data page reuse
     byte_cache: Option<ByteRangeCache>,
+    /// Coalescing parameters for byte-range merging
+    coalesce_config: CoalesceConfig,
 }
 
 impl CachedParquetReader {
@@ -65,6 +110,7 @@ impl CachedParquetReader {
             file_size,
             metadata: None,
             byte_cache: None,
+            coalesce_config: CoalesceConfig::default(),
         }
     }
 
@@ -81,6 +127,7 @@ impl CachedParquetReader {
             file_size,
             metadata: Some(metadata),
             byte_cache: None,
+            coalesce_config: CoalesceConfig::default(),
         }
     }
 
@@ -89,6 +136,12 @@ impl CachedParquetReader {
     /// subsequent reads of the same range, avoiding redundant S3/Azure calls.
     pub fn with_byte_cache(mut self, cache: ByteRangeCache) -> Self {
         self.byte_cache = Some(cache);
+        self
+    }
+
+    /// Set coalescing parameters for byte-range merging.
+    pub fn with_coalesce_config(mut self, config: CoalesceConfig) -> Self {
+        self.coalesce_config = config;
         self
     }
 
@@ -153,7 +206,9 @@ impl AsyncFileReader for CachedParquetReader {
                     )))
                 })?;
 
-            let bytes = Bytes::from(owned_bytes.to_vec());
+            // Zero-copy conversion: OwnedBytes → Bytes via from_owner()
+            // avoids the allocation+copy of .to_vec()
+            let bytes = Bytes::from_owner(owned_bytes);
 
             // Cache the result
             if let Some(cache) = byte_cache {
@@ -211,13 +266,15 @@ impl AsyncFileReader for CachedParquetReader {
 
         let byte_cache = self.byte_cache.clone();
         let path_for_cache = self.path.clone();
+        let coalesce_config = self.coalesce_config;
 
         async move {
-            // Fetch only the uncached ranges
+            // Fetch only the uncached ranges with configured coalescing
             let fetched = fetch_ranges_with_coalescing(
                 &storage,
                 &path,
                 uncached_ranges.clone(),
+                coalesce_config,
             )
             .await?;
 
@@ -283,14 +340,14 @@ impl AsyncFileReader for CachedParquetReader {
 
 /// Fetch multiple byte ranges from storage with coalescing of nearby ranges.
 /// This reduces the number of S3/Azure round-trips by merging ranges that are
-/// separated by at most MAX_COALESCE_GAP bytes into single fetches.
+/// separated by at most `config.max_gap` bytes into single fetches, capped at
+/// `config.max_total` bytes per coalesced group.
 async fn fetch_ranges_with_coalescing(
     storage: &Arc<dyn Storage>,
     path: &std::path::Path,
     ranges: Vec<Range<u64>>,
+    config: CoalesceConfig,
 ) -> Result<Vec<Bytes>, parquet::errors::ParquetError> {
-    const MAX_COALESCE_GAP: u64 = 64 * 1024; // 64 KB
-
     if ranges.len() <= 1 {
         let futs: Vec<_> = ranges
             .into_iter()
@@ -313,8 +370,9 @@ async fn fetch_ranges_with_coalescing(
                                 ),
                             ))
                         })?;
-                    Ok::<Bytes, parquet::errors::ParquetError>(Bytes::from(
-                        owned_bytes.to_vec(),
+                    // Zero-copy conversion: OwnedBytes → Bytes via from_owner()
+                    Ok::<Bytes, parquet::errors::ParquetError>(Bytes::from_owner(
+                        owned_bytes,
                     ))
                 }
             })
@@ -330,17 +388,19 @@ async fn fetch_ranges_with_coalescing(
         .collect();
     indexed_ranges.sort_by_key(|(_, r)| r.start);
 
-    // Coalesce nearby ranges into groups
+    // Coalesce nearby ranges into groups, respecting both max_gap and max_total
     let mut groups: Vec<CoalescedGroup> = Vec::new();
     let mut group_start = indexed_ranges[0].1.start;
     let mut group_end = indexed_ranges[0].1.end;
     let mut group_members = vec![indexed_ranges[0].clone()];
 
     for &(idx, ref range) in &indexed_ranges[1..] {
-        if range.start <= group_end + MAX_COALESCE_GAP {
-            group_end = group_end.max(range.end);
-            group_members.push((idx, range.clone()));
-        } else {
+        let new_end = group_end.max(range.end);
+        let would_exceed_gap = range.start > group_end + config.max_gap;
+        let would_exceed_total = (new_end - group_start) > config.max_total;
+
+        if would_exceed_gap || would_exceed_total {
+            // Start a new group
             groups.push(CoalescedGroup {
                 fetch_range: group_start..group_end,
                 members: std::mem::take(&mut group_members),
@@ -348,6 +408,9 @@ async fn fetch_ranges_with_coalescing(
             group_start = range.start;
             group_end = range.end;
             group_members = vec![(idx, range.clone())];
+        } else {
+            group_end = new_end;
+            group_members.push((idx, range.clone()));
         }
     }
     groups.push(CoalescedGroup {
@@ -356,10 +419,12 @@ async fn fetch_ranges_with_coalescing(
     });
 
     debug_println!(
-        "📖 PARQUET_READ: coalesced {} ranges into {} fetches for {:?}",
+        "📖 PARQUET_READ: coalesced {} ranges into {} fetches for {:?} (gap={}KB, max={}MB)",
         ranges.len(),
         groups.len(),
-        path
+        path,
+        config.max_gap / 1024,
+        config.max_total / (1024 * 1024),
     );
 
     // Fetch coalesced ranges in parallel
@@ -386,7 +451,8 @@ async fn fetch_ranges_with_coalescing(
                         ))
                     })?;
 
-                let coalesced_shared = Bytes::from(coalesced_bytes.to_vec());
+                // Zero-copy conversion: OwnedBytes → Bytes via from_owner()
+                let coalesced_shared = Bytes::from_owner(coalesced_bytes);
                 let results: Vec<(usize, Bytes)> = group
                     .members
                     .iter()

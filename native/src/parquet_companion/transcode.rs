@@ -10,7 +10,8 @@
 //   4. In hybrid mode: merge native numeric columns with parquet string columns
 //   5. In parquet-only mode: transcode ALL columns from parquet
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use arrow_array::{Array, RecordBatch};
@@ -22,6 +23,10 @@ use quickwit_storage::Storage;
 
 use super::cached_reader::CachedParquetReader;
 use super::manifest::{FastFieldMode, ParquetManifest};
+
+/// Shared metadata cache type — reused across doc retrieval and transcoding
+/// to avoid redundant footer reads from S3/Azure.
+pub type MetadataCache = Arc<Mutex<HashMap<std::path::PathBuf, Arc<parquet::file::metadata::ParquetMetaData>>>>;
 
 use crate::debug_println;
 
@@ -77,6 +82,7 @@ pub struct TranscodeColumn {
 /// * `manifest` - The parquet manifest
 /// * `storage` - Storage for reading parquet files
 /// * `num_docs` - Total number of documents in the segment
+/// * `metadata_cache` - Optional shared metadata cache (avoids re-reading footers)
 ///
 /// # Returns
 /// Bytes in tantivy columnar format suitable for .fast file
@@ -85,6 +91,7 @@ pub async fn transcode_columns_from_parquet(
     manifest: &ParquetManifest,
     storage: &Arc<dyn Storage>,
     num_docs: u32,
+    metadata_cache: Option<&MetadataCache>,
 ) -> Result<Vec<u8>> {
     if columns.is_empty() {
         // Return empty columnar with no columns
@@ -110,16 +117,42 @@ pub async fn transcode_columns_from_parquet(
     for file_entry in &manifest.parquet_files {
         // Use relative_path directly — the storage is rooted at table_root
         let parquet_path = &file_entry.relative_path;
+        let path_buf = std::path::PathBuf::from(parquet_path);
 
-        let reader = CachedParquetReader::new(
-            storage.clone(),
-            std::path::PathBuf::from(parquet_path),
-            file_entry.file_size_bytes,
-        );
+        // Check metadata cache to avoid re-reading footer from S3/Azure
+        let cached_meta = metadata_cache.and_then(|cache| {
+            cache.lock().ok().and_then(|guard| guard.get(&path_buf).cloned())
+        });
+
+        let reader = if let Some(meta) = cached_meta {
+            debug_println!("📊 TRANSCODE: Using cached metadata for {:?}", parquet_path);
+            CachedParquetReader::with_metadata(
+                storage.clone(),
+                path_buf.clone(),
+                file_entry.file_size_bytes,
+                meta,
+            )
+        } else {
+            CachedParquetReader::new(
+                storage.clone(),
+                path_buf.clone(),
+                file_entry.file_size_bytes,
+            )
+        };
 
         let builder = parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder::new(reader)
             .await
             .context("Failed to create parquet stream builder for transcode")?;
+
+        // Cache the metadata for subsequent reads (by doc retrieval or other transcodes)
+        if let Some(cache) = metadata_cache {
+            if let Ok(mut guard) = cache.lock() {
+                if !guard.contains_key(&path_buf) {
+                    guard.insert(path_buf.clone(), builder.metadata().clone());
+                    debug_println!("📊 TRANSCODE: Cached metadata for {:?}", parquet_path);
+                }
+            }
+        }
 
         let parquet_schema = builder.schema().clone();
         let parquet_file_schema = builder.parquet_schema().clone();

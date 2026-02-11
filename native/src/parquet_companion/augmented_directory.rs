@@ -217,6 +217,7 @@ impl ParquetAugmentedDirectory {
             &self.manifest,
             &self.storage,
             num_docs,
+            None, // metadata cache populated via prewarm/doc retrieval paths
         ).await?;
 
         // Merge with native fast fields if in hybrid mode
