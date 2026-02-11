@@ -20,9 +20,10 @@ use parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder;
 
 use quickwit_storage::Storage;
 
-use super::cached_reader::{CachedParquetReader, ByteRangeCache};
+use super::cached_reader::{CachedParquetReader, ByteRangeCache, CoalesceConfig};
 use super::docid_mapping::{translate_to_global_row, locate_row_in_file, group_doc_addresses_by_file};
 use super::manifest::ParquetManifest;
+use super::transcode::MetadataCache;
 
 use crate::debug_println;
 
@@ -35,14 +36,17 @@ use crate::debug_println;
 /// * `projected_fields` - Optional set of field names to retrieve (None = all)
 /// * `storage` - Storage instance for accessing parquet files
 /// * `metadata_cache` - Optional cache of parquet metadata per file path (avoids re-reading footer from S3)
+/// * `byte_cache` - Optional cache of fetched byte ranges (dictionary page reuse)
+/// * `coalesce_config` - Optional coalescing parameters (defaults to cloud-optimized settings)
 pub async fn retrieve_document_from_parquet(
     manifest: &ParquetManifest,
     segment_ord: u32,
     doc_id: u32,
     projected_fields: Option<&[String]>,
     storage: &Arc<dyn Storage>,
-    metadata_cache: Option<&std::sync::Arc<std::sync::Mutex<HashMap<std::path::PathBuf, std::sync::Arc<parquet::file::metadata::ParquetMetaData>>>>>,
+    metadata_cache: Option<&MetadataCache>,
     byte_cache: Option<&ByteRangeCache>,
+    coalesce_config: Option<CoalesceConfig>,
 ) -> Result<HashMap<String, serde_json::Value>> {
     let global_row = translate_to_global_row(segment_ord, doc_id, manifest)
         .map_err(|e| anyhow::anyhow!("{}", e))?;
@@ -82,6 +86,11 @@ pub async fn retrieve_document_from_parquet(
     };
     let reader = if let Some(bc) = byte_cache {
         reader.with_byte_cache(bc.clone())
+    } else {
+        reader
+    };
+    let reader = if let Some(config) = coalesce_config {
+        reader.with_coalesce_config(config)
     } else {
         reader
     };
@@ -190,13 +199,15 @@ pub async fn retrieve_document_from_parquet(
 ///   3. Filters row groups: skips entire row groups with no selected rows
 ///   4. Builds surgical RowSelection within selected row groups
 ///   5. Uses column projection to only decode requested columns
+///   6. Coalesces nearby byte ranges to reduce S3/Azure round-trips
 pub async fn batch_retrieve_from_parquet(
     addresses: &[(u32, u32)], // (segment_ord, doc_id)
     projected_fields: Option<&[String]>,
     manifest: &ParquetManifest,
     storage: &Arc<dyn Storage>,
-    metadata_cache: Option<&std::sync::Arc<std::sync::Mutex<HashMap<std::path::PathBuf, std::sync::Arc<parquet::file::metadata::ParquetMetaData>>>>>,
+    metadata_cache: Option<&MetadataCache>,
     byte_cache: Option<&ByteRangeCache>,
+    coalesce_config: Option<CoalesceConfig>,
 ) -> Result<Vec<HashMap<String, serde_json::Value>>> {
     let groups = group_doc_addresses_by_file(addresses, manifest)
         .map_err(|e| anyhow::anyhow!("{}", e))?;
@@ -246,6 +257,11 @@ pub async fn batch_retrieve_from_parquet(
                 };
                 let reader = if let Some(ref bc) = byte_cache {
                     reader.with_byte_cache(bc.clone())
+                } else {
+                    reader
+                };
+                let reader = if let Some(config) = coalesce_config {
+                    reader.with_coalesce_config(config)
                 } else {
                     reader
                 };
