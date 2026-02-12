@@ -1,5 +1,6 @@
 package io.indextables.tantivy4java;
 
+import io.indextables.tantivy4java.core.Document;
 import io.indextables.tantivy4java.core.Schema;
 import io.indextables.tantivy4java.result.SearchResult;
 import io.indextables.tantivy4java.split.*;
@@ -500,23 +501,22 @@ public class ParquetCompanionTest {
             assertTrue(results.getHits().size() >= 1, "should find item_100");
 
             // Retrieve with field projection
-            String json = searcher.docProjected(results.getHits().get(0).getDocAddress(),
+            Document doc = searcher.docProjected(results.getHits().get(0).getDocAddress(),
                     "id", "name");
-            assertNotNull(json, "docProjected should return JSON string");
+            assertNotNull(doc, "docProjected should return Document");
 
-            JsonNode node = MAPPER.readTree(json);
-            assertEquals(100, node.get("id").asInt());
-            assertEquals("item_100", node.get("name").asText());
+            assertEquals(100L, ((Number) doc.getFirst("id")).longValue());
+            assertEquals("item_100", doc.getFirst("name"));
             // score should not be present (not projected)
-            assertFalse(node.has("score"), "non-projected field should be absent");
+            assertNull(doc.getFirst("score"), "non-projected field should be absent");
 
             // Retrieve all fields (no projection)
-            String allJson = searcher.docProjected(results.getHits().get(0).getDocAddress());
-            JsonNode allNode = MAPPER.readTree(allJson);
-            assertTrue(allNode.has("id"));
-            assertTrue(allNode.has("name"));
-            assertTrue(allNode.has("score"));
-            assertTrue(allNode.has("active"));
+            Document allDoc = searcher.docProjected(results.getHits().get(0).getDocAddress());
+            assertNotNull(allDoc);
+            assertNotNull(allDoc.getFirst("id"));
+            assertNotNull(allDoc.getFirst("name"));
+            assertNotNull(allDoc.getFirst("score"));
+            assertNotNull(allDoc.getFirst("active"));
         }
     }
 
@@ -543,18 +543,16 @@ public class ParquetCompanionTest {
             assertTrue(results.getHits().size() >= 1);
 
             // Retrieve all fields to validate complex type serialization
-            String json = searcher.docProjected(results.getHits().get(0).getDocAddress());
-            assertNotNull(json);
+            Document doc = searcher.docProjected(results.getHits().get(0).getDocAddress());
+            assertNotNull(doc);
 
-            JsonNode node = MAPPER.readTree(json);
             // Basic types
-            assertTrue(node.has("id"), "should have i64");
-            assertTrue(node.has("name"), "should have utf8");
-            assertTrue(node.has("score"), "should have f64");
-            assertTrue(node.has("active"), "should have bool");
-            // Timestamp should be a number (micros)
-            assertTrue(node.has("created_at"), "should have timestamp");
-            assertTrue(node.get("created_at").isNumber(), "timestamp should be numeric (micros)");
+            assertNotNull(doc.getFirst("id"), "should have i64");
+            assertNotNull(doc.getFirst("name"), "should have utf8");
+            assertNotNull(doc.getFirst("score"), "should have f64");
+            assertNotNull(doc.getFirst("active"), "should have bool");
+            // Timestamp should be present
+            assertNotNull(doc.getFirst("created_at"), "should have timestamp");
         }
     }
 
@@ -588,19 +586,13 @@ public class ParquetCompanionTest {
             }
 
             // Batch retrieval with projection
-            byte[] batchBytes = searcher.docBatchProjected(addrs, "id", "name");
-            assertNotNull(batchBytes, "batch result should not be null");
+            List<Document> batchDocs = searcher.docBatchProjected(addrs, "id", "name");
+            assertEquals(3, batchDocs.size(), "should have 3 documents");
 
-            String batchJson = new String(batchBytes, StandardCharsets.UTF_8);
-            JsonNode arr = MAPPER.readTree(batchJson);
-            assertTrue(arr.isArray(), "batch result should be JSON array");
-            assertEquals(3, arr.size(), "should have 3 documents");
-
-            for (int i = 0; i < arr.size(); i++) {
-                JsonNode doc = arr.get(i);
-                assertTrue(doc.has("id"), "each doc should have id");
-                assertTrue(doc.has("name"), "each doc should have name");
-                assertFalse(doc.has("score"), "non-projected field should be absent");
+            for (Document batchDoc : batchDocs) {
+                assertNotNull(batchDoc.getFirst("id"), "each doc should have id");
+                assertNotNull(batchDoc.getFirst("name"), "each doc should have name");
+                assertNull(batchDoc.getFirst("score"), "non-projected field should be absent");
             }
         }
     }

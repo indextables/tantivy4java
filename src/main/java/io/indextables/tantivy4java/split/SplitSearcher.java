@@ -376,31 +376,49 @@ public class SplitSearcher implements AutoCloseable {
      * @param fields Optional list of field names to project (null = all fields)
      * @return JSON string of field values, e.g. {"name":"Alice","age":30}
      */
-    public String docProjected(DocAddress docAddress, String... fields) {
-        return (String) nativeDocProjected(nativePtr, docAddress.getSegmentOrd(), docAddress.getDoc(),
-                fields != null && fields.length > 0 ? fields : null);
+    public Document docProjected(DocAddress docAddress, String... fields) {
+        if (hasParquetCompanion()) {
+            // Route companion splits through unified TANT binary path
+            Set<String> fieldSet = (fields != null && fields.length > 0)
+                    ? new HashSet<>(Arrays.asList(fields))
+                    : null;
+            List<Document> docs = docBatchViaParquet(
+                    Collections.singletonList(docAddress), fieldSet);
+            return docs.isEmpty() ? null : docs.get(0);
+        }
+        // Non-companion: fall back to standard doc retrieval
+        return doc(docAddress);
     }
 
     /**
-     * Batch projected document retrieval from parquet companion.
-     * Returns a JSON array as a byte array for efficient JNI boundary crossing.
-     * Each element is a JSON object of field-value pairs.
-     *
-     * <p>If the split has no parquet manifest, falls back to standard bulk retrieval.
+     * Batch projected document retrieval returning raw TANT binary bytes.
+     * For companion splits, data is serialized directly from Arrow to TANT format.
+     * For standard splits, falls back to standard bulk retrieval (also TANT format).
      *
      * @param docAddresses Array of document addresses
      * @param fields Optional list of field names to project (null = all fields)
-     * @return UTF-8 encoded JSON array bytes: [{"field":"value",...}, ...]
+     * @return List of documents in the same order as the input addresses
      */
-    public byte[] docBatchProjected(DocAddress[] docAddresses, String... fields) {
+    public List<Document> docBatchProjected(DocAddress[] docAddresses, String... fields) {
         int[] segments = new int[docAddresses.length];
         int[] docIds = new int[docAddresses.length];
         for (int i = 0; i < docAddresses.length; i++) {
             segments[i] = docAddresses[i].getSegmentOrd();
             docIds[i] = docAddresses[i].getDoc();
         }
-        return nativeDocBatchProjected(nativePtr, segments, docIds,
+        byte[] result = nativeDocBatchProjected(nativePtr, segments, docIds,
                 fields != null && fields.length > 0 ? fields : null);
+        if (result == null) {
+            return new ArrayList<>();
+        }
+        java.nio.ByteBuffer buffer = java.nio.ByteBuffer.wrap(result);
+        BatchDocumentReader reader = new BatchDocumentReader();
+        List<Map<String, Object>> docMaps = reader.parseToMaps(buffer);
+        List<Document> docs = new ArrayList<>(docMaps.size());
+        for (Map<String, Object> docMap : docMaps) {
+            docs.add(new MapBackedDocument(docMap));
+        }
+        return docs;
     }
 
     /**
@@ -461,6 +479,11 @@ public class SplitSearcher implements AutoCloseable {
     public List<Document> docBatch(List<DocAddress> docAddresses, Set<String> fieldNames) {
         if (docAddresses == null || docAddresses.isEmpty()) {
             return new ArrayList<>();
+        }
+
+        // Companion splits: always use TANT binary path via parquet
+        if (hasParquetCompanion()) {
+            return docBatchViaParquet(docAddresses, fieldNames);
         }
 
         // Get threshold from cache manager configuration
@@ -602,6 +625,41 @@ public class SplitSearcher implements AutoCloseable {
      * occur when using Document objects (N documents × M fields for storing, plus N×M for reading).
      * Instead, all document data stays in pure Java after the single ByteBuffer transfer.
      */
+    /**
+     * Retrieve documents from parquet companion splits using TANT binary format.
+     * Calls nativeDocBatchProjected which serializes Arrow data directly to TANT binary,
+     * bypassing the expensive JSON round-trip.
+     */
+    private List<Document> docBatchViaParquet(List<DocAddress> docAddresses, Set<String> fieldNames) {
+        int[] segments = new int[docAddresses.size()];
+        int[] docIds = new int[docAddresses.size()];
+
+        for (int i = 0; i < docAddresses.size(); i++) {
+            DocAddress addr = docAddresses.get(i);
+            segments[i] = addr.getSegmentOrd();
+            docIds[i] = addr.getDoc();
+        }
+
+        String[] fieldsArray = (fieldNames != null && !fieldNames.isEmpty())
+                ? fieldNames.toArray(new String[0])
+                : null;
+
+        byte[] result = nativeDocBatchProjected(nativePtr, segments, docIds, fieldsArray);
+        if (result == null) {
+            return new ArrayList<>();
+        }
+
+        java.nio.ByteBuffer buffer = java.nio.ByteBuffer.wrap(result);
+        BatchDocumentReader reader = new BatchDocumentReader();
+        List<Map<String, Object>> docMaps = reader.parseToMaps(buffer);
+
+        List<Document> docs = new ArrayList<>(docMaps.size());
+        for (Map<String, Object> docMap : docMaps) {
+            docs.add(new MapBackedDocument(docMap));
+        }
+        return docs;
+    }
+
     private List<Document> docBatchViaByteBuffer(List<DocAddress> docAddresses, Set<String> fieldNames) {
         // Convert to arrays for JNI transfer
         int[] segments = new int[docAddresses.size()];

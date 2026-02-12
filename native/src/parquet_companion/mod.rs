@@ -20,6 +20,7 @@ pub mod name_mapping;
 pub mod merge;
 pub mod coalescing;
 pub mod field_extraction;
+pub mod arrow_to_tant;
 
 pub use manifest::{
     ParquetManifest, FastFieldMode, SegmentRowRange, ParquetFileEntry,

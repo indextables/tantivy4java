@@ -216,9 +216,9 @@ public class RealS3ParquetBenchmarkTest {
                 SplitCacheManager.resetObjectStorageRequestStats();
 
                 for (SearchResult.Hit hit : res.getHits()) {
-                    String json = searcher.docProjected(hit.getDocAddress(),
+                    Document doc = searcher.docProjected(hit.getDocAddress(),
                             "name", "id", "score");
-                    assertNotNull(json);
+                    assertNotNull(doc);
                 }
 
                 long retrieveReqs = SplitCacheManager.getObjectStorageRequestCount();
@@ -529,9 +529,9 @@ public class RealS3ParquetBenchmarkTest {
                 SplitQuery q = searcher.parseQuery("*");
                 SearchResult res = searcher.search(q, 100);
                 for (SearchResult.Hit hit : res.getHits()) {
-                    String json = searcher.docProjected(hit.getDocAddress(),
+                    Document doc = searcher.docProjected(hit.getDocAddress(),
                             "name", "id", "score");
-                    assertNotNull(json);
+                    assertNotNull(doc);
                 }
             }
         }
@@ -667,9 +667,9 @@ public class RealS3ParquetBenchmarkTest {
                 SplitQuery q = searcher.parseQuery("*");
                 SearchResult res = searcher.search(q, 100);
                 for (SearchResult.Hit hit : res.getHits()) {
-                    String json = searcher.docProjected(hit.getDocAddress(),
+                    Document doc = searcher.docProjected(hit.getDocAddress(),
                             "name", "id", "score");
-                    assertNotNull(json);
+                    assertNotNull(doc);
                 }
 
                 pqMs = (System.nanoTime() - start) / 1_000_000;
@@ -1038,8 +1038,8 @@ public class RealS3ParquetBenchmarkTest {
                 System.out.print("  [J] Doc retrieval (5 docs, projected)... ");
                 SearchResult docRes = searcher.search(new SplitMatchAllQuery(), 5);
                 for (SearchResult.Hit hit : docRes.getHits()) {
-                    String json = searcher.docProjected(hit.getDocAddress(), "name", "id", "score");
-                    assertNotNull(json);
+                    Document doc = searcher.docProjected(hit.getDocAddress(), "name", "id", "score");
+                    assertNotNull(doc);
                 }
                 long jReqs = SplitCacheManager.getObjectStorageRequestCount();
                 System.out.printf("%d docs, %d S3 reqs%n", docRes.getHits().size(), jReqs);
@@ -1436,8 +1436,8 @@ public class RealS3ParquetBenchmarkTest {
                 for (int i = 0; i < searchIters; i++) {
                     for (SearchResult.Hit hit : allHits) {
                         if (isCompanion) {
-                            String json = searcher.docProjected(hit.getDocAddress(), "name");
-                            assertNotNull(json);
+                            Document doc = searcher.docProjected(hit.getDocAddress(), "name");
+                            assertNotNull(doc);
                         } else {
                             try (Document doc = searcher.doc(hit.getDocAddress())) {
                                 doc.getFirst("name");

@@ -21,6 +21,7 @@ package io.indextables.tantivy4java;
 
 import io.indextables.tantivy4java.aggregation.*;
 import io.indextables.tantivy4java.core.DocAddress;
+import io.indextables.tantivy4java.core.Document;
 import io.indextables.tantivy4java.core.Schema;
 import io.indextables.tantivy4java.result.SearchResult;
 import io.indextables.tantivy4java.split.*;
@@ -29,16 +30,12 @@ import io.indextables.tantivy4java.split.merge.*;
 import org.junit.jupiter.api.*;
 import org.junit.jupiter.api.io.TempDir;
 
-import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.ObjectMapper;
-
 import com.azure.storage.blob.BlobServiceClient;
 import com.azure.storage.blob.BlobServiceClientBuilder;
 import com.azure.storage.blob.BlobContainerClient;
 import com.azure.storage.blob.BlobClient;
 import com.azure.storage.common.StorageSharedKeyCredential;
 
-import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
@@ -67,8 +64,6 @@ public class RealAzureParquetCompanionTest {
     private static final String TEST_CONTAINER = System.getProperty("test.azure.container", "tantivy4java-test");
     private static final String STORAGE_ACCOUNT = System.getProperty("test.azure.storageAccount");
     private static final String ACCOUNT_KEY = System.getProperty("test.azure.accountKey");
-    private static final ObjectMapper MAPPER = new ObjectMapper();
-
     private static String azureStorageAccount;
     private static String azureAccountKey;
 
@@ -268,17 +263,16 @@ public class RealAzureParquetCompanionTest {
 
             DocAddress addr = results.getHits().get(0).getDocAddress();
 
-            String docJson = searcher.docProjected(addr);
-            assertNotNull(docJson);
-            JsonNode doc = MAPPER.readTree(docJson);
+            Document doc = searcher.docProjected(addr);
+            assertNotNull(doc);
 
-            assertTrue(doc.has("id"), "i64");
-            assertTrue(doc.has("uint_val"), "u64");
-            assertTrue(doc.has("text_val"), "text/raw");
-            assertTrue(doc.has("ip_val"), "ip");
-            assertTrue(doc.has("category"), "categorical text");
-            assertTrue(doc.has("region"), "region text");
-            assertTrue(doc.has("is_active"), "bool");
+            assertNotNull(doc.getFirst("id"), "i64");
+            assertNotNull(doc.getFirst("uint_val"), "u64");
+            assertNotNull(doc.getFirst("text_val"), "text/raw");
+            assertNotNull(doc.getFirst("ip_val"), "ip");
+            assertNotNull(doc.getFirst("category"), "categorical text");
+            assertNotNull(doc.getFirst("region"), "region text");
+            assertNotNull(doc.getFirst("is_active"), "bool");
 
             // Batch retrieval
             DocAddress[] addrs = new DocAddress[3];
@@ -286,21 +280,18 @@ public class RealAzureParquetCompanionTest {
                 addrs[i] = results.getHits().get(i).getDocAddress();
             }
 
-            byte[] batchBytes = searcher.docBatchProjected(addrs,
+            List<Document> batchDocs = searcher.docBatchProjected(addrs,
                     "id", "uint_val", "float_val", "text_val", "ip_val",
                     "description", "src_ip", "category", "status_code",
                     "amount", "priority", "latitude", "longitude",
                     "region", "is_active", "retry_count", "large_text");
-            assertNotNull(batchBytes);
+            assertEquals(3, batchDocs.size());
 
-            JsonNode arr = MAPPER.readTree(new String(batchBytes, StandardCharsets.UTF_8));
-            assertEquals(3, arr.size());
-
-            for (int i = 0; i < arr.size(); i++) {
-                JsonNode d = arr.get(i);
-                assertTrue(d.has("id"), "doc " + i + " should have id");
-                assertTrue(d.has("category"), "doc " + i + " should have category");
-                assertTrue(d.has("region"), "doc " + i + " should have region");
+            for (int i = 0; i < batchDocs.size(); i++) {
+                Document d = batchDocs.get(i);
+                assertNotNull(d.getFirst("id"), "doc " + i + " should have id");
+                assertNotNull(d.getFirst("category"), "doc " + i + " should have category");
+                assertNotNull(d.getFirst("region"), "doc " + i + " should have region");
             }
         }
     }
@@ -361,10 +352,10 @@ public class RealAzureParquetCompanionTest {
                     "should find docs with 'fox' in description");
 
             DocAddress addr = results.getHits().get(0).getDocAddress();
-            String json = searcher.docProjected(addr, "description");
-            JsonNode doc = MAPPER.readTree(json);
-            assertTrue(doc.has("description"));
-            assertTrue(doc.get("description").asText().toLowerCase().contains("quick"),
+            Document doc = searcher.docProjected(addr, "description");
+            assertNotNull(doc);
+            assertNotNull(doc.getFirst("description"));
+            assertTrue(doc.getFirst("description").toString().toLowerCase().contains("quick"),
                     "description should contain 'quick'");
         }
     }
@@ -388,17 +379,16 @@ public class RealAzureParquetCompanionTest {
 
             if (results.getHits().size() > 0) {
                 DocAddress addr = results.getHits().get(0).getDocAddress();
-                String docJson = searcher.docProjected(addr);
-                assertNotNull(docJson);
-                JsonNode doc = MAPPER.readTree(docJson);
-                assertTrue(doc.has("ip_val"), "should have ip_val");
-                assertTrue(doc.has("src_ip"), "should have src_ip");
+                Document doc = searcher.docProjected(addr);
+                assertNotNull(doc);
+                assertNotNull(doc.getFirst("ip_val"), "should have ip_val");
+                assertNotNull(doc.getFirst("src_ip"), "should have src_ip");
 
                 // Also test projected retrieval with IP + non-IP fields
-                String projected = searcher.docProjected(addr, "id", "ip_val", "src_ip");
-                JsonNode projDoc = MAPPER.readTree(projected);
-                assertTrue(projDoc.has("id"), "projected should have id");
-                assertTrue(projDoc.has("ip_val"), "projected should have ip_val");
+                Document projDoc = searcher.docProjected(addr, "id", "ip_val", "src_ip");
+                assertNotNull(projDoc);
+                assertNotNull(projDoc.getFirst("id"), "projected should have id");
+                assertNotNull(projDoc.getFirst("ip_val"), "projected should have ip_val");
             }
         }
     }
@@ -500,13 +490,13 @@ public class RealAzureParquetCompanionTest {
             assertTrue(results.getHits().size() >= 1, "should find text_0");
 
             DocAddress addr = results.getHits().get(0).getDocAddress();
-            String docJson = searcher.docProjected(addr);
-            JsonNode doc = MAPPER.readTree(docJson);
+            Document doc = searcher.docProjected(addr);
+            assertNotNull(doc);
 
-            assertEquals(0, doc.get("id").asLong(), "id should be 0");
-            assertEquals(1_000_000_000L, doc.get("uint_val").asLong(), "uint_val base");
-            assertEquals("text_0", doc.get("text_val").asText());
-            assertFalse(doc.get("is_active").asBoolean(),
+            assertEquals(0L, ((Number) doc.getFirst("id")).longValue(), "id should be 0");
+            assertEquals(1_000_000_000L, ((Number) doc.getFirst("uint_val")).longValue(), "uint_val base");
+            assertEquals("text_0", doc.getFirst("text_val"));
+            assertEquals(false, doc.getFirst("is_active"),
                     "row 0: is_active should be false (0 % 3 == 0)");
         }
     }

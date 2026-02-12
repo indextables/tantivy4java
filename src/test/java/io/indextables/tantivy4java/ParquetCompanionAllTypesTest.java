@@ -4,6 +4,7 @@ import io.indextables.tantivy4java.aggregation.HistogramAggregation;
 import io.indextables.tantivy4java.aggregation.StatsAggregation;
 import io.indextables.tantivy4java.aggregation.TermsAggregation;
 import io.indextables.tantivy4java.core.DocAddress;
+import io.indextables.tantivy4java.core.Document;
 import io.indextables.tantivy4java.core.Schema;
 import io.indextables.tantivy4java.result.SearchResult;
 import io.indextables.tantivy4java.split.*;
@@ -15,7 +16,6 @@ import org.junit.jupiter.api.io.TempDir;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
-import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.util.*;
 
@@ -178,29 +178,26 @@ public class ParquetCompanionAllTypesTest {
             DocAddress addr = results.getHits().get(0).getDocAddress();
 
             // Retrieve doc with all fields (no projection = all fields)
-            String docJson = searcher.docProjected(addr);
-            assertNotNull(docJson);
+            Document doc = searcher.docProjected(addr);
+            assertNotNull(doc);
 
-            JsonNode doc = MAPPER.readTree(docJson);
-
-            // Parquet docProjected returns flat JSON: {"field": value}
             // Validate i64
-            assertTrue(doc.has("id"), "should have id (i64)");
-            assertEquals(0, doc.get("id").asLong());
+            assertNotNull(doc.getFirst("id"), "should have id (i64)");
+            assertEquals(0L, ((Number) doc.getFirst("id")).longValue());
 
             // Validate u64
-            assertTrue(doc.has("uint_val"), "should have uint_val (u64)");
-            assertEquals(1_000_000_000L, doc.get("uint_val").asLong());
+            assertNotNull(doc.getFirst("uint_val"), "should have uint_val (u64)");
+            assertEquals(1_000_000_000L, ((Number) doc.getFirst("uint_val")).longValue());
 
             // Validate text
-            assertTrue(doc.has("text_val"), "should have text_val");
-            assertEquals("text_0", doc.get("text_val").asText());
+            assertNotNull(doc.getFirst("text_val"), "should have text_val");
+            assertEquals("text_0", (String) doc.getFirst("text_val"));
 
             // Validate bool (row 0 → true)
-            assertTrue(doc.has("bool_val"), "should have bool_val");
+            assertNotNull(doc.getFirst("bool_val"), "should have bool_val");
 
             // Validate ip
-            assertTrue(doc.has("ip_val"), "should have ip_val");
+            assertNotNull(doc.getFirst("ip_val"), "should have ip_val");
         }
     }
 
@@ -227,24 +224,19 @@ public class ParquetCompanionAllTypesTest {
             }
 
             // Batch retrieval with ALL fields projected
-            byte[] batchBytes = searcher.docBatchProjected(addrs,
+            List<Document> docs = searcher.docBatchProjected(addrs,
                     "id", "uint_val", "float_val", "bool_val", "text_val",
                     "binary_val", "ts_val", "date_val", "ip_val",
                     "tags", "address", "props");
-            assertNotNull(batchBytes, "batch result should not be null");
-
-            String batchJson = new String(batchBytes, StandardCharsets.UTF_8);
-            JsonNode arr = MAPPER.readTree(batchJson);
-            assertTrue(arr.isArray(), "batch result should be JSON array");
-            assertEquals(5, arr.size(), "should have 5 documents");
+            assertEquals(5, docs.size(), "should have 5 documents");
 
             // Verify each doc has all projected fields (that have non-null values)
-            for (int i = 0; i < arr.size(); i++) {
-                JsonNode doc = arr.get(i);
-                assertTrue(doc.has("id"), "doc " + i + " should have id (i64)");
-                assertTrue(doc.has("uint_val"), "doc " + i + " should have uint_val (u64)");
-                assertTrue(doc.has("text_val"), "doc " + i + " should have text_val");
-                assertTrue(doc.has("ip_val"), "doc " + i + " should have ip_val");
+            for (int i = 0; i < docs.size(); i++) {
+                Document doc = docs.get(i);
+                assertNotNull(doc.getFirst("id"), "doc " + i + " should have id (i64)");
+                assertNotNull(doc.getFirst("uint_val"), "doc " + i + " should have uint_val (u64)");
+                assertNotNull(doc.getFirst("text_val"), "doc " + i + " should have text_val");
+                assertNotNull(doc.getFirst("ip_val"), "doc " + i + " should have ip_val");
                 // Note: nullable fields may be absent if null in the source
             }
         }
@@ -272,19 +264,16 @@ public class ParquetCompanionAllTypesTest {
             }
 
             // Only project id and ip_val
-            byte[] batchBytes = searcher.docBatchProjected(addrs, "id", "ip_val");
-            assertNotNull(batchBytes);
+            List<Document> docs = searcher.docBatchProjected(addrs, "id", "ip_val");
+            assertEquals(3, docs.size());
 
-            JsonNode arr = MAPPER.readTree(new String(batchBytes, StandardCharsets.UTF_8));
-            assertEquals(3, arr.size());
-
-            for (int i = 0; i < arr.size(); i++) {
-                JsonNode doc = arr.get(i);
-                assertTrue(doc.has("id"), "should have projected field id");
-                assertTrue(doc.has("ip_val"), "should have projected field ip_val");
+            for (int i = 0; i < docs.size(); i++) {
+                Document doc = docs.get(i);
+                assertNotNull(doc.getFirst("id"), "should have projected field id");
+                assertNotNull(doc.getFirst("ip_val"), "should have projected field ip_val");
                 // Non-projected fields should be absent
-                assertFalse(doc.has("text_val"), "non-projected field should be absent");
-                assertFalse(doc.has("uint_val"), "non-projected field should be absent");
+                assertNull(doc.getFirst("text_val"), "non-projected field should be absent");
+                assertNull(doc.getFirst("uint_val"), "non-projected field should be absent");
             }
         }
     }
@@ -480,22 +469,19 @@ public class ParquetCompanionAllTypesTest {
             }
 
             // Batch retrieval including complex/JSON fields
-            byte[] batchBytes = searcher.docBatchProjected(addrs,
+            List<Document> docs = searcher.docBatchProjected(addrs,
                     "id", "tags", "address", "props");
-            assertNotNull(batchBytes);
-
-            JsonNode arr = MAPPER.readTree(new String(batchBytes, StandardCharsets.UTF_8));
-            assertEquals(addrs.length, arr.size());
+            assertEquals(addrs.length, docs.size());
 
             // At least some docs should have JSON complex type data
             boolean foundTags = false;
             boolean foundAddress = false;
             boolean foundProps = false;
-            for (int i = 0; i < arr.size(); i++) {
-                JsonNode doc = arr.get(i);
-                if (doc.has("tags")) foundTags = true;
-                if (doc.has("address")) foundAddress = true;
-                if (doc.has("props")) foundProps = true;
+            for (int i = 0; i < docs.size(); i++) {
+                Document doc = docs.get(i);
+                if (doc.getFirst("tags") != null) foundTags = true;
+                if (doc.getFirst("address") != null) foundAddress = true;
+                if (doc.getFirst("props") != null) foundProps = true;
             }
             // tags, address, props are JSON fields — they're stored in tantivy for JSON types
             // At least tags and address should be present for most rows
@@ -525,15 +511,12 @@ public class ParquetCompanionAllTypesTest {
             }
 
             // Batch retrieval with binary field
-            byte[] batchBytes = searcher.docBatchProjected(addrs, "id", "binary_val");
-            assertNotNull(batchBytes);
+            List<Document> docs = searcher.docBatchProjected(addrs, "id", "binary_val");
+            assertEquals(addrs.length, docs.size());
 
-            JsonNode arr = MAPPER.readTree(new String(batchBytes, StandardCharsets.UTF_8));
-            assertEquals(addrs.length, arr.size());
-
-            for (int i = 0; i < arr.size(); i++) {
-                JsonNode doc = arr.get(i);
-                assertTrue(doc.has("id"));
+            for (int i = 0; i < docs.size(); i++) {
+                Document doc = docs.get(i);
+                assertNotNull(doc.getFirst("id"));
                 // binary_val may be null for some rows (null every 4th)
             }
         }
@@ -559,15 +542,12 @@ public class ParquetCompanionAllTypesTest {
                 addrs[i] = results.getHits().get(i).getDocAddress();
             }
 
-            byte[] batchBytes = searcher.docBatchProjected(addrs, "id", "ts_val", "date_val");
-            assertNotNull(batchBytes);
+            List<Document> docs = searcher.docBatchProjected(addrs, "id", "ts_val", "date_val");
+            assertEquals(addrs.length, docs.size());
 
-            JsonNode arr = MAPPER.readTree(new String(batchBytes, StandardCharsets.UTF_8));
-            assertEquals(addrs.length, arr.size());
-
-            for (int i = 0; i < arr.size(); i++) {
-                JsonNode doc = arr.get(i);
-                assertTrue(doc.has("id"));
+            for (int i = 0; i < docs.size(); i++) {
+                Document doc = docs.get(i);
+                assertNotNull(doc.getFirst("id"));
                 // ts_val and date_val are nullable — verify they can be present
             }
         }
@@ -753,17 +733,14 @@ public class ParquetCompanionAllTypesTest {
                 addrs[i] = results.getHits().get(i).getDocAddress();
             }
 
-            byte[] batchBytes = searcher.docBatchProjected(addrs, "id", "uint_val");
-            assertNotNull(batchBytes);
+            List<Document> docs = searcher.docBatchProjected(addrs, "id", "uint_val");
+            assertEquals(addrs.length, docs.size());
 
-            JsonNode arr = MAPPER.readTree(new String(batchBytes, StandardCharsets.UTF_8));
-            assertEquals(addrs.length, arr.size());
-
-            for (int i = 0; i < arr.size(); i++) {
-                JsonNode doc = arr.get(i);
-                assertTrue(doc.has("uint_val"), "should have u64 field");
-                // u64 values start at 1_000_000_000 (flat JSON format)
-                long val = doc.get("uint_val").asLong();
+            for (int i = 0; i < docs.size(); i++) {
+                Document doc = docs.get(i);
+                assertNotNull(doc.getFirst("uint_val"), "should have u64 field");
+                // u64 values start at 1_000_000_000 (TANT binary format)
+                long val = ((Number) doc.getFirst("uint_val")).longValue();
                 assertTrue(val >= 1_000_000_000L, "u64 value should be >= 1B, got " + val);
             }
         }

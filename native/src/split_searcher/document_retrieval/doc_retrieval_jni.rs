@@ -994,7 +994,7 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_nati
         .map(|(&seg, &doc)| (seg, doc))
         .collect();
 
-    // Batch retrieve from parquet
+    // Batch retrieve from parquet, serializing directly to TANT binary format
     let result = with_arc_safe(searcher_ptr, |ctx: &Arc<CachedSearcherContext>| {
         let manifest = ctx.parquet_manifest.as_ref().unwrap();
         // Use parquet_storage (rooted at table_root) for parquet file access.
@@ -1016,7 +1016,7 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_nati
 
         tokio::task::block_in_place(|| {
             runtime.block_on(async {
-                crate::parquet_companion::doc_retrieval::batch_retrieve_from_parquet(
+                crate::parquet_companion::arrow_to_tant::batch_parquet_to_tant_buffer(
                     &addresses,
                     projected_fields.as_deref(),
                     manifest,
@@ -1031,33 +1031,24 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_nati
     });
 
     match result {
-        Some(Ok(documents)) => {
-            // Serialize as JSON array for efficient JNI crossing
-            match serde_json::to_vec(&documents) {
-                Ok(json_bytes) => {
-                    debug_println!(
-                        "📖 PARQUET_BATCH: Retrieved {} docs, serialized to {} bytes",
-                        documents.len(), json_bytes.len()
-                    );
-                    match env.new_byte_array(json_bytes.len() as i32) {
-                        Ok(byte_array) => {
-                            let byte_slice: &[i8] = unsafe {
-                                std::slice::from_raw_parts(json_bytes.as_ptr() as *const i8, json_bytes.len())
-                            };
-                            if let Err(e) = env.set_byte_array_region(&byte_array, 0, byte_slice) {
-                                to_java_exception(&mut env, &anyhow::anyhow!("Failed to set byte array data: {}", e));
-                                return std::ptr::null_mut();
-                            }
-                            byte_array.into_raw()
-                        }
-                        Err(e) => {
-                            to_java_exception(&mut env, &anyhow::anyhow!("Failed to create byte array: {}", e));
-                            std::ptr::null_mut()
-                        }
+        Some(Ok(tant_bytes)) => {
+            debug_println!(
+                "📖 PARQUET_BATCH: Retrieved docs, serialized to {} TANT bytes",
+                tant_bytes.len()
+            );
+            match env.new_byte_array(tant_bytes.len() as i32) {
+                Ok(byte_array) => {
+                    let byte_slice: &[i8] = unsafe {
+                        std::slice::from_raw_parts(tant_bytes.as_ptr() as *const i8, tant_bytes.len())
+                    };
+                    if let Err(e) = env.set_byte_array_region(&byte_array, 0, byte_slice) {
+                        to_java_exception(&mut env, &anyhow::anyhow!("Failed to set byte array data: {}", e));
+                        return std::ptr::null_mut();
                     }
+                    byte_array.into_raw()
                 }
                 Err(e) => {
-                    to_java_exception(&mut env, &anyhow::anyhow!("Failed to serialize parquet documents: {}", e));
+                    to_java_exception(&mut env, &anyhow::anyhow!("Failed to create byte array: {}", e));
                     std::ptr::null_mut()
                 }
             }
