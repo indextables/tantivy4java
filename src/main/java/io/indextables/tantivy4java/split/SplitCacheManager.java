@@ -398,6 +398,10 @@ public class SplitCacheManager implements AutoCloseable {
                 keyBuilder.append("}");
             }
             
+            // Note: parquetTableRoot and parquetStorageConfig are intentionally excluded
+            // from the cache key. They are per-split parameters passed to createSplitSearcher()
+            // and do not affect the identity of the shared cache manager instance.
+
             // Add GCP config to key (sorted for consistency)
             if (!gcpConfig.isEmpty()) {
                 keyBuilder.append(",gcp={");
@@ -886,15 +890,36 @@ public class SplitCacheManager implements AutoCloseable {
      * @param metadata Split metadata with footer offsets
      * @param parquetTableRoot Base path for resolving parquet file locations (overrides CacheConfig setting)
      */
+    /**
+     * Create a SplitSearcher with per-split parquet table root and storage config overrides.
+     * This overload is used when different splits reference parquet files at different locations
+     * or need different storage credentials (e.g., cross-account S3 access).
+     *
+     * <p>Per-split arguments take precedence over CacheConfig-level defaults. Pass {@code null}
+     * for either parameter to fall back to the CacheConfig-level setting.
+     *
+     * @param splitPath Path or URI of the split file
+     * @param metadata Split metadata with footer offsets
+     * @param parquetTableRoot Base path for resolving parquet file locations (overrides CacheConfig setting), or null
+     * @param parquetStorageConfig Storage credentials for parquet file access (overrides CacheConfig setting), or null
+     */
+    public SplitSearcher createSplitSearcher(
+            String splitPath,
+            QuickwitSplit.SplitMetadata metadata,
+            String parquetTableRoot,
+            ParquetCompanionConfig.ParquetStorageConfig parquetStorageConfig) {
+        return createSplitSearcherInternal(splitPath, metadata, parquetTableRoot, parquetStorageConfig);
+    }
+
     public SplitSearcher createSplitSearcher(String splitPath, QuickwitSplit.SplitMetadata metadata, String parquetTableRoot) {
-        return createSplitSearcherInternal(splitPath, metadata, parquetTableRoot);
+        return createSplitSearcherInternal(splitPath, metadata, parquetTableRoot, null);
     }
 
     public SplitSearcher createSplitSearcher(String splitPath, QuickwitSplit.SplitMetadata metadata) {
-        return createSplitSearcherInternal(splitPath, metadata, null);
+        return createSplitSearcherInternal(splitPath, metadata, null, null);
     }
 
-    private SplitSearcher createSplitSearcherInternal(String splitPath, QuickwitSplit.SplitMetadata metadata, String perSplitParquetTableRoot) {
+    private SplitSearcher createSplitSearcherInternal(String splitPath, QuickwitSplit.SplitMetadata metadata, String perSplitParquetTableRoot, ParquetCompanionConfig.ParquetStorageConfig perSplitParquetStorageConfig) {
         if (metadata == null) {
             throw new IllegalArgumentException(
                 "Split metadata is required for SplitSearcher creation. " +
@@ -929,12 +954,15 @@ public class SplitCacheManager implements AutoCloseable {
         if (effectiveTableRoot != null && !effectiveTableRoot.isEmpty()) {
             splitConfig.put("parquet_table_root", effectiveTableRoot);
         }
-        if (this.parquetStorageConfig != null) {
-            if (!this.parquetStorageConfig.getAwsConfig().isEmpty()) {
-                splitConfig.put("parquet_aws_config", this.parquetStorageConfig.getAwsConfig());
+        // Per-split parquet storage config takes precedence over cache-manager-level default
+        ParquetCompanionConfig.ParquetStorageConfig effectiveParquetStorage =
+                (perSplitParquetStorageConfig != null) ? perSplitParquetStorageConfig : this.parquetStorageConfig;
+        if (effectiveParquetStorage != null) {
+            if (!effectiveParquetStorage.getAwsConfig().isEmpty()) {
+                splitConfig.put("parquet_aws_config", effectiveParquetStorage.getAwsConfig());
             }
-            if (!this.parquetStorageConfig.getAzureConfig().isEmpty()) {
-                splitConfig.put("parquet_azure_config", this.parquetStorageConfig.getAzureConfig());
+            if (!effectiveParquetStorage.getAzureConfig().isEmpty()) {
+                splitConfig.put("parquet_azure_config", effectiveParquetStorage.getAzureConfig());
             }
         }
 

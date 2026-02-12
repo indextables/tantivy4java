@@ -619,6 +619,8 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_crea
                                         Some(storage)
                                     }
                                     Err(e) => {
+                                        eprintln!("WARNING: PARQUET_COMPANION: Failed to create parquet storage for '{}': {}. \
+                                                   Doc retrieval/prewarm will fail for this split.", table_uri, e);
                                         debug_println!("⚠️ PARQUET_COMPANION: Failed to create parquet storage for '{}': {}", table_uri, e);
                                         None
                                     }

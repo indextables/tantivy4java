@@ -840,11 +840,18 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_nati
         // an explicit error instead of silently falling back to the wrong storage.
         let storage = match ctx.parquet_storage.as_ref() {
             Some(s) => s.clone(),
-            None => return Err(anyhow::anyhow!(
-                "Parquet companion split requires parquet_table_root to be set. \
-                 Pass the table root path as the 3rd argument to createSplitSearcher() \
-                 or configure it via CacheConfig.withParquetTableRoot()."
-            )),
+            None => {
+                let reason = if ctx.parquet_table_root.is_none() {
+                    "parquet_table_root was not set. Pass the table root path to createSplitSearcher() \
+                     or configure it via CacheConfig.withParquetTableRoot()."
+                } else {
+                    "parquet storage creation failed (likely bad credentials or unreachable endpoint). \
+                     Enable TANTIVY4JAVA_DEBUG=1 and check stderr for the storage creation error."
+                };
+                return Err(anyhow::anyhow!(
+                    "Parquet companion doc retrieval failed: {}", reason
+                ));
+            }
         };
         let metadata_cache = &ctx.parquet_metadata_cache;
         let byte_cache = &ctx.parquet_byte_range_cache;
@@ -1002,11 +1009,18 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_nati
         // an explicit error instead of silently falling back to the wrong storage.
         let storage = match ctx.parquet_storage.as_ref() {
             Some(s) => s.clone(),
-            None => return Err(anyhow::anyhow!(
-                "Parquet companion split requires parquet_table_root to be set. \
-                 Pass the table root path as the 3rd argument to createSplitSearcher() \
-                 or configure it via CacheConfig.withParquetTableRoot()."
-            )),
+            None => {
+                let reason = if ctx.parquet_table_root.is_none() {
+                    "parquet_table_root was not set. Pass the table root path to createSplitSearcher() \
+                     or configure it via CacheConfig.withParquetTableRoot()."
+                } else {
+                    "parquet storage creation failed (likely bad credentials or unreachable endpoint). \
+                     Enable TANTIVY4JAVA_DEBUG=1 and check stderr for the storage creation error."
+                };
+                return Err(anyhow::anyhow!(
+                    "Parquet companion batch retrieval failed: {}", reason
+                ));
+            }
         };
         let metadata_cache = &ctx.parquet_metadata_cache;
         let byte_cache = &ctx.parquet_byte_range_cache;

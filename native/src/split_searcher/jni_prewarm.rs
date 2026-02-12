@@ -428,7 +428,18 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_nati
 
         let storage = match &context.parquet_storage {
             Some(s) => s.clone(),
-            None => return Err(anyhow::anyhow!("No parquet storage configured")),
+            None => {
+                let reason = if context.parquet_table_root.is_none() {
+                    "parquet_table_root was not set. Pass the table root path to createSplitSearcher() \
+                     or configure it via CacheConfig.withParquetTableRoot()."
+                } else {
+                    "parquet storage creation failed (likely bad credentials or unreachable endpoint). \
+                     Enable TANTIVY4JAVA_DEBUG=1 and check stderr for the storage creation error."
+                };
+                return Err(anyhow::anyhow!(
+                    "Parquet column prewarm failed: {}", reason
+                ));
+            }
         };
 
         // Determine which columns to prewarm
