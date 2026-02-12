@@ -3,6 +3,16 @@
 
 use tantivy::schema::{OwnedValue, Schema, TantivyDocument};
 use std::collections::BTreeMap;
+use std::net::Ipv6Addr;
+
+/// Convert an IPv6 address to its canonical display form.
+/// IPv4-mapped IPv6 addresses (::ffff:x.x.x.x) are displayed as plain IPv4.
+fn canonical_ip_string(ip: &Ipv6Addr) -> String {
+    match ip.to_ipv4_mapped() {
+        Some(v4) => v4.to_string(),
+        None => ip.to_string(),
+    }
+}
 
 /// Magic number for batch protocol validation (same as Java: "TANT")
 const MAGIC_NUMBER: u32 = 0x54414E54;
@@ -209,8 +219,8 @@ fn serialize_field_value(buffer: &mut Vec<u8>, value: &OwnedValue) -> Result<(),
             buffer.extend_from_slice(bytes);
         }
         OwnedValue::IpAddr(ip) => {
-            // Serialize IP address as string
-            let ip_str = ip.to_string();
+            // Serialize IP address as canonical string (IPv4-mapped → plain IPv4)
+            let ip_str = canonical_ip_string(ip);
             let bytes = ip_str.as_bytes();
             buffer.extend_from_slice(&(bytes.len() as u32).to_ne_bytes());
             buffer.extend_from_slice(bytes);
@@ -289,7 +299,7 @@ fn owned_value_to_json(value: &OwnedValue) -> serde_json::Value {
             let values: Vec<serde_json::Value> = arr.iter().map(owned_value_to_json).collect();
             serde_json::Value::Array(values)
         }
-        OwnedValue::IpAddr(ip) => serde_json::Value::String(ip.to_string()),
+        OwnedValue::IpAddr(ip) => serde_json::Value::String(canonical_ip_string(ip)),
         OwnedValue::Facet(facet) => serde_json::Value::String(facet.to_path_string()),
         OwnedValue::PreTokStr(pts) => serde_json::Value::String(pts.text.clone()),
         OwnedValue::Null => serde_json::Value::Null,
