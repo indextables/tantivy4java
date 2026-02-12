@@ -396,7 +396,7 @@ pub async fn batch_retrieve_from_parquet(
 /// Build column projection indices from field names.
 ///
 /// Resolves tantivy field names to parquet column indices via the column_mapping.
-fn build_column_projection(
+pub(crate) fn build_column_projection(
     projected_fields: Option<&[String]>,
     parquet_schema: &arrow_schema::SchemaRef,
     column_mapping: &[super::manifest::ColumnMapping],
@@ -427,7 +427,7 @@ fn build_column_projection(
 /// This is the key optimization for batch retrieval: by knowing which row groups contain
 /// our target rows, we can skip reading entire row groups (potentially millions of rows
 /// and many column pages) that don't contain any documents we need.
-fn compute_row_group_filter(
+pub(crate) fn compute_row_group_filter(
     sorted_row_indices: &[usize],
     metadata: &parquet::file::metadata::ParquetMetaData,
 ) -> Option<Vec<bool>> {
@@ -470,13 +470,13 @@ fn compute_row_group_filter(
 }
 
 /// Row range [start, end) for a row group within the file
-struct RowGroupBoundary {
-    start: usize,
-    end: usize,
+pub(crate) struct RowGroupBoundary {
+    pub(crate) start: usize,
+    pub(crate) end: usize,
 }
 
 /// Compute cumulative row boundaries for each row group.
-fn compute_row_group_boundaries(
+pub(crate) fn compute_row_group_boundaries(
     metadata: &parquet::file::metadata::ParquetMetaData,
 ) -> Vec<RowGroupBoundary> {
     let mut boundaries = Vec::with_capacity(metadata.num_row_groups());
@@ -501,7 +501,7 @@ fn compute_row_group_boundaries(
 /// The key insight: after `with_row_groups([1, 3])`, the parquet reader only sees
 /// the rows from row groups 1 and 3. So our RowSelection must address positions
 /// within that reduced row space, not the full file row space.
-fn build_row_selection_for_rows_in_selected_groups(
+pub(crate) fn build_row_selection_for_rows_in_selected_groups(
     sorted_file_rows: &[usize],
     metadata: &parquet::file::metadata::ParquetMetaData,
     rg_filter: Option<&[bool]>,
@@ -749,7 +749,7 @@ fn arrow_value_to_json(array: &ArrayRef, row_idx: usize) -> Result<serde_json::V
 }
 
 /// Convert a complex Arrow array value to JSON (for List/Map/Struct types)
-fn arrow_json_value(array: &ArrayRef, row_idx: usize) -> serde_json::Value {
+pub(crate) fn arrow_json_value(array: &ArrayRef, row_idx: usize) -> serde_json::Value {
     use arrow_array::*;
     use arrow_schema::DataType;
 
