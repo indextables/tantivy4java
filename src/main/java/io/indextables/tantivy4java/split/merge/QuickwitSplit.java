@@ -1379,6 +1379,12 @@ public class QuickwitSplit {
     public static native void nativeWriteTestParquetWithIps(String path, int numRows, long idOffset);
 
     /**
+     * Test helper: write a parquet file with JSON string columns (stored as UTF8).
+     * Schema: id (i64), name (utf8), payload (utf8 — JSON objects), metadata (utf8 — JSON objects)
+     */
+    public static native void nativeWriteTestParquetWithJsonStrings(String path, int numRows, long idOffset);
+
+    /**
      * Test helper: write a parquet file covering ALL data types.
      * Schema: id (i64), uint_val (u64), float_val (f64), bool_val (bool),
      *         text_val (utf8), binary_val (binary), ts_val (timestamp_us),

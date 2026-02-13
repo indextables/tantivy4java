@@ -150,6 +150,7 @@ pub async fn create_split_from_parquet(
         skip_fields: parquet_config.schema_config.skip_fields.clone(),
         tokenizer_overrides: parquet_config.schema_config.tokenizer_overrides.clone(),
         ip_address_fields: parquet_config.schema_config.ip_address_fields.clone(),
+        json_fields: parquet_config.schema_config.json_fields.clone(),
     };
 
     let tantivy_schema = derive_tantivy_schema_with_mapping(&arrow_schema, &config, Some(&name_mapping))?;
@@ -575,6 +576,8 @@ fn add_arrow_value_to_doc(
             let val = arr.value(row_idx);
             if config.ip_address_fields.contains(field_name) {
                 add_ip_addr_value(doc, field, val, field_name)?;
+            } else if config.json_fields.contains(field_name) {
+                add_json_string_value(doc, field, val, field_name)?;
             } else {
                 doc.add_text(field, val);
                 if let Some(acc) = accumulators.get_mut(field_name) {
@@ -587,6 +590,8 @@ fn add_arrow_value_to_doc(
             let val = arr.value(row_idx);
             if config.ip_address_fields.contains(field_name) {
                 add_ip_addr_value(doc, field, val, field_name)?;
+            } else if config.json_fields.contains(field_name) {
+                add_json_string_value(doc, field, val, field_name)?;
             } else {
                 doc.add_text(field, val);
                 if let Some(acc) = accumulators.get_mut(field_name) {
@@ -715,6 +720,39 @@ fn add_ip_addr_value(
     Ok(())
 }
 
+/// Parse a JSON string value and add it to a tantivy document as a JSON object field.
+fn add_json_string_value(
+    doc: &mut TantivyDocument,
+    field: Field,
+    json_str: &str,
+    field_name: &str,
+) -> Result<()> {
+    let parsed: serde_json::Value = serde_json::from_str(json_str)
+        .with_context(|| format!(
+            "Failed to parse JSON string for field '{}': '{}'",
+            field_name,
+            if json_str.len() > 100 { &json_str[..100] } else { json_str }
+        ))?;
+    match parsed {
+        serde_json::Value::Object(_) => {
+            let owned: tantivy::schema::OwnedValue = serde_json::from_str(json_str)?;
+            if let tantivy::schema::OwnedValue::Object(obj) = owned {
+                let json_map: std::collections::BTreeMap<String, tantivy::schema::OwnedValue> =
+                    obj.into_iter().collect();
+                doc.add_object(field, json_map);
+            }
+        }
+        _ => {
+            anyhow::bail!(
+                "JSON field '{}' contains non-object value. JSON fields must contain JSON objects, got: {}",
+                field_name,
+                if json_str.len() > 100 { &json_str[..100] } else { json_str }
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Convert a complex Arrow type (List, Map, Struct) at a given row to a JSON value.
 fn convert_complex_to_json(array: &ArrayRef, row_idx: usize) -> Result<serde_json::Value> {
     use arrow_array::*;
@@ -829,9 +867,11 @@ fn build_column_mapping(
             None
         };
 
-        // Override tantivy type for IP address fields (parquet stores as Utf8).
+        // Override tantivy type for IP address and JSON fields (parquet stores as Utf8).
         let tantivy_type_str = if config.ip_address_fields.contains(&tantivy_field_name) {
             "IpAddr".to_string()
+        } else if config.json_fields.contains(&tantivy_field_name) {
+            "Json".to_string()
         } else {
             arrow_type_to_tantivy_type(arrow_field.data_type()).to_string()
         };
@@ -1424,5 +1464,204 @@ mod tests {
             file_names.iter().any(|f| f.contains("_parquet_manifest")),
             "Split should contain parquet manifest"
         );
+    }
+
+    // ── JSON string field tests ─────────────────────────────────────────
+
+    /// Helper: create a parquet file with JSON string columns.
+    fn write_test_parquet_with_json_strings(path: &std::path::Path, num_rows: usize, id_offset: i64) {
+        use arrow_array::*;
+        use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+        use parquet::arrow::ArrowWriter;
+        use std::sync::Arc;
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+            Field::new("payload", DataType::Utf8, false),
+            Field::new("metadata", DataType::Utf8, false),
+        ]));
+
+        let ids: Vec<i64> = (0..num_rows).map(|i| id_offset + i as i64).collect();
+        let names: Vec<String> = (0..num_rows)
+            .map(|i| format!("item_{}", id_offset + i as i64))
+            .collect();
+        let payloads: Vec<String> = (0..num_rows)
+            .map(|i| {
+                let idx = id_offset + i as i64;
+                format!(
+                    r#"{{"user":"user_{}","score":{},"active":{}}}"#,
+                    idx,
+                    idx * 10,
+                    idx % 2 == 0,
+                )
+            })
+            .collect();
+        let metadatas: Vec<String> = (0..num_rows)
+            .map(|i| {
+                let idx = id_offset + i as i64;
+                format!(
+                    r#"{{"region":"us-east-{}","version":{}}}"#,
+                    idx % 3,
+                    idx,
+                )
+            })
+            .collect();
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(ids)),
+                Arc::new(StringArray::from(names.iter().map(|s| s.as_str()).collect::<Vec<_>>())),
+                Arc::new(StringArray::from(payloads.iter().map(|s| s.as_str()).collect::<Vec<_>>())),
+                Arc::new(StringArray::from(metadatas.iter().map(|s| s.as_str()).collect::<Vec<_>>())),
+            ],
+        ).unwrap();
+
+        let file = std::fs::File::create(path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+    }
+
+    #[test]
+    fn test_add_json_string_value_valid_object() {
+        use tantivy::schema::*;
+
+        let mut builder = SchemaBuilder::new();
+        let field = builder.add_json_field("payload", JsonObjectOptions::default().set_stored());
+        let schema = builder.build();
+
+        let mut doc = TantivyDocument::new();
+        add_json_string_value(
+            &mut doc,
+            field,
+            r#"{"user":"alice","score":42}"#,
+            "payload",
+        ).expect("Valid JSON object should succeed");
+
+        // Verify the document has the JSON field
+        let json_val = doc.get_first(field);
+        assert!(json_val.is_some(), "Document should have the JSON field");
+    }
+
+    #[test]
+    fn test_add_json_string_value_invalid_json_fails() {
+        use tantivy::schema::*;
+
+        let mut builder = SchemaBuilder::new();
+        let field = builder.add_json_field("payload", JsonObjectOptions::default().set_stored());
+        let _schema = builder.build();
+
+        let mut doc = TantivyDocument::new();
+        let result = add_json_string_value(
+            &mut doc,
+            field,
+            "not valid json",
+            "payload",
+        );
+        assert!(result.is_err(), "Invalid JSON should fail");
+        assert!(result.unwrap_err().to_string().contains("Failed to parse JSON"));
+    }
+
+    #[test]
+    fn test_add_json_string_value_non_object_fails() {
+        use tantivy::schema::*;
+
+        let mut builder = SchemaBuilder::new();
+        let field = builder.add_json_field("payload", JsonObjectOptions::default().set_stored());
+        let _schema = builder.build();
+
+        let mut doc = TantivyDocument::new();
+        // Array is not an object
+        let result = add_json_string_value(
+            &mut doc,
+            field,
+            r#"[1,2,3]"#,
+            "payload",
+        );
+        assert!(result.is_err(), "Non-object JSON should fail");
+        assert!(result.unwrap_err().to_string().contains("non-object"));
+
+        // String literal is not an object
+        let mut doc2 = TantivyDocument::new();
+        let result2 = add_json_string_value(
+            &mut doc2,
+            field,
+            r#""hello""#,
+            "payload",
+        );
+        assert!(result2.is_err(), "String literal JSON should fail");
+    }
+
+    #[tokio::test]
+    async fn test_create_split_with_json_string_fields() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let parquet_path = temp_dir.path().join("json_data.parquet");
+        let output_path = temp_dir.path().join("json.split");
+
+        write_test_parquet_with_json_strings(&parquet_path, 20, 0);
+
+        let mut json_fields = HashSet::new();
+        json_fields.insert("payload".to_string());
+        json_fields.insert("metadata".to_string());
+
+        let config = CreateFromParquetConfig {
+            table_root: temp_dir.path().to_string_lossy().to_string(),
+            schema_config: SchemaDerivationConfig {
+                json_fields,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let storage: std::sync::Arc<dyn quickwit_storage::Storage> =
+            std::sync::Arc::new(quickwit_storage::RamStorage::default());
+
+        let result = create_split_from_parquet(
+            &[parquet_path.to_string_lossy().to_string()],
+            output_path.to_str().unwrap(),
+            &config,
+            &storage,
+        ).await.expect("JSON string field split creation should succeed");
+
+        assert_eq!(result.metadata.num_docs, 20);
+        assert!(output_path.exists());
+
+        // Open the split and verify JSON fields are correct type
+        let (index, _bundle_dir) = crate::quickwit_split::split_utils::open_split_with_quickwit_native(
+            output_path.to_str().unwrap()
+        ).expect("Should open the created split");
+
+        let schema = index.schema();
+
+        // payload and metadata should be JsonObject fields
+        let payload_field = schema.get_field("payload").unwrap();
+        let payload_entry = schema.get_field_entry(payload_field);
+        assert!(
+            matches!(payload_entry.field_type(), tantivy::schema::FieldType::JsonObject(_)),
+            "payload should be JsonObject type in the split"
+        );
+
+        let meta_field = schema.get_field("metadata").unwrap();
+        let meta_entry = schema.get_field_entry(meta_field);
+        assert!(
+            matches!(meta_entry.field_type(), tantivy::schema::FieldType::JsonObject(_)),
+            "metadata should be JsonObject type in the split"
+        );
+
+        // name should still be a text field
+        let name_field = schema.get_field("name").unwrap();
+        let name_entry = schema.get_field_entry(name_field);
+        assert!(
+            matches!(name_entry.field_type(), tantivy::schema::FieldType::Str(_)),
+            "name should still be Str type"
+        );
+
+        // Verify searchable
+        let reader = index.reader().expect("Should create reader");
+        reader.reload().expect("Should reload");
+        let searcher = reader.searcher();
+        assert_eq!(searcher.num_docs(), 20);
     }
 }

@@ -108,6 +108,7 @@ public class ParquetCompanionConfig {
     private String[] skipFields;
     private Map<String, String> tokenizerOverrides;
     private String[] ipAddressFields;
+    private String[] jsonFields;
     private String indexUid = "parquet-index";
     private String sourceId = "parquet-source";
     private String nodeId = "parquet-node";
@@ -191,6 +192,18 @@ public class ParquetCompanionConfig {
         return this;
     }
 
+    /**
+     * Declare fields that should be treated as JSON object type.
+     * Parquet has no native JSON type, so JSON data is stored as UTF8 strings.
+     * This tells the indexing pipeline to parse these string columns as JSON objects
+     * and create tantivy json_object fields, enabling nested path queries
+     * (e.g. "payload.user:alice").
+     */
+    public ParquetCompanionConfig withJsonFields(String... fields) {
+        this.jsonFields = fields;
+        return this;
+    }
+
     /** Set the index UID for split metadata. */
     public ParquetCompanionConfig withIndexUid(String uid) {
         this.indexUid = uid;
@@ -250,6 +263,7 @@ public class ParquetCompanionConfig {
     public String[] getSkipFields() { return skipFields; }
     public Map<String, String> getTokenizerOverrides() { return tokenizerOverrides; }
     public String[] getIpAddressFields() { return ipAddressFields; }
+    public String[] getJsonFields() { return jsonFields; }
     public String getIndexUid() { return indexUid; }
     public String getSourceId() { return sourceId; }
     public String getNodeId() { return nodeId; }
@@ -329,6 +343,15 @@ public class ParquetCompanionConfig {
             for (int i = 0; i < ipAddressFields.length; i++) {
                 if (i > 0) sb.append(",");
                 sb.append(jsonString(ipAddressFields[i]));
+            }
+            sb.append("]");
+        }
+
+        if (jsonFields != null && jsonFields.length > 0) {
+            sb.append(",\"json_fields\":[");
+            for (int i = 0; i < jsonFields.length; i++) {
+                if (i > 0) sb.append(",");
+                sb.append(jsonString(jsonFields[i]));
             }
             sb.append("]");
         }
