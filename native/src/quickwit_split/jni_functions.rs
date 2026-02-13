@@ -507,6 +507,11 @@ fn parse_create_from_parquet_config(json_str: &str) -> anyhow::Result<CreateFrom
         .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
         .unwrap_or_default();
 
+    let json_fields: HashSet<String> = parsed.get("json_fields")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+
     let writer_heap_size = parsed.get("writer_heap_size")
         .and_then(|v| v.as_u64())
         .map(|v| v as usize)
@@ -525,6 +530,7 @@ fn parse_create_from_parquet_config(json_str: &str) -> anyhow::Result<CreateFrom
             skip_fields,
             tokenizer_overrides,
             ip_address_fields,
+            json_fields,
         },
         statistics_fields,
         statistics_truncate_length,
@@ -850,6 +856,81 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_merge_QuickwitSpli
                 Arc::new(StringArray::from(dst_ips.iter().map(|s| s.as_str()).collect::<Vec<_>>())),
                 Arc::new(Int64Array::from(ports)),
                 Arc::new(StringArray::from(labels.iter().map(|s| s.as_str()).collect::<Vec<_>>())),
+            ],
+        ).map_err(|e| anyhow!("Failed to create RecordBatch: {}", e))?;
+
+        let file = std::fs::File::create(&path_str)
+            .map_err(|e| anyhow!("Failed to create file '{}': {}", path_str, e))?;
+        let mut writer = ArrowWriter::try_new(file, schema, None)
+            .map_err(|e| anyhow!("Failed to create ArrowWriter: {}", e))?;
+        writer.write(&batch).map_err(|e| anyhow!("Failed to write batch: {}", e))?;
+        writer.close().map_err(|e| anyhow!("Failed to close writer: {}", e))?;
+
+        Ok(())
+    });
+}
+
+/// JNI helper for tests: create a parquet file with JSON string columns (stored as UTF8).
+/// Schema: id (i64), name (utf8), payload (utf8 — JSON objects), metadata (utf8 — JSON objects)
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_split_merge_QuickwitSplit_nativeWriteTestParquetWithJsonStrings(
+    mut env: JNIEnv,
+    _class: JClass,
+    path: JString,
+    num_rows: jni::sys::jint,
+    id_offset: jni::sys::jlong,
+) {
+    let _ = convert_throwable(&mut env, |env| {
+        let path_str = jstring_to_string(env, &path)?;
+
+        use arrow_array::*;
+        use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+        use parquet::arrow::ArrowWriter;
+        use std::sync::Arc;
+
+        let num = num_rows as usize;
+        let offset = id_offset;
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+            Field::new("payload", DataType::Utf8, false),
+            Field::new("metadata", DataType::Utf8, false),
+        ]));
+
+        let ids: Vec<i64> = (0..num).map(|i| offset + i as i64).collect();
+        let names: Vec<String> = (0..num)
+            .map(|i| format!("item_{}", offset + i as i64))
+            .collect();
+        let payloads: Vec<String> = (0..num)
+            .map(|i| {
+                let idx = offset + i as i64;
+                format!(
+                    r#"{{"user":"user_{}","score":{},"active":{},"tags":["tag_a","tag_b"]}}"#,
+                    idx,
+                    idx * 10,
+                    idx % 2 == 0,
+                )
+            })
+            .collect();
+        let metadatas: Vec<String> = (0..num)
+            .map(|i| {
+                let idx = offset + i as i64;
+                format!(
+                    r#"{{"region":"us-east-{}","version":{}}}"#,
+                    idx % 3,
+                    idx,
+                )
+            })
+            .collect();
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(ids)),
+                Arc::new(StringArray::from(names.iter().map(|s| s.as_str()).collect::<Vec<_>>())),
+                Arc::new(StringArray::from(payloads.iter().map(|s| s.as_str()).collect::<Vec<_>>())),
+                Arc::new(StringArray::from(metadatas.iter().map(|s| s.as_str()).collect::<Vec<_>>())),
             ],
         ).map_err(|e| anyhow!("Failed to create RecordBatch: {}", e))?;
 

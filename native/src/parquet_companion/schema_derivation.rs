@@ -22,6 +22,8 @@ pub struct SchemaDerivationConfig {
     pub tokenizer_overrides: std::collections::HashMap<String, String>,
     /// Fields that should be treated as IP address type (parquet stores as UTF8 strings)
     pub ip_address_fields: HashSet<String>,
+    /// Fields that should be treated as JSON object type (parquet stores as UTF8 strings)
+    pub json_fields: HashSet<String>,
 }
 
 impl Default for SchemaDerivationConfig {
@@ -31,6 +33,7 @@ impl Default for SchemaDerivationConfig {
             skip_fields: HashSet::new(),
             tokenizer_overrides: std::collections::HashMap::new(),
             ip_address_fields: HashSet::new(),
+            json_fields: HashSet::new(),
         }
     }
 }
@@ -107,6 +110,33 @@ fn add_field_for_arrow_type(
             _ => {
                 debug_println!(
                     "⚠️ SCHEMA_DERIVE: Field '{}' declared as IP but has type {:?} (not Utf8), ignoring IP override",
+                    name, data_type
+                );
+            }
+        }
+    }
+
+    // Check if this field should be treated as a JSON object type.
+    // Parquet has no native JSON type, so JSON is stored as UTF8 strings.
+    // The user declares which fields are JSON via config.
+    if config.json_fields.contains(name) {
+        match data_type {
+            DataType::Utf8 | DataType::LargeUtf8 => {
+                // STRING column forced to JSON: stored + indexed with "default" tokenizer
+                let opts = JsonObjectOptions::default()
+                    .set_stored()
+                    .set_indexing_options(
+                        TextFieldIndexing::default()
+                            .set_tokenizer("default")
+                            .set_index_option(IndexRecordOption::Basic),
+                    );
+                builder.add_json_field(name, opts);
+                return Ok(());
+            }
+            _ => {
+                // Non-string field declared as json → warn, fall through to normal handling
+                debug_println!(
+                    "⚠️ SCHEMA_DERIVE: Field '{}' declared as JSON but has type {:?} (not Utf8), ignoring JSON override",
                     name, data_type
                 );
             }
@@ -831,6 +861,150 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(std::str::from_utf8(&result).unwrap()).unwrap();
         // json_object type should remain unchanged
         assert_eq!(parsed["schema"][0]["options"]["fast"], false);
+    }
+
+    // ── JSON fields tests ───────────────────────────────────────────────
+
+    #[test]
+    fn test_json_fields_utf8_creates_json_field() {
+        let arrow = ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("payload", DataType::Utf8, true),
+            Field::new("label", DataType::Utf8, true),
+        ]);
+        let mut config = SchemaDerivationConfig::default();
+        config.json_fields.insert("payload".to_string());
+
+        let schema = derive_tantivy_schema(&arrow, &config).unwrap();
+
+        // payload should be a JsonObject field
+        let payload_field = schema.get_field("payload").unwrap();
+        let payload_entry = schema.get_field_entry(payload_field);
+        assert!(
+            matches!(payload_entry.field_type(), tantivy::schema::FieldType::JsonObject(_)),
+            "payload should be JsonObject type, got {:?}", payload_entry.field_type()
+        );
+
+        // label should still be a text field
+        let label_field = schema.get_field("label").unwrap();
+        let label_entry = schema.get_field_entry(label_field);
+        assert!(
+            matches!(label_entry.field_type(), tantivy::schema::FieldType::Str(_)),
+            "label should still be Str type"
+        );
+    }
+
+    #[test]
+    fn test_json_fields_large_utf8_creates_json_field() {
+        let arrow = ArrowSchema::new(vec![
+            Field::new("metadata", DataType::LargeUtf8, true),
+        ]);
+        let mut config = SchemaDerivationConfig::default();
+        config.json_fields.insert("metadata".to_string());
+
+        let schema = derive_tantivy_schema(&arrow, &config).unwrap();
+
+        let meta_field = schema.get_field("metadata").unwrap();
+        let meta_entry = schema.get_field_entry(meta_field);
+        assert!(
+            matches!(meta_entry.field_type(), tantivy::schema::FieldType::JsonObject(_)),
+            "LargeUtf8 JSON field should be JsonObject type, got {:?}", meta_entry.field_type()
+        );
+    }
+
+    #[test]
+    fn test_json_fields_non_utf8_ignored() {
+        // JSON override on a non-Utf8 field should be ignored (falls through to normal handling)
+        let arrow = ArrowSchema::new(vec![
+            Field::new("count", DataType::Int64, false),
+        ]);
+        let mut config = SchemaDerivationConfig::default();
+        config.json_fields.insert("count".to_string());
+
+        let schema = derive_tantivy_schema(&arrow, &config).unwrap();
+
+        let count_field = schema.get_field("count").unwrap();
+        let count_entry = schema.get_field_entry(count_field);
+        assert!(
+            matches!(count_entry.field_type(), tantivy::schema::FieldType::I64(_)),
+            "Non-Utf8 JSON override should be ignored, got {:?}", count_entry.field_type()
+        );
+    }
+
+    #[test]
+    fn test_json_fields_coexists_with_ip_fields() {
+        let arrow = ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("src_ip", DataType::Utf8, true),
+            Field::new("payload", DataType::Utf8, true),
+            Field::new("label", DataType::Utf8, true),
+        ]);
+        let mut config = SchemaDerivationConfig::default();
+        config.ip_address_fields.insert("src_ip".to_string());
+        config.json_fields.insert("payload".to_string());
+
+        let schema = derive_tantivy_schema(&arrow, &config).unwrap();
+
+        // src_ip → IpAddr
+        let src_ip_field = schema.get_field("src_ip").unwrap();
+        let src_ip_entry = schema.get_field_entry(src_ip_field);
+        assert!(
+            matches!(src_ip_entry.field_type(), tantivy::schema::FieldType::IpAddr(_)),
+            "src_ip should be IpAddr type"
+        );
+
+        // payload → JsonObject
+        let payload_field = schema.get_field("payload").unwrap();
+        let payload_entry = schema.get_field_entry(payload_field);
+        assert!(
+            matches!(payload_entry.field_type(), tantivy::schema::FieldType::JsonObject(_)),
+            "payload should be JsonObject type"
+        );
+
+        // label → Str (default text)
+        let label_field = schema.get_field("label").unwrap();
+        let label_entry = schema.get_field_entry(label_field);
+        assert!(
+            matches!(label_entry.field_type(), tantivy::schema::FieldType::Str(_)),
+            "label should still be Str type"
+        );
+    }
+
+    #[test]
+    fn test_json_fields_not_fast() {
+        // JSON fields should never be fast (same as complex types like List/Map/Struct)
+        let arrow = ArrowSchema::new(vec![
+            Field::new("payload", DataType::Utf8, true),
+        ]);
+        let mut config = SchemaDerivationConfig::default();
+        config.fast_field_mode = FastFieldMode::Disabled; // All native fast
+        config.json_fields.insert("payload".to_string());
+
+        let schema = derive_tantivy_schema(&arrow, &config).unwrap();
+
+        let payload_field = schema.get_field("payload").unwrap();
+        let payload_entry = schema.get_field_entry(payload_field);
+        assert!(!payload_entry.is_fast(), "JSON fields should not be fast");
+    }
+
+    #[test]
+    fn test_json_fields_stored_and_indexed() {
+        let arrow = ArrowSchema::new(vec![
+            Field::new("payload", DataType::Utf8, true),
+        ]);
+        let mut config = SchemaDerivationConfig::default();
+        config.json_fields.insert("payload".to_string());
+
+        let schema = derive_tantivy_schema(&arrow, &config).unwrap();
+
+        let payload_field = schema.get_field("payload").unwrap();
+        let payload_entry = schema.get_field_entry(payload_field);
+
+        // Should be stored
+        assert!(payload_entry.is_stored(), "JSON field should be stored");
+
+        // Should be indexed (JsonObject with indexing options)
+        assert!(payload_entry.is_indexed(), "JSON field should be indexed");
     }
 }
 
