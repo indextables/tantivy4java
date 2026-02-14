@@ -147,6 +147,20 @@
             <scope>test</scope>
         </dependency>
         
+        <!-- Apache Iceberg Java SDK for creating test tables in REST catalog -->
+        <dependency>
+            <groupId>org.apache.iceberg</groupId>
+            <artifactId>iceberg-core</artifactId>
+            <version>1.7.1</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.iceberg</groupId>
+            <artifactId>iceberg-api</artifactId>
+            <version>1.7.1</version>
+            <scope>test</scope>
+        </dependency>
+
         <!-- Adobe S3Mock for S3 testing -->
         <dependency>
             <groupId>io.findify</groupId>
