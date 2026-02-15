@@ -1,5 +1,9 @@
 package io.indextables.tantivy4java.delta;
 
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
+
+import java.util.Collections;
 import java.util.Map;
 
 /**
@@ -18,10 +22,15 @@ import java.util.Map;
  */
 public class DeltaSchemaField {
 
+    private static final ObjectMapper MAPPER = new ObjectMapper();
+    private static final String PHYSICAL_NAME_KEY = "delta.columnMapping.physicalName";
+    private static final String COLUMN_MAPPING_ID_KEY = "delta.columnMapping.id";
+
     private final String name;
     private final String dataType;
     private final boolean nullable;
     private final String metadata;
+    private volatile Map<String, String> parsedMetadata;
 
     DeltaSchemaField(String name, String dataType, boolean nullable, String metadata) {
         this.name = name;
@@ -63,6 +72,67 @@ public class DeltaSchemaField {
      */
     public boolean isPrimitive() {
         return !dataType.startsWith("{");
+    }
+
+    /**
+     * Get the physical column name used in parquet files when Delta column mapping is enabled.
+     *
+     * <p>When {@code delta.columnMapping.mode} is set to {@code "name"} or {@code "id"},
+     * parquet files use physical column names (e.g. "col-abc123") that differ from the
+     * logical column names in the Delta schema. This method extracts the physical name
+     * from the field's metadata.
+     *
+     * @return the physical column name, or the logical name if column mapping is not configured
+     */
+    public String getPhysicalName() {
+        Map<String, String> meta = getMetadataMap();
+        String physicalName = meta.get(PHYSICAL_NAME_KEY);
+        return physicalName != null ? physicalName : name;
+    }
+
+    /**
+     * @return true if this field has Delta column mapping metadata
+     */
+    public boolean hasColumnMapping() {
+        Map<String, String> meta = getMetadataMap();
+        return meta.containsKey(PHYSICAL_NAME_KEY);
+    }
+
+    /**
+     * Get the Delta column mapping ID, if present.
+     *
+     * @return the column mapping ID, or -1 if not set
+     */
+    public int getColumnMappingId() {
+        Map<String, String> meta = getMetadataMap();
+        String idStr = meta.get(COLUMN_MAPPING_ID_KEY);
+        if (idStr != null) {
+            try {
+                return Integer.parseInt(idStr);
+            } catch (NumberFormatException e) {
+                return -1;
+            }
+        }
+        return -1;
+    }
+
+    /**
+     * Parse the metadata JSON string into a map, caching the result.
+     */
+    private Map<String, String> getMetadataMap() {
+        if (parsedMetadata == null) {
+            if (metadata == null || metadata.isEmpty() || "{}".equals(metadata)) {
+                parsedMetadata = Collections.emptyMap();
+            } else {
+                try {
+                    parsedMetadata = MAPPER.readValue(metadata,
+                            new TypeReference<Map<String, String>>() {});
+                } catch (Exception e) {
+                    parsedMetadata = Collections.emptyMap();
+                }
+            }
+        }
+        return parsedMetadata;
     }
 
     @Override

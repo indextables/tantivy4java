@@ -1,7 +1,9 @@
 package io.indextables.tantivy4java.delta;
 
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 /**
  * Immutable result class representing a Delta table's schema read from the transaction log.
@@ -58,6 +60,46 @@ public class DeltaTableSchema {
      */
     public int getFieldCount() {
         return fields.size();
+    }
+
+    /**
+     * Build a column name mapping from physical parquet names to logical Delta names.
+     *
+     * <p>When {@code delta.columnMapping.mode} is set to {@code "name"} or {@code "id"},
+     * parquet files use physical column names that differ from the logical Delta column names.
+     * This method returns a mapping from physical to logical names for all fields that have
+     * column mapping configured.
+     *
+     * <p>For fields without column mapping, the physical name equals the logical name
+     * (identity mapping).
+     *
+     * <h3>Usage Example</h3>
+     * <pre>{@code
+     * DeltaTableSchema schema = DeltaTableReader.readSchema(tableUrl, config);
+     * Map<String, String> mapping = schema.getColumnNameMapping();
+     * // Returns: {col-abc123=id, col-def456=name, col-ghi789=price}
+     * }</pre>
+     *
+     * @return map of physical parquet column name to logical Delta column name
+     */
+    public Map<String, String> getColumnNameMapping() {
+        Map<String, String> mapping = new HashMap<>(fields.size());
+        for (DeltaSchemaField field : fields) {
+            mapping.put(field.getPhysicalName(), field.getName());
+        }
+        return mapping;
+    }
+
+    /**
+     * @return true if any field in the schema has Delta column mapping configured
+     */
+    public boolean hasColumnMapping() {
+        for (DeltaSchemaField field : fields) {
+            if (field.hasColumnMapping()) {
+                return true;
+            }
+        }
+        return false;
     }
 
     @Override

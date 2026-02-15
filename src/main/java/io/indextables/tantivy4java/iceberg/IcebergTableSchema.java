@@ -1,7 +1,9 @@
 package io.indextables.tantivy4java.iceberg;
 
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 /**
  * Immutable result class representing an Iceberg table's schema.
@@ -58,6 +60,24 @@ public class IcebergTableSchema {
      */
     public int getFieldCount() {
         return fields.size();
+    }
+
+    /**
+     * Build a map from Iceberg field ID to logical column name.
+     *
+     * <p>This is useful for resolving physical parquet column names (e.g. "col_1")
+     * to their logical Iceberg names (e.g. "id") when the parquet file uses
+     * column name mapping (common in Databricks Unity Catalog).
+     *
+     * @return field ID to logical name map
+     * @see io.indextables.tantivy4java.parquet.ParquetSchemaReader#readColumnMapping
+     */
+    public Map<Integer, String> getFieldIdToNameMap() {
+        Map<Integer, String> map = new HashMap<>(fields.size());
+        for (IcebergSchemaField field : fields) {
+            map.put(field.getFieldId(), field.getName());
+        }
+        return map;
     }
 
     @Override

@@ -7,7 +7,9 @@ import org.junit.jupiter.api.*;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.file.Path;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -114,5 +116,86 @@ public class ParquetSchemaReaderTest {
         Path bogus = tempDir.resolve("does_not_exist.parquet");
         assertThrows(RuntimeException.class, () ->
             ParquetSchemaReader.readSchema(bogus.toString()));
+    }
+
+    // --- column name mapping tests ---
+
+    @Test
+    void testReadColumnMappingNullUrlThrows() {
+        Map<Integer, String> fieldIdToName = new HashMap<>();
+        fieldIdToName.put(1, "id");
+        assertThrows(IllegalArgumentException.class, () ->
+            ParquetSchemaReader.readColumnMapping(null, fieldIdToName));
+    }
+
+    @Test
+    void testReadColumnMappingNullFieldMapThrows() {
+        assertThrows(IllegalArgumentException.class, () ->
+            ParquetSchemaReader.readColumnMapping("/some/file.parquet", null));
+    }
+
+    @Test
+    void testReadColumnMappingResolvesPhysicalToLogicalNames() {
+        // Write a parquet file with physical names (col_1, col_2, col_3) and field IDs
+        Path parquetFile = tempDir.resolve("databricks_style.parquet");
+        ParquetSchemaReader.writeTestParquetWithFieldIds(parquetFile.toString());
+
+        // Simulate Iceberg schema field_id → logical_name mapping
+        Map<Integer, String> fieldIdToName = new HashMap<>();
+        fieldIdToName.put(1, "id");
+        fieldIdToName.put(2, "name");
+        fieldIdToName.put(3, "price");
+
+        Map<String, String> mapping = ParquetSchemaReader.readColumnMapping(
+                parquetFile.toString(), fieldIdToName);
+
+        assertNotNull(mapping);
+        assertEquals(3, mapping.size());
+        assertEquals("id", mapping.get("col_1"), "col_1 should map to 'id'");
+        assertEquals("name", mapping.get("col_2"), "col_2 should map to 'name'");
+        assertEquals("price", mapping.get("col_3"), "col_3 should map to 'price'");
+    }
+
+    @Test
+    void testReadColumnMappingIdentityWhenNoFieldIds() {
+        // Write a standard parquet file (no field IDs)
+        Path parquetFile = tempDir.resolve("standard.parquet");
+        ParquetSchemaReader.writeTestParquet(parquetFile.toString());
+
+        // Even with a field_id map, should fall back to identity since no field IDs in file
+        Map<Integer, String> fieldIdToName = new HashMap<>();
+        fieldIdToName.put(1, "identifier");
+        fieldIdToName.put(2, "full_name");
+
+        Map<String, String> mapping = ParquetSchemaReader.readColumnMapping(
+                parquetFile.toString(), fieldIdToName);
+
+        assertNotNull(mapping);
+        assertEquals(5, mapping.size());
+        // All should be identity mappings
+        assertEquals("id", mapping.get("id"));
+        assertEquals("name", mapping.get("name"));
+        assertEquals("score", mapping.get("score"));
+        assertEquals("active", mapping.get("active"));
+        assertEquals("created", mapping.get("created"));
+    }
+
+    @Test
+    void testReadColumnMappingWithEmptyFieldMap() {
+        // Write a parquet file with field IDs
+        Path parquetFile = tempDir.resolve("field_ids_empty_map.parquet");
+        ParquetSchemaReader.writeTestParquetWithFieldIds(parquetFile.toString());
+
+        // Empty field_id map — all should be identity
+        Map<Integer, String> fieldIdToName = new HashMap<>();
+
+        Map<String, String> mapping = ParquetSchemaReader.readColumnMapping(
+                parquetFile.toString(), fieldIdToName);
+
+        assertNotNull(mapping);
+        assertEquals(3, mapping.size());
+        assertEquals("col_1", mapping.get("col_1"));
+        assertEquals("col_2", mapping.get("col_2"));
+        assertEquals("col_3", mapping.get("col_3"));
     }
 }

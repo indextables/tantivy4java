@@ -17,6 +17,151 @@ use crate::delta_reader::engine::{DeltaStorageConfig, create_object_store};
 use crate::delta_reader::scan::DeltaSchemaField;
 use crate::delta_reader::serialization::serialize_delta_schema;
 
+/// Read column name mapping from a parquet file using Iceberg field IDs.
+///
+/// Databricks (and other engines) may use physical column names in parquet files
+/// (e.g. "col_1", "col_2") that differ from the logical Iceberg column names
+/// (e.g. "id", "name"). This function reads the parquet file's metadata, extracts
+/// field IDs, and matches them against the provided Iceberg field-ID-to-name map
+/// to produce a physical-name → logical-name mapping.
+///
+/// Resolution order:
+/// 1. Arrow field metadata `PARQUET:field_id` (set by Arrow parquet writers)
+/// 2. Parquet schema descriptor field IDs (set by all Iceberg-aware writers)
+/// 3. `iceberg.schema` KV metadata in the parquet footer (embedded by Iceberg writers)
+/// 4. Identity mapping (physical = logical) as fallback
+///
+/// Returns a `HashMap<String, String>` where keys are physical parquet column names
+/// and values are logical Iceberg column names.
+pub fn read_column_mapping(
+    parquet_url: &str,
+    field_id_to_name: &std::collections::HashMap<i32, String>,
+    config: &DeltaStorageConfig,
+) -> Result<std::collections::HashMap<String, String>> {
+    debug_println!("🔧 PARQUET_COLUMN_MAPPING: Reading mapping for url={}", parquet_url);
+
+    let (url, object_path) = parse_file_url(parquet_url)?;
+    let store = create_object_store(&url, config)?;
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| anyhow::anyhow!("Failed to create tokio runtime: {}", e))?;
+
+    rt.block_on(async {
+        // HEAD to get file size (required for Azure compatibility)
+        let meta = store.head(&object_path).await
+            .map_err(|e| anyhow::anyhow!("Failed to get metadata for '{}': {}", parquet_url, e))?;
+
+        let reader = ParquetObjectReader::new(Arc::clone(&store), object_path.clone())
+            .with_file_size(meta.size as u64);
+
+        let builder = parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder::new(reader).await
+            .map_err(|e| anyhow::anyhow!("Failed to read parquet metadata from '{}': {}", parquet_url, e))?;
+
+        let arrow_schema = builder.schema();
+        let parquet_metadata = builder.metadata();
+        let mut mapping = std::collections::HashMap::new();
+        let mut resolved_count = 0;
+
+        // Strategy 1: Arrow field metadata (PARQUET:field_id)
+        for field in arrow_schema.fields() {
+            let physical_name = field.name().clone();
+            if let Some(field_id_str) = field.metadata().get("PARQUET:field_id") {
+                if let Ok(field_id) = field_id_str.parse::<i32>() {
+                    if let Some(logical_name) = field_id_to_name.get(&field_id) {
+                        debug_println!(
+                            "🔧 PARQUET_COLUMN_MAPPING: Arrow metadata: {} (field_id={}) → {}",
+                            physical_name, field_id, logical_name
+                        );
+                        mapping.insert(physical_name, logical_name.clone());
+                        resolved_count += 1;
+                        continue;
+                    }
+                }
+            }
+            // Not resolved via Arrow metadata — will try other strategies below
+            mapping.insert(physical_name.clone(), physical_name);
+        }
+
+        // Strategy 2: Parquet schema descriptor field IDs (if Arrow metadata didn't resolve all)
+        if resolved_count < arrow_schema.fields().len() {
+            let schema_descr = parquet_metadata.file_metadata().schema_descr();
+            let root = schema_descr.root_schema();
+            for field_type in root.get_fields() {
+                let info = field_type.get_basic_info();
+                let physical_name = info.name().to_string();
+                if info.has_id() {
+                    let field_id = info.id();
+                    if let Some(logical_name) = field_id_to_name.get(&field_id) {
+                        // Only update if still identity-mapped (not already resolved)
+                        if mapping.get(&physical_name) == Some(&physical_name) {
+                            debug_println!(
+                                "🔧 PARQUET_COLUMN_MAPPING: Parquet schema: {} (field_id={}) → {}",
+                                physical_name, field_id, logical_name
+                            );
+                            mapping.insert(physical_name, logical_name.clone());
+                            resolved_count += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Strategy 3: iceberg.schema KV metadata in parquet footer
+        if resolved_count < arrow_schema.fields().len() {
+            if let Some(kv_meta) = parquet_metadata.file_metadata().key_value_metadata() {
+                if let Some(iceberg_schema_kv) = kv_meta.iter().find(|kv| kv.key == "iceberg.schema") {
+                    if let Some(ref json_str) = iceberg_schema_kv.value {
+                        if let Ok(schema_val) = serde_json::from_str::<serde_json::Value>(json_str) {
+                            if let Some(fields) = schema_val.get("fields").and_then(|f| f.as_array()) {
+                                // Build field_id → name map from embedded Iceberg schema
+                                let mut embedded_id_to_name = std::collections::HashMap::new();
+                                for field_val in fields {
+                                    if let (Some(id), Some(name)) = (
+                                        field_val.get("id").and_then(|v| v.as_i64()),
+                                        field_val.get("name").and_then(|v| v.as_str()),
+                                    ) {
+                                        embedded_id_to_name.insert(id as i32, name.to_string());
+                                    }
+                                }
+
+                                // Match parquet schema field IDs to embedded schema names
+                                let schema_descr = parquet_metadata.file_metadata().schema_descr();
+                                let root = schema_descr.root_schema();
+                                for field_type in root.get_fields() {
+                                    let info = field_type.get_basic_info();
+                                    let physical_name = info.name().to_string();
+                                    if info.has_id() {
+                                        let field_id = info.id();
+                                        if let Some(logical_name) = embedded_id_to_name.get(&field_id) {
+                                            if mapping.get(&physical_name) == Some(&physical_name) {
+                                                debug_println!(
+                                                    "🔧 PARQUET_COLUMN_MAPPING: Embedded schema: {} (field_id={}) → {}",
+                                                    physical_name, field_id, logical_name
+                                                );
+                                                mapping.insert(physical_name, logical_name.clone());
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        debug_println!(
+            "🔧 PARQUET_COLUMN_MAPPING: Resolved {} of {} columns",
+            mapping.iter().filter(|(k, v)| k != v).count(),
+            mapping.len()
+        );
+
+        Ok(mapping)
+    })
+}
+
 /// Read the Arrow schema from a single parquet file.
 ///
 /// Returns `(fields, schema_json)` where:
@@ -324,6 +469,55 @@ pub extern "system" fn Java_io_indextables_tantivy4java_parquet_ParquetSchemaRea
     }
 }
 
+/// Write a test parquet file with physical column names and Iceberg field IDs.
+///
+/// Schema: col_1 (Int64, field_id=1), col_2 (Utf8, field_id=2), col_3 (Float64, field_id=3)
+///
+/// Simulates a Databricks-style parquet file where physical names differ from logical names.
+/// Used by Java integration tests for column mapping verification.
+fn write_test_parquet_with_field_ids(path: &str) -> Result<()> {
+    use arrow_schema::{Field, Schema};
+    use arrow_array::{Int64Array, StringArray, Float64Array, RecordBatch};
+    use parquet::arrow::ArrowWriter;
+    use std::collections::HashMap;
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("col_1", DataType::Int64, false)
+            .with_metadata(HashMap::from([
+                ("PARQUET:field_id".to_string(), "1".to_string()),
+            ])),
+        Field::new("col_2", DataType::Utf8, true)
+            .with_metadata(HashMap::from([
+                ("PARQUET:field_id".to_string(), "2".to_string()),
+            ])),
+        Field::new("col_3", DataType::Float64, true)
+            .with_metadata(HashMap::from([
+                ("PARQUET:field_id".to_string(), "3".to_string()),
+            ])),
+    ]));
+
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2, 3])),
+            Arc::new(StringArray::from(vec![Some("alice"), Some("bob"), None])),
+            Arc::new(Float64Array::from(vec![Some(99.9), Some(88.8), Some(77.7)])),
+        ],
+    )
+    .map_err(|e| anyhow::anyhow!("Failed to create RecordBatch: {}", e))?;
+
+    let file = std::fs::File::create(path)
+        .map_err(|e| anyhow::anyhow!("Failed to create file '{}': {}", path, e))?;
+    let mut writer = ArrowWriter::try_new(file, Arc::clone(&schema), None)
+        .map_err(|e| anyhow::anyhow!("Failed to create ArrowWriter: {}", e))?;
+    writer.write(&batch)
+        .map_err(|e| anyhow::anyhow!("Failed to write batch: {}", e))?;
+    writer.close()
+        .map_err(|e| anyhow::anyhow!("Failed to close writer: {}", e))?;
+
+    Ok(())
+}
+
 /// Write a small test parquet file with a known multi-type schema.
 ///
 /// Schema: id (Int64, not null), name (Utf8, nullable), score (Float64, nullable),
@@ -391,6 +585,135 @@ pub extern "system" fn Java_io_indextables_tantivy4java_parquet_ParquetSchemaRea
 
     if let Err(e) = write_test_parquet(&path_str) {
         to_java_exception(&mut env, &e);
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_parquet_ParquetSchemaReader_nativeWriteTestParquetWithFieldIds(
+    mut env: JNIEnv,
+    _class: JClass,
+    path: JString,
+) {
+    let path_str = match env.get_string(&path) {
+        Ok(s) => s.to_string_lossy().to_string(),
+        Err(e) => {
+            to_java_exception(&mut env, &anyhow::anyhow!("Failed to read path: {}", e));
+            return;
+        }
+    };
+
+    if let Err(e) = write_test_parquet_with_field_ids(&path_str) {
+        to_java_exception(&mut env, &e);
+    }
+}
+
+/// JNI: Read column name mapping from a parquet file using Iceberg field IDs.
+///
+/// Parameters:
+///   parquet_url: path to the parquet file (local, file://, s3://, azure://)
+///   field_id_to_name_json: JSON string mapping field_id (int) → logical_name (string)
+///                          e.g. {"1":"id","2":"name","3":"price"}
+///   config_map: storage credentials (same as readParquetSchema)
+///
+/// Returns: JSON string mapping physical_name → logical_name
+///          e.g. {"col_1":"id","col_2":"name","col_3":"price"}
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_parquet_ParquetSchemaReader_nativeReadColumnMapping(
+    mut env: JNIEnv,
+    _class: JClass,
+    parquet_url: JString,
+    field_id_to_name_json: JString,
+    config_map: JObject,
+) -> jbyteArray {
+    use jni::objects::JByteArray;
+
+    debug_println!("🔧 PARQUET_COLUMN_MAPPING_JNI: nativeReadColumnMapping called");
+
+    let url_str = match env.get_string(&parquet_url) {
+        Ok(s) => s.to_string_lossy().to_string(),
+        Err(e) => {
+            to_java_exception(&mut env, &anyhow::anyhow!("Failed to read parquet URL: {}", e));
+            return std::ptr::null_mut();
+        }
+    };
+
+    let mapping_json_str = match env.get_string(&field_id_to_name_json) {
+        Ok(s) => s.to_string_lossy().to_string(),
+        Err(e) => {
+            to_java_exception(&mut env, &anyhow::anyhow!("Failed to read field mapping JSON: {}", e));
+            return std::ptr::null_mut();
+        }
+    };
+
+    // Parse the field_id → name JSON into a HashMap<i32, String>
+    let field_id_to_name: std::collections::HashMap<i32, String> = match serde_json::from_str::<
+        std::collections::HashMap<String, String>,
+    >(&mapping_json_str)
+    {
+        Ok(str_map) => {
+            let mut int_map = std::collections::HashMap::new();
+            for (k, v) in str_map {
+                if let Ok(id) = k.parse::<i32>() {
+                    int_map.insert(id, v);
+                }
+            }
+            int_map
+        }
+        Err(e) => {
+            to_java_exception(
+                &mut env,
+                &anyhow::anyhow!("Failed to parse field mapping JSON: {}", e),
+            );
+            return std::ptr::null_mut();
+        }
+    };
+
+    let config = build_config(&mut env, &config_map);
+
+    debug_println!(
+        "🔧 PARQUET_COLUMN_MAPPING_JNI: url={}, field_count={}",
+        url_str, field_id_to_name.len()
+    );
+
+    match read_column_mapping(&url_str, &field_id_to_name, &config) {
+        Ok(mapping) => {
+            // Serialize mapping as JSON string → return as byte array (UTF-8 bytes)
+            let result_json = serde_json::to_string(&mapping)
+                .unwrap_or_else(|_| "{}".to_string());
+
+            debug_println!(
+                "🔧 PARQUET_COLUMN_MAPPING_JNI: Result: {}",
+                result_json
+            );
+
+            let result_bytes = result_json.as_bytes();
+            match env.new_byte_array(result_bytes.len() as i32) {
+                Ok(byte_array) => {
+                    let byte_slice: &[i8] = unsafe {
+                        std::slice::from_raw_parts(result_bytes.as_ptr() as *const i8, result_bytes.len())
+                    };
+                    if let Err(e) = env.set_byte_array_region(&byte_array, 0, byte_slice) {
+                        to_java_exception(
+                            &mut env,
+                            &anyhow::anyhow!("Failed to copy byte array: {}", e),
+                        );
+                        return std::ptr::null_mut();
+                    }
+                    byte_array.into_raw()
+                }
+                Err(e) => {
+                    to_java_exception(
+                        &mut env,
+                        &anyhow::anyhow!("Failed to allocate byte array: {}", e),
+                    );
+                    std::ptr::null_mut()
+                }
+            }
+        }
+        Err(e) => {
+            to_java_exception(&mut env, &e);
+            std::ptr::null_mut()
+        }
     }
 }
 
@@ -696,5 +1019,171 @@ mod tests {
         assert_eq!(fields.len(), 1);
         assert_eq!(fields[0].name, "val");
         assert_eq!(fields[0].data_type, "int32");
+    }
+
+    #[test]
+    fn test_read_column_mapping_with_field_ids() {
+        use arrow_array::{RecordBatch, Int64Array, StringArray, Float64Array};
+        use arrow_schema::{Schema, Field};
+        use std::collections::HashMap;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let parquet_path = tmp.path().join("test_column_mapping.parquet");
+
+        // Create a parquet file with physical names (col_1, col_2, col_3)
+        // but with PARQUET:field_id metadata mapping to Iceberg field IDs
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("col_1", DataType::Int64, false)
+                .with_metadata(HashMap::from([
+                    ("PARQUET:field_id".to_string(), "1".to_string()),
+                ])),
+            Field::new("col_2", DataType::Utf8, true)
+                .with_metadata(HashMap::from([
+                    ("PARQUET:field_id".to_string(), "2".to_string()),
+                ])),
+            Field::new("col_3", DataType::Float64, true)
+                .with_metadata(HashMap::from([
+                    ("PARQUET:field_id".to_string(), "3".to_string()),
+                ])),
+        ]));
+
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2])),
+                Arc::new(StringArray::from(vec![Some("alice"), Some("bob")])),
+                Arc::new(Float64Array::from(vec![Some(99.9), Some(88.8)])),
+            ],
+        )
+        .unwrap();
+
+        let file = std::fs::File::create(&parquet_path).unwrap();
+        let mut writer = parquet::arrow::ArrowWriter::try_new(file, Arc::clone(&schema), None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        // Build the Iceberg field_id → logical_name map
+        let mut field_id_to_name = HashMap::new();
+        field_id_to_name.insert(1, "id".to_string());
+        field_id_to_name.insert(2, "name".to_string());
+        field_id_to_name.insert(3, "price".to_string());
+
+        let config = DeltaStorageConfig::default();
+        let mapping = read_column_mapping(
+            parquet_path.to_str().unwrap(),
+            &field_id_to_name,
+            &config,
+        )
+        .unwrap();
+
+        // Verify physical → logical mapping
+        assert_eq!(mapping.len(), 3);
+        assert_eq!(mapping.get("col_1").unwrap(), "id");
+        assert_eq!(mapping.get("col_2").unwrap(), "name");
+        assert_eq!(mapping.get("col_3").unwrap(), "price");
+    }
+
+    #[test]
+    fn test_read_column_mapping_identity_when_no_field_ids() {
+        use arrow_array::{RecordBatch, Int64Array, StringArray};
+        use arrow_schema::{Schema, Field};
+        use std::collections::HashMap;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let parquet_path = tmp.path().join("test_identity_mapping.parquet");
+
+        // Create a parquet file WITHOUT field_id metadata
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1])),
+                Arc::new(StringArray::from(vec![Some("alice")])),
+            ],
+        )
+        .unwrap();
+
+        let file = std::fs::File::create(&parquet_path).unwrap();
+        let mut writer = parquet::arrow::ArrowWriter::try_new(file, Arc::clone(&schema), None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        // Even with an Iceberg mapping, should fall back to identity since no field IDs
+        let mut field_id_to_name = HashMap::new();
+        field_id_to_name.insert(1, "identifier".to_string());
+        field_id_to_name.insert(2, "full_name".to_string());
+
+        let config = DeltaStorageConfig::default();
+        let mapping = read_column_mapping(
+            parquet_path.to_str().unwrap(),
+            &field_id_to_name,
+            &config,
+        )
+        .unwrap();
+
+        // Should be identity mapping since parquet has no field IDs
+        assert_eq!(mapping.len(), 2);
+        assert_eq!(mapping.get("id").unwrap(), "id");
+        assert_eq!(mapping.get("name").unwrap(), "name");
+    }
+
+    #[test]
+    fn test_read_column_mapping_partial_match() {
+        use arrow_array::{RecordBatch, Int64Array, StringArray, Float64Array};
+        use arrow_schema::{Schema, Field};
+        use std::collections::HashMap;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let parquet_path = tmp.path().join("test_partial_mapping.parquet");
+
+        // Only some fields have PARQUET:field_id
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("col_1", DataType::Int64, false)
+                .with_metadata(HashMap::from([
+                    ("PARQUET:field_id".to_string(), "1".to_string()),
+                ])),
+            Field::new("untagged_col", DataType::Utf8, true), // no field_id
+            Field::new("col_3", DataType::Float64, true)
+                .with_metadata(HashMap::from([
+                    ("PARQUET:field_id".to_string(), "3".to_string()),
+                ])),
+        ]));
+
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1])),
+                Arc::new(StringArray::from(vec![Some("val")])),
+                Arc::new(Float64Array::from(vec![Some(1.0)])),
+            ],
+        )
+        .unwrap();
+
+        let file = std::fs::File::create(&parquet_path).unwrap();
+        let mut writer = parquet::arrow::ArrowWriter::try_new(file, Arc::clone(&schema), None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        let mut field_id_to_name = HashMap::new();
+        field_id_to_name.insert(1, "id".to_string());
+        field_id_to_name.insert(2, "name".to_string()); // won't match — no field with id=2
+        field_id_to_name.insert(3, "price".to_string());
+
+        let config = DeltaStorageConfig::default();
+        let mapping = read_column_mapping(
+            parquet_path.to_str().unwrap(),
+            &field_id_to_name,
+            &config,
+        )
+        .unwrap();
+
+        assert_eq!(mapping.len(), 3);
+        assert_eq!(mapping.get("col_1").unwrap(), "id");
+        assert_eq!(mapping.get("untagged_col").unwrap(), "untagged_col"); // identity
+        assert_eq!(mapping.get("col_3").unwrap(), "price");
     }
 }

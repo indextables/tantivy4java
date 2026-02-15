@@ -1,5 +1,10 @@
 package io.indextables.tantivy4java.split;
 
+import io.indextables.tantivy4java.delta.DeltaTableSchema;
+import io.indextables.tantivy4java.iceberg.IcebergTableSchema;
+import io.indextables.tantivy4java.parquet.ParquetSchemaReader;
+
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
 
@@ -165,6 +170,102 @@ public class ParquetCompanionConfig {
     /** Enable auto-detection of Iceberg field ID mapping from parquet metadata. */
     public ParquetCompanionConfig withAutoDetectNameMapping(boolean autoDetect) {
         this.autoDetectNameMapping = autoDetect;
+        return this;
+    }
+
+    /**
+     * Apply column name mapping from a Delta table schema.
+     *
+     * <p>When {@code delta.columnMapping.mode} is {@code "name"} or {@code "id"},
+     * parquet files use physical column names (e.g. "col-abc123") that differ from
+     * the logical Delta column names (e.g. "id", "name"). This method extracts
+     * the physical-to-logical mapping from the Delta schema metadata and applies it
+     * to this config, so the indexing and reading pipelines use the correct names.
+     *
+     * <p>If the Delta schema has no column mapping configured (all fields use
+     * identity mapping), this method still sets the mapping — identity mappings
+     * are harmless and ensure consistent behavior.
+     *
+     * <h3>Usage Example</h3>
+     * <pre>{@code
+     * DeltaTableSchema deltaSchema = DeltaTableReader.readSchema(deltaTableUrl, config);
+     * ParquetCompanionConfig companionConfig = new ParquetCompanionConfig(tableRoot)
+     *     .withDeltaColumnMapping(deltaSchema)
+     *     .withFastFieldMode(FastFieldMode.HYBRID);
+     * }</pre>
+     *
+     * @param deltaSchema the Delta table schema (from {@link io.indextables.tantivy4java.delta.DeltaTableReader#readSchema})
+     * @return this config for chaining
+     * @throws IllegalArgumentException if deltaSchema is null
+     */
+    public ParquetCompanionConfig withDeltaColumnMapping(DeltaTableSchema deltaSchema) {
+        if (deltaSchema == null) {
+            throw new IllegalArgumentException("deltaSchema must not be null");
+        }
+        this.fieldIdMapping = deltaSchema.getColumnNameMapping();
+        return this;
+    }
+
+    /**
+     * Apply column name mapping from an Iceberg table schema by reading field IDs
+     * from a sample parquet file.
+     *
+     * <p>Databricks Unity Catalog (and other engines using Iceberg column mapping)
+     * store data in parquet files using physical column names (e.g. "col_1", "col_2")
+     * that differ from the logical Iceberg column names (e.g. "id", "name").
+     * This method reads a sample parquet file's metadata, extracts field IDs, and
+     * maps physical parquet column names to logical Iceberg names.
+     *
+     * <h3>Usage Example</h3>
+     * <pre>{@code
+     * IcebergTableSchema icebergSchema = IcebergTableReader.readSchema(
+     *     catalog, namespace, table, catalogConfig);
+     * List<IcebergFileEntry> files = IcebergTableReader.listFiles(
+     *     catalog, namespace, table, catalogConfig);
+     * String sampleParquetUrl = files.get(0).getPath();
+     *
+     * ParquetCompanionConfig companionConfig = new ParquetCompanionConfig(tableRoot)
+     *     .withIcebergColumnMapping(sampleParquetUrl, icebergSchema)
+     *     .withFastFieldMode(FastFieldMode.HYBRID);
+     * }</pre>
+     *
+     * @param sampleParquetUrl URL of a parquet file from the table (local, file://, s3://, azure://)
+     * @param icebergSchema the Iceberg table schema (from {@link io.indextables.tantivy4java.iceberg.IcebergTableReader#readSchema})
+     * @return this config for chaining
+     * @throws IllegalArgumentException if sampleParquetUrl or icebergSchema is null
+     * @throws RuntimeException if the parquet file cannot be read
+     */
+    public ParquetCompanionConfig withIcebergColumnMapping(
+            String sampleParquetUrl, IcebergTableSchema icebergSchema) {
+        return withIcebergColumnMapping(sampleParquetUrl, icebergSchema, Collections.emptyMap());
+    }
+
+    /**
+     * Apply column name mapping from an Iceberg table schema by reading field IDs
+     * from a sample parquet file, with storage credentials.
+     *
+     * @param sampleParquetUrl URL of a parquet file from the table (local, file://, s3://, azure://)
+     * @param icebergSchema the Iceberg table schema
+     * @param storageConfig storage credentials for accessing the parquet file
+     * @return this config for chaining
+     * @throws IllegalArgumentException if sampleParquetUrl or icebergSchema is null
+     * @throws RuntimeException if the parquet file cannot be read
+     * @see #withIcebergColumnMapping(String, IcebergTableSchema)
+     */
+    public ParquetCompanionConfig withIcebergColumnMapping(
+            String sampleParquetUrl,
+            IcebergTableSchema icebergSchema,
+            Map<String, String> storageConfig) {
+        if (sampleParquetUrl == null || sampleParquetUrl.isEmpty()) {
+            throw new IllegalArgumentException("sampleParquetUrl must not be null or empty");
+        }
+        if (icebergSchema == null) {
+            throw new IllegalArgumentException("icebergSchema must not be null");
+        }
+        this.fieldIdMapping = ParquetSchemaReader.readColumnMapping(
+                sampleParquetUrl,
+                icebergSchema.getFieldIdToNameMap(),
+                storageConfig != null ? storageConfig : Collections.emptyMap());
         return this;
     }
 
