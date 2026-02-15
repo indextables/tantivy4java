@@ -26,7 +26,7 @@ public class DeltaTableSchema {
     private final String schemaJson;
     private final long tableVersion;
 
-    DeltaTableSchema(List<DeltaSchemaField> fields, String schemaJson, long tableVersion) {
+    public DeltaTableSchema(List<DeltaSchemaField> fields, String schemaJson, long tableVersion) {
         this.fields = Collections.unmodifiableList(fields);
         this.schemaJson = schemaJson;
         this.tableVersion = tableVersion;

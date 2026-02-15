@@ -75,7 +75,7 @@ public class DeltaSchemaField {
      * Construct a DeltaSchemaField from a parsed TANT byte buffer map.
      * Package-private; used by DeltaTableReader.
      */
-    static DeltaSchemaField fromMap(Map<String, Object> map) {
+    public static DeltaSchemaField fromMap(Map<String, Object> map) {
         String name = (String) map.get("name");
         String dataType = (String) map.get("data_type");
         boolean nullable = toBoolean(map.get("nullable"));

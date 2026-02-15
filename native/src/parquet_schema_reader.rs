@@ -38,10 +38,16 @@ pub fn read_parquet_schema(
         .map_err(|e| anyhow::anyhow!("Failed to create tokio runtime: {}", e))?;
 
     let (fields, schema_json) = rt.block_on(async {
-        // ParquetObjectReader takes store + path (not ObjectMeta)
-        let reader = ParquetObjectReader::new(Arc::clone(&store), object_path.clone());
+        // HEAD request to get file size — required for Azure which doesn't
+        // support suffix range requests. Providing file_size switches the
+        // parquet reader from suffix ranges to bounded ranges.
+        let meta = store.head(&object_path).await
+            .map_err(|e| anyhow::anyhow!("Failed to get metadata for '{}': {}", url_str, e))?;
 
-        // Read parquet metadata from footer
+        let reader = ParquetObjectReader::new(Arc::clone(&store), object_path.clone())
+            .with_file_size(meta.size as u64);
+
+        // Read parquet metadata from footer (uses bounded range requests)
         let builder = parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder::new(reader).await
             .map_err(|e| anyhow::anyhow!("Failed to read parquet metadata from '{}': {}", url_str, e))?;
 
