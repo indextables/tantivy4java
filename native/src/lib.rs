@@ -46,6 +46,8 @@ mod persistent_cache_storage;  // Tiered cache integration with memory + disk
 mod batch_retrieval;  // Batch document retrieval (optimized + simple implementations)
 pub mod parquet_companion;  // Parquet companion mode for minimal splits referencing external parquet files
 pub mod delta_reader;  // Delta Lake table file listing via delta-kernel-rs
+pub mod iceberg_reader;  // Iceberg table reading via apache/iceberg-rust
+pub mod parquet_schema_reader;  // Read schema from standalone parquet files
 
 pub use schema::*;
 pub use document::*;

@@ -36,18 +36,21 @@ pub struct DeltaStorageConfig {
     pub azure_bearer_token: Option<String>,
 }
 
-/// Create a DefaultEngine backed by the appropriate ObjectStore for the given URL.
-pub fn create_engine(table_url: &Url, config: &DeltaStorageConfig) -> Result<DeltaEngine> {
-    let scheme = table_url.scheme();
-    debug_println!("🔧 DELTA_ENGINE: Creating engine for scheme={}, url={}", scheme, table_url);
+/// Create an ObjectStore for the given URL and storage configuration.
+///
+/// Supports S3/S3a, Azure (az/abfs/abfss), and local file:// URLs.
+/// Used by both delta_reader and parquet_schema_reader.
+pub fn create_object_store(url: &Url, config: &DeltaStorageConfig) -> Result<Arc<dyn ObjectStore>> {
+    let scheme = url.scheme();
+    debug_println!("🔧 DELTA_ENGINE: Creating ObjectStore for scheme={}, url={}", scheme, url);
 
     let store: Arc<dyn ObjectStore> = match scheme {
         "s3" | "s3a" => {
             let mut builder = AmazonS3Builder::new()
                 .with_bucket_name(
-                    table_url
+                    url
                         .host_str()
-                        .ok_or_else(|| anyhow::anyhow!("S3 URL missing bucket: {}", table_url))?,
+                        .ok_or_else(|| anyhow::anyhow!("S3 URL missing bucket: {}", url))?,
                 );
 
             if let Some(ref key) = config.aws_access_key {
@@ -74,10 +77,10 @@ pub fn create_engine(table_url: &Url, config: &DeltaStorageConfig) -> Result<Del
         "az" | "azure" | "abfs" | "abfss" => {
             let mut builder = MicrosoftAzureBuilder::new()
                 .with_container_name(
-                    table_url
+                    url
                         .host_str()
                         .ok_or_else(|| {
-                            anyhow::anyhow!("Azure URL missing container: {}", table_url)
+                            anyhow::anyhow!("Azure URL missing container: {}", url)
                         })?,
                 );
 
@@ -97,10 +100,16 @@ pub fn create_engine(table_url: &Url, config: &DeltaStorageConfig) -> Result<Del
             Arc::new(LocalFileSystem::new())
         }
         other => {
-            return Err(anyhow::anyhow!("Unsupported URL scheme '{}' for Delta table: {}", other, table_url));
+            return Err(anyhow::anyhow!("Unsupported URL scheme '{}': {}", other, url));
         }
     };
 
+    Ok(store)
+}
+
+/// Create a DefaultEngine backed by the appropriate ObjectStore for the given URL.
+pub fn create_engine(table_url: &Url, config: &DeltaStorageConfig) -> Result<DeltaEngine> {
+    let store = create_object_store(table_url, config)?;
     debug_println!("🔧 DELTA_ENGINE: ObjectStore created, building DefaultEngine");
     let engine = DefaultEngine::new(store);
     Ok(engine)
