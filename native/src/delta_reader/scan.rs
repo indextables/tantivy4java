@@ -169,7 +169,7 @@ pub fn read_delta_schema(
 /// IMPORTANT: The URL must end with a trailing slash so that `Url::join()`
 /// appends child paths instead of replacing the last segment. Delta-kernel
 /// internally does `table_root.join("_delta_log/")` which requires this.
-fn normalize_url(url_str: &str) -> Result<Url> {
+pub(crate) fn normalize_url(url_str: &str) -> Result<Url> {
     if url_str.starts_with("s3://")
         || url_str.starts_with("s3a://")
         || url_str.starts_with("az://")

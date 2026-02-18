@@ -3,6 +3,7 @@ package io.indextables.tantivy4java.delta;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
+import java.io.Serializable;
 import java.util.Collections;
 import java.util.Map;
 
@@ -12,8 +13,12 @@ import java.util.Map;
  * <p>Instances are returned by {@link DeltaTableReader#listFiles(String)} and contain
  * metadata from the Delta transaction log including file path, size, record count,
  * partition values, and deletion vector status.
+ *
+ * <p>Implements {@link Serializable} for Spark broadcast/shuffle.
  */
-public class DeltaFileEntry {
+public class DeltaFileEntry implements Serializable {
+
+    private static final long serialVersionUID = 1L;
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
     private static final TypeReference<Map<String, String>> MAP_TYPE = new TypeReference<Map<String, String>>() {};
@@ -26,8 +31,8 @@ public class DeltaFileEntry {
     private final boolean hasDeletionVector;
     private final long tableVersion;
 
-    DeltaFileEntry(String path, long size, long modificationTime, long numRecords,
-                   Map<String, String> partitionValues, boolean hasDeletionVector, long tableVersion) {
+    public DeltaFileEntry(String path, long size, long modificationTime, long numRecords,
+                          Map<String, String> partitionValues, boolean hasDeletionVector, long tableVersion) {
         this.path = path;
         this.size = size;
         this.modificationTime = modificationTime;

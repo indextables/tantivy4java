@@ -9,8 +9,10 @@ pub mod catalog;
 pub mod scan;
 pub mod serialization;
 pub mod jni;
+pub mod distributed;
 
 pub use scan::{
     IcebergFileEntry, IcebergSchemaField, IcebergSnapshot,
     list_iceberg_files, read_iceberg_schema, list_iceberg_snapshots,
 };
+pub use distributed::{IcebergSnapshotInfo, ManifestFileInfo};
