@@ -54,7 +54,7 @@ pub fn create_schema_from_doc_mapping(doc_mapping_json: &str) -> anyhow::Result<
                     text_options = text_options.set_indexing_options(text_indexing);
                 }
                 if fast {
-                    text_options = text_options.set_fast(Some("default"));
+                    text_options = text_options.set_fast(Some(tokenizer));
                 }
                 schema_builder.add_text_field(&field_mapping.name, text_options);
             },

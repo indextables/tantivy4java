@@ -215,11 +215,20 @@ pub extern "system" fn Java_io_indextables_tantivy4java_core_Schema_nativeGetFie
         let array_list = env.new_object(&array_list_class, "()V", &[]).map_err(|e| e.to_string())?;
 
         // Map Java FieldType enum values to Tantivy FieldType
-        // Java enum values: TEXT(1), UNSIGNED(2), INTEGER(3), FLOAT(4), BOOLEAN(5), DATE(6), FACET(7), BYTES(8), JSON(9), IP_ADDR(10)
+        // Java enum values: TEXT(1), UNSIGNED(2), INTEGER(3), FLOAT(4), BOOLEAN(5), DATE(6), FACET(7), BYTES(8), JSON(9), IP_ADDR(10), STRING(11)
         for (field, field_entry) in schema.fields() {
             let tantivy_field_type = field_entry.field_type();
             let matches_type = match field_type {
-                1 => matches!(tantivy_field_type, TantivyFieldType::Str(_)), // TEXT
+                1 => { // TEXT - tokenized Str fields (excludes raw tokenizer)
+                    if let TantivyFieldType::Str(text_options) = tantivy_field_type {
+                        let tokenizer = text_options.get_indexing_options()
+                            .map(|opts| opts.tokenizer().to_string())
+                            .unwrap_or_else(|| "default".to_string());
+                        tokenizer != "raw"
+                    } else {
+                        false
+                    }
+                },
                 2 => matches!(tantivy_field_type, TantivyFieldType::U64(_)), // UNSIGNED
                 3 => matches!(tantivy_field_type, TantivyFieldType::I64(_)), // INTEGER
                 4 => matches!(tantivy_field_type, TantivyFieldType::F64(_)), // FLOAT
@@ -229,6 +238,16 @@ pub extern "system" fn Java_io_indextables_tantivy4java_core_Schema_nativeGetFie
                 8 => matches!(tantivy_field_type, TantivyFieldType::Bytes(_)), // BYTES
                 9 => matches!(tantivy_field_type, TantivyFieldType::JsonObject(_)), // JSON
                 10 => matches!(tantivy_field_type, TantivyFieldType::IpAddr(_)), // IP_ADDR
+                11 => { // STRING - raw tokenizer Str fields
+                    if let TantivyFieldType::Str(text_options) = tantivy_field_type {
+                        let tokenizer = text_options.get_indexing_options()
+                            .map(|opts| opts.tokenizer().to_string())
+                            .unwrap_or_else(|| "default".to_string());
+                        tokenizer == "raw"
+                    } else {
+                        false
+                    }
+                },
                 _ => false,
             };
 
@@ -392,7 +411,9 @@ pub extern "system" fn Java_io_indextables_tantivy4java_core_Schema_nativeGetFie
                     })
                     .unwrap_or("basic")
                     .to_string();
-                (1, text_options.is_stored(), indexing_options.is_some(), text_options.is_fast(), Some(tokenizer), Some(index_opt))
+                // Distinguish STRING (raw tokenizer) from TEXT (tokenized)
+                let java_type = if tokenizer == "raw" { 11 } else { 1 };
+                (java_type, text_options.is_stored(), indexing_options.is_some(), text_options.is_fast(), Some(tokenizer), Some(index_opt))
             },
             TantivyFieldType::U64(numeric_options) => (2, numeric_options.is_stored(), numeric_options.is_indexed(), numeric_options.is_fast(), None, None),
             TantivyFieldType::I64(numeric_options) => (3, numeric_options.is_stored(), numeric_options.is_indexed(), numeric_options.is_fast(), None, None),
@@ -418,6 +439,7 @@ pub extern "system" fn Java_io_indextables_tantivy4java_core_Schema_nativeGetFie
             8 => "BYTES",
             9 => "JSON",
             10 => "IP_ADDR",
+            11 => "STRING",
             _ => "TEXT",
         };
         let field_type_name_str = env.new_string(field_type_name).map_err(|e| e.to_string())?;
@@ -514,7 +536,9 @@ pub extern "system" fn Java_io_indextables_tantivy4java_core_Schema_nativeGetAll
                         })
                         .unwrap_or("basic")
                         .to_string();
-                    (1, text_options.is_stored(), indexing_options.is_some(), text_options.is_fast(), Some(tokenizer), Some(index_opt))
+                    // Distinguish STRING (raw tokenizer) from TEXT (tokenized)
+                    let java_type = if tokenizer == "raw" { 11 } else { 1 };
+                    (java_type, text_options.is_stored(), indexing_options.is_some(), text_options.is_fast(), Some(tokenizer), Some(index_opt))
                 },
                 TantivyFieldType::U64(numeric_options) => (2, numeric_options.is_stored(), numeric_options.is_indexed(), numeric_options.is_fast(), None, None),
                 TantivyFieldType::I64(numeric_options) => (3, numeric_options.is_stored(), numeric_options.is_indexed(), numeric_options.is_fast(), None, None),
@@ -540,6 +564,7 @@ pub extern "system" fn Java_io_indextables_tantivy4java_core_Schema_nativeGetAll
                 8 => "BYTES",
                 9 => "JSON",
                 10 => "IP_ADDR",
+                11 => "STRING",
                 _ => "TEXT",
             };
             let field_type_name_str = env.new_string(field_type_name).map_err(|e| e.to_string())?;
