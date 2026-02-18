@@ -3,6 +3,7 @@ package io.indextables.tantivy4java.iceberg;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
+import java.io.Serializable;
 import java.util.Collections;
 import java.util.Map;
 
@@ -12,8 +13,12 @@ import java.util.Map;
  * <p>Instances are returned by {@link IcebergTableReader#listFiles} and contain
  * metadata from the Iceberg manifest including file path, format, record count,
  * size, partition values, content type, and the snapshot that added the file.
+ *
+ * <p>Implements {@link Serializable} for Spark broadcast/shuffle.
  */
-public class IcebergFileEntry {
+public class IcebergFileEntry implements Serializable {
+
+    private static final long serialVersionUID = 1L;
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
     private static final TypeReference<Map<String, String>> MAP_TYPE = new TypeReference<Map<String, String>>() {};
@@ -26,8 +31,8 @@ public class IcebergFileEntry {
     private final String contentType;
     private final long snapshotId;
 
-    IcebergFileEntry(String path, String fileFormat, long recordCount, long fileSizeBytes,
-                     Map<String, String> partitionValues, String contentType, long snapshotId) {
+    public IcebergFileEntry(String path, String fileFormat, long recordCount, long fileSizeBytes,
+                            Map<String, String> partitionValues, String contentType, long snapshotId) {
         this.path = path;
         this.fileFormat = fileFormat;
         this.recordCount = recordCount;

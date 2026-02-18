@@ -8,6 +8,8 @@ pub mod engine;
 pub mod scan;
 pub mod serialization;
 pub mod jni;
+pub mod distributed;
 
 pub use engine::DeltaStorageConfig;
 pub use scan::{DeltaFileEntry, DeltaSchemaField, list_delta_files, read_delta_schema};
+pub use distributed::{DeltaSnapshotInfo, DeltaLogChanges};
