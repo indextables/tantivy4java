@@ -226,6 +226,111 @@ public class DeltaTableReader {
         return -1;
     }
 
+    // ── Distributed scanning primitives ──────────────────────────────────────
+
+    /**
+     * Get lightweight snapshot metadata for distributed scanning.
+     *
+     * <p>Reads {@code _last_checkpoint} and lists commit files — does NOT read
+     * checkpoint contents. Returns paths that can be distributed to executors
+     * via {@link #readCheckpointPart(String, Map, String)}.
+     *
+     * @param tableUrl table location (local path, file://, s3://, or azure://)
+     * @param config   credential and storage configuration
+     * @return snapshot metadata with checkpoint part paths and commit file paths
+     */
+    public static DeltaSnapshotInfo getSnapshotInfo(String tableUrl, Map<String, String> config) {
+        if (tableUrl == null || tableUrl.isEmpty()) {
+            throw new IllegalArgumentException("tableUrl must not be null or empty");
+        }
+
+        byte[] bytes = nativeGetSnapshotInfo(tableUrl, config != null ? config : Collections.emptyMap());
+
+        ByteBuffer buffer = ByteBuffer.wrap(bytes);
+        buffer.order(ByteOrder.nativeOrder());
+
+        BatchDocumentReader reader = new BatchDocumentReader();
+        List<Map<String, Object>> maps = reader.parseToMaps(buffer);
+
+        if (maps.isEmpty()) {
+            throw new RuntimeException("Empty snapshot info response from native layer");
+        }
+
+        return DeltaSnapshotInfo.fromMap(maps.get(0));
+    }
+
+    /**
+     * Read one checkpoint parquet part and extract file entries.
+     *
+     * <p>Designed for executor-side use: reads a single checkpoint parquet file
+     * and returns the {@code add} file entries. Each checkpoint part typically
+     * contains ~54K entries.
+     *
+     * @param tableUrl table location
+     * @param config   credential and storage configuration
+     * @param partPath checkpoint parquet file path (relative to _delta_log/)
+     * @return list of file entries from this checkpoint part
+     */
+    public static List<DeltaFileEntry> readCheckpointPart(
+            String tableUrl, Map<String, String> config, String partPath) {
+        if (tableUrl == null || tableUrl.isEmpty()) {
+            throw new IllegalArgumentException("tableUrl must not be null or empty");
+        }
+        if (partPath == null || partPath.isEmpty()) {
+            throw new IllegalArgumentException("partPath must not be null or empty");
+        }
+
+        byte[] bytes = nativeReadCheckpointPart(tableUrl,
+                config != null ? config : Collections.emptyMap(), partPath);
+
+        ByteBuffer buffer = ByteBuffer.wrap(bytes);
+        buffer.order(ByteOrder.nativeOrder());
+
+        BatchDocumentReader reader = new BatchDocumentReader();
+        List<Map<String, Object>> maps = reader.parseToMaps(buffer);
+
+        List<DeltaFileEntry> entries = new ArrayList<>(maps.size());
+        for (Map<String, Object> map : maps) {
+            entries.add(DeltaFileEntry.fromMap(map));
+        }
+        return entries;
+    }
+
+    /**
+     * Read post-checkpoint JSON commit changes.
+     *
+     * <p>Reads JSON commit files after the checkpoint and returns added/removed
+     * file entries. Designed for driver-side use (typically small data).
+     *
+     * @param tableUrl    table location
+     * @param config      credential and storage configuration
+     * @param commitPaths list of JSON commit file paths (from {@link DeltaSnapshotInfo#getCommitFilePaths()})
+     * @return log changes with added files and removed paths
+     */
+    public static DeltaLogChanges readPostCheckpointChanges(
+            String tableUrl, Map<String, String> config, List<String> commitPaths) {
+        if (tableUrl == null || tableUrl.isEmpty()) {
+            throw new IllegalArgumentException("tableUrl must not be null or empty");
+        }
+
+        byte[] bytes = nativeReadPostCheckpointChanges(tableUrl,
+                config != null ? config : Collections.emptyMap(),
+                commitPaths != null ? commitPaths : Collections.emptyList());
+
+        ByteBuffer buffer = ByteBuffer.wrap(bytes);
+        buffer.order(ByteOrder.nativeOrder());
+
+        BatchDocumentReader reader = new BatchDocumentReader();
+        List<Map<String, Object>> maps = reader.parseToMaps(buffer);
+
+        return DeltaLogChanges.fromMaps(maps);
+    }
+
+    // ── Native methods ───────────────────────────────────────────────────────
+
     private static native byte[] nativeListFiles(String tableUrl, long version, Map<String, String> config, boolean compact);
     private static native byte[] nativeReadSchema(String tableUrl, long version, Map<String, String> config);
+    private static native byte[] nativeGetSnapshotInfo(String tableUrl, Map<String, String> config);
+    private static native byte[] nativeReadCheckpointPart(String tableUrl, Map<String, String> config, String partPath);
+    private static native byte[] nativeReadPostCheckpointChanges(String tableUrl, Map<String, String> config, List<String> commitPaths);
 }

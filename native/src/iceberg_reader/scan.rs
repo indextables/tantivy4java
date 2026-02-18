@@ -72,7 +72,7 @@ pub struct IcebergSnapshot {
 
 /// Parse a namespace string into a NamespaceIdent.
 /// Supports dotted notation: "db.schema" → ["db", "schema"]
-fn parse_namespace(namespace: &str) -> NamespaceIdent {
+pub(crate) fn parse_namespace(namespace: &str) -> NamespaceIdent {
     if namespace.contains('.') {
         let parts: Vec<String> = namespace.split('.').map(|s| s.to_string()).collect();
         NamespaceIdent::from_vec(parts).unwrap_or_else(|_| NamespaceIdent::new(namespace.to_string()))
@@ -81,7 +81,7 @@ fn parse_namespace(namespace: &str) -> NamespaceIdent {
     }
 }
 
-fn format_to_string(fmt: DataFileFormat) -> String {
+pub(crate) fn format_to_string(fmt: DataFileFormat) -> String {
     match fmt {
         DataFileFormat::Parquet => "parquet".to_string(),
         DataFileFormat::Avro => "avro".to_string(),
@@ -90,7 +90,7 @@ fn format_to_string(fmt: DataFileFormat) -> String {
     }
 }
 
-fn content_type_to_string(ct: DataContentType) -> String {
+pub(crate) fn content_type_to_string(ct: DataContentType) -> String {
     match ct {
         DataContentType::Data => "data".to_string(),
         DataContentType::EqualityDeletes => "equality_deletes".to_string(),
@@ -99,7 +99,7 @@ fn content_type_to_string(ct: DataContentType) -> String {
 }
 
 /// Convert an Iceberg Literal to a string for partition values.
-fn literal_to_string(lit: &iceberg::spec::Literal) -> String {
+pub(crate) fn literal_to_string(lit: &iceberg::spec::Literal) -> String {
     match lit {
         iceberg::spec::Literal::Primitive(p) => {
             use iceberg::spec::PrimitiveLiteral;

@@ -14,8 +14,10 @@ use crate::common::to_java_exception;
 use crate::debug_println;
 
 use super::scan::{list_iceberg_files, read_iceberg_schema, list_iceberg_snapshots};
+use super::distributed::{get_iceberg_snapshot_info, read_iceberg_manifest};
 use super::serialization::{
     serialize_iceberg_entries, serialize_iceberg_schema, serialize_iceberg_snapshots,
+    serialize_iceberg_snapshot_info,
 };
 
 /// Extract a full Java HashMap<String,String> into a Rust HashMap.
@@ -309,6 +311,160 @@ pub extern "system" fn Java_io_indextables_tantivy4java_iceberg_IcebergTableRead
             );
 
             let buffer = serialize_iceberg_snapshots(&snapshots);
+
+            match buffer_to_jbytearray(&mut env, &buffer) {
+                Ok(arr) => arr,
+                Err(e) => {
+                    to_java_exception(&mut env, &e);
+                    std::ptr::null_mut()
+                }
+            }
+        }
+        Err(e) => {
+            to_java_exception(&mut env, &e);
+            std::ptr::null_mut()
+        }
+    }
+}
+
+// ── Distributed scanning JNI entry points ────────────────────────────────────
+
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_iceberg_IcebergTableReader_nativeGetSnapshotInfo(
+    mut env: JNIEnv,
+    _class: JClass,
+    catalog_name: JString,
+    namespace: JString,
+    table_name: JString,
+    snapshot_id: jlong,
+    config_map: JObject,
+) -> jbyteArray {
+    debug_println!("🔧 ICEBERG_JNI: nativeGetSnapshotInfo called");
+
+    let catalog_str = match env.get_string(&catalog_name) {
+        Ok(s) => s.to_string_lossy().to_string(),
+        Err(e) => {
+            to_java_exception(&mut env, &anyhow::anyhow!("Failed to read catalog name: {}", e));
+            return std::ptr::null_mut();
+        }
+    };
+    let namespace_str = match env.get_string(&namespace) {
+        Ok(s) => s.to_string_lossy().to_string(),
+        Err(e) => {
+            to_java_exception(&mut env, &anyhow::anyhow!("Failed to read namespace: {}", e));
+            return std::ptr::null_mut();
+        }
+    };
+    let table_str = match env.get_string(&table_name) {
+        Ok(s) => s.to_string_lossy().to_string(),
+        Err(e) => {
+            to_java_exception(&mut env, &anyhow::anyhow!("Failed to read table name: {}", e));
+            return std::ptr::null_mut();
+        }
+    };
+
+    let config = match extract_hashmap(&mut env, &config_map) {
+        Ok(m) => m,
+        Err(e) => {
+            to_java_exception(&mut env, &anyhow::anyhow!("Failed to extract config map: {}", e));
+            return std::ptr::null_mut();
+        }
+    };
+
+    let snap_opt = if snapshot_id < 0 { None } else { Some(snapshot_id) };
+
+    debug_println!(
+        "🔧 ICEBERG_JNI: getSnapshotInfo catalog={}, ns={}, table={}, snapshot={:?}",
+        catalog_str, namespace_str, table_str, snap_opt
+    );
+
+    match get_iceberg_snapshot_info(&catalog_str, &config, &namespace_str, &table_str, snap_opt) {
+        Ok(info) => {
+            debug_println!(
+                "🔧 ICEBERG_JNI: SnapshotInfo snapshot_id={}, {} manifests",
+                info.snapshot_id, info.manifest_entries.len()
+            );
+
+            let buffer = serialize_iceberg_snapshot_info(&info);
+
+            match buffer_to_jbytearray(&mut env, &buffer) {
+                Ok(arr) => arr,
+                Err(e) => {
+                    to_java_exception(&mut env, &e);
+                    std::ptr::null_mut()
+                }
+            }
+        }
+        Err(e) => {
+            to_java_exception(&mut env, &e);
+            std::ptr::null_mut()
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_iceberg_IcebergTableReader_nativeReadManifestFile(
+    mut env: JNIEnv,
+    _class: JClass,
+    catalog_name: JString,
+    namespace: JString,
+    table_name: JString,
+    manifest_path: JString,
+    config_map: JObject,
+    compact: jboolean,
+) -> jbyteArray {
+    debug_println!("🔧 ICEBERG_JNI: nativeReadManifestFile called");
+
+    let catalog_str = match env.get_string(&catalog_name) {
+        Ok(s) => s.to_string_lossy().to_string(),
+        Err(e) => {
+            to_java_exception(&mut env, &anyhow::anyhow!("Failed to read catalog name: {}", e));
+            return std::ptr::null_mut();
+        }
+    };
+    let namespace_str = match env.get_string(&namespace) {
+        Ok(s) => s.to_string_lossy().to_string(),
+        Err(e) => {
+            to_java_exception(&mut env, &anyhow::anyhow!("Failed to read namespace: {}", e));
+            return std::ptr::null_mut();
+        }
+    };
+    let table_str = match env.get_string(&table_name) {
+        Ok(s) => s.to_string_lossy().to_string(),
+        Err(e) => {
+            to_java_exception(&mut env, &anyhow::anyhow!("Failed to read table name: {}", e));
+            return std::ptr::null_mut();
+        }
+    };
+    let manifest_str = match env.get_string(&manifest_path) {
+        Ok(s) => s.to_string_lossy().to_string(),
+        Err(e) => {
+            to_java_exception(&mut env, &anyhow::anyhow!("Failed to read manifest path: {}", e));
+            return std::ptr::null_mut();
+        }
+    };
+
+    let config = match extract_hashmap(&mut env, &config_map) {
+        Ok(m) => m,
+        Err(e) => {
+            to_java_exception(&mut env, &anyhow::anyhow!("Failed to extract config map: {}", e));
+            return std::ptr::null_mut();
+        }
+    };
+
+    debug_println!(
+        "🔧 ICEBERG_JNI: readManifestFile catalog={}, ns={}, table={}, manifest={}",
+        catalog_str, namespace_str, table_str, manifest_str
+    );
+
+    match read_iceberg_manifest(&catalog_str, &config, &namespace_str, &table_str, &manifest_str) {
+        Ok(entries) => {
+            debug_println!(
+                "🔧 ICEBERG_JNI: Read {} entries from manifest",
+                entries.len()
+            );
+
+            let buffer = serialize_iceberg_entries(&entries, 0, compact != 0);
 
             match buffer_to_jbytearray(&mut env, &buffer) {
                 Ok(arr) => arr,

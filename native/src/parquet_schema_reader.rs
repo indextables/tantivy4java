@@ -272,7 +272,7 @@ fn arrow_type_to_string(dt: &DataType) -> String {
 ///
 /// Since arrow_schema::Schema doesn't implement serde::Serialize, we build
 /// the JSON manually from the schema's fields.
-fn arrow_schema_to_json(schema: &arrow_schema::Schema) -> String {
+pub(crate) fn arrow_schema_to_json(schema: &arrow_schema::Schema) -> String {
     let fields: Vec<serde_json::Value> = schema
         .fields()
         .iter()

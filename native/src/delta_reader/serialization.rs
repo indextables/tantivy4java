@@ -161,6 +161,121 @@ pub fn serialize_delta_schema(
     buf
 }
 
+/// Serialize a DeltaSnapshotInfo into the TANT byte buffer format.
+///
+/// Produces a single document with fields:
+///   version, schema_json, partition_columns_json, checkpoint_part_paths_json,
+///   commit_file_paths_json, num_add_files
+pub fn serialize_snapshot_info(info: &super::distributed::DeltaSnapshotInfo) -> Vec<u8> {
+    let estimated = 4 + 2000 + info.schema_json.len() + 12;
+    let mut buf = Vec::with_capacity(estimated);
+
+    buf.extend_from_slice(&MAGIC_NUMBER.to_ne_bytes());
+
+    let mut offsets = Vec::with_capacity(1);
+    offsets.push(buf.len() as u32);
+
+    let field_count: u16 = 6;
+    buf.extend_from_slice(&field_count.to_ne_bytes());
+
+    // 1. version (INTEGER)
+    write_field_header(&mut buf, "version", FIELD_TYPE_INTEGER, 1);
+    buf.extend_from_slice(&(info.version as i64).to_ne_bytes());
+
+    // 2. schema_json (TEXT)
+    write_field_header(&mut buf, "schema_json", FIELD_TYPE_TEXT, 1);
+    write_string(&mut buf, &info.schema_json);
+
+    // 3. partition_columns_json (JSON)
+    write_field_header(&mut buf, "partition_columns_json", FIELD_TYPE_JSON, 1);
+    let pc_json = serde_json::to_string(&info.partition_columns).unwrap_or_else(|_| "[]".to_string());
+    write_string(&mut buf, &pc_json);
+
+    // 4. checkpoint_part_paths_json (JSON)
+    write_field_header(&mut buf, "checkpoint_part_paths_json", FIELD_TYPE_JSON, 1);
+    let cp_json = serde_json::to_string(&info.checkpoint_part_paths).unwrap_or_else(|_| "[]".to_string());
+    write_string(&mut buf, &cp_json);
+
+    // 5. commit_file_paths_json (JSON)
+    write_field_header(&mut buf, "commit_file_paths_json", FIELD_TYPE_JSON, 1);
+    let cf_json = serde_json::to_string(&info.commit_file_paths).unwrap_or_else(|_| "[]".to_string());
+    write_string(&mut buf, &cf_json);
+
+    // 6. num_add_files (INTEGER, -1 if unknown)
+    write_field_header(&mut buf, "num_add_files", FIELD_TYPE_INTEGER, 1);
+    let num_add = info.num_add_files.map(|n| n as i64).unwrap_or(-1i64);
+    buf.extend_from_slice(&num_add.to_ne_bytes());
+
+    // Offset table
+    let offset_table_start = buf.len() as u32;
+    for offset in &offsets {
+        buf.extend_from_slice(&offset.to_ne_bytes());
+    }
+
+    // Footer
+    buf.extend_from_slice(&offset_table_start.to_ne_bytes());
+    buf.extend_from_slice(&(1u32).to_ne_bytes());
+    buf.extend_from_slice(&MAGIC_NUMBER.to_ne_bytes());
+
+    buf
+}
+
+/// Serialize DeltaLogChanges into the TANT byte buffer format.
+///
+/// Document 0: header with num_added, num_removed
+/// Documents 1..N: added file entries (reuses serialize_entry format)
+/// Documents N+1..M: removed paths (path only)
+pub fn serialize_log_changes(changes: &super::distributed::DeltaLogChanges) -> Vec<u8> {
+    let doc_count = 1 + changes.added_files.len() + changes.removed_paths.len();
+    let estimated = 4 + doc_count * 200 + 12;
+    let mut buf = Vec::with_capacity(estimated);
+
+    buf.extend_from_slice(&MAGIC_NUMBER.to_ne_bytes());
+
+    let mut offsets = Vec::with_capacity(doc_count);
+
+    // Document 0: header
+    offsets.push(buf.len() as u32);
+    {
+        let field_count: u16 = 2;
+        buf.extend_from_slice(&field_count.to_ne_bytes());
+
+        write_field_header(&mut buf, "num_added", FIELD_TYPE_INTEGER, 1);
+        buf.extend_from_slice(&(changes.added_files.len() as i64).to_ne_bytes());
+
+        write_field_header(&mut buf, "num_removed", FIELD_TYPE_INTEGER, 1);
+        buf.extend_from_slice(&(changes.removed_paths.len() as i64).to_ne_bytes());
+    }
+
+    // Documents 1..N: added files (full format, version=0 since it's post-checkpoint)
+    for entry in &changes.added_files {
+        offsets.push(buf.len() as u32);
+        serialize_entry(&mut buf, entry, 0, false);
+    }
+
+    // Documents N+1..M: removed paths
+    for path in &changes.removed_paths {
+        offsets.push(buf.len() as u32);
+        let field_count: u16 = 1;
+        buf.extend_from_slice(&field_count.to_ne_bytes());
+        write_field_header(&mut buf, "path", FIELD_TYPE_TEXT, 1);
+        write_string(&mut buf, path);
+    }
+
+    // Offset table
+    let offset_table_start = buf.len() as u32;
+    for offset in &offsets {
+        buf.extend_from_slice(&offset.to_ne_bytes());
+    }
+
+    // Footer
+    buf.extend_from_slice(&offset_table_start.to_ne_bytes());
+    buf.extend_from_slice(&(doc_count as u32).to_ne_bytes());
+    buf.extend_from_slice(&MAGIC_NUMBER.to_ne_bytes());
+
+    buf
+}
+
 fn write_field_header(buf: &mut Vec<u8>, name: &str, field_type: u8, value_count: u16) {
     let name_bytes = name.as_bytes();
     buf.extend_from_slice(&(name_bytes.len() as u16).to_ne_bytes());

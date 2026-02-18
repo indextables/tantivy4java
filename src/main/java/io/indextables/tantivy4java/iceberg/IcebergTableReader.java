@@ -290,6 +290,106 @@ public class IcebergTableReader {
         return -1;
     }
 
+    // ── Distributed scanning primitives ──────────────────────────────────────
+
+    /**
+     * Get lightweight snapshot metadata for distributed scanning (current snapshot).
+     *
+     * <p>Opens catalog, loads table metadata, and reads the manifest list.
+     * Returns manifest file paths — does NOT read manifest file contents.
+     *
+     * @param catalogName catalog identifier
+     * @param namespace   Iceberg namespace
+     * @param tableName   table name
+     * @param config      catalog and storage configuration
+     * @return snapshot metadata with manifest file paths
+     */
+    public static IcebergSnapshotInfo getSnapshotInfo(
+            String catalogName, String namespace, String tableName, Map<String, String> config) {
+        return getSnapshotInfo(catalogName, namespace, tableName, config, -1);
+    }
+
+    /**
+     * Get lightweight snapshot metadata for distributed scanning.
+     *
+     * @param catalogName catalog identifier
+     * @param namespace   Iceberg namespace
+     * @param tableName   table name
+     * @param config      catalog and storage configuration
+     * @param snapshotId  snapshot ID (-1 for current)
+     * @return snapshot metadata with manifest file paths
+     */
+    public static IcebergSnapshotInfo getSnapshotInfo(
+            String catalogName, String namespace, String tableName,
+            Map<String, String> config, long snapshotId) {
+        validateParams(catalogName, namespace, tableName, config);
+
+        byte[] bytes = nativeGetSnapshotInfo(catalogName, namespace, tableName, snapshotId,
+                config != null ? config : Collections.emptyMap());
+
+        ByteBuffer buffer = ByteBuffer.wrap(bytes);
+        buffer.order(ByteOrder.nativeOrder());
+
+        BatchDocumentReader reader = new BatchDocumentReader();
+        List<Map<String, Object>> maps = reader.parseToMaps(buffer);
+
+        return IcebergSnapshotInfo.fromMaps(maps);
+    }
+
+    /**
+     * Read one manifest file and extract data file entries.
+     *
+     * <p>Designed for executor-side use: reads a single manifest avro file
+     * and returns the DataFile entries (excluding deleted entries).
+     *
+     * @param catalogName  catalog identifier (for FileIO construction)
+     * @param namespace    Iceberg namespace
+     * @param tableName    table name
+     * @param config       catalog and storage configuration
+     * @param manifestPath full path to the manifest avro file
+     * @return list of file entries from this manifest
+     */
+    public static List<IcebergFileEntry> readManifestFile(
+            String catalogName, String namespace, String tableName,
+            Map<String, String> config, String manifestPath) {
+        return readManifestFile(catalogName, namespace, tableName, config, manifestPath, false);
+    }
+
+    /**
+     * Read one manifest file and extract data file entries (with compact option).
+     *
+     * @param catalogName  catalog identifier
+     * @param namespace    Iceberg namespace
+     * @param tableName    table name
+     * @param config       catalog and storage configuration
+     * @param manifestPath full path to the manifest avro file
+     * @param compact      if true, skip partition_values and content_type
+     * @return list of file entries from this manifest
+     */
+    public static List<IcebergFileEntry> readManifestFile(
+            String catalogName, String namespace, String tableName,
+            Map<String, String> config, String manifestPath, boolean compact) {
+        validateParams(catalogName, namespace, tableName, config);
+        if (manifestPath == null || manifestPath.isEmpty()) {
+            throw new IllegalArgumentException("manifestPath must not be null or empty");
+        }
+
+        byte[] bytes = nativeReadManifestFile(catalogName, namespace, tableName, manifestPath,
+                config != null ? config : Collections.emptyMap(), compact);
+
+        ByteBuffer buffer = ByteBuffer.wrap(bytes);
+        buffer.order(ByteOrder.nativeOrder());
+
+        BatchDocumentReader reader = new BatchDocumentReader();
+        List<Map<String, Object>> maps = reader.parseToMaps(buffer);
+
+        List<IcebergFileEntry> entries = new ArrayList<>(maps.size());
+        for (Map<String, Object> map : maps) {
+            entries.add(IcebergFileEntry.fromMap(map));
+        }
+        return entries;
+    }
+
     // ── Native methods ────────────────────────────────────────────────────────
 
     private static native byte[] nativeListFiles(
@@ -303,4 +403,12 @@ public class IcebergTableReader {
     private static native byte[] nativeListSnapshots(
             String catalogName, String namespace, String tableName,
             Map<String, String> config);
+
+    private static native byte[] nativeGetSnapshotInfo(
+            String catalogName, String namespace, String tableName,
+            long snapshotId, Map<String, String> config);
+
+    private static native byte[] nativeReadManifestFile(
+            String catalogName, String namespace, String tableName,
+            String manifestPath, Map<String, String> config, boolean compact);
 }
