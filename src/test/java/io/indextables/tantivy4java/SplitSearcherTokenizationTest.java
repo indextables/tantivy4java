@@ -120,43 +120,40 @@ public class SplitSearcherTokenizationTest {
                             assertFalse(titleTokens.contains("Machine"), "Should not contain uppercase 'Machine'");
                             System.out.println("  ✅ Default tokenizer working correctly (lowercased and split)");
 
-                            // Test 2: Text field tokenization (also uses default tokenizer due to split format limitations)
-                            System.out.println("\n🔎 Test 2: Keywords field tokenization (default tokenizer)");
+                            // Test 2: Text field tokenization with whitespace tokenizer
+                            // Tokenizers ARE preserved through split round-trips.
+                            System.out.println("\n🔎 Test 2: Keywords field tokenization (whitespace tokenizer)");
                             List<String> keywordTokens = splitSearcher.tokenize("keywords", "machine-learning deep-learning artificial-intelligence tutorial");
                             System.out.println("  Keyword tokens: " + keywordTokens);
 
-                            // Note: Due to split format limitations, all text fields use default tokenizer
-                            // Default tokenizer: split on punctuation and whitespace, lowercase
-                            assertTrue(keywordTokens.size() >= 6, "Should produce multiple tokens from hyphenated terms");
-                            assertTrue(keywordTokens.contains("machine"), "Should split 'machine-learning' into parts");
-                            assertTrue(keywordTokens.contains("learning"), "Should split hyphenated terms");
-                            assertTrue(keywordTokens.contains("artificial"), "Should contain 'artificial'");
-                            assertTrue(keywordTokens.contains("intelligence"), "Should contain 'intelligence'");
+                            // Whitespace tokenizer: split on whitespace only, preserve hyphens and case
+                            assertEquals(4, keywordTokens.size(), "Whitespace tokenizer should produce 4 tokens (split on whitespace only)");
+                            assertTrue(keywordTokens.contains("machine-learning"), "Should preserve 'machine-learning' (whitespace tokenizer keeps hyphens)");
+                            assertTrue(keywordTokens.contains("deep-learning"), "Should preserve 'deep-learning'");
+                            assertTrue(keywordTokens.contains("artificial-intelligence"), "Should preserve 'artificial-intelligence'");
                             assertTrue(keywordTokens.contains("tutorial"), "Should contain 'tutorial'");
-                            System.out.println("  ✅ Default tokenizer working correctly (splits on punctuation)");
+                            System.out.println("  ✅ Whitespace tokenizer working correctly (splits on whitespace only)");
 
                             // Test 3: String field tokenization (also uses default tokenizer due to split format limitations)
-                            System.out.println("\n🔎 Test 3: String field tokenization (default tokenizer)");
+                            // Test 3: String field tokenization (raw tokenizer)
+                            // String fields use the raw tokenizer which returns input as a single token.
+                            System.out.println("\n🔎 Test 3: String field tokenization (raw tokenizer)");
                             List<String> categoryTokens = splitSearcher.tokenize("category", "Technology");
                             System.out.println("  Category tokens: " + categoryTokens);
 
-                            // Note: Due to split format limitations, string fields also use default tokenizer
-                            // Default tokenizer: lowercase and split on punctuation/whitespace
-                            assertEquals(1, categoryTokens.size(), "Should produce exactly 1 token");
-                            assertEquals("technology", categoryTokens.get(0), "Should be lowercased by default tokenizer");
-                            System.out.println("  ✅ String field tokenization working (lowercased by default tokenizer)");
+                            assertEquals(1, categoryTokens.size(), "Raw tokenizer should produce exactly 1 token");
+                            assertEquals("Technology", categoryTokens.get(0), "Raw tokenizer preserves original case");
+                            System.out.println("  ✅ String field tokenization working (raw tokenizer preserves input)");
 
-                            // Test 4: String field with complex input (also uses default tokenizer)
-                            System.out.println("\n🔎 Test 4: String field with complex input");
+                            // Test 4: String field with complex input (raw tokenizer)
+                            System.out.println("\n🔎 Test 4: String field with complex input (raw tokenizer)");
                             List<String> complexStringTokens = splitSearcher.tokenize("status", "Published and Available");
                             System.out.println("  Complex string tokens: " + complexStringTokens);
 
-                            // Default tokenizer splits on whitespace and lowercases
-                            assertEquals(3, complexStringTokens.size(), "Should split on whitespace");
-                            assertTrue(complexStringTokens.contains("published"), "Should contain 'published' (lowercased)");
-                            assertTrue(complexStringTokens.contains("and"), "Should contain 'and'");
-                            assertTrue(complexStringTokens.contains("available"), "Should contain 'available' (lowercased)");
-                            System.out.println("  ✅ String field tokenized by default tokenizer (split and lowercased)");
+                            // Raw tokenizer returns entire input as a single token
+                            assertEquals(1, complexStringTokens.size(), "Raw tokenizer should produce 1 token");
+                            assertEquals("Published and Available", complexStringTokens.get(0), "Raw tokenizer preserves entire input");
+                            System.out.println("  ✅ String field tokenized by raw tokenizer (preserves entire input)");
 
                             // Test 5: Numeric field tokenization
                             System.out.println("\n🔎 Test 5: Numeric field tokenization");
@@ -313,8 +310,8 @@ public class SplitSearcherTokenizationTest {
                             System.out.println("  Whitespace tokenizer: " + whitespaceTokens);
                             System.out.println("  Exact (raw) tokenizer: " + exactTokens);
 
-                            // Due to split format limitations, all fields use default tokenizer
-                            // Default tokenizer splits on punctuation and whitespace, lowercases
+                            // Tokenizers ARE preserved through split round-trips.
+                            // Default tokenizer: splits on punctuation and whitespace, lowercases
                             assertTrue(defaultTokens.size() >= 6, "Default tokenizer should split on punctuation");
                             assertTrue(defaultTokens.contains("machine"), "Should contain 'machine'");
                             assertTrue(defaultTokens.contains("learning"), "Should contain 'learning'");
@@ -323,11 +320,17 @@ public class SplitSearcherTokenizationTest {
                             assertTrue(defaultTokens.contains("data"), "Should contain 'data'");
                             assertTrue(defaultTokens.contains("science"), "Should contain 'science'");
 
-                            // All fields use same tokenizer due to split format limitations
-                            assertEquals(defaultTokens, whitespaceTokens, "All fields use default tokenizer");
-                            assertEquals(defaultTokens, exactTokens, "All fields use default tokenizer");
+                            // Whitespace tokenizer: splits on whitespace only, preserves case and hyphens
+                            assertEquals(3, whitespaceTokens.size(), "Whitespace tokenizer should produce 3 tokens");
+                            assertTrue(whitespaceTokens.contains("machine-learning"), "Whitespace tokenizer preserves hyphens");
+                            assertTrue(whitespaceTokens.contains("AI/ML"), "Whitespace tokenizer preserves case and slashes");
+                            assertTrue(whitespaceTokens.contains("data.science"), "Whitespace tokenizer preserves dots");
 
-                            System.out.println("  ✅ Tokenizer behavior validated (all use default due to split format)");
+                            // Raw tokenizer: returns entire input as single token
+                            assertEquals(1, exactTokens.size(), "Raw tokenizer should produce 1 token");
+                            assertEquals(testText, exactTokens.get(0), "Raw tokenizer preserves entire input");
+
+                            System.out.println("  ✅ Each tokenizer behaves correctly (preserved through split round-trip)");
 
                             // Test very long input
                             System.out.println("\n🔎 Testing long input handling");
