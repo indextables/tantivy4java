@@ -97,6 +97,58 @@ pub fn create_schema_from_doc_mapping(doc_mapping_json: &str) -> anyhow::Result<
                 }
                 schema_builder.add_bool_field(&field_mapping.name, bool_options);
             },
+            "u64" => {
+                let mut uint_options = tantivy::schema::NumericOptions::default();
+                if stored {
+                    uint_options = uint_options.set_stored();
+                }
+                if indexed {
+                    uint_options = uint_options.set_indexed();
+                }
+                if fast {
+                    uint_options = uint_options.set_fast();
+                }
+                schema_builder.add_u64_field(&field_mapping.name, uint_options);
+            },
+            "datetime" | "date" => {
+                let mut date_options = tantivy::schema::DateOptions::default();
+                if stored {
+                    date_options = date_options.set_stored();
+                }
+                if indexed {
+                    date_options = date_options.set_indexed();
+                }
+                if fast {
+                    date_options = date_options.set_fast();
+                }
+                schema_builder.add_date_field(&field_mapping.name, date_options);
+            },
+            "bytes" => {
+                let mut bytes_options = tantivy::schema::BytesOptions::default();
+                if stored {
+                    bytes_options = bytes_options.set_stored();
+                }
+                if indexed {
+                    bytes_options = bytes_options.set_indexed();
+                }
+                if fast {
+                    bytes_options = bytes_options.set_fast();
+                }
+                schema_builder.add_bytes_field(&field_mapping.name, bytes_options);
+            },
+            "ip" | "ip_addr" => {
+                let mut ip_options = tantivy::schema::IpAddrOptions::default();
+                if stored {
+                    ip_options = ip_options.set_stored();
+                }
+                if indexed {
+                    ip_options = ip_options.set_indexed();
+                }
+                if fast {
+                    ip_options = ip_options.set_fast();
+                }
+                schema_builder.add_ip_addr_field(&field_mapping.name, ip_options);
+            },
             "object" => {
                 debug_println!("RUST DEBUG: 🔧 JSON FIELD RECONSTRUCTION: field '{}', stored={}, indexed={}, fast={}, expand_dots={:?}, tokenizer={:?}, fast_tokenizer={:?}",
                     field_mapping.name, stored, indexed, fast, field_mapping.expand_dots, field_mapping.tokenizer, field_mapping.fast_tokenizer);
