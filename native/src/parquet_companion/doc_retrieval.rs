@@ -191,6 +191,105 @@ pub async fn retrieve_document_from_parquet(
     Ok(HashMap::new())
 }
 
+/// Retrieve a single document using pre-resolved file coordinates.
+///
+/// Unlike `retrieve_document_from_parquet`, this skips the segment→global→file
+/// resolution and directly uses the file_idx and row_in_file from fast fields.
+pub async fn retrieve_document_by_location(
+    manifest: &ParquetManifest,
+    file_idx: usize,
+    row_in_file: u64,
+    projected_fields: Option<&[String]>,
+    storage: &Arc<dyn Storage>,
+    metadata_cache: Option<&MetadataCache>,
+    byte_cache: Option<&ByteRangeCache>,
+    coalesce_config: Option<CoalesceConfig>,
+) -> Result<HashMap<String, serde_json::Value>> {
+    let file_entry = manifest.parquet_files.get(file_idx)
+        .ok_or_else(|| anyhow::anyhow!("file_idx {} out of range (have {} files)",
+            file_idx, manifest.parquet_files.len()))?;
+    let parquet_path = &file_entry.relative_path;
+
+    debug_println!(
+        "📖 PARQUET_DOC: Retrieving by location → file[{}]='{}' row_in_file={}",
+        file_idx, parquet_path, row_in_file
+    );
+
+    let path_buf = std::path::PathBuf::from(parquet_path);
+    let cached_meta = metadata_cache.and_then(|cache| {
+        cache.lock().ok().and_then(|guard| guard.get(&path_buf).cloned())
+    });
+
+    let reader = if let Some(meta) = cached_meta {
+        CachedParquetReader::with_metadata(
+            storage.clone(), path_buf.clone(), file_entry.file_size_bytes, meta,
+        )
+    } else {
+        CachedParquetReader::new(
+            storage.clone(), path_buf.clone(), file_entry.file_size_bytes,
+        )
+    };
+    let reader = if let Some(bc) = byte_cache {
+        reader.with_byte_cache(bc.clone())
+    } else { reader };
+    let reader = if let Some(config) = coalesce_config {
+        reader.with_coalesce_config(config)
+    } else { reader };
+
+    let builder = ParquetRecordBatchStreamBuilder::new(reader)
+        .await.context("Failed to create parquet stream builder")?;
+
+    if let Some(cache) = metadata_cache {
+        if let Ok(mut guard) = cache.lock() {
+            if !guard.contains_key(&path_buf) {
+                guard.insert(path_buf.clone(), builder.metadata().clone());
+            }
+        }
+    }
+
+    let parquet_schema = builder.schema().clone();
+    let projection = build_column_projection(projected_fields, &parquet_schema, &manifest.column_mapping);
+    if let Some(ref proj) = projection {
+        if proj.is_empty() { return Ok(HashMap::new()); }
+    }
+
+    let row_in_file_usize = row_in_file as usize;
+    let parquet_metadata = builder.metadata().clone();
+    let parquet_file_schema = builder.parquet_schema().clone();
+
+    let builder = if let Some(ref proj) = projection {
+        builder.with_projection(parquet::arrow::ProjectionMask::roots(
+            &parquet_file_schema, proj.iter().cloned(),
+        ))
+    } else { builder };
+
+    let rg_filter = compute_row_group_filter(&[row_in_file_usize], &parquet_metadata);
+    let builder = if let Some(ref filter) = rg_filter {
+        let selected_rgs: Vec<usize> = filter.iter().enumerate()
+            .filter(|(_, s)| **s).map(|(i, _)| i).collect();
+        builder.with_row_groups(selected_rgs)
+    } else { builder };
+
+    let row_selection = build_row_selection_for_rows_in_selected_groups(
+        &[row_in_file_usize], &parquet_metadata, rg_filter.as_deref(),
+    );
+    let builder = if let Some(selection) = row_selection {
+        builder.with_row_selection(selection)
+    } else {
+        builder.with_offset(row_in_file_usize).with_limit(1)
+    };
+
+    let mut stream = builder.build().context("Failed to build parquet record batch stream")?;
+    use futures::StreamExt;
+    if let Some(batch_result) = stream.next().await {
+        let batch = batch_result.context("Failed to read parquet record batch")?;
+        if batch.num_rows() > 0 {
+            return extract_row_as_map(&batch, 0, projected_fields);
+        }
+    }
+    Ok(HashMap::new())
+}
+
 /// Batch retrieve multiple documents from parquet files.
 ///
 /// Optimized for efficient column page access with groups of rows:

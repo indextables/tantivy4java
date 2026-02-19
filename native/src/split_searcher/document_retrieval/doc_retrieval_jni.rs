@@ -832,12 +832,9 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_nati
         );
     }
 
-    // Retrieve document from parquet via the manifest
+    // Retrieve document from parquet via fast field resolution
     let result = with_arc_safe(searcher_ptr, |ctx: &Arc<CachedSearcherContext>| {
         let manifest = ctx.parquet_manifest.as_ref().unwrap();
-        // Use parquet_storage (rooted at table_root) for parquet file access.
-        // If parquet_storage is None, parquet_table_root was not provided — return
-        // an explicit error instead of silently falling back to the wrong storage.
         let storage = match ctx.parquet_storage.as_ref() {
             Some(s) => s.clone(),
             None => {
@@ -856,20 +853,49 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_nati
         let metadata_cache = &ctx.parquet_metadata_cache;
         let byte_cache = &ctx.parquet_byte_range_cache;
 
+        // Read fast fields to resolve doc→parquet location (merge-safe)
+        let seg_ord = segment_ord as u32;
+        let doc = doc_id as u32;
+        let searcher = &ctx.cached_searcher;
+        let seg_reader = searcher.segment_readers().get(seg_ord as usize)
+            .ok_or_else(|| anyhow::anyhow!("Segment ordinal {} out of range", seg_ord))?;
+        let fast_fields = seg_reader.fast_fields();
+        let file_hash_col = fast_fields.u64(crate::parquet_companion::indexing::PARQUET_FILE_HASH_FIELD)
+            .map_err(|e| anyhow::anyhow!("Missing {} fast field — split may have been indexed \
+                before fast-field tracking was added. Re-index to fix: {}",
+                crate::parquet_companion::indexing::PARQUET_FILE_HASH_FIELD, e))?;
+        let row_col = fast_fields.u64(crate::parquet_companion::indexing::PARQUET_ROW_IN_FILE_FIELD)
+            .map_err(|e| anyhow::anyhow!("Missing {} fast field: {}",
+                crate::parquet_companion::indexing::PARQUET_ROW_IN_FILE_FIELD, e))?;
+
+        let file_hash: u64 = file_hash_col.values_for_doc(doc).next()
+            .ok_or_else(|| anyhow::anyhow!("No file hash value for seg={} doc={}", seg_ord, doc))?;
+        let row_in_file: u64 = row_col.values_for_doc(doc).next()
+            .ok_or_else(|| anyhow::anyhow!("No row_in_file value for seg={} doc={}", seg_ord, doc))?;
+
+        let location = crate::parquet_companion::docid_mapping::resolve_via_fast_fields(
+            file_hash, row_in_file, &ctx.parquet_file_hash_index,
+        ).map_err(|e| anyhow::anyhow!("{}", e))?;
+
+        debug_println!(
+            "📖 PARQUET_DOC: Fast field resolved seg={} doc={} → file_hash={} → file[{}] row={}",
+            seg_ord, doc, file_hash, location.file_idx, location.row_in_file
+        );
+
         let runtime = crate::runtime_manager::QuickwitRuntimeManager::global().handle();
         let _guard = runtime.enter();
 
         tokio::task::block_in_place(|| {
             runtime.block_on(async {
-                crate::parquet_companion::doc_retrieval::retrieve_document_from_parquet(
+                crate::parquet_companion::doc_retrieval::retrieve_document_by_location(
                     manifest,
-                    segment_ord as u32,
-                    doc_id as u32,
+                    location.file_idx,
+                    location.row_in_file,
                     projected_fields.as_deref(),
                     &storage,
                     Some(metadata_cache),
                     Some(byte_cache),
-                    None, // use default CoalesceConfig (512KB gap, 8MB max)
+                    None,
                 )
                 .await
             })
@@ -1001,12 +1027,9 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_nati
         .map(|(&seg, &doc)| (seg, doc))
         .collect();
 
-    // Batch retrieve from parquet, serializing directly to TANT binary format
+    // Batch retrieve: resolve all doc addresses via fast fields, then group by file
     let result = with_arc_safe(searcher_ptr, |ctx: &Arc<CachedSearcherContext>| {
         let manifest = ctx.parquet_manifest.as_ref().unwrap();
-        // Use parquet_storage (rooted at table_root) for parquet file access.
-        // If parquet_storage is None, parquet_table_root was not provided — return
-        // an explicit error instead of silently falling back to the wrong storage.
         let storage = match ctx.parquet_storage.as_ref() {
             Some(s) => s.clone(),
             None => {
@@ -1024,20 +1047,47 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_nati
         };
         let metadata_cache = &ctx.parquet_metadata_cache;
         let byte_cache = &ctx.parquet_byte_range_cache;
+        let searcher = &ctx.cached_searcher;
+
+        // Resolve all addresses via fast fields
+        let mut resolved_locations: Vec<(usize, u64, u64)> = Vec::with_capacity(addresses.len());
+        for (idx, &(seg_ord, doc_id)) in addresses.iter().enumerate() {
+            let seg_reader = searcher.segment_readers().get(seg_ord as usize)
+                .ok_or_else(|| anyhow::anyhow!("Segment ordinal {} out of range", seg_ord))?;
+            let fast_fields = seg_reader.fast_fields();
+            let file_hash_col = fast_fields.u64(crate::parquet_companion::indexing::PARQUET_FILE_HASH_FIELD)
+                .map_err(|e| anyhow::anyhow!("Missing {} fast field — re-index required: {}",
+                    crate::parquet_companion::indexing::PARQUET_FILE_HASH_FIELD, e))?;
+            let row_col = fast_fields.u64(crate::parquet_companion::indexing::PARQUET_ROW_IN_FILE_FIELD)
+                .map_err(|e| anyhow::anyhow!("Missing {} fast field: {}",
+                    crate::parquet_companion::indexing::PARQUET_ROW_IN_FILE_FIELD, e))?;
+
+            let file_hash = file_hash_col.values_for_doc(doc_id).next()
+                .ok_or_else(|| anyhow::anyhow!("No file hash for seg={} doc={}", seg_ord, doc_id))?;
+            let row_in_file = row_col.values_for_doc(doc_id).next()
+                .ok_or_else(|| anyhow::anyhow!("No row_in_file for seg={} doc={}", seg_ord, doc_id))?;
+
+            resolved_locations.push((idx, file_hash, row_in_file));
+        }
+
+        let groups = crate::parquet_companion::docid_mapping::group_resolved_locations_by_file(
+            &resolved_locations, &ctx.parquet_file_hash_index,
+        ).map_err(|e| anyhow::anyhow!("{}", e))?;
 
         let runtime = crate::runtime_manager::QuickwitRuntimeManager::global().handle();
         let _guard = runtime.enter();
 
         tokio::task::block_in_place(|| {
             runtime.block_on(async {
-                crate::parquet_companion::arrow_to_tant::batch_parquet_to_tant_buffer(
-                    &addresses,
+                crate::parquet_companion::arrow_to_tant::batch_parquet_to_tant_buffer_by_groups(
+                    groups,
+                    addresses.len(),
                     projected_fields.as_deref(),
                     manifest,
                     &storage,
                     Some(metadata_cache),
                     Some(byte_cache),
-                    None, // use default CoalesceConfig (512KB gap, 8MB max)
+                    None,
                 )
                 .await
             })

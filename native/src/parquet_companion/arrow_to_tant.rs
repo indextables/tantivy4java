@@ -372,9 +372,26 @@ pub async fn batch_parquet_to_tant_buffer(
 ) -> Result<Vec<u8>> {
     let groups =
         group_doc_addresses_by_file(addresses, manifest).map_err(|e| anyhow::anyhow!("{}", e))?;
+    batch_parquet_to_tant_buffer_by_groups(
+        groups, addresses.len(), projected_fields, manifest, storage,
+        metadata_cache, byte_cache, coalesce_config,
+    ).await
+}
 
-    let result_count = addresses.len();
-
+/// Core batch retrieval with pre-resolved file groups.
+///
+/// Accepts groups already resolved via fast fields (or legacy segment→global→file).
+/// Each entry in groups is: file_idx → [(original_index, row_in_file)].
+pub async fn batch_parquet_to_tant_buffer_by_groups(
+    groups: std::collections::HashMap<usize, Vec<(usize, u64)>>,
+    result_count: usize,
+    projected_fields: Option<&[String]>,
+    manifest: &ParquetManifest,
+    storage: &Arc<dyn Storage>,
+    metadata_cache: Option<&MetadataCache>,
+    byte_cache: Option<&ByteRangeCache>,
+    coalesce_config: Option<CoalesceConfig>,
+) -> Result<Vec<u8>> {
     // Process each file's rows in parallel
     let file_futures: Vec<_> = groups
         .into_iter()

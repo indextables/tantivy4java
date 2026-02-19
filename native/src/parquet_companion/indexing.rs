@@ -29,6 +29,23 @@ use super::name_mapping;
 use crate::debug_println;
 use crate::quickwit_split::QuickwitSplitMetadata;
 
+/// Hidden u64 fast field storing a hash of the parquet file's relative path.
+/// Combined with PARQUET_ROW_IN_FILE_FIELD, enables O(1) doc→parquet resolution
+/// that survives both segment merges and split merges.
+pub const PARQUET_FILE_HASH_FIELD: &str = "__pq_file_hash";
+
+/// Hidden u64 fast field storing the 0-based row index within the parquet file.
+pub const PARQUET_ROW_IN_FILE_FIELD: &str = "__pq_row_in_file";
+
+/// Compute a stable u64 hash for a parquet file's relative path.
+/// Uses FxHash-style mixing for speed; collision probability ~1/2^64 per pair.
+pub fn hash_parquet_path(relative_path: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    relative_path.hash(&mut hasher);
+    hasher.finish()
+}
+
 /// Configuration for creating a split from parquet files
 pub struct CreateFromParquetConfig {
     /// Table root path (parquet file paths are relative to this)
@@ -153,10 +170,27 @@ pub async fn create_split_from_parquet(
         json_fields: parquet_config.schema_config.json_fields.clone(),
     };
 
-    let tantivy_schema = derive_tantivy_schema_with_mapping(&arrow_schema, &config, Some(&name_mapping))?;
+    let derived_schema = derive_tantivy_schema_with_mapping(&arrow_schema, &config, Some(&name_mapping))?;
+
+    // Add hidden fast fields for merge-safe parquet row tracking.
+    // These u64 fast fields provide O(1) positional access by doc_id and
+    // survive both segment merges and split merges.
+    let mut schema_builder = tantivy::schema::SchemaBuilder::new();
+    for (_field, entry) in derived_schema.fields() {
+        schema_builder.add_field(entry.clone());
+    }
+    let pq_file_hash_field = schema_builder.add_u64_field(
+        PARQUET_FILE_HASH_FIELD,
+        tantivy::schema::NumericOptions::default().set_fast(),
+    );
+    let pq_row_in_file_field = schema_builder.add_u64_field(
+        PARQUET_ROW_IN_FILE_FIELD,
+        tantivy::schema::NumericOptions::default().set_fast(),
+    );
+    let tantivy_schema = schema_builder.build();
 
     debug_println!(
-        "🏗️ CREATE_FROM_PARQUET: Derived tantivy schema with {} fields",
+        "🏗️ CREATE_FROM_PARQUET: Derived tantivy schema with {} fields (incl 2 row-tracking fast fields)",
         tantivy_schema.fields().count()
     );
 
@@ -178,10 +212,9 @@ pub async fn create_split_from_parquet(
     let index = tantivy::Index::create_in_dir(&index_dir, tantivy_schema.clone())
         .context("Failed to create tantivy index")?;
 
-    // Use single-threaded writer to ensure all docs land in one segment
-    // in insertion order (matching parquet row order). Multi-threaded writers
-    // distribute docs across threads, creating multiple segments with
-    // non-deterministic ordering that breaks the docid-to-parquet-row mapping.
+    // Single-threaded writer ensures docs within each segment are in insertion order.
+    // Merges are allowed (default LogMergePolicy) — the __pq_file_hash and
+    // __pq_row_in_file fast fields make doc→parquet resolution merge-safe.
     let mut writer = index.writer_with_num_threads(1, parquet_config.writer_heap_size)
         .context("Failed to create index writer")?;
 
@@ -253,6 +286,7 @@ pub async fn create_split_from_parquet(
 
         // Compute relative path from table_root
         let relative_path = compute_relative_path(file_path, &parquet_config.table_root);
+        let file_hash = hash_parquet_path(&relative_path);
 
         parquet_file_entries.push(ParquetFileEntry {
             relative_path,
@@ -270,12 +304,13 @@ pub async fn create_split_from_parquet(
             .build()
             .context("Failed to build parquet reader")?;
 
+        let mut row_in_file: u64 = 0;
         for batch_result in reader {
             let batch = batch_result.context("Failed to read record batch")?;
             let batch_schema = batch.schema();
 
             for row_idx in 0..batch.num_rows() {
-                let tantivy_doc = arrow_row_to_tantivy_doc(
+                let mut tantivy_doc = arrow_row_to_tantivy_doc(
                     &batch,
                     &batch_schema,
                     row_idx,
@@ -285,8 +320,13 @@ pub async fn create_split_from_parquet(
                     &mut accumulators,
                 )?;
 
+                // Attach merge-safe parquet coordinates to each document
+                tantivy_doc.add_u64(pq_file_hash_field, file_hash);
+                tantivy_doc.add_u64(pq_row_in_file_field, row_in_file);
+
                 writer.add_document(tantivy_doc)
                     .context("Failed to add document to tantivy index")?;
+                row_in_file += 1;
             }
         }
 
@@ -301,39 +341,42 @@ pub async fn create_split_from_parquet(
 
     writer.commit().context("Failed to commit tantivy index")?;
 
-    // ── Step 10: Build segment_row_ranges from actual segment metadata ──
-    // With single-threaded indexing, tantivy may still create multiple segments
-    // if the writer's heap budget is exceeded mid-indexing (e.g., 1M+ rows).
-    // Read the actual segments after commit to build correct ordinal→row mappings.
-    // Segments are listed in meta.json in creation order, which matches insertion
-    // order for single-threaded writers — so row offsets are cumulative.
+    // ── Step 10: Build segment_row_ranges from whatever segments exist ──
+    // With __pq_file_hash and __pq_row_in_file fast fields, doc→parquet
+    // resolution no longer depends on segment ordering. The fast fields are
+    // immutable per-document properties that survive any merge operation.
+    // segment_row_ranges are kept for backward compatibility but are no
+    // longer used for correctness in the retrieval path.
     index.load_metas().context("Failed to load index metas after commit")?;
+
     let segment_metas = index.searchable_segment_metas()
         .context("Failed to read segment metas after commit")?;
 
-    let mut segment_row_ranges = Vec::with_capacity(segment_metas.len());
-    let mut row_offset = 0u64;
-    for (ord, seg_meta) in segment_metas.iter().enumerate() {
+    let docs_in_segments: u64 = segment_metas.iter().map(|m| m.max_doc() as u64).sum();
+    if docs_in_segments != total_rows {
+        anyhow::bail!(
+            "Segment row count mismatch: segments have {} rows but indexed {} rows",
+            docs_in_segments, total_rows
+        );
+    }
+
+    // Build segment_row_ranges — not used for correctness but kept for compat.
+    let mut segment_row_ranges = Vec::new();
+    let mut seg_row_offset: u64 = 0;
+    for (seg_ord, seg_meta) in segment_metas.iter().enumerate() {
         let num_rows = seg_meta.max_doc() as u64;
         segment_row_ranges.push(SegmentRowRange {
-            segment_ord: ord as u32,
-            row_offset,
+            segment_ord: seg_ord as u32,
+            row_offset: seg_row_offset,
             num_rows,
         });
-        row_offset += num_rows;
+        seg_row_offset += num_rows;
     }
 
     debug_println!(
-        "🏗️ CREATE_FROM_PARQUET: Indexed {} total rows from {} files into {} segment(s)",
-        total_rows, parquet_files.len(), segment_row_ranges.len()
+        "🏗️ CREATE_FROM_PARQUET: Indexed {} total rows from {} files across {} segment(s)",
+        total_rows, parquet_files.len(), segment_metas.len()
     );
-
-    if row_offset != total_rows {
-        anyhow::bail!(
-            "Segment row count mismatch: segments total {} rows but indexed {} rows",
-            row_offset, total_rows
-        );
-    }
 
     // ── Step 11: Build manifest ─────────────────────────────────────────
     let manifest = ParquetManifest {
@@ -1663,5 +1706,387 @@ mod tests {
         reader.reload().expect("Should reload");
         let searcher = reader.searcher();
         assert_eq!(searcher.num_docs(), 20);
+    }
+
+    // ── Multi-segment reproduction test ──────────────────────────────────
+
+    /// Helper: create a parquet file with many columns to force writer heap pressure.
+    /// Each file has a unique `file_tag` column so we can verify which file a row came from.
+    fn write_wide_parquet(path: &std::path::Path, num_rows: usize, file_tag: &str, id_offset: i64, num_extra_cols: usize) {
+        use arrow_array::*;
+        use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+        use parquet::arrow::ArrowWriter;
+        use std::sync::Arc;
+
+        let mut fields = vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("uuid", DataType::Utf8, false),
+            Field::new("file_tag", DataType::Utf8, false),
+        ];
+        // Add extra string columns to inflate the schema and force heap pressure
+        for i in 0..num_extra_cols {
+            fields.push(Field::new(format!("col_{}", i), DataType::Utf8, true));
+        }
+
+        let schema = Arc::new(ArrowSchema::new(fields));
+
+        let ids: Vec<i64> = (0..num_rows).map(|i| id_offset + i as i64).collect();
+        let uuids: Vec<String> = (0..num_rows)
+            .map(|i| format!("uuid-{}-{}", file_tag, i))
+            .collect();
+        let tags: Vec<String> = vec![file_tag.to_string(); num_rows];
+
+        let mut columns: Vec<ArrayRef> = vec![
+            Arc::new(Int64Array::from(ids)),
+            Arc::new(StringArray::from(uuids.iter().map(|s| s.as_str()).collect::<Vec<_>>())),
+            Arc::new(StringArray::from(tags.iter().map(|s| s.as_str()).collect::<Vec<_>>())),
+        ];
+        // Extra columns with repeating data to increase heap usage during indexing
+        for i in 0..num_extra_cols {
+            let vals: Vec<String> = (0..num_rows)
+                .map(|r| format!("val_{}_{}_in_{}", i, r, file_tag))
+                .collect();
+            columns.push(Arc::new(StringArray::from(
+                vals.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+            )));
+        }
+
+        let batch = RecordBatch::try_new(schema.clone(), columns).unwrap();
+        let file = std::fs::File::create(path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+    }
+
+    /// Reproduce the multi-segment doc_id mapping issue.
+    ///
+    /// Creates many parquet files with wide schemas and a small writer heap to
+    /// force multiple tantivy segments. Then verifies that every doc_id maps
+    /// to the correct parquet file and row via the manifest.
+    #[tokio::test]
+    async fn test_multi_segment_docid_mapping_correctness() {
+        let temp_dir = tempfile::tempdir().unwrap();
+
+        // Create 20 parquet files with 500 rows each and 50 extra columns.
+        // With a small 15MB heap, this should force multiple segments.
+        let num_files = 20;
+        let rows_per_file = 500;
+        let num_extra_cols = 50;
+        let mut parquet_paths: Vec<String> = Vec::new();
+        let mut cumulative_offset: i64 = 0;
+
+        for i in 0..num_files {
+            let file_name = format!("part-{:04}.parquet", i);
+            let file_path = temp_dir.path().join(&file_name);
+            let tag = format!("file{}", i);
+            write_wide_parquet(&file_path, rows_per_file, &tag, cumulative_offset, num_extra_cols);
+            parquet_paths.push(file_path.to_string_lossy().to_string());
+            cumulative_offset += rows_per_file as i64;
+        }
+
+        let total_rows = num_files * rows_per_file;
+
+        // Use a SMALL heap to force multiple segments
+        let config = CreateFromParquetConfig {
+            table_root: temp_dir.path().to_string_lossy().to_string(),
+            fast_field_mode: FastFieldMode::Disabled,
+            index_uid: "multi-seg-test".to_string(),
+            source_id: "test-source".to_string(),
+            node_id: "test-node".to_string(),
+            writer_heap_size: 15_000_000, // 15MB - minimum, should force many flushes
+            ..Default::default()
+        };
+
+        let storage: Arc<dyn quickwit_storage::Storage> =
+            Arc::new(quickwit_storage::RamStorage::default());
+
+        let result = create_split_from_parquet(
+            &parquet_paths,
+            temp_dir.path().join("multi_seg.split").to_str().unwrap(),
+            &config,
+            &storage,
+        )
+        .await
+        .expect("create_split_from_parquet should succeed");
+
+        assert_eq!(result.metadata.num_docs, total_rows);
+
+        // ── Now open the split and verify mapping ────────────────────────
+
+        let split_path = temp_dir.path().join("multi_seg.split");
+        let (index, _bundle_dir) = crate::quickwit_split::split_utils::open_split_with_quickwit_native(
+            split_path.to_str().unwrap(),
+        )
+        .expect("Should open the created split");
+
+        let reader = index.reader().expect("Should create reader");
+        reader.reload().expect("Should reload");
+        let searcher = reader.searcher();
+
+        let num_segments = searcher.segment_readers().len();
+        eprintln!(
+            "🔍 TEST: Split has {} segments, {} total docs",
+            num_segments,
+            searcher.num_docs()
+        );
+        assert_eq!(searcher.num_docs() as usize, total_rows);
+
+        // Read the manifest from the split bundle
+        let split_bytes = std::fs::read(&split_path).unwrap();
+        let file_slice = tantivy::directory::FileSlice::new(Arc::new(
+            tantivy::directory::OwnedBytes::new(split_bytes),
+        ));
+        let bundle = quickwit_directories::BundleDirectory::open_split(file_slice).unwrap();
+
+        use tantivy::directory::Directory;
+        use crate::parquet_companion::manifest_io::{MANIFEST_FILENAME, deserialize_manifest};
+        let manifest_path = std::path::PathBuf::from(MANIFEST_FILENAME);
+        let manifest_bytes = bundle.atomic_read(&manifest_path)
+            .expect("Should read manifest from bundle");
+        let manifest = deserialize_manifest(&manifest_bytes)
+            .expect("Should deserialize manifest");
+
+        eprintln!(
+            "🔍 TEST: Manifest has {} segment_row_ranges, {} parquet_files, {} total_rows",
+            manifest.segment_row_ranges.len(),
+            manifest.parquet_files.len(),
+            manifest.total_rows
+        );
+
+        // Log segment info
+        for sr in &manifest.segment_row_ranges {
+            eprintln!(
+                "  segment_ord={} row_offset={} num_rows={}",
+                sr.segment_ord, sr.row_offset, sr.num_rows
+            );
+        }
+
+        // ── Critical check: verify that segment ordinals from the searcher
+        //    match the manifest's segment_row_ranges ──────────────────────
+
+        // For each segment in the searcher, verify the doc count matches the manifest
+        for (seg_ord, seg_reader) in searcher.segment_readers().iter().enumerate() {
+            let seg_max_doc = seg_reader.max_doc();
+            let manifest_range = manifest.segment_row_ranges
+                .iter()
+                .find(|r| r.segment_ord == seg_ord as u32);
+
+            if let Some(range) = manifest_range {
+                eprintln!(
+                    "  Searcher seg[{}]: max_doc={}, manifest num_rows={}",
+                    seg_ord, seg_max_doc, range.num_rows
+                );
+                assert_eq!(
+                    seg_max_doc as u64, range.num_rows,
+                    "Segment {} doc count mismatch: searcher has {} but manifest says {}",
+                    seg_ord, seg_max_doc, range.num_rows
+                );
+            } else {
+                panic!(
+                    "Segment ordinal {} from searcher not found in manifest!",
+                    seg_ord
+                );
+            }
+        }
+
+        // ── Verify mapping via fast fields ──────────────────────────────
+        // Read __pq_file_hash and __pq_row_in_file fast fields to verify
+        // that each document's parquet coordinates are correct, even after
+        // segment merges have reordered doc IDs.
+
+        let schema = index.schema();
+        let uuid_field = schema.get_field("uuid").unwrap();
+
+        use crate::parquet_companion::docid_mapping::{build_file_hash_index, resolve_via_fast_fields};
+        use tantivy::query::TermQuery;
+        use tantivy::schema::IndexRecordOption;
+
+        let file_hash_index = build_file_hash_index(&manifest);
+
+        let mut errors = Vec::new();
+        let mut checked = 0;
+
+        // Test UUIDs from every file, at various positions within files
+        let test_positions = vec![0, 1, 249, 250, 499]; // first, second, middle, near-end, last
+        for file_idx in 0..num_files {
+            let tag = format!("file{}", file_idx);
+            let expected_file_name = format!("part-{:04}.parquet", file_idx);
+
+            for &row_in_file in &test_positions {
+                if row_in_file >= rows_per_file {
+                    continue;
+                }
+                let uuid = format!("uuid-{}-{}", tag, row_in_file);
+
+                // Search for this exact UUID (indexed with "raw" tokenizer)
+                let term = tantivy::Term::from_field_text(uuid_field, &uuid);
+                let query = TermQuery::new(term, IndexRecordOption::Basic);
+                let top_docs = searcher
+                    .search(&query, &tantivy::collector::TopDocs::with_limit(1))
+                    .unwrap();
+
+                if top_docs.is_empty() {
+                    errors.push(format!(
+                        "SEARCH MISS: uuid='{}' (file={}, row={}) not found!",
+                        uuid, file_idx, row_in_file
+                    ));
+                    continue;
+                }
+
+                let (_, doc_addr) = &top_docs[0];
+                let seg_ord = doc_addr.segment_ord as usize;
+                let doc_id = doc_addr.doc_id;
+
+                // Read the fast field values for this document
+                let seg_reader = &searcher.segment_readers()[seg_ord];
+                let ff = seg_reader.fast_fields();
+                let hash_col = ff.u64(PARQUET_FILE_HASH_FIELD)
+                    .expect("Missing __pq_file_hash fast field");
+                let row_col = ff.u64(PARQUET_ROW_IN_FILE_FIELD)
+                    .expect("Missing __pq_row_in_file fast field");
+
+                let file_hash: u64 = hash_col.values_for_doc(doc_id).next()
+                    .expect("No file hash value");
+                let actual_row_in_file: u64 = row_col.values_for_doc(doc_id).next()
+                    .expect("No row_in_file value");
+
+                // Resolve via the hash index
+                let location = match resolve_via_fast_fields(file_hash, actual_row_in_file, &file_hash_index) {
+                    Ok(loc) => loc,
+                    Err(e) => {
+                        errors.push(format!(
+                            "RESOLVE FAILED: uuid='{}' file_hash={} → {}",
+                            uuid, file_hash, e
+                        ));
+                        continue;
+                    }
+                };
+
+                // Verify the expected file hash matches
+                let expected_hash = hash_parquet_path(&expected_file_name);
+                if file_hash != expected_hash {
+                    errors.push(format!(
+                        "FILE HASH MISMATCH: uuid='{}' → hash={} but expected {} for '{}'  (seg={}, doc={})",
+                        uuid, file_hash, expected_hash, expected_file_name, seg_ord, doc_id
+                    ));
+                }
+
+                if location.file_idx != file_idx {
+                    errors.push(format!(
+                        "FILE IDX MISMATCH: uuid='{}' → file_idx={} but expected {}  (seg={}, doc={})",
+                        uuid, location.file_idx, file_idx, seg_ord, doc_id
+                    ));
+                }
+
+                if actual_row_in_file != row_in_file as u64 {
+                    errors.push(format!(
+                        "ROW_IN_FILE MISMATCH: uuid='{}' → row_in_file={} but expected {}  (file_idx={}, seg={}, doc={})",
+                        uuid, actual_row_in_file, row_in_file, location.file_idx, seg_ord, doc_id
+                    ));
+                }
+
+                checked += 1;
+            }
+        }
+
+        eprintln!("Verified {} UUID lookups across {} files", checked, num_files);
+
+        // Report errors
+        if !errors.is_empty() {
+            eprintln!("\n❌ FOUND {} MAPPING ERRORS:", errors.len());
+            for (i, err) in errors.iter().enumerate().take(30) {
+                eprintln!("  [{}] {}", i, err);
+            }
+            if errors.len() > 30 {
+                eprintln!("  ... and {} more", errors.len() - 30);
+            }
+            panic!(
+                "Doc ID → parquet row mapping has {} errors (shown first 30 above).",
+                errors.len()
+            );
+        }
+
+        eprintln!(
+            "✅ All {} UUID lookups verified: fast-field-based doc → parquet mapping is correct across {} segments",
+            checked, num_segments
+        );
+    }
+
+    /// Documents that tantivy merge does NOT preserve insertion order when
+    /// SegmentManager uses HashMap. This is the known behavior that motivates
+    /// the __pq_file_hash / __pq_row_in_file fast field approach.
+    #[test]
+    fn test_tantivy_merge_reorders_docs() {
+        use tantivy::schema::{SchemaBuilder, STORED, INDEXED, STRING};
+        use tantivy::query::TermQuery;
+        use tantivy::schema::IndexRecordOption;
+        use tantivy::collector::TopDocs;
+        use tantivy::indexer::NoMergePolicy;
+        use tantivy::Index;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+
+        let mut schema_builder = SchemaBuilder::new();
+        let id_field = schema_builder.add_u64_field("id", INDEXED | STORED);
+        let tag_field = schema_builder.add_text_field("tag", STRING | STORED);
+        let mut extra_fields = Vec::new();
+        for i in 0..50 {
+            extra_fields.push(schema_builder.add_text_field(&format!("col_{}", i), STRING));
+        }
+        let schema = schema_builder.build();
+
+        let index = Index::create_in_dir(temp_dir.path(), schema.clone()).unwrap();
+        let mut writer = index.writer_with_num_threads(1, 15_000_000).unwrap();
+        writer.set_merge_policy(Box::new(NoMergePolicy));
+
+        let num_docs = 5000u64;
+        for i in 0..num_docs {
+            let mut doc = tantivy::TantivyDocument::new();
+            doc.add_u64(id_field, i);
+            doc.add_text(tag_field, &format!("tag_{}", i));
+            for (j, f) in extra_fields.iter().enumerate() {
+                doc.add_text(*f, &format!("val_{}_{}", j, i));
+            }
+            writer.add_document(doc).unwrap();
+        }
+        writer.commit().unwrap();
+
+        let segment_ids = index.searchable_segment_ids().unwrap();
+        let num_segs = segment_ids.len();
+
+        if num_segs > 1 {
+            writer.merge(&segment_ids).wait().unwrap();
+            writer.commit().unwrap();
+            index.load_metas().unwrap();
+        }
+
+        let reader = index.reader().unwrap();
+        reader.reload().unwrap();
+        let searcher = reader.searcher();
+
+        let mut reordered = 0;
+        let test_ids: Vec<u64> = vec![0, 1, 100, 256, 257, 500, 999, 1000, 1500, 2000, 3000, 4000, 4999];
+        for expected_id in &test_ids {
+            let term = tantivy::Term::from_field_text(tag_field, &format!("tag_{}", expected_id));
+            let query = TermQuery::new(term, IndexRecordOption::Basic);
+            let top = searcher.search(&query, &TopDocs::with_limit(1)).unwrap();
+            if let Some((_, addr)) = top.first() {
+                if addr.doc_id as u64 != *expected_id {
+                    reordered += 1;
+                }
+            }
+        }
+
+        // With multiple segments, merge should reorder some docs
+        // (this is the known behavior that motivated the fast-field fix)
+        if num_segs > 1 {
+            assert!(reordered > 0,
+                "Expected merge to reorder some docs (had {} segments), but all were in order. \
+                 This test documents known tantivy behavior.", num_segs);
+        }
+        eprintln!(
+            "Confirmed: tantivy merge reordered {}/{} test docs across {} segments (expected behavior)",
+            reordered, test_ids.len(), num_segs
+        );
     }
 }

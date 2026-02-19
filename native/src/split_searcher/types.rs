@@ -79,6 +79,9 @@ pub(crate) struct CachedSearcherContext {
     // Dictionary pages are large (800KB-1MB) and must be fetched for every doc retrieval.
     // This cache ensures they're fetched from S3/Azure only once and reused across calls.
     pub(crate) parquet_byte_range_cache: crate::parquet_companion::cached_reader::ByteRangeCache,
+    // Parquet companion mode: pre-built lookup from file path hash → file index.
+    // Built once from manifest.parquet_files, used for O(1) fast-field-based doc resolution.
+    pub(crate) parquet_file_hash_index: HashMap<u64, usize>,
 }
 
 impl CachedSearcherContext {
