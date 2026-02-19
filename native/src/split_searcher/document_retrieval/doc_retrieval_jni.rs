@@ -832,12 +832,9 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_nati
         );
     }
 
-    // Retrieve document from parquet via the manifest
+    // Retrieve document from parquet via fast field resolution
     let result = with_arc_safe(searcher_ptr, |ctx: &Arc<CachedSearcherContext>| {
         let manifest = ctx.parquet_manifest.as_ref().unwrap();
-        // Use parquet_storage (rooted at table_root) for parquet file access.
-        // If parquet_storage is None, parquet_table_root was not provided — return
-        // an explicit error instead of silently falling back to the wrong storage.
         let storage = match ctx.parquet_storage.as_ref() {
             Some(s) => s.clone(),
             None => {
@@ -856,20 +853,40 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_nati
         let metadata_cache = &ctx.parquet_metadata_cache;
         let byte_cache = &ctx.parquet_byte_range_cache;
 
+        let seg_ord = segment_ord as u32;
+        let doc = doc_id as u32;
+
         let runtime = crate::runtime_manager::QuickwitRuntimeManager::global().handle();
         let _guard = runtime.enter();
 
         tokio::task::block_in_place(|| {
             runtime.block_on(async {
-                crate::parquet_companion::doc_retrieval::retrieve_document_from_parquet(
+                // Lazy-load __pq fast field data for this segment (reads .fast bytes
+                // from split bundle via async storage — HotDirectory hotcache doesn't
+                // include these columns so sync reads fail).
+                ctx.ensure_pq_segment_loaded(seg_ord).await
+                    .map_err(|e| anyhow::anyhow!("Failed to load __pq fields: {}", e))?;
+
+                let (file_hash, row_in_file) = ctx.get_pq_location(seg_ord, doc)?;
+
+                let location = crate::parquet_companion::docid_mapping::resolve_via_fast_fields(
+                    file_hash, row_in_file, &ctx.parquet_file_hash_index,
+                ).map_err(|e| anyhow::anyhow!("{}", e))?;
+
+                debug_println!(
+                    "📖 PARQUET_DOC: Resolved seg={} doc={} → file[{}] row={}",
+                    seg_ord, doc, location.file_idx, location.row_in_file
+                );
+
+                crate::parquet_companion::doc_retrieval::retrieve_document_by_location(
                     manifest,
-                    segment_ord as u32,
-                    doc_id as u32,
+                    location.file_idx,
+                    location.row_in_file,
                     projected_fields.as_deref(),
                     &storage,
                     Some(metadata_cache),
                     Some(byte_cache),
-                    None, // use default CoalesceConfig (512KB gap, 8MB max)
+                    None,
                 )
                 .await
             })
@@ -1001,12 +1018,9 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_nati
         .map(|(&seg, &doc)| (seg, doc))
         .collect();
 
-    // Batch retrieve from parquet, serializing directly to TANT binary format
+    // Batch retrieve: resolve all doc addresses via fast fields, then group by file
     let result = with_arc_safe(searcher_ptr, |ctx: &Arc<CachedSearcherContext>| {
         let manifest = ctx.parquet_manifest.as_ref().unwrap();
-        // Use parquet_storage (rooted at table_root) for parquet file access.
-        // If parquet_storage is None, parquet_table_root was not provided — return
-        // an explicit error instead of silently falling back to the wrong storage.
         let storage = match ctx.parquet_storage.as_ref() {
             Some(s) => s.clone(),
             None => {
@@ -1030,14 +1044,36 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_nati
 
         tokio::task::block_in_place(|| {
             runtime.block_on(async {
-                crate::parquet_companion::arrow_to_tant::batch_parquet_to_tant_buffer(
-                    &addresses,
+                // Lazy-load __pq fast field data for all segments we need.
+                // Reads .fast bytes from split bundle via async storage — HotDirectory
+                // hotcache doesn't include these columns so sync reads fail.
+                let unique_segments: std::collections::HashSet<u32> = addresses.iter()
+                    .map(|&(seg, _)| seg).collect();
+                for &seg in &unique_segments {
+                    ctx.ensure_pq_segment_loaded(seg).await
+                        .map_err(|e| anyhow::anyhow!("Failed to load __pq fields for seg {}: {}", seg, e))?;
+                }
+
+                // Resolve all addresses via pre-loaded __pq data
+                let mut resolved_locations: Vec<(usize, u64, u64)> = Vec::with_capacity(addresses.len());
+                for (idx, &(seg_ord, doc_id)) in addresses.iter().enumerate() {
+                    let (file_hash, row_in_file) = ctx.get_pq_location(seg_ord, doc_id)?;
+                    resolved_locations.push((idx, file_hash, row_in_file));
+                }
+
+                let groups = crate::parquet_companion::docid_mapping::group_resolved_locations_by_file(
+                    &resolved_locations, &ctx.parquet_file_hash_index,
+                ).map_err(|e| anyhow::anyhow!("{}", e))?;
+
+                crate::parquet_companion::arrow_to_tant::batch_parquet_to_tant_buffer_by_groups(
+                    groups,
+                    addresses.len(),
                     projected_fields.as_deref(),
                     manifest,
                     &storage,
                     Some(metadata_cache),
                     Some(byte_cache),
-                    None, // use default CoalesceConfig (512KB gap, 8MB max)
+                    None,
                 )
                 .await
             })

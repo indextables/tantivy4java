@@ -68,9 +68,10 @@ pub fn combine_parquet_manifests(
     }
 
     // Validate: no deletions in any source split.
-    // Parquet companion mode requires identity doc ID mapping (tantivy doc N = parquet row N).
-    // Deletions break this mapping because tantivy compacts away deleted docs during merge,
-    // shifting doc IDs, while the manifest still points to the original parquet rows.
+    // While fast-field-based resolution (__pq_file_hash / __pq_row_in_file) survives
+    // segment merges, split-level merges with deletions are still rejected because
+    // the deleted docs' fast field data would be discarded during compaction,
+    // creating mismatches if those docs are referenced by other structures.
     for (i, dir) in source_dirs.iter().enumerate() {
         let meta_path = dir.join("meta.json");
         if meta_path.exists() {

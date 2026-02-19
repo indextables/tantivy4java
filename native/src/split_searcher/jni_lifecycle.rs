@@ -766,11 +766,42 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_crea
                             let cached_searcher = std::sync::Arc::new(index_reader.searcher());
                             debug_println!("🔥 SEARCHER CACHED: Created cached searcher following Quickwit's exact pattern for optimal cache reuse");
 
+                            // Detect whether this split has merge-safe doc tracking fast fields.
+                            // Check the schema (not the segment fast field reader) because the
+                            // HotDirectory delegates to StorageDirectory for bytes not in the
+                            // hotcache, and StorageDirectory only supports async reads.
+                            let has_merge_safe_tracking = if parquet_manifest.is_some() {
+                                let schema = cached_index.schema();
+                                schema.get_field(crate::parquet_companion::indexing::PARQUET_FILE_HASH_FIELD).is_ok()
+                                    && schema.get_field(crate::parquet_companion::indexing::PARQUET_ROW_IN_FILE_FIELD).is_ok()
+                            } else {
+                                false
+                            };
+
+                            // Reject old-style parquet companion splits that lack fast field tracking.
+                            // These splits have broken doc_id→parquet row mapping after segment merges.
+                            if parquet_manifest.is_some() && !has_merge_safe_tracking {
+                                runtime.unregister_searcher();
+                                to_java_exception(&mut env, &anyhow::anyhow!(
+                                    "This parquet companion split was indexed before merge-safe \
+                                     doc tracking was added (missing {} fast field). \
+                                     Document retrieval from these splits returns incorrect rows. \
+                                     Please re-index the split using the current version.",
+                                    crate::parquet_companion::indexing::PARQUET_FILE_HASH_FIELD
+                                ));
+                                return 0;
+                            }
+
                             // ✅ FIX: Always use index.schema() for now - doc_mapping reconstruction has issues with dynamic JSON fields
                             debug_println!("RUST DEBUG: 🔧 Using index.schema() directly (doc_mapping has compatibility issues with dynamic JSON fields)");
                             let schema = cached_index.schema();
                             let schema_ptr = crate::utils::arc_to_jlong(std::sync::Arc::new(schema));
                             debug_println!("RUST DEBUG: 🔧 Created schema_ptr={} from reconstructed schema", schema_ptr);
+
+                            // Build file hash index before parquet_manifest is moved into the struct
+                            let parquet_file_hash_index = parquet_manifest.as_ref()
+                                .map(|m| crate::parquet_companion::docid_mapping::build_file_hash_index(m))
+                                .unwrap_or_default();
 
                             // Create clean struct-based context instead of complex tuple
                             let cached_context = CachedSearcherContext {
@@ -795,6 +826,9 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_crea
                                 segment_fast_paths,
                                 parquet_metadata_cache: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
                                 parquet_byte_range_cache: crate::parquet_companion::cached_reader::new_byte_range_cache(),
+                                parquet_file_hash_index,
+                                has_merge_safe_tracking,
+                                pq_doc_locations: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
                             };
 
                             let searcher_context = std::sync::Arc::new(cached_context);

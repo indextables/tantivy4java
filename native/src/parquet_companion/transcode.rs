@@ -468,7 +468,7 @@ pub fn merge_columnar_bytes(
 ///
 /// ColumnarReader expects just the columnar body (which has its own internal footer),
 /// so we must strip the outer tantivy Footer first.
-fn strip_tantivy_footer(fast_bytes: &[u8]) -> Result<&[u8]> {
+pub(crate) fn strip_tantivy_footer(fast_bytes: &[u8]) -> Result<&[u8]> {
     if fast_bytes.len() < 8 {
         anyhow::bail!("Fast file too small to contain footer ({} bytes)", fast_bytes.len());
     }

@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 use super::manifest::ParquetManifest;
+use super::indexing::hash_parquet_path;
 
 /// Result of locating a row in a specific parquet file
 #[derive(Debug, Clone)]
@@ -111,6 +112,67 @@ pub fn group_doc_addresses_by_file(
             .entry(location.file_idx)
             .or_default()
             .push((idx, location.row_in_file));
+    }
+
+    // Sort each file's rows for sequential access
+    for rows in groups.values_mut() {
+        rows.sort_by_key(|&(_, row)| row);
+    }
+
+    Ok(groups)
+}
+
+/// Build a lookup table from parquet file path hash → index into manifest.parquet_files.
+///
+/// This enables O(1) resolution from the __pq_file_hash fast field to the file entry.
+/// Should be built once at searcher creation time and reused across all retrievals.
+pub fn build_file_hash_index(manifest: &ParquetManifest) -> HashMap<u64, usize> {
+    manifest
+        .parquet_files
+        .iter()
+        .enumerate()
+        .map(|(idx, entry)| (hash_parquet_path(&entry.relative_path), idx))
+        .collect()
+}
+
+/// Resolve a document's parquet location using fast field values.
+///
+/// Instead of the old segment_ord → global_row → file lookup, this uses
+/// the __pq_file_hash and __pq_row_in_file values stored as fast fields
+/// in each tantivy document. These values survive all merge operations.
+pub fn resolve_via_fast_fields(
+    file_hash: u64,
+    row_in_file: u64,
+    file_hash_index: &HashMap<u64, usize>,
+) -> Result<FileRowLocation, String> {
+    let file_idx = *file_hash_index
+        .get(&file_hash)
+        .ok_or_else(|| format!(
+            "No parquet file found for hash {} — the split may reference \
+             a file not in the current manifest", file_hash
+        ))?;
+    Ok(FileRowLocation { file_idx, row_in_file })
+}
+
+/// Group pre-resolved fast field locations by their target parquet file.
+///
+/// Each entry in `locations` is (original_index, file_hash, row_in_file).
+/// Returns a map from file_idx to a list of (original_index, row_in_file),
+/// sorted by row_in_file for sequential access within each file.
+pub fn group_resolved_locations_by_file(
+    locations: &[(usize, u64, u64)], // (original_idx, file_hash, row_in_file)
+    file_hash_index: &HashMap<u64, usize>,
+) -> Result<HashMap<usize, Vec<(usize, u64)>>, String> {
+    let mut groups: HashMap<usize, Vec<(usize, u64)>> = HashMap::new();
+
+    for &(orig_idx, file_hash, row_in_file) in locations {
+        let file_idx = *file_hash_index
+            .get(&file_hash)
+            .ok_or_else(|| format!(
+                "No parquet file found for hash {} at index {}",
+                file_hash, orig_idx
+            ))?;
+        groups.entry(file_idx).or_default().push((orig_idx, row_in_file));
     }
 
     // Sort each file's rows for sequential access
@@ -231,6 +293,71 @@ mod tests {
             (0, 100),        // file 0, row 100
         ];
         let groups = group_doc_addresses_by_file(&addresses, &manifest).unwrap();
+
+        // File 0 should have indices 0 and 3 (sorted by row)
+        let file0 = &groups[&0];
+        assert_eq!(file0.len(), 2);
+        assert_eq!(file0[0], (3, 100));  // original idx 3, row 100
+        assert_eq!(file0[1], (0, 500));  // original idx 0, row 500
+
+        // File 1 should have index 1
+        let file1 = &groups[&1];
+        assert_eq!(file1.len(), 1);
+        assert_eq!(file1[0], (1, 500));
+
+        // File 2 should have index 2
+        let file2 = &groups[&2];
+        assert_eq!(file2.len(), 1);
+        assert_eq!(file2[0], (2, 500));
+    }
+
+    #[test]
+    fn test_build_file_hash_index() {
+        let manifest = make_multi_file_manifest();
+        let index = build_file_hash_index(&manifest);
+
+        assert_eq!(index.len(), 3);
+        assert_eq!(index[&hash_parquet_path("part-0001.parquet")], 0);
+        assert_eq!(index[&hash_parquet_path("part-0002.parquet")], 1);
+        assert_eq!(index[&hash_parquet_path("part-0003.parquet")], 2);
+    }
+
+    #[test]
+    fn test_resolve_via_fast_fields() {
+        let manifest = make_multi_file_manifest();
+        let index = build_file_hash_index(&manifest);
+
+        let hash1 = hash_parquet_path("part-0001.parquet");
+        let loc = resolve_via_fast_fields(hash1, 42, &index).unwrap();
+        assert_eq!(loc.file_idx, 0);
+        assert_eq!(loc.row_in_file, 42);
+
+        let hash3 = hash_parquet_path("part-0003.parquet");
+        let loc = resolve_via_fast_fields(hash3, 999, &index).unwrap();
+        assert_eq!(loc.file_idx, 2);
+        assert_eq!(loc.row_in_file, 999);
+
+        // Unknown hash should fail
+        assert!(resolve_via_fast_fields(12345, 0, &index).is_err());
+    }
+
+    #[test]
+    fn test_group_resolved_locations_by_file() {
+        let manifest = make_multi_file_manifest();
+        let index = build_file_hash_index(&manifest);
+
+        let hash0 = hash_parquet_path("part-0001.parquet");
+        let hash1 = hash_parquet_path("part-0002.parquet");
+        let hash2 = hash_parquet_path("part-0003.parquet");
+
+        let locations = vec![
+            (0, hash0, 500u64),  // file 0, row 500
+            (1, hash1, 500),     // file 1, row 500
+            (2, hash2, 500),     // file 2, row 500
+            (3, hash0, 100),     // file 0, row 100
+        ];
+
+        let groups = group_resolved_locations_by_file(&locations, &index).unwrap();
 
         // File 0 should have indices 0 and 3 (sorted by row)
         let file0 = &groups[&0];

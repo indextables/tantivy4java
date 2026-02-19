@@ -206,11 +206,15 @@ pub fn extract_doc_mapping_from_index(tantivy_index: &tantivy::Index) -> Result<
 
         // Map Tantivy field types to Quickwit field mapping types
         let field_mapping = match field_entry.field_type() {
-            tantivy::schema::FieldType::Str(_) => {
-                // Text field
+            tantivy::schema::FieldType::Str(text_options) => {
+                // Text field - include tokenizer to preserve raw vs default distinction
+                let tokenizer = text_options.get_indexing_options()
+                    .map(|opts| opts.tokenizer().to_string())
+                    .unwrap_or_else(|| "default".to_string());
                 serde_json::json!({
                     "name": field_name,
                     "type": "text",
+                    "tokenizer": tokenizer,
                     "stored": field_entry.is_stored(),
                     "indexed": field_entry.is_indexed(),
                     "fast": field_entry.is_fast()
