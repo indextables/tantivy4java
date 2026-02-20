@@ -329,10 +329,12 @@ impl AsyncFileReader for CachedParquetReader {
             let metadata = parquet::file::metadata::ParquetMetaDataReader::new()
                 .with_offset_index_policy(PageIndexPolicy::Optional)
                 .with_prefetch_hint(Some(64 * 1024)) // prefetch 64KB footer
-                .load_and_finish(self, file_size)
+                .load_and_finish(&mut *self, file_size)
                 .await?;
 
-            Ok(Arc::new(metadata))
+            let metadata = Arc::new(metadata);
+            self.metadata = Some(metadata.clone());
+            Ok(metadata)
         }
         .boxed()
     }

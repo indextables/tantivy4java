@@ -535,7 +535,7 @@ fn add_arrow_value_to_doc(
 ) -> Result<()> {
     match data_type {
         DataType::Boolean => {
-            let arr = array.as_any().downcast_ref::<BooleanArray>().unwrap();
+            let arr = array.as_any().downcast_ref::<BooleanArray>().ok_or_else(|| anyhow::anyhow!("Expected BooleanArray array"))?;
             let val = arr.value(row_idx);
             doc.add_bool(field, val);
             if let Some(acc) = accumulators.get_mut(field_name) {
@@ -544,7 +544,7 @@ fn add_arrow_value_to_doc(
         }
 
         DataType::Int8 => {
-            let arr = array.as_any().downcast_ref::<Int8Array>().unwrap();
+            let arr = array.as_any().downcast_ref::<Int8Array>().ok_or_else(|| anyhow::anyhow!("Expected Int8Array array"))?;
             let val = arr.value(row_idx) as i64;
             doc.add_i64(field, val);
             if let Some(acc) = accumulators.get_mut(field_name) {
@@ -552,7 +552,7 @@ fn add_arrow_value_to_doc(
             }
         }
         DataType::Int16 => {
-            let arr = array.as_any().downcast_ref::<Int16Array>().unwrap();
+            let arr = array.as_any().downcast_ref::<Int16Array>().ok_or_else(|| anyhow::anyhow!("Expected Int16Array array"))?;
             let val = arr.value(row_idx) as i64;
             doc.add_i64(field, val);
             if let Some(acc) = accumulators.get_mut(field_name) {
@@ -560,7 +560,7 @@ fn add_arrow_value_to_doc(
             }
         }
         DataType::Int32 => {
-            let arr = array.as_any().downcast_ref::<Int32Array>().unwrap();
+            let arr = array.as_any().downcast_ref::<Int32Array>().ok_or_else(|| anyhow::anyhow!("Expected Int32Array array"))?;
             let val = arr.value(row_idx) as i64;
             doc.add_i64(field, val);
             if let Some(acc) = accumulators.get_mut(field_name) {
@@ -568,7 +568,7 @@ fn add_arrow_value_to_doc(
             }
         }
         DataType::Int64 => {
-            let arr = array.as_any().downcast_ref::<Int64Array>().unwrap();
+            let arr = array.as_any().downcast_ref::<Int64Array>().ok_or_else(|| anyhow::anyhow!("Expected Int64Array array"))?;
             let val = arr.value(row_idx);
             doc.add_i64(field, val);
             if let Some(acc) = accumulators.get_mut(field_name) {
@@ -577,28 +577,40 @@ fn add_arrow_value_to_doc(
         }
 
         DataType::UInt8 => {
-            let arr = array.as_any().downcast_ref::<UInt8Array>().unwrap();
+            let arr = array.as_any().downcast_ref::<UInt8Array>().ok_or_else(|| anyhow::anyhow!("Expected UInt8Array array"))?;
             let val = arr.value(row_idx) as u64;
             doc.add_u64(field, val);
+            if let Some(acc) = accumulators.get_mut(field_name) {
+                acc.observe_i64(val as i64);
+            }
         }
         DataType::UInt16 => {
-            let arr = array.as_any().downcast_ref::<UInt16Array>().unwrap();
+            let arr = array.as_any().downcast_ref::<UInt16Array>().ok_or_else(|| anyhow::anyhow!("Expected UInt16Array array"))?;
             let val = arr.value(row_idx) as u64;
             doc.add_u64(field, val);
+            if let Some(acc) = accumulators.get_mut(field_name) {
+                acc.observe_i64(val as i64);
+            }
         }
         DataType::UInt32 => {
-            let arr = array.as_any().downcast_ref::<UInt32Array>().unwrap();
+            let arr = array.as_any().downcast_ref::<UInt32Array>().ok_or_else(|| anyhow::anyhow!("Expected UInt32Array array"))?;
             let val = arr.value(row_idx) as u64;
             doc.add_u64(field, val);
+            if let Some(acc) = accumulators.get_mut(field_name) {
+                acc.observe_i64(val as i64);
+            }
         }
         DataType::UInt64 => {
-            let arr = array.as_any().downcast_ref::<UInt64Array>().unwrap();
+            let arr = array.as_any().downcast_ref::<UInt64Array>().ok_or_else(|| anyhow::anyhow!("Expected UInt64Array array"))?;
             let val = arr.value(row_idx);
             doc.add_u64(field, val);
+            if let Some(acc) = accumulators.get_mut(field_name) {
+                acc.observe_i64(val as i64);
+            }
         }
 
         DataType::Float32 => {
-            let arr = array.as_any().downcast_ref::<Float32Array>().unwrap();
+            let arr = array.as_any().downcast_ref::<Float32Array>().ok_or_else(|| anyhow::anyhow!("Expected Float32Array array"))?;
             let val = arr.value(row_idx) as f64;
             doc.add_f64(field, val);
             if let Some(acc) = accumulators.get_mut(field_name) {
@@ -606,7 +618,7 @@ fn add_arrow_value_to_doc(
             }
         }
         DataType::Float64 => {
-            let arr = array.as_any().downcast_ref::<Float64Array>().unwrap();
+            let arr = array.as_any().downcast_ref::<Float64Array>().ok_or_else(|| anyhow::anyhow!("Expected Float64Array array"))?;
             let val = arr.value(row_idx);
             doc.add_f64(field, val);
             if let Some(acc) = accumulators.get_mut(field_name) {
@@ -615,7 +627,7 @@ fn add_arrow_value_to_doc(
         }
 
         DataType::Utf8 => {
-            let arr = array.as_any().downcast_ref::<StringArray>().unwrap();
+            let arr = array.as_any().downcast_ref::<StringArray>().ok_or_else(|| anyhow::anyhow!("Expected StringArray array"))?;
             let val = arr.value(row_idx);
             if config.ip_address_fields.contains(field_name) {
                 add_ip_addr_value(doc, field, val, field_name)?;
@@ -629,7 +641,7 @@ fn add_arrow_value_to_doc(
             }
         }
         DataType::LargeUtf8 => {
-            let arr = array.as_any().downcast_ref::<LargeStringArray>().unwrap();
+            let arr = array.as_any().downcast_ref::<LargeStringArray>().ok_or_else(|| anyhow::anyhow!("Expected LargeStringArray array"))?;
             let val = arr.value(row_idx);
             if config.ip_address_fields.contains(field_name) {
                 add_ip_addr_value(doc, field, val, field_name)?;
@@ -644,30 +656,30 @@ fn add_arrow_value_to_doc(
         }
 
         DataType::Binary => {
-            let arr = array.as_any().downcast_ref::<BinaryArray>().unwrap();
+            let arr = array.as_any().downcast_ref::<BinaryArray>().ok_or_else(|| anyhow::anyhow!("Expected BinaryArray array"))?;
             doc.add_bytes(field, arr.value(row_idx));
         }
         DataType::LargeBinary => {
-            let arr = array.as_any().downcast_ref::<LargeBinaryArray>().unwrap();
+            let arr = array.as_any().downcast_ref::<LargeBinaryArray>().ok_or_else(|| anyhow::anyhow!("Expected LargeBinaryArray array"))?;
             doc.add_bytes(field, arr.value(row_idx));
         }
 
         DataType::Timestamp(unit, _tz) => {
             let micros = match unit {
                 TimeUnit::Second => {
-                    let arr = array.as_any().downcast_ref::<TimestampSecondArray>().unwrap();
+                    let arr = array.as_any().downcast_ref::<TimestampSecondArray>().ok_or_else(|| anyhow::anyhow!("Expected TimestampSecondArray array"))?;
                     arr.value(row_idx) * 1_000_000
                 }
                 TimeUnit::Millisecond => {
-                    let arr = array.as_any().downcast_ref::<TimestampMillisecondArray>().unwrap();
+                    let arr = array.as_any().downcast_ref::<TimestampMillisecondArray>().ok_or_else(|| anyhow::anyhow!("Expected TimestampMillisecondArray array"))?;
                     arr.value(row_idx) * 1_000
                 }
                 TimeUnit::Microsecond => {
-                    let arr = array.as_any().downcast_ref::<TimestampMicrosecondArray>().unwrap();
+                    let arr = array.as_any().downcast_ref::<TimestampMicrosecondArray>().ok_or_else(|| anyhow::anyhow!("Expected TimestampMicrosecondArray array"))?;
                     arr.value(row_idx)
                 }
                 TimeUnit::Nanosecond => {
-                    let arr = array.as_any().downcast_ref::<TimestampNanosecondArray>().unwrap();
+                    let arr = array.as_any().downcast_ref::<TimestampNanosecondArray>().ok_or_else(|| anyhow::anyhow!("Expected TimestampNanosecondArray array"))?;
                     arr.value(row_idx) / 1_000
                 }
             };
@@ -679,7 +691,7 @@ fn add_arrow_value_to_doc(
         }
 
         DataType::Date32 => {
-            let arr = array.as_any().downcast_ref::<Date32Array>().unwrap();
+            let arr = array.as_any().downcast_ref::<Date32Array>().ok_or_else(|| anyhow::anyhow!("Expected Date32Array array"))?;
             let days = arr.value(row_idx) as i64;
             let micros = days * 86_400 * 1_000_000;
             let dt = tantivy::DateTime::from_timestamp_micros(micros);
@@ -689,7 +701,7 @@ fn add_arrow_value_to_doc(
             }
         }
         DataType::Date64 => {
-            let arr = array.as_any().downcast_ref::<Date64Array>().unwrap();
+            let arr = array.as_any().downcast_ref::<Date64Array>().ok_or_else(|| anyhow::anyhow!("Expected Date64Array array"))?;
             let millis = arr.value(row_idx);
             let micros = millis * 1_000;
             let dt = tantivy::DateTime::from_timestamp_micros(micros);
@@ -700,7 +712,7 @@ fn add_arrow_value_to_doc(
         }
 
         DataType::Decimal128(_, scale) => {
-            let arr = array.as_any().downcast_ref::<Decimal128Array>().unwrap();
+            let arr = array.as_any().downcast_ref::<Decimal128Array>().ok_or_else(|| anyhow::anyhow!("Expected Decimal128Array array"))?;
             let raw = arr.value(row_idx); // i128 unscaled
             let val = raw as f64 / 10f64.powi(*scale as i32);
             doc.add_f64(field, val);
@@ -709,7 +721,7 @@ fn add_arrow_value_to_doc(
             }
         }
         DataType::Decimal256(_, scale) => {
-            let arr = array.as_any().downcast_ref::<Decimal256Array>().unwrap();
+            let arr = array.as_any().downcast_ref::<Decimal256Array>().ok_or_else(|| anyhow::anyhow!("Expected Decimal256Array array"))?;
             let raw = arr.value(row_idx); // i256
             // Convert to string representation to preserve full 256-bit precision
             let val = if *scale == 0 {
@@ -726,7 +738,7 @@ fn add_arrow_value_to_doc(
         }
 
         DataType::FixedSizeBinary(_) => {
-            let arr = array.as_any().downcast_ref::<FixedSizeBinaryArray>().unwrap();
+            let arr = array.as_any().downcast_ref::<FixedSizeBinaryArray>().ok_or_else(|| anyhow::anyhow!("Expected FixedSizeBinaryArray array"))?;
             doc.add_bytes(field, arr.value(row_idx));
         }
 
@@ -812,21 +824,28 @@ fn convert_complex_to_json(array: &ArrayRef, row_idx: usize) -> Result<serde_jso
 
     match array.data_type() {
         DataType::List(_) | DataType::LargeList(_) => {
-            let list_array = array.as_any().downcast_ref::<ListArray>();
-            if let Some(list_arr) = list_array {
+            // Try ListArray first, then LargeListArray
+            if let Some(list_arr) = array.as_any().downcast_ref::<ListArray>() {
                 let inner = list_arr.value(row_idx);
                 let mut items = Vec::new();
                 for i in 0..inner.len() {
                     items.push(convert_complex_to_json(&inner, i)?);
                 }
-                return Ok(serde_json::Value::Array(items));
+                Ok(serde_json::Value::Array(items))
+            } else if let Some(list_arr) = array.as_any().downcast_ref::<LargeListArray>() {
+                let inner = list_arr.value(row_idx);
+                let mut items = Vec::new();
+                for i in 0..inner.len() {
+                    items.push(convert_complex_to_json(&inner, i)?);
+                }
+                Ok(serde_json::Value::Array(items))
+            } else {
+                Ok(serde_json::Value::Null)
             }
-            // Fallback for LargeList
-            Ok(serde_json::Value::Null)
         }
 
         DataType::Struct(fields) => {
-            let struct_arr = array.as_any().downcast_ref::<StructArray>().unwrap();
+            let struct_arr = array.as_any().downcast_ref::<StructArray>().ok_or_else(|| anyhow::anyhow!("Expected StructArray array"))?;
             let mut map = serde_json::Map::new();
             for (i, field) in fields.iter().enumerate() {
                 let col = struct_arr.column(i);
@@ -840,40 +859,40 @@ fn convert_complex_to_json(array: &ArrayRef, row_idx: usize) -> Result<serde_jso
 
         // Scalar types inside complex types
         DataType::Boolean => {
-            let arr = array.as_any().downcast_ref::<BooleanArray>().unwrap();
+            let arr = array.as_any().downcast_ref::<BooleanArray>().ok_or_else(|| anyhow::anyhow!("Expected BooleanArray array"))?;
             Ok(serde_json::Value::Bool(arr.value(row_idx)))
         }
         DataType::Int32 => {
-            let arr = array.as_any().downcast_ref::<Int32Array>().unwrap();
+            let arr = array.as_any().downcast_ref::<Int32Array>().ok_or_else(|| anyhow::anyhow!("Expected Int32Array array"))?;
             Ok(serde_json::json!(arr.value(row_idx)))
         }
         DataType::Int64 => {
-            let arr = array.as_any().downcast_ref::<Int64Array>().unwrap();
+            let arr = array.as_any().downcast_ref::<Int64Array>().ok_or_else(|| anyhow::anyhow!("Expected Int64Array array"))?;
             Ok(serde_json::json!(arr.value(row_idx)))
         }
         DataType::Float64 => {
-            let arr = array.as_any().downcast_ref::<Float64Array>().unwrap();
+            let arr = array.as_any().downcast_ref::<Float64Array>().ok_or_else(|| anyhow::anyhow!("Expected Float64Array array"))?;
             Ok(serde_json::json!(arr.value(row_idx)))
         }
         DataType::Utf8 => {
-            let arr = array.as_any().downcast_ref::<StringArray>().unwrap();
+            let arr = array.as_any().downcast_ref::<StringArray>().ok_or_else(|| anyhow::anyhow!("Expected StringArray array"))?;
             Ok(serde_json::Value::String(arr.value(row_idx).to_string()))
         }
         DataType::Decimal128(_, scale) => {
-            let arr = array.as_any().downcast_ref::<Decimal128Array>().unwrap();
+            let arr = array.as_any().downcast_ref::<Decimal128Array>().ok_or_else(|| anyhow::anyhow!("Expected Decimal128Array array"))?;
             let raw = arr.value(row_idx) as f64;
             let val = raw / 10f64.powi(*scale as i32);
             Ok(serde_json::json!(val))
         }
         DataType::Decimal256(_, scale) => {
-            let arr = array.as_any().downcast_ref::<Decimal256Array>().unwrap();
+            let arr = array.as_any().downcast_ref::<Decimal256Array>().ok_or_else(|| anyhow::anyhow!("Expected Decimal256Array array"))?;
             let raw = arr.value(row_idx);
             let val: f64 = raw.to_string().parse::<f64>().unwrap_or(0.0)
                 / 10f64.powi(*scale as i32);
             Ok(serde_json::json!(val))
         }
         DataType::FixedSizeBinary(_) => {
-            let arr = array.as_any().downcast_ref::<FixedSizeBinaryArray>().unwrap();
+            let arr = array.as_any().downcast_ref::<FixedSizeBinaryArray>().ok_or_else(|| anyhow::anyhow!("Expected FixedSizeBinaryArray array"))?;
             Ok(serde_json::Value::String(base64::Engine::encode(
                 &base64::engine::general_purpose::STANDARD,
                 arr.value(row_idx),

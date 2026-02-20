@@ -106,57 +106,57 @@ fn write_arrow_value_to_tant(
 
     match data_type {
         DataType::Boolean => {
-            let arr = array.as_any().downcast_ref::<BooleanArray>().unwrap();
+            let arr = array.as_any().downcast_ref::<BooleanArray>().ok_or_else(|| anyhow::anyhow!("Expected BooleanArray array"))?;
             buf.push(if arr.value(row_idx) { 1 } else { 0 });
         }
         DataType::Int8 => {
-            let arr = array.as_any().downcast_ref::<Int8Array>().unwrap();
+            let arr = array.as_any().downcast_ref::<Int8Array>().ok_or_else(|| anyhow::anyhow!("Expected Int8Array array"))?;
             buf.extend_from_slice(&(arr.value(row_idx) as i64).to_ne_bytes());
         }
         DataType::Int16 => {
-            let arr = array.as_any().downcast_ref::<Int16Array>().unwrap();
+            let arr = array.as_any().downcast_ref::<Int16Array>().ok_or_else(|| anyhow::anyhow!("Expected Int16Array array"))?;
             buf.extend_from_slice(&(arr.value(row_idx) as i64).to_ne_bytes());
         }
         DataType::Int32 => {
-            let arr = array.as_any().downcast_ref::<Int32Array>().unwrap();
+            let arr = array.as_any().downcast_ref::<Int32Array>().ok_or_else(|| anyhow::anyhow!("Expected Int32Array array"))?;
             buf.extend_from_slice(&(arr.value(row_idx) as i64).to_ne_bytes());
         }
         DataType::Int64 => {
-            let arr = array.as_any().downcast_ref::<Int64Array>().unwrap();
+            let arr = array.as_any().downcast_ref::<Int64Array>().ok_or_else(|| anyhow::anyhow!("Expected Int64Array array"))?;
             buf.extend_from_slice(&arr.value(row_idx).to_ne_bytes());
         }
         DataType::UInt8 => {
-            let arr = array.as_any().downcast_ref::<UInt8Array>().unwrap();
+            let arr = array.as_any().downcast_ref::<UInt8Array>().ok_or_else(|| anyhow::anyhow!("Expected UInt8Array array"))?;
             buf.extend_from_slice(&(arr.value(row_idx) as u64).to_ne_bytes());
         }
         DataType::UInt16 => {
-            let arr = array.as_any().downcast_ref::<UInt16Array>().unwrap();
+            let arr = array.as_any().downcast_ref::<UInt16Array>().ok_or_else(|| anyhow::anyhow!("Expected UInt16Array array"))?;
             buf.extend_from_slice(&(arr.value(row_idx) as u64).to_ne_bytes());
         }
         DataType::UInt32 => {
-            let arr = array.as_any().downcast_ref::<UInt32Array>().unwrap();
+            let arr = array.as_any().downcast_ref::<UInt32Array>().ok_or_else(|| anyhow::anyhow!("Expected UInt32Array array"))?;
             buf.extend_from_slice(&(arr.value(row_idx) as u64).to_ne_bytes());
         }
         DataType::UInt64 => {
-            let arr = array.as_any().downcast_ref::<UInt64Array>().unwrap();
+            let arr = array.as_any().downcast_ref::<UInt64Array>().ok_or_else(|| anyhow::anyhow!("Expected UInt64Array array"))?;
             buf.extend_from_slice(&arr.value(row_idx).to_ne_bytes());
         }
         DataType::Float32 => {
-            let arr = array.as_any().downcast_ref::<Float32Array>().unwrap();
+            let arr = array.as_any().downcast_ref::<Float32Array>().ok_or_else(|| anyhow::anyhow!("Expected Float32Array array"))?;
             buf.extend_from_slice(&(arr.value(row_idx) as f64).to_ne_bytes());
         }
         DataType::Float64 => {
-            let arr = array.as_any().downcast_ref::<Float64Array>().unwrap();
+            let arr = array.as_any().downcast_ref::<Float64Array>().ok_or_else(|| anyhow::anyhow!("Expected Float64Array array"))?;
             buf.extend_from_slice(&arr.value(row_idx).to_ne_bytes());
         }
         DataType::Decimal128(_, scale) => {
-            let arr = array.as_any().downcast_ref::<Decimal128Array>().unwrap();
+            let arr = array.as_any().downcast_ref::<Decimal128Array>().ok_or_else(|| anyhow::anyhow!("Expected Decimal128Array array"))?;
             let raw = arr.value(row_idx) as f64;
             let val = raw / 10f64.powi(*scale as i32);
             buf.extend_from_slice(&val.to_ne_bytes());
         }
         DataType::Decimal256(_, scale) => {
-            let arr = array.as_any().downcast_ref::<Decimal256Array>().unwrap();
+            let arr = array.as_any().downcast_ref::<Decimal256Array>().ok_or_else(|| anyhow::anyhow!("Expected Decimal256Array array"))?;
             let raw = arr.value(row_idx);
             let s = if *scale == 0 {
                 raw.to_string()
@@ -170,27 +170,27 @@ fn write_arrow_value_to_tant(
             buf.extend_from_slice(bytes);
         }
         DataType::Utf8 => {
-            let arr = array.as_any().downcast_ref::<StringArray>().unwrap();
+            let arr = array.as_any().downcast_ref::<StringArray>().ok_or_else(|| anyhow::anyhow!("Expected StringArray array"))?;
             let s = arr.value(row_idx);
             let bytes = s.as_bytes();
             buf.extend_from_slice(&(bytes.len() as u32).to_ne_bytes());
             buf.extend_from_slice(bytes);
         }
         DataType::LargeUtf8 => {
-            let arr = array.as_any().downcast_ref::<LargeStringArray>().unwrap();
+            let arr = array.as_any().downcast_ref::<LargeStringArray>().ok_or_else(|| anyhow::anyhow!("Expected LargeStringArray array"))?;
             let s = arr.value(row_idx);
             let bytes = s.as_bytes();
             buf.extend_from_slice(&(bytes.len() as u32).to_ne_bytes());
             buf.extend_from_slice(bytes);
         }
         DataType::Binary => {
-            let arr = array.as_any().downcast_ref::<BinaryArray>().unwrap();
+            let arr = array.as_any().downcast_ref::<BinaryArray>().ok_or_else(|| anyhow::anyhow!("Expected BinaryArray array"))?;
             let bytes = arr.value(row_idx);
             buf.extend_from_slice(&(bytes.len() as u32).to_ne_bytes());
             buf.extend_from_slice(bytes);
         }
         DataType::LargeBinary => {
-            let arr = array.as_any().downcast_ref::<LargeBinaryArray>().unwrap();
+            let arr = array.as_any().downcast_ref::<LargeBinaryArray>().ok_or_else(|| anyhow::anyhow!("Expected LargeBinaryArray array"))?;
             let bytes = arr.value(row_idx);
             buf.extend_from_slice(&(bytes.len() as u32).to_ne_bytes());
             buf.extend_from_slice(bytes);
@@ -199,7 +199,7 @@ fn write_arrow_value_to_tant(
             let arr = array
                 .as_any()
                 .downcast_ref::<FixedSizeBinaryArray>()
-                .unwrap();
+                .ok_or_else(|| anyhow::anyhow!("Expected FixedSizeBinaryArray array"))?;
             let bytes = arr.value(row_idx);
             buf.extend_from_slice(&(bytes.len() as u32).to_ne_bytes());
             buf.extend_from_slice(bytes);
@@ -211,40 +211,43 @@ fn write_arrow_value_to_tant(
                     let arr = array
                         .as_any()
                         .downcast_ref::<TimestampSecondArray>()
-                        .unwrap();
-                    arr.value(row_idx) * 1_000_000_000
+                        .ok_or_else(|| anyhow::anyhow!("Expected TimestampSecondArray array"))?;
+                    arr.value(row_idx).checked_mul(1_000_000_000)
+                        .ok_or_else(|| anyhow::anyhow!("Timestamp seconds overflow converting to nanos"))?
                 }
                 TimeUnit::Millisecond => {
                     let arr = array
                         .as_any()
                         .downcast_ref::<TimestampMillisecondArray>()
-                        .unwrap();
-                    arr.value(row_idx) * 1_000_000
+                        .ok_or_else(|| anyhow::anyhow!("Expected TimestampMillisecondArray array"))?;
+                    arr.value(row_idx).checked_mul(1_000_000)
+                        .ok_or_else(|| anyhow::anyhow!("Timestamp millis overflow converting to nanos"))?
                 }
                 TimeUnit::Microsecond => {
                     let arr = array
                         .as_any()
                         .downcast_ref::<TimestampMicrosecondArray>()
-                        .unwrap();
-                    arr.value(row_idx) * 1_000
+                        .ok_or_else(|| anyhow::anyhow!("Expected TimestampMicrosecondArray array"))?;
+                    arr.value(row_idx).checked_mul(1_000)
+                        .ok_or_else(|| anyhow::anyhow!("Timestamp micros overflow converting to nanos"))?
                 }
                 TimeUnit::Nanosecond => {
                     let arr = array
                         .as_any()
                         .downcast_ref::<TimestampNanosecondArray>()
-                        .unwrap();
+                        .ok_or_else(|| anyhow::anyhow!("Expected TimestampNanosecondArray array"))?;
                     arr.value(row_idx)
                 }
             };
             buf.extend_from_slice(&nanos.to_ne_bytes());
         }
         DataType::Date32 => {
-            let arr = array.as_any().downcast_ref::<Date32Array>().unwrap();
+            let arr = array.as_any().downcast_ref::<Date32Array>().ok_or_else(|| anyhow::anyhow!("Expected Date32Array array"))?;
             let nanos = arr.value(row_idx) as i64 * 86_400 * 1_000_000_000;
             buf.extend_from_slice(&nanos.to_ne_bytes());
         }
         DataType::Date64 => {
-            let arr = array.as_any().downcast_ref::<Date64Array>().unwrap();
+            let arr = array.as_any().downcast_ref::<Date64Array>().ok_or_else(|| anyhow::anyhow!("Expected Date64Array array"))?;
             let nanos = arr.value(row_idx) * 1_000_000;
             buf.extend_from_slice(&nanos.to_ne_bytes());
         }
