@@ -336,8 +336,15 @@ public class ParquetCompanionPrewarmCacheTest {
             System.out.println("   Total prewarm downloads: " + afterAllPrewarm.getTotalDownloads()
                     + " (" + afterAllPrewarm.getTotalBytes() + " bytes)");
 
-            // Wait for async disk cache writes
-            Thread.sleep(2000);
+            // Wait for async disk cache writes to complete
+            for (int attempt = 0; attempt < 20; attempt++) {
+                Thread.sleep(200);
+                // Check if metrics are stable (no more writes in progress)
+                long dl1 = SplitCacheManager.getStorageDownloadMetrics().getTotalBytes();
+                Thread.sleep(200);
+                long dl2 = SplitCacheManager.getStorageDownloadMetrics().getTotalBytes();
+                if (dl1 == dl2) break;
+            }
 
             // ── PHASE 2: RESET & VERIFY ZERO DOWNLOADS ───────────────
             System.out.println("\n[PHASE 2] Resetting metrics — all subsequent operations must produce 0 downloads");

@@ -370,6 +370,23 @@ public class ParquetCompanionTest {
 
             assertTrue(searcher.hasParquetCompanion(),
                     "Merged split should retain parquet companion manifest");
+
+            // Verify doc values survive merge — check a doc from each original split
+            SplitQuery queryA = new SplitTermQuery("name", "item_0");
+            SearchResult hitsA = searcher.search(queryA, 1);
+            assertTrue(hitsA.getHits().size() >= 1, "Should find item_0 from split A");
+            Document docA = searcher.docProjected(hitsA.getHits().get(0).getDocAddress(),
+                    "id", "name", "score");
+            assertEquals(0L, ((Number) docA.getFirst("id")).longValue());
+            assertEquals("item_0", docA.getFirst("name"));
+
+            SplitQuery queryB = new SplitTermQuery("name", "item_30");
+            SearchResult hitsB = searcher.search(queryB, 1);
+            assertTrue(hitsB.getHits().size() >= 1, "Should find item_30 from split B");
+            Document docB = searcher.docProjected(hitsB.getHits().get(0).getDocAddress(),
+                    "id", "name", "score");
+            assertEquals(30L, ((Number) docB.getFirst("id")).longValue());
+            assertEquals("item_30", docB.getFirst("name"));
         }
     }
 

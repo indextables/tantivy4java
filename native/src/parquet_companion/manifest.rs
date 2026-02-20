@@ -84,7 +84,7 @@ pub struct ColumnChunkInfo {
 }
 
 /// Maps a tantivy field to a parquet column
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ColumnMapping {
     /// Tantivy field name
     pub tantivy_field_name: String,
@@ -151,6 +151,9 @@ impl ParquetManifest {
     pub fn resolve_path(&self, relative_path: &str) -> String {
         if relative_path.starts_with('/') || relative_path.contains("://") {
             // Already absolute or has protocol
+            relative_path.to_string()
+        } else if self.table_root.is_empty() {
+            // No table_root set — return path as-is (avoid producing "/path")
             relative_path.to_string()
         } else {
             let root = self.table_root.trim_end_matches('/');

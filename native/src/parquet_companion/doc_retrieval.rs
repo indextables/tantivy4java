@@ -711,66 +711,66 @@ fn arrow_value_to_json(array: &ArrayRef, row_idx: usize) -> Result<serde_json::V
 
     let value = match array.data_type() {
         DataType::Boolean => {
-            let arr = array.as_any().downcast_ref::<BooleanArray>().unwrap();
+            let arr = array.as_any().downcast_ref::<BooleanArray>().ok_or_else(|| anyhow::anyhow!("Expected BooleanArray array"))?;
             serde_json::Value::Bool(arr.value(row_idx))
         }
         DataType::Int8 => {
-            let arr = array.as_any().downcast_ref::<Int8Array>().unwrap();
+            let arr = array.as_any().downcast_ref::<Int8Array>().ok_or_else(|| anyhow::anyhow!("Expected Int8Array array"))?;
             serde_json::json!(arr.value(row_idx))
         }
         DataType::Int16 => {
-            let arr = array.as_any().downcast_ref::<Int16Array>().unwrap();
+            let arr = array.as_any().downcast_ref::<Int16Array>().ok_or_else(|| anyhow::anyhow!("Expected Int16Array array"))?;
             serde_json::json!(arr.value(row_idx))
         }
         DataType::Int32 => {
-            let arr = array.as_any().downcast_ref::<Int32Array>().unwrap();
+            let arr = array.as_any().downcast_ref::<Int32Array>().ok_or_else(|| anyhow::anyhow!("Expected Int32Array array"))?;
             serde_json::json!(arr.value(row_idx))
         }
         DataType::Int64 => {
-            let arr = array.as_any().downcast_ref::<Int64Array>().unwrap();
+            let arr = array.as_any().downcast_ref::<Int64Array>().ok_or_else(|| anyhow::anyhow!("Expected Int64Array array"))?;
             serde_json::json!(arr.value(row_idx))
         }
         DataType::UInt8 => {
-            let arr = array.as_any().downcast_ref::<UInt8Array>().unwrap();
+            let arr = array.as_any().downcast_ref::<UInt8Array>().ok_or_else(|| anyhow::anyhow!("Expected UInt8Array array"))?;
             serde_json::json!(arr.value(row_idx))
         }
         DataType::UInt16 => {
-            let arr = array.as_any().downcast_ref::<UInt16Array>().unwrap();
+            let arr = array.as_any().downcast_ref::<UInt16Array>().ok_or_else(|| anyhow::anyhow!("Expected UInt16Array array"))?;
             serde_json::json!(arr.value(row_idx))
         }
         DataType::UInt32 => {
-            let arr = array.as_any().downcast_ref::<UInt32Array>().unwrap();
+            let arr = array.as_any().downcast_ref::<UInt32Array>().ok_or_else(|| anyhow::anyhow!("Expected UInt32Array array"))?;
             serde_json::json!(arr.value(row_idx))
         }
         DataType::UInt64 => {
-            let arr = array.as_any().downcast_ref::<UInt64Array>().unwrap();
+            let arr = array.as_any().downcast_ref::<UInt64Array>().ok_or_else(|| anyhow::anyhow!("Expected UInt64Array array"))?;
             serde_json::json!(arr.value(row_idx))
         }
         DataType::Float32 => {
-            let arr = array.as_any().downcast_ref::<Float32Array>().unwrap();
+            let arr = array.as_any().downcast_ref::<Float32Array>().ok_or_else(|| anyhow::anyhow!("Expected Float32Array array"))?;
             serde_json::json!(arr.value(row_idx))
         }
         DataType::Float64 => {
-            let arr = array.as_any().downcast_ref::<Float64Array>().unwrap();
+            let arr = array.as_any().downcast_ref::<Float64Array>().ok_or_else(|| anyhow::anyhow!("Expected Float64Array array"))?;
             serde_json::json!(arr.value(row_idx))
         }
         DataType::Utf8 => {
-            let arr = array.as_any().downcast_ref::<StringArray>().unwrap();
+            let arr = array.as_any().downcast_ref::<StringArray>().ok_or_else(|| anyhow::anyhow!("Expected StringArray array"))?;
             serde_json::Value::String(arr.value(row_idx).to_string())
         }
         DataType::LargeUtf8 => {
-            let arr = array.as_any().downcast_ref::<LargeStringArray>().unwrap();
+            let arr = array.as_any().downcast_ref::<LargeStringArray>().ok_or_else(|| anyhow::anyhow!("Expected LargeStringArray array"))?;
             serde_json::Value::String(arr.value(row_idx).to_string())
         }
         DataType::Binary => {
-            let arr = array.as_any().downcast_ref::<BinaryArray>().unwrap();
+            let arr = array.as_any().downcast_ref::<BinaryArray>().ok_or_else(|| anyhow::anyhow!("Expected BinaryArray array"))?;
             serde_json::Value::String(base64::Engine::encode(
                 &base64::engine::general_purpose::STANDARD,
                 arr.value(row_idx),
             ))
         }
         DataType::LargeBinary => {
-            let arr = array.as_any().downcast_ref::<LargeBinaryArray>().unwrap();
+            let arr = array.as_any().downcast_ref::<LargeBinaryArray>().ok_or_else(|| anyhow::anyhow!("Expected LargeBinaryArray array"))?;
             serde_json::Value::String(base64::Engine::encode(
                 &base64::engine::general_purpose::STANDARD,
                 arr.value(row_idx),
@@ -780,41 +780,41 @@ fn arrow_value_to_json(array: &ArrayRef, row_idx: usize) -> Result<serde_json::V
             use arrow_schema::TimeUnit;
             let micros = match unit {
                 TimeUnit::Second => {
-                    let arr = array.as_any().downcast_ref::<TimestampSecondArray>().unwrap();
+                    let arr = array.as_any().downcast_ref::<TimestampSecondArray>().ok_or_else(|| anyhow::anyhow!("Expected TimestampSecondArray array"))?;
                     arr.value(row_idx) * 1_000_000
                 }
                 TimeUnit::Millisecond => {
-                    let arr = array.as_any().downcast_ref::<TimestampMillisecondArray>().unwrap();
+                    let arr = array.as_any().downcast_ref::<TimestampMillisecondArray>().ok_or_else(|| anyhow::anyhow!("Expected TimestampMillisecondArray array"))?;
                     arr.value(row_idx) * 1_000
                 }
                 TimeUnit::Microsecond => {
-                    let arr = array.as_any().downcast_ref::<TimestampMicrosecondArray>().unwrap();
+                    let arr = array.as_any().downcast_ref::<TimestampMicrosecondArray>().ok_or_else(|| anyhow::anyhow!("Expected TimestampMicrosecondArray array"))?;
                     arr.value(row_idx)
                 }
                 TimeUnit::Nanosecond => {
-                    let arr = array.as_any().downcast_ref::<TimestampNanosecondArray>().unwrap();
+                    let arr = array.as_any().downcast_ref::<TimestampNanosecondArray>().ok_or_else(|| anyhow::anyhow!("Expected TimestampNanosecondArray array"))?;
                     arr.value(row_idx) / 1_000
                 }
             };
             serde_json::json!(micros)
         }
         DataType::Date32 => {
-            let arr = array.as_any().downcast_ref::<Date32Array>().unwrap();
+            let arr = array.as_any().downcast_ref::<Date32Array>().ok_or_else(|| anyhow::anyhow!("Expected Date32Array array"))?;
             serde_json::json!(arr.value(row_idx) as i64 * 86_400_000_000i64) // days → micros
         }
         DataType::Date64 => {
-            let arr = array.as_any().downcast_ref::<Date64Array>().unwrap();
+            let arr = array.as_any().downcast_ref::<Date64Array>().ok_or_else(|| anyhow::anyhow!("Expected Date64Array array"))?;
             serde_json::json!(arr.value(row_idx) * 1_000i64) // millis → micros
         }
         DataType::Decimal128(_, scale) => {
-            let arr = array.as_any().downcast_ref::<Decimal128Array>().unwrap();
+            let arr = array.as_any().downcast_ref::<Decimal128Array>().ok_or_else(|| anyhow::anyhow!("Expected Decimal128Array array"))?;
             let raw = arr.value(row_idx) as f64;
             let val = raw / 10f64.powi(*scale as i32);
             serde_json::json!(val)
         }
         DataType::Decimal256(_, scale) => {
             // Decimal256 can exceed f64 precision — return as string representation
-            let arr = array.as_any().downcast_ref::<Decimal256Array>().unwrap();
+            let arr = array.as_any().downcast_ref::<Decimal256Array>().ok_or_else(|| anyhow::anyhow!("Expected Decimal256Array array"))?;
             let raw = arr.value(row_idx);
             let unscaled = raw.to_string();
             if *scale == 0 {
@@ -827,7 +827,7 @@ fn arrow_value_to_json(array: &ArrayRef, row_idx: usize) -> Result<serde_json::V
             }
         }
         DataType::FixedSizeBinary(_) => {
-            let arr = array.as_any().downcast_ref::<FixedSizeBinaryArray>().unwrap();
+            let arr = array.as_any().downcast_ref::<FixedSizeBinaryArray>().ok_or_else(|| anyhow::anyhow!("Expected FixedSizeBinaryArray array"))?;
             serde_json::Value::String(base64::Engine::encode(
                 &base64::engine::general_purpose::STANDARD,
                 arr.value(row_idx),
@@ -858,7 +858,7 @@ pub(crate) fn arrow_json_value(array: &ArrayRef, row_idx: usize) -> serde_json::
 
     match array.data_type() {
         DataType::List(_) => {
-            let list = array.as_any().downcast_ref::<ListArray>().unwrap();
+            let list = array.as_any().downcast_ref::<ListArray>().expect("Expected ListArray array");
             let values = list.value(row_idx);
             let mut arr = Vec::new();
             for i in 0..values.len() {
@@ -867,7 +867,7 @@ pub(crate) fn arrow_json_value(array: &ArrayRef, row_idx: usize) -> serde_json::
             serde_json::Value::Array(arr)
         }
         DataType::Struct(_) => {
-            let struct_arr = array.as_any().downcast_ref::<StructArray>().unwrap();
+            let struct_arr = array.as_any().downcast_ref::<StructArray>().expect("Expected StructArray array");
             let mut map = serde_json::Map::new();
             for (i, field) in struct_arr.fields().iter().enumerate() {
                 let col = struct_arr.column(i);
@@ -876,9 +876,9 @@ pub(crate) fn arrow_json_value(array: &ArrayRef, row_idx: usize) -> serde_json::
             serde_json::Value::Object(map)
         }
         DataType::Map(_, _) => {
-            let map_arr = array.as_any().downcast_ref::<MapArray>().unwrap();
+            let map_arr = array.as_any().downcast_ref::<MapArray>().expect("Expected MapArray array");
             let entry = map_arr.value(row_idx); // StructArray with keys + values
-            let struct_arr = entry.as_any().downcast_ref::<StructArray>().unwrap();
+            let struct_arr = entry.as_any().downcast_ref::<StructArray>().expect("Expected StructArray array");
             let keys = struct_arr.column(0); // key column
             let values = struct_arr.column(1); // value column
             let mut map = serde_json::Map::new();

@@ -176,9 +176,9 @@ impl ParquetAugmentedDirectory {
                 use std::hash::{Hash, Hasher};
                 let mut hasher = std::collections::hash_map::DefaultHasher::new();
                 col_names.hash(&mut hasher);
-                hasher.finish() as u32
+                hasher.finish()
             };
-            let component = format!("parquet_transcoded_{}_{:08x}", fast_name, col_hash);
+            let component = format!("parquet_transcoded_{}_{:016x}", fast_name, col_hash);
             (storage_loc, split_id, component)
         });
 
@@ -342,9 +342,17 @@ impl Directory for ParquetAugmentedDirectory {
         self.inner.atomic_read(path)
     }
 
-    fn atomic_write(&self, _path: &Path, _data: &[u8]) -> std::io::Result<()> {
-        // Read-only directory — silently accept writes (needed for ManagedDirectory wrapper
-        // in Index::open which writes .managed.json)
+    fn atomic_write(&self, path: &Path, _data: &[u8]) -> std::io::Result<()> {
+        // Read-only directory — accept writes silently for known internal files
+        // (.managed.json written by ManagedDirectory during Index::open).
+        // Log unexpected writes so they don't get silently lost.
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if name != ".managed.json" && name != "meta.json" {
+            crate::debug_println!(
+                "⚠️ PARQUET_AUGMENTED_DIR: Discarding write to {} (read-only directory)",
+                path.display()
+            );
+        }
         Ok(())
     }
 

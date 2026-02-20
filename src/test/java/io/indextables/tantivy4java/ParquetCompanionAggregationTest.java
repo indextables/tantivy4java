@@ -89,12 +89,17 @@ public class ParquetCompanionAggregationTest {
         SplitSearcher searcher = cacheManager.createSplitSearcher(splitUrl, metadata, dir.toString());
 
         // Prewarm for HYBRID/PARQUET_ONLY so fast fields are available
-        if (mode != ParquetCompanionConfig.FastFieldMode.DISABLED) {
-            if (complex) {
-                searcher.preloadParquetFastFields("id", "score", "name", "active", "created_at").join();
-            } else {
-                searcher.preloadParquetFastFields("id", "score", "name", "active").join();
+        try {
+            if (mode != ParquetCompanionConfig.FastFieldMode.DISABLED) {
+                if (complex) {
+                    searcher.preloadParquetFastFields("id", "score", "name", "active", "created_at").join();
+                } else {
+                    searcher.preloadParquetFastFields("id", "score", "name", "active").join();
+                }
             }
+        } catch (Exception e) {
+            searcher.close();
+            throw e;
         }
 
         return searcher;

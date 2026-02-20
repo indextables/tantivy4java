@@ -74,28 +74,51 @@ pub fn combine_parquet_manifests(
     // creating mismatches if those docs are referenced by other structures.
     for (i, dir) in source_dirs.iter().enumerate() {
         let meta_path = dir.join("meta.json");
-        if meta_path.exists() {
-            let meta_bytes = std::fs::read(&meta_path)
-                .with_context(|| format!("Failed to read meta.json from {:?}", meta_path))?;
-            let meta_str = std::str::from_utf8(&meta_bytes)
-                .context("meta.json is not valid UTF-8")?;
-            let meta: serde_json::Value = serde_json::from_str(meta_str)
-                .context("Failed to parse meta.json")?;
+        if !meta_path.exists() {
+            crate::debug_println!(
+                "⚠️ PARQUET_MERGE: Missing meta.json in source split[{}] ({:?}), \
+                 skipping deletion check",
+                i, dir
+            );
+            continue;
+        }
+        let meta_bytes = std::fs::read(&meta_path)
+            .with_context(|| format!("Failed to read meta.json from {:?}", meta_path))?;
+        let meta_str = std::str::from_utf8(&meta_bytes)
+            .context("meta.json is not valid UTF-8")?;
+        let meta: serde_json::Value = serde_json::from_str(meta_str)
+            .context("Failed to parse meta.json")?;
 
-            if let Some(segments) = meta.get("segments").and_then(|s| s.as_array()) {
-                for seg in segments {
-                    let num_deleted = seg.get("num_deleted_docs")
-                        .and_then(|n| n.as_u64())
-                        .unwrap_or(0);
-                    if num_deleted > 0 {
-                        anyhow::bail!(
-                            "Cannot merge parquet companion splits with deletions: \
-                             split[{}] has {} deleted docs. Identity doc ID mapping \
-                             requires zero deletions in all source splits.",
-                            i, num_deleted
-                        );
-                    }
+        if let Some(segments) = meta.get("segments").and_then(|s| s.as_array()) {
+            for seg in segments {
+                let num_deleted = seg.get("num_deleted_docs")
+                    .and_then(|n| n.as_u64())
+                    .unwrap_or(0);
+                if num_deleted > 0 {
+                    anyhow::bail!(
+                        "Cannot merge parquet companion splits with deletions: \
+                         split[{}] has {} deleted docs. Identity doc ID mapping \
+                         requires zero deletions in all source splits.",
+                        i, num_deleted
+                    );
                 }
+            }
+        }
+    }
+
+    // Validate: all manifests have compatible column_mappings.
+    // Mismatched column_mappings mean the splits were built from different parquet schemas,
+    // which would cause data corruption after merge.
+    if manifests.len() > 1 {
+        let base_mapping = &manifests[0].column_mapping;
+        for (i, manifest) in manifests.iter().enumerate().skip(1) {
+            if manifest.column_mapping != *base_mapping {
+                anyhow::bail!(
+                    "Cannot merge splits with incompatible column_mappings: \
+                     split[0] has {} mappings, split[{}] has {} mappings. \
+                     All splits must be built from the same parquet schema.",
+                    base_mapping.len(), i, manifest.column_mapping.len()
+                );
             }
         }
     }
@@ -384,6 +407,80 @@ mod tests {
             dir2.path().join("meta.json"),
             serde_json::to_string(&meta_no_deletions).unwrap(),
         ).unwrap();
+
+        let result = combine_parquet_manifests(
+            &[dir1.path(), dir2.path()],
+            output.path(),
+        );
+
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_some());
+    }
+
+    #[test]
+    fn test_combine_rejects_incompatible_column_mappings() {
+        let dir1 = tempfile::tempdir().unwrap();
+        let dir2 = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+
+        let mut m1 = make_test_manifest("s3://bucket", vec![("p1.parquet", 100, 1024)]);
+        m1.column_mapping = vec![ColumnMapping {
+            tantivy_field_name: "id".to_string(),
+            parquet_column_name: "id".to_string(),
+            physical_ordinal: 0,
+            parquet_type: "INT64".to_string(),
+            tantivy_type: "I64".to_string(),
+            field_id: None,
+            fast_field_tokenizer: None,
+        }];
+
+        let mut m2 = make_test_manifest("s3://bucket", vec![("p2.parquet", 200, 2048)]);
+        m2.column_mapping = vec![ColumnMapping {
+            tantivy_field_name: "id".to_string(),
+            parquet_column_name: "identifier".to_string(),  // different!
+            physical_ordinal: 0,
+            parquet_type: "INT64".to_string(),
+            tantivy_type: "I64".to_string(),
+            field_id: None,
+            fast_field_tokenizer: None,
+        }];
+
+        std::fs::write(dir1.path().join(MANIFEST_FILENAME), serialize_manifest(&m1).unwrap()).unwrap();
+        std::fs::write(dir2.path().join(MANIFEST_FILENAME), serialize_manifest(&m2).unwrap()).unwrap();
+
+        let result = combine_parquet_manifests(
+            &[dir1.path(), dir2.path()],
+            output.path(),
+        );
+
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("column_mapping"), "Error should mention column_mapping: {}", err_msg);
+    }
+
+    #[test]
+    fn test_combine_compatible_column_mappings_ok() {
+        let dir1 = tempfile::tempdir().unwrap();
+        let dir2 = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+
+        let mapping = vec![ColumnMapping {
+            tantivy_field_name: "id".to_string(),
+            parquet_column_name: "id".to_string(),
+            physical_ordinal: 0,
+            parquet_type: "INT64".to_string(),
+            tantivy_type: "I64".to_string(),
+            field_id: None,
+            fast_field_tokenizer: None,
+        }];
+
+        let mut m1 = make_test_manifest("s3://bucket", vec![("p1.parquet", 100, 1024)]);
+        m1.column_mapping = mapping.clone();
+        let mut m2 = make_test_manifest("s3://bucket", vec![("p2.parquet", 200, 2048)]);
+        m2.column_mapping = mapping;
+
+        std::fs::write(dir1.path().join(MANIFEST_FILENAME), serialize_manifest(&m1).unwrap()).unwrap();
+        std::fs::write(dir2.path().join(MANIFEST_FILENAME), serialize_manifest(&m2).unwrap()).unwrap();
 
         let result = combine_parquet_manifests(
             &[dir1.path(), dir2.path()],

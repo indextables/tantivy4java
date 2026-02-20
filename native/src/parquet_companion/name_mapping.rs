@@ -77,8 +77,14 @@ fn auto_detect_iceberg_mapping(
     let mut mapping = NameMapping::new();
 
     for field in fields {
-        let id = field.get("id")?.as_i64()?;
-        let name = field.get("name")?.as_str()?;
+        let id = match field.get("id").and_then(|v| v.as_i64()) {
+            Some(id) => id,
+            None => continue, // Skip fields with missing/invalid id
+        };
+        let name = match field.get("name").and_then(|v| v.as_str()) {
+            Some(name) => name,
+            None => continue, // Skip fields with missing/invalid name
+        };
 
         // In Iceberg, the field ID corresponds to the parquet column's field_id
         // We need to find which parquet column has this field_id

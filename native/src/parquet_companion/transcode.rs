@@ -664,10 +664,10 @@ fn record_arrow_value(
 fn extract_i64(array: &dyn Array, row: usize) -> Result<i64> {
     use arrow_array::*;
     match array.data_type() {
-        DataType::Int8 => Ok(array.as_any().downcast_ref::<Int8Array>().unwrap().value(row) as i64),
-        DataType::Int16 => Ok(array.as_any().downcast_ref::<Int16Array>().unwrap().value(row) as i64),
-        DataType::Int32 => Ok(array.as_any().downcast_ref::<Int32Array>().unwrap().value(row) as i64),
-        DataType::Int64 => Ok(array.as_any().downcast_ref::<Int64Array>().unwrap().value(row)),
+        DataType::Int8 => Ok(array.as_any().downcast_ref::<Int8Array>().ok_or_else(|| anyhow::anyhow!("Expected Int8Array array"))?.value(row) as i64),
+        DataType::Int16 => Ok(array.as_any().downcast_ref::<Int16Array>().ok_or_else(|| anyhow::anyhow!("Expected Int16Array array"))?.value(row) as i64),
+        DataType::Int32 => Ok(array.as_any().downcast_ref::<Int32Array>().ok_or_else(|| anyhow::anyhow!("Expected Int32Array array"))?.value(row) as i64),
+        DataType::Int64 => Ok(array.as_any().downcast_ref::<Int64Array>().ok_or_else(|| anyhow::anyhow!("Expected Int64Array array"))?.value(row)),
         _ => anyhow::bail!("Cannot extract i64 from {:?}", array.data_type()),
     }
 }
@@ -676,12 +676,12 @@ fn extract_i64(array: &dyn Array, row: usize) -> Result<i64> {
 fn extract_u64(array: &dyn Array, row: usize) -> Result<u64> {
     use arrow_array::*;
     match array.data_type() {
-        DataType::UInt8 => Ok(array.as_any().downcast_ref::<UInt8Array>().unwrap().value(row) as u64),
-        DataType::UInt16 => Ok(array.as_any().downcast_ref::<UInt16Array>().unwrap().value(row) as u64),
-        DataType::UInt32 => Ok(array.as_any().downcast_ref::<UInt32Array>().unwrap().value(row) as u64),
-        DataType::UInt64 => Ok(array.as_any().downcast_ref::<UInt64Array>().unwrap().value(row)),
+        DataType::UInt8 => Ok(array.as_any().downcast_ref::<UInt8Array>().ok_or_else(|| anyhow::anyhow!("Expected UInt8Array array"))?.value(row) as u64),
+        DataType::UInt16 => Ok(array.as_any().downcast_ref::<UInt16Array>().ok_or_else(|| anyhow::anyhow!("Expected UInt16Array array"))?.value(row) as u64),
+        DataType::UInt32 => Ok(array.as_any().downcast_ref::<UInt32Array>().ok_or_else(|| anyhow::anyhow!("Expected UInt32Array array"))?.value(row) as u64),
+        DataType::UInt64 => Ok(array.as_any().downcast_ref::<UInt64Array>().ok_or_else(|| anyhow::anyhow!("Expected UInt64Array array"))?.value(row)),
         // Also support signed types coerced to u64
-        DataType::Int64 => Ok(array.as_any().downcast_ref::<Int64Array>().unwrap().value(row) as u64),
+        DataType::Int64 => Ok(array.as_any().downcast_ref::<Int64Array>().ok_or_else(|| anyhow::anyhow!("Expected Int64Array array"))?.value(row) as u64),
         _ => anyhow::bail!("Cannot extract u64 from {:?}", array.data_type()),
     }
 }
@@ -690,8 +690,8 @@ fn extract_u64(array: &dyn Array, row: usize) -> Result<u64> {
 fn extract_f64(array: &dyn Array, row: usize) -> Result<f64> {
     use arrow_array::*;
     match array.data_type() {
-        DataType::Float32 => Ok(array.as_any().downcast_ref::<Float32Array>().unwrap().value(row) as f64),
-        DataType::Float64 => Ok(array.as_any().downcast_ref::<Float64Array>().unwrap().value(row)),
+        DataType::Float32 => Ok(array.as_any().downcast_ref::<Float32Array>().ok_or_else(|| anyhow::anyhow!("Expected Float32Array array"))?.value(row) as f64),
+        DataType::Float64 => Ok(array.as_any().downcast_ref::<Float64Array>().ok_or_else(|| anyhow::anyhow!("Expected Float64Array array"))?.value(row)),
         _ => anyhow::bail!("Cannot extract f64 from {:?}", array.data_type()),
     }
 }
@@ -700,8 +700,8 @@ fn extract_f64(array: &dyn Array, row: usize) -> Result<f64> {
 fn extract_string(array: &dyn Array, row: usize) -> Result<String> {
     use arrow_array::*;
     match array.data_type() {
-        DataType::Utf8 => Ok(array.as_any().downcast_ref::<StringArray>().unwrap().value(row).to_string()),
-        DataType::LargeUtf8 => Ok(array.as_any().downcast_ref::<LargeStringArray>().unwrap().value(row).to_string()),
+        DataType::Utf8 => Ok(array.as_any().downcast_ref::<StringArray>().ok_or_else(|| anyhow::anyhow!("Expected StringArray array"))?.value(row).to_string()),
+        DataType::LargeUtf8 => Ok(array.as_any().downcast_ref::<LargeStringArray>().ok_or_else(|| anyhow::anyhow!("Expected LargeStringArray array"))?.value(row).to_string()),
         _ => anyhow::bail!("Cannot extract string from {:?}", array.data_type()),
     }
 }
@@ -710,8 +710,8 @@ fn extract_string(array: &dyn Array, row: usize) -> Result<String> {
 fn extract_bytes(array: &dyn Array, row: usize) -> Result<Vec<u8>> {
     use arrow_array::*;
     match array.data_type() {
-        DataType::Binary => Ok(array.as_any().downcast_ref::<BinaryArray>().unwrap().value(row).to_vec()),
-        DataType::LargeBinary => Ok(array.as_any().downcast_ref::<LargeBinaryArray>().unwrap().value(row).to_vec()),
+        DataType::Binary => Ok(array.as_any().downcast_ref::<BinaryArray>().ok_or_else(|| anyhow::anyhow!("Expected BinaryArray array"))?.value(row).to_vec()),
+        DataType::LargeBinary => Ok(array.as_any().downcast_ref::<LargeBinaryArray>().ok_or_else(|| anyhow::anyhow!("Expected LargeBinaryArray array"))?.value(row).to_vec()),
         _ => anyhow::bail!("Cannot extract bytes from {:?}", array.data_type()),
     }
 }
@@ -722,22 +722,22 @@ fn extract_timestamp_micros(array: &dyn Array, row: usize) -> Result<i64> {
     use arrow_schema::TimeUnit;
     match array.data_type() {
         DataType::Timestamp(TimeUnit::Second, _) => {
-            Ok(array.as_any().downcast_ref::<TimestampSecondArray>().unwrap().value(row) * 1_000_000)
+            Ok(array.as_any().downcast_ref::<TimestampSecondArray>().ok_or_else(|| anyhow::anyhow!("Expected TimestampSecondArray array"))?.value(row) * 1_000_000)
         }
         DataType::Timestamp(TimeUnit::Millisecond, _) => {
-            Ok(array.as_any().downcast_ref::<TimestampMillisecondArray>().unwrap().value(row) * 1_000)
+            Ok(array.as_any().downcast_ref::<TimestampMillisecondArray>().ok_or_else(|| anyhow::anyhow!("Expected TimestampMillisecondArray array"))?.value(row) * 1_000)
         }
         DataType::Timestamp(TimeUnit::Microsecond, _) => {
-            Ok(array.as_any().downcast_ref::<TimestampMicrosecondArray>().unwrap().value(row))
+            Ok(array.as_any().downcast_ref::<TimestampMicrosecondArray>().ok_or_else(|| anyhow::anyhow!("Expected TimestampMicrosecondArray array"))?.value(row))
         }
         DataType::Timestamp(TimeUnit::Nanosecond, _) => {
-            Ok(array.as_any().downcast_ref::<TimestampNanosecondArray>().unwrap().value(row) / 1_000)
+            Ok(array.as_any().downcast_ref::<TimestampNanosecondArray>().ok_or_else(|| anyhow::anyhow!("Expected TimestampNanosecondArray array"))?.value(row) / 1_000)
         }
         DataType::Date32 => {
-            Ok(array.as_any().downcast_ref::<Date32Array>().unwrap().value(row) as i64 * 86_400_000_000i64)
+            Ok(array.as_any().downcast_ref::<Date32Array>().ok_or_else(|| anyhow::anyhow!("Expected Date32Array array"))?.value(row) as i64 * 86_400_000_000i64)
         }
         DataType::Date64 => {
-            Ok(array.as_any().downcast_ref::<Date64Array>().unwrap().value(row) * 1_000i64)
+            Ok(array.as_any().downcast_ref::<Date64Array>().ok_or_else(|| anyhow::anyhow!("Expected Date64Array array"))?.value(row) * 1_000i64)
         }
         _ => anyhow::bail!("Cannot extract timestamp from {:?}", array.data_type()),
     }
