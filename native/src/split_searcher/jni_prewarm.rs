@@ -364,6 +364,22 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_nati
             ))?;
         }
 
+        // Update transcoded_fast_columns so that the first aggregation after prewarm
+        // skips the transcode loop and uses the L1 cache directly. Without this update,
+        // ensure_fast_fields_for_query sees an empty set and redundantly re-reads all
+        // parquet files — causing unnecessary I/O (and OOM on large datasets).
+        let transcoded_names = augmented_dir.effective_column_names(cols_ref);
+        if !transcoded_names.is_empty() {
+            let mut transcoded = context.transcoded_fast_columns.lock().unwrap();
+            for name in transcoded_names {
+                transcoded.insert(name);
+            }
+            debug_println!(
+                "📊 PARQUET_PREWARM: Updated transcoded_fast_columns with {} entries",
+                transcoded.len()
+            );
+        }
+
         debug_println!("📊 PARQUET_PREWARM: All segments transcoded successfully");
         Ok(())
     }) {
