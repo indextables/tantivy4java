@@ -828,7 +828,7 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_crea
                                 parquet_byte_range_cache: crate::parquet_companion::cached_reader::new_byte_range_cache(),
                                 parquet_file_hash_index,
                                 has_merge_safe_tracking,
-                                pq_doc_locations: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+                                pq_doc_locations: std::sync::Arc::new(std::sync::RwLock::new(Vec::new())),
                             };
 
                             let searcher_context = std::sync::Arc::new(cached_context);

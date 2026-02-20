@@ -1,12 +1,17 @@
 package io.indextables.tantivy4java.split;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import io.indextables.tantivy4java.delta.DeltaTableSchema;
 import io.indextables.tantivy4java.iceberg.IcebergTableSchema;
 import io.indextables.tantivy4java.parquet.ParquetSchemaReader;
 
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.Objects;
 
 /**
  * Configuration for parquet companion mode in SplitSearcher.
@@ -95,8 +100,8 @@ public class ParquetCompanionConfig {
             return this;
         }
 
-        public Map<String, String> getAwsConfig() { return awsConfig; }
-        public Map<String, String> getAzureConfig() { return azureConfig; }
+        public Map<String, String> getAwsConfig() { return Collections.unmodifiableMap(awsConfig); }
+        public Map<String, String> getAzureConfig() { return Collections.unmodifiableMap(azureConfig); }
     }
 
     private String tableRoot;
@@ -120,14 +125,16 @@ public class ParquetCompanionConfig {
     private long writerHeapSize = 256_000_000L;
     private int readerBatchSize = 8192;
 
+    private static final ObjectMapper MAPPER = new ObjectMapper();
+
     /** Create a parquet companion config with the table root path. */
     public ParquetCompanionConfig(String tableRoot) {
-        this.tableRoot = tableRoot;
+        this.tableRoot = Objects.requireNonNull(tableRoot, "tableRoot must not be null");
     }
 
     /** Set the fast field mode. */
     public ParquetCompanionConfig withFastFieldMode(FastFieldMode mode) {
-        this.fastFieldMode = mode;
+        this.fastFieldMode = Objects.requireNonNull(mode, "mode must not be null");
         return this;
     }
 
@@ -139,24 +146,27 @@ public class ParquetCompanionConfig {
 
     /** Set the policy for handling missing parquet files. */
     public ParquetCompanionConfig withMissingFilePolicy(MissingFilePolicy policy) {
-        this.missingFilePolicy = policy;
+        this.missingFilePolicy = Objects.requireNonNull(policy, "policy must not be null");
         return this;
     }
 
     /** Set default fields to retrieve when no projection is specified. */
     public ParquetCompanionConfig withDefaultRetrievalFields(String... fields) {
-        this.defaultRetrievalFields = fields;
+        this.defaultRetrievalFields = fields != null ? fields.clone() : null;
         return this;
     }
 
     /** Set fields to compute column statistics for during indexing. */
     public ParquetCompanionConfig withStatisticsFields(String... fields) {
-        this.statisticsFields = fields;
+        this.statisticsFields = fields != null ? fields.clone() : null;
         return this;
     }
 
     /** Set the max string length for statistics truncation (default: 256). */
     public ParquetCompanionConfig withStatisticsTruncateLength(int length) {
+        if (length < 1) {
+            throw new IllegalArgumentException("Statistics truncate length must be at least 1. Got: " + length);
+        }
         this.statisticsTruncateLength = length;
         return this;
     }
@@ -271,7 +281,7 @@ public class ParquetCompanionConfig {
 
     /** Set fields to skip during schema derivation and indexing. */
     public ParquetCompanionConfig withSkipFields(String... fields) {
-        this.skipFields = fields;
+        this.skipFields = fields != null ? fields.clone() : null;
         return this;
     }
 
@@ -289,7 +299,7 @@ public class ParquetCompanionConfig {
      * native fast fields (like numerics), not parquet transcoding.
      */
     public ParquetCompanionConfig withIpAddressFields(String... fields) {
-        this.ipAddressFields = fields;
+        this.ipAddressFields = fields != null ? fields.clone() : null;
         return this;
     }
 
@@ -301,7 +311,7 @@ public class ParquetCompanionConfig {
      * (e.g. "payload.user:alice").
      */
     public ParquetCompanionConfig withJsonFields(String... fields) {
-        this.jsonFields = fields;
+        this.jsonFields = fields != null ? fields.clone() : null;
         return this;
     }
 
@@ -356,15 +366,15 @@ public class ParquetCompanionConfig {
     public FastFieldMode getFastFieldMode() { return fastFieldMode; }
     public ParquetStorageConfig getParquetStorage() { return parquetStorage; }
     public MissingFilePolicy getMissingFilePolicy() { return missingFilePolicy; }
-    public String[] getDefaultRetrievalFields() { return defaultRetrievalFields; }
-    public String[] getStatisticsFields() { return statisticsFields; }
+    public String[] getDefaultRetrievalFields() { return defaultRetrievalFields != null ? defaultRetrievalFields.clone() : null; }
+    public String[] getStatisticsFields() { return statisticsFields != null ? statisticsFields.clone() : null; }
     public int getStatisticsTruncateLength() { return statisticsTruncateLength; }
-    public Map<String, String> getFieldIdMapping() { return fieldIdMapping; }
+    public Map<String, String> getFieldIdMapping() { return fieldIdMapping != null ? Collections.unmodifiableMap(fieldIdMapping) : null; }
     public boolean isAutoDetectNameMapping() { return autoDetectNameMapping; }
-    public String[] getSkipFields() { return skipFields; }
-    public Map<String, String> getTokenizerOverrides() { return tokenizerOverrides; }
-    public String[] getIpAddressFields() { return ipAddressFields; }
-    public String[] getJsonFields() { return jsonFields; }
+    public String[] getSkipFields() { return skipFields != null ? skipFields.clone() : null; }
+    public Map<String, String> getTokenizerOverrides() { return tokenizerOverrides != null ? Collections.unmodifiableMap(tokenizerOverrides) : null; }
+    public String[] getIpAddressFields() { return ipAddressFields != null ? ipAddressFields.clone() : null; }
+    public String[] getJsonFields() { return jsonFields != null ? jsonFields.clone() : null; }
     public String getIndexUid() { return indexUid; }
     public String getSourceId() { return sourceId; }
     public String getNodeId() { return nodeId; }
@@ -372,108 +382,56 @@ public class ParquetCompanionConfig {
     public int getReaderBatchSize() { return readerBatchSize; }
 
     /**
-     * Convert this config to a map for passing through JNI.
-     */
-    public Map<String, Object> toConfigMap() {
-        Map<String, Object> map = new HashMap<>();
-        map.put("parquet_table_root", tableRoot);
-        map.put("fast_field_mode", fastFieldMode.name());
-        map.put("missing_file_policy", missingFilePolicy.name());
-        if (defaultRetrievalFields != null) {
-            map.put("default_retrieval_fields", defaultRetrievalFields);
-        }
-        if (parquetStorage != null) {
-            if (!parquetStorage.getAwsConfig().isEmpty()) {
-                map.put("parquet_aws_config", parquetStorage.getAwsConfig());
-            }
-            if (!parquetStorage.getAzureConfig().isEmpty()) {
-                map.put("parquet_azure_config", parquetStorage.getAzureConfig());
-            }
-        }
-        return map;
-    }
-
-    /**
      * Convert this config to a JSON string for the createFromParquet native method.
      * This includes all indexing pipeline configuration.
      */
     public String toIndexingConfigJson() {
-        StringBuilder sb = new StringBuilder();
-        sb.append("{");
-        sb.append("\"table_root\":").append(jsonString(tableRoot));
-        sb.append(",\"fast_field_mode\":").append(jsonString(fastFieldMode.name()));
-        sb.append(",\"index_uid\":").append(jsonString(indexUid));
-        sb.append(",\"source_id\":").append(jsonString(sourceId));
-        sb.append(",\"node_id\":").append(jsonString(nodeId));
-        sb.append(",\"statistics_truncate_length\":").append(statisticsTruncateLength);
-        sb.append(",\"auto_detect_name_mapping\":").append(autoDetectNameMapping);
-        sb.append(",\"writer_heap_size\":").append(writerHeapSize);
-        sb.append(",\"reader_batch_size\":").append(readerBatchSize);
+        Map<String, Object> map = new LinkedHashMap<>();
+        map.put("table_root", tableRoot);
+        map.put("fast_field_mode", fastFieldMode.name());
+        map.put("missing_file_policy", missingFilePolicy.name());
+        map.put("index_uid", indexUid);
+        map.put("source_id", sourceId);
+        map.put("node_id", nodeId);
+        map.put("statistics_truncate_length", statisticsTruncateLength);
+        map.put("auto_detect_name_mapping", autoDetectNameMapping);
+        map.put("writer_heap_size", writerHeapSize);
+        map.put("reader_batch_size", readerBatchSize);
 
         if (statisticsFields != null && statisticsFields.length > 0) {
-            sb.append(",\"statistics_fields\":[");
-            for (int i = 0; i < statisticsFields.length; i++) {
-                if (i > 0) sb.append(",");
-                sb.append(jsonString(statisticsFields[i]));
-            }
-            sb.append("]");
+            map.put("statistics_fields", Arrays.asList(statisticsFields));
         }
-
+        if (defaultRetrievalFields != null && defaultRetrievalFields.length > 0) {
+            map.put("default_retrieval_fields", Arrays.asList(defaultRetrievalFields));
+        }
         if (skipFields != null && skipFields.length > 0) {
-            sb.append(",\"skip_fields\":[");
-            for (int i = 0; i < skipFields.length; i++) {
-                if (i > 0) sb.append(",");
-                sb.append(jsonString(skipFields[i]));
-            }
-            sb.append("]");
+            map.put("skip_fields", Arrays.asList(skipFields));
         }
-
         if (tokenizerOverrides != null && !tokenizerOverrides.isEmpty()) {
-            sb.append(",\"tokenizer_overrides\":{");
-            boolean first = true;
-            for (Map.Entry<String, String> entry : tokenizerOverrides.entrySet()) {
-                if (!first) sb.append(",");
-                sb.append(jsonString(entry.getKey())).append(":").append(jsonString(entry.getValue()));
-                first = false;
-            }
-            sb.append("}");
+            map.put("tokenizer_overrides", tokenizerOverrides);
         }
-
         if (ipAddressFields != null && ipAddressFields.length > 0) {
-            sb.append(",\"ip_address_fields\":[");
-            for (int i = 0; i < ipAddressFields.length; i++) {
-                if (i > 0) sb.append(",");
-                sb.append(jsonString(ipAddressFields[i]));
-            }
-            sb.append("]");
+            map.put("ip_address_fields", Arrays.asList(ipAddressFields));
         }
-
         if (jsonFields != null && jsonFields.length > 0) {
-            sb.append(",\"json_fields\":[");
-            for (int i = 0; i < jsonFields.length; i++) {
-                if (i > 0) sb.append(",");
-                sb.append(jsonString(jsonFields[i]));
-            }
-            sb.append("]");
+            map.put("json_fields", Arrays.asList(jsonFields));
         }
-
         if (fieldIdMapping != null && !fieldIdMapping.isEmpty()) {
-            sb.append(",\"field_id_mapping\":{");
-            boolean first = true;
-            for (Map.Entry<String, String> entry : fieldIdMapping.entrySet()) {
-                if (!first) sb.append(",");
-                sb.append(jsonString(entry.getKey())).append(":").append(jsonString(entry.getValue()));
-                first = false;
+            map.put("field_id_mapping", fieldIdMapping);
+        }
+        if (parquetStorage != null) {
+            if (!parquetStorage.awsConfig.isEmpty()) {
+                map.put("parquet_aws_config", parquetStorage.awsConfig);
             }
-            sb.append("}");
+            if (!parquetStorage.azureConfig.isEmpty()) {
+                map.put("parquet_azure_config", parquetStorage.azureConfig);
+            }
         }
 
-        sb.append("}");
-        return sb.toString();
-    }
-
-    private static String jsonString(String value) {
-        if (value == null) return "null";
-        return "\"" + value.replace("\\", "\\\\").replace("\"", "\\\"") + "\"";
+        try {
+            return MAPPER.writeValueAsString(map);
+        } catch (JsonProcessingException e) {
+            throw new RuntimeException("Failed to serialize indexing config to JSON", e);
+        }
     }
 }

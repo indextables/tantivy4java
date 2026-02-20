@@ -209,7 +209,8 @@ impl ParquetAugmentedDirectory {
             columns.len(), fast_file_path
         );
 
-        let num_docs = self.manifest.total_rows as u32;
+        let num_docs: u32 = self.manifest.total_rows.try_into()
+            .map_err(|_| anyhow::anyhow!("total_rows {} exceeds u32::MAX", self.manifest.total_rows))?;
 
         // Transcode parquet columns to columnar bytes
         let parquet_columnar_bytes = transcode_columns_from_parquet(
