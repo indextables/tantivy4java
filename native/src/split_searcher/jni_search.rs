@@ -263,7 +263,7 @@ pub async fn perform_search_async_impl_leaf_response_with_aggregations(
             context,
             &query_json,
             aggregation_request_json.as_deref(),
-        ).await
+        ).await?
     } else {
         context.split_overrides.as_ref().map(|o| quickwit_search::SplitOverrides {
             meta_json: o.meta_json.clone(),

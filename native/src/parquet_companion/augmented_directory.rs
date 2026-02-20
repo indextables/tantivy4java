@@ -129,6 +129,19 @@ impl ParquetAugmentedDirectory {
         &self.inner
     }
 
+    /// Returns the tantivy column names that `transcode_and_cache` would actually
+    /// transcode for the given requested column set (or all applicable columns if None).
+    ///
+    /// Used by the prewarm path to update `transcoded_fast_columns` after a successful
+    /// transcode, preventing the first post-prewarm aggregation from redundantly
+    /// re-reading all parquet files.
+    pub fn effective_column_names(&self, requested: Option<&[String]>) -> Vec<String> {
+        columns_to_transcode(&self.manifest, self.mode, requested)
+            .into_iter()
+            .map(|col| col.tantivy_name)
+            .collect()
+    }
+
     /// Transcode and cache fast fields for a segment.
     ///
     /// This reads parquet data, transcodes to columnar format, optionally merges

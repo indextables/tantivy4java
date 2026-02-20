@@ -19,13 +19,26 @@ use quickwit_storage::Storage;
 ///
 /// Returns fresh SplitOverrides with the current transcoded .fast data, or None if
 /// this is not a parquet companion split.
+///
+/// # Errors
+///
+/// Returns an error if any segment fails to transcode. Previously, transcode failures
+/// were silently swallowed: `transcoded_fast_columns` was updated before the transcode
+/// succeeded, so failed columns were permanently marked as "done", leaving
+/// `fast_field_data` empty and causing aggregations to return count=0.
 pub(crate) async fn ensure_fast_fields_for_query(
     context: &CachedSearcherContext,
     query_json: &str,
     aggregation_json: Option<&str>,
-) -> Option<quickwit_search::SplitOverrides> {
-    let augmented_dir = context.augmented_directory.as_ref()?;
-    let meta_json = context.parquet_meta_json.as_ref()?;
+) -> anyhow::Result<Option<quickwit_search::SplitOverrides>> {
+    let augmented_dir = match context.augmented_directory.as_ref() {
+        Some(d) => d,
+        None => return Ok(None),
+    };
+    let meta_json = match context.parquet_meta_json.as_ref() {
+        Some(m) => m,
+        None => return Ok(None),
+    };
 
     // Extract field names from query (range queries) and aggregation request
     let needed_fields = crate::parquet_companion::field_extraction::extract_all_fast_field_names(
@@ -34,30 +47,35 @@ pub(crate) async fn ensure_fast_fields_for_query(
 
     if needed_fields.is_empty() {
         // No fast fields needed — return overrides with meta_json only (for schema override)
-        return Some(quickwit_search::SplitOverrides {
+        return Ok(Some(quickwit_search::SplitOverrides {
             meta_json: meta_json.clone(),
             fast_field_data: std::collections::HashMap::new(),
-        });
+        }));
     }
 
     // Check which fields still need transcoding
-    let columns_to_add = {
+    let columns_to_add: Vec<String> = {
         let existing = context.transcoded_fast_columns.lock().unwrap();
-        let missing: Vec<String> = needed_fields.iter()
+        needed_fields.iter()
             .filter(|f| !existing.contains(*f))
             .cloned()
-            .collect();
-        missing
+            .collect()
     };
 
     if !columns_to_add.is_empty() {
-        // Compute the full column set (existing + new)
+        // Compute the full column set (existing + new) WITHOUT modifying
+        // transcoded_fast_columns yet. We only update the tracker AFTER all segments
+        // have been successfully transcoded. Previously the tracker was updated before
+        // the transcode, so a failure would permanently mark columns as "done" —
+        // leaving fast_field_data empty and producing count=0 for all aggregations.
         let full_column_set: Vec<String> = {
-            let mut existing = context.transcoded_fast_columns.lock().unwrap();
+            let existing = context.transcoded_fast_columns.lock().unwrap();
+            let mut set: std::collections::HashSet<String> =
+                existing.iter().cloned().collect();
             for col in &columns_to_add {
-                existing.insert(col.clone());
+                set.insert(col.clone());
             }
-            existing.iter().cloned().collect()
+            set.into_iter().collect()
         };
 
         debug_println!(
@@ -65,16 +83,25 @@ pub(crate) async fn ensure_fast_fields_for_query(
             columns_to_add.len(), columns_to_add, full_column_set
         );
 
-        // Transcode for each segment
+        // Transcode for each segment — propagate errors instead of swallowing them.
+        // A swallowed error leaves fast_field_data empty, causing the aggregation to
+        // fall back to the native .fast file (no parquet-derived string columns in
+        // HYBRID mode) and return count=0 for every bucket.
         for fast_path in &context.segment_fast_paths {
-            if let Err(e) = augmented_dir.transcode_and_cache(
+            augmented_dir.transcode_and_cache(
                 fast_path,
                 Some(&full_column_set),
-            ).await {
-                debug_println!(
-                    "⚠️ LAZY_TRANSCODE: Failed to transcode columns for {:?}: {}",
-                    fast_path, e
-                );
+            ).await.map_err(|e| anyhow::anyhow!(
+                "Failed to transcode parquet columns {:?} for segment {:?}: {}",
+                full_column_set, fast_path, e
+            ))?;
+        }
+
+        // All segments succeeded — safe to mark the new columns as transcoded.
+        {
+            let mut existing = context.transcoded_fast_columns.lock().unwrap();
+            for col in &columns_to_add {
+                existing.insert(col.clone());
             }
         }
     }
@@ -86,10 +113,10 @@ pub(crate) async fn ensure_fast_fields_for_query(
         fast_field_data.insert(path.clone(), bytes.to_vec());
     }
 
-    Some(quickwit_search::SplitOverrides {
+    Ok(Some(quickwit_search::SplitOverrides {
         meta_json: meta_json.clone(),
         fast_field_data,
-    })
+    }))
 }
 
 // Thread-safe async implementation function for search operations
@@ -198,7 +225,7 @@ pub async fn perform_search_async_impl_leaf_response(
 
     // Lazy transcoding: ensure fast fields needed by range queries are transcoded
     let overrides = if context.augmented_directory.is_some() {
-        ensure_fast_fields_for_query(context, &effective_query_json, None).await
+        ensure_fast_fields_for_query(context, &effective_query_json, None).await?
     } else {
         context.split_overrides.as_ref().map(|o| quickwit_search::SplitOverrides {
             meta_json: o.meta_json.clone(),
