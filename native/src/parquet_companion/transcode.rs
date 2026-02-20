@@ -11,13 +11,20 @@
 //   5. In parquet-only mode: transcode ALL columns from parquet
 
 use std::collections::HashMap;
+use std::io::Write;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use arrow_array::{Array, RecordBatch};
 use arrow_schema::DataType;
 
-use tantivy::columnar::ColumnarWriter;
+use tantivy::columnar::{ColumnType, ColumnarWriter};
+use tantivy::columnar::column_index::{serialize_column_index, SerializableColumnIndex, SerializableOptionalIndex};
+use tantivy::columnar::column_values::{serialize_u64_based_column_values, CodecType};
+#[allow(unused_imports)]
+use tantivy::columnar::iterable::Iterable; // needed for Box<dyn Iterable> coercion
+
+use sstable::{Dictionary, RangeSSTable, VoidSSTable};
 
 use quickwit_storage::Storage;
 
@@ -74,8 +81,9 @@ pub struct TranscodeColumn {
 
 /// Transcode parquet columns into tantivy columnar format (.fast file bytes).
 ///
-/// This reads parquet files through the storage layer, extracts the specified columns,
-/// and writes them into a tantivy ColumnarWriter to produce valid .fast file bytes.
+/// String columns use a direct serialization path that bypasses ColumnarWriter,
+/// building tantivy columnar bytes directly from arrow StringArray buffers.
+/// Non-string columns use the traditional ColumnarWriter row-by-row path.
 ///
 /// # Arguments
 /// * `columns` - Columns to transcode from parquet
@@ -94,7 +102,6 @@ pub async fn transcode_columns_from_parquet(
     metadata_cache: Option<&MetadataCache>,
 ) -> Result<Vec<u8>> {
     if columns.is_empty() {
-        // Return empty columnar with no columns
         let mut writer = ColumnarWriter::default();
         let mut output = Vec::new();
         writer.serialize(num_docs, &mut output)
@@ -102,24 +109,57 @@ pub async fn transcode_columns_from_parquet(
         return Ok(output);
     }
 
+    // Split columns into string (direct path) and non-string (ColumnarWriter path)
+    let str_columns: Vec<TranscodeColumn> = columns.iter()
+        .filter(|c| c.tantivy_type == "Str")
+        .cloned()
+        .collect();
+    let other_columns: Vec<TranscodeColumn> = columns.iter()
+        .filter(|c| c.tantivy_type != "Str")
+        .cloned()
+        .collect();
+
     debug_println!(
-        "📊 TRANSCODE: Transcoding {} columns from parquet ({} docs across {} files)",
-        columns.len(), num_docs, manifest.parquet_files.len()
+        "📊 TRANSCODE: Transcoding {} columns ({} str direct, {} via ColumnarWriter) from parquet ({} docs across {} files)",
+        columns.len(), str_columns.len(), other_columns.len(), num_docs, manifest.parquet_files.len()
     );
 
-    let mut writer = ColumnarWriter::default();
+    if str_columns.is_empty() {
+        // All non-string: use existing ColumnarWriter path
+        return transcode_via_columnar_writer(&other_columns, manifest, storage, num_docs, metadata_cache).await;
+    }
 
-    // Build the parquet column names we need to project
+    if other_columns.is_empty() {
+        // All string: use direct serialization path
+        return transcode_str_columns_direct(&str_columns, manifest, storage, num_docs, metadata_cache).await;
+    }
+
+    // Both types: serialize each independently and merge
+    let other_bytes = transcode_via_columnar_writer(&other_columns, manifest, storage, num_docs, metadata_cache).await?;
+    let str_bytes = transcode_str_columns_direct(&str_columns, manifest, storage, num_docs, metadata_cache).await?;
+
+    // merge_two_columnars expects first arg WITH tantivy footer, second arg raw
+    let other_wrapped = wrap_with_tantivy_footer(&other_bytes);
+    merge_two_columnars(Some(&other_wrapped), &str_bytes)
+}
+
+/// Transcode columns via tantivy's ColumnarWriter (row-by-row path).
+/// Used for non-string column types (numeric, bool, date, bytes, etc.).
+async fn transcode_via_columnar_writer(
+    columns: &[TranscodeColumn],
+    manifest: &ParquetManifest,
+    storage: &Arc<dyn Storage>,
+    num_docs: u32,
+    metadata_cache: Option<&MetadataCache>,
+) -> Result<Vec<u8>> {
+    let mut writer = ColumnarWriter::default();
     let parquet_col_names: Vec<&str> = columns.iter().map(|c| c.parquet_name.as_str()).collect();
 
-    // Process each parquet file sequentially (rows must be recorded in order)
     let mut global_row: u32 = 0;
     for file_entry in &manifest.parquet_files {
-        // Use relative_path directly — the storage is rooted at table_root
         let parquet_path = &file_entry.relative_path;
         let path_buf = std::path::PathBuf::from(parquet_path);
 
-        // Check metadata cache to avoid re-reading footer from S3/Azure
         let cached_meta = metadata_cache.and_then(|cache| {
             cache.lock().ok().and_then(|guard| guard.get(&path_buf).cloned())
         });
@@ -144,7 +184,6 @@ pub async fn transcode_columns_from_parquet(
             .await
             .context("Failed to create parquet stream builder for transcode")?;
 
-        // Cache the metadata for subsequent reads (by doc retrieval or other transcodes)
         if let Some(cache) = metadata_cache {
             if let Ok(mut guard) = cache.lock() {
                 if !guard.contains_key(&path_buf) {
@@ -157,7 +196,6 @@ pub async fn transcode_columns_from_parquet(
         let parquet_schema = builder.schema().clone();
         let parquet_file_schema = builder.parquet_schema().clone();
 
-        // Build projection mask for just the columns we need
         let col_indices: Vec<usize> = parquet_col_names
             .iter()
             .filter_map(|name| {
@@ -166,9 +204,6 @@ pub async fn transcode_columns_from_parquet(
             .collect();
 
         let builder = if !col_indices.is_empty() {
-            // Use roots() not leaves() because col_indices are top-level arrow field
-            // positions, not parquet leaf column indices. For schemas with nested types
-            // (List, Map, Struct), leaf indices diverge from top-level positions.
             builder.with_projection(parquet::arrow::ProjectionMask::roots(
                 &parquet_file_schema,
                 col_indices.iter().cloned(),
@@ -189,7 +224,7 @@ pub async fn transcode_columns_from_parquet(
     }
 
     debug_println!(
-        "📊 TRANSCODE: Recorded {} rows, serializing columnar...",
+        "📊 TRANSCODE: ColumnarWriter recorded {} rows, serializing...",
         global_row
     );
 
@@ -198,11 +233,340 @@ pub async fn transcode_columns_from_parquet(
         .context("Failed to serialize transcoded columnar")?;
 
     debug_println!(
-        "📊 TRANSCODE: Serialized {} bytes of columnar data",
+        "📊 TRANSCODE: ColumnarWriter serialized {} bytes of columnar data",
         output.len()
     );
 
     Ok(output)
+}
+
+/// Collected data for a single string column, ready for direct serialization.
+struct StrColumnData {
+    /// Tantivy column name
+    name: String,
+    /// Unique terms sorted lexicographically
+    sorted_terms: Vec<Vec<u8>>,
+    /// Per-non-null-row ordinal (indexes into sorted_terms after sort)
+    ordinals: Vec<u64>,
+    /// Doc IDs that have non-null values (None = all rows have values, Full cardinality)
+    non_null_doc_ids: Option<Vec<u32>>,
+}
+
+/// Direct string column transcoding that bypasses ColumnarWriter.
+///
+/// Builds tantivy columnar bytes directly from arrow StringArray buffers:
+/// - Zero per-row String allocation (reads bytes directly from arrow buffer)
+/// - Single hash lookup per row (HashMap::get on &[u8], alloc only for new terms)
+/// - No ColumnarWriter stacker replay during serialization
+///
+/// The output is raw tantivy columnar bytes (no tantivy Footer).
+async fn transcode_str_columns_direct(
+    str_columns: &[TranscodeColumn],
+    manifest: &ParquetManifest,
+    storage: &Arc<dyn Storage>,
+    num_docs: u32,
+    metadata_cache: Option<&MetadataCache>,
+) -> Result<Vec<u8>> {
+    use arrow_array::{StringArray, LargeStringArray};
+
+    // Per-column collection state
+    struct Collector {
+        name: String,
+        parquet_name: String,
+        dict: HashMap<Vec<u8>, u32>,
+        ordinals: Vec<u64>,
+        non_null_doc_ids: Vec<u32>,
+        has_nulls: bool,
+    }
+
+    let mut collectors: Vec<Collector> = str_columns.iter().map(|c| Collector {
+        name: c.tantivy_name.clone(),
+        parquet_name: c.parquet_name.clone(),
+        dict: HashMap::new(),
+        ordinals: Vec::new(),
+        non_null_doc_ids: Vec::new(),
+        has_nulls: false,
+    }).collect();
+
+    let parquet_col_names: Vec<&str> = str_columns.iter().map(|c| c.parquet_name.as_str()).collect();
+
+    // Process each parquet file sequentially (rows must be recorded in order)
+    let mut global_row: u32 = 0;
+    for file_entry in &manifest.parquet_files {
+        let parquet_path = &file_entry.relative_path;
+        let path_buf = std::path::PathBuf::from(parquet_path);
+
+        let cached_meta = metadata_cache.and_then(|cache| {
+            cache.lock().ok().and_then(|guard| guard.get(&path_buf).cloned())
+        });
+
+        let reader = if let Some(meta) = cached_meta {
+            CachedParquetReader::with_metadata(
+                storage.clone(),
+                path_buf.clone(),
+                file_entry.file_size_bytes,
+                meta,
+            )
+        } else {
+            CachedParquetReader::new(
+                storage.clone(),
+                path_buf.clone(),
+                file_entry.file_size_bytes,
+            )
+        };
+
+        let builder = parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder::new(reader)
+            .await
+            .context("Failed to create parquet stream builder for str transcode")?;
+
+        if let Some(cache) = metadata_cache {
+            if let Ok(mut guard) = cache.lock() {
+                if !guard.contains_key(&path_buf) {
+                    guard.insert(path_buf.clone(), builder.metadata().clone());
+                }
+            }
+        }
+
+        let parquet_schema = builder.schema().clone();
+        let parquet_file_schema = builder.parquet_schema().clone();
+
+        let col_indices: Vec<usize> = parquet_col_names
+            .iter()
+            .filter_map(|name| {
+                parquet_schema.fields().iter().position(|f| f.name() == *name)
+            })
+            .collect();
+
+        let builder = if !col_indices.is_empty() {
+            builder.with_projection(parquet::arrow::ProjectionMask::roots(
+                &parquet_file_schema,
+                col_indices.iter().cloned(),
+            ))
+        } else {
+            builder
+        };
+
+        let mut stream = builder.build()
+            .context("Failed to build parquet stream for str transcode")?;
+
+        use futures::StreamExt;
+        while let Some(batch_result) = stream.next().await {
+            let batch = batch_result.context("Failed to read parquet batch for str transcode")?;
+            let batch_schema = batch.schema();
+
+            for collector in collectors.iter_mut() {
+                let col_idx = match batch_schema.fields().iter()
+                    .position(|f| f.name() == &collector.parquet_name)
+                {
+                    Some(idx) => idx,
+                    None => continue,
+                };
+
+                let array = batch.column(col_idx);
+
+                // Extract strings zero-copy from arrow buffers
+                match array.data_type() {
+                    DataType::Utf8 => {
+                        let str_array = array.as_any().downcast_ref::<StringArray>()
+                            .context("Expected StringArray for Utf8 column")?;
+                        for row in 0..str_array.len() {
+                            let doc_id = global_row + row as u32;
+                            if str_array.is_null(row) {
+                                collector.has_nulls = true;
+                                continue;
+                            }
+                            let bytes = str_array.value(row).as_bytes();
+                            let ord = if let Some(&existing) = collector.dict.get(bytes) {
+                                existing
+                            } else {
+                                let next_id = collector.dict.len() as u32;
+                                collector.dict.insert(bytes.to_vec(), next_id);
+                                next_id
+                            };
+                            collector.ordinals.push(ord as u64);
+                            collector.non_null_doc_ids.push(doc_id);
+                        }
+                    }
+                    DataType::LargeUtf8 => {
+                        let str_array = array.as_any().downcast_ref::<LargeStringArray>()
+                            .context("Expected LargeStringArray for LargeUtf8 column")?;
+                        for row in 0..str_array.len() {
+                            let doc_id = global_row + row as u32;
+                            if str_array.is_null(row) {
+                                collector.has_nulls = true;
+                                continue;
+                            }
+                            let bytes = str_array.value(row).as_bytes();
+                            let ord = if let Some(&existing) = collector.dict.get(bytes) {
+                                existing
+                            } else {
+                                let next_id = collector.dict.len() as u32;
+                                collector.dict.insert(bytes.to_vec(), next_id);
+                                next_id
+                            };
+                            collector.ordinals.push(ord as u64);
+                            collector.non_null_doc_ids.push(doc_id);
+                        }
+                    }
+                    other => {
+                        anyhow::bail!(
+                            "Unexpected data type {:?} for Str column '{}'",
+                            other, collector.name
+                        );
+                    }
+                }
+            }
+
+            global_row += batch.num_rows() as u32;
+        }
+    }
+
+    debug_println!(
+        "📊 TRANSCODE: Direct str collection complete: {} rows, {} columns",
+        global_row, collectors.len()
+    );
+
+    // Post-process: sort dictionaries, remap ordinals, build StrColumnData
+    let column_data: Vec<StrColumnData> = collectors.into_iter().map(|collector| {
+        // Sort dictionary entries lexicographically
+        let mut entries: Vec<(Vec<u8>, u32)> = collector.dict.into_iter().collect();
+        entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+
+        // Build old-to-new ordinal remap
+        let mut old_to_new = vec![0u64; entries.len()];
+        let sorted_terms: Vec<Vec<u8>> = entries.into_iter()
+            .enumerate()
+            .map(|(new_ord, (term, old_ord))| {
+                old_to_new[old_ord as usize] = new_ord as u64;
+                term
+            })
+            .collect();
+
+        // Remap ordinals from insertion order to sorted order
+        let ordinals: Vec<u64> = collector.ordinals.into_iter()
+            .map(|o| old_to_new[o as usize])
+            .collect();
+
+        let non_null_doc_ids = if collector.has_nulls {
+            Some(collector.non_null_doc_ids)
+        } else {
+            None
+        };
+
+        StrColumnData {
+            name: collector.name,
+            sorted_terms,
+            ordinals,
+            non_null_doc_ids,
+        }
+    }).collect();
+
+    let result = serialize_str_columnar(column_data, num_docs)?;
+
+    debug_println!(
+        "📊 TRANSCODE: Direct str serialized {} bytes of columnar data",
+        result.len()
+    );
+
+    Ok(result)
+}
+
+/// Build a complete tantivy columnar file containing only string columns,
+/// using direct serialization (bypassing ColumnarWriter).
+///
+/// Columnar file format:
+///   [col1_data][col2_data]...[RangeSSTable][sstable_len: u64 LE][num_rows: u32 LE][version+magic: 8 bytes]
+///
+/// Each string column's data:
+///   [dictionary][column_index][column_values][col_index_num_bytes: u32 LE][dict_len: u32 LE]
+fn serialize_str_columnar(
+    mut columns: Vec<StrColumnData>,
+    num_docs: u32,
+) -> Result<Vec<u8>> {
+    // Sort columns by name (RangeSSTable envelope requires sorted keys)
+    columns.sort_unstable_by(|a, b| a.name.cmp(&b.name));
+
+    let mut buf: Vec<u8> = Vec::new();
+    let mut column_entries: Vec<(Vec<u8>, std::ops::Range<u64>)> = Vec::new();
+
+    for col in &columns {
+        let start_offset = buf.len() as u64;
+
+        // 1. Write term dictionary (VoidSSTable — maps sorted terms to ())
+        let dict_buf = {
+            let mut dict_writer = Dictionary::<VoidSSTable>::builder(Vec::new())
+                .context("Failed to create VoidSSTable dictionary builder")?;
+            for term in &col.sorted_terms {
+                dict_writer.insert(term, &())
+                    .context("Failed to insert term into dictionary")?;
+            }
+            dict_writer.finish()
+                .context("Failed to finalize term dictionary")?
+        };
+        let dict_len = dict_buf.len() as u32;
+        buf.extend_from_slice(&dict_buf);
+
+        // 2. Write column index (Full if all rows present, Optional if nulls exist)
+        let col_index = if let Some(ref doc_ids) = col.non_null_doc_ids {
+            SerializableColumnIndex::Optional(SerializableOptionalIndex {
+                non_null_row_ids: Box::new(&doc_ids[..]),
+                num_rows: num_docs,
+            })
+        } else {
+            SerializableColumnIndex::Full
+        };
+        let col_index_num_bytes = serialize_column_index(col_index, &mut buf)
+            .context("Failed to serialize column index")?;
+
+        // 3. Write column values (ordinals as u64, bitpacked)
+        serialize_u64_based_column_values(
+            &&col.ordinals[..],
+            &[CodecType::Bitpacked, CodecType::BlockwiseLinear],
+            &mut buf,
+        ).context("Failed to serialize column values")?;
+
+        // 4. Write column_index_num_bytes trailer (u32 LE)
+        buf.write_all(&col_index_num_bytes.to_le_bytes())
+            .context("Failed to write column index length")?;
+
+        // 5. Write dict_len trailer (u32 LE)
+        buf.write_all(&dict_len.to_le_bytes())
+            .context("Failed to write dictionary length")?;
+
+        let end_offset = buf.len() as u64;
+
+        // Build envelope key: column_name + \0 (JSON_END_OF_PATH) + type_code
+        let mut key = Vec::with_capacity(col.name.len() + 2);
+        key.extend_from_slice(col.name.as_bytes());
+        key.push(0u8); // JSON_END_OF_PATH
+        key.push(ColumnType::Str.to_code());
+        column_entries.push((key, start_offset..end_offset));
+    }
+
+    // Write RangeSSTable envelope index (maps column keys to byte ranges)
+    let mut sstable_writer = Dictionary::<RangeSSTable>::builder(Vec::new())
+        .context("Failed to create RangeSSTable envelope builder")?;
+    for (key, range) in &column_entries {
+        sstable_writer.insert(key, range)
+            .context("Failed to insert column range into envelope")?;
+    }
+    let sstable_bytes = sstable_writer.finish()
+        .context("Failed to finalize envelope SSTable")?;
+    let sstable_len = sstable_bytes.len() as u64;
+    buf.extend_from_slice(&sstable_bytes);
+    buf.write_all(&sstable_len.to_le_bytes())
+        .context("Failed to write sstable length")?;
+
+    // Write num_rows footer (u32 LE, matches BinarySerializable for u32)
+    buf.write_all(&num_docs.to_le_bytes())
+        .context("Failed to write num_rows")?;
+
+    // Write columnar format version + magic footer
+    // Version::V2 = 2u32 LE, MAGIC_BYTES = [2, 113, 119, 66]
+    buf.write_all(&[2u8, 0, 0, 0, 2, 113, 119, 66])
+        .context("Failed to write version footer")?;
+
+    Ok(buf)
 }
 
 /// Record all rows from a RecordBatch into a ColumnarWriter.
@@ -834,6 +1198,541 @@ mod tests {
         let columns = reader.list_columns().unwrap();
         assert_eq!(columns.len(), 1);
         assert_eq!(columns[0].0, "city");
+    }
+
+    #[test]
+    fn test_direct_str_transcode_roundtrip() {
+        // Build columnar via direct path, open with ColumnarReader, verify correctness
+        let col = StrColumnData {
+            name: "city".to_string(),
+            sorted_terms: vec![
+                b"alice_town".to_vec(),
+                b"bob_city".to_vec(),
+                b"charlie_ville".to_vec(),
+            ],
+            // doc0="bob_city" (ord 1), doc1="alice_town" (ord 0), doc2="charlie_ville" (ord 2)
+            ordinals: vec![1, 0, 2],
+            non_null_doc_ids: None, // Full cardinality
+        };
+
+        let bytes = serialize_str_columnar(vec![col], 3).unwrap();
+
+        // Verify ColumnarReader can open and read it
+        let reader = tantivy::columnar::ColumnarReader::open(bytes).unwrap();
+        assert_eq!(reader.num_rows(), 3);
+
+        let columns = reader.list_columns().unwrap();
+        assert_eq!(columns.len(), 1, "Expected 1 column, got {}", columns.len());
+        assert_eq!(columns[0].0, "city");
+
+        // Open the string column and verify terms and ordinals
+        let (_, handle) = &columns[0];
+        let dyn_col = handle.open().unwrap();
+        match dyn_col {
+            tantivy::columnar::DynamicColumn::Str(str_col) => {
+                let ords = str_col.ords();
+                // doc0 = "bob_city" (sorted ord 1)
+                let vals0: Vec<u64> = ords.values_for_doc(0).collect();
+                assert_eq!(vals0, vec![1], "doc0 ordinal");
+                // doc1 = "alice_town" (sorted ord 0)
+                let vals1: Vec<u64> = ords.values_for_doc(1).collect();
+                assert_eq!(vals1, vec![0], "doc1 ordinal");
+                // doc2 = "charlie_ville" (sorted ord 2)
+                let vals2: Vec<u64> = ords.values_for_doc(2).collect();
+                assert_eq!(vals2, vec![2], "doc2 ordinal");
+
+                // Verify term dictionary
+                let mut buf = String::new();
+                assert!(str_col.ord_to_str(0, &mut buf).unwrap());
+                assert_eq!(buf, "alice_town");
+                buf.clear();
+                assert!(str_col.ord_to_str(1, &mut buf).unwrap());
+                assert_eq!(buf, "bob_city");
+                buf.clear();
+                assert!(str_col.ord_to_str(2, &mut buf).unwrap());
+                assert_eq!(buf, "charlie_ville");
+            }
+            other => panic!("Expected Str column, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_direct_str_transcode_nullable() {
+        // String column with nulls at known positions
+        let col = StrColumnData {
+            name: "tag".to_string(),
+            sorted_terms: vec![b"alpha".to_vec(), b"beta".to_vec()],
+            // Only doc0 and doc2 have values (doc1 is null)
+            ordinals: vec![0, 1], // alpha, beta
+            non_null_doc_ids: Some(vec![0, 2]),
+        };
+
+        let bytes = serialize_str_columnar(vec![col], 3).unwrap();
+
+        let reader = tantivy::columnar::ColumnarReader::open(bytes).unwrap();
+        assert_eq!(reader.num_rows(), 3);
+
+        let columns = reader.list_columns().unwrap();
+        assert_eq!(columns.len(), 1);
+
+        let (_, handle) = &columns[0];
+        let dyn_col = handle.open().unwrap();
+        match dyn_col {
+            tantivy::columnar::DynamicColumn::Str(str_col) => {
+                let ords = str_col.ords();
+                // doc0 = "alpha"
+                let vals0: Vec<u64> = ords.values_for_doc(0).collect();
+                assert_eq!(vals0, vec![0]);
+                // doc1 = null (no values)
+                let vals1: Vec<u64> = ords.values_for_doc(1).collect();
+                assert!(vals1.is_empty(), "doc1 should have no values (null)");
+                // doc2 = "beta"
+                let vals2: Vec<u64> = ords.values_for_doc(2).collect();
+                assert_eq!(vals2, vec![1]);
+            }
+            other => panic!("Expected Str column, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_direct_str_transcode_multi_column() {
+        // Two string columns in the same columnar
+        let col1 = StrColumnData {
+            name: "city".to_string(),
+            sorted_terms: vec![b"NYC".to_vec(), b"SF".to_vec()],
+            ordinals: vec![0, 1],
+            non_null_doc_ids: None,
+        };
+        let col2 = StrColumnData {
+            name: "state".to_string(),
+            sorted_terms: vec![b"CA".to_vec(), b"NY".to_vec()],
+            ordinals: vec![1, 0],
+            non_null_doc_ids: None,
+        };
+
+        let bytes = serialize_str_columnar(vec![col1, col2], 2).unwrap();
+
+        let reader = tantivy::columnar::ColumnarReader::open(bytes).unwrap();
+        assert_eq!(reader.num_rows(), 2);
+
+        let columns = reader.list_columns().unwrap();
+        assert_eq!(columns.len(), 2, "Expected 2 columns, got {}", columns.len());
+
+        let col_names: Vec<&str> = columns.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(col_names.contains(&"city"), "Missing 'city' column");
+        assert!(col_names.contains(&"state"), "Missing 'state' column");
+    }
+
+    #[test]
+    fn test_direct_str_vs_columnar_writer_equivalence() {
+        // Verify direct path produces output readable identically to ColumnarWriter path
+        let terms = vec!["hello", "world", "foo", "bar"];
+
+        // ColumnarWriter path
+        let mut writer = ColumnarWriter::default();
+        for (i, term) in terms.iter().enumerate() {
+            writer.record_str(i as u32, "text", term);
+        }
+        let mut cw_bytes = Vec::new();
+        writer.serialize(4, &mut cw_bytes).unwrap();
+        let cw_reader = tantivy::columnar::ColumnarReader::open(cw_bytes).unwrap();
+
+        // Direct path: terms must be sorted, ordinals remapped
+        let mut sorted: Vec<(&str, u32)> = terms.iter().enumerate()
+            .map(|(i, &t)| (t, i as u32))
+            .collect();
+        sorted.sort_by_key(|&(t, _)| t);
+        let mut old_to_new = vec![0u64; terms.len()];
+        let sorted_terms: Vec<Vec<u8>> = sorted.iter().enumerate().map(|(new, &(t, old))| {
+            old_to_new[old as usize] = new as u64;
+            t.as_bytes().to_vec()
+        }).collect();
+        let ordinals: Vec<u64> = (0..terms.len()).map(|i| old_to_new[i]).collect();
+
+        let col = StrColumnData {
+            name: "text".to_string(),
+            sorted_terms,
+            ordinals,
+            non_null_doc_ids: None,
+        };
+        let direct_bytes = serialize_str_columnar(vec![col], 4).unwrap();
+        let direct_reader = tantivy::columnar::ColumnarReader::open(direct_bytes).unwrap();
+
+        // Both should have same structure
+        assert_eq!(cw_reader.num_rows(), direct_reader.num_rows());
+        let cw_cols = cw_reader.list_columns().unwrap();
+        let direct_cols = direct_reader.list_columns().unwrap();
+        assert_eq!(cw_cols.len(), direct_cols.len());
+        assert_eq!(cw_cols[0].0, direct_cols[0].0);
+
+        // Verify identical string values per doc
+        let cw_str = match cw_cols[0].1.open().unwrap() {
+            tantivy::columnar::DynamicColumn::Str(s) => s,
+            _ => panic!("Expected Str"),
+        };
+        let direct_str = match direct_cols[0].1.open().unwrap() {
+            tantivy::columnar::DynamicColumn::Str(s) => s,
+            _ => panic!("Expected Str"),
+        };
+
+        for doc in 0..4u32 {
+            let cw_ords: Vec<u64> = cw_str.ords().values_for_doc(doc).collect();
+            let direct_ords: Vec<u64> = direct_str.ords().values_for_doc(doc).collect();
+            assert_eq!(cw_ords.len(), direct_ords.len(), "doc {} ordinal count", doc);
+
+            for (&cw_ord, &direct_ord) in cw_ords.iter().zip(direct_ords.iter()) {
+                let mut cw_buf = String::new();
+                let mut direct_buf = String::new();
+                cw_str.ord_to_str(cw_ord, &mut cw_buf).unwrap();
+                direct_str.ord_to_str(direct_ord, &mut direct_buf).unwrap();
+                assert_eq!(cw_buf, direct_buf, "doc {} term mismatch", doc);
+            }
+        }
+    }
+
+    #[test]
+    fn test_direct_str_transcode_multi_column_values() {
+        // Verify multi-column output has correct values (not just column presence)
+        let col1 = StrColumnData {
+            name: "city".to_string(),
+            sorted_terms: vec![b"NYC".to_vec(), b"SF".to_vec()],
+            ordinals: vec![0, 1], // doc0=NYC, doc1=SF
+            non_null_doc_ids: None,
+        };
+        let col2 = StrColumnData {
+            name: "state".to_string(),
+            sorted_terms: vec![b"CA".to_vec(), b"NY".to_vec()],
+            ordinals: vec![1, 0], // doc0=NY, doc1=CA
+            non_null_doc_ids: None,
+        };
+
+        let bytes = serialize_str_columnar(vec![col1, col2], 2).unwrap();
+        let reader = tantivy::columnar::ColumnarReader::open(bytes).unwrap();
+        let columns = reader.list_columns().unwrap();
+
+        for (name, handle) in &columns {
+            let dyn_col = handle.open().unwrap();
+            match dyn_col {
+                tantivy::columnar::DynamicColumn::Str(str_col) => {
+                    let ords = str_col.ords();
+                    if name == "city" {
+                        let vals0: Vec<u64> = ords.values_for_doc(0).collect();
+                        let vals1: Vec<u64> = ords.values_for_doc(1).collect();
+                        assert_eq!(vals0, vec![0], "city doc0 should be NYC (ord 0)");
+                        assert_eq!(vals1, vec![1], "city doc1 should be SF (ord 1)");
+                        let mut buf = String::new();
+                        str_col.ord_to_str(0, &mut buf).unwrap();
+                        assert_eq!(buf, "NYC");
+                        buf.clear();
+                        str_col.ord_to_str(1, &mut buf).unwrap();
+                        assert_eq!(buf, "SF");
+                    } else if name == "state" {
+                        let vals0: Vec<u64> = ords.values_for_doc(0).collect();
+                        let vals1: Vec<u64> = ords.values_for_doc(1).collect();
+                        assert_eq!(vals0, vec![1], "state doc0 should be NY (ord 1)");
+                        assert_eq!(vals1, vec![0], "state doc1 should be CA (ord 0)");
+                        let mut buf = String::new();
+                        str_col.ord_to_str(0, &mut buf).unwrap();
+                        assert_eq!(buf, "CA");
+                        buf.clear();
+                        str_col.ord_to_str(1, &mut buf).unwrap();
+                        assert_eq!(buf, "NY");
+                    }
+                }
+                other => panic!("Expected Str column for '{}', got {:?}", name, other),
+            }
+        }
+    }
+
+    #[test]
+    fn test_direct_str_transcode_empty_string() {
+        // Verify empty strings and unicode are handled correctly
+        let col = StrColumnData {
+            name: "text".to_string(),
+            sorted_terms: vec![
+                b"".to_vec(),                   // empty string
+                "caf\u{e9}".as_bytes().to_vec(), // unicode café
+                "hello".as_bytes().to_vec(),
+                "\u{4e2d}\u{6587}".as_bytes().to_vec(), // Chinese characters (中文)
+            ],
+            ordinals: vec![2, 0, 1, 3], // doc0=hello, doc1=empty, doc2=café, doc3=中文
+            non_null_doc_ids: None,
+        };
+
+        let bytes = serialize_str_columnar(vec![col], 4).unwrap();
+        let reader = tantivy::columnar::ColumnarReader::open(bytes).unwrap();
+        assert_eq!(reader.num_rows(), 4);
+
+        let columns = reader.list_columns().unwrap();
+        let (_, handle) = &columns[0];
+        let dyn_col = handle.open().unwrap();
+        match dyn_col {
+            tantivy::columnar::DynamicColumn::Str(str_col) => {
+                let mut buf = String::new();
+
+                // doc0 = "hello" (ord 2)
+                let ords0: Vec<u64> = str_col.ords().values_for_doc(0).collect();
+                assert_eq!(ords0, vec![2]);
+                str_col.ord_to_str(2, &mut buf).unwrap();
+                assert_eq!(buf, "hello");
+
+                // doc1 = "" (ord 0, empty string)
+                buf.clear();
+                let ords1: Vec<u64> = str_col.ords().values_for_doc(1).collect();
+                assert_eq!(ords1, vec![0]);
+                str_col.ord_to_str(0, &mut buf).unwrap();
+                assert_eq!(buf, "");
+
+                // doc2 = "café" (ord 1)
+                buf.clear();
+                let ords2: Vec<u64> = str_col.ords().values_for_doc(2).collect();
+                assert_eq!(ords2, vec![1]);
+                str_col.ord_to_str(1, &mut buf).unwrap();
+                assert_eq!(buf, "caf\u{e9}");
+
+                // doc3 = "中文" (ord 3)
+                buf.clear();
+                let ords3: Vec<u64> = str_col.ords().values_for_doc(3).collect();
+                assert_eq!(ords3, vec![3]);
+                str_col.ord_to_str(3, &mut buf).unwrap();
+                assert_eq!(buf, "\u{4e2d}\u{6587}");
+            }
+            other => panic!("Expected Str column, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_direct_str_transcode_large_cardinality() {
+        // Many distinct terms to stress the dictionary and bitpacking
+        let num_terms = 500;
+        let sorted_terms: Vec<Vec<u8>> = (0..num_terms)
+            .map(|i| format!("term_{:04}", i).into_bytes())
+            .collect();
+
+        // Each doc gets a different term: doc_i → term_i
+        let ordinals: Vec<u64> = (0..num_terms as u64).collect();
+
+        let col = StrColumnData {
+            name: "tag".to_string(),
+            sorted_terms: sorted_terms.clone(),
+            ordinals,
+            non_null_doc_ids: None,
+        };
+
+        let bytes = serialize_str_columnar(vec![col], num_terms as u32).unwrap();
+        let reader = tantivy::columnar::ColumnarReader::open(bytes).unwrap();
+        assert_eq!(reader.num_rows(), num_terms as u32);
+
+        let columns = reader.list_columns().unwrap();
+        assert_eq!(columns.len(), 1);
+
+        let (_, handle) = &columns[0];
+        let dyn_col = handle.open().unwrap();
+        match dyn_col {
+            tantivy::columnar::DynamicColumn::Str(str_col) => {
+                // Verify first, middle, and last docs
+                for doc in [0u32, 250, 499] {
+                    let ords: Vec<u64> = str_col.ords().values_for_doc(doc).collect();
+                    assert_eq!(ords, vec![doc as u64], "doc {} ordinal", doc);
+                    let mut buf = String::new();
+                    str_col.ord_to_str(doc as u64, &mut buf).unwrap();
+                    assert_eq!(buf, format!("term_{:04}", doc), "doc {} term", doc);
+                }
+            }
+            other => panic!("Expected Str column, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_direct_str_transcode_duplicate_heavy() {
+        // Many rows, few unique terms (tests ordinal reuse and bitpacking efficiency)
+        let sorted_terms = vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()];
+        let num_docs = 1000u32;
+        // Cycle through 3 terms: a, b, c, a, b, c, ...
+        let ordinals: Vec<u64> = (0..num_docs).map(|i| (i % 3) as u64).collect();
+
+        let col = StrColumnData {
+            name: "category".to_string(),
+            sorted_terms,
+            ordinals,
+            non_null_doc_ids: None,
+        };
+
+        let bytes = serialize_str_columnar(vec![col], num_docs).unwrap();
+        let reader = tantivy::columnar::ColumnarReader::open(bytes).unwrap();
+        assert_eq!(reader.num_rows(), num_docs);
+
+        let columns = reader.list_columns().unwrap();
+        let (_, handle) = &columns[0];
+        let dyn_col = handle.open().unwrap();
+        match dyn_col {
+            tantivy::columnar::DynamicColumn::Str(str_col) => {
+                // Verify term dictionary has exactly 3 terms
+                let mut buf = String::new();
+                assert!(str_col.ord_to_str(0, &mut buf).unwrap());
+                assert_eq!(buf, "a");
+                buf.clear();
+                assert!(str_col.ord_to_str(1, &mut buf).unwrap());
+                assert_eq!(buf, "b");
+                buf.clear();
+                assert!(str_col.ord_to_str(2, &mut buf).unwrap());
+                assert_eq!(buf, "c");
+
+                // Verify cycling pattern at various doc positions
+                for doc in [0u32, 3, 6, 99, 999] {
+                    let ords: Vec<u64> = str_col.ords().values_for_doc(doc).collect();
+                    assert_eq!(ords, vec![(doc % 3) as u64], "doc {} ordinal", doc);
+                }
+            }
+            other => panic!("Expected Str column, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_direct_str_transcode_all_null() {
+        // Column where every row is null — should produce Optional cardinality
+        // with zero ordinals and zero non_null_doc_ids
+        let col = StrColumnData {
+            name: "empty_col".to_string(),
+            sorted_terms: vec![],
+            ordinals: vec![],
+            non_null_doc_ids: Some(vec![]),
+        };
+
+        let bytes = serialize_str_columnar(vec![col], 5).unwrap();
+        let reader = tantivy::columnar::ColumnarReader::open(bytes).unwrap();
+        assert_eq!(reader.num_rows(), 5);
+
+        let columns = reader.list_columns().unwrap();
+        assert_eq!(columns.len(), 1);
+
+        let (_, handle) = &columns[0];
+        let dyn_col = handle.open().unwrap();
+        match dyn_col {
+            tantivy::columnar::DynamicColumn::Str(str_col) => {
+                // All docs should have no values
+                for doc in 0..5u32 {
+                    let ords: Vec<u64> = str_col.ords().values_for_doc(doc).collect();
+                    assert!(ords.is_empty(), "doc {} should have no values", doc);
+                }
+            }
+            other => panic!("Expected Str column, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_direct_str_transcode_single_term() {
+        // Edge case: single unique term across all docs (ordinal always 0)
+        let col = StrColumnData {
+            name: "status".to_string(),
+            sorted_terms: vec![b"active".to_vec()],
+            ordinals: vec![0, 0, 0, 0, 0],
+            non_null_doc_ids: None,
+        };
+
+        let bytes = serialize_str_columnar(vec![col], 5).unwrap();
+        let reader = tantivy::columnar::ColumnarReader::open(bytes).unwrap();
+        assert_eq!(reader.num_rows(), 5);
+
+        let columns = reader.list_columns().unwrap();
+        let (_, handle) = &columns[0];
+        let dyn_col = handle.open().unwrap();
+        match dyn_col {
+            tantivy::columnar::DynamicColumn::Str(str_col) => {
+                for doc in 0..5u32 {
+                    let ords: Vec<u64> = str_col.ords().values_for_doc(doc).collect();
+                    assert_eq!(ords, vec![0], "doc {} should have ordinal 0", doc);
+                }
+                let mut buf = String::new();
+                str_col.ord_to_str(0, &mut buf).unwrap();
+                assert_eq!(buf, "active");
+            }
+            other => panic!("Expected Str column, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_direct_str_transcode_nullable_first_and_last() {
+        // Nulls at boundaries: first and last docs are null, middle has values
+        let col = StrColumnData {
+            name: "label".to_string(),
+            sorted_terms: vec![b"x".to_vec(), b"y".to_vec(), b"z".to_vec()],
+            ordinals: vec![0, 1, 2], // only 3 non-null ordinals for docs 1, 2, 3
+            non_null_doc_ids: Some(vec![1, 2, 3]),
+        };
+
+        let bytes = serialize_str_columnar(vec![col], 5).unwrap();
+        let reader = tantivy::columnar::ColumnarReader::open(bytes).unwrap();
+        assert_eq!(reader.num_rows(), 5);
+
+        let columns = reader.list_columns().unwrap();
+        let (_, handle) = &columns[0];
+        let dyn_col = handle.open().unwrap();
+        match dyn_col {
+            tantivy::columnar::DynamicColumn::Str(str_col) => {
+                // doc0 = null
+                let ords0: Vec<u64> = str_col.ords().values_for_doc(0).collect();
+                assert!(ords0.is_empty(), "doc0 should be null");
+                // doc1 = "x"
+                let ords1: Vec<u64> = str_col.ords().values_for_doc(1).collect();
+                assert_eq!(ords1, vec![0]);
+                // doc2 = "y"
+                let ords2: Vec<u64> = str_col.ords().values_for_doc(2).collect();
+                assert_eq!(ords2, vec![1]);
+                // doc3 = "z"
+                let ords3: Vec<u64> = str_col.ords().values_for_doc(3).collect();
+                assert_eq!(ords3, vec![2]);
+                // doc4 = null
+                let ords4: Vec<u64> = str_col.ords().values_for_doc(4).collect();
+                assert!(ords4.is_empty(), "doc4 should be null");
+            }
+            other => panic!("Expected Str column, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_direct_str_mixed_nullable_and_full() {
+        // One full column + one nullable column in same columnar
+        let col1 = StrColumnData {
+            name: "country".to_string(),
+            sorted_terms: vec![b"DE".to_vec(), b"US".to_vec()],
+            ordinals: vec![1, 0, 1], // US, DE, US
+            non_null_doc_ids: None,   // Full cardinality
+        };
+        let col2 = StrColumnData {
+            name: "region".to_string(),
+            sorted_terms: vec![b"east".to_vec(), b"west".to_vec()],
+            ordinals: vec![1, 0], // only doc0=west, doc2=east
+            non_null_doc_ids: Some(vec![0, 2]),
+        };
+
+        let bytes = serialize_str_columnar(vec![col1, col2], 3).unwrap();
+        let reader = tantivy::columnar::ColumnarReader::open(bytes).unwrap();
+        assert_eq!(reader.num_rows(), 3);
+
+        let columns = reader.list_columns().unwrap();
+        assert_eq!(columns.len(), 2);
+
+        for (name, handle) in &columns {
+            let dyn_col = handle.open().unwrap();
+            match dyn_col {
+                tantivy::columnar::DynamicColumn::Str(str_col) => {
+                    let ords = str_col.ords();
+                    if name == "country" {
+                        // All 3 docs have values
+                        assert_eq!(ords.values_for_doc(0).collect::<Vec<_>>(), vec![1]); // US
+                        assert_eq!(ords.values_for_doc(1).collect::<Vec<_>>(), vec![0]); // DE
+                        assert_eq!(ords.values_for_doc(2).collect::<Vec<_>>(), vec![1]); // US
+                    } else if name == "region" {
+                        // doc0=west, doc1=null, doc2=east
+                        assert_eq!(ords.values_for_doc(0).collect::<Vec<_>>(), vec![1]); // west
+                        assert!(ords.values_for_doc(1).collect::<Vec<u64>>().is_empty()); // null
+                        assert_eq!(ords.values_for_doc(2).collect::<Vec<_>>(), vec![0]); // east
+                    }
+                }
+                other => panic!("Expected Str for '{}', got {:?}", name, other),
+            }
+        }
     }
 
     fn make_test_manifest() -> ParquetManifest {

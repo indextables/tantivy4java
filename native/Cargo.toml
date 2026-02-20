@@ -61,6 +61,10 @@ fs2 = "0.4"  # Disk space detection for cache auto-sizing
 async-trait = "0.1"  # For Storage trait implementation
 aws-sdk-s3 = "=1.62"  # For streaming file uploads (PutPayload implementation)
 
+# Tantivy sub-crates for direct columnar serialization (bypass ColumnarWriter for string fast fields)
+sstable = { path = "../../tantivy/sstable", package = "tantivy-sstable" }
+common = { path = "../../tantivy/common", package = "tantivy-common" }
+
 # Parquet companion mode - enables minimal splits referencing external parquet files
 parquet = { version = "57", default-features = false, features = ["async", "arrow", "zstd", "lz4", "snap", "flate2", "flate2-rust_backened"] }
 arrow = { version = "57", default-features = false, features = ["ffi"] }
@@ -83,10 +87,12 @@ iceberg-catalog-hms = "0.8"
 [build-dependencies]
 jni = "0.21.1"
 
-# Patch to redirect quickwit's tantivy dependency to our fork with batch optimization API
-# This ensures ALL tantivy references use the same pinned commit
+# Patch to redirect ALL tantivy references to local fork (for pub mod iterable and direct columnar APIs)
 [patch."https://github.com/quickwit-oss/tantivy/"]
-tantivy = { git = "https://github.com/indextables/tantivy", rev = "3e2d4f494c97d033662b6bf70dc6257d3b7a1ea7" }
+tantivy = { path = "../../tantivy" }
+
+[patch."https://github.com/indextables/tantivy/"]
+tantivy = { path = "../../tantivy" }
 
 # Debug symbols configuration for maximum debug information
 [profile.dev]
