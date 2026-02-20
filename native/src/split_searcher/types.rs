@@ -1,6 +1,6 @@
 // types.rs - Shared data structures for split_searcher module
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::ops::Range;
@@ -90,7 +90,7 @@ pub(crate) struct CachedSearcherContext {
     // Indexed as pq_doc_locations[segment_ord] = Some(vec![(file_hash, row_in_file), ...])
     // Populated on first doc retrieval (not during init) via async storage reads,
     // because the HotDirectory hotcache doesn't include these columns.
-    pub(crate) pq_doc_locations: Arc<Mutex<Vec<Option<Vec<(u64, u64)>>>>>,
+    pub(crate) pq_doc_locations: Arc<RwLock<Vec<Option<Vec<(u64, u64)>>>>>,
 }
 
 impl CachedSearcherContext {
@@ -112,9 +112,9 @@ impl CachedSearcherContext {
     ///
     /// This is a no-op if the segment data is already cached.
     pub(crate) async fn ensure_pq_segment_loaded(&self, seg_ord: u32) -> anyhow::Result<()> {
-        // Quick check under lock — return immediately if already loaded
+        // Quick check under read lock — return immediately if already loaded
         {
-            let cache = self.pq_doc_locations.lock().unwrap();
+            let cache = self.pq_doc_locations.read().unwrap();
             if cache.get(seg_ord as usize).and_then(|o| o.as_ref()).is_some() {
                 return Ok(());
             }
@@ -184,8 +184,8 @@ impl CachedSearcherContext {
             seg_locations.len(), fast_path.display()
         );
 
-        // Store under lock (double-check to avoid overwriting a concurrent load)
-        let mut cache = self.pq_doc_locations.lock().unwrap();
+        // Store under write lock (double-check to avoid overwriting a concurrent load)
+        let mut cache = self.pq_doc_locations.write().unwrap();
         while cache.len() <= seg_ord as usize {
             cache.push(None);
         }
@@ -198,7 +198,7 @@ impl CachedSearcherContext {
 
     /// Look up a pre-loaded __pq location. Must call ensure_pq_segment_loaded first.
     pub(crate) fn get_pq_location(&self, seg_ord: u32, doc_id: u32) -> anyhow::Result<(u64, u64)> {
-        let cache = self.pq_doc_locations.lock().unwrap();
+        let cache = self.pq_doc_locations.read().unwrap();
         cache.get(seg_ord as usize)
             .and_then(|opt| opt.as_ref())
             .and_then(|seg| seg.get(doc_id as usize))

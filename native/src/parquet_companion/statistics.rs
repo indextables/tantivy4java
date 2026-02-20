@@ -81,13 +81,13 @@ impl StatisticsAccumulator {
 
     pub fn observe_string(&mut self, value: &str) {
         let truncated_min = if value.len() > self.truncate_length {
-            value[..self.truncate_length].to_string()
+            safe_truncate(value, self.truncate_length).to_string()
         } else {
             value.to_string()
         };
 
         let truncated_max = if value.len() > self.truncate_length {
-            truncate_ceiling(&value[..self.truncate_length])
+            truncate_ceiling(safe_truncate(value, self.truncate_length))
         } else {
             value.to_string()
         };
@@ -135,6 +135,20 @@ impl StatisticsAccumulator {
             null_count: self.null_count,
         }
     }
+}
+
+/// Safely truncate a string to at most `max_bytes` bytes without splitting a UTF-8
+/// multi-byte character. Returns the longest prefix that fits.
+fn safe_truncate(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let end = s.char_indices()
+        .take_while(|(i, c)| i + c.len_utf8() <= max_bytes)
+        .last()
+        .map(|(i, c)| i + c.len_utf8())
+        .unwrap_or(0);
+    &s[..end]
 }
 
 /// Truncate a string and adjust the last character up by 1 to create a ceiling value.
@@ -234,6 +248,36 @@ mod tests {
         let result = acc.finalize();
         assert_eq!(result.min_bool, Some(false));
         assert_eq!(result.max_bool, Some(true));
+    }
+
+    #[test]
+    fn test_string_truncation_multibyte_utf8() {
+        // Emoji (4 bytes each): truncate_length=5 should not panic
+        let mut acc = StatisticsAccumulator::new("emoji", "Str", 5);
+        acc.observe_string("😀😁😂😃");
+        let result = acc.finalize();
+        // "😀" is 4 bytes — fits in 5. "😁" would be byte 4..8 — doesn't fit.
+        assert_eq!(result.min_string, Some("😀".to_string()));
+
+        // CJK characters (3 bytes each): truncate_length=5
+        let mut acc2 = StatisticsAccumulator::new("cjk", "Str", 5);
+        acc2.observe_string("你好世界");
+        let result2 = acc2.finalize();
+        // "你" is 3 bytes, "好" is 3 bytes (total 6 > 5), so only "你" fits
+        assert_eq!(result2.min_string, Some("你".to_string()));
+    }
+
+    #[test]
+    fn test_safe_truncate() {
+        assert_eq!(safe_truncate("hello", 3), "hel");
+        assert_eq!(safe_truncate("hello", 10), "hello");
+        assert_eq!(safe_truncate("😀😁", 4), "😀");
+        assert_eq!(safe_truncate("😀😁", 5), "😀");
+        assert_eq!(safe_truncate("😀😁", 8), "😀😁");
+        assert_eq!(safe_truncate("", 5), "");
+        // Mixed ASCII + multi-byte
+        assert_eq!(safe_truncate("ab😀cd", 4), "ab");
+        assert_eq!(safe_truncate("ab😀cd", 6), "ab😀");
     }
 
     #[test]

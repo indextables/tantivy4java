@@ -711,12 +711,17 @@ fn add_arrow_value_to_doc(
         DataType::Decimal256(_, scale) => {
             let arr = array.as_any().downcast_ref::<Decimal256Array>().unwrap();
             let raw = arr.value(row_idx); // i256
-            // Convert via string to preserve as much precision as possible
-            let val: f64 = raw.to_string().parse::<f64>().unwrap_or(0.0)
-                / 10f64.powi(*scale as i32);
-            doc.add_f64(field, val);
+            // Convert to string representation to preserve full 256-bit precision
+            let val = if *scale == 0 {
+                raw.to_string()
+            } else {
+                let f: f64 = raw.to_string().parse::<f64>().unwrap_or(0.0)
+                    / 10f64.powi(*scale as i32);
+                f.to_string()
+            };
+            doc.add_text(field, &val);
             if let Some(acc) = accumulators.get_mut(field_name) {
-                acc.observe_f64(val);
+                acc.observe_string(&val);
             }
         }
 

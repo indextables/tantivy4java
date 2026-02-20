@@ -197,14 +197,29 @@ fn add_field_for_arrow_type(
             builder.add_text_field(name, opts);
         }
 
-        DataType::Decimal128(_, _) | DataType::Decimal256(_, _) => {
-            // Decimal types: map to f64 for tantivy (lossy for very large values)
+        DataType::Decimal128(_, _) => {
+            // Decimal128: map to f64 for tantivy (lossy for values > 2^53)
             let mut opts = NumericOptions::default();
             opts = opts.set_indexed();
             if should_add_fast(config, name, data_type) {
                 opts = opts.set_fast();
             }
             builder.add_f64_field(name, opts);
+        }
+        DataType::Decimal256(_, _) => {
+            // Decimal256: map to text to avoid precision loss (256-bit values exceed f64 range)
+            let tok = config.tokenizer_overrides.get(name).cloned();
+            let tok = tok.as_deref().unwrap_or("raw");
+            let mut opts = TextOptions::default()
+                .set_indexing_options(
+                    TextFieldIndexing::default()
+                        .set_tokenizer(tok)
+                        .set_index_option(IndexRecordOption::WithFreqsAndPositions),
+                );
+            if should_add_fast(config, name, data_type) {
+                opts = opts.set_fast(Some(tok));
+            }
+            builder.add_text_field(name, opts);
         }
 
         DataType::Binary | DataType::LargeBinary | DataType::FixedSizeBinary(_) => {
@@ -269,7 +284,7 @@ fn should_add_fast(config: &SchemaDerivationConfig, field_name: &str, data_type:
                 | DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
                 | DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64
                 | DataType::Float32 | DataType::Float64
-                | DataType::Decimal128(_, _) | DataType::Decimal256(_, _)
+                | DataType::Decimal128(_, _)
                 | DataType::Timestamp(_, _) | DataType::Date32 | DataType::Date64
             )
         }
@@ -361,7 +376,8 @@ pub fn arrow_type_to_tantivy_type(data_type: &DataType) -> &'static str {
         DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => "I64",
         DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 => "U64",
         DataType::Float32 | DataType::Float64 => "F64",
-        DataType::Decimal128(_, _) | DataType::Decimal256(_, _) => "F64",
+        DataType::Decimal128(_, _) => "F64",
+        DataType::Decimal256(_, _) => "Str",
         DataType::Utf8 | DataType::LargeUtf8 => "Str",
         DataType::Binary | DataType::LargeBinary | DataType::FixedSizeBinary(_) => "Bytes",
         DataType::Timestamp(_, _) | DataType::Date32 | DataType::Date64 => "Date",
@@ -825,8 +841,8 @@ mod tests {
         let big_field = schema.get_field("big_val").unwrap();
         let big_entry = schema.get_field_entry(big_field);
         assert!(
-            matches!(big_entry.field_type(), tantivy::schema::FieldType::F64(_)),
-            "Decimal256 should map to F64, got {:?}", big_entry.field_type()
+            matches!(big_entry.field_type(), tantivy::schema::FieldType::Str(_)),
+            "Decimal256 should map to Str (text), got {:?}", big_entry.field_type()
         );
 
         // FixedSizeBinary → Bytes
@@ -839,7 +855,7 @@ mod tests {
 
         // Verify tantivy type mappings
         assert_eq!(arrow_type_to_tantivy_type(&DataType::Decimal128(18, 2)), "F64");
-        assert_eq!(arrow_type_to_tantivy_type(&DataType::Decimal256(38, 10)), "F64");
+        assert_eq!(arrow_type_to_tantivy_type(&DataType::Decimal256(38, 10)), "Str");
         assert_eq!(arrow_type_to_tantivy_type(&DataType::FixedSizeBinary(16)), "Bytes");
 
         // Verify parquet type mappings
