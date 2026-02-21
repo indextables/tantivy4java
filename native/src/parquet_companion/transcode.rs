@@ -1786,6 +1786,7 @@ mod tests {
             total_rows: 100,
             storage_config: None,
             metadata: std::collections::HashMap::new(),
+            string_hash_fields: std::collections::HashMap::new(),
         }
     }
 }

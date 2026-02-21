@@ -227,6 +227,7 @@ mod tests {
             total_rows: 3000,
             storage_config: None,
             metadata: StdHashMap::new(),
+            string_hash_fields: StdHashMap::new(),
         }
     }
 

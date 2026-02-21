@@ -2,6 +2,8 @@
 // Extracted from mod.rs during refactoring
 // Contains: searchWithQueryAst, searchWithSplitQuery, searchWithAggregations, getSchemaFromNative
 
+use std::collections::{HashMap, HashSet};
+
 use jni::objects::{JClass, JString, JObject};
 use jni::sys::{jlong, jobject, jint};
 use jni::JNIEnv;
@@ -15,6 +17,20 @@ use super::aggregation::{
     convert_java_aggregations_to_json, perform_unified_search_result_creation,
 };
 use super::{perform_search_async_impl_leaf_response, perform_schema_retrieval_async_impl_thread_safe, perform_real_quickwit_search_with_aggregations};
+
+/// Result of `perform_search_async_impl_leaf_response_with_aggregations`, bundling
+/// the Quickwit leaf response with optional hash-field touchup context (Phase 2/3).
+pub struct SearchWithHashContext {
+    pub leaf_response: quickwit_proto::search::LeafSearchResponse,
+    /// Aggregation JSON actually used for the search (may be rewritten from original).
+    pub effective_agg_json: Option<String>,
+    /// Aggregation names whose field was redirected to a `_phash_*` hash field.
+    pub redirected_hash_agg_names: Option<HashSet<String>>,
+    /// Hash value → original string resolution map (populated after Phase 3 touchup).
+    pub hash_resolution_map: Option<HashMap<u64, String>>,
+    /// Touchup infos from Phase 2 (include/exclude string filters for post-processing).
+    pub touchup_infos: Option<Vec<crate::parquet_companion::hash_field_rewriter::HashFieldTouchupInfo>>,
+}
 
 /// Async-first method for Java_io_indextables_tantivy4java_split_SplitSearcher_searchWithQueryAst
 /// This method uses the new async-first architecture to eliminate deadlocks
@@ -45,7 +61,7 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_sear
         Ok(leaf_search_response) => {
             debug_println!("✅ ASYNC_JNI: Got LeafSearchResponse, creating SearchResult object");
             // Create proper SearchResult object directly from LeafSearchResponse (no JSON marshalling)
-            match perform_unified_search_result_creation(leaf_search_response, &mut env, None) {
+            match perform_unified_search_result_creation(leaf_search_response, &mut env, None, None, None, None) {
                 Ok(search_result_obj) => {
                     debug_println!("✅ ASYNC_JNI: Successfully created SearchResult object");
                     search_result_obj
@@ -124,7 +140,7 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_sear
             debug_println!("🔥 NATIVE DEBUG: block_on_operation SUCCESS - Got LeafSearchResponse from SplitQuery");
             debug_println!("✅ ASYNC_JNI: Got LeafSearchResponse from SplitQuery, creating SearchResult object");
             // Create proper SearchResult object directly from LeafSearchResponse (no JSON marshalling)
-            match perform_unified_search_result_creation(leaf_search_response, &mut env, None) {
+            match perform_unified_search_result_creation(leaf_search_response, &mut env, None, None, None, None) {
                 Ok(search_result_obj) => {
                     debug_println!("🔥 NATIVE DEBUG: Successfully created SearchResult object from SplitQuery");
                     debug_println!("✅ ASYNC_JNI: Successfully created SearchResult object from SplitQuery");
@@ -213,13 +229,20 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_sear
     match block_on_operation(async move {
         perform_search_async_impl_leaf_response_with_aggregations(searcher_ptr_copy, query_json, limit_copy, aggregation_request_json_copy).await
     }) {
-        Ok(leaf_search_response) => {
+        Ok(ctx) => {
             debug_println!("RUST DEBUG: ⏱️ searchWithAggregations SUCCESS [TIMING: {}ms]", method_start_time.elapsed().as_millis());
             debug_println!("RUST DEBUG: Found {} hits, has aggregations: {}",
-                         leaf_search_response.num_hits,
-                         leaf_search_response.intermediate_aggregation_result.is_some());
+                         ctx.leaf_response.num_hits,
+                         ctx.leaf_response.intermediate_aggregation_result.is_some());
 
-            match perform_unified_search_result_creation(leaf_search_response, &mut env, aggregation_request_json.clone()) {
+            match perform_unified_search_result_creation(
+                ctx.leaf_response,
+                &mut env,
+                ctx.effective_agg_json,
+                ctx.redirected_hash_agg_names,
+                ctx.hash_resolution_map,
+                ctx.touchup_infos,
+            ) {
                 Ok(search_result_obj) => search_result_obj,
                 Err(e) => {
                     debug_println!("RUST DEBUG: ⏱️ searchWithAggregations ERROR: Failed to create SearchResult [TIMING: {}ms]: {}", method_start_time.elapsed().as_millis(), e);
@@ -236,13 +259,15 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_sear
     }
 }
 
-/// Async implementation for search with aggregations
+/// Async implementation for search with aggregations.
+/// Returns a `SearchWithHashContext` which bundles the Quickwit leaf response with
+/// optional Phase 2/3 hash-field touchup data (see `hash_field_rewriter` and `hash_touchup`).
 pub async fn perform_search_async_impl_leaf_response_with_aggregations(
     searcher_ptr: jlong,
     query_json: String,
     limit: usize,
     aggregation_request_json: Option<String>,
-) -> anyhow::Result<quickwit_proto::search::LeafSearchResponse> {
+) -> anyhow::Result<SearchWithHashContext> {
     debug_println!("🔍 ASYNC_JNI: Starting search with aggregations using working pattern");
 
     if searcher_ptr == 0 {
@@ -257,12 +282,49 @@ pub async fn perform_search_async_impl_leaf_response_with_aggregations(
 
     debug_println!("🔍 ASYNC_JNI: Extracted searcher context, performing search with aggregations on split: {}", context.split_uri);
 
-    // Lazy transcoding: ensure fast fields needed by aggregation + range queries are transcoded
+    // Phase 2: Rewrite aggregation JSON to replace string field references with _phash_* fields.
+    // This avoids expensive parquet transcoding for terms/value_count/cardinality aggregations.
+    let (effective_agg_json, rewrite_output) =
+        if let (Some(ref agg_json), Some(ref manifest)) =
+            (&aggregation_request_json, &context.parquet_manifest)
+        {
+            if !manifest.string_hash_fields.is_empty() {
+                match crate::parquet_companion::hash_field_rewriter::rewrite_aggs_for_hash_fields(
+                    agg_json,
+                    &manifest.string_hash_fields,
+                ) {
+                    Ok(output) => {
+                        if !output.touchup_infos.is_empty() {
+                            debug_println!(
+                                "📊 HASH_OPT: Rewrote {} agg(s) to hash fields",
+                                output.touchup_infos.len()
+                            );
+                        }
+                        let rewritten = output.rewritten_json.clone();
+                        (Some(rewritten), Some(output))
+                    }
+                    Err(e) => {
+                        debug_println!(
+                            "⚠️ HASH_OPT: Failed to rewrite agg JSON: {} — using original",
+                            e
+                        );
+                        (aggregation_request_json.clone(), None)
+                    }
+                }
+            } else {
+                (aggregation_request_json.clone(), None)
+            }
+        } else {
+            (aggregation_request_json.clone(), None)
+        };
+
+    // Lazy transcoding: ensure fast fields needed by aggregation + range queries are transcoded.
+    // Use the rewritten JSON so that hash fields (already native) are not transcoded from parquet.
     let overrides = if context.augmented_directory.is_some() {
         super::async_impl::ensure_fast_fields_for_query(
             context,
             &query_json,
-            aggregation_request_json.as_deref(),
+            effective_agg_json.as_deref(),
         ).await?
     } else {
         context.split_overrides.as_ref().map(|o| quickwit_search::SplitOverrides {
@@ -271,8 +333,8 @@ pub async fn perform_search_async_impl_leaf_response_with_aggregations(
         })
     };
 
-    // Use the SAME working search functionality but with aggregations
-    let search_result = perform_real_quickwit_search_with_aggregations(
+    // Perform the search using the (possibly rewritten) aggregation JSON
+    let leaf_response = perform_real_quickwit_search_with_aggregations(
         &context.split_uri,
         &context.aws_config,
         context.footer_start,
@@ -283,12 +345,75 @@ pub async fn perform_search_async_impl_leaf_response_with_aggregations(
         context.cached_index.clone(),
         &query_json,
         limit,
-        aggregation_request_json,
+        effective_agg_json.clone(),
         overrides,
     ).await?;
 
-    debug_println!("✅ ASYNC_JNI: Search with aggregations completed successfully with {} hits", search_result.num_hits);
-    Ok(search_result)
+    debug_println!(
+        "✅ ASYNC_JNI: Search with aggregations completed successfully with {} hits",
+        leaf_response.num_hits
+    );
+
+    // Phase 3: Build hash → string resolution map for any redirected terms aggregations.
+    let (redirected_hash_agg_names, hash_resolution_map) =
+        if let Some(ref output) = rewrite_output {
+            if !output.touchup_infos.is_empty()
+                && leaf_response.intermediate_aggregation_result.is_some()
+            {
+                match crate::parquet_companion::hash_touchup::build_hash_resolution_map(
+                    &output.touchup_infos,
+                    &leaf_response,
+                    effective_agg_json.as_deref().unwrap_or(""),
+                    &context.cached_index,
+                    &context.bundle_file_offsets,
+                    &context.split_uri,
+                    &context.cached_storage,
+                    context.parquet_manifest.as_ref(),
+                    context.parquet_storage.as_ref(),
+                    &context.parquet_metadata_cache,
+                    &context.parquet_byte_range_cache,
+                    &context.parquet_file_hash_index,
+                    &context.pq_doc_locations,
+                )
+                .await
+                {
+                    Ok(resolution_map) => {
+                        let redirected: HashSet<String> = output
+                            .touchup_infos
+                            .iter()
+                            .map(|t| t.agg_name.clone())
+                            .collect();
+                        debug_println!(
+                            "✅ HASH_OPT: Phase 3 resolved {} hash values",
+                            resolution_map.len()
+                        );
+                        (Some(redirected), Some(resolution_map))
+                    }
+                    Err(e) => {
+                        debug_println!(
+                            "⚠️ HASH_OPT: Phase 3 failed to build resolution map: {}",
+                            e
+                        );
+                        (None, None)
+                    }
+                }
+            } else {
+                (None, None)
+            }
+        } else {
+            (None, None)
+        };
+
+    // Extract touchup_infos from rewrite_output (if any) for include/exclude post-filtering
+    let touchup_infos = rewrite_output.map(|o| o.touchup_infos);
+
+    Ok(SearchWithHashContext {
+        leaf_response,
+        effective_agg_json,
+        redirected_hash_agg_names,
+        hash_resolution_map,
+        touchup_infos,
+    })
 }
 
 /// Async-first replacement for Java_io_indextables_tantivy4java_split_SplitSearcher_getSchemaFromNative

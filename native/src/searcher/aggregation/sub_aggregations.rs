@@ -17,10 +17,15 @@ use super::metric_results::{
     create_min_result_object, create_stats_result_object, create_sum_result_object,
 };
 
-/// Helper function to create a Java HashMap of sub-aggregations from AggregationResults
+/// Helper function to create a Java HashMap of sub-aggregations from AggregationResults.
+///
+/// `resolution_map` and `redirected_names` are threaded through to support hash-field
+/// touchup in nested terms aggregations (Phase 3).
 pub(crate) fn create_sub_aggregations_map(
     env: &mut JNIEnv,
     sub_aggregations: &AggregationResults,
+    resolution_map: Option<&std::collections::HashMap<u64, String>>,
+    redirected_names: Option<&std::collections::HashSet<String>>,
 ) -> anyhow::Result<jobject> {
     debug_println!(
         "RUST DEBUG: Creating sub-aggregations map with {} entries",
@@ -39,10 +44,11 @@ pub(crate) fn create_sub_aggregations_map(
             agg_result
         );
 
-        // Convert aggregation result to Java object
-        // Sub-aggregations don't have access to the original JSON, so pass false as default hint
-        let java_agg_result =
-            create_java_aggregation_from_final_result(env, agg_name, agg_result, false)?;
+        // Convert aggregation result to Java object, passing through hash resolution context.
+        // Sub-aggregations don't carry per-name include/exclude filters.
+        let java_agg_result = create_java_aggregation_from_final_result(
+            env, agg_name, agg_result, false, resolution_map, redirected_names, None, None,
+        )?;
 
         if !java_agg_result.is_null() {
             // Add to HashMap - Convert jobject to JObject for JValue::Object
@@ -64,13 +70,22 @@ pub(crate) fn create_sub_aggregations_map(
     Ok(sub_agg_map.into_raw())
 }
 
-/// Create Java aggregation result from final Tantivy aggregation result
-/// is_date_histogram_hint: true if the original request was a date_histogram aggregation
+/// Create Java aggregation result from final Tantivy aggregation result.
+///
+/// `is_date_histogram_hint`: true if the original request was a date_histogram aggregation.
+/// `resolution_map`: optional hash → string map for Phase 3 touchup of terms buckets.
+/// `redirected_names`: set of aggregation names redirected to `_phash_*` hash fields.
+/// `include_filter`: if `Some`, only terms buckets with keys in this set are returned.
+/// `exclude_filter`: if `Some`, terms buckets with keys in this set are excluded.
 pub(crate) fn create_java_aggregation_from_final_result(
     env: &mut JNIEnv,
     aggregation_name: &str,
     agg_result: &AggregationResult,
     is_date_histogram_hint: bool,
+    resolution_map: Option<&std::collections::HashMap<u64, String>>,
+    redirected_names: Option<&std::collections::HashSet<String>>,
+    include_filter: Option<&std::collections::HashSet<String>>,
+    exclude_filter: Option<&std::collections::HashSet<String>>,
 ) -> anyhow::Result<jobject> {
     debug_println!(
         "RUST DEBUG: Creating Java aggregation for '{}', type: {:?}, date_histogram_hint: {}",
@@ -171,7 +186,16 @@ pub(crate) fn create_java_aggregation_from_final_result(
                         "RUST DEBUG: Creating TermsResult with {} buckets",
                         buckets.len()
                     );
-                    create_terms_result_object(env, aggregation_name, buckets)
+                    // Pass the resolution map only if this aggregation was redirected to a hash field
+                    let effective_map = if redirected_names
+                        .map(|s| s.contains(aggregation_name))
+                        .unwrap_or(false)
+                    {
+                        resolution_map
+                    } else {
+                        None
+                    };
+                    create_terms_result_object(env, aggregation_name, buckets, effective_map, redirected_names, include_filter, exclude_filter)
                 }
                 BucketResult::Range { buckets } => {
                     debug_println!("RUST DEBUG: Creating RangeResult");

@@ -522,6 +522,10 @@ fn parse_create_from_parquet_config(json_str: &str) -> anyhow::Result<CreateFrom
         .map(|v| v as usize)
         .unwrap_or(8192);
 
+    let string_hash_optimization = parsed.get("string_hash_optimization")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+
     Ok(CreateFromParquetConfig {
         table_root,
         fast_field_mode,
@@ -541,6 +545,7 @@ fn parse_create_from_parquet_config(json_str: &str) -> anyhow::Result<CreateFrom
         node_id,
         writer_heap_size,
         reader_batch_size,
+        string_hash_optimization,
     })
 }
 

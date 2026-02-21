@@ -11,11 +11,21 @@ use crate::debug_println;
 
 use super::sub_aggregations::create_sub_aggregations_map;
 
-/// Helper function to create a TermsResult Java object
+/// Helper function to create a TermsResult Java object.
+///
+/// `resolution_map`: if `Some`, U64 bucket keys are looked up in this map and replaced
+/// with their original string values (used when the field was redirected to a `_phash_*`
+/// hash fast field). Keys not found in the map fall back to numeric string formatting.
+/// `include_filter`: if `Some`, only buckets whose resolved key is in this set are included.
+/// `exclude_filter`: if `Some`, buckets whose resolved key is in this set are excluded.
 pub(crate) fn create_terms_result_object(
     env: &mut JNIEnv,
     aggregation_name: &str,
     buckets: &Vec<BucketEntry>,
+    resolution_map: Option<&std::collections::HashMap<u64, String>>,
+    redirected_names: Option<&std::collections::HashSet<String>>,
+    include_filter: Option<&std::collections::HashSet<String>>,
+    exclude_filter: Option<&std::collections::HashSet<String>>,
 ) -> anyhow::Result<jobject> {
     debug_println!(
         "RUST DEBUG: Creating TermsResult for '{}' with {} buckets",
@@ -44,13 +54,37 @@ pub(crate) fn create_terms_result_object(
             !bucket.sub_aggregation.0.is_empty()
         );
 
-        // Convert the bucket key to string
-        let key_string = match &bucket.key {
-            Key::Str(s) => env.new_string(s)?,
-            Key::U64(n) => env.new_string(&n.to_string())?,
-            Key::I64(n) => env.new_string(&n.to_string())?,
-            Key::F64(n) => env.new_string(&n.to_string())?,
+        // Resolve the bucket key to a Rust String first so we can apply include/exclude filters.
+        // For U64 keys, attempt to resolve via the hash resolution map first
+        // (populated when the field was a _phash_* redirect). Falls back to n.to_string().
+        let key_resolved: String = match &bucket.key {
+            Key::Str(s) => s.clone(),
+            Key::U64(n) => {
+                let resolved = resolution_map.and_then(|m| m.get(n));
+                if let Some(s) = resolved {
+                    s.clone()
+                } else {
+                    n.to_string()
+                }
+            },
+            Key::I64(n) => n.to_string(),
+            Key::F64(n) => n.to_string(),
         };
+
+        // Apply include/exclude filters (post-filter for hash-field aggs where Tantivy
+        // ignores numeric include/exclude arrays on U64 fast fields).
+        if let Some(include) = include_filter {
+            if !include.contains(&key_resolved) {
+                continue;
+            }
+        }
+        if let Some(exclude) = exclude_filter {
+            if exclude.contains(&key_resolved) {
+                continue;
+            }
+        }
+
+        let key_string = env.new_string(&key_resolved)?;
 
         // Process sub-aggregations if any
         let sub_agg_map = if !bucket.sub_aggregation.0.is_empty() {
@@ -58,7 +92,7 @@ pub(crate) fn create_terms_result_object(
                 "RUST DEBUG: Processing {} sub-aggregations in bucket",
                 bucket.sub_aggregation.0.len()
             );
-            create_sub_aggregations_map(env, &bucket.sub_aggregation)?
+            create_sub_aggregations_map(env, &bucket.sub_aggregation, resolution_map, redirected_names)?
         } else {
             debug_println!("RUST DEBUG: No sub-aggregations in bucket");
             // Create empty HashMap
@@ -156,7 +190,7 @@ pub(crate) fn create_histogram_result_object(
                 "RUST DEBUG: Processing {} sub-aggregations in histogram bucket",
                 bucket.sub_aggregation.0.len()
             );
-            create_sub_aggregations_map(env, &bucket.sub_aggregation)?
+            create_sub_aggregations_map(env, &bucket.sub_aggregation, None, None)?
         } else {
             // Create empty HashMap
             let hashmap_class = env.find_class("java/util/HashMap")?;
@@ -268,7 +302,7 @@ pub(crate) fn create_date_histogram_result_object(
                 "RUST DEBUG: Processing {} sub-aggregations in date histogram bucket",
                 bucket.sub_aggregation.0.len()
             );
-            create_sub_aggregations_map(env, &bucket.sub_aggregation)?
+            create_sub_aggregations_map(env, &bucket.sub_aggregation, None, None)?
         } else {
             // Create empty HashMap
             let hashmap_class = env.find_class("java/util/HashMap")?;
@@ -383,7 +417,7 @@ pub(crate) fn create_range_result_object(
                 "RUST DEBUG: Processing {} sub-aggregations in range bucket",
                 bucket.sub_aggregation.0.len()
             );
-            create_sub_aggregations_map(env, &bucket.sub_aggregation)?
+            create_sub_aggregations_map(env, &bucket.sub_aggregation, None, None)?
         } else {
             // Create empty HashMap
             let hashmap_class = env.find_class("java/util/HashMap")?;

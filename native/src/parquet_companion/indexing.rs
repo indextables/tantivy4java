@@ -46,6 +46,18 @@ pub fn hash_parquet_path(relative_path: &str) -> u64 {
     hasher.finish()
 }
 
+/// Compute a stable 64-bit hash for a string value using xxHash64.
+///
+/// Returns a non-zero value: if xxh64 produces 0 (probability ~1/2^64), returns 1
+/// instead so that 0 can be used exclusively as the null/absent sentinel.
+pub fn hash_string_value(s: &str) -> u64 {
+    let h = xxhash_rust::xxh64::xxh64(s.as_bytes(), 0);
+    if h == 0 { 1 } else { h }
+}
+
+/// Prefix for hidden string hash fast fields.
+pub const PHASH_FIELD_PREFIX: &str = "_phash_";
+
 /// Configuration for creating a split from parquet files
 pub struct CreateFromParquetConfig {
     /// Table root path (parquet file paths are relative to this)
@@ -74,6 +86,10 @@ pub struct CreateFromParquetConfig {
     /// Larger batches reduce per-batch overhead but use more memory.
     /// Default: 8192.
     pub reader_batch_size: usize,
+    /// When true (default), adds hidden `_phash_<field>` U64 fast fields for each
+    /// string fast field in HYBRID mode with "raw" tokenizer. These enable hash-based
+    /// aggregations without full parquet column transcoding.
+    pub string_hash_optimization: bool,
 }
 
 impl Default for CreateFromParquetConfig {
@@ -91,6 +107,7 @@ impl Default for CreateFromParquetConfig {
             node_id: "parquet-node".to_string(),
             writer_heap_size: 256_000_000, // 256MB
             reader_batch_size: 8192,
+            string_hash_optimization: true,
         }
     }
 }
@@ -187,11 +204,73 @@ pub async fn create_split_from_parquet(
         PARQUET_ROW_IN_FILE_FIELD,
         tantivy::schema::NumericOptions::default().set_fast(),
     );
+
+    // ── String hash fields (HYBRID mode optimization) ────────────────────
+    // For each string fast field in HYBRID mode (raw tokenizer), add a hidden U64 fast field
+    // named `_phash_<field>` that stores xxHash64 of the string value. This allows
+    // aggregations like value_count, cardinality, and terms to avoid full parquet
+    // column transcoding.
+    //
+    // Collect the set of all tantivy field names (after name mapping) for conflict detection.
+    let user_tantivy_names: std::collections::HashSet<String> = arrow_schema.fields().iter()
+        .filter_map(|f| {
+            let pname = f.name();
+            if !config.skip_fields.contains(pname.as_str()) {
+                Some(name_mapping.get(pname.as_str()).cloned().unwrap_or_else(|| pname.to_string()))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    // Build the hash field map: tantivy_field_name → hash_field_name
+    let mut string_hash_fields: HashMap<String, String> = HashMap::new();
+
+    if parquet_config.string_hash_optimization
+        && parquet_config.fast_field_mode == FastFieldMode::Hybrid
+    {
+        for (_field, entry) in derived_schema.fields() {
+            let tantivy_name = entry.name();
+            // Only Str fields with raw tokenizer benefit from hash optimization.
+            // IP address fields resolve to IpAddr (native), not Str.
+            // JSON fields resolve to JsonObject, not Str.
+            // Bytes fields are INDEXED-only, so no fast field transcoding is needed.
+            let is_raw_str = matches!(entry.field_type(), tantivy::schema::FieldType::Str(opts)
+                if opts.get_indexing_options()
+                    .map(|io| io.tokenizer() == "raw")
+                    .unwrap_or(false));
+            if !is_raw_str {
+                continue;
+            }
+            let hash_field_name = format!("{}{}", PHASH_FIELD_PREFIX, tantivy_name);
+            // Conflict check: if the user has a column literally named `_phash_X`, skip.
+            if user_tantivy_names.contains(&hash_field_name) {
+                debug_println!(
+                    "⚠️ PARQUET_HASH: Conflict — user column '{}' shadows hash field for '{}', \
+                     disabling hash optimization for this field",
+                    hash_field_name, tantivy_name
+                );
+                continue;
+            }
+            schema_builder.add_u64_field(
+                &hash_field_name,
+                tantivy::schema::NumericOptions::default().set_fast(),
+            );
+            string_hash_fields.insert(tantivy_name.to_string(), hash_field_name.clone());
+            debug_println!(
+                "🏗️ PARQUET_HASH: Added hash field '{}' for string field '{}'",
+                hash_field_name, tantivy_name
+            );
+        }
+    }
+
     let tantivy_schema = schema_builder.build();
 
     debug_println!(
-        "🏗️ CREATE_FROM_PARQUET: Derived tantivy schema with {} fields (incl 2 row-tracking fast fields)",
-        tantivy_schema.fields().count()
+        "🏗️ CREATE_FROM_PARQUET: Derived tantivy schema with {} fields \
+         (incl 2 row-tracking + {} hash fields)",
+        tantivy_schema.fields().count(),
+        string_hash_fields.len()
     );
 
     // ── Step 5: Build column mapping ────────────────────────────────────
@@ -317,6 +396,7 @@ pub async fn create_split_from_parquet(
                     &tantivy_schema,
                     &name_mapping,
                     &config,
+                    &string_hash_fields,
                     &mut accumulators,
                 )?;
 
@@ -389,6 +469,7 @@ pub async fn create_split_from_parquet(
         total_rows,
         storage_config: None,
         metadata: HashMap::new(),
+        string_hash_fields,
     };
 
     manifest.validate().map_err(|e| anyhow::anyhow!("Manifest validation failed: {}", e))?;
@@ -482,6 +563,7 @@ fn arrow_row_to_tantivy_doc(
     tantivy_schema: &Schema,
     name_mapping: &name_mapping::NameMapping,
     config: &SchemaDerivationConfig,
+    string_hash_fields: &HashMap<String, String>,
     accumulators: &mut HashMap<String, StatisticsAccumulator>,
 ) -> Result<TantivyDocument> {
     let mut doc = TantivyDocument::new();
@@ -516,13 +598,20 @@ fn arrow_row_to_tantivy_doc(
             continue; // Skip null values — tantivy handles absent fields natively
         }
 
-        add_arrow_value_to_doc(&mut doc, field, array, arrow_field.data_type(), row_idx, tantivy_field_name, config, accumulators)?;
+        add_arrow_value_to_doc(
+            &mut doc, field, array, arrow_field.data_type(), row_idx,
+            tantivy_field_name, config, string_hash_fields, tantivy_schema,
+            accumulators,
+        )?;
     }
 
     Ok(doc)
 }
 
 /// Add a single Arrow value to a tantivy document, recording statistics if applicable.
+/// If the field has a hash counterpart (`string_hash_fields`), also stores the xxHash64
+/// of the string value in the corresponding U64 fast field.
+#[allow(clippy::too_many_arguments)]
 fn add_arrow_value_to_doc(
     doc: &mut TantivyDocument,
     field: Field,
@@ -531,6 +620,8 @@ fn add_arrow_value_to_doc(
     row_idx: usize,
     field_name: &str,
     config: &SchemaDerivationConfig,
+    string_hash_fields: &HashMap<String, String>,
+    tantivy_schema: &Schema,
     accumulators: &mut HashMap<String, StatisticsAccumulator>,
 ) -> Result<()> {
     match data_type {
@@ -638,6 +729,12 @@ fn add_arrow_value_to_doc(
                 if let Some(acc) = accumulators.get_mut(field_name) {
                     acc.observe_string(val);
                 }
+                // Add xxHash64 to hidden hash field (if one was created for this field)
+                if let Some(hash_field_name) = string_hash_fields.get(field_name) {
+                    if let Ok(hash_field) = tantivy_schema.get_field(hash_field_name) {
+                        doc.add_u64(hash_field, hash_string_value(val));
+                    }
+                }
             }
         }
         DataType::LargeUtf8 => {
@@ -651,6 +748,12 @@ fn add_arrow_value_to_doc(
                 doc.add_text(field, val);
                 if let Some(acc) = accumulators.get_mut(field_name) {
                     acc.observe_string(val);
+                }
+                // Add xxHash64 to hidden hash field (if one was created for this field)
+                if let Some(hash_field_name) = string_hash_fields.get(field_name) {
+                    if let Ok(hash_field) = tantivy_schema.get_field(hash_field_name) {
+                        doc.add_u64(hash_field, hash_string_value(val));
+                    }
                 }
             }
         }
@@ -734,6 +837,12 @@ fn add_arrow_value_to_doc(
             doc.add_text(field, &val);
             if let Some(acc) = accumulators.get_mut(field_name) {
                 acc.observe_string(&val);
+            }
+            // Add xxHash64 to hidden hash field (if one was created for this field)
+            if let Some(hash_field_name) = string_hash_fields.get(field_name) {
+                if let Ok(hash_field) = tantivy_schema.get_field(hash_field_name) {
+                    doc.add_u64(hash_field, hash_string_value(&val));
+                }
             }
         }
 

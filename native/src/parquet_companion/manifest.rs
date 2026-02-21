@@ -144,6 +144,11 @@ pub struct ParquetManifest {
     /// Arbitrary metadata key-value pairs
     #[serde(default)]
     pub metadata: HashMap<String, String>,
+    /// Maps tantivy string field name → hash field name for HYBRID mode optimization.
+    /// Only populated in HYBRID mode. Empty map means no hash fields present
+    /// (e.g., old splits created before this feature).
+    #[serde(default)]
+    pub string_hash_fields: HashMap<String, String>,
 }
 
 impl ParquetManifest {
@@ -248,6 +253,7 @@ mod tests {
             total_rows: 1000,
             storage_config: None,
             metadata: HashMap::new(),
+            string_hash_fields: HashMap::new(),
         }
     }
 

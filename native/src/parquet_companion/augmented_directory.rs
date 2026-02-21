@@ -132,14 +132,29 @@ impl ParquetAugmentedDirectory {
     /// Returns the tantivy column names that `transcode_and_cache` would actually
     /// transcode for the given requested column set (or all applicable columns if None).
     ///
+    /// Also appends hash field counterparts (`_phash_*`) for any string columns that
+    /// have them. Hash fields are native U64 fast fields — they are always in the
+    /// bundle alongside their parent string column and require zero parquet I/O.
+    /// Registering them here prevents subsequent hash-path queries from needlessly
+    /// checking whether those fields still need transcoding.
+    ///
     /// Used by the prewarm path to update `transcoded_fast_columns` after a successful
     /// transcode, preventing the first post-prewarm aggregation from redundantly
     /// re-reading all parquet files.
     pub fn effective_column_names(&self, requested: Option<&[String]>) -> Vec<String> {
-        columns_to_transcode(&self.manifest, self.mode, requested)
+        let parquet_names: Vec<String> = columns_to_transcode(&self.manifest, self.mode, requested)
             .into_iter()
             .map(|col| col.tantivy_name)
-            .collect()
+            .collect();
+
+        // Append hash counterparts: they are native U64 and always available in the bundle.
+        let mut names = parquet_names.clone();
+        for name in &parquet_names {
+            if let Some(hash_name) = self.manifest.string_hash_fields.get(name) {
+                names.push(hash_name.clone());
+            }
+        }
+        names
     }
 
     /// Transcode and cache fast fields for a segment.
@@ -491,6 +506,7 @@ mod tests {
             total_rows: 0,
             storage_config: None,
             metadata: std::collections::HashMap::new(),
+            string_hash_fields: std::collections::HashMap::new(),
         }
     }
 

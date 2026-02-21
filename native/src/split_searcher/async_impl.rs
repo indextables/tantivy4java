@@ -63,45 +63,81 @@ pub(crate) async fn ensure_fast_fields_for_query(
     };
 
     if !columns_to_add.is_empty() {
-        // Compute the full column set (existing + new) WITHOUT modifying
-        // transcoded_fast_columns yet. We only update the tracker AFTER all segments
-        // have been successfully transcoded. Previously the tracker was updated before
-        // the transcode, so a failure would permanently mark columns as "done" —
-        // leaving fast_field_data empty and producing count=0 for all aggregations.
-        let full_column_set: Vec<String> = {
-            let existing = context.transcoded_fast_columns.lock().unwrap();
-            let mut set: std::collections::HashSet<String> =
-                existing.iter().cloned().collect();
-            for col in &columns_to_add {
-                set.insert(col.clone());
+        // Partition: hash fields (`_phash_*`) are native U64 — they live in the native
+        // bundle and require zero parquet I/O. We can register them immediately without
+        // launching any transcode operation.
+        let (native_hash_cols, parquet_cols): (Vec<String>, Vec<String>) =
+            if let Some(manifest) = context.parquet_manifest.as_ref() {
+                let hash_values: std::collections::HashSet<&str> = manifest
+                    .string_hash_fields.values().map(|s| s.as_str()).collect();
+                columns_to_add.iter().cloned()
+                    .partition(|col| hash_values.contains(col.as_str()))
+            } else {
+                (vec![], columns_to_add.clone())
+            };
+
+        // Register native hash fields immediately (no I/O needed).
+        if !native_hash_cols.is_empty() {
+            debug_println!(
+                "📊 LAZY_TRANSCODE: Registering {} native hash fields (no parquet I/O): {:?}",
+                native_hash_cols.len(), native_hash_cols
+            );
+            let mut existing = context.transcoded_fast_columns.lock().unwrap();
+            for col in &native_hash_cols {
+                existing.insert(col.clone());
             }
-            set.into_iter().collect()
-        };
-
-        debug_println!(
-            "📊 LAZY_TRANSCODE: Transcoding {} new columns ({:?}), total set: {:?}",
-            columns_to_add.len(), columns_to_add, full_column_set
-        );
-
-        // Transcode for each segment — propagate errors instead of swallowing them.
-        // A swallowed error leaves fast_field_data empty, causing the aggregation to
-        // fall back to the native .fast file (no parquet-derived string columns in
-        // HYBRID mode) and return count=0 for every bucket.
-        for fast_path in &context.segment_fast_paths {
-            augmented_dir.transcode_and_cache(
-                fast_path,
-                Some(&full_column_set),
-            ).await.map_err(|e| anyhow::anyhow!(
-                "Failed to transcode parquet columns {:?} for segment {:?}: {}",
-                full_column_set, fast_path, e
-            ))?;
         }
 
-        // All segments succeeded — safe to mark the new columns as transcoded.
-        {
-            let mut existing = context.transcoded_fast_columns.lock().unwrap();
-            for col in &columns_to_add {
-                existing.insert(col.clone());
+        // Only launch transcode I/O for actual parquet-sourced columns.
+        if !parquet_cols.is_empty() {
+            // Compute the full column set (existing + new) WITHOUT modifying
+            // transcoded_fast_columns yet. We only update the tracker AFTER all segments
+            // have been successfully transcoded. Previously the tracker was updated before
+            // the transcode, so a failure would permanently mark columns as "done" —
+            // leaving fast_field_data empty and producing count=0 for all aggregations.
+            let full_column_set: Vec<String> = {
+                let existing = context.transcoded_fast_columns.lock().unwrap();
+                let mut set: std::collections::HashSet<String> =
+                    existing.iter().cloned().collect();
+                for col in &parquet_cols {
+                    set.insert(col.clone());
+                }
+                set.into_iter().collect()
+            };
+
+            debug_println!(
+                "📊 LAZY_TRANSCODE: Transcoding {} new parquet columns ({:?}), total set: {:?}",
+                parquet_cols.len(), parquet_cols, full_column_set
+            );
+
+            // Transcode for each segment — propagate errors instead of swallowing them.
+            // A swallowed error leaves fast_field_data empty, causing the aggregation to
+            // fall back to the native .fast file (no parquet-derived string columns in
+            // HYBRID mode) and return count=0 for every bucket.
+            for fast_path in &context.segment_fast_paths {
+                augmented_dir.transcode_and_cache(
+                    fast_path,
+                    Some(&full_column_set),
+                ).await.map_err(|e| anyhow::anyhow!(
+                    "Failed to transcode parquet columns {:?} for segment {:?}: {}",
+                    full_column_set, fast_path, e
+                ))?;
+            }
+
+            // All segments succeeded — safe to mark the new columns as transcoded.
+            // Also register any hash counterparts that correspond to the newly-transcoded
+            // string columns (they are already in the bundle but not yet registered).
+            {
+                let mut existing = context.transcoded_fast_columns.lock().unwrap();
+                for col in &parquet_cols {
+                    existing.insert(col.clone());
+                    // Hash counterpart is native U64 — always present in the merged bytes.
+                    if let Some(manifest) = context.parquet_manifest.as_ref() {
+                        if let Some(hash_name) = manifest.string_hash_fields.get(col) {
+                            existing.insert(hash_name.clone());
+                        }
+                    }
+                }
             }
         }
     }

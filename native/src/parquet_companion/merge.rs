@@ -143,6 +143,25 @@ pub fn combine_parquet_manifests(
         num_rows: cumulative_rows,
     }];
 
+    // Union string_hash_fields from all manifests (they should be identical for same-schema splits).
+    let mut combined_hash_fields = manifests[0].string_hash_fields.clone();
+    for (i, manifest) in manifests.iter().enumerate().skip(1) {
+        for (k, v) in &manifest.string_hash_fields {
+            if let Some(existing) = combined_hash_fields.get(k) {
+                debug_assert_eq!(existing, v,
+                    "string_hash_fields mismatch during merge for field {}", k);
+            }
+            combined_hash_fields.insert(k.clone(), v.clone());
+        }
+        if manifest.string_hash_fields != manifests[0].string_hash_fields {
+            debug_println!(
+                "⚠️ MERGE_MANIFEST: string_hash_fields differ between split[0] and split[{}]; \
+                 using union (this may indicate schema inconsistency)",
+                i
+            );
+        }
+    }
+
     // Use first manifest's metadata as base
     let combined = ParquetManifest {
         version: SUPPORTED_MANIFEST_VERSION,
@@ -154,6 +173,7 @@ pub fn combine_parquet_manifests(
         total_rows: cumulative_rows,
         storage_config: manifests[0].storage_config.clone(),
         metadata: manifests[0].metadata.clone(),
+        string_hash_fields: combined_hash_fields,
     };
 
     // Validate combined manifest
@@ -211,6 +231,7 @@ mod tests {
             total_rows: total,
             storage_config: None,
             metadata: std::collections::HashMap::new(),
+            string_hash_fields: std::collections::HashMap::new(),
         }
     }
 
