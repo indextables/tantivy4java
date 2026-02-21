@@ -63,27 +63,47 @@ pub(crate) async fn ensure_fast_fields_for_query(
     };
 
     if !columns_to_add.is_empty() {
-        // Partition: hash fields (`_phash_*`) are native U64 — they live in the native
-        // bundle and require zero parquet I/O. We can register them immediately without
-        // launching any transcode operation.
-        let (native_hash_cols, parquet_cols): (Vec<String>, Vec<String>) =
+        // Partition columns into native (already in the split bundle) vs parquet-sourced.
+        // Native fields include:
+        //   - `_phash_*` hash fields (U64, always in native bundle)
+        //   - Numeric/bool/date/ip fields in HYBRID mode (indexed natively by tantivy)
+        // These require zero parquet I/O and can be registered immediately.
+        let (native_cols, parquet_cols): (Vec<String>, Vec<String>) =
             if let Some(manifest) = context.parquet_manifest.as_ref() {
                 let hash_values: std::collections::HashSet<&str> = manifest
                     .string_hash_fields.values().map(|s| s.as_str()).collect();
+                // Build a lookup from tantivy field name → tantivy type
+                let field_types: std::collections::HashMap<&str, &str> = manifest
+                    .column_mapping.iter()
+                    .map(|m| (m.tantivy_field_name.as_str(), m.tantivy_type.as_str()))
+                    .collect();
+                let mode = manifest.fast_field_mode;
                 columns_to_add.iter().cloned()
-                    .partition(|col| hash_values.contains(col.as_str()))
+                    .partition(|col| {
+                        // Hash fields are always native
+                        if hash_values.contains(col.as_str()) {
+                            return true;
+                        }
+                        // Check if this field's type is native in the current mode
+                        if let Some(tantivy_type) = field_types.get(col.as_str()) {
+                            crate::parquet_companion::transcode::field_source(tantivy_type, mode)
+                                == crate::parquet_companion::transcode::FieldSource::Native
+                        } else {
+                            false // Unknown field — don't assume native
+                        }
+                    })
             } else {
                 (vec![], columns_to_add.clone())
             };
 
-        // Register native hash fields immediately (no I/O needed).
-        if !native_hash_cols.is_empty() {
+        // Register native fields immediately (no I/O needed).
+        if !native_cols.is_empty() {
             debug_println!(
-                "📊 LAZY_TRANSCODE: Registering {} native hash fields (no parquet I/O): {:?}",
-                native_hash_cols.len(), native_hash_cols
+                "📊 LAZY_TRANSCODE: Skipping {} native fields (no parquet I/O needed): {:?}",
+                native_cols.len(), native_cols
             );
             let mut existing = context.transcoded_fast_columns.lock().unwrap();
-            for col in &native_hash_cols {
+            for col in &native_cols {
                 existing.insert(col.clone());
             }
         }

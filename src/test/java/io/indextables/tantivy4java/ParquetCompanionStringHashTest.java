@@ -719,4 +719,64 @@ public class ParquetCompanionStringHashTest {
                     "name has 20 distinct values → cardinality should be 20");
         }
     }
+
+    // ═══════════════════════════════════════════════════════════════
+    // 17. Native fields don't trigger parquet transcoding
+    //     In HYBRID mode, range queries and aggregations on numeric/bool
+    //     fields (id, score, active) should work WITHOUT any parquet access.
+    //     We verify this by deleting the parquet file after split creation
+    //     and then running queries — if they succeed, no parquet I/O occurred.
+    // ═══════════════════════════════════════════════════════════════
+
+    @Test @org.junit.jupiter.api.Order(17)
+    @DisplayName("Native fields (id, score, active) don't trigger parquet transcoding in HYBRID mode")
+    void nativeFieldsNoParquetTranscode(@TempDir Path dir) throws Exception {
+        int numRows = 20;
+        Path parquetFile = dir.resolve("native_only.parquet");
+        Path splitFile   = dir.resolve("native_only.split");
+
+        QuickwitSplit.nativeWriteTestParquet(parquetFile.toString(), numRows, 0);
+
+        ParquetCompanionConfig config = new ParquetCompanionConfig(dir.toString())
+                .withFastFieldMode(ParquetCompanionConfig.FastFieldMode.HYBRID)
+                .withStringHashOptimization(true);
+
+        QuickwitSplit.SplitMetadata metadata = QuickwitSplit.createFromParquet(
+                Collections.singletonList(parquetFile.toString()),
+                splitFile.toString(), config);
+
+        // Delete the parquet file — any parquet access from here will fail
+        java.nio.file.Files.delete(parquetFile);
+        assertFalse(java.nio.file.Files.exists(parquetFile),
+                "Parquet file should be deleted");
+
+        String splitUrl = "file://" + splitFile.toAbsolutePath();
+        try (SplitSearcher s = cacheManager.createSplitSearcher(splitUrl, metadata, dir.toString())) {
+            // Do NOT prewarm — let the lazy transcode path handle it.
+            // If native fields are incorrectly routed to the transcode path,
+            // it will try to read the deleted parquet file and throw.
+
+            // 1. Range query on native i64 field (id)
+            SplitRangeQuery rangeQ = SplitRangeQuery.inclusiveRange("id", "5", "14", "i64");
+            SearchResult rangeResult = s.search(rangeQ, numRows);
+            assertEquals(10, rangeResult.getHits().size(),
+                    "Range [5,14] on native i64 field should match 10 docs without parquet");
+
+            // 2. Stats aggregation on native f64 field (score)
+            StatsAggregation statsAgg = new StatsAggregation("score_stats", "score");
+            SearchResult statsResult = s.search(new SplitMatchAllQuery(), 0, "stats", statsAgg);
+            StatsResult stats = (StatsResult) statsResult.getAggregation("stats");
+            assertNotNull(stats, "Stats on native f64 field should work without parquet");
+            assertEquals(numRows, stats.getCount(),
+                    "Stats count should be " + numRows);
+            assertEquals(10.0, stats.getMin(), 0.01, "min score should be 10.0");
+
+            // 3. Range query as predicate + aggregation on native fields only
+            SearchResult filteredStats = s.search(rangeQ, 0, "filtered", statsAgg);
+            StatsResult fStats = (StatsResult) filteredStats.getAggregation("filtered");
+            assertNotNull(fStats, "Range predicate + stats on native fields should work without parquet");
+            assertEquals(10, fStats.getCount(),
+                    "Filtered stats count should be 10 (ids 5-14)");
+        }
+    }
 }
