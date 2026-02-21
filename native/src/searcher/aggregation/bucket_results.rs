@@ -18,6 +18,11 @@ use super::sub_aggregations::create_sub_aggregations_map;
 /// hash fast field). Keys not found in the map fall back to numeric string formatting.
 /// `include_filter`: if `Some`, only buckets whose resolved key is in this set are included.
 /// `exclude_filter`: if `Some`, buckets whose resolved key is in this set are excluded.
+/// `missing_value`: if `Some`, the U64 zero-sentinel bucket (null docs) is relabeled with
+/// the original `missing` string value from the aggregation request instead of "0".
+/// `needs_resort`: if `true`, the bucket list is re-sorted alphabetically by key after hash
+/// resolution (needed when `order: {"_key": ...}` was specified, since Tantivy sorted by
+/// U64 hash value which doesn't match string ordering).
 pub(crate) fn create_terms_result_object(
     env: &mut JNIEnv,
     aggregation_name: &str,
@@ -26,6 +31,8 @@ pub(crate) fn create_terms_result_object(
     redirected_names: Option<&std::collections::HashSet<String>>,
     include_filter: Option<&std::collections::HashSet<String>>,
     exclude_filter: Option<&std::collections::HashSet<String>>,
+    missing_value: Option<&str>,
+    needs_resort: bool,
 ) -> anyhow::Result<jobject> {
     debug_println!(
         "RUST DEBUG: Creating TermsResult for '{}' with {} buckets",
@@ -33,19 +40,8 @@ pub(crate) fn create_terms_result_object(
         buckets.len()
     );
 
-    // Create TermsResult class
-    let terms_result_class =
-        env.find_class("io/indextables/tantivy4java/aggregation/TermsResult")?;
-    let name_string = env.new_string(aggregation_name)?;
-
-    // Create ArrayList for buckets
-    let arraylist_class = env.find_class("java/util/ArrayList")?;
-    let bucket_list = env.new_object(&arraylist_class, "()V", &[])?;
-
-    // Create TermsBucket class for individual buckets
-    let bucket_class =
-        env.find_class("io/indextables/tantivy4java/aggregation/TermsResult$TermsBucket")?;
-
+    // Phase 1: Resolve keys and filter. Collect (resolved_key, bucket_ref) pairs.
+    let mut resolved_buckets: Vec<(String, &BucketEntry)> = Vec::with_capacity(buckets.len());
     for bucket in buckets {
         debug_println!(
             "RUST DEBUG: Processing bucket - key: {:?}, doc_count: {}, has_sub_aggs: {}",
@@ -57,14 +53,19 @@ pub(crate) fn create_terms_result_object(
         // Resolve the bucket key to a Rust String first so we can apply include/exclude filters.
         // For U64 keys, attempt to resolve via the hash resolution map first
         // (populated when the field was a _phash_* redirect). Falls back to n.to_string().
+        // Special case: U64 key 0 is the null sentinel. If `missing_value` is set, relabel it
+        // with the original `missing` string from the aggregation request.
         let key_resolved: String = match &bucket.key {
             Key::Str(s) => s.clone(),
             Key::U64(n) => {
-                let resolved = resolution_map.and_then(|m| m.get(n));
-                if let Some(s) = resolved {
-                    s.clone()
+                if *n == 0 {
+                    if let Some(mv) = missing_value {
+                        mv.to_string()
+                    } else {
+                        resolution_map.and_then(|m| m.get(n)).cloned().unwrap_or_else(|| n.to_string())
+                    }
                 } else {
-                    n.to_string()
+                    resolution_map.and_then(|m| m.get(n)).cloned().unwrap_or_else(|| n.to_string())
                 }
             },
             Key::I64(n) => n.to_string(),
@@ -84,7 +85,28 @@ pub(crate) fn create_terms_result_object(
             }
         }
 
-        let key_string = env.new_string(&key_resolved)?;
+        resolved_buckets.push((key_resolved, bucket));
+    }
+
+    // Phase 2: Sort by resolved string key if order:_key was requested.
+    // Tantivy sorted by U64 hash value which doesn't match string ordering.
+    if needs_resort {
+        resolved_buckets.sort_by(|(a, _), (b, _)| a.cmp(b));
+    }
+
+    // Phase 3: Create Java objects from the resolved, filtered, sorted list.
+    let terms_result_class =
+        env.find_class("io/indextables/tantivy4java/aggregation/TermsResult")?;
+    let name_string = env.new_string(aggregation_name)?;
+
+    let arraylist_class = env.find_class("java/util/ArrayList")?;
+    let bucket_list = env.new_object(&arraylist_class, "()V", &[])?;
+
+    let bucket_class =
+        env.find_class("io/indextables/tantivy4java/aggregation/TermsResult$TermsBucket")?;
+
+    for (key_resolved, bucket) in &resolved_buckets {
+        let key_string = env.new_string(key_resolved)?;
 
         // Process sub-aggregations if any
         let sub_agg_map = if !bucket.sub_aggregation.0.is_empty() {

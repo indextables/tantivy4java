@@ -19,6 +19,8 @@
  *  10. exclude filter — excluded string values absent from result after hash resolution
  *  11. f64 (score) stats alongside hash-opt string terms — float data type not affected
  *  12. bool (active) value_count alongside hash-opt string terms — bool not redirected
+ *  13. order:_key — buckets re-sorted alphabetically after hash resolution
+ *  14. exists query on string field — FieldPresence redirected to _phash_name
  *
  * Run:
  *   mvn test -pl . -Dtest=ParquetCompanionStringHashTest
@@ -525,6 +527,85 @@ public class ParquetCompanionStringHashTest {
             assertNotNull(count, "value_count on bool field should return a result");
             assertEquals(20, count.getCount(),
                     "value_count on non-nullable bool field should be 20");
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // 13. order:_key — buckets re-sorted alphabetically after hash resolution
+    //     Without the fix, Tantivy sorts by U64 hash value (effectively random).
+    //     With needs_resort, the result is re-sorted by resolved string key.
+    // ═══════════════════════════════════════════════════════════════
+
+    @Test @org.junit.jupiter.api.Order(13)
+    @DisplayName("Terms with order:_key — buckets sorted alphabetically by resolved string key")
+    void termsAggOrderByKey(@TempDir Path dir) throws Exception {
+        try (SplitSearcher s = createSearcher(dir, true, 20, "order_key")) {
+            SplitAggregation orderKeyAgg = new SplitAggregation("name_ordered") {
+                @Override
+                public String toAggregationJson() {
+                    return "{\"terms\": {\"field\": \"name\", \"size\": 50, "
+                            + "\"order\": {\"_key\": \"asc\"}}}";
+                }
+                @Override public String getFieldName()       { return "name"; }
+                @Override public String getAggregationType() { return "terms"; }
+            };
+
+            SearchResult result = s.search(new SplitMatchAllQuery(), 0, "terms", orderKeyAgg);
+
+            assertTrue(result.hasAggregations());
+            TermsResult terms = (TermsResult) result.getAggregation("terms");
+            assertNotNull(terms);
+
+            List<TermsResult.TermsBucket> buckets = terms.getBuckets();
+            assertEquals(20, buckets.size(),
+                    "order:_key should return all 20 buckets");
+
+            // Verify keys are in ascending alphabetical order.
+            // "item_0", "item_1", "item_10", "item_11", ..., "item_19", "item_2", ..., "item_9"
+            List<String> actualKeys = new ArrayList<>();
+            for (TermsResult.TermsBucket b : buckets) {
+                assertTrue(b.getKey() instanceof String,
+                        "Key should be a resolved string: " + b.getKey());
+                actualKeys.add((String) b.getKey());
+            }
+
+            List<String> expectedKeys = new ArrayList<>(actualKeys);
+            Collections.sort(expectedKeys);
+
+            assertEquals(expectedKeys, actualKeys,
+                    "With order:{_key:asc}, buckets must be sorted alphabetically by resolved string key");
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    //  14. Exists query on hash-optimized string field
+    //     SplitExistsQuery("name") should match all docs — the query
+    //     is transparently redirected to FieldPresence("_phash_name")
+    //     which avoids parquet string transcoding.
+    // ═══════════════════════════════════════════════════════════════
+
+    @Test @org.junit.jupiter.api.Order(14)
+    @DisplayName("Exists query on hash-opt string field — redirected to _phash_name")
+    void existsQueryOnHashField(@TempDir Path dir) throws Exception {
+        int numRows = 20;
+
+        // First verify exists query works on a numeric field (score)
+        // which is always a native fast field and doesn't involve hash rewriting
+        try (SplitSearcher s = createSearcher(dir, true, numRows, "exists_hash_num")) {
+            SplitExistsQuery existsScore = new SplitExistsQuery("score");
+            SearchResult numResult = s.search(existsScore, numRows);
+            assertEquals(numRows, numResult.getHits().size(),
+                    "Exists query on numeric field 'score' should match all " + numRows + " docs");
+        }
+
+        // Now test the hash-optimized path: exists on string field "name" is
+        // rewritten to FieldPresence("_phash_name") — same result, no parquet transcode
+        try (SplitSearcher s = createSearcher(dir, true, numRows, "exists_hash_str")) {
+            SplitExistsQuery existsQuery = new SplitExistsQuery("name");
+            SearchResult result = s.search(existsQuery, numRows);
+
+            assertEquals(numRows, result.getHits().size(),
+                    "Exists query on name should match all " + numRows + " docs");
         }
     }
 }

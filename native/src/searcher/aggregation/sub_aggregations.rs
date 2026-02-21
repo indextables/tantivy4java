@@ -45,9 +45,9 @@ pub(crate) fn create_sub_aggregations_map(
         );
 
         // Convert aggregation result to Java object, passing through hash resolution context.
-        // Sub-aggregations don't carry per-name include/exclude filters.
+        // Sub-aggregations don't carry per-name include/exclude/missing/resort info.
         let java_agg_result = create_java_aggregation_from_final_result(
-            env, agg_name, agg_result, false, resolution_map, redirected_names, None, None,
+            env, agg_name, agg_result, false, resolution_map, redirected_names, None, None, None, false,
         )?;
 
         if !java_agg_result.is_null() {
@@ -77,6 +77,8 @@ pub(crate) fn create_sub_aggregations_map(
 /// `redirected_names`: set of aggregation names redirected to `_phash_*` hash fields.
 /// `include_filter`: if `Some`, only terms buckets with keys in this set are returned.
 /// `exclude_filter`: if `Some`, terms buckets with keys in this set are excluded.
+/// `missing_value`: if `Some`, the U64 zero-sentinel bucket is relabeled with this string.
+/// `needs_resort`: if `true`, buckets are re-sorted alphabetically after hash key resolution.
 pub(crate) fn create_java_aggregation_from_final_result(
     env: &mut JNIEnv,
     aggregation_name: &str,
@@ -86,6 +88,8 @@ pub(crate) fn create_java_aggregation_from_final_result(
     redirected_names: Option<&std::collections::HashSet<String>>,
     include_filter: Option<&std::collections::HashSet<String>>,
     exclude_filter: Option<&std::collections::HashSet<String>>,
+    missing_value: Option<&str>,
+    needs_resort: bool,
 ) -> anyhow::Result<jobject> {
     debug_println!(
         "RUST DEBUG: Creating Java aggregation for '{}', type: {:?}, date_histogram_hint: {}",
@@ -195,7 +199,7 @@ pub(crate) fn create_java_aggregation_from_final_result(
                     } else {
                         None
                     };
-                    create_terms_result_object(env, aggregation_name, buckets, effective_map, redirected_names, include_filter, exclude_filter)
+                    create_terms_result_object(env, aggregation_name, buckets, effective_map, redirected_names, include_filter, exclude_filter, missing_value, needs_resort)
                 }
                 BucketResult::Range { buckets } => {
                     debug_println!("RUST DEBUG: Creating RangeResult");

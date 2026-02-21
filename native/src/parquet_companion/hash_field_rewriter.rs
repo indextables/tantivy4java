@@ -1,4 +1,4 @@
-// hash_field_rewriter.rs - Phase 2: Rewrite aggregation JSON to use hash fields
+// hash_field_rewriter.rs - Phase 2: Rewrite aggregation JSON and query AST to use hash fields
 //
 // For HYBRID mode parquet companion splits, string fast fields are expensive to transcode
 // (requires reading all parquet rows). This rewriter substitutes `_phash_<field>` U64 fields
@@ -7,6 +7,11 @@
 //   value_count  → redirect field: counts non-null values, hash absent = null
 //   cardinality  → redirect field: distinct hash count ≈ distinct string count
 //   terms        → redirect field; bucket keys resolved in Phase 3 touchup
+//
+// Query AST rewriting:
+//   FieldPresence (exists query) → redirect to `_phash_<field>`: non-null strings have a
+//   hash value stored; null strings have no hash value. FieldPresence on the hash field
+//   is equivalent to FieldPresence on the original string field.
 //
 // Operations that cannot be redirected:
 //   terms with min_doc_count: 0  → needs full dictionary (not possible with hashes)
@@ -283,6 +288,107 @@ fn rewrite_agg_def(
     }
 }
 
+// ─── Query AST rewriting ─────────────────────────────────────────────────────
+//
+// Rewrites `FieldPresence` nodes in the Quickwit QueryAst JSON to use the
+// `_phash_*` hash field instead of the original string field. This avoids
+// transcoding the full parquet column just to check for non-null values.
+//
+// The replacement is semantically correct because during indexing:
+// - Non-null string → `doc.add_u64(hash_field, hash)` → field is present
+// - Null string → no `add_u64` call → field is absent
+//
+// So `FieldPresence(_phash_X)` ≡ `FieldPresence(X)` for string fields.
+
+/// Rewrite a Quickwit QueryAst JSON string, replacing `FieldPresence` queries
+/// on string hash fields with `FieldPresence` queries on the corresponding
+/// `_phash_*` field.
+///
+/// Returns `None` if no changes were made (the JSON is already optimal).
+/// Returns `Some(rewritten_json)` if at least one field was redirected.
+pub fn rewrite_query_for_hash_fields(
+    query_json: &str,
+    string_hash_fields: &HashMap<String, String>,
+) -> Option<String> {
+    if string_hash_fields.is_empty() {
+        return None;
+    }
+
+    let mut value: Value = match serde_json::from_str(query_json) {
+        Ok(v) => v,
+        Err(_) => return None,
+    };
+
+    if rewrite_query_node(&mut value, string_hash_fields) {
+        serde_json::to_string(&value).ok()
+    } else {
+        None
+    }
+}
+
+/// Recursively walk a QueryAst JSON node, replacing `FieldPresence` fields.
+/// Returns `true` if any modification was made.
+fn rewrite_query_node(
+    node: &mut Value,
+    string_hash_fields: &HashMap<String, String>,
+) -> bool {
+    let obj = match node.as_object_mut() {
+        Some(o) => o,
+        None => return false,
+    };
+
+    // Check if this node is a FieldPresence query
+    let is_field_presence = obj
+        .get("type")
+        .and_then(|t| t.as_str())
+        .map(|t| t == "field_presence")
+        .unwrap_or(false);
+
+    if is_field_presence {
+        if let Some(field) = obj.get("field").and_then(|f| f.as_str()).map(|s| s.to_string()) {
+            if let Some(hash_field) = string_hash_fields.get(&field) {
+                obj.insert("field".to_string(), Value::String(hash_field.clone()));
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Recurse into Bool query clauses
+    let is_bool = obj
+        .get("type")
+        .and_then(|t| t.as_str())
+        .map(|t| t == "bool")
+        .unwrap_or(false);
+
+    if is_bool {
+        let mut changed = false;
+        for clause_key in &["must", "should", "must_not", "filter"] {
+            if let Some(arr) = obj.get_mut(*clause_key).and_then(|v| v.as_array_mut()) {
+                for item in arr.iter_mut() {
+                    changed |= rewrite_query_node(item, string_hash_fields);
+                }
+            }
+        }
+        return changed;
+    }
+
+    // Recurse into Boost query
+    let is_boost = obj
+        .get("type")
+        .and_then(|t| t.as_str())
+        .map(|t| t == "boost")
+        .unwrap_or(false);
+
+    if is_boost {
+        if let Some(underlying) = obj.get_mut("underlying") {
+            return rewrite_query_node(underlying, string_hash_fields);
+        }
+    }
+
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -446,5 +552,67 @@ mod tests {
         assert_eq!(h1, h2, "hash must be deterministic");
         assert_ne!(h1, 0, "hash must never be zero");
         assert_ne!(hash_string_value("active"), hash_string_value("pending"));
+    }
+
+    // ─── Query rewriting tests ──────────────────────────────────────────────
+
+    #[test]
+    fn test_rewrite_query_field_presence_redirected() {
+        let query = r#"{"type":"field_presence","field":"status"}"#;
+        let result = rewrite_query_for_hash_fields(query, &make_hash_fields());
+        assert!(result.is_some(), "field_presence on hash-mapped field should be rewritten");
+        let v: Value = serde_json::from_str(&result.unwrap()).unwrap();
+        assert_eq!(v["field"].as_str().unwrap(), "_phash_status");
+        assert_eq!(v["type"].as_str().unwrap(), "field_presence");
+    }
+
+    #[test]
+    fn test_rewrite_query_field_presence_non_hash_field_unchanged() {
+        let query = r#"{"type":"field_presence","field":"score"}"#;
+        let result = rewrite_query_for_hash_fields(query, &make_hash_fields());
+        assert!(result.is_none(), "field_presence on non-hash field should not be rewritten");
+    }
+
+    #[test]
+    fn test_rewrite_query_non_field_presence_unchanged() {
+        let query = r#"{"type":"term","field":"status","value":"active"}"#;
+        let result = rewrite_query_for_hash_fields(query, &make_hash_fields());
+        assert!(result.is_none(), "Term query should not be rewritten");
+    }
+
+    #[test]
+    fn test_rewrite_query_bool_with_nested_field_presence() {
+        let query = r#"{"type":"bool","must":[{"type":"field_presence","field":"status"},{"type":"term","field":"name","value":"alice"}],"should":[],"must_not":[],"filter":[]}"#;
+        let result = rewrite_query_for_hash_fields(query, &make_hash_fields());
+        assert!(result.is_some());
+        let v: Value = serde_json::from_str(&result.unwrap()).unwrap();
+        assert_eq!(v["must"][0]["field"].as_str().unwrap(), "_phash_status");
+        assert_eq!(v["must"][0]["type"].as_str().unwrap(), "field_presence");
+        // Term query should be unchanged
+        assert_eq!(v["must"][1]["field"].as_str().unwrap(), "name");
+    }
+
+    #[test]
+    fn test_rewrite_query_empty_hash_fields_noop() {
+        let query = r#"{"type":"field_presence","field":"status"}"#;
+        let result = rewrite_query_for_hash_fields(query, &HashMap::new());
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_rewrite_query_boost_wrapping_field_presence() {
+        let query = r#"{"type":"boost","underlying":{"type":"field_presence","field":"category"},"boost":2.0}"#;
+        let result = rewrite_query_for_hash_fields(query, &make_hash_fields());
+        assert!(result.is_some());
+        let v: Value = serde_json::from_str(&result.unwrap()).unwrap();
+        assert_eq!(v["underlying"]["field"].as_str().unwrap(), "_phash_category");
+        assert_eq!(v["underlying"]["type"].as_str().unwrap(), "field_presence");
+    }
+
+    #[test]
+    fn test_rewrite_query_match_all_unchanged() {
+        let query = r#"{"type":"match_all"}"#;
+        let result = rewrite_query_for_hash_fields(query, &make_hash_fields());
+        assert!(result.is_none());
     }
 }

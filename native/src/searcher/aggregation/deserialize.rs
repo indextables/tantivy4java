@@ -117,8 +117,10 @@ pub(crate) fn deserialize_aggregation_results(
             is_date_histogram_hint,
             hash_resolution_map.as_ref(),
             redirected_hash_agg_names.as_ref(),
-            None, // include_filter: not available in this deserialization path
-            None, // exclude_filter: not available in this deserialization path
+            None,  // include_filter: not available in this deserialization path
+            None,  // exclude_filter: not available in this deserialization path
+            None,  // missing_value
+            false, // needs_resort
         ) {
             Ok(java_obj) => {
                 if !java_obj.is_null() {
@@ -362,13 +364,15 @@ pub(crate) fn find_specific_aggregation_result(
     if let Some(agg_result) = final_results.0.get(aggregation_name) {
         debug_println!("RUST DEBUG: Found aggregation result: {:?}", agg_result);
 
-        // Look up per-aggregation include/exclude string filters from the touchup infos.
-        // These were captured during Phase 2 rewriting and removed from the JSON sent to Tantivy
+        // Look up per-aggregation touchup info (include/exclude, missing, resort) from Phase 2.
+        // These were captured during rewriting and removed from the JSON sent to Tantivy
         // because Tantivy ignores numeric include arrays for U64 fast fields.
-        let (include_filter, exclude_filter) = touchup_infos
-            .and_then(|infos| infos.iter().find(|i| i.agg_name == aggregation_name))
-            .map(|info| (info.include_strings.as_ref(), info.exclude_strings.as_ref()))
-            .unwrap_or((None, None));
+        let touchup = touchup_infos
+            .and_then(|infos| infos.iter().find(|i| i.agg_name == aggregation_name));
+        let include_filter = touchup.and_then(|t| t.include_strings.as_ref());
+        let exclude_filter = touchup.and_then(|t| t.exclude_strings.as_ref());
+        let missing_value = touchup.and_then(|t| t.missing_value.as_deref());
+        let needs_resort = touchup.map(|t| t.needs_resort).unwrap_or(false);
 
         return create_java_aggregation_from_final_result(
             env,
@@ -379,6 +383,8 @@ pub(crate) fn find_specific_aggregation_result(
             redirected_hash_agg_names,
             include_filter,
             exclude_filter,
+            missing_value,
+            needs_resort,
         );
     } else {
         debug_println!(

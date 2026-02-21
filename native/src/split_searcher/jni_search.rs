@@ -282,7 +282,29 @@ pub async fn perform_search_async_impl_leaf_response_with_aggregations(
 
     debug_println!("🔍 ASYNC_JNI: Extracted searcher context, performing search with aggregations on split: {}", context.split_uri);
 
-    // Phase 2: Rewrite aggregation JSON to replace string field references with _phash_* fields.
+    // Phase 2a: Rewrite query JSON to redirect FieldPresence (exists) queries on string
+    // hash fields to the native _phash_* U64 field, avoiding string column transcoding.
+    let effective_query_json = if let Some(ref manifest) = context.parquet_manifest {
+        if !manifest.string_hash_fields.is_empty() {
+            if let Some(rewritten) = crate::parquet_companion::hash_field_rewriter::rewrite_query_for_hash_fields(
+                &query_json,
+                &manifest.string_hash_fields,
+            ) {
+                debug_println!(
+                    "📊 HASH_OPT: Rewrote query FieldPresence to hash field(s)"
+                );
+                rewritten
+            } else {
+                query_json.clone()
+            }
+        } else {
+            query_json.clone()
+        }
+    } else {
+        query_json.clone()
+    };
+
+    // Phase 2b: Rewrite aggregation JSON to replace string field references with _phash_* fields.
     // This avoids expensive parquet transcoding for terms/value_count/cardinality aggregations.
     let (effective_agg_json, rewrite_output) =
         if let (Some(ref agg_json), Some(ref manifest)) =
@@ -319,11 +341,11 @@ pub async fn perform_search_async_impl_leaf_response_with_aggregations(
         };
 
     // Lazy transcoding: ensure fast fields needed by aggregation + range queries are transcoded.
-    // Use the rewritten JSON so that hash fields (already native) are not transcoded from parquet.
+    // Use the rewritten query/agg JSON so that hash fields (already native) are not transcoded from parquet.
     let overrides = if context.augmented_directory.is_some() {
         super::async_impl::ensure_fast_fields_for_query(
             context,
-            &query_json,
+            &effective_query_json,
             effective_agg_json.as_deref(),
         ).await?
     } else {
@@ -333,7 +355,7 @@ pub async fn perform_search_async_impl_leaf_response_with_aggregations(
         })
     };
 
-    // Perform the search using the (possibly rewritten) aggregation JSON
+    // Perform the search using the (possibly rewritten) query and aggregation JSON
     let leaf_response = perform_real_quickwit_search_with_aggregations(
         &context.split_uri,
         &context.aws_config,
@@ -343,7 +365,7 @@ pub async fn perform_search_async_impl_leaf_response_with_aggregations(
         context.cached_storage.clone(),
         context.cached_searcher.clone(),
         context.cached_index.clone(),
-        &query_json,
+        &effective_query_json,
         limit,
         effective_agg_json.clone(),
         overrides,

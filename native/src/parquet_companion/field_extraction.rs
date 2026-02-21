@@ -94,9 +94,11 @@ fn extract_fields_from_agg_value(value: &serde_json::Value, fields: &mut HashSet
 fn extract_fields_from_query_value(value: &serde_json::Value, fields: &mut HashSet<String>) {
     match value {
         serde_json::Value::Object(map) => {
-            // Check for range query pattern: { "type": "range", "field": "..." }
+            // Check for range or field_presence query pattern:
+            //   { "type": "range", "field": "..." }
+            //   { "type": "field_presence", "field": "..." }
             if let Some(type_val) = map.get("type").and_then(|t| t.as_str()) {
-                if type_val == "range" {
+                if type_val == "range" || type_val == "field_presence" {
                     if let Some(field_name) = map.get("field").and_then(|f| f.as_str()) {
                         fields.insert(field_name.to_string());
                     }
