@@ -12,8 +12,8 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 # Main library dependencies (for JNI functions and core search functionality)
-# Pin to specific commit for reproducible builds (main branch)
-tantivy = { git = "https://github.com/indextables/tantivy", rev = "696b8477", default-features = false, features = [
+# Pin to specific commit for reproducible builds (v0.22.0-indextables-1)
+tantivy = { git = "https://github.com/indextables/tantivy", rev = "4b6d7d49", default-features = false, features = [
   "lz4-compression",
   "mmap",
   "quickwit",
