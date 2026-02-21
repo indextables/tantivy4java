@@ -694,10 +694,19 @@ fn retrieve_documents_as_tantivy_docs(
                     }
                 }
 
+                // Validate segment ordinals before retrieval to prevent index-out-of-bounds panics
+                let num_segments = cached_searcher.segment_readers().len();
+
                 // Retrieve documents concurrently
                 let doc_futures = doc_addresses.into_iter().map(|doc_addr| {
                     let moved_searcher = cached_searcher.clone();
                     async move {
+                        if doc_addr.segment_ord as usize >= num_segments {
+                            return Err(anyhow::anyhow!(
+                                "Invalid segment ordinal {}: index has {} segment(s)",
+                                doc_addr.segment_ord, num_segments
+                            ));
+                        }
                         let doc: tantivy::schema::TantivyDocument = tokio::time::timeout(
                             std::time::Duration::from_secs(5),
                             moved_searcher.doc_async(doc_addr),

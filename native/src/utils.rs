@@ -95,6 +95,21 @@ pub fn unwrap_or_throw<T>(env: &mut JNIEnv, result: Result<T, Box<dyn std::error
     }
 }
 
+/// Install a global panic hook that logs the panic to stderr instead of aborting.
+/// This provides diagnostic output when panics occur on background threads
+/// (e.g., tokio workers) that don't have a catch_unwind wrapper.
+pub fn install_panic_hook() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let default_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            eprintln!("tantivy4java: panic on thread {:?}: {}", std::thread::current().name(), info);
+            default_hook(info);
+        }));
+    });
+}
+
 /// Convert JString to Rust String
 pub fn jstring_to_string(env: &mut JNIEnv, jstr: &jni::objects::JString) -> anyhow::Result<String> {
     Ok(env.get_string(jstr)?.into())
@@ -105,16 +120,33 @@ pub fn string_to_jstring<'a>(env: &mut JNIEnv<'a>, s: &str) -> anyhow::Result<jn
     Ok(env.new_string(s)?)
 }
 
-/// Execute function and convert any errors to Java exceptions
+/// Execute function and convert any errors AND panics to Java exceptions.
+/// CRITICAL: This is the JNI boundary guard. Rust panics that cross the JNI/C FFI
+/// boundary cause undefined behavior (typically SIGABRT). We must catch them here.
 pub fn convert_throwable<T, F>(env: &mut JNIEnv, f: F) -> anyhow::Result<T>
 where
     F: FnOnce(&mut JNIEnv) -> anyhow::Result<T>,
 {
-    match f(env) {
-        Ok(value) => Ok(value),
-        Err(error) => {
+    // Wrap in catch_unwind to prevent panics from crossing the JNI boundary.
+    // AssertUnwindSafe is required because JNIEnv is not UnwindSafe, but this is
+    // safe here: on panic we only use env to throw a Java exception, we don't
+    // access any partially-mutated state from the panicked closure.
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(env))) {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(error)) => {
             let _ = env.throw_new("java/lang/RuntimeException", error.to_string());
             Err(error)
+        }
+        Err(panic_info) => {
+            let panic_msg = if let Some(s) = panic_info.downcast_ref::<&str>() {
+                format!("Rust panic: {}", s)
+            } else if let Some(s) = panic_info.downcast_ref::<String>() {
+                format!("Rust panic: {}", s)
+            } else {
+                "Rust panic (unknown payload)".to_string()
+            };
+            let _ = env.throw_new("java/lang/RuntimeException", &panic_msg);
+            Err(anyhow::anyhow!("{}", panic_msg))
         }
     }
 }

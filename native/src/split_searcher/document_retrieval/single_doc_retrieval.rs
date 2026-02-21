@@ -82,6 +82,14 @@ pub fn retrieve_document_from_split_optimized(
                     crate::runtime_manager::QuickwitRuntimeManager::global()
                         .handle()
                         .block_on(async {
+                            // Validate segment ordinal to prevent index-out-of-bounds panic
+                            let num_segments = searcher.segment_readers().len();
+                            if doc_address.segment_ord as usize >= num_segments {
+                                return Err(anyhow::anyhow!(
+                                    "Invalid segment ordinal {}: index has {} segment(s)",
+                                    doc_address.segment_ord, num_segments
+                                ));
+                            }
                             let doc = tokio::time::timeout(
                                 std::time::Duration::from_secs(5),
                                 searcher.doc_async(doc_address),
@@ -301,6 +309,15 @@ pub fn retrieve_document_from_split_optimized(
                         index_opening_start.elapsed().as_millis()
                     );
 
+                    // Validate segment ordinal to prevent index-out-of-bounds panic
+                    let num_segments = searcher.segment_readers().len();
+                    if doc_address.segment_ord as usize >= num_segments {
+                        return Err(anyhow::anyhow!(
+                            "Invalid segment ordinal {}: index has {} segment(s)",
+                            doc_address.segment_ord, num_segments
+                        ));
+                    }
+
                     // Retrieve the document using async method with timeout (same as batch retrieval for StorageDirectory compatibility)
                     let doc_retrieval_start = std::time::Instant::now();
                     let doc = tokio::time::timeout(
@@ -508,6 +525,15 @@ pub fn retrieve_document_from_split(
                 .map_err(|e| anyhow::anyhow!("Failed to create index reader: {}", e))?;
 
             let tantivy_searcher = index_reader.searcher();
+
+            // Validate segment ordinal to prevent index-out-of-bounds panic
+            let num_segments = tantivy_searcher.segment_readers().len();
+            if doc_address.segment_ord as usize >= num_segments {
+                return Err(anyhow::anyhow!(
+                    "Invalid segment ordinal {}: index has {} segment(s)",
+                    doc_address.segment_ord, num_segments
+                ));
+            }
 
             // Use doc_async like Quickwit does (fetch_docs.rs line 205-207) - QUICKWIT OPTIMIZATION
             let doc: tantivy::schema::TantivyDocument = tokio::time::timeout(

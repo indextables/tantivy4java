@@ -207,10 +207,19 @@ pub fn retrieve_documents_batch_from_split_optimized(
                     // Using global cache configuration for concurrent batch processing
                     // Note: doc_async calls will now benefit from prefetched ByteRangeCache
 
+                    // Validate segment ordinals before retrieval to prevent index-out-of-bounds panics
+                    let num_segments_cached = cached_searcher.segment_readers().len();
+
                     let doc_futures = doc_addresses.into_iter().map(|doc_addr| {
                         let moved_searcher = cached_searcher.clone(); // Reuse cached searcher
                         let moved_schema = schema.clone();
                         async move {
+                            if doc_addr.segment_ord as usize >= num_segments_cached {
+                                return Err(anyhow::anyhow!(
+                                    "Invalid segment ordinal {}: index has {} segment(s)",
+                                    doc_addr.segment_ord, num_segments_cached
+                                ));
+                            }
                             // Add timeout to individual doc_async calls to prevent hanging
                             let doc: tantivy::schema::TantivyDocument = tokio::time::timeout(
                                 std::time::Duration::from_secs(5),
@@ -475,11 +484,20 @@ pub fn retrieve_documents_batch_from_split_optimized(
                     // ✅ QUICKWIT CONCURRENT PATTERN: Use concurrent document retrieval (fetch_docs.rs line 200-258)
                     // Note: doc_async calls will now benefit from prefetched ByteRangeCache
 
+                    // Validate segment ordinals before retrieval to prevent index-out-of-bounds panics
+                    let num_segments_tantivy = tantivy_searcher.segment_readers().len();
+
                     // Create async futures for concurrent document retrieval (like Quickwit)
                     let doc_futures = doc_addresses.into_iter().map(|doc_addr| {
                         let moved_searcher = tantivy_searcher.clone(); // Clone Arc for concurrent access
                         let moved_schema = schema.clone(); // Clone schema for each future
                         async move {
+                            if doc_addr.segment_ord as usize >= num_segments_tantivy {
+                                return Err(anyhow::anyhow!(
+                                    "Invalid segment ordinal {}: index has {} segment(s)",
+                                    doc_addr.segment_ord, num_segments_tantivy
+                                ));
+                            }
                             // Use doc_async like Quickwit with timeout - QUICKWIT OPTIMIZATION (fetch_docs.rs line 205-207)
                             let doc: tantivy::schema::TantivyDocument = tokio::time::timeout(
                                 std::time::Duration::from_secs(5),

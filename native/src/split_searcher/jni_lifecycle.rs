@@ -915,6 +915,22 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_clos
     crate::split_query::remove_searcher_schema(searcher_ptr);
     debug_println!("✅ CLEANUP: Removed direct schema mapping for searcher {}", searcher_ptr);
 
+    // ✅ FIX: Evict from SEARCHER_CACHE before releasing Arc, to prevent
+    // use-after-free panics on tokio worker threads during JVM shutdown.
+    // The SEARCHER_CACHE holds Arc<tantivy::Searcher> which references index data;
+    // if the test deletes the split files while these cached searchers still exist,
+    // background threads accessing them will panic with UnexpectedEof.
+    if let Some(split_uri) = crate::utils::jlong_to_arc::<crate::split_searcher::types::CachedSearcherContext>(searcher_ptr)
+        .map(|ctx| ctx.split_uri.clone())
+    {
+        let cache = crate::split_searcher::searcher_cache::get_searcher_cache();
+        if let Ok(mut guard) = cache.lock() {
+            if guard.pop(&split_uri).is_some() {
+                debug_println!("✅ CLEANUP: Evicted searcher cache entry for {}", split_uri);
+            }
+        }
+    }
+
     // Unregister searcher from runtime manager
     let runtime = crate::runtime_manager::QuickwitRuntimeManager::global();
     runtime.unregister_searcher();
