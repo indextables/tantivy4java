@@ -578,6 +578,36 @@ public class ParquetCompanionStringHashTest {
     }
 
     // ═══════════════════════════════════════════════════════════════
+    //  Helper: create a HYBRID-mode split with hash opt, prewarming extra columns
+    // ═══════════════════════════════════════════════════════════════
+
+    private SplitSearcher createSearcherWithCategory(Path dir, boolean hashOpt, int numRows, String tag)
+            throws Exception {
+        Path parquetFile = dir.resolve(tag + ".parquet");
+        Path splitFile   = dir.resolve(tag + ".split");
+
+        QuickwitSplit.nativeWriteTestParquet(parquetFile.toString(), numRows, 0);
+
+        ParquetCompanionConfig config = new ParquetCompanionConfig(dir.toString())
+                .withFastFieldMode(ParquetCompanionConfig.FastFieldMode.HYBRID)
+                .withStringHashOptimization(hashOpt);
+
+        QuickwitSplit.SplitMetadata metadata = QuickwitSplit.createFromParquet(
+                Collections.singletonList(parquetFile.toString()),
+                splitFile.toString(), config);
+
+        String splitUrl = "file://" + splitFile.toAbsolutePath();
+        SplitSearcher searcher = cacheManager.createSplitSearcher(splitUrl, metadata, dir.toString());
+        try {
+            searcher.preloadParquetFastFields("id", "score", "name", "active", "category").join();
+        } catch (Exception e) {
+            searcher.close();
+            throw e;
+        }
+        return searcher;
+    }
+
+    // ═══════════════════════════════════════════════════════════════
     //  14. Exists query on hash-optimized string field
     //     SplitExistsQuery("name") should match all docs — the query
     //     is transparently redirected to FieldPresence("_phash_name")
@@ -606,6 +636,87 @@ public class ParquetCompanionStringHashTest {
 
             assertEquals(numRows, result.getHits().size(),
                     "Exists query on name should match all " + numRows + " docs");
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // 15. Multiple string fields — both "name" and "category" hash-optimized
+    //     in the same request. Tests that the rewriter handles >1 string hash
+    //     field and Phase-3 resolves both independently.
+    // ═══════════════════════════════════════════════════════════════
+
+    @Test @org.junit.jupiter.api.Order(15)
+    @DisplayName("Multiple string hash fields: terms(name) + terms(category) in one request")
+    void multipleStringFieldsHashOptimized(@TempDir Path dir) throws Exception {
+        int numRows = 20;
+        try (SplitSearcher s = createSearcherWithCategory(dir, true, numRows, "multi_str")) {
+            Map<String, SplitAggregation> aggs = new LinkedHashMap<>();
+            aggs.put("name_terms", new TermsAggregation("name_terms", "name", 50, 0));
+            aggs.put("cat_terms",  new TermsAggregation("cat_terms", "category", 50, 0));
+
+            SearchResult result = s.search(new SplitMatchAllQuery(), 0, aggs);
+
+            assertTrue(result.hasAggregations());
+            assertEquals(2, result.getAggregations().size());
+
+            // "name" — 20 unique values, each with doc_count=1
+            TermsResult nameTerms = (TermsResult) result.getAggregation("name_terms");
+            assertNotNull(nameTerms);
+            assertEquals(numRows, nameTerms.getBuckets().size(),
+                    "name terms should have " + numRows + " buckets");
+            for (TermsResult.TermsBucket b : nameTerms.getBuckets()) {
+                assertTrue(b.getKey() instanceof String,
+                        "name key should be a resolved string: " + b.getKey());
+                assertTrue(((String) b.getKey()).startsWith("item_"),
+                        "name key should match 'item_X': " + b.getKey());
+                assertEquals(1, b.getDocCount());
+            }
+
+            // "category" — 5 unique values (cat_0..cat_4), each with doc_count=4
+            TermsResult catTerms = (TermsResult) result.getAggregation("cat_terms");
+            assertNotNull(catTerms);
+            assertEquals(5, catTerms.getBuckets().size(),
+                    "category terms should have 5 buckets (cat_0..cat_4)");
+            for (TermsResult.TermsBucket b : catTerms.getBuckets()) {
+                assertTrue(b.getKey() instanceof String,
+                        "category key should be a resolved string: " + b.getKey());
+                assertTrue(((String) b.getKey()).startsWith("cat_"),
+                        "category key should match 'cat_X': " + b.getKey());
+                assertEquals(4, b.getDocCount(),
+                        "Each category appears in 4 docs (20 rows / 5 categories)");
+            }
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // 16. Cardinality aggregation on hash-optimized string field
+    //     Distinct hash count approximates distinct string count.
+    // ═══════════════════════════════════════════════════════════════
+
+    @Test @org.junit.jupiter.api.Order(16)
+    @DisplayName("Cardinality agg on hash-opt string field — estimated distinct count correct")
+    void cardinalityAggOnStringField(@TempDir Path dir) throws Exception {
+        int numRows = 20;
+        try (SplitSearcher s = createSearcherWithCategory(dir, true, numRows, "cardinality")) {
+            Map<String, SplitAggregation> aggs = new LinkedHashMap<>();
+            // category has 5 distinct values (cat_0..cat_4)
+            aggs.put("cat_card", new CardinalityAggregation("cat_card", "category"));
+            // name has 20 distinct values (item_0..item_19)
+            aggs.put("name_card", new CardinalityAggregation("name_card", "name"));
+
+            SearchResult result = s.search(new SplitMatchAllQuery(), 0, aggs);
+
+            assertTrue(result.hasAggregations());
+
+            CardinalityResult catCard = (CardinalityResult) result.getAggregation("cat_card");
+            assertNotNull(catCard, "Cardinality result for category should not be null");
+            assertEquals(5, catCard.getValue(),
+                    "category has 5 distinct values → cardinality should be 5");
+
+            CardinalityResult nameCard = (CardinalityResult) result.getAggregation("name_card");
+            assertNotNull(nameCard, "Cardinality result for name should not be null");
+            assertEquals(20, nameCard.getValue(),
+                    "name has 20 distinct values → cardinality should be 20");
         }
     }
 }

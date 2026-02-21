@@ -13,8 +13,9 @@ use super::bucket_results::{
     create_range_result_object, create_terms_result_object,
 };
 use super::metric_results::{
-    create_average_result_object, create_count_result_object, create_max_result_object,
-    create_min_result_object, create_stats_result_object, create_sum_result_object,
+    create_average_result_object, create_cardinality_result_object, create_count_result_object,
+    create_max_result_object, create_min_result_object, create_stats_result_object,
+    create_sum_result_object,
 };
 
 /// Helper function to create a Java HashMap of sub-aggregations from AggregationResults.
@@ -174,9 +175,16 @@ pub(crate) fn create_java_aggregation_from_final_result(
                     debug_println!("RUST DEBUG: TopHits not yet implemented");
                     Ok(std::ptr::null_mut())
                 }
-                MetricResult::Cardinality(_) => {
-                    debug_println!("RUST DEBUG: Cardinality not yet implemented");
-                    Ok(std::ptr::null_mut())
+                MetricResult::Cardinality(cardinality_result) => {
+                    debug_println!(
+                        "RUST DEBUG: Creating CardinalityResult - value: {:?}",
+                        cardinality_result.value
+                    );
+                    create_cardinality_result_object(
+                        env,
+                        aggregation_name,
+                        cardinality_result.value.unwrap_or(0.0) as u64,
+                    )
                 }
             }
         }

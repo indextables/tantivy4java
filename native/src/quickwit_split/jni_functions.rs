@@ -624,7 +624,7 @@ fn create_java_column_statistics_map<'a>(
 }
 
 /// JNI helper for tests: create a parquet file with test data.
-/// Schema: id (i64), name (utf8), score (f64), active (bool)
+/// Schema: id (i64), name (utf8), score (f64), active (bool), category (utf8)
 /// Rows: num_rows rows, ids starting from id_offset.
 #[no_mangle]
 pub extern "system" fn Java_io_indextables_tantivy4java_split_merge_QuickwitSplit_nativeWriteTestParquet(
@@ -650,6 +650,7 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_merge_QuickwitSpli
             Field::new("name", DataType::Utf8, false),
             Field::new("score", DataType::Float64, true),
             Field::new("active", DataType::Boolean, true),
+            Field::new("category", DataType::Utf8, false),
         ]));
 
         let ids: Vec<i64> = (0..num).map(|i| offset + i as i64).collect();
@@ -658,6 +659,9 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_merge_QuickwitSpli
             .collect();
         let scores: Vec<f64> = (0..num).map(|i| (i as f64) * 1.5 + 10.0).collect();
         let actives: Vec<bool> = (0..num).map(|i| i % 2 == 0).collect();
+        let categories: Vec<String> = (0..num)
+            .map(|i| format!("cat_{}", i % 5))
+            .collect();
 
         let batch = RecordBatch::try_new(
             schema.clone(),
@@ -668,6 +672,9 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_merge_QuickwitSpli
                 )),
                 Arc::new(Float64Array::from(scores)),
                 Arc::new(BooleanArray::from(actives)),
+                Arc::new(StringArray::from(
+                    categories.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+                )),
             ],
         )
         .map_err(|e| anyhow!("Failed to create RecordBatch: {}", e))?;

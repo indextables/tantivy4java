@@ -136,3 +136,25 @@ pub(crate) fn create_sum_result_object(
 
     Ok(result.into_raw())
 }
+
+/// Helper function to create a CardinalityResult Java object
+pub(crate) fn create_cardinality_result_object(
+    env: &mut JNIEnv,
+    aggregation_name: &str,
+    value: u64,
+) -> anyhow::Result<jobject> {
+    let class =
+        env.find_class("io/indextables/tantivy4java/aggregation/CardinalityResult")?;
+    let name_string = env.new_string(aggregation_name)?;
+
+    let result = env.new_object(
+        &class,
+        "(Ljava/lang/String;J)V",
+        &[
+            JValue::Object(&name_string),
+            JValue::Long(value as jlong),
+        ],
+    )?;
+
+    Ok(result.into_raw())
+}

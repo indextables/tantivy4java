@@ -1139,6 +1139,7 @@ mod tests {
             Field::new("name", DataType::Utf8, false),
             Field::new("score", DataType::Float64, true),
             Field::new("active", DataType::Boolean, true),
+            Field::new("category", DataType::Utf8, false),
         ]));
 
         let ids: Vec<i64> = (0..num_rows).map(|i| id_offset + i as i64).collect();
@@ -1147,6 +1148,9 @@ mod tests {
             .collect();
         let scores: Vec<f64> = (0..num_rows).map(|i| (i as f64) * 1.5 + 10.0).collect();
         let actives: Vec<bool> = (0..num_rows).map(|i| i % 2 == 0).collect();
+        let categories: Vec<String> = (0..num_rows)
+            .map(|i| format!("cat_{}", i % 5))
+            .collect();
 
         let batch = RecordBatch::try_new(
             schema.clone(),
@@ -1155,6 +1159,7 @@ mod tests {
                 Arc::new(StringArray::from(names.iter().map(|s| s.as_str()).collect::<Vec<_>>())),
                 Arc::new(Float64Array::from(scores)),
                 Arc::new(BooleanArray::from(actives)),
+                Arc::new(StringArray::from(categories.iter().map(|s| s.as_str()).collect::<Vec<_>>())),
             ],
         ).unwrap();
 
