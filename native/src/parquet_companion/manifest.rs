@@ -6,6 +6,8 @@
 use std::collections::HashMap;
 use serde::{Serialize, Deserialize};
 
+use super::string_indexing::{StringIndexingMode, CompanionFieldInfo};
+
 /// Current manifest format version
 pub const SUPPORTED_MANIFEST_VERSION: u32 = 1;
 
@@ -149,6 +151,15 @@ pub struct ParquetManifest {
     /// (e.g., old splits created before this feature).
     #[serde(default)]
     pub string_hash_fields: HashMap<String, String>,
+    /// Maps field name → compact string indexing mode for fields using non-standard
+    /// indexing strategies (exact_only, text_uuid_*, text_custom_*).
+    /// Empty for splits without compact string indexing.
+    #[serde(default)]
+    pub string_indexing_modes: HashMap<String, StringIndexingMode>,
+    /// Maps companion hash field name → info about the original field and regex pattern.
+    /// Only populated for *_exactonly modes that create companion `__uuids` fields.
+    #[serde(default)]
+    pub companion_hash_fields: HashMap<String, CompanionFieldInfo>,
 }
 
 impl ParquetManifest {
@@ -254,6 +265,8 @@ mod tests {
             storage_config: None,
             metadata: HashMap::new(),
             string_hash_fields: HashMap::new(),
+            string_indexing_modes: HashMap::new(),
+            companion_hash_fields: HashMap::new(),
         }
     }
 
@@ -294,5 +307,56 @@ mod tests {
         assert_eq!(json, "\"hybrid\"");
         let mode: FastFieldMode = serde_json::from_str("\"parquet_only\"").unwrap();
         assert_eq!(mode, FastFieldMode::ParquetOnly);
+    }
+
+    #[test]
+    fn test_manifest_serde_roundtrip_with_string_indexing() {
+        use super::super::string_indexing::{StringIndexingMode, CompanionFieldInfo, UUID_REGEX};
+
+        let mut manifest = make_test_manifest();
+        manifest.string_indexing_modes.insert(
+            "trace_id".to_string(),
+            StringIndexingMode::ExactOnly,
+        );
+        manifest.string_indexing_modes.insert(
+            "message".to_string(),
+            StringIndexingMode::TextUuidExactonly,
+        );
+        manifest.companion_hash_fields.insert(
+            "message__uuids".to_string(),
+            CompanionFieldInfo {
+                original_field_name: "message".to_string(),
+                regex_pattern: UUID_REGEX.to_string(),
+            },
+        );
+
+        let json = serde_json::to_string(&manifest).unwrap();
+        let parsed: ParquetManifest = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed.string_indexing_modes.len(), 2);
+        assert_eq!(parsed.string_indexing_modes["trace_id"], StringIndexingMode::ExactOnly);
+        assert_eq!(parsed.string_indexing_modes["message"], StringIndexingMode::TextUuidExactonly);
+        assert_eq!(parsed.companion_hash_fields.len(), 1);
+        assert_eq!(parsed.companion_hash_fields["message__uuids"].original_field_name, "message");
+    }
+
+    #[test]
+    fn test_manifest_backward_compat_missing_new_fields() {
+        // Verify that manifests without the new fields deserialize with defaults
+        let json = r#"{
+            "version": 1,
+            "table_root": "",
+            "fast_field_mode": "disabled",
+            "segment_row_ranges": [{"segment_ord": 0, "row_offset": 0, "num_rows": 10}],
+            "parquet_files": [{"relative_path": "p.parquet", "file_size_bytes": 100, "row_offset": 0, "num_rows": 10, "has_offset_index": false, "row_groups": []}],
+            "column_mapping": [],
+            "total_rows": 10,
+            "storage_config": null,
+            "metadata": {},
+            "string_hash_fields": {}
+        }"#;
+        let parsed: ParquetManifest = serde_json::from_str(json).unwrap();
+        assert!(parsed.string_indexing_modes.is_empty());
+        assert!(parsed.companion_hash_fields.is_empty());
     }
 }

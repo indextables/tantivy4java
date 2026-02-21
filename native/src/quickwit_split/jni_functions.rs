@@ -1324,3 +1324,104 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_merge_QuickwitSpli
         Ok(())
     });
 }
+
+/// Test helper: write a parquet file for string indexing mode testing.
+///
+/// Schema (5 columns):
+///   id (i64), trace_id (utf8 — pure UUIDs),
+///   message (utf8 — text with embedded UUID),
+///   error_log (utf8 — text with ERR-XXXX pattern),
+///   category (utf8 — cycling "info"/"warn"/"error")
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_split_merge_QuickwitSplit_nativeWriteTestParquetForStringIndexing(
+    mut env: JNIEnv,
+    _class: JClass,
+    path: JString,
+    num_rows: jni::sys::jint,
+    id_offset: jni::sys::jlong,
+) {
+    let _ = convert_throwable(&mut env, |env| {
+        let path_str = jstring_to_string(env, &path)?;
+
+        use arrow_array::*;
+        use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+        use parquet::arrow::ArrowWriter;
+        use std::sync::Arc;
+
+        let num = num_rows as usize;
+        let offset = id_offset as u64;
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("trace_id", DataType::Utf8, false),
+            Field::new("message", DataType::Utf8, false),
+            Field::new("error_log", DataType::Utf8, false),
+            Field::new("category", DataType::Utf8, false),
+        ]));
+
+        // Simple deterministic hash for generating UUID-like strings
+        fn mix(seed: u64) -> u64 {
+            let mut h = seed;
+            h = h.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            h ^= h >> 33;
+            h = h.wrapping_mul(0xff51afd7ed558ccd);
+            h ^= h >> 33;
+            h
+        }
+
+        fn fake_uuid(row: u64, col: u64) -> String {
+            let a = mix(row.wrapping_mul(31).wrapping_add(col.wrapping_mul(1000003)));
+            let b = mix(a);
+            format!(
+                "{:08x}-{:04x}-4{:03x}-{:04x}-{:012x}",
+                (a >> 32) as u32,
+                (a >> 16) as u16,
+                a as u16 & 0x0FFF,
+                ((b >> 48) as u16 & 0x3FFF) | 0x8000,
+                b & 0xFFFF_FFFFFFFF
+            )
+        }
+
+        let ids: Vec<i64> = (0..num).map(|i| (offset + i as u64) as i64).collect();
+
+        // trace_id: pure UUIDs (one per row)
+        let trace_ids: Vec<String> = (0..num).map(|i| fake_uuid(offset + i as u64, 1)).collect();
+
+        // message: text with an embedded UUID
+        let actions = ["login", "search", "purchase", "logout", "upload"];
+        let messages: Vec<String> = (0..num).map(|i| {
+            let uuid = fake_uuid(offset + i as u64, 2);
+            format!("Request {} completed action {} for user_{}", uuid, actions[i % 5], i)
+        }).collect();
+
+        // error_log: text with ERR-XXXX custom pattern (use global offset for uniqueness across splits)
+        let error_logs: Vec<String> = (0..num).map(|i| {
+            let row = offset + i as u64;
+            format!("ERR-{:04}: Connection to host_{}.example.com timed out after {}ms",
+                    row, row % 10, 100 + row)
+        }).collect();
+
+        let categories = ["info", "warn", "error"];
+        let category_vals: Vec<String> = (0..num).map(|i| categories[i % 3].to_string()).collect();
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(ids)),
+                Arc::new(StringArray::from(trace_ids.iter().map(|s| s.as_str()).collect::<Vec<_>>())),
+                Arc::new(StringArray::from(messages.iter().map(|s| s.as_str()).collect::<Vec<_>>())),
+                Arc::new(StringArray::from(error_logs.iter().map(|s| s.as_str()).collect::<Vec<_>>())),
+                Arc::new(StringArray::from(category_vals.iter().map(|s| s.as_str()).collect::<Vec<_>>())),
+            ],
+        ).map_err(|e| anyhow!("Failed to create string-indexing RecordBatch: {}", e))?;
+
+        let file = std::fs::File::create(&path_str)
+            .map_err(|e| anyhow!("Failed to create file '{}': {}", path_str, e))?;
+        let mut writer = ArrowWriter::try_new(file, schema, None)
+            .map_err(|e| anyhow!("Failed to create ArrowWriter: {}", e))?;
+        writer.write(&batch).map_err(|e| anyhow!("write string-indexing parquet: {}", e))?;
+        writer.close().map_err(|e| anyhow!("close string-indexing parquet: {}", e))?;
+
+        Ok(())
+    });
+}

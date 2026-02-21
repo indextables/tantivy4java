@@ -304,6 +304,28 @@ pub async fn perform_search_async_impl_leaf_response_with_aggregations(
         query_json.clone()
     };
 
+    // Phase 2a2: Rewrite term queries for compact string indexing modes.
+    // Also blocks unsupported query types (wildcard, phrase, regex) on exact_only fields.
+    let effective_query_json = if let Some(ref manifest) = context.parquet_manifest {
+        if !manifest.string_indexing_modes.is_empty() {
+            match crate::parquet_companion::hash_field_rewriter::rewrite_query_for_string_indexing(
+                &effective_query_json,
+                &manifest.string_indexing_modes,
+                &manifest.companion_hash_fields,
+            )? {
+                Some(rewritten) => {
+                    debug_println!("📊 STRING_IDX: Rewrote query for compact string indexing mode(s)");
+                    rewritten
+                }
+                None => effective_query_json,
+            }
+        } else {
+            effective_query_json
+        }
+    } else {
+        effective_query_json
+    };
+
     // Phase 2b: Rewrite aggregation JSON to replace string field references with _phash_* fields.
     // This avoids expensive parquet transcoding for terms/value_count/cardinality aggregations.
     let (effective_agg_json, rewrite_output) =

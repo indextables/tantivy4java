@@ -228,6 +228,8 @@ mod tests {
             storage_config: None,
             metadata: StdHashMap::new(),
             string_hash_fields: StdHashMap::new(),
+            string_indexing_modes: StdHashMap::new(),
+            companion_hash_fields: StdHashMap::new(),
         }
     }
 

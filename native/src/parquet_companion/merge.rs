@@ -162,6 +162,31 @@ pub fn combine_parquet_manifests(
         }
     }
 
+    // Union string_indexing_modes from all manifests with mismatch validation.
+    let mut combined_indexing_modes = manifests[0].string_indexing_modes.clone();
+    for (i, manifest) in manifests.iter().enumerate().skip(1) {
+        for (field, mode) in &manifest.string_indexing_modes {
+            if let Some(existing) = combined_indexing_modes.get(field) {
+                if existing != mode {
+                    anyhow::bail!(
+                        "Cannot merge: string_indexing_modes mismatch for field '{}' \
+                         between split[0] ({:?}) and split[{}] ({:?})",
+                        field, existing, i, mode
+                    );
+                }
+            }
+            combined_indexing_modes.insert(field.clone(), mode.clone());
+        }
+    }
+
+    // Union companion_hash_fields from all manifests.
+    let mut combined_companion_fields = manifests[0].companion_hash_fields.clone();
+    for (_i, manifest) in manifests.iter().enumerate().skip(1) {
+        for (k, v) in &manifest.companion_hash_fields {
+            combined_companion_fields.insert(k.clone(), v.clone());
+        }
+    }
+
     // Use first manifest's metadata as base
     let combined = ParquetManifest {
         version: SUPPORTED_MANIFEST_VERSION,
@@ -174,6 +199,8 @@ pub fn combine_parquet_manifests(
         storage_config: manifests[0].storage_config.clone(),
         metadata: manifests[0].metadata.clone(),
         string_hash_fields: combined_hash_fields,
+        string_indexing_modes: combined_indexing_modes,
+        companion_hash_fields: combined_companion_fields,
     };
 
     // Validate combined manifest
@@ -232,6 +259,8 @@ mod tests {
             storage_config: None,
             metadata: std::collections::HashMap::new(),
             string_hash_fields: std::collections::HashMap::new(),
+            string_indexing_modes: std::collections::HashMap::new(),
+            companion_hash_fields: std::collections::HashMap::new(),
         }
     }
 
@@ -477,6 +506,73 @@ mod tests {
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(err_msg.contains("column_mapping"), "Error should mention column_mapping: {}", err_msg);
+    }
+
+    #[test]
+    fn test_combine_string_indexing_modes() {
+        use super::super::string_indexing::{StringIndexingMode, CompanionFieldInfo, UUID_REGEX};
+
+        let dir1 = tempfile::tempdir().unwrap();
+        let dir2 = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+
+        let mut m1 = make_test_manifest("s3://bucket", vec![("p1.parquet", 100, 1024)]);
+        m1.string_indexing_modes.insert("trace_id".to_string(), StringIndexingMode::ExactOnly);
+        m1.string_indexing_modes.insert("msg".to_string(), StringIndexingMode::TextUuidExactonly);
+        m1.companion_hash_fields.insert("msg__uuids".to_string(), CompanionFieldInfo {
+            original_field_name: "msg".to_string(),
+            regex_pattern: UUID_REGEX.to_string(),
+        });
+
+        let mut m2 = make_test_manifest("s3://bucket", vec![("p2.parquet", 200, 2048)]);
+        m2.string_indexing_modes.insert("trace_id".to_string(), StringIndexingMode::ExactOnly);
+        m2.string_indexing_modes.insert("msg".to_string(), StringIndexingMode::TextUuidExactonly);
+        m2.companion_hash_fields.insert("msg__uuids".to_string(), CompanionFieldInfo {
+            original_field_name: "msg".to_string(),
+            regex_pattern: UUID_REGEX.to_string(),
+        });
+
+        std::fs::write(dir1.path().join(MANIFEST_FILENAME), serialize_manifest(&m1).unwrap()).unwrap();
+        std::fs::write(dir2.path().join(MANIFEST_FILENAME), serialize_manifest(&m2).unwrap()).unwrap();
+
+        let result = combine_parquet_manifests(
+            &[dir1.path(), dir2.path()],
+            output.path(),
+        ).unwrap();
+        assert!(result.is_some());
+
+        let combined_data = std::fs::read(output.path().join(MANIFEST_FILENAME)).unwrap();
+        let combined = deserialize_manifest(&combined_data).unwrap();
+
+        assert_eq!(combined.string_indexing_modes.len(), 2);
+        assert_eq!(combined.string_indexing_modes["trace_id"], StringIndexingMode::ExactOnly);
+        assert_eq!(combined.companion_hash_fields.len(), 1);
+        assert!(combined.companion_hash_fields.contains_key("msg__uuids"));
+    }
+
+    #[test]
+    fn test_combine_rejects_mismatched_string_indexing_modes() {
+        use super::super::string_indexing::StringIndexingMode;
+
+        let dir1 = tempfile::tempdir().unwrap();
+        let dir2 = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+
+        let mut m1 = make_test_manifest("s3://bucket", vec![("p1.parquet", 100, 1024)]);
+        m1.string_indexing_modes.insert("field_a".to_string(), StringIndexingMode::ExactOnly);
+
+        let mut m2 = make_test_manifest("s3://bucket", vec![("p2.parquet", 200, 2048)]);
+        m2.string_indexing_modes.insert("field_a".to_string(), StringIndexingMode::TextUuidStrip);
+
+        std::fs::write(dir1.path().join(MANIFEST_FILENAME), serialize_manifest(&m1).unwrap()).unwrap();
+        std::fs::write(dir2.path().join(MANIFEST_FILENAME), serialize_manifest(&m2).unwrap()).unwrap();
+
+        let result = combine_parquet_manifests(
+            &[dir1.path(), dir2.path()],
+            output.path(),
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("string_indexing_modes mismatch"));
     }
 
     #[test]

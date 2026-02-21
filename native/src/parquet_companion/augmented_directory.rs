@@ -507,6 +507,8 @@ mod tests {
             storage_config: None,
             metadata: std::collections::HashMap::new(),
             string_hash_fields: std::collections::HashMap::new(),
+            string_indexing_modes: std::collections::HashMap::new(),
+            companion_hash_fields: std::collections::HashMap::new(),
         }
     }
 

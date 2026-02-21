@@ -24,6 +24,37 @@ import java.util.Objects;
 public class ParquetCompanionConfig {
 
     /**
+     * Compact string indexing mode constants for use with
+     * {@link ParquetCompanionConfig#withTokenizerOverrides(Map)}.
+     *
+     * <p>These modes reduce index size for string fields by replacing full text
+     * indexing with compact hash-based indexing or by stripping patterns (e.g., UUIDs)
+     * before text indexing.</p>
+     */
+    public static final class StringIndexingMode {
+        private StringIndexingMode() {} // prevent instantiation
+
+        /** Index xxHash64 as U64 (TERM + fast). No Str field. Term queries auto-hashed. */
+        public static final String EXACT_ONLY = "exact_only";
+
+        /** Strip UUIDs, index text with "default" tokenizer. UUIDs stored as hash in companion field. */
+        public static final String TEXT_UUID_EXACTONLY = "text_uuid_exactonly";
+
+        /** Strip UUIDs, index text with "default" tokenizer. UUIDs discarded. */
+        public static final String TEXT_UUID_STRIP = "text_uuid_strip";
+
+        /** Strip custom regex matches, index text. Matches stored as hash in companion field. */
+        public static String textCustomExactonly(String regex) {
+            return "text_custom_exactonly:" + regex;
+        }
+
+        /** Strip custom regex matches, index text. Matches discarded. */
+        public static String textCustomStrip(String regex) {
+            return "text_custom_strip:" + regex;
+        }
+    }
+
+    /**
      * Fast field mode determines how fast fields (columnar data) are served.
      */
     public enum FastFieldMode {
