@@ -69,8 +69,12 @@ public class ParquetCompanionLazyTranscodeTest {
 
         QuickwitSplit.nativeWriteTestParquet(parquetFile.toString(), 20, 0);
 
+        // Disable string hash optimization: with hash-opt ON (default), terms on "name"
+        // would be redirected to the native _phash_name U64 field, which doesn't need parquet
+        // at all. This test specifically validates the transcode error propagation path.
         ParquetCompanionConfig config = new ParquetCompanionConfig(dir.toString())
-                .withFastFieldMode(ParquetCompanionConfig.FastFieldMode.HYBRID);
+                .withFastFieldMode(ParquetCompanionConfig.FastFieldMode.HYBRID)
+                .withStringHashOptimization(false);
 
         QuickwitSplit.SplitMetadata metadata = QuickwitSplit.createFromParquet(
                 Collections.singletonList(parquetFile.toString()),
