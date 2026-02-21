@@ -38,11 +38,11 @@ public class SplitQueryParsingComprehensiveTest {
     public void setUp() throws Exception {
         System.out.println("=== Setting up SplitQuery Parsing Test ===");
         
-        // Create temp directory
-        tempDir = "/tmp/split_query_comprehensive_test_" + System.currentTimeMillis();
+        // Create temp directory with unique name to avoid cache collisions
+        tempDir = "/tmp/split_query_comprehensive_test_" + System.nanoTime();
         File splitDir = new File(tempDir);
         splitDir.mkdirs();
-        splitPath = tempDir + "/comprehensive_test.split";
+        splitPath = tempDir + "/comprehensive_test_" + System.nanoTime() + ".split";
         
         // Create comprehensive test schema
         SchemaBuilder builder = new SchemaBuilder();
@@ -83,8 +83,8 @@ public class SplitQueryParsingComprehensiveTest {
         splitMetadata = QuickwitSplit.convertIndexFromPath(indexPath.toString(), splitPath, config);
         System.out.println("✅ Converted index to split: " + splitPath);
         
-        // Create SplitSearcher
-        SplitCacheManager.CacheConfig cacheConfig = new SplitCacheManager.CacheConfig("comprehensive-test-cache");
+        // Create SplitSearcher with unique cache name to avoid stale cache entries
+        SplitCacheManager.CacheConfig cacheConfig = new SplitCacheManager.CacheConfig("comprehensive-test-cache-" + System.nanoTime());
         cacheManager = SplitCacheManager.getInstance(cacheConfig);
         splitSearcher = cacheManager.createSplitSearcher("file://" + splitPath, splitMetadata);
         

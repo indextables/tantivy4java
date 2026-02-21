@@ -87,7 +87,8 @@ public class SplitSearcherDocumentRetrievalTest {
         testIndex.close();
 
         // Convert index to split file using QuickwitSplit
-        splitPath = tempDir.resolve("document_test.split");
+        // Use unique split filename per test to avoid stale searcher/footer cache entries
+        splitPath = tempDir.resolve("document_test_" + System.nanoTime() + ".split");
         QuickwitSplit.SplitConfig config = new QuickwitSplit.SplitConfig(
             "document-test-index",
             "document-test-source", 
@@ -260,12 +261,14 @@ public class SplitSearcherDocumentRetrievalTest {
     
     @Test
     @DisplayName("Test document retrieval performance and caching")
-    void testDocumentRetrievalPerformanceAndCaching() {
+    void testDocumentRetrievalPerformanceAndCaching() throws InterruptedException {
+        // Allow async FS updates from prior test to settle
+        Thread.sleep(200);
         try (SplitSearcher searcher = cacheManager.createSplitSearcher(splitUrl, metadata)) {
             Schema schema = searcher.getSchema();
-            SplitQuery query = new SplitTermQuery("title", "Document");
+            SplitQuery query = new SplitTermQuery("title", "document");
             SearchResult result = searcher.search(query, 3);
-            
+
             List<SearchResult.Hit> hits = result.getHits();
             assertTrue(hits.size() > 0, "Should have hits for performance test");
             
