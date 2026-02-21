@@ -112,9 +112,10 @@ pub fn extract_split_to_directory_impl(split_path: &Path, output_dir: &Path) -> 
     debug_log!("🔧 MERGE EXTRACTION: Opening bundle directory with full file access (no lazy loading)");
 
     // ✅ CORRUPTION RESILIENCE: Catch panics from corrupted split files during directory access
-    let bundle_directory = match std::panic::catch_unwind(|| {
+    // NOTE: Requires panic = "unwind" (not "abort") in .cargo/config.toml for catch_unwind to work
+    let bundle_directory = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         get_tantivy_directory_from_split_bundle_full_access(&split_path_str)
-    }) {
+    })) {
         Ok(Ok(directory)) => directory,
         Ok(Err(e)) => {
             debug_log!("🚨 SPLIT ACCESS ERROR: Failed to open split directory for '{}': {}", split_path_str, e);

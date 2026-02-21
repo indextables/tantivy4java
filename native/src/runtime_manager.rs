@@ -94,15 +94,18 @@ impl QuickwitRuntimeManager {
     }
 
     /// Get the global runtime manager instance (singleton pattern)
+    ///
+    /// IMPORTANT: We intentionally leak the runtime so it is never dropped during process exit.
+    /// Static destructors run in undefined order; if the tokio runtime is dropped while its
+    /// worker threads still reference searcher/index data (or vice versa), we get a
+    /// double-panic abort (SIGABRT).  Leaking the runtime means the OS reclaims memory at
+    /// process exit, but worker threads are never abruptly aborted mid-operation.
     pub fn global() -> &'static Self {
-        static RUNTIME_MANAGER: OnceLock<QuickwitRuntimeManager> = OnceLock::new();
-        RUNTIME_MANAGER.get_or_init(|| {
+        static RUNTIME_MANAGER: OnceLock<&QuickwitRuntimeManager> = OnceLock::new();
+        *RUNTIME_MANAGER.get_or_init(|| {
             let manager = Self::new().expect("Failed to create QuickwitRuntimeManager");
-
-            // Note: JVM shutdown hooks must be registered from Java side
-            // The runtime will be properly shut down via explicit calls or JVM termination
-
-            manager
+            // Leak so the runtime is never dropped — standard pattern for Rust FFI/JNI singletons
+            &*Box::leak(Box::new(manager))
         })
     }
 
@@ -165,6 +168,8 @@ impl QuickwitRuntimeManager {
         }
 
         // Try to use the runtime, but catch if it's been dropped/shutdown externally
+        // CRITICAL: Do NOT re-panic here — a re-panic during unwinding causes an immediate abort.
+        // Instead, resume the original panic so the caller's catch_unwind can handle it.
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.runtime.block_on(future)
         })) {
@@ -172,9 +177,9 @@ impl QuickwitRuntimeManager {
                 debug_println!("✅ RUNTIME_MANAGER: Generic block_on operation completed");
                 result
             }
-            Err(_panic_info) => {
-                debug_println!("❌ RUNTIME_MANAGER: Runtime panicked or was dropped externally - this suggests a runtime lifecycle issue");
-                panic!("Runtime was dropped externally while operation was in progress - this indicates the runtime shutdown coordination is not working properly");
+            Err(panic_info) => {
+                debug_println!("❌ RUNTIME_MANAGER: Runtime panicked or was dropped externally - propagating panic");
+                std::panic::resume_unwind(panic_info);
             }
         }
     }

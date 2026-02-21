@@ -66,6 +66,7 @@ pub extern "system" fn Java_io_indextables_tantivy4java_core_Tantivy_getVersion(
     env: JNIEnv,
     _class: JClass,
 ) -> jstring {
+    utils::install_panic_hook();
     let version = env.new_string("0.24.0").unwrap();
     version.into_raw()
 }

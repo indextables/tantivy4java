@@ -399,6 +399,15 @@ async fn perform_quickwit_async_doc_retrieval(
     debug_println!("🔥 SEARCHER CACHED: Reusing cached searcher following Quickwit's exact pattern for optimal cache performance");
     debug_println!("🔥 QUICKWIT_DOC: Using cached Tantivy searcher with preserved cache state");
 
+    // Validate segment ordinal to prevent index-out-of-bounds panic in tantivy's Searcher::doc_async
+    let num_segments = searcher.segment_readers().len();
+    if doc_address.segment_ord as usize >= num_segments {
+        return Err(anyhow::anyhow!(
+            "Invalid segment ordinal {}: index has {} segment(s)",
+            doc_address.segment_ord, num_segments
+        ));
+    }
+
     // Use Quickwit's exact async document retrieval pattern: searcher.doc_async(doc_addr).await
     let tantivy_doc = tokio::time::timeout(
         std::time::Duration::from_secs(5),
