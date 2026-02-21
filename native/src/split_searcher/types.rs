@@ -28,7 +28,17 @@ pub struct SearchHit {
 pub struct EnhancedSearchResult {
     pub hits: Vec<(f32, tantivy::DocAddress)>,
     pub aggregation_results: Option<Vec<u8>>, // Postcard-serialized aggregation results
-    pub aggregation_json: Option<String>, // Original aggregation request JSON
+    pub aggregation_json: Option<String>, // Aggregation request JSON (may be rewritten for hash fields)
+    /// Names of aggregations whose field was redirected to a `_phash_*` fast field (Phase 2).
+    /// Used in Phase 3 touchup to identify which terms buckets need hash → string resolution.
+    pub redirected_hash_agg_names: Option<std::collections::HashSet<String>>,
+    /// Hash value → original string mapping built during Phase 3 touchup.
+    /// Stored here so `create_terms_result_object` can replace U64 bucket keys with strings.
+    pub hash_resolution_map: Option<std::collections::HashMap<u64, String>>,
+    /// Per-aggregation include/exclude string filters saved from Phase 2 rewriting.
+    /// Keyed by aggregation name. Used in result creation to post-filter buckets since
+    /// Tantivy ignores numeric include arrays on U64 fields.
+    pub hash_agg_touchup_infos: Option<Vec<crate::parquet_companion::hash_field_rewriter::HashFieldTouchupInfo>>,
 }
 
 /// Cached searcher context for efficient single document retrieval

@@ -124,6 +124,7 @@ public class ParquetCompanionConfig {
     private String nodeId = "parquet-node";
     private long writerHeapSize = 256_000_000L;
     private int readerBatchSize = 8192;
+    private boolean stringHashOptimization = true;
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
@@ -350,6 +351,25 @@ public class ParquetCompanionConfig {
     }
 
     /**
+     * Enable or disable the string hash fast-field optimization for HYBRID mode.
+     *
+     * <p>When enabled (default), the indexing pipeline stores a hidden {@code _phash_<field>}
+     * U64 fast field alongside each raw-tokenizer string fast field. At query time, aggregations
+     * such as {@code terms}, {@code value_count}, and {@code cardinality} on those string fields
+     * are transparently redirected to the cheaper U64 hash field. Bucket keys are resolved
+     * back to the original strings after the aggregation completes.
+     *
+     * <p>Disable this if you need exact string ordering semantics for {@code order: _key}
+     * terms aggregations, or if you prefer to avoid the extra storage overhead.
+     *
+     * <p>Default: {@code true}.
+     */
+    public ParquetCompanionConfig withStringHashOptimization(boolean enable) {
+        this.stringHashOptimization = enable;
+        return this;
+    }
+
+    /**
      * Set the number of rows per Arrow RecordBatch when reading parquet files.
      * Larger batches reduce per-batch overhead but use more memory per batch.
      * Default: 8192. Typical range: 1024 to 65536.
@@ -380,6 +400,7 @@ public class ParquetCompanionConfig {
     public String getNodeId() { return nodeId; }
     public long getWriterHeapSize() { return writerHeapSize; }
     public int getReaderBatchSize() { return readerBatchSize; }
+    public boolean isStringHashOptimization() { return stringHashOptimization; }
 
     /**
      * Convert this config to a JSON string for the createFromParquet native method.
@@ -397,6 +418,7 @@ public class ParquetCompanionConfig {
         map.put("auto_detect_name_mapping", autoDetectNameMapping);
         map.put("writer_heap_size", writerHeapSize);
         map.put("reader_batch_size", readerBatchSize);
+        map.put("string_hash_optimization", stringHashOptimization);
 
         if (statisticsFields != null && statisticsFields.length > 0) {
             map.put("statistics_fields", Arrays.asList(statisticsFields));

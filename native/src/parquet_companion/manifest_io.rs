@@ -88,6 +88,7 @@ mod tests {
             total_rows: 500,
             storage_config: None,
             metadata: HashMap::new(),
+            string_hash_fields: HashMap::new(),
         }
     }
 

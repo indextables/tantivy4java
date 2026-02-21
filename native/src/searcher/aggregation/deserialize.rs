@@ -27,15 +27,17 @@ pub(crate) fn deserialize_aggregation_results(
         intermediate_agg_bytes.len()
     );
 
-    // Get the aggregation request JSON from the enhanced result to know what aggregations were requested
-    let aggregation_json =
-        with_arc_safe::<crate::split_searcher::EnhancedSearchResult, String>(ptr, |enhanced_result_arc| {
-            enhanced_result_arc
-                .aggregation_json
-                .clone()
-                .unwrap_or_default()
+    // Get the aggregation request JSON and optional hash-touchup context from the enhanced result
+    let (aggregation_json, hash_resolution_map, redirected_hash_agg_names) =
+        with_arc_safe::<crate::split_searcher::EnhancedSearchResult, _>(ptr, |r| {
+            (
+                r.aggregation_json.clone().unwrap_or_default(),
+                r.hash_resolution_map.clone(),
+                r.redirected_hash_agg_names.clone(),
+            )
         })
-        .unwrap_or_default();
+        .unwrap_or_else(|| (String::new(), None, None));
+    let aggregation_json = aggregation_json;
 
     // If we don't have the aggregation JSON, we can't properly deserialize
     if aggregation_json.is_empty() {
@@ -113,6 +115,12 @@ pub(crate) fn deserialize_aggregation_results(
             &agg_name,
             &agg_result,
             is_date_histogram_hint,
+            hash_resolution_map.as_ref(),
+            redirected_hash_agg_names.as_ref(),
+            None,  // include_filter: not available in this deserialization path
+            None,  // exclude_filter: not available in this deserialization path
+            None,  // missing_value
+            false, // needs_resort
         ) {
             Ok(java_obj) => {
                 if !java_obj.is_null() {
@@ -195,6 +203,9 @@ pub(crate) fn find_specific_aggregation_result(
     intermediate_agg_bytes: &[u8],
     aggregation_name: &str,
     aggregation_json: &str,
+    hash_resolution_map: Option<&std::collections::HashMap<u64, String>>,
+    redirected_hash_agg_names: Option<&std::collections::HashSet<String>>,
+    touchup_infos: Option<&[crate::parquet_companion::hash_field_rewriter::HashFieldTouchupInfo]>,
 ) -> anyhow::Result<jobject> {
     debug_println!(
         "RUST DEBUG: find_specific_aggregation_result called for '{}' with {} bytes",
@@ -352,11 +363,28 @@ pub(crate) fn find_specific_aggregation_result(
 
     if let Some(agg_result) = final_results.0.get(aggregation_name) {
         debug_println!("RUST DEBUG: Found aggregation result: {:?}", agg_result);
+
+        // Look up per-aggregation touchup info (include/exclude, missing, resort) from Phase 2.
+        // These were captured during rewriting and removed from the JSON sent to Tantivy
+        // because Tantivy ignores numeric include arrays for U64 fast fields.
+        let touchup = touchup_infos
+            .and_then(|infos| infos.iter().find(|i| i.agg_name == aggregation_name));
+        let include_filter = touchup.and_then(|t| t.include_strings.as_ref());
+        let exclude_filter = touchup.and_then(|t| t.exclude_strings.as_ref());
+        let missing_value = touchup.and_then(|t| t.missing_value.as_deref());
+        let needs_resort = touchup.map(|t| t.needs_resort).unwrap_or(false);
+
         return create_java_aggregation_from_final_result(
             env,
             aggregation_name,
             agg_result,
             is_date_histogram_request,
+            hash_resolution_map,
+            redirected_hash_agg_names,
+            include_filter,
+            exclude_filter,
+            missing_value,
+            needs_resort,
         );
     } else {
         debug_println!(

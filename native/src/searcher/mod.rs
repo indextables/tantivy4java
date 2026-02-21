@@ -121,6 +121,9 @@ pub extern "system" fn Java_io_indextables_tantivy4java_result_SearchResult_nati
         hits: Vec::new(),
         aggregation_results: None,
         aggregation_json: None,
+        redirected_hash_agg_names: None,
+        hash_resolution_map: None,
+        hash_agg_touchup_infos: None,
     };
     arc_to_jlong(Arc::new(empty_result))
 }
@@ -288,8 +291,12 @@ pub extern "system" fn Java_io_indextables_tantivy4java_result_SearchResult_nati
                 if let Some(ref intermediate_agg_bytes) = enhanced_result_arc.aggregation_results {
                     // Get the aggregation JSON for proper deserialization
                     let aggregation_json = enhanced_result_arc.aggregation_json.as_deref().unwrap_or("{}");
+                    // Pass hash resolution context so hash-optimised terms buckets resolve to strings
+                    let resolution_map = enhanced_result_arc.hash_resolution_map.as_ref();
+                    let redirected_names = enhanced_result_arc.redirected_hash_agg_names.as_ref();
+                    let touchup_infos = enhanced_result_arc.hash_agg_touchup_infos.as_deref();
                     // Deserialize and find the specific aggregation by name
-                    match find_specific_aggregation_result(&mut env, intermediate_agg_bytes, &aggregation_name, aggregation_json) {
+                    match find_specific_aggregation_result(&mut env, intermediate_agg_bytes, &aggregation_name, aggregation_json, resolution_map, redirected_names, touchup_infos) {
                         Ok(agg_result) => agg_result,
                         Err(e) => {
                             handle_error(&mut env, &format!("Failed to find aggregation '{}': {}", aggregation_name, e));

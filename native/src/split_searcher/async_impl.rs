@@ -63,45 +63,81 @@ pub(crate) async fn ensure_fast_fields_for_query(
     };
 
     if !columns_to_add.is_empty() {
-        // Compute the full column set (existing + new) WITHOUT modifying
-        // transcoded_fast_columns yet. We only update the tracker AFTER all segments
-        // have been successfully transcoded. Previously the tracker was updated before
-        // the transcode, so a failure would permanently mark columns as "done" —
-        // leaving fast_field_data empty and producing count=0 for all aggregations.
-        let full_column_set: Vec<String> = {
-            let existing = context.transcoded_fast_columns.lock().unwrap();
-            let mut set: std::collections::HashSet<String> =
-                existing.iter().cloned().collect();
-            for col in &columns_to_add {
-                set.insert(col.clone());
+        // Partition: hash fields (`_phash_*`) are native U64 — they live in the native
+        // bundle and require zero parquet I/O. We can register them immediately without
+        // launching any transcode operation.
+        let (native_hash_cols, parquet_cols): (Vec<String>, Vec<String>) =
+            if let Some(manifest) = context.parquet_manifest.as_ref() {
+                let hash_values: std::collections::HashSet<&str> = manifest
+                    .string_hash_fields.values().map(|s| s.as_str()).collect();
+                columns_to_add.iter().cloned()
+                    .partition(|col| hash_values.contains(col.as_str()))
+            } else {
+                (vec![], columns_to_add.clone())
+            };
+
+        // Register native hash fields immediately (no I/O needed).
+        if !native_hash_cols.is_empty() {
+            debug_println!(
+                "📊 LAZY_TRANSCODE: Registering {} native hash fields (no parquet I/O): {:?}",
+                native_hash_cols.len(), native_hash_cols
+            );
+            let mut existing = context.transcoded_fast_columns.lock().unwrap();
+            for col in &native_hash_cols {
+                existing.insert(col.clone());
             }
-            set.into_iter().collect()
-        };
-
-        debug_println!(
-            "📊 LAZY_TRANSCODE: Transcoding {} new columns ({:?}), total set: {:?}",
-            columns_to_add.len(), columns_to_add, full_column_set
-        );
-
-        // Transcode for each segment — propagate errors instead of swallowing them.
-        // A swallowed error leaves fast_field_data empty, causing the aggregation to
-        // fall back to the native .fast file (no parquet-derived string columns in
-        // HYBRID mode) and return count=0 for every bucket.
-        for fast_path in &context.segment_fast_paths {
-            augmented_dir.transcode_and_cache(
-                fast_path,
-                Some(&full_column_set),
-            ).await.map_err(|e| anyhow::anyhow!(
-                "Failed to transcode parquet columns {:?} for segment {:?}: {}",
-                full_column_set, fast_path, e
-            ))?;
         }
 
-        // All segments succeeded — safe to mark the new columns as transcoded.
-        {
-            let mut existing = context.transcoded_fast_columns.lock().unwrap();
-            for col in &columns_to_add {
-                existing.insert(col.clone());
+        // Only launch transcode I/O for actual parquet-sourced columns.
+        if !parquet_cols.is_empty() {
+            // Compute the full column set (existing + new) WITHOUT modifying
+            // transcoded_fast_columns yet. We only update the tracker AFTER all segments
+            // have been successfully transcoded. Previously the tracker was updated before
+            // the transcode, so a failure would permanently mark columns as "done" —
+            // leaving fast_field_data empty and producing count=0 for all aggregations.
+            let full_column_set: Vec<String> = {
+                let existing = context.transcoded_fast_columns.lock().unwrap();
+                let mut set: std::collections::HashSet<String> =
+                    existing.iter().cloned().collect();
+                for col in &parquet_cols {
+                    set.insert(col.clone());
+                }
+                set.into_iter().collect()
+            };
+
+            debug_println!(
+                "📊 LAZY_TRANSCODE: Transcoding {} new parquet columns ({:?}), total set: {:?}",
+                parquet_cols.len(), parquet_cols, full_column_set
+            );
+
+            // Transcode for each segment — propagate errors instead of swallowing them.
+            // A swallowed error leaves fast_field_data empty, causing the aggregation to
+            // fall back to the native .fast file (no parquet-derived string columns in
+            // HYBRID mode) and return count=0 for every bucket.
+            for fast_path in &context.segment_fast_paths {
+                augmented_dir.transcode_and_cache(
+                    fast_path,
+                    Some(&full_column_set),
+                ).await.map_err(|e| anyhow::anyhow!(
+                    "Failed to transcode parquet columns {:?} for segment {:?}: {}",
+                    full_column_set, fast_path, e
+                ))?;
+            }
+
+            // All segments succeeded — safe to mark the new columns as transcoded.
+            // Also register any hash counterparts that correspond to the newly-transcoded
+            // string columns (they are already in the bundle but not yet registered).
+            {
+                let mut existing = context.transcoded_fast_columns.lock().unwrap();
+                for col in &parquet_cols {
+                    existing.insert(col.clone());
+                    // Hash counterpart is native U64 — always present in the merged bytes.
+                    if let Some(manifest) = context.parquet_manifest.as_ref() {
+                        if let Some(hash_name) = manifest.string_hash_fields.get(col) {
+                            existing.insert(hash_name.clone());
+                        }
+                    }
+                }
             }
         }
     }
@@ -222,6 +258,26 @@ pub async fn perform_search_async_impl_leaf_response(
     // ========================================================================
     // End of Smart Wildcard Optimization
     // ========================================================================
+
+    // Rewrite FieldPresence (exists) queries on string hash fields to use the native
+    // _phash_* U64 field, avoiding string column transcoding.
+    let effective_query_json = if let Some(ref manifest) = context.parquet_manifest {
+        if !manifest.string_hash_fields.is_empty() {
+            if let Some(rewritten) = crate::parquet_companion::hash_field_rewriter::rewrite_query_for_hash_fields(
+                &effective_query_json,
+                &manifest.string_hash_fields,
+            ) {
+                debug_println!("📊 HASH_OPT: Rewrote query FieldPresence to hash field(s)");
+                rewritten
+            } else {
+                effective_query_json
+            }
+        } else {
+            effective_query_json
+        }
+    } else {
+        effective_query_json
+    };
 
     // Lazy transcoding: ensure fast fields needed by range queries are transcoded
     let overrides = if context.augmented_directory.is_some() {
@@ -466,7 +522,7 @@ async fn perform_real_quickwit_search(
     _aws_config: &std::collections::HashMap<String, String>,
     footer_start: u64,
     footer_end: u64,
-    _doc_mapping_json: &Option<String>,
+    doc_mapping_json: &Option<String>,
     cached_storage: Arc<dyn Storage>,
     _cached_searcher: Arc<tantivy::Searcher>,
     _cached_index: Arc<tantivy::Index>,
@@ -479,12 +535,56 @@ async fn perform_real_quickwit_search(
     // Following async-first architecture design - this is a pure async function
     // with no JNI dependencies, only receiving thread-safe parameters
 
-    // ✅ FIX: Create DocMapper from cached index schema instead of doc_mapping JSON
-    // DocMapper parsing has compatibility issues with dynamic JSON fields (requires non-empty field_mappings)
-    debug_println!("🔍 REAL_QUICKWIT: Creating DocMapper from cached index schema (bypassing doc_mapping JSON)");
+    // Create DocMapper from doc_mapping_json when available (required for FieldPresence/ExistsQuery).
+    // The DocMapper built from doc_mapping_json knows the actual field types and fast flags,
+    // which is critical for FieldPresenceQuery to choose between ExistsQuery (fast path)
+    // and _field_presence fallback (hash-based). Without the real DocMapper, the
+    // default_doc_mapper_for_test() has hardcoded test fields that don't match the split.
+    // Fall back to default_doc_mapper_for_test() for legacy non-companion splits that
+    // may not have doc_mapping_json.
+    let doc_mapper: Arc<quickwit_doc_mapper::DocMapper> = if let Some(doc_mapping_str) = doc_mapping_json {
+        debug_println!("🔍 REAL_QUICKWIT: Creating DocMapper from doc_mapping_json ({} chars)", doc_mapping_str.len());
+        let cleaned_json = if doc_mapping_str.contains("\\\"") {
+            doc_mapping_str.replace("\\\"", "\"").replace("\\\\", "\\")
+        } else {
+            doc_mapping_str.to_string()
+        };
 
-    let doc_mapper = quickwit_doc_mapper::default_doc_mapper_for_test();
-    let doc_mapper = Arc::new(doc_mapper);
+        match serde_json::from_str::<Vec<serde_json::Value>>(&cleaned_json) {
+            Ok(field_mappings) => {
+                let doc_mapper_builder_json = serde_json::json!({
+                    "field_mappings": field_mappings,
+                    "timestamp_field": null,
+                    "default_search_fields": []
+                });
+                match serde_json::from_value::<quickwit_doc_mapper::DocMapperBuilder>(doc_mapper_builder_json) {
+                    Ok(builder) => {
+                        match quickwit_doc_mapper::DocMapper::try_from(builder) {
+                            Ok(dm) => {
+                                debug_println!("🔍 REAL_QUICKWIT: DocMapper created from doc_mapping_json");
+                                Arc::new(dm)
+                            }
+                            Err(e) => {
+                                debug_println!("⚠️ REAL_QUICKWIT: DocMapper conversion failed ({}), using test fallback", e);
+                                Arc::new(quickwit_doc_mapper::default_doc_mapper_for_test())
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        debug_println!("⚠️ REAL_QUICKWIT: DocMapperBuilder parse failed ({}), using test fallback", e);
+                        Arc::new(quickwit_doc_mapper::default_doc_mapper_for_test())
+                    }
+                }
+            }
+            Err(e) => {
+                debug_println!("⚠️ REAL_QUICKWIT: doc_mapping_json parse failed ({}), using test fallback", e);
+                Arc::new(quickwit_doc_mapper::default_doc_mapper_for_test())
+            }
+        }
+    } else {
+        debug_println!("🔍 REAL_QUICKWIT: No doc_mapping_json, using default_doc_mapper_for_test()");
+        Arc::new(quickwit_doc_mapper::default_doc_mapper_for_test())
+    };
 
     // Create SearchRequest following Quickwit patterns
     let search_request = quickwit_proto::search::SearchRequest {

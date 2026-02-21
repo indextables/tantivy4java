@@ -11,11 +11,28 @@ use crate::debug_println;
 
 use super::sub_aggregations::create_sub_aggregations_map;
 
-/// Helper function to create a TermsResult Java object
+/// Helper function to create a TermsResult Java object.
+///
+/// `resolution_map`: if `Some`, U64 bucket keys are looked up in this map and replaced
+/// with their original string values (used when the field was redirected to a `_phash_*`
+/// hash fast field). Keys not found in the map fall back to numeric string formatting.
+/// `include_filter`: if `Some`, only buckets whose resolved key is in this set are included.
+/// `exclude_filter`: if `Some`, buckets whose resolved key is in this set are excluded.
+/// `missing_value`: if `Some`, the U64 zero-sentinel bucket (null docs) is relabeled with
+/// the original `missing` string value from the aggregation request instead of "0".
+/// `needs_resort`: if `true`, the bucket list is re-sorted alphabetically by key after hash
+/// resolution (needed when `order: {"_key": ...}` was specified, since Tantivy sorted by
+/// U64 hash value which doesn't match string ordering).
 pub(crate) fn create_terms_result_object(
     env: &mut JNIEnv,
     aggregation_name: &str,
     buckets: &Vec<BucketEntry>,
+    resolution_map: Option<&std::collections::HashMap<u64, String>>,
+    redirected_names: Option<&std::collections::HashSet<String>>,
+    include_filter: Option<&std::collections::HashSet<String>>,
+    exclude_filter: Option<&std::collections::HashSet<String>>,
+    missing_value: Option<&str>,
+    needs_resort: bool,
 ) -> anyhow::Result<jobject> {
     debug_println!(
         "RUST DEBUG: Creating TermsResult for '{}' with {} buckets",
@@ -23,19 +40,8 @@ pub(crate) fn create_terms_result_object(
         buckets.len()
     );
 
-    // Create TermsResult class
-    let terms_result_class =
-        env.find_class("io/indextables/tantivy4java/aggregation/TermsResult")?;
-    let name_string = env.new_string(aggregation_name)?;
-
-    // Create ArrayList for buckets
-    let arraylist_class = env.find_class("java/util/ArrayList")?;
-    let bucket_list = env.new_object(&arraylist_class, "()V", &[])?;
-
-    // Create TermsBucket class for individual buckets
-    let bucket_class =
-        env.find_class("io/indextables/tantivy4java/aggregation/TermsResult$TermsBucket")?;
-
+    // Phase 1: Resolve keys and filter. Collect (resolved_key, bucket_ref) pairs.
+    let mut resolved_buckets: Vec<(String, &BucketEntry)> = Vec::with_capacity(buckets.len());
     for bucket in buckets {
         debug_println!(
             "RUST DEBUG: Processing bucket - key: {:?}, doc_count: {}, has_sub_aggs: {}",
@@ -44,13 +50,63 @@ pub(crate) fn create_terms_result_object(
             !bucket.sub_aggregation.0.is_empty()
         );
 
-        // Convert the bucket key to string
-        let key_string = match &bucket.key {
-            Key::Str(s) => env.new_string(s)?,
-            Key::U64(n) => env.new_string(&n.to_string())?,
-            Key::I64(n) => env.new_string(&n.to_string())?,
-            Key::F64(n) => env.new_string(&n.to_string())?,
+        // Resolve the bucket key to a Rust String first so we can apply include/exclude filters.
+        // For U64 keys, attempt to resolve via the hash resolution map first
+        // (populated when the field was a _phash_* redirect). Falls back to n.to_string().
+        // Special case: U64 key 0 is the null sentinel. If `missing_value` is set, relabel it
+        // with the original `missing` string from the aggregation request.
+        let key_resolved: String = match &bucket.key {
+            Key::Str(s) => s.clone(),
+            Key::U64(n) => {
+                if *n == 0 {
+                    if let Some(mv) = missing_value {
+                        mv.to_string()
+                    } else {
+                        resolution_map.and_then(|m| m.get(n)).cloned().unwrap_or_else(|| n.to_string())
+                    }
+                } else {
+                    resolution_map.and_then(|m| m.get(n)).cloned().unwrap_or_else(|| n.to_string())
+                }
+            },
+            Key::I64(n) => n.to_string(),
+            Key::F64(n) => n.to_string(),
         };
+
+        // Apply include/exclude filters (post-filter for hash-field aggs where Tantivy
+        // ignores numeric include/exclude arrays on U64 fast fields).
+        if let Some(include) = include_filter {
+            if !include.contains(&key_resolved) {
+                continue;
+            }
+        }
+        if let Some(exclude) = exclude_filter {
+            if exclude.contains(&key_resolved) {
+                continue;
+            }
+        }
+
+        resolved_buckets.push((key_resolved, bucket));
+    }
+
+    // Phase 2: Sort by resolved string key if order:_key was requested.
+    // Tantivy sorted by U64 hash value which doesn't match string ordering.
+    if needs_resort {
+        resolved_buckets.sort_by(|(a, _), (b, _)| a.cmp(b));
+    }
+
+    // Phase 3: Create Java objects from the resolved, filtered, sorted list.
+    let terms_result_class =
+        env.find_class("io/indextables/tantivy4java/aggregation/TermsResult")?;
+    let name_string = env.new_string(aggregation_name)?;
+
+    let arraylist_class = env.find_class("java/util/ArrayList")?;
+    let bucket_list = env.new_object(&arraylist_class, "()V", &[])?;
+
+    let bucket_class =
+        env.find_class("io/indextables/tantivy4java/aggregation/TermsResult$TermsBucket")?;
+
+    for (key_resolved, bucket) in &resolved_buckets {
+        let key_string = env.new_string(key_resolved)?;
 
         // Process sub-aggregations if any
         let sub_agg_map = if !bucket.sub_aggregation.0.is_empty() {
@@ -58,7 +114,7 @@ pub(crate) fn create_terms_result_object(
                 "RUST DEBUG: Processing {} sub-aggregations in bucket",
                 bucket.sub_aggregation.0.len()
             );
-            create_sub_aggregations_map(env, &bucket.sub_aggregation)?
+            create_sub_aggregations_map(env, &bucket.sub_aggregation, resolution_map, redirected_names)?
         } else {
             debug_println!("RUST DEBUG: No sub-aggregations in bucket");
             // Create empty HashMap
@@ -156,7 +212,7 @@ pub(crate) fn create_histogram_result_object(
                 "RUST DEBUG: Processing {} sub-aggregations in histogram bucket",
                 bucket.sub_aggregation.0.len()
             );
-            create_sub_aggregations_map(env, &bucket.sub_aggregation)?
+            create_sub_aggregations_map(env, &bucket.sub_aggregation, None, None)?
         } else {
             // Create empty HashMap
             let hashmap_class = env.find_class("java/util/HashMap")?;
@@ -268,7 +324,7 @@ pub(crate) fn create_date_histogram_result_object(
                 "RUST DEBUG: Processing {} sub-aggregations in date histogram bucket",
                 bucket.sub_aggregation.0.len()
             );
-            create_sub_aggregations_map(env, &bucket.sub_aggregation)?
+            create_sub_aggregations_map(env, &bucket.sub_aggregation, None, None)?
         } else {
             // Create empty HashMap
             let hashmap_class = env.find_class("java/util/HashMap")?;
@@ -383,7 +439,7 @@ pub(crate) fn create_range_result_object(
                 "RUST DEBUG: Processing {} sub-aggregations in range bucket",
                 bucket.sub_aggregation.0.len()
             );
-            create_sub_aggregations_map(env, &bucket.sub_aggregation)?
+            create_sub_aggregations_map(env, &bucket.sub_aggregation, None, None)?
         } else {
             // Create empty HashMap
             let hashmap_class = env.find_class("java/util/HashMap")?;

@@ -352,6 +352,9 @@ pub(crate) fn perform_unified_search_result_creation(
     leaf_search_response: quickwit_proto::search::LeafSearchResponse,
     env: &mut JNIEnv,
     aggregation_request_json: Option<String>,
+    redirected_hash_agg_names: Option<std::collections::HashSet<String>>,
+    hash_resolution_map: Option<std::collections::HashMap<u64, String>>,
+    hash_agg_touchup_infos: Option<Vec<crate::parquet_companion::hash_field_rewriter::HashFieldTouchupInfo>>,
 ) -> anyhow::Result<jni::sys::jobject> {
     // Convert results to enhanced format
     let mut search_results = Vec::new();
@@ -388,6 +391,9 @@ pub(crate) fn perform_unified_search_result_creation(
         hits: search_results,
         aggregation_results,
         aggregation_json: aggregation_request_json.clone(),
+        redirected_hash_agg_names,
+        hash_resolution_map,
+        hash_agg_touchup_infos,
     };
 
     let search_results_arc = Arc::new(enhanced_result);
