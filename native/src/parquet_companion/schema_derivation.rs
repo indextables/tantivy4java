@@ -66,6 +66,17 @@ pub fn derive_tantivy_schema_with_mapping(
 ) -> Result<Schema> {
     let mut builder = SchemaBuilder::new();
 
+    // Collect all tantivy field names for collision detection with companion fields.
+    let all_field_names: HashSet<String> = arrow_schema.fields().iter()
+        .filter(|f| !config.skip_fields.contains(f.name().as_str()))
+        .map(|f| {
+            name_mapping
+                .and_then(|m| m.get(f.name().as_str()))
+                .cloned()
+                .unwrap_or_else(|| f.name().clone())
+        })
+        .collect();
+
     for field in arrow_schema.fields() {
         let parquet_name = field.name();
 
@@ -80,7 +91,7 @@ pub fn derive_tantivy_schema_with_mapping(
             .map(|s| s.as_str())
             .unwrap_or(parquet_name.as_str());
 
-        add_field_for_arrow_type(&mut builder, tantivy_name, field.data_type(), config)?;
+        add_field_for_arrow_type(&mut builder, tantivy_name, field.data_type(), config, &all_field_names)?;
     }
 
     Ok(builder.build())
@@ -91,6 +102,7 @@ fn add_field_for_arrow_type(
     name: &str,
     data_type: &DataType,
     config: &SchemaDerivationConfig,
+    all_field_names: &HashSet<String>,
 ) -> Result<()> {
     use tantivy::schema::*;
 
@@ -205,6 +217,13 @@ fn add_field_for_arrow_type(
                         builder.add_text_field(name, text_opts);
                         // Companion field: U64 hash field for extracted patterns
                         let companion_name = string_indexing::companion_field_name(name);
+                        if all_field_names.contains(&companion_name) {
+                            anyhow::bail!(
+                                "Companion field name '{}' for field '{}' collides with an existing \
+                                 column. Rename the column or use a different indexing mode.",
+                                companion_name, name
+                            );
+                        }
                         let companion_opts = NumericOptions::default().set_indexed().set_fast();
                         builder.add_u64_field(&companion_name, companion_opts);
                     }

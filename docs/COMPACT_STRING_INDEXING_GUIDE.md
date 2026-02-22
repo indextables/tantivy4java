@@ -53,7 +53,7 @@ tokenizers.put("audit_log", StringIndexingMode.textCustomExactonly("\\d{3}-\\d{2
 // Custom pattern: strip order IDs, discard them
 tokenizers.put("notes", StringIndexingMode.textCustomStrip("ORD-\\d{8}"));
 
-ParquetCompanionConfig config = new ParquetCompanionConfig()
+ParquetCompanionConfig config = new ParquetCompanionConfig(tableRoot)
     .withFastFieldMode(ParquetCompanionConfig.FastFieldMode.HYBRID)
     .withTokenizerOverrides(tokenizers);
 ```
@@ -81,10 +81,10 @@ During document indexing:
 At query time, queries are automatically rewritten for compact string indexing:
 
 - **Term queries** on `exact_only`: The search term is hashed and the query targets the U64 field
-- **Term queries** on `text_*_exactonly`: If the search term matches the field's regex pattern, the query is redirected to the companion `__uuids` hash field with the hashed value. Non-matching terms query the text field directly.
+- **Term queries** on `text_*_exactonly`: If the search term contains a regex match (unanchored), the matched portion is extracted and hashed, and the query is redirected to the companion `__uuids` hash field. Non-matching terms query the text field directly.
 - **Term queries** on `text_*_strip`: No rewriting — queries hit the text field directly
 - **`parseQuery()` / full_text queries** on `exact_only`: Automatically converted to a hashed term query (the original text is preserved in the `full_text` AST node)
-- **`parseQuery()` / full_text queries** on `text_*_exactonly`: If the text matches the field's regex, converted to a companion hash term query; otherwise left as a text search on the stripped field
+- **`parseQuery()` / full_text queries** on `text_*_exactonly`: If the text contains a regex match (unanchored), the matched portion is extracted and hashed into a companion hash term query; otherwise left as a text search on the stripped field
 - **Phrase queries** on `exact_only` / `text_*_exactonly`: Converted to term queries (phrases joined and hashed)
 
 **Unsupported query types on `exact_only` fields** (wildcard, regex, phrase_prefix) are rejected at rewrite time with a clear error message. These query types cannot be meaningfully converted to term queries on a U64 hash field.
@@ -142,7 +142,7 @@ The same applies to `text_custom_exactonly` fields — both `SplitTermQuery` and
 ## Limitations
 
 - **Hash collisions**: xxHash64 has ~1 in 2^64 collision probability per pair. In practice, this is negligible for any realistic dataset size.
-- **No phrase/wildcard on `exact_only`**: Since only hashes are stored, phrase and wildcard queries are not supported on `exact_only` fields.
+- **No wildcard/regex/phrase_prefix on `exact_only`**: Since only hashes are stored, wildcard, regex, and phrase_prefix queries are not supported on `exact_only` fields. Phrase queries are supported (converted to hashed term queries).
 - **UUID pattern**: Only dashed UUID format is recognized. Non-dashed UUIDs require a custom regex via `text_custom_*` modes.
 - **Irreversible hashing**: Original string values cannot be recovered from hashes. For `exact_only` fields, document retrieval still works via parquet (the original string is in the parquet file).
 
@@ -184,7 +184,9 @@ Returns JSON mapping field names to their compact indexing mode:
 
 ```java
 String modes = searcher.getStringIndexingModes();
-// {"trace_id":"ExactOnly","message":"TextUuidExactonly"}
+// {"trace_id":{"mode":"exact_only"},"message":{"mode":"text_uuid_exactonly"}}
+// Custom regex modes include the pattern:
+// {"audit_log":{"mode":"text_custom_exactonly","regex":"\\d{3}-\\d{2}-\\d{4}"}}
 ```
 
-Fields in this map with `ExactOnly` mode have `tantivy_type: "U64"` but actually return string data from parquet. Use this to identify fields that need type correction in your schema.
+Fields in this map with `"mode":"exact_only"` have `tantivy_type: "U64"` but actually return string data from parquet. Use this to identify fields that need type correction in your schema.

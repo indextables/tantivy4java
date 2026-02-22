@@ -580,38 +580,39 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_nati
     _class: JClass,
     searcher_ptr: jlong,
 ) -> jobject {
-    use jni::sys::jobject;
-    use crate::utils::string_to_jstring;
+    use crate::utils::{string_to_jstring, convert_throwable};
 
-    if searcher_ptr == 0 {
-        return std::ptr::null_mut();
-    }
+    convert_throwable(&mut env, |env| {
+        if searcher_ptr == 0 {
+            return Ok(std::ptr::null_mut());
+        }
 
-    let context = match crate::utils::jlong_to_arc::<super::types::CachedSearcherContext>(searcher_ptr) {
-        Some(ctx) => ctx,
-        None => return std::ptr::null_mut(),
-    };
+        let context = match crate::utils::jlong_to_arc::<super::types::CachedSearcherContext>(searcher_ptr) {
+            Some(ctx) => ctx,
+            None => return Ok(std::ptr::null_mut()),
+        };
 
-    let manifest = match &context.parquet_manifest {
-        Some(m) => m,
-        None => return std::ptr::null_mut(),
-    };
+        let manifest = match &context.parquet_manifest {
+            Some(m) => m,
+            None => return Ok(std::ptr::null_mut()),
+        };
 
-    let mapping: Vec<serde_json::Value> = manifest.column_mapping.iter()
-        .map(|cm| serde_json::json!({
-            "tantivy_field_name": cm.tantivy_field_name,
-            "parquet_column_name": cm.parquet_column_name,
-            "physical_ordinal": cm.physical_ordinal,
-            "parquet_type": cm.parquet_type,
-            "tantivy_type": cm.tantivy_type,
-        }))
-        .collect();
+        let mapping: Vec<serde_json::Value> = manifest.column_mapping.iter()
+            .map(|cm| serde_json::json!({
+                "tantivy_field_name": cm.tantivy_field_name,
+                "parquet_column_name": cm.parquet_column_name,
+                "physical_ordinal": cm.physical_ordinal,
+                "parquet_type": cm.parquet_type,
+                "tantivy_type": cm.tantivy_type,
+            }))
+            .collect();
 
-    let json_str = serde_json::to_string(&mapping).unwrap_or_default();
-    match string_to_jstring(&mut env, &json_str) {
-        Ok(jstr) => jstr.into_raw(),
-        Err(_) => std::ptr::null_mut(),
-    }
+        let json_str = serde_json::to_string(&mapping).unwrap_or_default();
+        match string_to_jstring(env, &json_str) {
+            Ok(jstr) => Ok(jstr.into_raw()),
+            Err(_) => Ok(std::ptr::null_mut()),
+        }
+    }).unwrap_or(std::ptr::null_mut())
 }
 
 /// Get the string indexing modes from the parquet companion manifest.
@@ -622,39 +623,40 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_nati
     _class: JClass,
     searcher_ptr: jlong,
 ) -> jobject {
-    use jni::sys::jobject;
-    use crate::utils::string_to_jstring;
+    use crate::utils::{string_to_jstring, convert_throwable};
 
-    if searcher_ptr == 0 {
-        return std::ptr::null_mut();
-    }
+    convert_throwable(&mut env, |env| {
+        if searcher_ptr == 0 {
+            return Ok(std::ptr::null_mut());
+        }
 
-    let context = match crate::utils::jlong_to_arc::<super::types::CachedSearcherContext>(searcher_ptr) {
-        Some(ctx) => ctx,
-        None => return std::ptr::null_mut(),
-    };
-
-    let manifest = match &context.parquet_manifest {
-        Some(m) => m,
-        None => return std::ptr::null_mut(),
-    };
-
-    if manifest.string_indexing_modes.is_empty() {
-        // Return empty JSON object rather than null to distinguish
-        // "no manifest" from "manifest exists but no compact modes"
-        let json_str = "{}";
-        return match string_to_jstring(&mut env, json_str) {
-            Ok(jstr) => jstr.into_raw(),
-            Err(_) => std::ptr::null_mut(),
+        let context = match crate::utils::jlong_to_arc::<super::types::CachedSearcherContext>(searcher_ptr) {
+            Some(ctx) => ctx,
+            None => return Ok(std::ptr::null_mut()),
         };
-    }
 
-    // Serialize directly — StringIndexingMode derives serde::Serialize
-    let json_str = serde_json::to_string(&manifest.string_indexing_modes).unwrap_or_default();
-    match string_to_jstring(&mut env, &json_str) {
-        Ok(jstr) => jstr.into_raw(),
-        Err(_) => std::ptr::null_mut(),
-    }
+        let manifest = match &context.parquet_manifest {
+            Some(m) => m,
+            None => return Ok(std::ptr::null_mut()),
+        };
+
+        if manifest.string_indexing_modes.is_empty() {
+            // Return empty JSON object rather than null to distinguish
+            // "no manifest" from "manifest exists but no compact modes"
+            let json_str = "{}";
+            return match string_to_jstring(env, json_str) {
+                Ok(jstr) => Ok(jstr.into_raw()),
+                Err(_) => Ok(std::ptr::null_mut()),
+            };
+        }
+
+        // Serialize directly — StringIndexingMode derives serde::Serialize
+        let json_str = serde_json::to_string(&manifest.string_indexing_modes).unwrap_or_default();
+        match string_to_jstring(env, &json_str) {
+            Ok(jstr) => Ok(jstr.into_raw()),
+            Err(_) => Ok(std::ptr::null_mut()),
+        }
+    }).unwrap_or(std::ptr::null_mut())
 }
 
 /// Resolve a relative parquet file path against the effective table root.

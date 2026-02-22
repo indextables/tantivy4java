@@ -37,6 +37,9 @@ public class ParquetCompanionStringIndexingTest {
 
     private static final int NUM_ROWS = 30;
     private static final String ERR_PATTERN = "ERR-\\d{4}";
+    private static final Pattern UUID_PATTERN = Pattern.compile(
+            "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}");
+    private static final Pattern ERR_CODE_PATTERN = Pattern.compile(ERR_PATTERN);
 
     private static SplitCacheManager cacheManager;
 
@@ -88,15 +91,13 @@ public class ParquetCompanionStringIndexingTest {
 
     /** Extract a UUID from a text string using the standard UUID regex. */
     private static String extractUuid(String text) {
-        Matcher m = Pattern.compile(
-                "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
-        ).matcher(text);
+        Matcher m = UUID_PATTERN.matcher(text);
         return m.find() ? m.group() : null;
     }
 
     /** Extract ERR-XXXX from a text string. */
     private static String extractErrCode(String text) {
-        Matcher m = Pattern.compile(ERR_PATTERN).matcher(text);
+        Matcher m = ERR_CODE_PATTERN.matcher(text);
         return m.find() ? m.group() : null;
     }
 
@@ -445,7 +446,7 @@ public class ParquetCompanionStringIndexingTest {
     // ═══════════════════════════════════════════════════════════════
 
     @Test @Order(15)
-    @DisplayName("All 5 modes — trace_id=exact_only, message=text_uuid_exactonly, error_log=text_custom_strip, category=raw")
+    @DisplayName("Mixed modes — trace_id=exact_only, message=text_uuid_exactonly, error_log=text_custom_strip, category=raw")
     void allModesInOneSplit(@TempDir Path dir) throws Exception {
         Map<String, String> overrides = new HashMap<>();
         overrides.put("trace_id", ParquetCompanionConfig.StringIndexingMode.EXACT_ONLY);
@@ -1002,8 +1003,10 @@ public class ParquetCompanionStringIndexingTest {
                     () -> s.search(q, 10),
                     "Wildcard on exact_only field should throw");
             String msg = ex.getMessage();
-            assertTrue(msg.contains("exact_only") || msg.contains("wildcard"),
-                    "Error should mention exact_only or wildcard: " + msg);
+            assertTrue(msg.contains("exact_only"),
+                    "Error should mention exact_only: " + msg);
+            assertTrue(msg.contains("trace_id"),
+                    "Error should mention field name trace_id: " + msg);
         }
     }
 
@@ -1069,6 +1072,7 @@ public class ParquetCompanionStringIndexingTest {
     // ── Test 33: getColumnMapping exposes parquet types for exact_only fields ──
 
     @Test @Order(33)
+    @DisplayName("getColumnMapping — exact_only shows U64 tantivy_type but BYTE_ARRAY parquet_type")
     void columnMappingExposesParquetTypes(@TempDir Path dir) throws Exception {
         Map<String, String> overrides = new LinkedHashMap<>();
         overrides.put("trace_id", ParquetCompanionConfig.StringIndexingMode.EXACT_ONLY);
@@ -1094,6 +1098,7 @@ public class ParquetCompanionStringIndexingTest {
     // ── Test 34: getStringIndexingModes exposes compact indexing modes ──
 
     @Test @Order(34)
+    @DisplayName("getStringIndexingModes — reports exact_only and text_uuid_exactonly modes")
     void stringIndexingModesExposed(@TempDir Path dir) throws Exception {
         Map<String, String> overrides = new LinkedHashMap<>();
         overrides.put("trace_id", ParquetCompanionConfig.StringIndexingMode.EXACT_ONLY);

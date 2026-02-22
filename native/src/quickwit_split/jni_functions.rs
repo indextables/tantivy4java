@@ -1232,6 +1232,8 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_merge_QuickwitSpli
         use parquet::arrow::ArrowWriter;
         use std::sync::Arc;
 
+        anyhow::ensure!(num_rows >= 0, "num_rows must be non-negative, got {}", num_rows);
+        anyhow::ensure!(id_offset >= 0, "id_offset must be non-negative, got {}", id_offset);
         let num = num_rows as usize;
         let offset = id_offset as u64;
 
@@ -1348,6 +1350,8 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_merge_QuickwitSpli
         use parquet::arrow::ArrowWriter;
         use std::sync::Arc;
 
+        anyhow::ensure!(num_rows >= 0, "num_rows must be non-negative, got {}", num_rows);
+        anyhow::ensure!(id_offset >= 0, "id_offset must be non-negative, got {}", id_offset);
         let num = num_rows as usize;
         let offset = id_offset as u64;
 
