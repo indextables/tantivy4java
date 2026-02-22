@@ -25,6 +25,8 @@ pub struct SchemaDerivationConfig {
     pub ip_address_fields: HashSet<String>,
     /// Fields that should be treated as JSON object type (parquet stores as UTF8 strings)
     pub json_fields: HashSet<String>,
+    /// Whether to enable fieldnorms for text fields (default: false)
+    pub fieldnorms_enabled: bool,
 }
 
 impl Default for SchemaDerivationConfig {
@@ -35,6 +37,7 @@ impl Default for SchemaDerivationConfig {
             tokenizer_overrides: std::collections::HashMap::new(),
             ip_address_fields: HashSet::new(),
             json_fields: HashSet::new(),
+            fieldnorms_enabled: false,
         }
     }
 }
@@ -141,7 +144,8 @@ fn add_field_for_arrow_type(
                     .set_indexing_options(
                         TextFieldIndexing::default()
                             .set_tokenizer("default")
-                            .set_index_option(IndexRecordOption::Basic),
+                            .set_index_option(IndexRecordOption::Basic)
+                            .set_fieldnorms(config.fieldnorms_enabled),
                     );
                 builder.add_json_field(name, opts);
                 return Ok(());
@@ -212,7 +216,8 @@ fn add_field_for_arrow_type(
                             .set_indexing_options(
                                 TextFieldIndexing::default()
                                     .set_tokenizer("default")
-                                    .set_index_option(IndexRecordOption::WithFreqsAndPositions),
+                                    .set_index_option(IndexRecordOption::WithFreqsAndPositions)
+                                    .set_fieldnorms(config.fieldnorms_enabled),
                             );
                         builder.add_text_field(name, text_opts);
                         // Companion field: U64 hash field for extracted patterns
@@ -234,7 +239,8 @@ fn add_field_for_arrow_type(
                             .set_indexing_options(
                                 TextFieldIndexing::default()
                                     .set_tokenizer("default")
-                                    .set_index_option(IndexRecordOption::WithFreqsAndPositions),
+                                    .set_index_option(IndexRecordOption::WithFreqsAndPositions)
+                                    .set_fieldnorms(config.fieldnorms_enabled),
                             );
                         builder.add_text_field(name, text_opts);
                     }
@@ -247,7 +253,8 @@ fn add_field_for_arrow_type(
                     .set_indexing_options(
                         TextFieldIndexing::default()
                             .set_tokenizer(tok)
-                            .set_index_option(IndexRecordOption::WithFreqsAndPositions),
+                            .set_index_option(IndexRecordOption::WithFreqsAndPositions)
+                            .set_fieldnorms(config.fieldnorms_enabled),
                     );
                 if should_add_fast(config, name, data_type) {
                     opts = opts.set_fast(Some(tok));
@@ -273,7 +280,8 @@ fn add_field_for_arrow_type(
                 .set_indexing_options(
                     TextFieldIndexing::default()
                         .set_tokenizer(tok)
-                        .set_index_option(IndexRecordOption::WithFreqsAndPositions),
+                        .set_index_option(IndexRecordOption::WithFreqsAndPositions)
+                        .set_fieldnorms(config.fieldnorms_enabled),
                 );
             if should_add_fast(config, name, data_type) {
                 opts = opts.set_fast(Some(tok));
@@ -301,7 +309,8 @@ fn add_field_for_arrow_type(
                 .set_indexing_options(
                     TextFieldIndexing::default()
                         .set_tokenizer("default")
-                        .set_index_option(IndexRecordOption::Basic),
+                        .set_index_option(IndexRecordOption::Basic)
+                        .set_fieldnorms(config.fieldnorms_enabled),
                 );
             builder.add_json_field(name, opts);
         }

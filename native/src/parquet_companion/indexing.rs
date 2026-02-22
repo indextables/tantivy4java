@@ -186,6 +186,7 @@ pub async fn create_split_from_parquet(
         tokenizer_overrides: parquet_config.schema_config.tokenizer_overrides.clone(),
         ip_address_fields: parquet_config.schema_config.ip_address_fields.clone(),
         json_fields: parquet_config.schema_config.json_fields.clone(),
+        fieldnorms_enabled: parquet_config.schema_config.fieldnorms_enabled,
     };
 
     let derived_schema = derive_tantivy_schema_with_mapping(&arrow_schema, &config, Some(&name_mapping))?;
