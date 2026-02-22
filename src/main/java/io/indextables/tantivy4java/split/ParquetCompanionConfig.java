@@ -45,11 +45,17 @@ public class ParquetCompanionConfig {
 
         /** Strip custom regex matches, index text. Matches stored as hash in companion field. */
         public static String textCustomExactonly(String regex) {
+            if (regex == null || regex.isEmpty()) {
+                throw new IllegalArgumentException("regex must not be null or empty");
+            }
             return "text_custom_exactonly:" + regex;
         }
 
         /** Strip custom regex matches, index text. Matches discarded. */
         public static String textCustomStrip(String regex) {
+            if (regex == null || regex.isEmpty()) {
+                throw new IllegalArgumentException("regex must not be null or empty");
+            }
             return "text_custom_strip:" + regex;
         }
     }

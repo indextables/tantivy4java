@@ -306,7 +306,6 @@ pub async fn perform_search_async_impl_leaf_response(
             match crate::parquet_companion::hash_field_rewriter::rewrite_query_for_string_indexing(
                 &effective_query_json,
                 &manifest.string_indexing_modes,
-                &manifest.companion_hash_fields,
             )? {
                 Some(rewritten) => {
                     debug_println!("📊 STRING_IDX: Rewrote query for compact string indexing mode(s)");

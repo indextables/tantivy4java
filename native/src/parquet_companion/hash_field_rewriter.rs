@@ -23,7 +23,7 @@ use serde_json::{json, Value};
 
 use crate::parquet_companion::indexing::hash_string_value;
 use crate::parquet_companion::string_indexing::{
-    StringIndexingMode, CompanionFieldInfo, companion_field_name, regex_pattern, UUID_REGEX,
+    StringIndexingMode, companion_field_name, compile_regexes,
 };
 
 /// Info needed to resolve hash bucket keys back to strings after aggregation (Phase 3).
@@ -424,7 +424,6 @@ fn rewrite_query_node(
 pub fn rewrite_query_for_string_indexing(
     query_json: &str,
     string_indexing_modes: &HashMap<String, StringIndexingMode>,
-    companion_hash_fields: &HashMap<String, CompanionFieldInfo>,
 ) -> anyhow::Result<Option<String>> {
     if string_indexing_modes.is_empty() {
         return Ok(None);
@@ -435,14 +434,12 @@ pub fn rewrite_query_for_string_indexing(
         Err(_) => return Ok(None),
     };
 
-    // Build a lookup from original field name to its regex (compiled lazily)
-    let compiled_regexes: HashMap<String, regex::Regex> = string_indexing_modes.iter()
-        .filter_map(|(field, mode)| {
-            regex_pattern(mode).and_then(|pat| {
-                regex::Regex::new(pat).ok().map(|re| (field.clone(), re))
-            })
-        })
-        .collect();
+    // Compile unanchored regexes for pattern extraction. For text_*_exactonly modes,
+    // we extract the matching portion from the search value and hash that (not the
+    // full value). This allows values like "{UUID}" or "prefix-UUID" to still find
+    // the document via the companion hash field.
+    // Compilation errors are propagated instead of silently swallowed.
+    let compiled_regexes = compile_regexes(string_indexing_modes)?;
 
     if rewrite_string_indexing_node(&mut value, string_indexing_modes, &compiled_regexes)? {
         Ok(serde_json::to_string(&value).ok())
@@ -483,12 +480,14 @@ fn rewrite_string_indexing_node(
                         }
                     }
                     StringIndexingMode::TextUuidExactonly | StringIndexingMode::TextCustomExactonly { .. } => {
-                        // If the value matches the regex, redirect to companion field
+                        // If the value contains a regex match, extract the matched portion,
+                        // hash it, and redirect to the companion field. This handles both
+                        // pure values ("UUID") and wrapped values ("{UUID}").
                         if let Some(val) = obj.get("value").and_then(|v| v.as_str()).map(|s| s.to_string()) {
                             if let Some(regex) = compiled_regexes.get(&field) {
-                                if regex.is_match(&val) {
+                                if let Some(m) = regex.find(&val) {
                                     let companion = companion_field_name(&field);
-                                    let hash = hash_string_value(&val);
+                                    let hash = hash_string_value(m.as_str());
                                     obj.insert("field".to_string(), Value::String(companion));
                                     obj.insert("value".to_string(), Value::String(hash.to_string()));
                                     return Ok(true);
@@ -530,12 +529,13 @@ fn rewrite_string_indexing_node(
                         }
                     }
                     StringIndexingMode::TextUuidExactonly | StringIndexingMode::TextCustomExactonly { .. } => {
-                        // If text matches regex, convert to term → redirect to companion hash
+                        // If text contains a regex match, extract and hash the matched portion,
+                        // then convert to a term query on the companion hash field.
                         if let Some(text) = obj.get("text").and_then(|t| t.as_str()).map(|s| s.to_string()) {
                             if let Some(regex) = compiled_regexes.get(&field) {
-                                if regex.is_match(&text) {
+                                if let Some(m) = regex.find(&text) {
                                     let companion = companion_field_name(&field);
-                                    let hash = hash_string_value(&text);
+                                    let hash = hash_string_value(m.as_str());
                                     obj.insert("type".to_string(), Value::String("term".to_string()));
                                     obj.insert("field".to_string(), Value::String(companion));
                                     obj.insert("value".to_string(), Value::String(hash.to_string()));
@@ -582,7 +582,8 @@ fn rewrite_string_indexing_node(
                         }
                     }
                     StringIndexingMode::TextUuidExactonly | StringIndexingMode::TextCustomExactonly { .. } => {
-                        // Reconstruct text; if it matches regex, convert to term on companion
+                        // Reconstruct text; if it contains a regex match, extract the matched
+                        // portion and convert to a hashed term query on the companion field.
                         if let Some(phrases) = obj.get("phrases").and_then(|p| p.as_array()) {
                             let text: String = phrases.iter()
                                 .filter_map(|v| v.as_str())
@@ -590,9 +591,9 @@ fn rewrite_string_indexing_node(
                                 .join(" ");
                             if !text.is_empty() {
                                 if let Some(regex) = compiled_regexes.get(&field) {
-                                    if regex.is_match(&text) {
+                                    if let Some(m) = regex.find(&text) {
                                         let companion = companion_field_name(&field);
-                                        let hash = hash_string_value(&text);
+                                        let hash = hash_string_value(m.as_str());
                                         obj.insert("type".to_string(), Value::String("term".to_string()));
                                         obj.insert("field".to_string(), Value::String(companion));
                                         obj.insert("value".to_string(), Value::String(hash.to_string()));
@@ -894,25 +895,12 @@ mod tests {
         m
     }
 
-    fn make_companion_fields() -> HashMap<String, CompanionFieldInfo> {
-        let mut m = HashMap::new();
-        m.insert("message__uuids".to_string(), CompanionFieldInfo {
-            original_field_name: "message".to_string(),
-            regex_pattern: UUID_REGEX.to_string(),
-        });
-        m.insert("data__uuids".to_string(), CompanionFieldInfo {
-            original_field_name: "data".to_string(),
-            regex_pattern: r"\d{3}-\d{2}-\d{4}".to_string(),
-        });
-        m
-    }
-
     #[test]
     fn test_string_indexing_exact_only_term_hashed() {
         let query = r#"{"type":"term","field":"trace_id","value":"abc123"}"#;
         let modes = make_string_indexing_modes();
-        let companions = make_companion_fields();
-        let result = rewrite_query_for_string_indexing(query, &modes, &companions).unwrap();
+
+        let result = rewrite_query_for_string_indexing(query, &modes).unwrap();
         assert!(result.is_some(), "exact_only term query should be rewritten");
         let v: Value = serde_json::from_str(&result.unwrap()).unwrap();
         assert_eq!(v["field"].as_str().unwrap(), "trace_id");
@@ -926,8 +914,8 @@ mod tests {
         let uuid = "550e8400-e29b-41d4-a716-446655440000";
         let query = format!(r#"{{"type":"term","field":"message","value":"{}"}}"#, uuid);
         let modes = make_string_indexing_modes();
-        let companions = make_companion_fields();
-        let result = rewrite_query_for_string_indexing(&query, &modes, &companions).unwrap();
+
+        let result = rewrite_query_for_string_indexing(&query, &modes).unwrap();
         assert!(result.is_some(), "UUID value on uuid_exactonly field should be redirected");
         let v: Value = serde_json::from_str(&result.unwrap()).unwrap();
         assert_eq!(v["field"].as_str().unwrap(), "message__uuids");
@@ -939,8 +927,8 @@ mod tests {
     fn test_string_indexing_uuid_exactonly_non_uuid_unchanged() {
         let query = r#"{"type":"term","field":"message","value":"error occurred"}"#;
         let modes = make_string_indexing_modes();
-        let companions = make_companion_fields();
-        let result = rewrite_query_for_string_indexing(query, &modes, &companions).unwrap();
+
+        let result = rewrite_query_for_string_indexing(query, &modes).unwrap();
         assert!(result.is_none(), "non-UUID value on uuid_exactonly should not be rewritten");
     }
 
@@ -949,8 +937,8 @@ mod tests {
         let uuid = "550e8400-e29b-41d4-a716-446655440000";
         let query = format!(r#"{{"type":"term","field":"log","value":"{}"}}"#, uuid);
         let modes = make_string_indexing_modes();
-        let companions = make_companion_fields();
-        let result = rewrite_query_for_string_indexing(&query, &modes, &companions).unwrap();
+
+        let result = rewrite_query_for_string_indexing(&query, &modes).unwrap();
         assert!(result.is_none(), "text_uuid_strip should not rewrite term queries");
     }
 
@@ -958,8 +946,8 @@ mod tests {
     fn test_string_indexing_custom_exactonly_matching_value() {
         let query = r#"{"type":"term","field":"data","value":"123-45-6789"}"#;
         let modes = make_string_indexing_modes();
-        let companions = make_companion_fields();
-        let result = rewrite_query_for_string_indexing(query, &modes, &companions).unwrap();
+
+        let result = rewrite_query_for_string_indexing(query, &modes).unwrap();
         assert!(result.is_some(), "matching custom pattern should be redirected");
         let v: Value = serde_json::from_str(&result.unwrap()).unwrap();
         assert_eq!(v["field"].as_str().unwrap(), "data__uuids");
@@ -969,8 +957,8 @@ mod tests {
     fn test_string_indexing_custom_exactonly_non_matching_value() {
         let query = r#"{"type":"term","field":"data","value":"hello world"}"#;
         let modes = make_string_indexing_modes();
-        let companions = make_companion_fields();
-        let result = rewrite_query_for_string_indexing(query, &modes, &companions).unwrap();
+
+        let result = rewrite_query_for_string_indexing(query, &modes).unwrap();
         assert!(result.is_none(), "non-matching value should not be redirected");
     }
 
@@ -978,7 +966,7 @@ mod tests {
     fn test_string_indexing_empty_modes_noop() {
         let query = r#"{"type":"term","field":"trace_id","value":"abc"}"#;
         let result = rewrite_query_for_string_indexing(
-            query, &HashMap::new(), &HashMap::new()
+            query, &HashMap::new()
         ).unwrap();
         assert!(result.is_none());
     }
@@ -991,8 +979,8 @@ mod tests {
             uuid
         );
         let modes = make_string_indexing_modes();
-        let companions = make_companion_fields();
-        let result = rewrite_query_for_string_indexing(&query, &modes, &companions).unwrap();
+
+        let result = rewrite_query_for_string_indexing(&query, &modes).unwrap();
         assert!(result.is_some());
         let v: Value = serde_json::from_str(&result.unwrap()).unwrap();
         // trace_id term should be hashed
@@ -1009,8 +997,8 @@ mod tests {
     fn test_wildcard_on_exact_only_returns_error() {
         let query = r#"{"type":"wildcard","field":"trace_id","value":"abc*"}"#;
         let modes = make_string_indexing_modes();
-        let companions = make_companion_fields();
-        let result = rewrite_query_for_string_indexing(query, &modes, &companions);
+
+        let result = rewrite_query_for_string_indexing(query, &modes);
         assert!(result.is_err(), "wildcard on exact_only should return Err");
         let err_msg = result.unwrap_err().to_string();
         assert!(err_msg.contains("wildcard"), "error should mention 'wildcard': {}", err_msg);
@@ -1023,8 +1011,8 @@ mod tests {
         // Phrase queries on exact_only are converted to term queries (joined with spaces)
         let query = r#"{"type":"phrase","field":"trace_id","phrases":["abc","def"],"slop":0}"#;
         let modes = make_string_indexing_modes();
-        let companions = make_companion_fields();
-        let result = rewrite_query_for_string_indexing(query, &modes, &companions).unwrap();
+
+        let result = rewrite_query_for_string_indexing(query, &modes).unwrap();
         assert!(result.is_some(), "phrase on exact_only should be converted");
         let v: Value = serde_json::from_str(&result.unwrap()).unwrap();
         assert_eq!(v["type"].as_str().unwrap(), "term");
@@ -1041,8 +1029,8 @@ mod tests {
     fn test_regex_on_exact_only_returns_error() {
         let query = r#"{"type":"regex","field":"trace_id","pattern":"abc.*"}"#;
         let modes = make_string_indexing_modes();
-        let companions = make_companion_fields();
-        let result = rewrite_query_for_string_indexing(query, &modes, &companions);
+
+        let result = rewrite_query_for_string_indexing(query, &modes);
         assert!(result.is_err(), "regex on exact_only should return Err");
     }
 
@@ -1051,8 +1039,8 @@ mod tests {
         // full_text queries (from parseQuery) on exact_only are converted to term queries
         let query = r#"{"type":"full_text","field":"trace_id","text":"hello-world","params":{"tokenizer":"default"}}"#;
         let modes = make_string_indexing_modes();
-        let companions = make_companion_fields();
-        let result = rewrite_query_for_string_indexing(query, &modes, &companions).unwrap();
+
+        let result = rewrite_query_for_string_indexing(query, &modes).unwrap();
         assert!(result.is_some(), "full_text on exact_only should be converted to term");
         let v: Value = serde_json::from_str(&result.unwrap()).unwrap();
         assert_eq!(v["type"].as_str().unwrap(), "term");
@@ -1073,8 +1061,8 @@ mod tests {
             uuid
         );
         let modes = make_string_indexing_modes();
-        let companions = make_companion_fields();
-        let result = rewrite_query_for_string_indexing(&query, &modes, &companions).unwrap();
+
+        let result = rewrite_query_for_string_indexing(&query, &modes).unwrap();
         assert!(result.is_some(), "full_text UUID on uuid_exactonly should be converted");
         let v: Value = serde_json::from_str(&result.unwrap()).unwrap();
         assert_eq!(v["type"].as_str().unwrap(), "term");
@@ -1088,8 +1076,8 @@ mod tests {
         // full_text on text_uuid_exactonly with non-UUID text → leave as full_text
         let query = r#"{"type":"full_text","field":"message","text":"error occurred","params":{"tokenizer":"default"}}"#;
         let modes = make_string_indexing_modes();
-        let companions = make_companion_fields();
-        let result = rewrite_query_for_string_indexing(query, &modes, &companions).unwrap();
+
+        let result = rewrite_query_for_string_indexing(query, &modes).unwrap();
         assert!(result.is_none(), "non-UUID full_text on uuid_exactonly should not be rewritten");
     }
 
@@ -1097,8 +1085,8 @@ mod tests {
     fn test_phrase_prefix_on_exact_only_returns_error() {
         let query = r#"{"type":"phrase_prefix","field":"trace_id","phrases":["abc"],"max_expansions":50}"#;
         let modes = make_string_indexing_modes();
-        let companions = make_companion_fields();
-        let result = rewrite_query_for_string_indexing(query, &modes, &companions);
+
+        let result = rewrite_query_for_string_indexing(query, &modes);
         assert!(result.is_err(), "phrase_prefix on exact_only should return Err");
     }
 
@@ -1107,8 +1095,8 @@ mod tests {
         // text_uuid_exactonly keeps a real text field, so wildcard is valid
         let query = r#"{"type":"wildcard","field":"message","value":"error*"}"#;
         let modes = make_string_indexing_modes();
-        let companions = make_companion_fields();
-        let result = rewrite_query_for_string_indexing(query, &modes, &companions);
+
+        let result = rewrite_query_for_string_indexing(query, &modes);
         assert!(result.is_ok(), "wildcard on text_uuid_exactonly should not error");
         assert!(result.unwrap().is_none(), "wildcard on text_uuid_exactonly should not be rewritten");
     }
@@ -1118,8 +1106,8 @@ mod tests {
         // "unknown_field" has no string indexing mode — should pass through
         let query = r#"{"type":"wildcard","field":"unknown_field","value":"test*"}"#;
         let modes = make_string_indexing_modes();
-        let companions = make_companion_fields();
-        let result = rewrite_query_for_string_indexing(query, &modes, &companions);
+
+        let result = rewrite_query_for_string_indexing(query, &modes);
         assert!(result.is_ok(), "wildcard on non-overridden field should not error");
         assert!(result.unwrap().is_none(), "wildcard on non-overridden field should not be rewritten");
     }
@@ -1129,8 +1117,8 @@ mod tests {
         // text_uuid_strip keeps a text field, so wildcard is valid
         let query = r#"{"type":"wildcard","field":"log","value":"error*"}"#;
         let modes = make_string_indexing_modes();
-        let companions = make_companion_fields();
-        let result = rewrite_query_for_string_indexing(query, &modes, &companions);
+
+        let result = rewrite_query_for_string_indexing(query, &modes);
         assert!(result.is_ok(), "wildcard on text_uuid_strip should not error");
     }
 
@@ -1139,8 +1127,43 @@ mod tests {
         // A wildcard on exact_only nested inside a bool query should still error
         let query = r#"{"type":"bool","must":[{"type":"wildcard","field":"trace_id","value":"abc*"}],"should":[],"must_not":[],"filter":[]}"#;
         let modes = make_string_indexing_modes();
-        let companions = make_companion_fields();
-        let result = rewrite_query_for_string_indexing(query, &modes, &companions);
+
+        let result = rewrite_query_for_string_indexing(query, &modes);
         assert!(result.is_err(), "wildcard on exact_only nested in bool should return Err");
+    }
+
+    #[test]
+    fn test_uuid_substring_extracted_and_redirected() {
+        // A value that CONTAINS a UUID should have the UUID portion extracted,
+        // hashed, and redirected to the companion field. This handles values
+        // like "{UUID}" or "prefix-UUID-suffix".
+        let uuid = "550e8400-e29b-41d4-a716-446655440000";
+        let uuid_embedded = format!("prefix-{}-suffix", uuid);
+        let query = format!(r#"{{"type":"term","field":"message","value":"{}"}}"#, uuid_embedded);
+        let modes = make_string_indexing_modes();
+
+        let result = rewrite_query_for_string_indexing(&query, &modes).unwrap();
+        assert!(result.is_some(),
+            "value containing a UUID should be redirected to companion field");
+        let v: Value = serde_json::from_str(&result.unwrap()).unwrap();
+        assert_eq!(v["field"].as_str().unwrap(), "message__uuids");
+        // Should hash just the extracted UUID, not the full value with prefix/suffix
+        let expected_hash = hash_string_value(uuid);
+        assert_eq!(v["value"].as_str().unwrap(), expected_hash.to_string());
+    }
+
+    #[test]
+    fn test_invalid_regex_pattern_returns_error() {
+        // A field with an invalid regex should return an error, not silently ignore
+        let mut modes = HashMap::new();
+        modes.insert("bad_field".to_string(), StringIndexingMode::TextCustomExactonly {
+            regex: "[invalid".to_string(),
+        });
+
+        let query = r#"{"type":"term","field":"bad_field","value":"test"}"#;
+        let result = rewrite_query_for_string_indexing(query, &modes);
+        assert!(result.is_err(), "invalid regex should return Err");
+        assert!(result.unwrap_err().to_string().contains("Invalid regex"),
+            "error should mention invalid regex");
     }
 }

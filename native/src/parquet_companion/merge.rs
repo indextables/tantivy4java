@@ -179,10 +179,19 @@ pub fn combine_parquet_manifests(
         }
     }
 
-    // Union companion_hash_fields from all manifests.
+    // Union companion_hash_fields from all manifests with mismatch validation.
     let mut combined_companion_fields = manifests[0].companion_hash_fields.clone();
-    for (_i, manifest) in manifests.iter().enumerate().skip(1) {
+    for (i, manifest) in manifests.iter().enumerate().skip(1) {
         for (k, v) in &manifest.companion_hash_fields {
+            if let Some(existing) = combined_companion_fields.get(k) {
+                if existing != v {
+                    anyhow::bail!(
+                        "Cannot merge: companion_hash_fields mismatch for field '{}' \
+                         between split[0] ({:?}) and split[{}] ({:?})",
+                        k, existing, i, v
+                    );
+                }
+            }
             combined_companion_fields.insert(k.clone(), v.clone());
         }
     }
