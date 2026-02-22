@@ -758,14 +758,6 @@ pub fn columns_to_transcode(
             if source != FieldSource::Parquet {
                 return false;
             }
-            // Skip Str columns with non-"raw" tokenizers — tokenized text fields
-            // are incompatible with parquet's raw string storage for fast field aggregation.
-            if mapping.tantivy_type == "Str" {
-                let tok = mapping.fast_field_tokenizer.as_deref().unwrap_or("raw");
-                if tok != "raw" {
-                    return false;
-                }
-            }
             // If specific columns requested, filter to those
             if let Some(requested) = requested_columns {
                 return requested.iter().any(|r| r == &mapping.tantivy_field_name);

@@ -161,7 +161,8 @@ public class ParquetCompanionConfig {
     private String nodeId = "parquet-node";
     private long writerHeapSize = 256_000_000L;
     private int readerBatchSize = 8192;
-    private boolean stringHashOptimization = true;
+    private String[] stringFingerprintFields;        // include list (null = all eligible)
+    private String[] stringFingerprintExcludeFields;  // exclude list (null = not set)
     private boolean fieldnormsEnabled = false;
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
@@ -389,21 +390,58 @@ public class ParquetCompanionConfig {
     }
 
     /**
-     * Enable or disable the string hash fast-field optimization for HYBRID mode.
+     * Enable string fingerprints only for the specified fields.
      *
-     * <p>When enabled (default), the indexing pipeline stores a hidden {@code _phash_<field>}
-     * U64 fast field alongside each raw-tokenizer string fast field. At query time, aggregations
-     * such as {@code terms}, {@code value_count}, and {@code cardinality} on those string fields
-     * are transparently redirected to the cheaper U64 hash field. Bucket keys are resolved
-     * back to the original strings after the aggregation completes.
+     * <p>String fingerprints are hidden {@code _phash_<field>} U64 fast fields that store
+     * xxHash64 of each string value. At query time, aggregations such as {@code terms},
+     * {@code value_count}, and {@code cardinality} on those string fields are transparently
+     * redirected to the cheaper U64 hash field. Bucket keys are resolved back to the
+     * original strings after the aggregation completes.
      *
-     * <p>Disable this if you need exact string ordering semantics for {@code order: _key}
-     * terms aggregations, or if you prefer to avoid the extra storage overhead.
+     * <p>By default (no include/exclude list set), fingerprints are created for all eligible
+     * string fields. Use this method to restrict fingerprints to a specific set of fields,
+     * reducing index size when some string fields are never aggregated.
      *
-     * <p>Default: {@code true}.
+     * <p>Mutually exclusive with {@link #withoutStringFingerprints(String...)}.
+     *
+     * @param fields the field names to create string fingerprints for
+     * @return this config for chaining
      */
+    public ParquetCompanionConfig withStringFingerprints(String... fields) {
+        this.stringFingerprintFields = fields != null ? fields.clone() : null;
+        this.stringFingerprintExcludeFields = null;
+        return this;
+    }
+
+    /**
+     * Enable string fingerprints for all eligible fields except the specified ones.
+     *
+     * <p>By default, fingerprints are created for all eligible string fields.
+     * Use this method to exclude specific fields from fingerprint creation.
+     *
+     * <p>Mutually exclusive with {@link #withStringFingerprints(String...)}.
+     *
+     * @param fields the field names to exclude from string fingerprint creation
+     * @return this config for chaining
+     */
+    public ParquetCompanionConfig withoutStringFingerprints(String... fields) {
+        this.stringFingerprintExcludeFields = fields != null ? fields.clone() : null;
+        this.stringFingerprintFields = null;
+        return this;
+    }
+
+    /**
+     * @deprecated Use {@link #withStringFingerprints(String...)} or {@link #withoutStringFingerprints(String...)} instead.
+     */
+    @Deprecated
     public ParquetCompanionConfig withStringHashOptimization(boolean enable) {
-        this.stringHashOptimization = enable;
+        if (!enable) {
+            this.stringFingerprintFields = new String[0]; // empty include list = none
+            this.stringFingerprintExcludeFields = null;
+        } else {
+            this.stringFingerprintFields = null;
+            this.stringFingerprintExcludeFields = null;
+        }
         return this;
     }
 
@@ -456,7 +494,8 @@ public class ParquetCompanionConfig {
     public String getNodeId() { return nodeId; }
     public long getWriterHeapSize() { return writerHeapSize; }
     public int getReaderBatchSize() { return readerBatchSize; }
-    public boolean isStringHashOptimization() { return stringHashOptimization; }
+    public String[] getStringFingerprintFields() { return stringFingerprintFields != null ? stringFingerprintFields.clone() : null; }
+    public String[] getStringFingerprintExcludeFields() { return stringFingerprintExcludeFields != null ? stringFingerprintExcludeFields.clone() : null; }
     public boolean isFieldnormsEnabled() { return fieldnormsEnabled; }
 
     /**
@@ -475,7 +514,20 @@ public class ParquetCompanionConfig {
         map.put("auto_detect_name_mapping", autoDetectNameMapping);
         map.put("writer_heap_size", writerHeapSize);
         map.put("reader_batch_size", readerBatchSize);
-        map.put("string_hash_optimization", stringHashOptimization);
+        // String fingerprint configuration
+        if (stringFingerprintFields != null) {
+            if (stringFingerprintFields.length == 0) {
+                // Empty include list means no fingerprints (withStringHashOptimization(false) compat)
+                map.put("string_hash_optimization", false);
+            } else {
+                map.put("string_fingerprint_fields", Arrays.asList(stringFingerprintFields));
+            }
+        } else if (stringFingerprintExcludeFields != null) {
+            map.put("string_fingerprint_exclude_fields", Arrays.asList(stringFingerprintExcludeFields));
+        } else {
+            // Default: all eligible fields get fingerprints
+            map.put("string_hash_optimization", true);
+        }
         map.put("fieldnorms_enabled", fieldnormsEnabled);
 
         if (statisticsFields != null && statisticsFields.length > 0) {
