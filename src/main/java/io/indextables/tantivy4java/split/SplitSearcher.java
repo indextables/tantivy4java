@@ -861,6 +861,43 @@ public class SplitSearcher implements AutoCloseable {
     }
 
     /**
+     * Get the column mapping from the parquet companion manifest.
+     *
+     * <p>Returns a JSON string describing how tantivy fields map to parquet columns,
+     * including both the tantivy type (index type) and parquet type (data type).
+     * This is essential for consumers like Spark that need to know the actual data type
+     * of fields, particularly for {@code exact_only} fields where the tantivy schema
+     * reports U64 (the hash type) but the parquet data is a string.</p>
+     *
+     * <p>JSON format: array of objects, each with:
+     * {@code tantivy_field_name}, {@code parquet_column_name}, {@code tantivy_type},
+     * {@code parquet_type}, {@code physical_ordinal}.</p>
+     *
+     * @return JSON string with column mapping, or null if no parquet manifest
+     */
+    public String getColumnMapping() {
+        return nativeGetColumnMapping(nativePtr);
+    }
+
+    /**
+     * Get the string indexing modes from the parquet companion manifest.
+     *
+     * <p>Returns a JSON string mapping field names to their compact string indexing mode.
+     * Fields not in this map use standard string indexing. This allows consumers to
+     * identify fields where the tantivy schema type (U64) differs from the actual
+     * data type (string) due to hash-based indexing.</p>
+     *
+     * <p>Possible mode values: {@code "exact_only"}, {@code "text_uuid_exactonly"},
+     * {@code "text_uuid_strip"}, {@code "text_custom_exactonly:<regex>"},
+     * {@code "text_custom_strip:<regex>"}.</p>
+     *
+     * @return JSON string mapping field name to indexing mode, or null if no parquet manifest
+     */
+    public String getStringIndexingModes() {
+        return nativeGetStringIndexingModes(nativePtr);
+    }
+
+    /**
      * Warmup system: Proactively fetch query-relevant components before search execution.
      * This implements Quickwit's sophisticated warmup optimization that analyzes queries
      * and preloads only the data needed for optimal performance.
@@ -1105,6 +1142,8 @@ public class SplitSearcher implements AutoCloseable {
     private static native boolean nativePrewarmParquetFastFields(long nativePtr, String[] columns);
     private static native boolean nativePrewarmParquetColumns(long nativePtr, String[] columns);
     private static native String nativeGetParquetRetrievalStats(long nativePtr);
+    private static native String nativeGetColumnMapping(long nativePtr);
+    private static native String nativeGetStringIndexingModes(long nativePtr);
     private static native void warmupQueryNative(long nativePtr, long queryPtr);
     private static native WarmupStats warmupQueryAdvancedNative(long nativePtr, long queryPtr, IndexComponent[] components, boolean enableParallel);
     private static native CacheStats getCacheStatsNative(long nativePtr);

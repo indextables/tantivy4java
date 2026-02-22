@@ -407,8 +407,16 @@ fn rewrite_query_node(
 /// - `text_*_exactonly` fields: if value matches regex, redirect to companion hash field
 /// - `text_*_strip` fields: no change
 ///
-/// Also **blocks** unsupported query types on `exact_only` fields: wildcard, phrase,
-/// regex, full_text, and phrase_prefix queries cannot work on a U64 hash field.
+/// Converts `full_text` and `phrase` queries to `term` queries for compact modes:
+/// - `full_text` on `exact_only`: extracts `text`, converts to hashed term query
+/// - `full_text` on `text_*_exactonly`: if text matches regex, converts to companion term
+/// - `phrase` on `exact_only`: joins phrases, converts to hashed term query
+/// - `phrase` on `text_*_exactonly`: if joined text matches regex, converts to companion term
+///
+/// This allows `parseQuery("field:value")` to work transparently on compact fields.
+///
+/// **Blocks** wildcard, regex, and phrase_prefix queries on `exact_only` fields
+/// (these cannot be meaningfully converted to term queries on a U64 hash field).
 ///
 /// Returns `Ok(None)` if no changes were made.
 /// Returns `Ok(Some(rewritten))` if at least one node was rewritten.
@@ -497,11 +505,116 @@ fn rewrite_string_indexing_node(
             Ok(false)
         }
 
+        // Convert full_text queries to term queries for compact string indexing modes.
+        // parseQuery("field:value") generates full_text nodes with the original text
+        // preserved in the "text" field. We convert to a term query so the existing
+        // term handler can hash the value (exact_only) or redirect to companion
+        // (text_*_exactonly when regex matches).
+        "full_text" => {
+            let field = match obj.get("field").and_then(|f| f.as_str()).map(|s| s.to_string()) {
+                Some(f) => f,
+                None => return Ok(false),
+            };
+
+            if let Some(mode) = string_indexing_modes.get(&field) {
+                match mode {
+                    StringIndexingMode::ExactOnly => {
+                        // Convert full_text → term, then hash the value
+                        if let Some(text) = obj.get("text").and_then(|t| t.as_str()).map(|s| s.to_string()) {
+                            let hash = hash_string_value(&text);
+                            obj.insert("type".to_string(), Value::String("term".to_string()));
+                            obj.insert("value".to_string(), Value::String(hash.to_string()));
+                            obj.remove("text");
+                            obj.remove("params");
+                            return Ok(true);
+                        }
+                    }
+                    StringIndexingMode::TextUuidExactonly | StringIndexingMode::TextCustomExactonly { .. } => {
+                        // If text matches regex, convert to term → redirect to companion hash
+                        if let Some(text) = obj.get("text").and_then(|t| t.as_str()).map(|s| s.to_string()) {
+                            if let Some(regex) = compiled_regexes.get(&field) {
+                                if regex.is_match(&text) {
+                                    let companion = companion_field_name(&field);
+                                    let hash = hash_string_value(&text);
+                                    obj.insert("type".to_string(), Value::String("term".to_string()));
+                                    obj.insert("field".to_string(), Value::String(companion));
+                                    obj.insert("value".to_string(), Value::String(hash.to_string()));
+                                    obj.remove("text");
+                                    obj.remove("params");
+                                    return Ok(true);
+                                }
+                            }
+                        }
+                        // Non-matching text: leave as full_text on stripped text field
+                    }
+                    _ => {} // strip modes: leave as-is
+                }
+            }
+            Ok(false)
+        }
+
+        // Convert phrase queries to term queries for compact string indexing modes.
+        // Phrase queries have tokenized text in "phrases" array. We reconstruct the
+        // original text (best effort by joining with spaces) and convert to a term query.
+        "phrase" => {
+            let field = match obj.get("field").and_then(|f| f.as_str()).map(|s| s.to_string()) {
+                Some(f) => f,
+                None => return Ok(false),
+            };
+
+            if let Some(mode) = string_indexing_modes.get(&field) {
+                match mode {
+                    StringIndexingMode::ExactOnly => {
+                        // Reconstruct text from phrases, convert to term, hash
+                        if let Some(phrases) = obj.get("phrases").and_then(|p| p.as_array()) {
+                            let text: String = phrases.iter()
+                                .filter_map(|v| v.as_str())
+                                .collect::<Vec<_>>()
+                                .join(" ");
+                            if !text.is_empty() {
+                                let hash = hash_string_value(&text);
+                                obj.insert("type".to_string(), Value::String("term".to_string()));
+                                obj.insert("value".to_string(), Value::String(hash.to_string()));
+                                obj.remove("phrases");
+                                obj.remove("slop");
+                                return Ok(true);
+                            }
+                        }
+                    }
+                    StringIndexingMode::TextUuidExactonly | StringIndexingMode::TextCustomExactonly { .. } => {
+                        // Reconstruct text; if it matches regex, convert to term on companion
+                        if let Some(phrases) = obj.get("phrases").and_then(|p| p.as_array()) {
+                            let text: String = phrases.iter()
+                                .filter_map(|v| v.as_str())
+                                .collect::<Vec<_>>()
+                                .join(" ");
+                            if !text.is_empty() {
+                                if let Some(regex) = compiled_regexes.get(&field) {
+                                    if regex.is_match(&text) {
+                                        let companion = companion_field_name(&field);
+                                        let hash = hash_string_value(&text);
+                                        obj.insert("type".to_string(), Value::String("term".to_string()));
+                                        obj.insert("field".to_string(), Value::String(companion));
+                                        obj.insert("value".to_string(), Value::String(hash.to_string()));
+                                        obj.remove("phrases");
+                                        obj.remove("slop");
+                                        return Ok(true);
+                                    }
+                                }
+                            }
+                        }
+                        // Non-matching: leave as phrase query on stripped text field
+                    }
+                    _ => {} // strip modes: leave as-is
+                }
+            }
+            Ok(false)
+        }
+
         // Block unsupported query types on exact_only fields.
-        // exact_only replaces the Str field with a U64 xxHash64 hash — only term queries
-        // make sense. Wildcard, phrase, regex, and full_text queries would silently fail
-        // or return wrong results because the underlying field is U64, not text.
-        "wildcard" | "phrase" | "regex" | "full_text" | "phrase_prefix" => {
+        // Wildcard, regex, and phrase_prefix queries cannot be meaningfully converted
+        // to term queries on a U64 hash field.
+        "wildcard" | "regex" | "phrase_prefix" => {
             let field = match obj.get("field").and_then(|f| f.as_str()) {
                 Some(f) => f,
                 None => return Ok(false),
@@ -510,7 +623,7 @@ fn rewrite_string_indexing_node(
             if let Some(StringIndexingMode::ExactOnly) = string_indexing_modes.get(field) {
                 anyhow::bail!(
                     "Cannot use {} query on exact_only field '{}'. \
-                     exact_only fields only support exact term queries.",
+                     exact_only fields only support exact term queries via parseQuery() or SplitTermQuery.",
                     node_type, field
                 );
             }
@@ -906,15 +1019,22 @@ mod tests {
     }
 
     #[test]
-    fn test_phrase_on_exact_only_returns_error() {
-        let query = r#"{"type":"phrase","field":"trace_id","phrases":["abc","def"]}"#;
+    fn test_phrase_on_exact_only_converted_to_term() {
+        // Phrase queries on exact_only are converted to term queries (joined with spaces)
+        let query = r#"{"type":"phrase","field":"trace_id","phrases":["abc","def"],"slop":0}"#;
         let modes = make_string_indexing_modes();
         let companions = make_companion_fields();
-        let result = rewrite_query_for_string_indexing(query, &modes, &companions);
-        assert!(result.is_err(), "phrase on exact_only should return Err");
-        let err_msg = result.unwrap_err().to_string();
-        assert!(err_msg.contains("phrase"), "error should mention 'phrase': {}", err_msg);
-        assert!(err_msg.contains("trace_id"), "error should mention field name: {}", err_msg);
+        let result = rewrite_query_for_string_indexing(query, &modes, &companions).unwrap();
+        assert!(result.is_some(), "phrase on exact_only should be converted");
+        let v: Value = serde_json::from_str(&result.unwrap()).unwrap();
+        assert_eq!(v["type"].as_str().unwrap(), "term");
+        assert_eq!(v["field"].as_str().unwrap(), "trace_id");
+        // Value should be hash of "abc def" (phrases joined with space)
+        let expected_hash = hash_string_value("abc def");
+        assert_eq!(v["value"].as_str().unwrap(), expected_hash.to_string());
+        // phrases and slop should be removed
+        assert!(v.get("phrases").is_none());
+        assert!(v.get("slop").is_none());
     }
 
     #[test]
@@ -927,12 +1047,50 @@ mod tests {
     }
 
     #[test]
-    fn test_full_text_on_exact_only_returns_error() {
-        let query = r#"{"type":"full_text","field":"trace_id","text":"hello world"}"#;
+    fn test_full_text_on_exact_only_converted_to_term() {
+        // full_text queries (from parseQuery) on exact_only are converted to term queries
+        let query = r#"{"type":"full_text","field":"trace_id","text":"hello-world","params":{"tokenizer":"default"}}"#;
         let modes = make_string_indexing_modes();
         let companions = make_companion_fields();
-        let result = rewrite_query_for_string_indexing(query, &modes, &companions);
-        assert!(result.is_err(), "full_text on exact_only should return Err");
+        let result = rewrite_query_for_string_indexing(query, &modes, &companions).unwrap();
+        assert!(result.is_some(), "full_text on exact_only should be converted to term");
+        let v: Value = serde_json::from_str(&result.unwrap()).unwrap();
+        assert_eq!(v["type"].as_str().unwrap(), "term");
+        assert_eq!(v["field"].as_str().unwrap(), "trace_id");
+        let expected_hash = hash_string_value("hello-world");
+        assert_eq!(v["value"].as_str().unwrap(), expected_hash.to_string());
+        // text and params should be removed
+        assert!(v.get("text").is_none());
+        assert!(v.get("params").is_none());
+    }
+
+    #[test]
+    fn test_full_text_on_uuid_exactonly_uuid_converted() {
+        // full_text on text_uuid_exactonly with UUID text → convert to companion term
+        let uuid = "550e8400-e29b-41d4-a716-446655440000";
+        let query = format!(
+            r#"{{"type":"full_text","field":"message","text":"{}","params":{{"tokenizer":"default"}}}}"#,
+            uuid
+        );
+        let modes = make_string_indexing_modes();
+        let companions = make_companion_fields();
+        let result = rewrite_query_for_string_indexing(&query, &modes, &companions).unwrap();
+        assert!(result.is_some(), "full_text UUID on uuid_exactonly should be converted");
+        let v: Value = serde_json::from_str(&result.unwrap()).unwrap();
+        assert_eq!(v["type"].as_str().unwrap(), "term");
+        assert_eq!(v["field"].as_str().unwrap(), "message__uuids");
+        let expected_hash = hash_string_value(uuid);
+        assert_eq!(v["value"].as_str().unwrap(), expected_hash.to_string());
+    }
+
+    #[test]
+    fn test_full_text_on_uuid_exactonly_non_uuid_unchanged() {
+        // full_text on text_uuid_exactonly with non-UUID text → leave as full_text
+        let query = r#"{"type":"full_text","field":"message","text":"error occurred","params":{"tokenizer":"default"}}"#;
+        let modes = make_string_indexing_modes();
+        let companions = make_companion_fields();
+        let result = rewrite_query_for_string_indexing(query, &modes, &companions).unwrap();
+        assert!(result.is_none(), "non-UUID full_text on uuid_exactonly should not be rewritten");
     }
 
     #[test]

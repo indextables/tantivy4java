@@ -1006,4 +1006,116 @@ public class ParquetCompanionStringIndexingTest {
                     "Error should mention exact_only or wildcard: " + msg);
         }
     }
+
+    // ═══════════════════════════════════════════════════════════════
+    //  31. parseQuery works on exact_only field (full_text → term conversion)
+    // ═══════════════════════════════════════════════════════════════
+
+    @Test @Order(31)
+    @DisplayName("exact_only — parseQuery finds document (full_text converted to term)")
+    void parseQueryOnExactOnlyFindsDoc(@TempDir Path dir) throws Exception {
+        Map<String, String> overrides = new HashMap<>();
+        overrides.put("trace_id", ParquetCompanionConfig.StringIndexingMode.EXACT_ONLY);
+
+        try (SplitSearcher s = createSearcher(dir, overrides, "eo_parsequery")) {
+            // Get a doc's trace_id from parquet retrieval
+            SearchResult allDocs = s.search(new SplitMatchAllQuery(), 1);
+            assertEquals(1, allDocs.getHits().size());
+
+            String traceId;
+            try (Document doc = s.docProjected(allDocs.getHits().get(0).getDocAddress())) {
+                traceId = (String) doc.getFirst("trace_id");
+                assertNotNull(traceId, "trace_id should be retrievable from parquet");
+            }
+
+            // parseQuery generates a full_text node — rewriter should convert to term + hash
+            SplitQuery q = s.parseQuery("trace_id:" + traceId);
+            SearchResult result = s.search(q, 10);
+            assertEquals(1, result.getHits().size(),
+                    "parseQuery on exact_only should find the document via full_text→term conversion");
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    //  32. parseQuery with UUID on text_uuid_exactonly (full_text → companion)
+    // ═══════════════════════════════════════════════════════════════
+
+    @Test @Order(32)
+    @DisplayName("text_uuid_exactonly — parseQuery with UUID finds document via companion")
+    void parseQueryUuidOnTextUuidExactonly(@TempDir Path dir) throws Exception {
+        Map<String, String> overrides = new HashMap<>();
+        overrides.put("message", ParquetCompanionConfig.StringIndexingMode.TEXT_UUID_EXACTONLY);
+
+        try (SplitSearcher s = createSearcher(dir, overrides, "tue_parsequery")) {
+            // Get first doc's message to extract its UUID
+            SearchResult allDocs = s.search(new SplitMatchAllQuery(), 1);
+            String message;
+            try (Document doc = s.docProjected(allDocs.getHits().get(0).getDocAddress())) {
+                message = (String) doc.getFirst("message");
+                assertNotNull(message);
+            }
+
+            String uuid = extractUuid(message);
+            assertNotNull(uuid, "Message should contain a UUID: " + message);
+
+            // parseQuery generates full_text → rewriter detects UUID match → companion hash
+            SplitQuery q = s.parseQuery("message:" + uuid);
+            SearchResult result = s.search(q, 10);
+            assertEquals(1, result.getHits().size(),
+                    "parseQuery with UUID on text_uuid_exactonly should find doc via companion");
+        }
+    }
+
+    // ── Test 33: getColumnMapping exposes parquet types for exact_only fields ──
+
+    @Test @Order(33)
+    void columnMappingExposesParquetTypes(@TempDir Path dir) throws Exception {
+        Map<String, String> overrides = new LinkedHashMap<>();
+        overrides.put("trace_id", ParquetCompanionConfig.StringIndexingMode.EXACT_ONLY);
+
+        try (SplitSearcher s = createSearcher(dir, overrides,
+                ParquetCompanionConfig.FastFieldMode.HYBRID, "col_map_test")) {
+
+            String columnMapping = s.getColumnMapping();
+            assertNotNull(columnMapping, "getColumnMapping should return non-null for companion split");
+
+            // Parse JSON array
+            // Find trace_id entry: tantivy_type should be "U64" (index type),
+            // but parquet_type should indicate string (BYTE_ARRAY)
+            assertTrue(columnMapping.contains("\"tantivy_field_name\":\"trace_id\""),
+                    "Column mapping should contain trace_id");
+            assertTrue(columnMapping.contains("\"tantivy_type\":\"U64\""),
+                    "trace_id tantivy_type should be U64 (hash indexed)");
+            assertTrue(columnMapping.contains("\"parquet_type\":\"BYTE_ARRAY\""),
+                    "trace_id parquet_type should be BYTE_ARRAY (original string data)");
+        }
+    }
+
+    // ── Test 34: getStringIndexingModes exposes compact indexing modes ──
+
+    @Test @Order(34)
+    void stringIndexingModesExposed(@TempDir Path dir) throws Exception {
+        Map<String, String> overrides = new LinkedHashMap<>();
+        overrides.put("trace_id", ParquetCompanionConfig.StringIndexingMode.EXACT_ONLY);
+        overrides.put("message", ParquetCompanionConfig.StringIndexingMode.TEXT_UUID_EXACTONLY);
+
+        try (SplitSearcher s = createSearcher(dir, overrides,
+                ParquetCompanionConfig.FastFieldMode.HYBRID, "str_modes_test")) {
+
+            String modes = s.getStringIndexingModes();
+            assertNotNull(modes, "getStringIndexingModes should return non-null for companion split");
+
+            // Should contain exact_only for trace_id
+            assertTrue(modes.contains("trace_id"),
+                    "String indexing modes should contain trace_id");
+            assertTrue(modes.contains("ExactOnly") || modes.contains("exact_only"),
+                    "trace_id should have ExactOnly mode");
+
+            // Should contain text_uuid_exactonly for message
+            assertTrue(modes.contains("message"),
+                    "String indexing modes should contain message");
+            assertTrue(modes.contains("TextUuidExactonly") || modes.contains("text_uuid_exactonly"),
+                    "message should have TextUuidExactonly mode");
+        }
+    }
 }

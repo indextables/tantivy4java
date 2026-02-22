@@ -1,5 +1,7 @@
 # Compact String Indexing Guide
 
+> **Requires tantivy4java version 0.30.3 or later.**
+
 ## Overview
 
 Companion splits index text fields as full Str types with TERM dictionaries, postings, and (in HYBRID mode) fast fields. For fields where only exact-match or hash-based lookup is needed, this wastes significant index space. Additionally, fields containing UUIDs (common in log/event data) inflate the term dictionary with high-cardinality unique strings that rarely benefit from tokenized search.
@@ -76,11 +78,16 @@ During document indexing:
 
 ### Query Rewriting
 
-At query time, term queries are automatically rewritten:
+At query time, queries are automatically rewritten for compact string indexing:
 
-- **`exact_only`**: The search term is hashed and the query targets the U64 field
-- **`text_*_exactonly`**: If the search term matches the field's regex pattern, the query is redirected to the companion `__uuids` hash field with the hashed value. Non-matching terms query the text field directly.
-- **`text_*_strip`**: No rewriting — queries hit the text field directly
+- **Term queries** on `exact_only`: The search term is hashed and the query targets the U64 field
+- **Term queries** on `text_*_exactonly`: If the search term matches the field's regex pattern, the query is redirected to the companion `__uuids` hash field with the hashed value. Non-matching terms query the text field directly.
+- **Term queries** on `text_*_strip`: No rewriting — queries hit the text field directly
+- **`parseQuery()` / full_text queries** on `exact_only`: Automatically converted to a hashed term query (the original text is preserved in the `full_text` AST node)
+- **`parseQuery()` / full_text queries** on `text_*_exactonly`: If the text matches the field's regex, converted to a companion hash term query; otherwise left as a text search on the stripped field
+- **Phrase queries** on `exact_only` / `text_*_exactonly`: Converted to term queries (phrases joined and hashed)
+
+**Unsupported query types on `exact_only` fields** (wildcard, regex, phrase_prefix) are rejected at rewrite time with a clear error message. These query types cannot be meaningfully converted to term queries on a U64 hash field.
 
 ### Aggregation Support
 
@@ -95,11 +102,36 @@ The existing hash-based aggregation pipeline handles compact indexing modes auto
 | Query Type | `exact_only` | `text_*_exactonly` | `text_*_strip` |
 |-----------|-------------|-------------------|---------------|
 | **Term (exact)** | Hash match on U64 | Regex match → companion hash; else text search | Text search (stripped) |
-| **Phrase** | Not supported | On stripped text | On stripped text |
-| **Wildcard** | Not supported | On stripped text | On stripped text |
+| **parseQuery / full_text** | Converted to hashed term | Regex match → companion hash; else text search | Text search (stripped) |
+| **Phrase** | Converted to hashed term | Regex match → companion hash; else stripped text | On stripped text |
+| **Wildcard** | **Blocked** (error) | On stripped text only | On stripped text |
+| **Regex** | **Blocked** (error) | On stripped text only | On stripped text |
 | **Exists** | U64 field presence | Text field presence | Text field presence |
 | **Range** | Not meaningful | On text field | On text field |
 | **Terms agg** | Via hash touchup | Text or companion depending on field | On text field |
+
+### Querying Compact Fields
+
+Both `SplitTermQuery` and `parseQuery()` work transparently on compact string indexing fields. The query rewriter automatically converts `full_text` and `phrase` AST nodes to term queries with the appropriate hashing.
+
+```java
+// exact_only field: both approaches work
+String traceId = "550e8400-e29b-41d4-a716-446655440000";
+
+// SplitTermQuery — generates "type":"term" → rewriter hashes value
+SearchResult result = searcher.search(new SplitTermQuery("trace_id", traceId), 10);
+
+// parseQuery — generates "type":"full_text" → rewriter converts to hashed term
+SearchResult result = searcher.search(searcher.parseQuery("trace_id:" + traceId), 10);
+
+// text_uuid_exactonly: parseQuery with UUID → rewriter detects UUID match → companion hash
+SearchResult result = searcher.search(searcher.parseQuery("message:" + uuid), 10);
+
+// text_uuid_exactonly: parseQuery with regular text → searches stripped text field
+SearchResult result = searcher.search(searcher.parseQuery("message:completed"), 10);
+```
+
+The same applies to `text_custom_exactonly` fields — both `SplitTermQuery` and `parseQuery()` with pattern-matching values query via the companion hash field.
 
 ## Size Reduction Estimates
 
@@ -125,3 +157,34 @@ The existing hash-based aggregation pipeline handles compact indexing modes auto
 | `text_custom_strip:<regex>` | Tokenizer override | Strip custom regex, discard |
 
 All modes are configured via `withTokenizerOverrides()` on `ParquetCompanionConfig`. The `StringIndexingMode` class provides convenience constants.
+
+## Schema Introspection for Compact Fields
+
+When using compact string indexing, the **tantivy schema** reports the **index type** (e.g., U64 for `exact_only`), while the actual data retrieved from parquet has the **original type** (string). Consumers like Spark need to know the data type, not the index type, when building a DataFrame schema.
+
+Two methods on `SplitSearcher` expose this information:
+
+### `getColumnMapping()`
+
+Returns JSON with the full column mapping, including both types:
+
+```java
+String mapping = searcher.getColumnMapping();
+// [{"tantivy_field_name":"trace_id","parquet_column_name":"trace_id",
+//   "tantivy_type":"U64","parquet_type":"BYTE_ARRAY","physical_ordinal":1},
+//  {"tantivy_field_name":"id","parquet_column_name":"id",
+//   "tantivy_type":"I64","parquet_type":"INT64","physical_ordinal":0}, ...]
+```
+
+For `exact_only` fields, use `parquet_type` (not `tantivy_type`) when determining the data type for your DataFrame schema.
+
+### `getStringIndexingModes()`
+
+Returns JSON mapping field names to their compact indexing mode:
+
+```java
+String modes = searcher.getStringIndexingModes();
+// {"trace_id":"ExactOnly","message":"TextUuidExactonly"}
+```
+
+Fields in this map with `ExactOnly` mode have `tantivy_type: "U64"` but actually return string data from parquet. Use this to identify fields that need type correction in your schema.
