@@ -22,7 +22,7 @@ use super::merge_config::{extract_merge_config, extract_string_list_from_jobject
 use super::merge_impl::merge_splits_impl;
 use super::split_utils::{open_split_with_quickwit_native, get_split_file_list};
 use super::json_discovery::extract_doc_mapping_from_index;
-use crate::parquet_companion::indexing::{CreateFromParquetConfig, create_split_from_parquet};
+use crate::parquet_companion::indexing::{CreateFromParquetConfig, StringFingerprintMode, create_split_from_parquet};
 use crate::parquet_companion::manifest::FastFieldMode;
 use crate::parquet_companion::schema_derivation::SchemaDerivationConfig;
 use crate::parquet_companion::statistics::ColumnStatisticsResult;
@@ -522,9 +522,27 @@ fn parse_create_from_parquet_config(json_str: &str) -> anyhow::Result<CreateFrom
         .map(|v| v as usize)
         .unwrap_or(8192);
 
-    let string_hash_optimization = parsed.get("string_hash_optimization")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(true);
+    // Parse string fingerprint configuration:
+    //   - "string_fingerprint_fields": [...] → Include(set)
+    //   - "string_fingerprint_exclude_fields": [...] → Exclude(set)
+    //   - Fall back to "string_hash_optimization" bool → All or None
+    //   - Default → All
+    let string_fingerprint_mode = if let Some(arr) = parsed.get("string_fingerprint_fields").and_then(|v| v.as_array()) {
+        let set: HashSet<String> = arr.iter().filter_map(|v| v.as_str().map(String::from)).collect();
+        if set.is_empty() {
+            StringFingerprintMode::None
+        } else {
+            StringFingerprintMode::Include(set)
+        }
+    } else if let Some(arr) = parsed.get("string_fingerprint_exclude_fields").and_then(|v| v.as_array()) {
+        let set: HashSet<String> = arr.iter().filter_map(|v| v.as_str().map(String::from)).collect();
+        StringFingerprintMode::Exclude(set)
+    } else {
+        match parsed.get("string_hash_optimization").and_then(|v| v.as_bool()) {
+            Some(false) => StringFingerprintMode::None,
+            _ => StringFingerprintMode::All,
+        }
+    };
 
     let fieldnorms_enabled = parsed.get("fieldnorms_enabled")
         .and_then(|v| v.as_bool())
@@ -550,7 +568,7 @@ fn parse_create_from_parquet_config(json_str: &str) -> anyhow::Result<CreateFrom
         node_id,
         writer_heap_size,
         reader_batch_size,
-        string_hash_optimization,
+        string_fingerprint_mode,
     })
 }
 

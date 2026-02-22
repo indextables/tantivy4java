@@ -59,6 +59,18 @@ pub fn hash_string_value(s: &str) -> u64 {
 /// Prefix for hidden string hash fast fields.
 pub const PHASH_FIELD_PREFIX: &str = "_phash_";
 
+/// Controls which string fields get `_phash_<field>` fingerprint fast fields.
+pub enum StringFingerprintMode {
+    /// All eligible Str fields get fingerprints (default).
+    All,
+    /// No fields get fingerprints.
+    None,
+    /// Only these fields get fingerprints (by tantivy field name).
+    Include(std::collections::HashSet<String>),
+    /// All eligible fields except these get fingerprints (by tantivy field name).
+    Exclude(std::collections::HashSet<String>),
+}
+
 /// Configuration for creating a split from parquet files
 pub struct CreateFromParquetConfig {
     /// Table root path (parquet file paths are relative to this)
@@ -87,10 +99,10 @@ pub struct CreateFromParquetConfig {
     /// Larger batches reduce per-batch overhead but use more memory.
     /// Default: 8192.
     pub reader_batch_size: usize,
-    /// When true (default), adds hidden `_phash_<field>` U64 fast fields for each
-    /// string fast field in HYBRID mode with "raw" tokenizer. These enable hash-based
-    /// aggregations without full parquet column transcoding.
-    pub string_hash_optimization: bool,
+    /// Controls which string fields get `_phash_<field>` fingerprint U64 fast fields
+    /// in HYBRID mode. These enable hash-based aggregations without full parquet
+    /// column transcoding.
+    pub string_fingerprint_mode: StringFingerprintMode,
 }
 
 impl Default for CreateFromParquetConfig {
@@ -108,7 +120,7 @@ impl Default for CreateFromParquetConfig {
             node_id: "parquet-node".to_string(),
             writer_heap_size: 256_000_000, // 256MB
             reader_batch_size: 8192,
-            string_hash_optimization: true,
+            string_fingerprint_mode: StringFingerprintMode::All,
         }
     }
 }
@@ -269,7 +281,7 @@ pub async fn create_split_from_parquet(
         );
     }
 
-    if parquet_config.string_hash_optimization
+    if !matches!(parquet_config.string_fingerprint_mode, StringFingerprintMode::None)
         && parquet_config.fast_field_mode == FastFieldMode::Hybrid
     {
         for (_field, entry) in derived_schema.fields() {
@@ -281,15 +293,19 @@ pub async fn create_split_from_parquet(
                 continue;
             }
 
-            // Only Str fields with raw tokenizer benefit from hash optimization.
+            // Per-field fingerprint filtering based on include/exclude lists.
+            match &parquet_config.string_fingerprint_mode {
+                StringFingerprintMode::Include(set) if !set.contains(tantivy_name) => continue,
+                StringFingerprintMode::Exclude(set) if set.contains(tantivy_name) => continue,
+                _ => {}
+            }
+
+            // Only Str fields benefit from hash optimization.
             // IP address fields resolve to IpAddr (native), not Str.
             // JSON fields resolve to JsonObject, not Str.
             // Bytes fields are INDEXED-only, so no fast field transcoding is needed.
-            let is_raw_str = matches!(entry.field_type(), tantivy::schema::FieldType::Str(opts)
-                if opts.get_indexing_options()
-                    .map(|io| io.tokenizer() == "raw")
-                    .unwrap_or(false));
-            if !is_raw_str {
+            let is_str = matches!(entry.field_type(), tantivy::schema::FieldType::Str(_));
+            if !is_str {
                 continue;
             }
             let hash_field_name = format!("{}{}", PHASH_FIELD_PREFIX, tantivy_name);
@@ -2851,5 +2867,151 @@ mod tests {
         let top_docs = searcher.search(&query, &tantivy::collector::TopDocs::with_limit(num_rows)).unwrap();
         assert_eq!(top_docs.len(), num_rows,
             "Text search for 'status' should find all {} docs after UUID stripping", num_rows);
+    }
+
+    /// Verify that non-raw tokenizer text fields get fingerprint hash fields in HYBRID mode
+    /// and that the split is created successfully with the "default" tokenizer.
+    #[tokio::test]
+    async fn test_non_raw_text_fields_get_fingerprints_in_hybrid() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let parquet_path = temp_dir.path().join("nonraw_fp.parquet");
+        let output_path = temp_dir.path().join("nonraw_fp.split");
+
+        // Write test data with string columns that will get "default" tokenizer
+        write_test_parquet(&parquet_path, 20, 0);
+
+        let mut tokenizer_overrides = HashMap::new();
+        // Override "name" and "category" to use "default" tokenizer instead of "raw"
+        tokenizer_overrides.insert("name".to_string(), "default".to_string());
+        tokenizer_overrides.insert("category".to_string(), "default".to_string());
+
+        let config = CreateFromParquetConfig {
+            table_root: temp_dir.path().to_string_lossy().to_string(),
+            fast_field_mode: FastFieldMode::Hybrid,
+            schema_config: SchemaDerivationConfig {
+                fast_field_mode: FastFieldMode::Hybrid,
+                tokenizer_overrides,
+                ..Default::default()
+            },
+            string_fingerprint_mode: StringFingerprintMode::All,
+            ..Default::default()
+        };
+
+        let storage: std::sync::Arc<dyn quickwit_storage::Storage> =
+            std::sync::Arc::new(quickwit_storage::RamStorage::default());
+
+        let result = create_split_from_parquet(
+            &[parquet_path.to_string_lossy().to_string()],
+            output_path.to_str().unwrap(),
+            &config,
+            &storage,
+        ).await.expect("Non-raw text fields in HYBRID mode should create split successfully");
+
+        assert_eq!(result.metadata.num_docs, 20);
+        assert!(output_path.exists());
+
+        // Verify the split has _phash_ fields for the non-raw text fields
+        let (index, _dir) = super::super::super::quickwit_split::split_utils::open_split_with_quickwit_native(
+            output_path.to_str().unwrap()
+        ).unwrap();
+        let schema = index.schema();
+
+        // Both "name" and "category" should have hash fields even with "default" tokenizer
+        assert!(schema.get_field(&format!("{}name", PHASH_FIELD_PREFIX)).is_ok(),
+            "_phash_name field should exist for 'default' tokenizer text field");
+        assert!(schema.get_field(&format!("{}category", PHASH_FIELD_PREFIX)).is_ok(),
+            "_phash_category field should exist for 'default' tokenizer text field");
+    }
+
+    /// Verify per-field fingerprint Include mode: only listed fields get _phash_ fields.
+    #[tokio::test]
+    async fn test_string_fingerprint_include_mode() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let parquet_path = temp_dir.path().join("fp_include.parquet");
+        let output_path = temp_dir.path().join("fp_include.split");
+
+        write_test_parquet(&parquet_path, 10, 0);
+
+        let config = CreateFromParquetConfig {
+            table_root: temp_dir.path().to_string_lossy().to_string(),
+            fast_field_mode: FastFieldMode::Hybrid,
+            schema_config: SchemaDerivationConfig {
+                fast_field_mode: FastFieldMode::Hybrid,
+                ..Default::default()
+            },
+            // Only "name" gets a fingerprint, not "category"
+            string_fingerprint_mode: StringFingerprintMode::Include(
+                ["name".to_string()].into_iter().collect()
+            ),
+            ..Default::default()
+        };
+
+        let storage: std::sync::Arc<dyn quickwit_storage::Storage> =
+            std::sync::Arc::new(quickwit_storage::RamStorage::default());
+
+        let result = create_split_from_parquet(
+            &[parquet_path.to_string_lossy().to_string()],
+            output_path.to_str().unwrap(),
+            &config,
+            &storage,
+        ).await.expect("Include mode should succeed");
+
+        assert_eq!(result.metadata.num_docs, 10);
+
+        let (index, _dir) = super::super::super::quickwit_split::split_utils::open_split_with_quickwit_native(
+            output_path.to_str().unwrap()
+        ).unwrap();
+        let schema = index.schema();
+
+        assert!(schema.get_field(&format!("{}name", PHASH_FIELD_PREFIX)).is_ok(),
+            "_phash_name should exist (included)");
+        assert!(schema.get_field(&format!("{}category", PHASH_FIELD_PREFIX)).is_err(),
+            "_phash_category should NOT exist (not in include list)");
+    }
+
+    /// Verify per-field fingerprint Exclude mode: excluded fields don't get _phash_ fields.
+    #[tokio::test]
+    async fn test_string_fingerprint_exclude_mode() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let parquet_path = temp_dir.path().join("fp_exclude.parquet");
+        let output_path = temp_dir.path().join("fp_exclude.split");
+
+        write_test_parquet(&parquet_path, 10, 0);
+
+        let config = CreateFromParquetConfig {
+            table_root: temp_dir.path().to_string_lossy().to_string(),
+            fast_field_mode: FastFieldMode::Hybrid,
+            schema_config: SchemaDerivationConfig {
+                fast_field_mode: FastFieldMode::Hybrid,
+                ..Default::default()
+            },
+            // Exclude "category" from fingerprints
+            string_fingerprint_mode: StringFingerprintMode::Exclude(
+                ["category".to_string()].into_iter().collect()
+            ),
+            ..Default::default()
+        };
+
+        let storage: std::sync::Arc<dyn quickwit_storage::Storage> =
+            std::sync::Arc::new(quickwit_storage::RamStorage::default());
+
+        let result = create_split_from_parquet(
+            &[parquet_path.to_string_lossy().to_string()],
+            output_path.to_str().unwrap(),
+            &config,
+            &storage,
+        ).await.expect("Exclude mode should succeed");
+
+        assert_eq!(result.metadata.num_docs, 10);
+
+        let (index, _dir) = super::super::super::quickwit_split::split_utils::open_split_with_quickwit_native(
+            output_path.to_str().unwrap()
+        ).unwrap();
+        let schema = index.schema();
+
+        assert!(schema.get_field(&format!("{}name", PHASH_FIELD_PREFIX)).is_ok(),
+            "_phash_name should exist (not excluded)");
+        assert!(schema.get_field(&format!("{}category", PHASH_FIELD_PREFIX)).is_err(),
+            "_phash_category should NOT exist (excluded)");
     }
 }

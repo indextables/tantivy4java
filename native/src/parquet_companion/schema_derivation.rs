@@ -409,18 +409,16 @@ pub fn promote_meta_json_all_fast(meta_bytes: &[u8]) -> Result<Vec<u8>> {
                 if let Some(options) = obj.get_mut("options") {
                     match field_type.as_str() {
                         "text" => {
-                            // Only promote text fields with "raw" tokenizer to fast.
-                            // Non-raw tokenizers (e.g. "default") split text into tokens
-                            // during indexing, which is incompatible with parquet's raw
-                            // string storage — skip these for fast field aggregation.
+                            // Promote all text fields to fast, regardless of tokenizer.
+                            // Tantivy fast fields store raw bytes independent of the
+                            // tokenizer used for the inverted index — so even non-raw
+                            // tokenized fields can participate in fast field aggregations.
                             let tok = options.get("indexing")
                                 .and_then(|i| i.get("tokenizer"))
                                 .and_then(|t| t.as_str())
                                 .unwrap_or("raw")
                                 .to_string();
-                            if tok == "raw" {
-                                options["fast"] = serde_json::json!({"with_tokenizer": tok});
-                            }
+                            options["fast"] = serde_json::json!({"with_tokenizer": tok});
                         }
                         "i64" | "u64" | "f64" | "bool" | "date" | "ip_addr" | "bytes" => {
                             options["fast"] = serde_json::Value::Bool(true);
@@ -874,7 +872,7 @@ mod tests {
     }
 
     #[test]
-    fn test_promote_meta_json_text_default_tokenizer_not_promoted() {
+    fn test_promote_meta_json_text_default_tokenizer_promoted() {
         let meta = serde_json::json!({
             "schema": [
                 {"type": "text", "options": {"indexing": {"tokenizer": "default"}, "fast": false}},
@@ -884,8 +882,8 @@ mod tests {
         let meta_bytes = serde_json::to_vec(&meta).unwrap();
         let result = promote_meta_json_all_fast(&meta_bytes).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(std::str::from_utf8(&result).unwrap()).unwrap();
-        // Non-raw tokenizer text fields should NOT be promoted
-        assert_eq!(parsed["schema"][0]["options"]["fast"], false);
+        // Non-raw tokenizer text fields should now be promoted
+        assert_eq!(parsed["schema"][0]["options"]["fast"]["with_tokenizer"], "default");
     }
 
     #[test]

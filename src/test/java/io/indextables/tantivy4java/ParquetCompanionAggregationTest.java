@@ -752,24 +752,24 @@ public class ParquetCompanionAggregationTest {
     }
 
     @Test @org.junit.jupiter.api.Order(40)
-    @DisplayName("Terms agg on default-tokenized string (notes) — HYBRID mode returns empty (unsupported)")
+    @DisplayName("Terms agg on default-tokenized string (notes) — HYBRID mode succeeds")
     void termsDefaultTokenizerHybrid(@TempDir Path dir) throws Exception {
         Map<String, String> overrides = new HashMap<>();
         overrides.put("notes", "default");
         try (SplitSearcher s = createSearcher(dir, ParquetCompanionConfig.FastFieldMode.HYBRID,
                 10, true, "terms_def_hyb", overrides)) {
-            verifyDefaultTokenizerTermsUnsupported(s);
+            verifyDefaultTokenizerTermsSupported(s);
         }
     }
 
     @Test @org.junit.jupiter.api.Order(41)
-    @DisplayName("Terms agg on default-tokenized string (notes) — PARQUET_ONLY mode returns empty (unsupported)")
+    @DisplayName("Terms agg on default-tokenized string (notes) — PARQUET_ONLY mode succeeds")
     void termsDefaultTokenizerParquetOnly(@TempDir Path dir) throws Exception {
         Map<String, String> overrides = new HashMap<>();
         overrides.put("notes", "default");
         try (SplitSearcher s = createSearcher(dir, ParquetCompanionConfig.FastFieldMode.PARQUET_ONLY,
                 10, true, "terms_def_pq", overrides)) {
-            verifyDefaultTokenizerTermsUnsupported(s);
+            verifyDefaultTokenizerTermsSupported(s);
         }
     }
 
@@ -799,17 +799,13 @@ public class ParquetCompanionAggregationTest {
                 "Token 'note' should appear in 5 docs (even rows)");
     }
 
-    private void verifyDefaultTokenizerTermsUnsupported(SplitSearcher s) {
-        // Non-"raw" tokenized text fields are not supported for fast field aggregation
-        // in parquet companion mode. The "default" tokenizer splits text into tokens
-        // during indexing, which is incompatible with parquet's raw string storage.
-        // Aggregation on such fields should fail with "not configured as fast field".
+    private void verifyDefaultTokenizerTermsSupported(SplitSearcher s) {
+        // All text fields now support fast field aggregation regardless of tokenizer.
+        // Tantivy fast fields store raw bytes independent of the tokenizer.
         TermsAggregation agg = new TermsAggregation("notes_terms", "notes", 50, 0);
-        RuntimeException ex = assertThrows(RuntimeException.class,
-                () -> s.search(new SplitMatchAllQuery(), 0, "terms", agg),
-                "Aggregation on non-raw tokenized text field should fail in parquet companion mode");
-        assertTrue(ex.getMessage().contains("not configured as fast field"),
-                "Error should indicate field is not a fast field, got: " + ex.getMessage());
+        SearchResult result = s.search(new SplitMatchAllQuery(), 0, "terms", agg);
+        assertNotNull(result, "Aggregation on default-tokenized text field should succeed");
+        assertNotNull(result.getAggregations(), "Aggregation result should have aggregations map");
     }
 
     // ═══════════════════════════════════════════════════════════════
