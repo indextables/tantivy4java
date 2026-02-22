@@ -526,6 +526,10 @@ fn parse_create_from_parquet_config(json_str: &str) -> anyhow::Result<CreateFrom
         .and_then(|v| v.as_bool())
         .unwrap_or(true);
 
+    let fieldnorms_enabled = parsed.get("fieldnorms_enabled")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
     Ok(CreateFromParquetConfig {
         table_root,
         fast_field_mode,
@@ -535,6 +539,7 @@ fn parse_create_from_parquet_config(json_str: &str) -> anyhow::Result<CreateFrom
             tokenizer_overrides,
             ip_address_fields,
             json_fields,
+            fieldnorms_enabled,
         },
         statistics_fields,
         statistics_truncate_length,

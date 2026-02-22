@@ -162,6 +162,7 @@ public class ParquetCompanionConfig {
     private long writerHeapSize = 256_000_000L;
     private int readerBatchSize = 8192;
     private boolean stringHashOptimization = true;
+    private boolean fieldnormsEnabled = false;
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
@@ -407,6 +408,24 @@ public class ParquetCompanionConfig {
     }
 
     /**
+     * Enable or disable fieldnorms for text fields in companion splits.
+     *
+     * <p>Fieldnorms store 1 byte per document per indexed field, encoding approximate
+     * token count for BM25 length normalization. For companion splits, most text fields
+     * use the "raw" tokenizer (1 token per value), making fieldnorms constant and wasteful.
+     * For 10M docs with 20 fields, that's ~200MB of redundant data.
+     *
+     * <p>Default: {@code false} (fieldnorms disabled).
+     *
+     * @param enable true to enable fieldnorms (needed for BM25 scoring with variable-length text)
+     * @return this config for chaining
+     */
+    public ParquetCompanionConfig withFieldnorms(boolean enable) {
+        this.fieldnormsEnabled = enable;
+        return this;
+    }
+
+    /**
      * Set the number of rows per Arrow RecordBatch when reading parquet files.
      * Larger batches reduce per-batch overhead but use more memory per batch.
      * Default: 8192. Typical range: 1024 to 65536.
@@ -438,6 +457,7 @@ public class ParquetCompanionConfig {
     public long getWriterHeapSize() { return writerHeapSize; }
     public int getReaderBatchSize() { return readerBatchSize; }
     public boolean isStringHashOptimization() { return stringHashOptimization; }
+    public boolean isFieldnormsEnabled() { return fieldnormsEnabled; }
 
     /**
      * Convert this config to a JSON string for the createFromParquet native method.
@@ -456,6 +476,7 @@ public class ParquetCompanionConfig {
         map.put("writer_heap_size", writerHeapSize);
         map.put("reader_batch_size", readerBatchSize);
         map.put("string_hash_optimization", stringHashOptimization);
+        map.put("fieldnorms_enabled", fieldnormsEnabled);
 
         if (statisticsFields != null && statisticsFields.length > 0) {
             map.put("statistics_fields", Arrays.asList(statisticsFields));
