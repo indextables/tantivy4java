@@ -299,6 +299,27 @@ pub async fn perform_search_async_impl_leaf_response(
         effective_query_json
     };
 
+    // Rewrite term queries for compact string indexing modes (exact_only, text_*_exactonly).
+    // Also blocks unsupported query types (wildcard, phrase, regex) on exact_only fields.
+    let effective_query_json = if let Some(ref manifest) = context.parquet_manifest {
+        if !manifest.string_indexing_modes.is_empty() {
+            match crate::parquet_companion::hash_field_rewriter::rewrite_query_for_string_indexing(
+                &effective_query_json,
+                &manifest.string_indexing_modes,
+            )? {
+                Some(rewritten) => {
+                    debug_println!("📊 STRING_IDX: Rewrote query for compact string indexing mode(s)");
+                    rewritten
+                }
+                None => effective_query_json,
+            }
+        } else {
+            effective_query_json
+        }
+    } else {
+        effective_query_json
+    };
+
     // Lazy transcoding: ensure fast fields needed by range queries are transcoded
     let overrides = if context.augmented_directory.is_some() {
         ensure_fast_fields_for_query(context, &effective_query_json, None).await?

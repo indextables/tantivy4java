@@ -73,6 +73,7 @@ arrow-array = "57"
 zstd = "0.13"
 bytes = "1"
 xxhash-rust = { version = "0.8", features = ["xxh64"] }
+regex = "1"
 
 # Delta Lake table file listing via delta-kernel-rs
 delta_kernel = { version = "0.19", features = ["default-engine-rustls", "arrow"] }

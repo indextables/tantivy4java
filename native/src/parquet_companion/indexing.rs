@@ -25,6 +25,7 @@ use super::schema_derivation::{
 };
 use super::statistics::{StatisticsAccumulator, ColumnStatisticsResult, validate_statistics_fields};
 use super::name_mapping;
+use super::string_indexing::{self, StringIndexingMode, CompanionFieldInfo};
 
 use crate::debug_println;
 use crate::quickwit_split::QuickwitSplitMetadata;
@@ -226,11 +227,59 @@ pub async fn create_split_from_parquet(
     // Build the hash field map: tantivy_field_name → hash_field_name
     let mut string_hash_fields: HashMap<String, String> = HashMap::new();
 
+    // ── Parse compact string indexing modes from tokenizer overrides ─────
+    // These are non-standard tokenizer values like "exact_only", "text_uuid_exactonly", etc.
+    let mut string_indexing_modes: HashMap<String, StringIndexingMode> = HashMap::new();
+    let mut companion_hash_fields_map: HashMap<String, CompanionFieldInfo> = HashMap::new();
+
+    for (field_name, tokenizer_value) in &config.tokenizer_overrides {
+        // Resolve the tantivy field name via name mapping
+        let tantivy_name = name_mapping
+            .get(field_name.as_str())
+            .map(|s| s.as_str())
+            .unwrap_or(field_name.as_str());
+
+        if let Some(mode) = string_indexing::parse_tokenizer_override(tokenizer_value) {
+            // Build companion field info for *_exactonly modes
+            if string_indexing::needs_companion_field(&mode) {
+                let companion_name = string_indexing::companion_field_name(tantivy_name);
+                let pattern = string_indexing::regex_pattern(&mode)
+                    .unwrap_or("")
+                    .to_string();
+                companion_hash_fields_map.insert(
+                    companion_name.clone(),
+                    CompanionFieldInfo {
+                        original_field_name: tantivy_name.to_string(),
+                        regex_pattern: pattern,
+                    },
+                );
+            }
+            string_indexing_modes.insert(tantivy_name.to_string(), mode);
+        }
+    }
+
+    // Compile regexes for modes that need them
+    let compiled_regexes = string_indexing::compile_regexes(&string_indexing_modes)?;
+
+    if !string_indexing_modes.is_empty() {
+        debug_println!(
+            "🏗️ STRING_INDEXING: Parsed {} compact indexing modes, {} companion fields",
+            string_indexing_modes.len(), companion_hash_fields_map.len()
+        );
+    }
+
     if parquet_config.string_hash_optimization
         && parquet_config.fast_field_mode == FastFieldMode::Hybrid
     {
         for (_field, entry) in derived_schema.fields() {
             let tantivy_name = entry.name();
+
+            // Skip fields with custom string indexing modes — they have their own
+            // hash strategy and must not get a duplicate _phash_ field.
+            if string_indexing_modes.contains_key(tantivy_name) {
+                continue;
+            }
+
             // Only Str fields with raw tokenizer benefit from hash optimization.
             // IP address fields resolve to IpAddr (native), not Str.
             // JSON fields resolve to JsonObject, not Str.
@@ -264,6 +313,17 @@ pub async fn create_split_from_parquet(
         }
     }
 
+    // Register exact_only fields in string_hash_fields (the field IS the hash field)
+    for (field_name, mode) in &string_indexing_modes {
+        if matches!(mode, StringIndexingMode::ExactOnly) {
+            string_hash_fields.insert(field_name.clone(), field_name.clone());
+        }
+    }
+    // Register companion __uuids fields in string_hash_fields (companion IS the hash field)
+    for (companion_name, _info) in &companion_hash_fields_map {
+        string_hash_fields.insert(companion_name.clone(), companion_name.clone());
+    }
+
     let tantivy_schema = schema_builder.build();
 
     debug_println!(
@@ -274,7 +334,14 @@ pub async fn create_split_from_parquet(
     );
 
     // ── Step 5: Build column mapping ────────────────────────────────────
-    let column_mapping = build_column_mapping(&arrow_schema, &name_mapping, &parquet_metadata, &config);
+    let mut column_mapping = build_column_mapping(&arrow_schema, &name_mapping, &parquet_metadata, &config);
+
+    // Patch tantivy_type for exact_only fields: they are U64, not Str
+    for cm in &mut column_mapping {
+        if let Some(StringIndexingMode::ExactOnly) = string_indexing_modes.get(&cm.tantivy_field_name) {
+            cm.tantivy_type = "U64".to_string();
+        }
+    }
 
     // ── Step 6: Validate statistics fields ──────────────────────────────
     let field_types: HashMap<String, String> = column_mapping
@@ -398,6 +465,8 @@ pub async fn create_split_from_parquet(
                     &config,
                     &string_hash_fields,
                     &mut accumulators,
+                    &string_indexing_modes,
+                    &compiled_regexes,
                 )?;
 
                 // Attach merge-safe parquet coordinates to each document
@@ -470,6 +539,8 @@ pub async fn create_split_from_parquet(
         storage_config: None,
         metadata: HashMap::new(),
         string_hash_fields,
+        string_indexing_modes,
+        companion_hash_fields: companion_hash_fields_map,
     };
 
     manifest.validate().map_err(|e| anyhow::anyhow!("Manifest validation failed: {}", e))?;
@@ -565,6 +636,8 @@ fn arrow_row_to_tantivy_doc(
     config: &SchemaDerivationConfig,
     string_hash_fields: &HashMap<String, String>,
     accumulators: &mut HashMap<String, StatisticsAccumulator>,
+    string_indexing_modes: &HashMap<String, StringIndexingMode>,
+    compiled_regexes: &HashMap<String, regex::Regex>,
 ) -> Result<TantivyDocument> {
     let mut doc = TantivyDocument::new();
 
@@ -601,7 +674,7 @@ fn arrow_row_to_tantivy_doc(
         add_arrow_value_to_doc(
             &mut doc, field, array, arrow_field.data_type(), row_idx,
             tantivy_field_name, config, string_hash_fields, tantivy_schema,
-            accumulators,
+            accumulators, string_indexing_modes, compiled_regexes,
         )?;
     }
 
@@ -623,6 +696,8 @@ fn add_arrow_value_to_doc(
     string_hash_fields: &HashMap<String, String>,
     tantivy_schema: &Schema,
     accumulators: &mut HashMap<String, StatisticsAccumulator>,
+    string_indexing_modes: &HashMap<String, StringIndexingMode>,
+    compiled_regexes: &HashMap<String, regex::Regex>,
 ) -> Result<()> {
     match data_type {
         DataType::Boolean => {
@@ -720,42 +795,18 @@ fn add_arrow_value_to_doc(
         DataType::Utf8 => {
             let arr = array.as_any().downcast_ref::<StringArray>().ok_or_else(|| anyhow::anyhow!("Expected StringArray array"))?;
             let val = arr.value(row_idx);
-            if config.ip_address_fields.contains(field_name) {
-                add_ip_addr_value(doc, field, val, field_name)?;
-            } else if config.json_fields.contains(field_name) {
-                add_json_string_value(doc, field, val, field_name)?;
-            } else {
-                doc.add_text(field, val);
-                if let Some(acc) = accumulators.get_mut(field_name) {
-                    acc.observe_string(val);
-                }
-                // Add xxHash64 to hidden hash field (if one was created for this field)
-                if let Some(hash_field_name) = string_hash_fields.get(field_name) {
-                    if let Ok(hash_field) = tantivy_schema.get_field(hash_field_name) {
-                        doc.add_u64(hash_field, hash_string_value(val));
-                    }
-                }
-            }
+            add_string_value_to_doc(
+                doc, field, val, field_name, config, string_hash_fields,
+                tantivy_schema, accumulators, string_indexing_modes, compiled_regexes,
+            )?;
         }
         DataType::LargeUtf8 => {
             let arr = array.as_any().downcast_ref::<LargeStringArray>().ok_or_else(|| anyhow::anyhow!("Expected LargeStringArray array"))?;
             let val = arr.value(row_idx);
-            if config.ip_address_fields.contains(field_name) {
-                add_ip_addr_value(doc, field, val, field_name)?;
-            } else if config.json_fields.contains(field_name) {
-                add_json_string_value(doc, field, val, field_name)?;
-            } else {
-                doc.add_text(field, val);
-                if let Some(acc) = accumulators.get_mut(field_name) {
-                    acc.observe_string(val);
-                }
-                // Add xxHash64 to hidden hash field (if one was created for this field)
-                if let Some(hash_field_name) = string_hash_fields.get(field_name) {
-                    if let Ok(hash_field) = tantivy_schema.get_field(hash_field_name) {
-                        doc.add_u64(hash_field, hash_string_value(val));
-                    }
-                }
-            }
+            add_string_value_to_doc(
+                doc, field, val, field_name, config, string_hash_fields,
+                tantivy_schema, accumulators, string_indexing_modes, compiled_regexes,
+            )?;
         }
 
         DataType::Binary => {
@@ -869,6 +920,82 @@ fn add_arrow_value_to_doc(
         }
     }
 
+    Ok(())
+}
+
+/// Handle string value indexing for all modes (standard, IP, JSON, compact indexing).
+#[allow(clippy::too_many_arguments)]
+fn add_string_value_to_doc(
+    doc: &mut TantivyDocument,
+    field: Field,
+    val: &str,
+    field_name: &str,
+    config: &SchemaDerivationConfig,
+    string_hash_fields: &HashMap<String, String>,
+    tantivy_schema: &Schema,
+    accumulators: &mut HashMap<String, StatisticsAccumulator>,
+    string_indexing_modes: &HashMap<String, StringIndexingMode>,
+    compiled_regexes: &HashMap<String, regex::Regex>,
+) -> Result<()> {
+    if config.ip_address_fields.contains(field_name) {
+        add_ip_addr_value(doc, field, val, field_name)?;
+    } else if config.json_fields.contains(field_name) {
+        add_json_string_value(doc, field, val, field_name)?;
+    } else if let Some(mode) = string_indexing_modes.get(field_name) {
+        match mode {
+            StringIndexingMode::ExactOnly => {
+                // Field is U64 — store hash of the string value
+                doc.add_u64(field, hash_string_value(val));
+                if let Some(acc) = accumulators.get_mut(field_name) {
+                    acc.observe_string(val);
+                }
+            }
+            StringIndexingMode::TextUuidExactonly | StringIndexingMode::TextCustomExactonly { .. } => {
+                // Extract pattern matches, store stripped text + hash each match
+                if let Some(regex) = compiled_regexes.get(field_name) {
+                    let (stripped, matches) = string_indexing::extract_pattern(val, regex);
+                    doc.add_text(field, &stripped);
+                    if let Some(acc) = accumulators.get_mut(field_name) {
+                        acc.observe_string(val);
+                    }
+                    // Add hashes to companion field
+                    let companion_name = string_indexing::companion_field_name(field_name);
+                    if let Ok(companion_field) = tantivy_schema.get_field(&companion_name) {
+                        for m in &matches {
+                            doc.add_u64(companion_field, hash_string_value(m));
+                        }
+                    }
+                } else {
+                    // Fallback: no compiled regex (shouldn't happen)
+                    doc.add_text(field, val);
+                }
+            }
+            StringIndexingMode::TextUuidStrip | StringIndexingMode::TextCustomStrip { .. } => {
+                // Strip pattern matches, store stripped text only
+                if let Some(regex) = compiled_regexes.get(field_name) {
+                    let stripped = string_indexing::strip_pattern(val, regex);
+                    doc.add_text(field, &stripped);
+                    if let Some(acc) = accumulators.get_mut(field_name) {
+                        acc.observe_string(val);
+                    }
+                } else {
+                    doc.add_text(field, val);
+                }
+            }
+        }
+    } else {
+        // Standard text field path
+        doc.add_text(field, val);
+        if let Some(acc) = accumulators.get_mut(field_name) {
+            acc.observe_string(val);
+        }
+        // Add xxHash64 to hidden hash field (if one was created for this field)
+        if let Some(hash_field_name) = string_hash_fields.get(field_name) {
+            if let Ok(hash_field) = tantivy_schema.get_field(hash_field_name) {
+                doc.add_u64(hash_field, hash_string_value(val));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -2226,5 +2353,502 @@ mod tests {
             "Confirmed: tantivy merge reordered {}/{} test docs across {} segments (expected behavior)",
             reordered, test_ids.len(), num_segs
         );
+    }
+
+    // ── String indexing modes integration tests ──────────────────────────
+
+    /// Helper: create a parquet file with string fields suitable for string indexing mode tests.
+    /// Schema: id (Int64), trace_id (Utf8 — fake UUIDs), message (Utf8 — text with embedded UUID),
+    /// category (Utf8 — cycling info/warn/error)
+    fn write_test_parquet_for_string_indexing(path: &std::path::Path, num_rows: usize, id_offset: i64) {
+        use arrow_array::*;
+        use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+        use parquet::arrow::ArrowWriter;
+        use std::sync::Arc;
+
+        fn fake_uuid(row: i64, seed: u64) -> String {
+            let h = (row as u64).wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(seed);
+            format!(
+                "{:08x}-{:04x}-4{:03x}-{:04x}-{:012x}",
+                (h >> 32) as u32,
+                (h >> 16) as u16 & 0xFFFF,
+                h as u16 & 0x0FFF,
+                ((h >> 48) as u16 & 0x3FFF) | 0x8000,
+                h & 0xFFFF_FFFF_FFFF
+            )
+        }
+
+        let actions = ["login", "view", "click", "search", "logout"];
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("trace_id", DataType::Utf8, false),
+            Field::new("message", DataType::Utf8, false),
+            Field::new("category", DataType::Utf8, false),
+        ]));
+
+        let ids: Vec<i64> = (0..num_rows).map(|i| id_offset + i as i64).collect();
+        let trace_ids: Vec<String> = (0..num_rows)
+            .map(|i| fake_uuid(id_offset + i as i64, 1))
+            .collect();
+        let messages: Vec<String> = (0..num_rows)
+            .map(|i| {
+                let row = id_offset + i as i64;
+                let uuid = fake_uuid(row, 2);
+                let action = actions[i % 5];
+                format!("Request {} completed action {} for user_{}", uuid, action, i)
+            })
+            .collect();
+        let categories: Vec<String> = (0..num_rows)
+            .map(|i| ["info", "warn", "error"][i % 3].to_string())
+            .collect();
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(ids)),
+                Arc::new(StringArray::from(trace_ids.iter().map(|s| s.as_str()).collect::<Vec<_>>())),
+                Arc::new(StringArray::from(messages.iter().map(|s| s.as_str()).collect::<Vec<_>>())),
+                Arc::new(StringArray::from(categories.iter().map(|s| s.as_str()).collect::<Vec<_>>())),
+            ],
+        ).unwrap();
+
+        let file = std::fs::File::create(path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+    }
+
+    /// Integration test: create a split with exact_only string indexing mode and verify
+    /// the manifest contains correct string_indexing_modes and the schema has U64 fields.
+    #[tokio::test]
+    async fn test_create_split_with_exact_only_string_indexing() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let parquet_path = temp_dir.path().join("stridx_eo.parquet");
+        let output_path = temp_dir.path().join("stridx_eo.split");
+
+        write_test_parquet_for_string_indexing(&parquet_path, 30, 0);
+
+        let mut tokenizer_overrides = HashMap::new();
+        tokenizer_overrides.insert("trace_id".to_string(), "exact_only".to_string());
+
+        let config = CreateFromParquetConfig {
+            table_root: temp_dir.path().to_string_lossy().to_string(),
+            schema_config: SchemaDerivationConfig {
+                tokenizer_overrides,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let storage: Arc<dyn quickwit_storage::Storage> =
+            Arc::new(quickwit_storage::RamStorage::default());
+
+        let result = create_split_from_parquet(
+            &[parquet_path.to_string_lossy().to_string()],
+            output_path.to_str().unwrap(),
+            &config,
+            &storage,
+        ).await.expect("exact_only split creation should succeed");
+
+        assert_eq!(result.metadata.num_docs, 30);
+        assert!(output_path.exists());
+
+        // Open the split and verify schema
+        let (index, _bundle_dir) = crate::quickwit_split::split_utils::open_split_with_quickwit_native(
+            output_path.to_str().unwrap()
+        ).expect("Should open the created split");
+
+        let schema = index.schema();
+
+        // trace_id should be U64 (not Str) because exact_only converts it
+        let trace_field = schema.get_field("trace_id").unwrap();
+        let trace_entry = schema.get_field_entry(trace_field);
+        assert!(
+            matches!(trace_entry.field_type(), tantivy::schema::FieldType::U64(_)),
+            "exact_only field 'trace_id' should be U64 type, got: {:?}", trace_entry.field_type()
+        );
+
+        // message should still be Str (no override)
+        let msg_field = schema.get_field("message").unwrap();
+        let msg_entry = schema.get_field_entry(msg_field);
+        assert!(
+            matches!(msg_entry.field_type(), tantivy::schema::FieldType::Str(_)),
+            "Non-overridden field 'message' should remain Str type"
+        );
+
+        // Read the manifest from the split bundle and verify string_indexing_modes
+        let split_bytes = std::fs::read(&output_path).unwrap();
+        let file_slice = tantivy::directory::FileSlice::new(Arc::new(
+            tantivy::directory::OwnedBytes::new(split_bytes),
+        ));
+        let bundle = quickwit_directories::BundleDirectory::open_split(file_slice).unwrap();
+
+        use tantivy::directory::Directory;
+        use crate::parquet_companion::manifest_io::{MANIFEST_FILENAME, deserialize_manifest};
+        let manifest_path = std::path::PathBuf::from(MANIFEST_FILENAME);
+        let manifest_bytes = bundle.atomic_read(&manifest_path)
+            .expect("Should read manifest from bundle");
+        let manifest = deserialize_manifest(&manifest_bytes)
+            .expect("Should deserialize manifest");
+
+        // Verify string_indexing_modes
+        assert_eq!(manifest.string_indexing_modes.len(), 1,
+            "Should have 1 string indexing mode");
+        assert_eq!(
+            manifest.string_indexing_modes["trace_id"],
+            super::super::string_indexing::StringIndexingMode::ExactOnly,
+            "trace_id should have ExactOnly mode"
+        );
+
+        // exact_only has no companion field
+        assert!(manifest.companion_hash_fields.is_empty(),
+            "exact_only should not create companion hash fields");
+
+        // exact_only field should be in string_hash_fields (mapped to itself)
+        assert_eq!(
+            manifest.string_hash_fields.get("trace_id"),
+            Some(&"trace_id".to_string()),
+            "exact_only field should map to itself in string_hash_fields"
+        );
+
+        // Verify the column mapping for trace_id says U64
+        let trace_mapping = manifest.column_mapping.iter()
+            .find(|m| m.tantivy_field_name == "trace_id")
+            .expect("trace_id should be in column_mapping");
+        assert_eq!(trace_mapping.tantivy_type, "U64",
+            "exact_only column_mapping should say U64");
+
+        // Verify the split is searchable
+        let reader = index.reader().expect("Should create reader");
+        reader.reload().expect("Should reload");
+        let searcher = reader.searcher();
+        assert_eq!(searcher.num_docs(), 30);
+    }
+
+    /// Integration test: create a split with text_uuid_exactonly and verify
+    /// the companion field exists in manifest and schema.
+    #[tokio::test]
+    async fn test_create_split_with_text_uuid_exactonly_string_indexing() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let parquet_path = temp_dir.path().join("stridx_tue.parquet");
+        let output_path = temp_dir.path().join("stridx_tue.split");
+
+        write_test_parquet_for_string_indexing(&parquet_path, 20, 0);
+
+        let mut tokenizer_overrides = HashMap::new();
+        tokenizer_overrides.insert("message".to_string(), "text_uuid_exactonly".to_string());
+
+        let config = CreateFromParquetConfig {
+            table_root: temp_dir.path().to_string_lossy().to_string(),
+            schema_config: SchemaDerivationConfig {
+                tokenizer_overrides,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let storage: Arc<dyn quickwit_storage::Storage> =
+            Arc::new(quickwit_storage::RamStorage::default());
+
+        let result = create_split_from_parquet(
+            &[parquet_path.to_string_lossy().to_string()],
+            output_path.to_str().unwrap(),
+            &config,
+            &storage,
+        ).await.expect("text_uuid_exactonly split creation should succeed");
+
+        assert_eq!(result.metadata.num_docs, 20);
+
+        // Open the split
+        let (index, _bundle_dir) = crate::quickwit_split::split_utils::open_split_with_quickwit_native(
+            output_path.to_str().unwrap()
+        ).expect("Should open the created split");
+
+        let schema = index.schema();
+
+        // message should remain Str (text_uuid_exactonly keeps text indexing)
+        let msg_field = schema.get_field("message").unwrap();
+        let msg_entry = schema.get_field_entry(msg_field);
+        assert!(
+            matches!(msg_entry.field_type(), tantivy::schema::FieldType::Str(_)),
+            "text_uuid_exactonly field 'message' should remain Str type"
+        );
+
+        // Companion field message__uuids should exist as U64
+        let companion_field = schema.get_field("message__uuids").unwrap();
+        let companion_entry = schema.get_field_entry(companion_field);
+        assert!(
+            matches!(companion_entry.field_type(), tantivy::schema::FieldType::U64(_)),
+            "Companion field 'message__uuids' should be U64 type"
+        );
+
+        // Read manifest
+        let split_bytes = std::fs::read(&output_path).unwrap();
+        let file_slice = tantivy::directory::FileSlice::new(Arc::new(
+            tantivy::directory::OwnedBytes::new(split_bytes),
+        ));
+        let bundle = quickwit_directories::BundleDirectory::open_split(file_slice).unwrap();
+
+        use tantivy::directory::Directory;
+        use crate::parquet_companion::manifest_io::{MANIFEST_FILENAME, deserialize_manifest};
+        let manifest_path = std::path::PathBuf::from(MANIFEST_FILENAME);
+        let manifest_bytes = bundle.atomic_read(&manifest_path)
+            .expect("Should read manifest from bundle");
+        let manifest = deserialize_manifest(&manifest_bytes)
+            .expect("Should deserialize manifest");
+
+        // Verify string_indexing_modes
+        assert_eq!(manifest.string_indexing_modes.len(), 1);
+        assert_eq!(
+            manifest.string_indexing_modes["message"],
+            super::super::string_indexing::StringIndexingMode::TextUuidExactonly,
+        );
+
+        // Verify companion_hash_fields
+        assert_eq!(manifest.companion_hash_fields.len(), 1);
+        let companion_info = &manifest.companion_hash_fields["message__uuids"];
+        assert_eq!(companion_info.original_field_name, "message");
+        assert!(!companion_info.regex_pattern.is_empty(),
+            "Companion should have UUID regex pattern");
+
+        // Verify companion field is in string_hash_fields
+        assert_eq!(
+            manifest.string_hash_fields.get("message__uuids"),
+            Some(&"message__uuids".to_string()),
+            "Companion field should map to itself in string_hash_fields"
+        );
+    }
+
+    /// Integration test: create a split with multiple string indexing modes at once.
+    #[tokio::test]
+    async fn test_create_split_with_multiple_string_indexing_modes() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let parquet_path = temp_dir.path().join("stridx_multi.parquet");
+        let output_path = temp_dir.path().join("stridx_multi.split");
+
+        write_test_parquet_for_string_indexing(&parquet_path, 15, 0);
+
+        let mut tokenizer_overrides = HashMap::new();
+        tokenizer_overrides.insert("trace_id".to_string(), "exact_only".to_string());
+        tokenizer_overrides.insert("message".to_string(), "text_uuid_exactonly".to_string());
+
+        let config = CreateFromParquetConfig {
+            table_root: temp_dir.path().to_string_lossy().to_string(),
+            schema_config: SchemaDerivationConfig {
+                tokenizer_overrides,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let storage: Arc<dyn quickwit_storage::Storage> =
+            Arc::new(quickwit_storage::RamStorage::default());
+
+        let result = create_split_from_parquet(
+            &[parquet_path.to_string_lossy().to_string()],
+            output_path.to_str().unwrap(),
+            &config,
+            &storage,
+        ).await.expect("multi-mode split creation should succeed");
+
+        assert_eq!(result.metadata.num_docs, 15);
+
+        // Read manifest
+        let split_bytes = std::fs::read(&output_path).unwrap();
+        let file_slice = tantivy::directory::FileSlice::new(Arc::new(
+            tantivy::directory::OwnedBytes::new(split_bytes),
+        ));
+        let bundle = quickwit_directories::BundleDirectory::open_split(file_slice).unwrap();
+
+        use tantivy::directory::Directory;
+        use crate::parquet_companion::manifest_io::{MANIFEST_FILENAME, deserialize_manifest};
+        let manifest_path = std::path::PathBuf::from(MANIFEST_FILENAME);
+        let manifest_bytes = bundle.atomic_read(&manifest_path)
+            .expect("Should read manifest from bundle");
+        let manifest = deserialize_manifest(&manifest_bytes)
+            .expect("Should deserialize manifest");
+
+        // Should have 2 string indexing modes
+        assert_eq!(manifest.string_indexing_modes.len(), 2);
+        assert_eq!(
+            manifest.string_indexing_modes["trace_id"],
+            super::super::string_indexing::StringIndexingMode::ExactOnly,
+        );
+        assert_eq!(
+            manifest.string_indexing_modes["message"],
+            super::super::string_indexing::StringIndexingMode::TextUuidExactonly,
+        );
+
+        // 1 companion field (message__uuids)
+        assert_eq!(manifest.companion_hash_fields.len(), 1);
+        assert!(manifest.companion_hash_fields.contains_key("message__uuids"));
+
+        // string_hash_fields: trace_id → trace_id, message__uuids → message__uuids
+        assert_eq!(
+            manifest.string_hash_fields.get("trace_id"),
+            Some(&"trace_id".to_string()),
+        );
+        assert_eq!(
+            manifest.string_hash_fields.get("message__uuids"),
+            Some(&"message__uuids".to_string()),
+        );
+
+        // Category should NOT be in string_indexing_modes (no override)
+        assert!(!manifest.string_indexing_modes.contains_key("category"));
+    }
+
+    /// Helper: create a parquet file where each message contains MULTIPLE UUIDs.
+    fn write_test_parquet_multi_uuid(path: &std::path::Path, num_rows: usize) {
+        use arrow_array::*;
+        use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+        use parquet::arrow::ArrowWriter;
+        use std::sync::Arc;
+
+        fn fake_uuid(row: u64, seed: u64) -> String {
+            let h = (row as u64).wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(seed);
+            format!(
+                "{:08x}-{:04x}-4{:03x}-{:04x}-{:012x}",
+                (h >> 32) as u32,
+                (h >> 16) as u16 & 0xFFFF,
+                h as u16 & 0x0FFF,
+                ((h >> 48) as u16 & 0x3FFF) | 0x8000,
+                h & 0xFFFF_FFFF_FFFF
+            )
+        }
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("log_line", DataType::Utf8, false),
+        ]));
+
+        let ids: Vec<i64> = (0..num_rows).map(|i| i as i64).collect();
+        // Each message has 3 UUIDs embedded in text
+        let log_lines: Vec<String> = (0..num_rows)
+            .map(|i| {
+                let uuid_a = fake_uuid(i as u64, 100);
+                let uuid_b = fake_uuid(i as u64, 200);
+                let uuid_c = fake_uuid(i as u64, 300);
+                format!(
+                    "trace={} parent={} request={} status=ok host=server_{}",
+                    uuid_a, uuid_b, uuid_c, i % 5
+                )
+            })
+            .collect();
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(ids)),
+                Arc::new(StringArray::from(log_lines.iter().map(|s| s.as_str()).collect::<Vec<_>>())),
+            ],
+        ).unwrap();
+
+        let file = std::fs::File::create(path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+    }
+
+    /// Integration test: documents with MULTIPLE UUIDs — each UUID should be
+    /// independently hashed into the __uuids companion field and findable via term query.
+    #[tokio::test]
+    async fn test_multi_uuid_per_document_all_hashed_to_companion() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let parquet_path = temp_dir.path().join("multi_uuid.parquet");
+        let output_path = temp_dir.path().join("multi_uuid.split");
+
+        let num_rows = 10;
+        write_test_parquet_multi_uuid(&parquet_path, num_rows);
+
+        let mut tokenizer_overrides = HashMap::new();
+        tokenizer_overrides.insert("log_line".to_string(), "text_uuid_exactonly".to_string());
+
+        let config = CreateFromParquetConfig {
+            table_root: temp_dir.path().to_string_lossy().to_string(),
+            schema_config: SchemaDerivationConfig {
+                tokenizer_overrides,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let storage: Arc<dyn quickwit_storage::Storage> =
+            Arc::new(quickwit_storage::RamStorage::default());
+
+        let result = create_split_from_parquet(
+            &[parquet_path.to_string_lossy().to_string()],
+            output_path.to_str().unwrap(),
+            &config,
+            &storage,
+        ).await.expect("multi-uuid split creation should succeed");
+
+        assert_eq!(result.metadata.num_docs, num_rows);
+
+        // Open the split and verify we can search for each UUID independently
+        let (index, _bundle_dir) = crate::quickwit_split::split_utils::open_split_with_quickwit_native(
+            output_path.to_str().unwrap()
+        ).expect("Should open the split");
+
+        let schema = index.schema();
+
+        // Verify companion field exists
+        let companion_field = schema.get_field("log_line__uuids").unwrap();
+        assert!(
+            matches!(schema.get_field_entry(companion_field).field_type(), tantivy::schema::FieldType::U64(_)),
+            "Companion field should be U64"
+        );
+
+        // Verify text field still exists
+        let log_field = schema.get_field("log_line").unwrap();
+        assert!(
+            matches!(schema.get_field_entry(log_field).field_type(), tantivy::schema::FieldType::Str(_)),
+            "log_line should remain Str"
+        );
+
+        let reader = index.reader().unwrap();
+        reader.reload().unwrap();
+        let searcher = reader.searcher();
+        assert_eq!(searcher.num_docs(), num_rows as u64);
+
+        // For each row, generate the 3 UUIDs and verify each one finds exactly 1 doc
+        // via the companion U64 hash field
+        fn fake_uuid(row: u64, seed: u64) -> String {
+            let h = row.wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(seed);
+            format!(
+                "{:08x}-{:04x}-4{:03x}-{:04x}-{:012x}",
+                (h >> 32) as u32,
+                (h >> 16) as u16 & 0xFFFF,
+                h as u16 & 0x0FFF,
+                ((h >> 48) as u16 & 0x3FFF) | 0x8000,
+                h & 0xFFFF_FFFF_FFFF
+            )
+        }
+
+        for row in 0..num_rows {
+            for (label, seed) in &[("trace", 100u64), ("parent", 200), ("request", 300)] {
+                let uuid = fake_uuid(row as u64, *seed);
+                let hash = hash_string_value(&uuid);
+
+                // Search the companion field for this hash
+                let term = tantivy::Term::from_field_u64(companion_field, hash);
+                let query = tantivy::query::TermQuery::new(term, tantivy::schema::IndexRecordOption::Basic);
+                let top_docs = searcher.search(&query, &tantivy::collector::TopDocs::with_limit(10)).unwrap();
+
+                assert_eq!(
+                    top_docs.len(), 1,
+                    "Row {}: {} UUID {} (hash={}) should find exactly 1 doc, found {}",
+                    row, label, uuid, hash, top_docs.len()
+                );
+            }
+        }
+
+        // Also verify text search works (UUIDs stripped, text remains)
+        // "status" appears in every log_line after stripping
+        let status_term = tantivy::Term::from_field_text(log_field, "status");
+        let query = tantivy::query::TermQuery::new(status_term, tantivy::schema::IndexRecordOption::Basic);
+        let top_docs = searcher.search(&query, &tantivy::collector::TopDocs::with_limit(num_rows)).unwrap();
+        assert_eq!(top_docs.len(), num_rows,
+            "Text search for 'status' should find all {} docs after UUID stripping", num_rows);
     }
 }

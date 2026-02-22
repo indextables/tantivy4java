@@ -1400,4 +1400,13 @@ public class QuickwitSplit {
      *         uuid_1..uuid_5 (utf8 — unique UUIDs per row)
      */
     public static native void nativeWriteTestParquetWide(String path, int numRows, long idOffset);
+
+    /**
+     * Test helper: write a parquet file for string indexing mode testing.
+     * Schema: id (i64), trace_id (utf8 — pure UUIDs),
+     *         message (utf8 — text with embedded UUID),
+     *         error_log (utf8 — text with ERR-XXXX pattern),
+     *         category (utf8 — cycling "info"/"warn"/"error")
+     */
+    public static native void nativeWriteTestParquetForStringIndexing(String path, int numRows, long idOffset);
 }

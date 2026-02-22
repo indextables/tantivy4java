@@ -9,6 +9,7 @@ use arrow_schema::{DataType, Schema as ArrowSchema};
 use tantivy::schema::{Schema, SchemaBuilder};
 
 use super::manifest::FastFieldMode;
+use super::string_indexing::{self, StringIndexingMode};
 
 use crate::debug_println;
 
@@ -65,6 +66,17 @@ pub fn derive_tantivy_schema_with_mapping(
 ) -> Result<Schema> {
     let mut builder = SchemaBuilder::new();
 
+    // Collect all tantivy field names for collision detection with companion fields.
+    let all_field_names: HashSet<String> = arrow_schema.fields().iter()
+        .filter(|f| !config.skip_fields.contains(f.name().as_str()))
+        .map(|f| {
+            name_mapping
+                .and_then(|m| m.get(f.name().as_str()))
+                .cloned()
+                .unwrap_or_else(|| f.name().clone())
+        })
+        .collect();
+
     for field in arrow_schema.fields() {
         let parquet_name = field.name();
 
@@ -79,7 +91,7 @@ pub fn derive_tantivy_schema_with_mapping(
             .map(|s| s.as_str())
             .unwrap_or(parquet_name.as_str());
 
-        add_field_for_arrow_type(&mut builder, tantivy_name, field.data_type(), config)?;
+        add_field_for_arrow_type(&mut builder, tantivy_name, field.data_type(), config, &all_field_names)?;
     }
 
     Ok(builder.build())
@@ -90,6 +102,7 @@ fn add_field_for_arrow_type(
     name: &str,
     data_type: &DataType,
     config: &SchemaDerivationConfig,
+    all_field_names: &HashSet<String>,
 ) -> Result<()> {
     use tantivy::schema::*;
 
@@ -183,18 +196,64 @@ fn add_field_for_arrow_type(
 
         DataType::Utf8 | DataType::LargeUtf8 => {
             let tokenizer = config.tokenizer_overrides.get(name).cloned();
-            let tok = tokenizer.as_deref().unwrap_or("raw");
-            // Text fields: always indexed, never stored (parquet is the store)
-            let mut opts = TextOptions::default()
-                .set_indexing_options(
-                    TextFieldIndexing::default()
-                        .set_tokenizer(tok)
-                        .set_index_option(IndexRecordOption::WithFreqsAndPositions),
-                );
-            if should_add_fast(config, name, data_type) {
-                opts = opts.set_fast(Some(tok));
+
+            // Check for compact string indexing modes before standard tokenizer logic
+            if let Some(mode) = tokenizer.as_deref().and_then(string_indexing::parse_tokenizer_override) {
+                match &mode {
+                    StringIndexingMode::ExactOnly => {
+                        // Replace Str field entirely with U64 hash field (indexed + fast)
+                        let opts = NumericOptions::default().set_indexed().set_fast();
+                        builder.add_u64_field(name, opts);
+                    }
+                    StringIndexingMode::TextUuidExactonly
+                    | StringIndexingMode::TextCustomExactonly { .. } => {
+                        // Main field: text with "default" tokenizer, no fast
+                        let text_opts = TextOptions::default()
+                            .set_indexing_options(
+                                TextFieldIndexing::default()
+                                    .set_tokenizer("default")
+                                    .set_index_option(IndexRecordOption::WithFreqsAndPositions),
+                            );
+                        builder.add_text_field(name, text_opts);
+                        // Companion field: U64 hash field for extracted patterns
+                        let companion_name = string_indexing::companion_field_name(name);
+                        if all_field_names.contains(&companion_name) {
+                            anyhow::bail!(
+                                "Companion field name '{}' for field '{}' collides with an existing \
+                                 column. Rename the column or use a different indexing mode.",
+                                companion_name, name
+                            );
+                        }
+                        let companion_opts = NumericOptions::default().set_indexed().set_fast();
+                        builder.add_u64_field(&companion_name, companion_opts);
+                    }
+                    StringIndexingMode::TextUuidStrip
+                    | StringIndexingMode::TextCustomStrip { .. } => {
+                        // Text with "default" tokenizer, no fast, no companion field
+                        let text_opts = TextOptions::default()
+                            .set_indexing_options(
+                                TextFieldIndexing::default()
+                                    .set_tokenizer("default")
+                                    .set_index_option(IndexRecordOption::WithFreqsAndPositions),
+                            );
+                        builder.add_text_field(name, text_opts);
+                    }
+                }
+            } else {
+                // Standard tokenizer path
+                let tok = tokenizer.as_deref().unwrap_or("raw");
+                // Text fields: always indexed, never stored (parquet is the store)
+                let mut opts = TextOptions::default()
+                    .set_indexing_options(
+                        TextFieldIndexing::default()
+                            .set_tokenizer(tok)
+                            .set_index_option(IndexRecordOption::WithFreqsAndPositions),
+                    );
+                if should_add_fast(config, name, data_type) {
+                    opts = opts.set_fast(Some(tok));
+                }
+                builder.add_text_field(name, opts);
             }
-            builder.add_text_field(name, opts);
         }
 
         DataType::Decimal128(_, _) => {
@@ -1021,6 +1080,118 @@ mod tests {
 
         // Should be indexed (JsonObject with indexing options)
         assert!(payload_entry.is_indexed(), "JSON field should be indexed");
+    }
+
+    // ── String indexing mode tests ─────────────────────────────────────
+
+    #[test]
+    fn test_exact_only_creates_u64_field() {
+        let arrow = ArrowSchema::new(vec![
+            Field::new("trace_id", DataType::Utf8, true),
+            Field::new("label", DataType::Utf8, true),
+        ]);
+        let mut config = SchemaDerivationConfig::default();
+        config.tokenizer_overrides.insert("trace_id".to_string(), "exact_only".to_string());
+
+        let schema = derive_tantivy_schema(&arrow, &config).unwrap();
+
+        // trace_id should be U64 (hash field)
+        let trace_field = schema.get_field("trace_id").unwrap();
+        let trace_entry = schema.get_field_entry(trace_field);
+        assert!(
+            matches!(trace_entry.field_type(), tantivy::schema::FieldType::U64(_)),
+            "exact_only should create U64 field, got {:?}", trace_entry.field_type()
+        );
+        assert!(trace_entry.is_fast(), "exact_only U64 should be fast");
+        assert!(trace_entry.is_indexed(), "exact_only U64 should be indexed");
+
+        // label should still be standard text
+        let label_field = schema.get_field("label").unwrap();
+        let label_entry = schema.get_field_entry(label_field);
+        assert!(
+            matches!(label_entry.field_type(), tantivy::schema::FieldType::Str(_)),
+            "label should still be Str type"
+        );
+    }
+
+    #[test]
+    fn test_text_uuid_exactonly_creates_text_plus_companion() {
+        let arrow = ArrowSchema::new(vec![
+            Field::new("message", DataType::Utf8, true),
+        ]);
+        let mut config = SchemaDerivationConfig::default();
+        config.tokenizer_overrides.insert("message".to_string(), "text_uuid_exactonly".to_string());
+
+        let schema = derive_tantivy_schema(&arrow, &config).unwrap();
+
+        // message should be a text field with "default" tokenizer
+        let msg_field = schema.get_field("message").unwrap();
+        let msg_entry = schema.get_field_entry(msg_field);
+        assert!(
+            matches!(msg_entry.field_type(), tantivy::schema::FieldType::Str(_)),
+            "text_uuid_exactonly main field should be Str"
+        );
+
+        // message__uuids should be a U64 companion field
+        let companion_field = schema.get_field("message__uuids").unwrap();
+        let companion_entry = schema.get_field_entry(companion_field);
+        assert!(
+            matches!(companion_entry.field_type(), tantivy::schema::FieldType::U64(_)),
+            "companion field should be U64, got {:?}", companion_entry.field_type()
+        );
+        assert!(companion_entry.is_fast(), "companion U64 should be fast");
+        assert!(companion_entry.is_indexed(), "companion U64 should be indexed");
+    }
+
+    #[test]
+    fn test_text_uuid_strip_creates_text_only() {
+        let arrow = ArrowSchema::new(vec![
+            Field::new("message", DataType::Utf8, true),
+        ]);
+        let mut config = SchemaDerivationConfig::default();
+        config.tokenizer_overrides.insert("message".to_string(), "text_uuid_strip".to_string());
+
+        let schema = derive_tantivy_schema(&arrow, &config).unwrap();
+
+        // message should be a text field
+        assert!(schema.get_field("message").is_ok());
+
+        // No companion field
+        assert!(schema.get_field("message__uuids").is_err());
+    }
+
+    #[test]
+    fn test_text_custom_exactonly_creates_text_plus_companion() {
+        let arrow = ArrowSchema::new(vec![
+            Field::new("log_line", DataType::Utf8, true),
+        ]);
+        let mut config = SchemaDerivationConfig::default();
+        config.tokenizer_overrides.insert(
+            "log_line".to_string(),
+            "text_custom_exactonly:\\d{3}-\\d{4}".to_string(),
+        );
+
+        let schema = derive_tantivy_schema(&arrow, &config).unwrap();
+
+        assert!(schema.get_field("log_line").is_ok());
+        assert!(schema.get_field("log_line__uuids").is_ok());
+    }
+
+    #[test]
+    fn test_text_custom_strip_creates_text_only() {
+        let arrow = ArrowSchema::new(vec![
+            Field::new("log_line", DataType::Utf8, true),
+        ]);
+        let mut config = SchemaDerivationConfig::default();
+        config.tokenizer_overrides.insert(
+            "log_line".to_string(),
+            "text_custom_strip:\\d{3}-\\d{4}".to_string(),
+        );
+
+        let schema = derive_tantivy_schema(&arrow, &config).unwrap();
+
+        assert!(schema.get_field("log_line").is_ok());
+        assert!(schema.get_field("log_line__uuids").is_err());
     }
 }
 

@@ -89,6 +89,8 @@ mod tests {
             storage_config: None,
             metadata: HashMap::new(),
             string_hash_fields: HashMap::new(),
+            string_indexing_modes: HashMap::new(),
+            companion_hash_fields: HashMap::new(),
         }
     }
 
