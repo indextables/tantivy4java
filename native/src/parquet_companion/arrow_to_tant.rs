@@ -395,6 +395,12 @@ pub async fn batch_parquet_to_tant_buffer_by_groups(
     byte_cache: Option<&ByteRangeCache>,
     coalesce_config: Option<CoalesceConfig>,
 ) -> Result<Vec<u8>> {
+    let t_total = std::time::Instant::now();
+    eprintln!(
+        "⏱️ PROJ_DIAG: batch_parquet_to_tant_buffer_by_groups START - {} files, {} result docs, projected_fields={:?}",
+        groups.len(), result_count, projected_fields
+    );
+
     // Process each file's rows in parallel
     let file_futures: Vec<_> = groups
         .into_iter()
@@ -407,14 +413,13 @@ pub async fn batch_parquet_to_tant_buffer_by_groups(
             let byte_cache = byte_cache.cloned();
 
             async move {
+                let t_file = std::time::Instant::now();
                 let file_entry = &manifest.parquet_files[file_idx];
                 let parquet_path = &file_entry.relative_path;
 
-                debug_println!(
-                    "📖 PARQUET_TANT: file[{}]='{}' retrieving {} rows as TANT",
-                    file_idx,
-                    parquet_path,
-                    rows.len()
+                eprintln!(
+                    "⏱️ PROJ_DIAG: file[{}]='{}' retrieving {} rows, file_size={}",
+                    file_idx, parquet_path, rows.len(), file_entry.file_size_bytes
                 );
 
                 // Check metadata cache to avoid re-reading footer from S3/Azure
@@ -425,6 +430,7 @@ pub async fn batch_parquet_to_tant_buffer_by_groups(
                         .ok()
                         .and_then(|guard| guard.get(&path_buf).cloned())
                 });
+                let meta_was_cached = cached_meta.is_some();
 
                 let reader = if let Some(meta) = cached_meta {
                     CachedParquetReader::with_metadata(
@@ -451,9 +457,14 @@ pub async fn batch_parquet_to_tant_buffer_by_groups(
                     reader
                 };
 
+                let t_builder = std::time::Instant::now();
                 let builder = ParquetRecordBatchStreamBuilder::new(reader)
                     .await
                     .context("Failed to create parquet stream builder")?;
+                eprintln!(
+                    "⏱️ PROJ_DIAG: file[{}] ParquetRecordBatchStreamBuilder::new took {}ms (metadata_cached={})",
+                    file_idx, t_builder.elapsed().as_millis(), meta_was_cached
+                );
 
                 // Cache the metadata for subsequent reads
                 if let Some(cache) = &metadata_cache {
@@ -468,6 +479,12 @@ pub async fn batch_parquet_to_tant_buffer_by_groups(
                 let parquet_metadata = builder.metadata().clone();
                 let parquet_file_schema = builder.parquet_schema().clone();
 
+                let total_parquet_columns = parquet_schema.fields().len();
+                eprintln!(
+                    "⏱️ PROJ_DIAG: file[{}] parquet schema has {} columns, {} row groups",
+                    file_idx, total_parquet_columns, parquet_metadata.num_row_groups()
+                );
+
                 // Build column projection
                 let proj_fields = projected_fields_owned.as_deref();
                 let projection = build_column_projection(
@@ -476,12 +493,29 @@ pub async fn batch_parquet_to_tant_buffer_by_groups(
                     &manifest.column_mapping,
                 );
 
+                eprintln!(
+                    "⏱️ PROJ_DIAG: file[{}] build_column_projection: input={:?}, output_indices={:?} (of {} total columns)",
+                    file_idx,
+                    proj_fields.map(|f| f.len()),
+                    projection.as_ref().map(|p| p.clone()),
+                    total_parquet_columns
+                );
+
                 let builder = if let Some(ref proj) = projection {
-                    builder.with_projection(parquet::arrow::ProjectionMask::roots(
+                    let mask = parquet::arrow::ProjectionMask::roots(
                         &parquet_file_schema,
                         proj.iter().cloned(),
-                    ))
+                    );
+                    eprintln!(
+                        "⏱️ PROJ_DIAG: file[{}] applying ProjectionMask with {} root indices",
+                        file_idx, proj.len()
+                    );
+                    builder.with_projection(mask)
                 } else {
+                    eprintln!(
+                        "⏱️ PROJ_DIAG: file[{}] NO projection applied (reading ALL {} columns)",
+                        file_idx, total_parquet_columns
+                    );
                     builder
                 };
 
@@ -501,15 +535,17 @@ pub async fn batch_parquet_to_tant_buffer_by_groups(
                         .map(|(idx, _)| idx)
                         .collect();
 
-                    debug_println!(
-                        "📖 PARQUET_TANT: file[{}] selecting {}/{} row groups",
-                        file_idx,
-                        selected_rgs.len(),
-                        parquet_metadata.num_row_groups()
+                    eprintln!(
+                        "⏱️ PROJ_DIAG: file[{}] row_group_filter: selected {}/{} row groups (indices={:?})",
+                        file_idx, selected_rgs.len(), parquet_metadata.num_row_groups(), selected_rgs
                     );
 
                     builder.with_row_groups(selected_rgs)
                 } else {
+                    eprintln!(
+                        "⏱️ PROJ_DIAG: file[{}] row_group_filter: ALL {} row groups needed",
+                        file_idx, parquet_metadata.num_row_groups()
+                    );
                     builder
                 };
 
@@ -519,15 +555,25 @@ pub async fn batch_parquet_to_tant_buffer_by_groups(
                     &parquet_metadata,
                     rg_filter.as_deref(),
                 );
+                let has_row_selection = row_selection.is_some();
                 let builder = if let Some(selection) = row_selection {
                     builder.with_row_selection(selection)
                 } else {
                     builder
                 };
+                eprintln!(
+                    "⏱️ PROJ_DIAG: file[{}] row_selection applied={}, target_rows={:?}",
+                    file_idx, has_row_selection, row_indices
+                );
 
+                let t_stream = std::time::Instant::now();
                 let mut stream = builder
                     .build()
                     .context("Failed to build parquet record batch stream")?;
+                eprintln!(
+                    "⏱️ PROJ_DIAG: file[{}] stream.build() took {}ms",
+                    file_idx, t_stream.elapsed().as_millis()
+                );
 
                 // Build column info AFTER projection is applied (schema may have fewer columns)
                 // We need to wait until we see the first batch to get the projected schema.
@@ -535,9 +581,26 @@ pub async fn batch_parquet_to_tant_buffer_by_groups(
 
                 // Collect TANT bytes for each row
                 let mut collected_rows: Vec<Vec<u8>> = Vec::new();
+                let mut batch_count = 0u32;
                 use futures::StreamExt;
+                let t_read = std::time::Instant::now();
                 while let Some(batch_result) = stream.next().await {
                     let batch = batch_result.context("Failed to read parquet batch")?;
+                    batch_count += 1;
+
+                    if batch_count == 1 {
+                        eprintln!(
+                            "⏱️ PROJ_DIAG: file[{}] FIRST stream.next() took {}ms — batch has {} rows, {} columns",
+                            file_idx, t_read.elapsed().as_millis(), batch.num_rows(), batch.num_columns()
+                        );
+                        // Log column names in the batch to verify projection
+                        let batch_schema = batch.schema();
+                        let col_names: Vec<&str> = batch_schema.fields().iter().map(|f| f.name().as_str()).collect();
+                        eprintln!(
+                            "⏱️ PROJ_DIAG: file[{}] batch column names: {:?}",
+                            file_idx, col_names
+                        );
+                    }
 
                     // Build column info lazily from the projected batch schema
                     let info = column_info.get_or_insert_with(|| {
@@ -549,12 +612,14 @@ pub async fn batch_parquet_to_tant_buffer_by_groups(
                         collected_rows.push(doc_bytes);
                     }
                 }
+                eprintln!(
+                    "⏱️ PROJ_DIAG: file[{}] stream exhausted: {} batches, {} rows total, read took {}ms",
+                    file_idx, batch_count, collected_rows.len(), t_read.elapsed().as_millis()
+                );
 
-                debug_println!(
-                    "📖 PARQUET_TANT: file[{}] collected {} rows (expected {})",
-                    file_idx,
-                    collected_rows.len(),
-                    rows.len()
+                eprintln!(
+                    "⏱️ PROJ_DIAG: file[{}] TOTAL file processing took {}ms",
+                    file_idx, t_file.elapsed().as_millis()
                 );
 
                 // Return (original_index, doc_bytes) pairs for reassembly
@@ -583,7 +648,12 @@ pub async fn batch_parquet_to_tant_buffer_by_groups(
         }
     }
 
-    assemble_tant_buffer(doc_buffers)
+    let result = assemble_tant_buffer(doc_buffers);
+    eprintln!(
+        "⏱️ PROJ_DIAG: batch_parquet_to_tant_buffer_by_groups TOTAL took {}ms",
+        t_total.elapsed().as_millis()
+    );
+    result
 }
 
 #[cfg(test)]

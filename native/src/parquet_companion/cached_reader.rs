@@ -180,21 +180,25 @@ impl AsyncFileReader for CachedParquetReader {
     fn get_bytes(&mut self, range: Range<u64>) -> BoxFuture<'_, parquet::errors::Result<Bytes>> {
         let storage = self.storage.clone();
         let path = self.path.clone();
-        debug_println!(
-            "📖 PARQUET_READ: get_bytes path={:?} range={}..{} ({} bytes)",
-            path, range.start, range.end, range.end - range.start
+        let byte_size = range.end - range.start;
+        eprintln!(
+            "⏱️ PROJ_DIAG: get_bytes path={:?} range={}..{} ({} bytes)",
+            path.file_name().unwrap_or_default(), range.start, range.end, byte_size
         );
 
         // Check cache first
         if let Some(cached) = self.cache_get(&range) {
-            debug_println!("📖 PARQUET_READ: cache HIT for {}..{}", range.start, range.end);
+            eprintln!("⏱️ PROJ_DIAG: get_bytes CACHE HIT {} bytes", cached.len());
             return async move { Ok(cached) }.boxed();
         }
+
+        eprintln!("⏱️ PROJ_DIAG: get_bytes CACHE MISS — fetching {} bytes from storage", byte_size);
 
         let byte_cache = self.byte_cache.clone();
         let path_for_cache = self.path.clone();
 
         async move {
+            let t = std::time::Instant::now();
             let usize_range = Self::to_usize_range(&range);
             let owned_bytes = storage
                 .get_slice(&path, usize_range)
@@ -205,6 +209,10 @@ impl AsyncFileReader for CachedParquetReader {
                         format!("Storage read failed for {:?} range {:?}: {}", path, range, e),
                     )))
                 })?;
+            eprintln!(
+                "⏱️ PROJ_DIAG: get_bytes storage.get_slice took {}ms for {} bytes",
+                t.elapsed().as_millis(), byte_size
+            );
 
             // Zero-copy conversion: OwnedBytes → Bytes via from_owner()
             // avoids the allocation+copy of .to_vec()
@@ -229,9 +237,10 @@ impl AsyncFileReader for CachedParquetReader {
     ) -> BoxFuture<'_, parquet::errors::Result<Vec<Bytes>>> {
         let storage = self.storage.clone();
         let path = self.path.clone();
-        debug_println!(
-            "📖 PARQUET_READ: get_byte_ranges path={:?} count={} ranges",
-            path, ranges.len()
+        let total_requested: u64 = ranges.iter().map(|r| r.end - r.start).sum();
+        eprintln!(
+            "⏱️ PROJ_DIAG: get_byte_ranges path={:?} count={} ranges, total_requested={} bytes",
+            path.file_name().unwrap_or_default(), ranges.len(), total_requested
         );
 
         // Partition ranges into cached and uncached
@@ -249,15 +258,15 @@ impl AsyncFileReader for CachedParquetReader {
         }
 
         let cache_hits = ranges.len() - uncached_ranges.len();
-        if cache_hits > 0 {
-            debug_println!(
-                "📖 PARQUET_READ: byte_range cache: {} hits, {} misses",
-                cache_hits, uncached_ranges.len()
-            );
-        }
+        let uncached_bytes: u64 = uncached_ranges.iter().map(|r| r.end - r.start).sum();
+        eprintln!(
+            "⏱️ PROJ_DIAG: get_byte_ranges: {} cache hits, {} misses ({} bytes to fetch from storage)",
+            cache_hits, uncached_ranges.len(), uncached_bytes
+        );
 
         // If all cached, return immediately
         if uncached_ranges.is_empty() {
+            eprintln!("⏱️ PROJ_DIAG: get_byte_ranges ALL CACHED — returning immediately");
             return async move {
                 Ok(results.into_iter().map(|opt| opt.unwrap()).collect())
             }
@@ -269,6 +278,7 @@ impl AsyncFileReader for CachedParquetReader {
         let coalesce_config = self.coalesce_config;
 
         async move {
+            let t = std::time::Instant::now();
             // Fetch only the uncached ranges with configured coalescing
             let fetched = fetch_ranges_with_coalescing(
                 &storage,
@@ -277,6 +287,10 @@ impl AsyncFileReader for CachedParquetReader {
                 coalesce_config,
             )
             .await?;
+            eprintln!(
+                "⏱️ PROJ_DIAG: get_byte_ranges fetch_ranges_with_coalescing took {}ms for {} uncached bytes",
+                t.elapsed().as_millis(), uncached_bytes
+            );
 
             // Cache and fill results
             for (fetch_idx, orig_idx) in uncached_indices.into_iter().enumerate() {
@@ -310,27 +324,37 @@ impl AsyncFileReader for CachedParquetReader {
         _options: Option<&'a ArrowReaderOptions>,
     ) -> BoxFuture<'a, parquet::errors::Result<Arc<ParquetMetaData>>> {
         if let Some(ref metadata) = self.metadata {
+            eprintln!("⏱️ PROJ_DIAG: get_metadata CACHED — returning immediately");
             let metadata = metadata.clone();
             return async move { Ok(metadata) }.boxed();
         }
 
         let file_size = self.file_size;
+        eprintln!(
+            "⏱️ PROJ_DIAG: get_metadata NOT CACHED — loading footer+offset_index for file_size={}",
+            file_size
+        );
 
         async move {
-            // Use the parquet crate's async metadata loader which:
-            // 1. Reads the footer via get_bytes() on this reader
-            // 2. Reads the offset index (page locations) via get_bytes()
-            //
-            // The offset index is CRITICAL for page-level byte-range reads.
-            // Without it, the reader downloads entire column chunks (~30MB for 1M rows).
-            // With it, the reader downloads only the specific pages containing
-            // the target rows (~few KB per page).
+            let t = std::time::Instant::now();
             use parquet::file::metadata::PageIndexPolicy;
             let metadata = parquet::file::metadata::ParquetMetaDataReader::new()
                 .with_offset_index_policy(PageIndexPolicy::Optional)
                 .with_prefetch_hint(Some(64 * 1024)) // prefetch 64KB footer
                 .load_and_finish(&mut *self, file_size)
                 .await?;
+
+            let has_offset_index = metadata.offset_index().is_some();
+            let num_row_groups = metadata.num_row_groups();
+            let num_columns = if num_row_groups > 0 {
+                metadata.row_group(0).num_columns()
+            } else {
+                0
+            };
+            eprintln!(
+                "⏱️ PROJ_DIAG: get_metadata loaded in {}ms — {} row_groups, {} columns, has_offset_index={}",
+                t.elapsed().as_millis(), num_row_groups, num_columns, has_offset_index
+            );
 
             let metadata = Arc::new(metadata);
             self.metadata = Some(metadata.clone());

@@ -501,6 +501,7 @@ pub(crate) fn build_column_projection(
     column_mapping: &[super::manifest::ColumnMapping],
 ) -> Option<Vec<usize>> {
     let fields = projected_fields?;
+    let total_columns = parquet_schema.fields().len();
     let indices: Vec<usize> = fields
         .iter()
         .filter_map(|f| {
@@ -509,12 +510,23 @@ pub(crate) fn build_column_projection(
                 .find(|m| m.tantivy_field_name == *f)
                 .map(|m| m.parquet_column_name.as_str())
                 .unwrap_or(f.as_str());
-            parquet_schema
+            let pos = parquet_schema
                 .fields()
                 .iter()
-                .position(|field| field.name() == parquet_name)
+                .position(|field| field.name() == parquet_name);
+            if pos.is_none() {
+                eprintln!(
+                    "⏱️ PROJ_DIAG: build_column_projection: field '{}' (parquet='{}') NOT FOUND in schema",
+                    f, parquet_name
+                );
+            }
+            pos
         })
         .collect();
+    eprintln!(
+        "⏱️ PROJ_DIAG: build_column_projection: {} requested fields → {} matched indices out of {} total columns",
+        fields.len(), indices.len(), total_columns
+    );
     Some(indices)
 }
 
