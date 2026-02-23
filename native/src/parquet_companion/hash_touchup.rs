@@ -12,7 +12,6 @@
 //   5. Building a HashMap<u64 hash, String value> for use in Java object creation
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -21,12 +20,9 @@ use quickwit_storage::Storage;
 use tantivy::aggregation::agg_result::{AggregationResult, BucketResult};
 use tantivy::aggregation::Key;
 use tantivy::aggregation::AggregationLimitsGuard;
-use tantivy::columnar::DynamicColumn;
-use tantivy::index::SegmentComponent;
 
 use crate::debug_println;
 use crate::parquet_companion::hash_field_rewriter::HashFieldTouchupInfo;
-use crate::parquet_companion::transcode::strip_tantivy_footer;
 
 /// Build a hash → string resolution map for all touchup infos.
 ///
@@ -44,7 +40,7 @@ pub async fn build_hash_resolution_map(
     rewritten_agg_json: &str,
     // Context fields needed for Column<u64> scan and parquet reads
     cached_index: &tantivy::Index,
-    bundle_file_offsets: &HashMap<PathBuf, std::ops::Range<u64>>,
+    cached_searcher: &Arc<tantivy::Searcher>,
     split_uri: &str,
     cached_storage: &Arc<dyn Storage>,
     parquet_manifest: Option<&Arc<crate::parquet_companion::manifest::ParquetManifest>>,
@@ -109,71 +105,49 @@ pub async fn build_hash_resolution_map(
     );
 
     // Step 3: For each hash field, find representative doc_ids by scanning Column<u64>
-    let split_path = PathBuf::from(
-        std::path::Path::new(split_uri)
-            .file_name()
-            .map(|f| f.to_str().unwrap_or(split_uri))
-            .unwrap_or(split_uri),
-    );
-
+    // Uses selective column reads via FastFieldReaders: downloads only the SSTable index
+    // + specific column byte ranges instead of the entire .fast file (~100MB+).
     let seg_metas = cached_index
         .searchable_segment_metas()
         .map_err(|e| anyhow::anyhow!("Failed to get segment metas: {}", e))?;
 
-    // Collect (hash_field → (hash_val → (seg_ord, doc_id))) across all segments
     let mut hash_to_doc: HashMap<u64, (u32, u32)> = HashMap::new();
     let mut all_needed: HashSet<u64> = hashes_per_field.values().flatten().cloned().collect();
 
-    'seg_loop: for (seg_ord, seg_meta) in seg_metas.iter().enumerate() {
+    'seg_loop: for (seg_ord, _seg_meta) in seg_metas.iter().enumerate() {
         if all_needed.is_empty() {
             break;
         }
 
-        let fast_path = seg_meta.relative_path(SegmentComponent::FastFields);
-        let range = match bundle_file_offsets.get(&fast_path) {
-            Some(r) => r.clone(),
-            None => continue,
-        };
-
-        let fast_bytes = cached_storage
-            .get_slice(&split_path, range.start as usize..range.end as usize)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to read .fast for touchup: {}", e))?;
-
-        let body = strip_tantivy_footer(&fast_bytes)
-            .map_err(|e| anyhow::anyhow!("Failed to strip .fast footer: {}", e))?;
-
-        let columnar = tantivy::columnar::ColumnarReader::open(body.to_vec())
-            .map_err(|e| anyhow::anyhow!("Failed to open columnar for touchup: {}", e))?;
-
-        // For each hash field we need, try to open its column
-        let col_list = columnar
-            .list_columns()
-            .map_err(|e| anyhow::anyhow!("Failed to list columns: {}", e))?;
+        let segment_reader = cached_searcher.segment_reader(seg_ord as u32);
+        let fast_fields = segment_reader.fast_fields();
 
         for (hash_field_name, needed_hashes) in &hashes_per_field {
             if needed_hashes.is_empty() {
                 continue;
             }
 
-            // Find this hash field in the column list
-            let hash_col: Option<tantivy::columnar::Column<u64>> = col_list
-                .iter()
-                .find(|(name, _)| name == hash_field_name)
-                .and_then(|(_, handle)| {
-                    if let Ok(DynamicColumn::U64(col)) = handle.open() {
-                        Some(col)
-                    } else {
-                        None
-                    }
-                });
-
-            let col = match hash_col {
-                Some(c) => c,
+            // Selective read: only download this hash column's bytes via async path
+            let handles = match fast_fields.list_dynamic_column_handles(hash_field_name).await {
+                Ok(h) => h,
+                Err(_) => continue,
+            };
+            let handle = match handles.into_iter().next() {
+                Some(h) => h,
                 None => continue,
             };
+            // read_bytes_async populates CachingDirectory's ByteRangeCache
+            let _bytes = match handle.file_slice().read_bytes_async().await {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            // open_u64_lenient (sync) hits the CachingDirectory cache — no I/O
+            let col: tantivy::columnar::Column<u64> = match handle.open_u64_lenient() {
+                Ok(Some(c)) => c,
+                _ => continue,
+            };
 
-            let num_docs = columnar.num_rows();
+            let num_docs = segment_reader.num_docs() + segment_reader.num_deleted_docs();
             for doc_id in 0..num_docs {
                 let hash_val = col.values_for_doc(doc_id).next().unwrap_or(0);
                 if hash_val != 0 && all_needed.contains(&hash_val) {
@@ -198,70 +172,70 @@ pub async fn build_hash_resolution_map(
         hashes_per_field.values().map(|s| s.len()).sum::<usize>()
     );
 
-    // Step 4: Ensure pq_doc_locations are loaded for the segments we'll use
+    // Step 4: Ensure pq_doc_locations are loaded for the segments we'll use.
+    // Uses selective column reads via FastFieldReaders — same pattern as
+    // CachedSearcherContext::ensure_pq_segment_loaded.
     let seg_ords_needed: HashSet<u32> = hash_to_doc.values().map(|(s, _)| *s).collect();
     for &seg_ord in &seg_ords_needed {
-        // Load the segment's pq locations if not already loaded
+        // Already loaded?
         {
             let cache = pq_doc_locations.read().unwrap();
             if cache.get(seg_ord as usize).and_then(|o| o.as_ref()).is_some() {
-                continue; // already loaded
+                continue;
             }
         }
-        // Need to load — re-read the .fast bytes for this segment
-        let seg_metas2 = cached_index
-            .searchable_segment_metas()
-            .map_err(|e| anyhow::anyhow!("Failed to get segment metas: {}", e))?;
-        if let Some(seg_meta) = seg_metas2.get(seg_ord as usize) {
-            let fast_path = seg_meta.relative_path(SegmentComponent::FastFields);
-            if let Some(range) = bundle_file_offsets.get(&fast_path) {
-                let fast_bytes = cached_storage
-                    .get_slice(&split_path, range.start as usize..range.end as usize)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("Failed to read .fast for pq locations: {}", e))?;
-                let body = strip_tantivy_footer(&fast_bytes)
-                    .map_err(|e| anyhow::anyhow!("Failed to strip footer: {}", e))?;
-                let columnar = tantivy::columnar::ColumnarReader::open(body.to_vec())
-                    .map_err(|e| anyhow::anyhow!("Failed to open columnar: {}", e))?;
-                let num_docs = columnar.num_rows();
 
-                let col_list2 = columnar
-                    .list_columns()
-                    .map_err(|e| anyhow::anyhow!("Failed to list columns: {}", e))?;
+        let segment_reader = cached_searcher.segment_reader(seg_ord);
+        let fast_fields = segment_reader.fast_fields();
 
-                let mut file_hash_col = None;
-                let mut row_col = None;
-                for (name, handle) in &col_list2 {
-                    if name == crate::parquet_companion::indexing::PARQUET_FILE_HASH_FIELD {
-                        if let Ok(DynamicColumn::U64(col)) = handle.open() {
-                            file_hash_col = Some(col);
-                        }
-                    } else if name == crate::parquet_companion::indexing::PARQUET_ROW_IN_FILE_FIELD {
-                        if let Ok(DynamicColumn::U64(col)) = handle.open() {
-                            row_col = Some(col);
-                        }
-                    }
-                    if file_hash_col.is_some() && row_col.is_some() {
-                        break;
-                    }
-                }
+        let file_hash_field = crate::parquet_companion::indexing::PARQUET_FILE_HASH_FIELD;
+        let row_field = crate::parquet_companion::indexing::PARQUET_ROW_IN_FILE_FIELD;
 
-                if let (Some(fhc), Some(rc)) = (file_hash_col, row_col) {
-                    let mut seg_locations = Vec::with_capacity(num_docs as usize);
-                    for doc_id in 0..num_docs {
-                        let fh = fhc.values_for_doc(doc_id).next().unwrap_or(0);
-                        let ri = rc.values_for_doc(doc_id).next().unwrap_or(0);
-                        seg_locations.push((fh, ri));
-                    }
-                    let mut cache = pq_doc_locations.write().unwrap();
-                    while cache.len() <= seg_ord as usize {
-                        cache.push(None);
-                    }
-                    if cache[seg_ord as usize].is_none() {
-                        cache[seg_ord as usize] = Some(seg_locations);
-                    }
-                }
-            }
+        // Selective reads: SSTable index + 2 column byte ranges only
+        let fh_handles = fast_fields.list_dynamic_column_handles(file_hash_field).await
+            .map_err(|e| anyhow::anyhow!("Failed to list {} column handles: {}", file_hash_field, e))?;
+        let row_handles = fast_fields.list_dynamic_column_handles(row_field).await
+            .map_err(|e| anyhow::anyhow!("Failed to list {} column handles: {}", row_field, e))?;
+
+        let fh_handle = match fh_handles.into_iter().next() {
+            Some(h) => h,
+            None => continue,
+        };
+        let row_handle = match row_handles.into_iter().next() {
+            Some(h) => h,
+            None => continue,
+        };
+
+        // Async reads populate CachingDirectory cache
+        let (_fh_bytes, _row_bytes) = tokio::try_join!(
+            fh_handle.file_slice().read_bytes_async(),
+            row_handle.file_slice().read_bytes_async(),
+        ).map_err(|e| anyhow::anyhow!("Failed to read __pq column bytes: {}", e))?;
+
+        // Sync opens hit CachingDirectory cache — no I/O
+        let fh_col: tantivy::columnar::Column<u64> = match fh_handle.open_u64_lenient() {
+            Ok(Some(c)) => c,
+            _ => continue,
+        };
+        let row_col: tantivy::columnar::Column<u64> = match row_handle.open_u64_lenient() {
+            Ok(Some(c)) => c,
+            _ => continue,
+        };
+
+        let num_docs = segment_reader.num_docs() + segment_reader.num_deleted_docs();
+        let mut seg_locations = Vec::with_capacity(num_docs as usize);
+        for doc_id in 0..num_docs {
+            let fh = fh_col.values_for_doc(doc_id).next().unwrap_or(0);
+            let ri = row_col.values_for_doc(doc_id).next().unwrap_or(0);
+            seg_locations.push((fh, ri));
+        }
+
+        let mut cache = pq_doc_locations.write().unwrap();
+        while cache.len() <= seg_ord as usize {
+            cache.push(None);
+        }
+        if cache[seg_ord as usize].is_none() {
+            cache[seg_ord as usize] = Some(seg_locations);
         }
     }
 

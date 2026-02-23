@@ -140,6 +140,10 @@ impl CachedSearcherContext {
         // Use the existing cached_searcher → SegmentReader → FastFieldReaders path.
         // This goes through HotDirectory/StorageDirectory which does byte-range level reads,
         // fetching only the SSTable index + the 2 __pq column byte ranges — NOT the entire .fast file.
+        //
+        // Must use async path: HotDirectory delegates to StorageDirectory for bytes not in
+        // the hotcache, and StorageDirectory only supports async reads.
+        // Pattern: list_dynamic_column_handles (async) → read_bytes_async → open_u64_lenient (sync, now cached)
         let t_cols = std::time::Instant::now();
         let segment_reader = self.cached_searcher.segment_reader(seg_ord);
         let fast_fields = segment_reader.fast_fields();
@@ -147,12 +151,33 @@ impl CachedSearcherContext {
         let file_hash_field = crate::parquet_companion::indexing::PARQUET_FILE_HASH_FIELD;
         let row_field = crate::parquet_companion::indexing::PARQUET_ROW_IN_FILE_FIELD;
 
-        let file_hash_col: tantivy::columnar::Column<u64> = fast_fields.u64(file_hash_field)
-            .map_err(|e| anyhow::anyhow!("Failed to open {} fast field: {}", file_hash_field, e))?;
-        let row_col: tantivy::columnar::Column<u64> = fast_fields.u64(row_field)
-            .map_err(|e| anyhow::anyhow!("Failed to open {} fast field: {}", row_field, e))?;
-        eprintln!("⏱️ PROJ_DIAG: ensure_pq_segment_loaded seg={} fast field columns opened in {}ms",
-            seg_ord, t_cols.elapsed().as_millis());
+        // Step 1: Get column handles asynchronously (reads SSTable index only)
+        let file_hash_handles = fast_fields.list_dynamic_column_handles(file_hash_field).await
+            .map_err(|e| anyhow::anyhow!("Failed to list {} column handles: {}", file_hash_field, e))?;
+        let row_handles = fast_fields.list_dynamic_column_handles(row_field).await
+            .map_err(|e| anyhow::anyhow!("Failed to list {} column handles: {}", row_field, e))?;
+
+        let file_hash_handle = file_hash_handles.into_iter().next()
+            .ok_or_else(|| anyhow::anyhow!("No column handle found for {}", file_hash_field))?;
+        let row_handle = row_handles.into_iter().next()
+            .ok_or_else(|| anyhow::anyhow!("No column handle found for {}", row_field))?;
+
+        // Step 2: Read column bytes asynchronously (fetches only these columns' byte ranges)
+        let (file_hash_bytes, row_bytes) = tokio::try_join!(
+            file_hash_handle.file_slice().read_bytes_async(),
+            row_handle.file_slice().read_bytes_async(),
+        ).map_err(|e| anyhow::anyhow!("Failed to read __pq column bytes: {}", e))?;
+
+        eprintln!("⏱️ PROJ_DIAG: ensure_pq_segment_loaded seg={} async column reads in {}ms ({}B + {}B)",
+            seg_ord, t_cols.elapsed().as_millis(), file_hash_bytes.len(), row_bytes.len());
+
+        // Step 3: Open columns (sync — bytes already in memory from step 2)
+        let file_hash_col: tantivy::columnar::Column<u64> = file_hash_handle.open_u64_lenient()
+            .map_err(|e| anyhow::anyhow!("Failed to open {} column: {}", file_hash_field, e))?
+            .ok_or_else(|| anyhow::anyhow!("{} column is not u64-compatible", file_hash_field))?;
+        let row_col: tantivy::columnar::Column<u64> = row_handle.open_u64_lenient()
+            .map_err(|e| anyhow::anyhow!("Failed to open {} column: {}", row_field, e))?
+            .ok_or_else(|| anyhow::anyhow!("{} column is not u64-compatible", row_field))?;
 
         let num_docs = segment_reader.num_docs() + segment_reader.num_deleted_docs();
         let t_iter = std::time::Instant::now();

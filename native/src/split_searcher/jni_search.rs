@@ -408,7 +408,7 @@ pub async fn perform_search_async_impl_leaf_response_with_aggregations(
                     &leaf_response,
                     effective_agg_json.as_deref().unwrap_or(""),
                     &context.cached_index,
-                    &context.bundle_file_offsets,
+                    &context.cached_searcher,
                     &context.split_uri,
                     &context.cached_storage,
                     context.parquet_manifest.as_ref(),
