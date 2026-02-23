@@ -345,17 +345,19 @@ impl AsyncFileReader for CachedParquetReader {
                 .load_and_finish(&mut *self, file_size)
                 .await?;
 
-            let has_offset_index = metadata.offset_index().is_some();
-            let num_row_groups = metadata.num_row_groups();
-            let num_columns = if num_row_groups > 0 {
-                metadata.row_group(0).num_columns()
-            } else {
-                0
-            };
-            perf_println!(
-                "⏱️ PROJ_DIAG: get_metadata loaded in {}ms — {} row_groups, {} columns, has_offset_index={}",
-                t.elapsed().as_millis(), num_row_groups, num_columns, has_offset_index
-            );
+            if *crate::debug::PERFLOG_ENABLED {
+                let has_offset_index = metadata.offset_index().is_some();
+                let num_row_groups = metadata.num_row_groups();
+                let num_columns = if num_row_groups > 0 {
+                    metadata.row_group(0).num_columns()
+                } else {
+                    0
+                };
+                perf_println!(
+                    "⏱️ PROJ_DIAG: get_metadata loaded in {}ms — {} row_groups, {} columns, has_offset_index={}",
+                    t.elapsed().as_millis(), num_row_groups, num_columns, has_offset_index
+                );
+            }
 
             let metadata = Arc::new(metadata);
             self.metadata = Some(metadata.clone());

@@ -592,17 +592,12 @@ pub async fn batch_parquet_to_tant_buffer_by_groups(
                     let batch = batch_result.context("Failed to read parquet batch")?;
                     batch_count += 1;
 
-                    if batch_count == 1 {
-                        perf_println!(
-                            "⏱️ PROJ_DIAG: file[{}] FIRST stream.next() took {}ms — batch has {} rows, {} columns",
-                            file_idx, t_read.elapsed().as_millis(), batch.num_rows(), batch.num_columns()
-                        );
-                        // Log column names in the batch to verify projection
+                    if batch_count == 1 && *crate::debug::PERFLOG_ENABLED {
                         let batch_schema = batch.schema();
                         let col_names: Vec<&str> = batch_schema.fields().iter().map(|f| f.name().as_str()).collect();
                         perf_println!(
-                            "⏱️ PROJ_DIAG: file[{}] batch column names: {:?}",
-                            file_idx, col_names
+                            "⏱️ PROJ_DIAG: file[{}] FIRST stream.next() took {}ms — batch has {} rows, {} columns, names: {:?}",
+                            file_idx, t_read.elapsed().as_millis(), batch.num_rows(), batch.num_columns(), col_names
                         );
                     }
 
