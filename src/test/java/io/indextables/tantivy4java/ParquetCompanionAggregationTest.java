@@ -967,4 +967,72 @@ public class ParquetCompanionAggregationTest {
             }
         }
     }
+
+    // ═══════════════════════════════════════════════════════════════
+    //  Regression: merge two HYBRID companion splits, then aggregate
+    //  Verifies that promote_doc_mapping_all_fast is called on merge
+    //  path so that fast field aggregations work on merged splits.
+    // ═══════════════════════════════════════════════════════════════
+
+    @Test @org.junit.jupiter.api.Order(102)
+    @DisplayName("Merge two HYBRID companion splits — aggregations still work on merged result")
+    void mergedHybridCompanionSplitAggregation(@TempDir Path dir) throws Exception {
+        // Build split A: 20 rows (id 0..19)
+        Path pqA = dir.resolve("merge_agg_a.parquet");
+        Path splitA = dir.resolve("merge_agg_a.split");
+        QuickwitSplit.nativeWriteTestParquet(pqA.toString(), 20, 0);
+
+        ParquetCompanionConfig configA = new ParquetCompanionConfig(dir.toString())
+                .withFastFieldMode(ParquetCompanionConfig.FastFieldMode.HYBRID);
+        QuickwitSplit.SplitMetadata metaA = QuickwitSplit.createFromParquet(
+                Collections.singletonList(pqA.toString()), splitA.toString(), configA);
+        assertEquals(20, metaA.getNumDocs());
+
+        // Build split B: 20 rows (id 20..39)
+        Path pqB = dir.resolve("merge_agg_b.parquet");
+        Path splitB = dir.resolve("merge_agg_b.split");
+        QuickwitSplit.nativeWriteTestParquet(pqB.toString(), 20, 20);
+
+        ParquetCompanionConfig configB = new ParquetCompanionConfig(dir.toString())
+                .withFastFieldMode(ParquetCompanionConfig.FastFieldMode.HYBRID);
+        QuickwitSplit.SplitMetadata metaB = QuickwitSplit.createFromParquet(
+                Collections.singletonList(pqB.toString()), splitB.toString(), configB);
+        assertEquals(20, metaB.getNumDocs());
+
+        // Merge A + B
+        Path mergedSplit = dir.resolve("merge_agg_merged.split");
+        QuickwitSplit.MergeConfig mergeConfig = new QuickwitSplit.MergeConfig(
+                "merge-agg-test", "merge-agg-source", "merge-agg-node");
+        QuickwitSplit.SplitMetadata mergedMeta = QuickwitSplit.mergeSplits(
+                Arrays.asList(splitA.toString(), splitB.toString()),
+                mergedSplit.toString(), mergeConfig);
+        assertEquals(40, mergedMeta.getNumDocs());
+
+        // Open the merged split and run aggregations
+        String splitUrl = "file://" + mergedSplit.toAbsolutePath();
+        try (SplitSearcher s = cacheManager.createSplitSearcher(splitUrl, mergedMeta, dir.toString())) {
+            // Prewarm fast fields
+            s.preloadParquetFastFields("id", "score", "name").join();
+
+            // Stats aggregation on numeric field
+            StatsAggregation statsAgg = new StatsAggregation("id_stats", "id");
+            SearchResult statsResult = s.search(new SplitMatchAllQuery(), 0, "stats", statsAgg);
+            assertTrue(statsResult.hasAggregations(),
+                    "Merged HYBRID split should support stats aggregation");
+            StatsResult stats = (StatsResult) statsResult.getAggregation("stats");
+            assertNotNull(stats);
+            assertEquals(40, stats.getCount(),
+                    "Stats should cover all 40 merged docs");
+
+            // Terms aggregation on string field — this was the failing case before the fix
+            TermsAggregation termsAgg = new TermsAggregation("name_terms", "name", 50, 0);
+            SearchResult termsResult = s.search(new SplitMatchAllQuery(), 0, "terms", termsAgg);
+            assertTrue(termsResult.hasAggregations(),
+                    "Merged HYBRID split should support terms aggregation on string field");
+            TermsResult terms = (TermsResult) termsResult.getAggregation("terms");
+            assertNotNull(terms);
+            assertTrue(terms.getBuckets().size() > 0,
+                    "Terms agg on merged split should return buckets");
+        }
+    }
 }
