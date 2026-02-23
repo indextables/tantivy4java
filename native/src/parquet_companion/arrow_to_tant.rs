@@ -396,7 +396,7 @@ pub async fn batch_parquet_to_tant_buffer_by_groups(
     coalesce_config: Option<CoalesceConfig>,
 ) -> Result<Vec<u8>> {
     let t_total = std::time::Instant::now();
-    eprintln!(
+    perf_println!(
         "⏱️ PROJ_DIAG: batch_parquet_to_tant_buffer_by_groups START - {} files, {} result docs, projected_fields={:?}",
         groups.len(), result_count, projected_fields
     );
@@ -420,7 +420,7 @@ pub async fn batch_parquet_to_tant_buffer_by_groups(
                 let file_entry = &manifest.parquet_files[file_idx];
                 let parquet_path = &file_entry.relative_path;
 
-                eprintln!(
+                perf_println!(
                     "⏱️ PROJ_DIAG: file[{}]='{}' retrieving {} rows, file_size={}",
                     file_idx, parquet_path, rows.len(), file_entry.file_size_bytes
                 );
@@ -464,7 +464,7 @@ pub async fn batch_parquet_to_tant_buffer_by_groups(
                 let builder = ParquetRecordBatchStreamBuilder::new(reader)
                     .await
                     .context("Failed to create parquet stream builder")?;
-                eprintln!(
+                perf_println!(
                     "⏱️ PROJ_DIAG: file[{}] ParquetRecordBatchStreamBuilder::new took {}ms (metadata_cached={})",
                     file_idx, t_builder.elapsed().as_millis(), meta_was_cached
                 );
@@ -483,7 +483,7 @@ pub async fn batch_parquet_to_tant_buffer_by_groups(
                 let parquet_file_schema = builder.parquet_schema().clone();
 
                 let total_parquet_columns = parquet_schema.fields().len();
-                eprintln!(
+                perf_println!(
                     "⏱️ PROJ_DIAG: file[{}] parquet schema has {} columns, {} row groups",
                     file_idx, total_parquet_columns, parquet_metadata.num_row_groups()
                 );
@@ -496,7 +496,7 @@ pub async fn batch_parquet_to_tant_buffer_by_groups(
                     &manifest.column_mapping,
                 );
 
-                eprintln!(
+                perf_println!(
                     "⏱️ PROJ_DIAG: file[{}] build_column_projection: input={:?}, output_indices={:?} (of {} total columns)",
                     file_idx,
                     proj_fields.map(|f| f.len()),
@@ -509,13 +509,13 @@ pub async fn batch_parquet_to_tant_buffer_by_groups(
                         &parquet_file_schema,
                         proj.iter().cloned(),
                     );
-                    eprintln!(
+                    perf_println!(
                         "⏱️ PROJ_DIAG: file[{}] applying ProjectionMask with {} root indices",
                         file_idx, proj.len()
                     );
                     builder.with_projection(mask)
                 } else {
-                    eprintln!(
+                    perf_println!(
                         "⏱️ PROJ_DIAG: file[{}] NO projection applied (reading ALL {} columns)",
                         file_idx, total_parquet_columns
                     );
@@ -538,14 +538,14 @@ pub async fn batch_parquet_to_tant_buffer_by_groups(
                         .map(|(idx, _)| idx)
                         .collect();
 
-                    eprintln!(
+                    perf_println!(
                         "⏱️ PROJ_DIAG: file[{}] row_group_filter: selected {}/{} row groups (indices={:?})",
                         file_idx, selected_rgs.len(), parquet_metadata.num_row_groups(), selected_rgs
                     );
 
                     builder.with_row_groups(selected_rgs)
                 } else {
-                    eprintln!(
+                    perf_println!(
                         "⏱️ PROJ_DIAG: file[{}] row_group_filter: ALL {} row groups needed",
                         file_idx, parquet_metadata.num_row_groups()
                     );
@@ -564,7 +564,7 @@ pub async fn batch_parquet_to_tant_buffer_by_groups(
                 } else {
                     builder
                 };
-                eprintln!(
+                perf_println!(
                     "⏱️ PROJ_DIAG: file[{}] row_selection applied={}, target_rows={:?}",
                     file_idx, has_row_selection, row_indices
                 );
@@ -573,7 +573,7 @@ pub async fn batch_parquet_to_tant_buffer_by_groups(
                 let mut stream = builder
                     .build()
                     .context("Failed to build parquet record batch stream")?;
-                eprintln!(
+                perf_println!(
                     "⏱️ PROJ_DIAG: file[{}] stream.build() took {}ms",
                     file_idx, t_stream.elapsed().as_millis()
                 );
@@ -592,14 +592,14 @@ pub async fn batch_parquet_to_tant_buffer_by_groups(
                     batch_count += 1;
 
                     if batch_count == 1 {
-                        eprintln!(
+                        perf_println!(
                             "⏱️ PROJ_DIAG: file[{}] FIRST stream.next() took {}ms — batch has {} rows, {} columns",
                             file_idx, t_read.elapsed().as_millis(), batch.num_rows(), batch.num_columns()
                         );
                         // Log column names in the batch to verify projection
                         let batch_schema = batch.schema();
                         let col_names: Vec<&str> = batch_schema.fields().iter().map(|f| f.name().as_str()).collect();
-                        eprintln!(
+                        perf_println!(
                             "⏱️ PROJ_DIAG: file[{}] batch column names: {:?}",
                             file_idx, col_names
                         );
@@ -615,12 +615,12 @@ pub async fn batch_parquet_to_tant_buffer_by_groups(
                         collected_rows.push(doc_bytes);
                     }
                 }
-                eprintln!(
+                perf_println!(
                     "⏱️ PROJ_DIAG: file[{}] stream exhausted: {} batches, {} rows total, read took {}ms",
                     file_idx, batch_count, collected_rows.len(), t_read.elapsed().as_millis()
                 );
 
-                eprintln!(
+                perf_println!(
                     "⏱️ PROJ_DIAG: file[{}] TOTAL file processing took {}ms",
                     file_idx, t_file.elapsed().as_millis()
                 );
@@ -652,7 +652,7 @@ pub async fn batch_parquet_to_tant_buffer_by_groups(
     }
 
     let result = assemble_tant_buffer(doc_buffers);
-    eprintln!(
+    perf_println!(
         "⏱️ PROJ_DIAG: batch_parquet_to_tant_buffer_by_groups TOTAL took {}ms",
         t_total.elapsed().as_millis()
     );

@@ -109,7 +109,7 @@ pub(crate) async fn ensure_fast_fields_for_query(
             }
         }
 
-        eprintln!("⏱️ PROJ_DIAG: ensure_fast_fields needed={:?}, native={}, parquet={}",
+        perf_println!("⏱️ PROJ_DIAG: ensure_fast_fields needed={:?}, native={}, parquet={}",
             needed_fields, native_cols.len(), parquet_cols.len());
 
         // Only launch transcode I/O for actual parquet-sourced columns.
@@ -148,7 +148,7 @@ pub(crate) async fn ensure_fast_fields_for_query(
                     full_column_set, fast_path, e
                 ))?;
             }
-            eprintln!("⏱️ PROJ_DIAG: ensure_fast_fields transcode {} parquet cols across {} segments took {}ms",
+            perf_println!("⏱️ PROJ_DIAG: ensure_fast_fields transcode {} parquet cols across {} segments took {}ms",
                 parquet_cols.len(), context.segment_fast_paths.len(), t_transcode_io.elapsed().as_millis());
 
             // All segments succeeded — safe to mark the new columns as transcoded.
@@ -177,7 +177,7 @@ pub(crate) async fn ensure_fast_fields_for_query(
         fast_field_data.insert(path.clone(), bytes.clone());
     }
     let total_override_bytes: usize = fast_field_data.values().map(|b| b.len()).sum();
-    eprintln!("⏱️ PROJ_DIAG: ensure_fast_fields TOTAL {}ms — {} override entries, {} total bytes",
+    perf_println!("⏱️ PROJ_DIAG: ensure_fast_fields TOTAL {}ms — {} override entries, {} total bytes",
         t0.elapsed().as_millis(), fast_field_data.len(), total_override_bytes);
 
     Ok(Some(quickwit_search::SplitOverrides {
@@ -207,7 +207,7 @@ pub async fn perform_search_async_impl_leaf_response(
 
     let context = searcher_context.as_ref();
 
-    eprintln!("⏱️ PROJ_DIAG: perform_search_leaf_response START — split={}", context.split_uri);
+    perf_println!("⏱️ PROJ_DIAG: perform_search_leaf_response START — split={}", context.split_uri);
     debug_println!("🔍 ASYNC_IMPL: Extracted searcher context, performing search on split: {}", context.split_uri);
 
     // ========================================================================
@@ -335,7 +335,7 @@ pub async fn perform_search_async_impl_leaf_response(
 
     // Lazy transcoding: ensure fast fields needed by range queries are transcoded
     let t_rewrite = t_total.elapsed();
-    eprintln!("⏱️ PROJ_DIAG: perform_search_leaf_response query rewriting took {}ms", t_rewrite.as_millis());
+    perf_println!("⏱️ PROJ_DIAG: perform_search_leaf_response query rewriting took {}ms", t_rewrite.as_millis());
     let t_transcode = std::time::Instant::now();
     let overrides = if context.augmented_directory.is_some() {
         ensure_fast_fields_for_query(context, &effective_query_json, None).await?
@@ -345,7 +345,7 @@ pub async fn perform_search_async_impl_leaf_response(
             fast_field_data: o.fast_field_data.clone(),
         })
     };
-    eprintln!("⏱️ PROJ_DIAG: perform_search_leaf_response ensure_fast_fields took {}ms",
+    perf_println!("⏱️ PROJ_DIAG: perform_search_leaf_response ensure_fast_fields took {}ms",
         t_transcode.elapsed().as_millis());
 
     // Use Quickwit's real search functionality with cached searcher following their patterns
@@ -364,7 +364,7 @@ pub async fn perform_search_async_impl_leaf_response(
         overrides,
     ).await?;
 
-    eprintln!("⏱️ PROJ_DIAG: perform_search_leaf_response TOTAL {}ms (rewrite={}ms, transcode={}ms, leaf={}ms) — {} hits",
+    perf_println!("⏱️ PROJ_DIAG: perform_search_leaf_response TOTAL {}ms (rewrite={}ms, transcode={}ms, leaf={}ms) — {} hits",
         t_total.elapsed().as_millis(), t_rewrite.as_millis(), t_transcode.elapsed().as_millis(),
         t_leaf.elapsed().as_millis(), search_result.num_hits);
     debug_println!("✅ ASYNC_IMPL: Search completed successfully with {} hits", search_result.num_hits);
@@ -660,7 +660,7 @@ async fn perform_real_quickwit_search(
     };
 
     let t_docmapper = t0.elapsed();
-    eprintln!("⏱️ PROJ_DIAG: perform_real_quickwit_search DocMapper creation took {}ms", t_docmapper.as_millis());
+    perf_println!("⏱️ PROJ_DIAG: perform_real_quickwit_search DocMapper creation took {}ms", t_docmapper.as_millis());
 
     // Create SearchRequest following Quickwit patterns
     let search_request = quickwit_proto::search::SearchRequest {
@@ -735,7 +735,7 @@ async fn perform_real_quickwit_search(
     debug_println!("🔍 PERMIT_FIX: Acquiring permit from dedicated provider - should be immediate");
     let t_permit = std::time::Instant::now();
     let mut search_permit = permit_future.await;
-    eprintln!("⏱️ PROJ_DIAG: perform_real_quickwit_search permit acquisition took {}ms", t_permit.elapsed().as_millis());
+    perf_println!("⏱️ PROJ_DIAG: perform_real_quickwit_search permit acquisition took {}ms", t_permit.elapsed().as_millis());
     debug_println!("✅ PERMIT_FIX: Successfully acquired search permit from dedicated provider - no timeout needed!");
 
     debug_println!("🔥 REAL_QUICKWIT: Using leaf_search_single_split with cache injection");
@@ -782,9 +782,9 @@ async fn perform_real_quickwit_search(
         }
     };
 
-    eprintln!("⏱️ PROJ_DIAG: perform_real_quickwit_search leaf_search_single_split took {}ms, {} hits",
+    perf_println!("⏱️ PROJ_DIAG: perform_real_quickwit_search leaf_search_single_split took {}ms, {} hits",
         t_leaf_inner.elapsed().as_millis(), result.num_hits);
-    eprintln!("⏱️ PROJ_DIAG: perform_real_quickwit_search TOTAL {}ms (docmapper={}ms, permit={}ms, leaf={}ms)",
+    perf_println!("⏱️ PROJ_DIAG: perform_real_quickwit_search TOTAL {}ms (docmapper={}ms, permit={}ms, leaf={}ms)",
         t0.elapsed().as_millis(), t_docmapper.as_millis(), t_permit.elapsed().as_millis(),
         t_leaf_inner.elapsed().as_millis());
     debug_println!("✅ REAL_QUICKWIT: Search completed successfully with {} hits", result.num_hits);
@@ -849,7 +849,7 @@ pub async fn perform_real_quickwit_search_with_aggregations(
         return Err(anyhow::anyhow!("No doc mapping available for search"));
     };
     let t_docmapper = t0.elapsed();
-    eprintln!("⏱️ PROJ_DIAG: perform_real_quickwit_search_with_agg DocMapper creation took {}ms", t_docmapper.as_millis());
+    perf_println!("⏱️ PROJ_DIAG: perform_real_quickwit_search_with_agg DocMapper creation took {}ms", t_docmapper.as_millis());
 
     // Create SearchRequest following Quickwit patterns (KEY DIFFERENCE: enable aggregations)
     let search_request = quickwit_proto::search::SearchRequest {
@@ -916,7 +916,7 @@ pub async fn perform_real_quickwit_search_with_aggregations(
         .expect("Expected one permit future");
 
     let mut search_permit = permit_future.await;
-    eprintln!("⏱️ PROJ_DIAG: perform_real_quickwit_search_with_agg permit acquisition took {}ms",
+    perf_println!("⏱️ PROJ_DIAG: perform_real_quickwit_search_with_agg permit acquisition took {}ms",
         t_permit.elapsed().as_millis());
     debug_println!("✅ AGGREGATION_SEARCH: Successfully acquired search permit for aggregation query");
 
@@ -949,9 +949,9 @@ pub async fn perform_real_quickwit_search_with_aggregations(
         }
     };
 
-    eprintln!("⏱️ PROJ_DIAG: perform_real_quickwit_search_with_agg leaf_search_single_split took {}ms, {} hits, has_aggs={}",
+    perf_println!("⏱️ PROJ_DIAG: perform_real_quickwit_search_with_agg leaf_search_single_split took {}ms, {} hits, has_aggs={}",
         t_leaf_inner.elapsed().as_millis(), result.num_hits, result.intermediate_aggregation_result.is_some());
-    eprintln!("⏱️ PROJ_DIAG: perform_real_quickwit_search_with_agg TOTAL {}ms (docmapper={}ms, permit={}ms, leaf={}ms)",
+    perf_println!("⏱️ PROJ_DIAG: perform_real_quickwit_search_with_agg TOTAL {}ms (docmapper={}ms, permit={}ms, leaf={}ms)",
         t0.elapsed().as_millis(), t_docmapper.as_millis(), t_permit.elapsed().as_millis(),
         t_leaf_inner.elapsed().as_millis());
     debug_println!("✅ AGGREGATION_SEARCH: Search completed successfully with {} hits, has aggregations: {}",

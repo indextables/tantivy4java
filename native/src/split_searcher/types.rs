@@ -128,11 +128,11 @@ impl CachedSearcherContext {
             let cache = self.pq_columns.read().unwrap();
             let cache_len = cache.len();
             if cache.get(seg_ord as usize).and_then(|o| o.as_ref()).is_some() {
-                eprintln!("⏱️ PROJ_DIAG: ensure_pq_segment_loaded seg={} CACHE HIT (cache has {} segments, self={:p}) took {}ms",
+                perf_println!("⏱️ PROJ_DIAG: ensure_pq_segment_loaded seg={} CACHE HIT (cache has {} segments, self={:p}) took {}ms",
                     seg_ord, cache_len, self, t0.elapsed().as_millis());
                 return Ok(());
             }
-            eprintln!("⏱️ PROJ_DIAG: ensure_pq_segment_loaded seg={} CACHE MISS (cache has {} segments, self={:p}) — loading via searcher fast fields",
+            perf_println!("⏱️ PROJ_DIAG: ensure_pq_segment_loaded seg={} CACHE MISS (cache has {} segments, self={:p}) — loading via searcher fast fields",
                 seg_ord, cache_len, self);
         }
         // Lock released — do column reads without holding it
@@ -168,7 +168,7 @@ impl CachedSearcherContext {
             row_handle.file_slice().read_bytes_async(),
         ).map_err(|e| anyhow::anyhow!("Failed to read __pq column bytes: {}", e))?;
 
-        eprintln!("⏱️ PROJ_DIAG: ensure_pq_segment_loaded seg={} async column reads in {}ms ({}B + {}B)",
+        perf_println!("⏱️ PROJ_DIAG: ensure_pq_segment_loaded seg={} async column reads in {}ms ({}B + {}B)",
             seg_ord, t_cols.elapsed().as_millis(), file_hash_bytes.len(), row_bytes.len());
 
         // Step 3: Open Column<u64> handles (sync — bytes already in memory from step 2)
@@ -195,7 +195,7 @@ impl CachedSearcherContext {
             cache[seg_ord as usize] = Some((file_hash_col, row_col));
         }
 
-        eprintln!("⏱️ PROJ_DIAG: ensure_pq_segment_loaded seg={} TOTAL {}ms (self={:p})",
+        perf_println!("⏱️ PROJ_DIAG: ensure_pq_segment_loaded seg={} TOTAL {}ms (self={:p})",
             seg_ord, t0.elapsed().as_millis(), self);
         Ok(())
     }

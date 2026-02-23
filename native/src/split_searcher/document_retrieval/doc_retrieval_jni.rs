@@ -1016,7 +1016,7 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_nati
     };
 
     let t_jni_total = std::time::Instant::now();
-    eprintln!(
+    perf_println!(
         "⏱️ PROJ_DIAG: === nativeDocBatchProjected START === {} docs, fields={:?}",
         array_len, projected_fields
     );
@@ -1062,7 +1062,7 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_nati
                     ctx.ensure_pq_segment_loaded(seg).await
                         .map_err(|e| anyhow::anyhow!("Failed to load __pq fields for seg {}: {}", seg, e))?;
                 }
-                eprintln!(
+                perf_println!(
                     "⏱️ PROJ_DIAG: ensure_pq_segment_loaded({} segments) took {}ms",
                     unique_segments.len(), t_pq_load.elapsed().as_millis()
                 );
@@ -1074,7 +1074,7 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_nati
                     let (file_hash, row_in_file) = ctx.get_pq_location(seg_ord, doc_id)?;
                     resolved_locations.push((idx, file_hash, row_in_file));
                 }
-                eprintln!(
+                perf_println!(
                     "⏱️ PROJ_DIAG: get_pq_location({} docs) took {}ms",
                     addresses.len(), t_resolve.elapsed().as_millis()
                 );
@@ -1083,7 +1083,7 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_nati
                 let groups = crate::parquet_companion::docid_mapping::group_resolved_locations_by_file(
                     &resolved_locations, &ctx.parquet_file_hash_index,
                 ).map_err(|e| anyhow::anyhow!("{}", e))?;
-                eprintln!(
+                perf_println!(
                     "⏱️ PROJ_DIAG: group_resolved_locations_by_file → {} file groups, took {}ms",
                     groups.len(), t_group.elapsed().as_millis()
                 );
@@ -1100,7 +1100,7 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_nati
                     None,
                 )
                 .await;
-                eprintln!(
+                perf_println!(
                     "⏱️ PROJ_DIAG: batch_parquet_to_tant_buffer_by_groups took {}ms",
                     t_parquet.elapsed().as_millis()
                 );
@@ -1112,7 +1112,7 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_nati
     match result {
         Some(Ok(tant_bytes)) => {
             let t_jni_copy = std::time::Instant::now();
-            eprintln!(
+            perf_println!(
                 "⏱️ PROJ_DIAG: serialized {} TANT bytes, copying to JNI byte array",
                 tant_bytes.len()
             );
@@ -1125,11 +1125,11 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_nati
                         to_java_exception(&mut env, &anyhow::anyhow!("Failed to set byte array data: {}", e));
                         return std::ptr::null_mut();
                     }
-                    eprintln!(
+                    perf_println!(
                         "⏱️ PROJ_DIAG: JNI byte array copy took {}ms",
                         t_jni_copy.elapsed().as_millis()
                     );
-                    eprintln!(
+                    perf_println!(
                         "⏱️ PROJ_DIAG: === nativeDocBatchProjected TOTAL took {}ms ===",
                         t_jni_total.elapsed().as_millis()
                     );
@@ -1142,7 +1142,7 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_nati
             }
         }
         Some(Err(e)) => {
-            eprintln!(
+            perf_println!(
                 "⏱️ PROJ_DIAG: === nativeDocBatchProjected FAILED after {}ms: {} ===",
                 t_jni_total.elapsed().as_millis(), e
             );

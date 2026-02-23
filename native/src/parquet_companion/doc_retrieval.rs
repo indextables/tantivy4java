@@ -518,7 +518,7 @@ pub(crate) fn build_column_projection(
                 .iter()
                 .position(|field| field.name() == parquet_name);
             if pos.is_none() {
-                eprintln!(
+                perf_println!(
                     "⏱️ PROJ_DIAG: build_column_projection: field '{}' (parquet='{}') NOT FOUND in schema",
                     f, parquet_name
                 );
@@ -526,7 +526,7 @@ pub(crate) fn build_column_projection(
             pos
         })
         .collect();
-    eprintln!(
+    perf_println!(
         "⏱️ PROJ_DIAG: build_column_projection: {} requested fields → {} matched indices out of {} total columns",
         fields.len(), indices.len(), total_columns
     );

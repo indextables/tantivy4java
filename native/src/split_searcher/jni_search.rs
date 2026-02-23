@@ -56,26 +56,26 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_sear
 
     // Use async pattern that returns LeafSearchResponse directly (avoid unnecessary JSON marshalling)
     debug_println!("🔍 ASYNC_JNI: About to call perform_search_async_impl_leaf_response");
-    eprintln!("⏱️ PROJ_DIAG: === searchWithQueryAst START === limit={}", limit);
+    perf_println!("⏱️ PROJ_DIAG: === searchWithQueryAst START === limit={}", limit);
     match block_on_operation(async move {
         perform_search_async_impl_leaf_response(searcher_ptr, query_json, limit).await
     }) {
         Ok(leaf_search_response) => {
             let t_search = t_total.elapsed();
-            eprintln!("⏱️ PROJ_DIAG: searchWithQueryAst async search took {}ms, {} hits",
+            perf_println!("⏱️ PROJ_DIAG: searchWithQueryAst async search took {}ms, {} hits",
                 t_search.as_millis(), leaf_search_response.num_hits);
             debug_println!("✅ ASYNC_JNI: Got LeafSearchResponse, creating SearchResult object");
             let t_result = std::time::Instant::now();
             // Create proper SearchResult object directly from LeafSearchResponse (no JSON marshalling)
             match perform_unified_search_result_creation(leaf_search_response, &mut env, None, None, None, None) {
                 Ok(search_result_obj) => {
-                    eprintln!("⏱️ PROJ_DIAG: === searchWithQueryAst TOTAL {}ms (search={}ms, result_creation={}ms) ===",
+                    perf_println!("⏱️ PROJ_DIAG: === searchWithQueryAst TOTAL {}ms (search={}ms, result_creation={}ms) ===",
                         t_total.elapsed().as_millis(), t_search.as_millis(), t_result.elapsed().as_millis());
                     debug_println!("✅ ASYNC_JNI: Successfully created SearchResult object");
                     search_result_obj
                 },
                 Err(e) => {
-                    eprintln!("⏱️ PROJ_DIAG: === searchWithQueryAst FAILED after {}ms: {} ===",
+                    perf_println!("⏱️ PROJ_DIAG: === searchWithQueryAst FAILED after {}ms: {} ===",
                         t_total.elapsed().as_millis(), e);
                     debug_println!("❌ ASYNC_JNI: Failed to create SearchResult object: {}", e);
                     to_java_exception(&mut env, &anyhow::anyhow!("Failed to create SearchResult: {}", e));
@@ -84,7 +84,7 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_sear
             }
         },
         Err(e) => {
-            eprintln!("⏱️ PROJ_DIAG: === searchWithQueryAst FAILED after {}ms: {} ===",
+            perf_println!("⏱️ PROJ_DIAG: === searchWithQueryAst FAILED after {}ms: {} ===",
                 t_total.elapsed().as_millis(), e);
             debug_println!("❌ ASYNC_JNI: Search operation failed: {}", e);
 
@@ -143,9 +143,9 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_sear
     }
 
     debug_println!("🚨 CRITICAL: Calling block_on_operation with async search operation");
-    eprintln!("⏱️ PROJ_DIAG: === searchWithSplitQuery START === limit={}", limit);
+    perf_println!("⏱️ PROJ_DIAG: === searchWithSplitQuery START === limit={}", limit);
     let t_query_convert = t_total.elapsed();
-    eprintln!("⏱️ PROJ_DIAG: searchWithSplitQuery query JSON conversion took {}ms", t_query_convert.as_millis());
+    perf_println!("⏱️ PROJ_DIAG: searchWithSplitQuery query JSON conversion took {}ms", t_query_convert.as_millis());
     match block_on_operation(async move {
         debug_println!("🔍 ASYNC_START: Inside async block - about to call perform_search_async_impl_leaf_response");
         let result = perform_search_async_impl_leaf_response(searcher_ptr, query_json_str, limit).await;
@@ -154,7 +154,7 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_sear
     }) {
         Ok(leaf_search_response) => {
             let t_search = t_total.elapsed();
-            eprintln!("⏱️ PROJ_DIAG: searchWithSplitQuery async search took {}ms, {} hits",
+            perf_println!("⏱️ PROJ_DIAG: searchWithSplitQuery async search took {}ms, {} hits",
                 t_search.as_millis(), leaf_search_response.num_hits);
             debug_println!("🔥 NATIVE DEBUG: block_on_operation SUCCESS - Got LeafSearchResponse from SplitQuery");
             debug_println!("✅ ASYNC_JNI: Got LeafSearchResponse from SplitQuery, creating SearchResult object");
@@ -162,14 +162,14 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_sear
             // Create proper SearchResult object directly from LeafSearchResponse (no JSON marshalling)
             match perform_unified_search_result_creation(leaf_search_response, &mut env, None, None, None, None) {
                 Ok(search_result_obj) => {
-                    eprintln!("⏱️ PROJ_DIAG: === searchWithSplitQuery TOTAL {}ms (query_convert={}ms, search={}ms, result_creation={}ms) ===",
+                    perf_println!("⏱️ PROJ_DIAG: === searchWithSplitQuery TOTAL {}ms (query_convert={}ms, search={}ms, result_creation={}ms) ===",
                         t_total.elapsed().as_millis(), t_query_convert.as_millis(), t_search.as_millis() - t_query_convert.as_millis(), t_result.elapsed().as_millis());
                     debug_println!("🔥 NATIVE DEBUG: Successfully created SearchResult object from SplitQuery");
                     debug_println!("✅ ASYNC_JNI: Successfully created SearchResult object from SplitQuery");
                     search_result_obj
                 },
                 Err(e) => {
-                    eprintln!("⏱️ PROJ_DIAG: === searchWithSplitQuery FAILED after {}ms: {} ===",
+                    perf_println!("⏱️ PROJ_DIAG: === searchWithSplitQuery FAILED after {}ms: {} ===",
                         t_total.elapsed().as_millis(), e);
                     debug_println!("🔥 NATIVE DEBUG: Failed to create SearchResult object from SplitQuery: {}", e);
                     debug_println!("❌ ASYNC_JNI: Failed to create SearchResult object from SplitQuery: {}", e);
@@ -179,7 +179,7 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_sear
             }
         },
         Err(e) => {
-            eprintln!("⏱️ PROJ_DIAG: === searchWithSplitQuery FAILED after {}ms: {} ===",
+            perf_println!("⏱️ PROJ_DIAG: === searchWithSplitQuery FAILED after {}ms: {} ===",
                 t_total.elapsed().as_millis(), e);
             debug_println!("🔥 NATIVE DEBUG: block_on_operation FAILED: {}", e);
             debug_println!("❌ ASYNC_JNI: SplitQuery search operation failed: {}", e);
@@ -204,7 +204,7 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_sear
     aggregations_map: JObject<'local>,
 ) -> jobject {
     let method_start_time = std::time::Instant::now();
-    eprintln!("⏱️ PROJ_DIAG: === searchWithAggregations START ===");
+    perf_println!("⏱️ PROJ_DIAG: === searchWithAggregations START ===");
     debug_println!("🚀 RUST NATIVE: searchWithAggregations ENTRY - Real aggregation processing starting");
 
     if searcher_ptr == 0 {
@@ -254,13 +254,13 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_sear
     let limit_copy = limit as usize;
     let aggregation_request_json_copy = aggregation_request_json.clone();
     let t_jni_prep = method_start_time.elapsed();
-    eprintln!("⏱️ PROJ_DIAG: searchWithAggregations JNI prep (query+agg conversion) took {}ms", t_jni_prep.as_millis());
+    perf_println!("⏱️ PROJ_DIAG: searchWithAggregations JNI prep (query+agg conversion) took {}ms", t_jni_prep.as_millis());
     match block_on_operation(async move {
         perform_search_async_impl_leaf_response_with_aggregations(searcher_ptr_copy, query_json, limit_copy, aggregation_request_json_copy).await
     }) {
         Ok(ctx) => {
             let t_search = method_start_time.elapsed();
-            eprintln!("⏱️ PROJ_DIAG: searchWithAggregations async search took {}ms, {} hits, has_aggs={}",
+            perf_println!("⏱️ PROJ_DIAG: searchWithAggregations async search took {}ms, {} hits, has_aggs={}",
                 t_search.as_millis(), ctx.leaf_response.num_hits,
                 ctx.leaf_response.intermediate_aggregation_result.is_some());
             debug_println!("RUST DEBUG: ⏱️ searchWithAggregations SUCCESS [TIMING: {}ms]", method_start_time.elapsed().as_millis());
@@ -278,13 +278,13 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_sear
                 ctx.touchup_infos,
             ) {
                 Ok(search_result_obj) => {
-                    eprintln!("⏱️ PROJ_DIAG: === searchWithAggregations TOTAL {}ms (jni_prep={}ms, search={}ms, result_creation={}ms) ===",
+                    perf_println!("⏱️ PROJ_DIAG: === searchWithAggregations TOTAL {}ms (jni_prep={}ms, search={}ms, result_creation={}ms) ===",
                         method_start_time.elapsed().as_millis(), t_jni_prep.as_millis(),
                         t_search.as_millis() - t_jni_prep.as_millis(), t_result.elapsed().as_millis());
                     search_result_obj
                 }
                 Err(e) => {
-                    eprintln!("⏱️ PROJ_DIAG: === searchWithAggregations FAILED after {}ms: {} ===",
+                    perf_println!("⏱️ PROJ_DIAG: === searchWithAggregations FAILED after {}ms: {} ===",
                         method_start_time.elapsed().as_millis(), e);
                     debug_println!("RUST DEBUG: ⏱️ searchWithAggregations ERROR: Failed to create SearchResult [TIMING: {}ms]: {}", method_start_time.elapsed().as_millis(), e);
                     to_java_exception(&mut env, &anyhow::anyhow!("Failed to create SearchResult: {}", e));
@@ -293,7 +293,7 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_sear
             }
         }
         Err(e) => {
-            eprintln!("⏱️ PROJ_DIAG: === searchWithAggregations FAILED after {}ms: {} ===",
+            perf_println!("⏱️ PROJ_DIAG: === searchWithAggregations FAILED after {}ms: {} ===",
                 method_start_time.elapsed().as_millis(), e);
             debug_println!("RUST DEBUG: ⏱️ searchWithAggregations ERROR: Search failed [TIMING: {}ms]: {}", method_start_time.elapsed().as_millis(), e);
             to_java_exception(&mut env, &e);
@@ -312,7 +312,7 @@ pub async fn perform_search_async_impl_leaf_response_with_aggregations(
     aggregation_request_json: Option<String>,
 ) -> anyhow::Result<SearchWithHashContext> {
     let t_total = std::time::Instant::now();
-    eprintln!("⏱️ PROJ_DIAG: perform_search_with_aggregations START — limit={}, has_agg={}",
+    perf_println!("⏱️ PROJ_DIAG: perform_search_with_aggregations START — limit={}, has_agg={}",
         limit, aggregation_request_json.is_some());
     debug_println!("🔍 ASYNC_JNI: Starting search with aggregations using working pattern");
 
@@ -410,7 +410,7 @@ pub async fn perform_search_async_impl_leaf_response_with_aggregations(
     // Lazy transcoding: ensure fast fields needed by aggregation + range queries are transcoded.
     // Use the rewritten query/agg JSON so that hash fields (already native) are not transcoded from parquet.
     let t_rewrite = t_total.elapsed();
-    eprintln!("⏱️ PROJ_DIAG: perform_search_with_aggregations query/agg rewriting took {}ms", t_rewrite.as_millis());
+    perf_println!("⏱️ PROJ_DIAG: perform_search_with_aggregations query/agg rewriting took {}ms", t_rewrite.as_millis());
     let t_transcode = std::time::Instant::now();
     let overrides = if context.augmented_directory.is_some() {
         super::async_impl::ensure_fast_fields_for_query(
@@ -424,7 +424,7 @@ pub async fn perform_search_async_impl_leaf_response_with_aggregations(
             fast_field_data: o.fast_field_data.clone(),
         })
     };
-    eprintln!("⏱️ PROJ_DIAG: perform_search_with_aggregations ensure_fast_fields took {}ms",
+    perf_println!("⏱️ PROJ_DIAG: perform_search_with_aggregations ensure_fast_fields took {}ms",
         t_transcode.elapsed().as_millis());
 
     // Perform the search using the (possibly rewritten) query and aggregation JSON
@@ -443,7 +443,7 @@ pub async fn perform_search_async_impl_leaf_response_with_aggregations(
         effective_agg_json.clone(),
         overrides,
     ).await?;
-    eprintln!("⏱️ PROJ_DIAG: perform_search_with_aggregations leaf_search took {}ms, {} hits",
+    perf_println!("⏱️ PROJ_DIAG: perform_search_with_aggregations leaf_search took {}ms, {} hits",
         t_leaf.elapsed().as_millis(), leaf_response.num_hits);
 
     debug_println!(
@@ -502,13 +502,13 @@ pub async fn perform_search_async_impl_leaf_response_with_aggregations(
             (None, None)
         };
 
-    eprintln!("⏱️ PROJ_DIAG: perform_search_with_aggregations phase3 hash_resolution took {}ms",
+    perf_println!("⏱️ PROJ_DIAG: perform_search_with_aggregations phase3 hash_resolution took {}ms",
         t_phase3.elapsed().as_millis());
 
     // Extract touchup_infos from rewrite_output (if any) for include/exclude post-filtering
     let touchup_infos = rewrite_output.map(|o| o.touchup_infos);
 
-    eprintln!("⏱️ PROJ_DIAG: perform_search_with_aggregations TOTAL {}ms (rewrite={}ms, transcode={}ms, leaf={}ms, phase3={}ms)",
+    perf_println!("⏱️ PROJ_DIAG: perform_search_with_aggregations TOTAL {}ms (rewrite={}ms, transcode={}ms, leaf={}ms, phase3={}ms)",
         t_total.elapsed().as_millis(), t_rewrite.as_millis(), t_transcode.elapsed().as_millis(),
         t_leaf.elapsed().as_millis(), t_phase3.elapsed().as_millis());
 

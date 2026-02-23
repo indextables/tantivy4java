@@ -181,18 +181,18 @@ impl AsyncFileReader for CachedParquetReader {
         let storage = self.storage.clone();
         let path = self.path.clone();
         let byte_size = range.end - range.start;
-        eprintln!(
+        perf_println!(
             "⏱️ PROJ_DIAG: get_bytes path={:?} range={}..{} ({} bytes)",
             path.file_name().unwrap_or_default(), range.start, range.end, byte_size
         );
 
         // Check cache first
         if let Some(cached) = self.cache_get(&range) {
-            eprintln!("⏱️ PROJ_DIAG: get_bytes CACHE HIT {} bytes", cached.len());
+            perf_println!("⏱️ PROJ_DIAG: get_bytes CACHE HIT {} bytes", cached.len());
             return async move { Ok(cached) }.boxed();
         }
 
-        eprintln!("⏱️ PROJ_DIAG: get_bytes CACHE MISS — fetching {} bytes from storage", byte_size);
+        perf_println!("⏱️ PROJ_DIAG: get_bytes CACHE MISS — fetching {} bytes from storage", byte_size);
 
         let byte_cache = self.byte_cache.clone();
         let path_for_cache = self.path.clone();
@@ -209,7 +209,7 @@ impl AsyncFileReader for CachedParquetReader {
                         format!("Storage read failed for {:?} range {:?}: {}", path, range, e),
                     )))
                 })?;
-            eprintln!(
+            perf_println!(
                 "⏱️ PROJ_DIAG: get_bytes storage.get_slice took {}ms for {} bytes",
                 t.elapsed().as_millis(), byte_size
             );
@@ -238,7 +238,7 @@ impl AsyncFileReader for CachedParquetReader {
         let storage = self.storage.clone();
         let path = self.path.clone();
         let total_requested: u64 = ranges.iter().map(|r| r.end - r.start).sum();
-        eprintln!(
+        perf_println!(
             "⏱️ PROJ_DIAG: get_byte_ranges path={:?} count={} ranges, total_requested={} bytes",
             path.file_name().unwrap_or_default(), ranges.len(), total_requested
         );
@@ -259,14 +259,14 @@ impl AsyncFileReader for CachedParquetReader {
 
         let cache_hits = ranges.len() - uncached_ranges.len();
         let uncached_bytes: u64 = uncached_ranges.iter().map(|r| r.end - r.start).sum();
-        eprintln!(
+        perf_println!(
             "⏱️ PROJ_DIAG: get_byte_ranges: {} cache hits, {} misses ({} bytes to fetch from storage)",
             cache_hits, uncached_ranges.len(), uncached_bytes
         );
 
         // If all cached, return immediately
         if uncached_ranges.is_empty() {
-            eprintln!("⏱️ PROJ_DIAG: get_byte_ranges ALL CACHED — returning immediately");
+            perf_println!("⏱️ PROJ_DIAG: get_byte_ranges ALL CACHED — returning immediately");
             return async move {
                 Ok(results.into_iter().map(|opt| opt.unwrap()).collect())
             }
@@ -287,7 +287,7 @@ impl AsyncFileReader for CachedParquetReader {
                 coalesce_config,
             )
             .await?;
-            eprintln!(
+            perf_println!(
                 "⏱️ PROJ_DIAG: get_byte_ranges fetch_ranges_with_coalescing took {}ms for {} uncached bytes",
                 t.elapsed().as_millis(), uncached_bytes
             );
@@ -324,13 +324,13 @@ impl AsyncFileReader for CachedParquetReader {
         _options: Option<&'a ArrowReaderOptions>,
     ) -> BoxFuture<'a, parquet::errors::Result<Arc<ParquetMetaData>>> {
         if let Some(ref metadata) = self.metadata {
-            eprintln!("⏱️ PROJ_DIAG: get_metadata CACHED — returning immediately");
+            perf_println!("⏱️ PROJ_DIAG: get_metadata CACHED — returning immediately");
             let metadata = metadata.clone();
             return async move { Ok(metadata) }.boxed();
         }
 
         let file_size = self.file_size;
-        eprintln!(
+        perf_println!(
             "⏱️ PROJ_DIAG: get_metadata NOT CACHED — loading footer+offset_index for file_size={}",
             file_size
         );
@@ -351,7 +351,7 @@ impl AsyncFileReader for CachedParquetReader {
             } else {
                 0
             };
-            eprintln!(
+            perf_println!(
                 "⏱️ PROJ_DIAG: get_metadata loaded in {}ms — {} row_groups, {} columns, has_offset_index={}",
                 t.elapsed().as_millis(), num_row_groups, num_columns, has_offset_index
             );
