@@ -9,6 +9,7 @@ use jni::sys::{jlong, jobject, jint};
 use jni::JNIEnv;
 
 use crate::debug_println;
+use crate::perf_println;
 use crate::common::to_java_exception;
 use crate::runtime_manager::block_on_operation;
 use crate::split_query::convert_split_query_to_json;

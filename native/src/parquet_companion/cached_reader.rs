@@ -19,6 +19,7 @@ use parquet::file::metadata::ParquetMetaData;
 use quickwit_storage::Storage;
 
 use crate::debug_println;
+use crate::perf_println;
 
 /// Cache key: (file_path, start_byte, end_byte)
 type ByteRangeCacheKey = (std::path::PathBuf, u64, u64);

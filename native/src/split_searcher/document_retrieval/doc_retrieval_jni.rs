@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use crate::common::to_java_exception;
 use crate::debug_println;
+use crate::perf_println;
 use crate::runtime_manager::block_on_operation;
 use crate::split_searcher::async_impl::perform_doc_retrieval_async_impl_thread_safe;
 use crate::split_searcher::types::CachedSearcherContext;

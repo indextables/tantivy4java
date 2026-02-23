@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::ops::Range;
 use quickwit_storage::{Storage, ByteRangeCache};
+use crate::perf_println;
 use crate::standalone_searcher::StandaloneSearcher;
 use crate::parquet_companion::manifest::ParquetManifest;
 

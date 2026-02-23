@@ -7,6 +7,7 @@ use jni::sys::{jlong, jint};
 use jni::JNIEnv;
 
 use crate::debug_println;
+use crate::perf_println;
 use super::types::CachedSearcherContext;
 use super::searcher_cache::extract_split_id_from_uri;
 use quickwit_storage::Storage;

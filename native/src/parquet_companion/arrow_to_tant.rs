@@ -12,6 +12,7 @@ use arrow_schema::DataType;
 use parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder;
 use quickwit_storage::Storage;
 
+use crate::perf_println;
 use super::cached_reader::{ByteRangeCache, CachedParquetReader, CoalesceConfig};
 use super::doc_retrieval::{
     arrow_json_value, build_column_projection, build_row_selection_for_rows_in_selected_groups,

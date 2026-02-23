@@ -26,6 +26,7 @@ use super::manifest::ParquetManifest;
 use super::transcode::MetadataCache;
 
 use crate::debug_println;
+use crate::perf_println;
 
 /// Retrieve a single document from parquet files.
 ///
