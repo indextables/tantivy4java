@@ -48,7 +48,7 @@ pub async fn build_hash_resolution_map(
     parquet_metadata_cache: &crate::parquet_companion::transcode::MetadataCache,
     parquet_byte_range_cache: &crate::parquet_companion::cached_reader::ByteRangeCache,
     parquet_file_hash_index: &HashMap<u64, usize>,
-    pq_doc_locations: &std::sync::Arc<std::sync::RwLock<Vec<Option<Vec<(u64, u64)>>>>>,
+    pq_columns: &std::sync::Arc<std::sync::RwLock<Vec<Option<(tantivy::columnar::Column<u64>, tantivy::columnar::Column<u64>)>>>>,
 ) -> Result<HashMap<u64, String>> {
     if touchup_infos.is_empty() {
         return Ok(HashMap::new());
@@ -172,14 +172,15 @@ pub async fn build_hash_resolution_map(
         hashes_per_field.values().map(|s| s.len()).sum::<usize>()
     );
 
-    // Step 4: Ensure pq_doc_locations are loaded for the segments we'll use.
+    // Step 4: Ensure __pq Column handles are loaded for the segments we'll use.
     // Uses selective column reads via FastFieldReaders — same pattern as
     // CachedSearcherContext::ensure_pq_segment_loaded.
+    // Caches Column<u64> handles for O(1) random access — no iteration needed.
     let seg_ords_needed: HashSet<u32> = hash_to_doc.values().map(|(s, _)| *s).collect();
     for &seg_ord in &seg_ords_needed {
         // Already loaded?
         {
-            let cache = pq_doc_locations.read().unwrap();
+            let cache = pq_columns.read().unwrap();
             if cache.get(seg_ord as usize).and_then(|o| o.as_ref()).is_some() {
                 continue;
             }
@@ -212,7 +213,7 @@ pub async fn build_hash_resolution_map(
             row_handle.file_slice().read_bytes_async(),
         ).map_err(|e| anyhow::anyhow!("Failed to read __pq column bytes: {}", e))?;
 
-        // Sync opens hit CachingDirectory cache — no I/O
+        // Open Column<u64> handles — O(1) random access, no iteration
         let fh_col: tantivy::columnar::Column<u64> = match fh_handle.open_u64_lenient() {
             Ok(Some(c)) => c,
             _ => continue,
@@ -222,20 +223,12 @@ pub async fn build_hash_resolution_map(
             _ => continue,
         };
 
-        let num_docs = segment_reader.num_docs() + segment_reader.num_deleted_docs();
-        let mut seg_locations = Vec::with_capacity(num_docs as usize);
-        for doc_id in 0..num_docs {
-            let fh = fh_col.values_for_doc(doc_id).next().unwrap_or(0);
-            let ri = row_col.values_for_doc(doc_id).next().unwrap_or(0);
-            seg_locations.push((fh, ri));
-        }
-
-        let mut cache = pq_doc_locations.write().unwrap();
+        let mut cache = pq_columns.write().unwrap();
         while cache.len() <= seg_ord as usize {
             cache.push(None);
         }
         if cache[seg_ord as usize].is_none() {
-            cache[seg_ord as usize] = Some(seg_locations);
+            cache[seg_ord as usize] = Some((fh_col, row_col));
         }
     }
 
@@ -269,14 +262,17 @@ pub async fn build_hash_resolution_map(
                 None => continue,
             };
 
-            // Get parquet location for this doc
+            // Get parquet location for this doc via O(1) column random access
             let (file_hash, row_in_file) = {
-                let cache = pq_doc_locations.read().unwrap();
+                let cache = pq_columns.read().unwrap();
                 match cache
                     .get(seg_ord as usize)
                     .and_then(|opt| opt.as_ref())
-                    .and_then(|seg| seg.get(doc_id as usize))
-                    .copied()
+                    .map(|(fh_col, row_col)| {
+                        let fh = fh_col.values_for_doc(doc_id).next().unwrap_or(0);
+                        let ri = row_col.values_for_doc(doc_id).next().unwrap_or(0);
+                        (fh, ri)
+                    })
                 {
                     Some(loc) => loc,
                     None => {

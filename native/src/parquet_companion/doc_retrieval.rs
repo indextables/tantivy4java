@@ -313,14 +313,17 @@ pub async fn batch_retrieve_from_parquet(
 
     let result_count = addresses.len();
 
+    // Share projected_fields across parallel tasks via Arc (avoid per-task Vec clone)
+    let projected_fields_shared: Option<Arc<[String]>> =
+        projected_fields.map(|f| f.into());
+
     // Process each file's rows in parallel
     let file_futures: Vec<_> = groups
         .into_iter()
         .map(|(file_idx, rows)| {
             let storage = storage.clone();
             let manifest = manifest.clone();
-            let projected_fields_owned: Option<Vec<String>> =
-                projected_fields.map(|f| f.to_vec());
+            let projected_fields_owned = projected_fields_shared.clone();
             let metadata_cache = metadata_cache.cloned();
             let byte_cache = byte_cache.cloned();
 

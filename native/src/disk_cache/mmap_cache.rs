@@ -8,8 +8,67 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use memmap2::Mmap;
+use tantivy::directory::OwnedBytes;
 
 use crate::debug_println;
+
+/// Wrapper around Arc<Mmap> that implements StableDeref, allowing zero-copy
+/// conversion to OwnedBytes. Without this, every disk cache hit requires
+/// copying the entire mmap'd region into a Vec<u8>.
+#[derive(Clone)]
+pub(crate) struct StableMmap(pub Arc<Mmap>);
+
+impl std::ops::Deref for StableMmap {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+// SAFETY: Mmap is backed by kernel-managed virtual memory pages.
+// The pointer returned by Deref is stable for the lifetime of the Mmap —
+// the kernel guarantees the mapping address doesn't change after mmap().
+unsafe impl stable_deref_trait::StableDeref for StableMmap {}
+
+/// Wrapper around a sub-slice of an Arc<Mmap> that implements StableDeref.
+/// Enables zero-copy OwnedBytes for sub-range reads from mmap'd files.
+#[derive(Clone)]
+pub(crate) struct StableMmapSlice {
+    _mmap: Arc<Mmap>,
+    offset: usize,
+    len: usize,
+}
+
+impl StableMmapSlice {
+    pub fn new(mmap: Arc<Mmap>, offset: usize, len: usize) -> Self {
+        debug_assert!(offset + len <= mmap.len());
+        Self { _mmap: mmap, offset, len }
+    }
+}
+
+impl std::ops::Deref for StableMmapSlice {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        &self._mmap[self.offset..self.offset + self.len]
+    }
+}
+
+// SAFETY: Same as StableMmap — the slice is a fixed sub-range of a stable mmap.
+unsafe impl stable_deref_trait::StableDeref for StableMmapSlice {}
+
+impl StableMmap {
+    /// Convert to OwnedBytes with zero copy.
+    pub fn into_owned_bytes(self) -> OwnedBytes {
+        OwnedBytes::new(self)
+    }
+}
+
+impl StableMmapSlice {
+    /// Convert to OwnedBytes with zero copy.
+    pub fn into_owned_bytes(self) -> OwnedBytes {
+        OwnedBytes::new(self)
+    }
+}
 
 /// LRU cache of memory-mapped files for fast random access reads.
 ///

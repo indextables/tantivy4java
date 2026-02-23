@@ -567,10 +567,14 @@ fn rewrite_string_indexing_node(
                     StringIndexingMode::ExactOnly => {
                         // Reconstruct text from phrases, convert to term, hash
                         if let Some(phrases) = obj.get("phrases").and_then(|p| p.as_array()) {
-                            let text: String = phrases.iter()
-                                .filter_map(|v| v.as_str())
-                                .collect::<Vec<_>>()
-                                .join(" ");
+                            let text: String = {
+                                let mut s = String::new();
+                                for (i, w) in phrases.iter().filter_map(|v| v.as_str()).enumerate() {
+                                    if i > 0 { s.push(' '); }
+                                    s.push_str(w);
+                                }
+                                s
+                            };
                             if !text.is_empty() {
                                 let hash = hash_string_value(&text);
                                 obj.insert("type".to_string(), Value::String("term".to_string()));
@@ -585,10 +589,14 @@ fn rewrite_string_indexing_node(
                         // Reconstruct text; if it contains a regex match, extract the matched
                         // portion and convert to a hashed term query on the companion field.
                         if let Some(phrases) = obj.get("phrases").and_then(|p| p.as_array()) {
-                            let text: String = phrases.iter()
-                                .filter_map(|v| v.as_str())
-                                .collect::<Vec<_>>()
-                                .join(" ");
+                            let text: String = {
+                                let mut s = String::new();
+                                for (i, w) in phrases.iter().filter_map(|v| v.as_str()).enumerate() {
+                                    if i > 0 { s.push(' '); }
+                                    s.push_str(w);
+                                }
+                                s
+                            };
                             if !text.is_empty() {
                                 if let Some(regex) = compiled_regexes.get(&field) {
                                     if let Some(m) = regex.find(&text) {
