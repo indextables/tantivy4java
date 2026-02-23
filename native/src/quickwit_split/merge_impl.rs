@@ -336,7 +336,7 @@ pub fn merge_splits_impl(split_urls: &[String], output_path: &str, config: &Inte
 
     // ✅ PARQUET COMPANION: Combine parquet manifests from source splits (if any)
     // Must happen before temp dirs are dropped since manifests are in the extracted dirs
-    {
+    let is_companion_merge = {
         let source_paths: Vec<std::path::PathBuf> = temp_dirs.iter()
             .map(|td| td.path().to_path_buf())
             .collect();
@@ -346,15 +346,18 @@ pub fn merge_splits_impl(split_urls: &[String], output_path: &str, config: &Inte
         match crate::parquet_companion::merge::combine_parquet_manifests(&source_refs, &output_temp_dir) {
             Ok(Some(())) => {
                 debug_log!("📦 PARQUET_COMPANION: Combined parquet manifests from {} source splits into merged output", source_refs.len());
+                true
             }
             Ok(None) => {
                 debug_log!("📦 PARQUET_COMPANION: No parquet manifests found in source splits (standard merge)");
+                false
             }
             Err(e) => {
                 debug_log!("⚠️ PARQUET_COMPANION: Failed to combine parquet manifests: {} (continuing without manifest)", e);
+                false
             }
         }
-    }
+    };
 
     // ✅ MEMORY OPTIMIZATION: Early temp directory cleanup
     // Source split temp directories are no longer needed after merge completes
@@ -371,7 +374,17 @@ pub fn merge_splits_impl(split_urls: &[String], output_path: &str, config: &Inte
     let merged_directory = MmapDirectory::open(&output_temp_dir)?;
     let tokenizer_manager = get_quickwit_fastfield_normalizer_manager().tantivy_manager();
     let merged_index = open_index(merged_directory, tokenizer_manager)?;
-    let doc_mapping_json = extract_doc_mapping_from_index(&merged_index)?;
+    let raw_doc_mapping = extract_doc_mapping_from_index(&merged_index)?;
+    // For companion splits, promote all fields to fast in the doc mapping so that
+    // clients know aggregations are available via parquet transcoding. This matches
+    // what the build path (createFromParquet) does. Only apply to companion merges —
+    // non-companion splits should report their actual fast field configuration.
+    let doc_mapping_json = if is_companion_merge {
+        crate::parquet_companion::schema_derivation::promote_doc_mapping_all_fast(&raw_doc_mapping)
+            .unwrap_or(raw_doc_mapping)
+    } else {
+        raw_doc_mapping
+    };
     debug_log!("✅ DOCMAPPING EXTRACT: Extracted doc mapping from merged index ({} bytes)", doc_mapping_json.len());
     debug_log!("✅ DOCMAPPING CONTENT: {}", &doc_mapping_json);
 
