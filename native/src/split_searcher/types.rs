@@ -122,76 +122,52 @@ impl CachedSearcherContext {
     ///
     /// This is a no-op if the segment data is already cached.
     pub(crate) async fn ensure_pq_segment_loaded(&self, seg_ord: u32) -> anyhow::Result<()> {
+        let t0 = std::time::Instant::now();
         // Quick check under read lock — return immediately if already loaded
         {
             let cache = self.pq_doc_locations.read().unwrap();
+            let cache_len = cache.len();
             if cache.get(seg_ord as usize).and_then(|o| o.as_ref()).is_some() {
+                eprintln!("⏱️ PROJ_DIAG: ensure_pq_segment_loaded seg={} CACHE HIT (cache has {} segments, self={:p}) took {}ms",
+                    seg_ord, cache_len, self, t0.elapsed().as_millis());
                 return Ok(());
             }
+            eprintln!("⏱️ PROJ_DIAG: ensure_pq_segment_loaded seg={} CACHE MISS (cache has {} segments, self={:p}) — loading via searcher fast fields",
+                seg_ord, cache_len, self);
         }
-        // Lock released — do async IO without holding it
+        // Lock released — do column reads without holding it
 
-        let seg_metas = self.cached_index.searchable_segment_metas().unwrap_or_default();
-        let seg_meta = seg_metas.get(seg_ord as usize)
-            .ok_or_else(|| anyhow::anyhow!("Segment ordinal {} out of range (have {})", seg_ord, seg_metas.len()))?;
-        let fast_path = seg_meta.relative_path(tantivy::index::SegmentComponent::FastFields);
+        // Use the existing cached_searcher → SegmentReader → FastFieldReaders path.
+        // This goes through HotDirectory/StorageDirectory which does byte-range level reads,
+        // fetching only the SSTable index + the 2 __pq column byte ranges — NOT the entire .fast file.
+        let t_cols = std::time::Instant::now();
+        let segment_reader = self.cached_searcher.segment_reader(seg_ord);
+        let fast_fields = segment_reader.fast_fields();
 
-        let range = self.bundle_file_offsets.get(&fast_path)
-            .ok_or_else(|| anyhow::anyhow!(".fast file {} not found in bundle offsets", fast_path.display()))?;
+        let file_hash_field = crate::parquet_companion::indexing::PARQUET_FILE_HASH_FIELD;
+        let row_field = crate::parquet_companion::indexing::PARQUET_ROW_IN_FILE_FIELD;
 
-        let split_path = std::path::Path::new(&self.split_uri).file_name()
-            .map(|f| PathBuf::from(f))
-            .unwrap_or_else(|| PathBuf::from(&self.split_uri));
+        let file_hash_col: tantivy::columnar::Column<u64> = fast_fields.u64(file_hash_field)
+            .map_err(|e| anyhow::anyhow!("Failed to open {} fast field: {}", file_hash_field, e))?;
+        let row_col: tantivy::columnar::Column<u64> = fast_fields.u64(row_field)
+            .map_err(|e| anyhow::anyhow!("Failed to open {} fast field: {}", row_field, e))?;
+        eprintln!("⏱️ PROJ_DIAG: ensure_pq_segment_loaded seg={} fast field columns opened in {}ms",
+            seg_ord, t_cols.elapsed().as_millis());
 
-        let fast_bytes = self.cached_storage
-            .get_slice(&split_path, range.start as usize..range.end as usize)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to read .fast for {}: {}", fast_path.display(), e))?;
-
-        let body = crate::parquet_companion::transcode::strip_tantivy_footer(&fast_bytes)
-            .map_err(|e| anyhow::anyhow!("Failed to strip footer from {}: {}", fast_path.display(), e))?;
-
-        let columnar = tantivy::columnar::ColumnarReader::open(body.to_vec())
-            .map_err(|e| anyhow::anyhow!("Failed to open columnar for {}: {}", fast_path.display(), e))?;
-
-        let num_docs = columnar.num_rows();
-
-        // Find the __pq columns
-        let mut file_hash_col = None;
-        let mut row_col = None;
-        for (name, handle) in columnar.list_columns()
-            .map_err(|e| anyhow::anyhow!("Failed to list columns: {}", e))?
-        {
-            if name == crate::parquet_companion::indexing::PARQUET_FILE_HASH_FIELD {
-                if let tantivy::columnar::DynamicColumn::U64(col) = handle.open()
-                    .map_err(|e| anyhow::anyhow!("Failed to open {} column: {}", name, e))? {
-                    file_hash_col = Some(col);
-                }
-            } else if name == crate::parquet_companion::indexing::PARQUET_ROW_IN_FILE_FIELD {
-                if let tantivy::columnar::DynamicColumn::U64(col) = handle.open()
-                    .map_err(|e| anyhow::anyhow!("Failed to open {} column: {}", name, e))? {
-                    row_col = Some(col);
-                }
-            }
-        }
-
-        let file_hash_col = file_hash_col
-            .ok_or_else(|| anyhow::anyhow!("Column {} not found in .fast",
-                crate::parquet_companion::indexing::PARQUET_FILE_HASH_FIELD))?;
-        let row_col = row_col
-            .ok_or_else(|| anyhow::anyhow!("Column {} not found in .fast",
-                crate::parquet_companion::indexing::PARQUET_ROW_IN_FILE_FIELD))?;
-
+        let num_docs = segment_reader.num_docs() + segment_reader.num_deleted_docs();
+        let t_iter = std::time::Instant::now();
         let mut seg_locations = Vec::with_capacity(num_docs as usize);
         for doc_id in 0..num_docs {
             let file_hash = file_hash_col.values_for_doc(doc_id).next().unwrap_or(0);
             let row_in_file = row_col.values_for_doc(doc_id).next().unwrap_or(0);
             seg_locations.push((file_hash, row_in_file));
         }
+        eprintln!("⏱️ PROJ_DIAG: ensure_pq_segment_loaded seg={} iterated {} docs in {}ms",
+            seg_ord, seg_locations.len(), t_iter.elapsed().as_millis());
 
         crate::debug_println!(
             "📦 PARQUET_COMPANION: Lazy-loaded {} __pq locations for segment {}",
-            seg_locations.len(), fast_path.display()
+            seg_locations.len(), seg_ord
         );
 
         // Store under write lock (double-check to avoid overwriting a concurrent load)
@@ -203,6 +179,8 @@ impl CachedSearcherContext {
             cache[seg_ord as usize] = Some(seg_locations);
         }
 
+        eprintln!("⏱️ PROJ_DIAG: ensure_pq_segment_loaded seg={} TOTAL {}ms (self={:p})",
+            seg_ord, t0.elapsed().as_millis(), self);
         Ok(())
     }
 
