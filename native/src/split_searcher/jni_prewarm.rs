@@ -114,8 +114,10 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_prel
             }
         }
 
-        // After component prewarm, eagerly load __pq columns for companion splits
-        // so first doc retrieval doesn't trigger additional downloads
+        // After component prewarm, eagerly load __pq columns and warm all native
+        // fast field columns into L1 for companion splits.
+        // The FASTFIELD prewarm writes to L2 disk cache, but the CachingDirectory L1
+        // ByteRangeCache needs individual column byte ranges to avoid downloads at query time.
         if let Some(ctx) = crate::utils::jlong_to_arc::<super::types::CachedSearcherContext>(searcher_ptr) {
             if ctx.has_merge_safe_tracking && ctx.parquet_manifest.is_some() {
                 let num_segments = ctx.cached_searcher.segment_readers().len();
@@ -125,6 +127,10 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_prel
                     }
                 }
                 debug_println!("✅ PREWARM: Pre-loaded __pq columns for {} segments", num_segments);
+            }
+            // Warm all native fast field columns into L1 CachingDirectory cache
+            if let Err(e) = ctx.warm_native_fast_fields_l1().await {
+                debug_println!("⚠️ PREWARM: Failed to warm native fast fields into L1: {}", e);
             }
         }
 
@@ -225,7 +231,9 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_prel
             }
         };
 
-        // After field-specific prewarm, eagerly load __pq columns for companion splits
+        // After field-specific prewarm, eagerly load __pq columns and warm native
+        // fast field columns into L1 for companion splits — scoped to requested fields
+        // plus their companion fields (_phash_*, *__uuids)
         if result.is_ok() {
             if let Some(ctx) = crate::utils::jlong_to_arc::<super::types::CachedSearcherContext>(searcher_ptr) {
                 if ctx.has_merge_safe_tracking && ctx.parquet_manifest.is_some() {
@@ -236,6 +244,13 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_prel
                         }
                     }
                     debug_println!("✅ PREWARM_FIELDS: Pre-loaded __pq columns for {} segments", num_segments);
+                }
+                // Warm only the requested fields + their companion native fast field columns into L1
+                let schema = ctx.cached_searcher.index().schema();
+                let expanded = crate::prewarm::field_specific::expand_companion_fields(&field_filter, &schema);
+                let expanded_vec: Vec<String> = expanded.into_iter().collect();
+                if let Err(e) = ctx.warm_native_fast_fields_l1_for_fields(&expanded_vec).await {
+                    debug_println!("⚠️ PREWARM_FIELDS: Failed to warm native fast fields into L1: {}", e);
                 }
             }
         }

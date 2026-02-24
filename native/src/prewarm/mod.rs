@@ -52,7 +52,7 @@
 mod all_fields;
 mod cache_extension;
 mod component_sizes;
-mod field_specific;
+pub(crate) mod field_specific;
 mod helpers;
 
 // Re-export public API - all-fields prewarm functions

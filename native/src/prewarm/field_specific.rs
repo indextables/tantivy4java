@@ -16,7 +16,7 @@ use crate::utils::with_arc_safe;
 /// For field "X": also includes "X__uuids" and "_phash_X" if they exist.
 /// This ensures that field-specific prewarm also warms companion fields used by
 /// aggregations and doc retrieval, preventing query-time downloads.
-fn expand_companion_fields(
+pub(crate) fn expand_companion_fields(
     field_names: &HashSet<String>,
     schema: &tantivy::schema::Schema,
 ) -> HashSet<String> {
