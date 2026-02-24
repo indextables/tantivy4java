@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use crate::common::to_java_exception;
 use crate::debug_println;
+use crate::perf_println;
 use crate::runtime_manager::block_on_operation;
 use crate::split_searcher::async_impl::perform_doc_retrieval_async_impl_thread_safe;
 use crate::split_searcher::types::CachedSearcherContext;
@@ -1015,8 +1016,9 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_nati
         }
     };
 
-    debug_println!(
-        "📖 PARQUET_BATCH: nativeDocBatchProjected called - {} docs, fields={:?}",
+    let t_jni_total = std::time::Instant::now();
+    perf_println!(
+        "⏱️ PROJ_DIAG: === nativeDocBatchProjected START === {} docs, fields={:?}",
         array_len, projected_fields
     );
 
@@ -1054,27 +1056,41 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_nati
         tokio::task::block_in_place(|| {
             runtime.block_on(async {
                 // Lazy-load __pq fast field data for all segments we need.
-                // Reads .fast bytes from split bundle via async storage — HotDirectory
-                // hotcache doesn't include these columns so sync reads fail.
+                let t_pq_load = std::time::Instant::now();
                 let unique_segments: std::collections::HashSet<u32> = addresses.iter()
                     .map(|&(seg, _)| seg).collect();
                 for &seg in &unique_segments {
                     ctx.ensure_pq_segment_loaded(seg).await
                         .map_err(|e| anyhow::anyhow!("Failed to load __pq fields for seg {}: {}", seg, e))?;
                 }
+                perf_println!(
+                    "⏱️ PROJ_DIAG: ensure_pq_segment_loaded({} segments) took {}ms",
+                    unique_segments.len(), t_pq_load.elapsed().as_millis()
+                );
 
                 // Resolve all addresses via pre-loaded __pq data
+                let t_resolve = std::time::Instant::now();
                 let mut resolved_locations: Vec<(usize, u64, u64)> = Vec::with_capacity(addresses.len());
                 for (idx, &(seg_ord, doc_id)) in addresses.iter().enumerate() {
                     let (file_hash, row_in_file) = ctx.get_pq_location(seg_ord, doc_id)?;
                     resolved_locations.push((idx, file_hash, row_in_file));
                 }
+                perf_println!(
+                    "⏱️ PROJ_DIAG: get_pq_location({} docs) took {}ms",
+                    addresses.len(), t_resolve.elapsed().as_millis()
+                );
 
+                let t_group = std::time::Instant::now();
                 let groups = crate::parquet_companion::docid_mapping::group_resolved_locations_by_file(
                     &resolved_locations, &ctx.parquet_file_hash_index,
                 ).map_err(|e| anyhow::anyhow!("{}", e))?;
+                perf_println!(
+                    "⏱️ PROJ_DIAG: group_resolved_locations_by_file → {} file groups, took {}ms",
+                    groups.len(), t_group.elapsed().as_millis()
+                );
 
-                crate::parquet_companion::arrow_to_tant::batch_parquet_to_tant_buffer_by_groups(
+                let t_parquet = std::time::Instant::now();
+                let result = crate::parquet_companion::arrow_to_tant::batch_parquet_to_tant_buffer_by_groups(
                     groups,
                     addresses.len(),
                     projected_fields.as_deref(),
@@ -1084,15 +1100,21 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_nati
                     Some(byte_cache),
                     None,
                 )
-                .await
+                .await;
+                perf_println!(
+                    "⏱️ PROJ_DIAG: batch_parquet_to_tant_buffer_by_groups took {}ms",
+                    t_parquet.elapsed().as_millis()
+                );
+                result
             })
         })
     });
 
     match result {
         Some(Ok(tant_bytes)) => {
-            debug_println!(
-                "📖 PARQUET_BATCH: Retrieved docs, serialized to {} TANT bytes",
+            let t_jni_copy = std::time::Instant::now();
+            perf_println!(
+                "⏱️ PROJ_DIAG: serialized {} TANT bytes, copying to JNI byte array",
                 tant_bytes.len()
             );
             match env.new_byte_array(tant_bytes.len() as i32) {
@@ -1104,6 +1126,14 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_nati
                         to_java_exception(&mut env, &anyhow::anyhow!("Failed to set byte array data: {}", e));
                         return std::ptr::null_mut();
                     }
+                    perf_println!(
+                        "⏱️ PROJ_DIAG: JNI byte array copy took {}ms",
+                        t_jni_copy.elapsed().as_millis()
+                    );
+                    perf_println!(
+                        "⏱️ PROJ_DIAG: === nativeDocBatchProjected TOTAL took {}ms ===",
+                        t_jni_total.elapsed().as_millis()
+                    );
                     byte_array.into_raw()
                 }
                 Err(e) => {
@@ -1113,6 +1143,10 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_nati
             }
         }
         Some(Err(e)) => {
+            perf_println!(
+                "⏱️ PROJ_DIAG: === nativeDocBatchProjected FAILED after {}ms: {} ===",
+                t_jni_total.elapsed().as_millis(), e
+            );
             to_java_exception(&mut env, &anyhow::anyhow!("Parquet batch retrieval failed: {}", e));
             std::ptr::null_mut()
         }

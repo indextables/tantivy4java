@@ -13,7 +13,7 @@ use crate::common::to_java_exception;
 use crate::utils::{arc_to_jlong, with_arc_safe, release_arc};
 use crate::standalone_searcher::{StandaloneSearcher, StandaloneSearchConfig};
 use quickwit_config::S3StorageConfig;
-use quickwit_storage::Storage;
+use quickwit_storage::{ByteRangeCache, Storage};
 use super::types::CachedSearcherContext;
 use super::searcher_cache::parse_bundle_file_offsets;
 use super::cache_config::{get_batch_doc_cache_blocks_with_metadata, extract_split_metadata_for_allocation};
@@ -483,11 +483,24 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_crea
                         // DEBUGGING: L1 cache can be disabled via TieredCacheConfig.withDisableL1Cache(true)
                         // to help debug cache key mismatches between prewarm and query operations.
                         let byte_range_cache = crate::global_cache::get_or_create_global_l1_cache();
-                        let byte_range_cache_for_open = byte_range_cache.clone();
+
+                        // Always create a ByteRangeCache for open_index_with_caches so that
+                        // CachingDirectory is present in the directory stack. This is required
+                        // for selective column reads: read_bytes_async() populates the
+                        // CachingDirectory cache, then open_u64_lenient() (sync) hits it.
+                        // Without CachingDirectory, the sync read has no cached data and fails.
+                        let byte_range_cache_for_open = Some(
+                            byte_range_cache.clone().unwrap_or_else(|| {
+                                ByteRangeCache::with_infinite_capacity(
+                                    &quickwit_storage::STORAGE_METRICS.shortlived_cache,
+                                )
+                            })
+                        );
+
                         if byte_range_cache.is_some() {
                             debug_println!("🚀 L1_CACHE_ENABLED: Using shared global ByteRangeCache");
                         } else {
-                            debug_println!("⚠️ L1_CACHE_DISABLED: ByteRangeCache set to None - all reads go to L2 disk cache / L3 storage");
+                            debug_println!("⚠️ L1_CACHE_DISABLED: ByteRangeCache disabled for prewarm/prefetch, but CachingDirectory still active for selective reads");
                         }
 
                         // 🚀 OPTIMIZATION: Call open_index_with_caches FIRST to populate split_footer_cache
@@ -828,7 +841,7 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_crea
                                 parquet_byte_range_cache: crate::parquet_companion::cached_reader::new_byte_range_cache(),
                                 parquet_file_hash_index,
                                 has_merge_safe_tracking,
-                                pq_doc_locations: std::sync::Arc::new(std::sync::RwLock::new(Vec::new())),
+                                pq_columns: std::sync::Arc::new(std::sync::RwLock::new(Vec::new())),
                             };
 
                             let searcher_context = std::sync::Arc::new(cached_context);

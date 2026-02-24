@@ -107,10 +107,11 @@ pub fn needs_companion_field(mode: &StringIndexingMode) -> bool {
 pub fn strip_pattern(text: &str, compiled_regex: &regex::Regex) -> String {
     let stripped = compiled_regex.replace_all(text, " ");
     // Collapse multiple whitespace and trim
-    let collapsed: String = stripped
-        .split_whitespace()
-        .collect::<Vec<&str>>()
-        .join(" ");
+    let mut collapsed = String::new();
+    for (i, word) in stripped.split_whitespace().enumerate() {
+        if i > 0 { collapsed.push(' '); }
+        collapsed.push_str(word);
+    }
     collapsed
 }
 

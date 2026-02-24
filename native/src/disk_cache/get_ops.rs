@@ -87,23 +87,21 @@ pub fn get(
         entry.compression,
     );
 
-    // For uncompressed files, use memory-mapped I/O (fast random access)
+    // For uncompressed files, use memory-mapped I/O (zero-copy via StableMmap)
     // For compressed files, fall back to read-all + decompress
-    let data = if entry.compression == CompressionAlgorithm::None {
-        // Fast path: mmap for uncompressed files
+    let owned_bytes = if entry.compression == CompressionAlgorithm::None {
+        // Fast path: mmap for uncompressed files — zero copy via StableMmap wrapper
         let mmap = {
             let mut mmap_cache_guard = mmap_cache.lock().ok()?;
             mmap_cache_guard.get_or_map(&file_path).ok()?
         };
-        // Return a copy of the mapped data
-        // (OwnedBytes requires owned data, but mmap access is still fast)
-        mmap.to_vec()
+        super::mmap_cache::StableMmap(mmap).into_owned_bytes()
     } else {
         // Slow path: read entire file for compressed data
         let mut file = File::open(&file_path).ok()?;
         let mut data = Vec::with_capacity(entry.disk_size_bytes as usize);
         file.read_to_end(&mut data).ok()?;
-        decompress_data(&data, entry.compression).ok()?
+        OwnedBytes::new(decompress_data(&data, entry.compression).ok()?)
     };
 
     // Update LRU access time
@@ -115,7 +113,7 @@ pub fn get(
         }
     }
 
-    Some(OwnedBytes::new(data))
+    Some(owned_bytes)
 }
 
 /// Get a sub-range from a cached file using mmap (fast path for random access).
@@ -159,12 +157,12 @@ pub fn get_subrange(
         let offset = (requested_range.start - cached_range.start) as usize;
         let len = (requested_range.end - requested_range.start) as usize;
         if offset + len <= full_data.len() {
-            return Some(OwnedBytes::new(full_data[offset..offset + len].to_vec()));
+            return Some(full_data.slice(offset..offset + len));
         }
         return None;
     }
 
-    // Fast path: mmap and extract just the requested slice
+    // Fast path: mmap and extract just the requested slice — zero copy via StableMmapSlice
     let file_path = component_path(
         &config.root_path,
         storage_loc,
@@ -191,8 +189,8 @@ pub fn get_subrange(
         return None;
     }
 
-    // Return just the requested slice (fast - only copies the slice, not entire file)
-    Some(OwnedBytes::new(mmap[offset..offset + len].to_vec()))
+    // Zero-copy: StableMmapSlice keeps Arc<Mmap> alive while exposing just the slice
+    Some(super::mmap_cache::StableMmapSlice::new(mmap, offset, len).into_owned_bytes())
 }
 
 /// Get cached data with range coalescing

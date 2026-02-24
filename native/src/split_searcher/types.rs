@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::ops::Range;
 use quickwit_storage::{Storage, ByteRangeCache};
+use crate::perf_println;
 use crate::standalone_searcher::StandaloneSearcher;
 use crate::parquet_companion::manifest::ParquetManifest;
 
@@ -96,11 +97,12 @@ pub(crate) struct CachedSearcherContext {
     // When true, doc retrieval uses merge-safe fast-field resolution.
     // When false, falls back to legacy segment-based positional resolution.
     pub(crate) has_merge_safe_tracking: bool,
-    // Parquet companion mode: lazily-loaded __pq_file_hash and __pq_row_in_file values.
-    // Indexed as pq_doc_locations[segment_ord] = Some(vec![(file_hash, row_in_file), ...])
-    // Populated on first doc retrieval (not during init) via async storage reads,
-    // because the HotDirectory hotcache doesn't include these columns.
-    pub(crate) pq_doc_locations: Arc<RwLock<Vec<Option<Vec<(u64, u64)>>>>>,
+    // Parquet companion mode: lazily-loaded __pq_file_hash and __pq_row_in_file Column handles.
+    // Indexed as pq_columns[segment_ord] = Some((file_hash_col, row_in_file_col))
+    // Column<u64> supports O(1) random access via values_for_doc(doc_id) — no need to
+    // materialize all values into a Vec. Populated on first doc retrieval (not during init)
+    // via async storage reads, because the HotDirectory hotcache doesn't include these columns.
+    pub(crate) pq_columns: Arc<RwLock<Vec<Option<(tantivy::columnar::Column<u64>, tantivy::columnar::Column<u64>)>>>>,
 }
 
 impl CachedSearcherContext {
@@ -115,108 +117,102 @@ impl CachedSearcherContext {
         }
     }
 
-    /// Ensure __pq fast field data is loaded for the given segment.
-    /// Reads .fast bytes from the split bundle via async storage, strips the
-    /// tantivy footer, opens a ColumnarReader, and caches the (file_hash, row_in_file)
-    /// pairs for all docs in that segment.
+    /// Ensure __pq Column<u64> handles are loaded for the given segment.
+    /// Fetches only the SSTable index + 2 column byte ranges via async reads,
+    /// then opens Column<u64> handles for O(1) random access by doc_id.
     ///
-    /// This is a no-op if the segment data is already cached.
+    /// This is a no-op if the segment columns are already cached.
     pub(crate) async fn ensure_pq_segment_loaded(&self, seg_ord: u32) -> anyhow::Result<()> {
+        let t0 = std::time::Instant::now();
         // Quick check under read lock — return immediately if already loaded
         {
-            let cache = self.pq_doc_locations.read().unwrap();
+            let cache = self.pq_columns.read().unwrap();
+            let cache_len = cache.len();
             if cache.get(seg_ord as usize).and_then(|o| o.as_ref()).is_some() {
+                perf_println!("⏱️ PROJ_DIAG: ensure_pq_segment_loaded seg={} CACHE HIT (cache has {} segments, self={:p}) took {}ms",
+                    seg_ord, cache_len, self, t0.elapsed().as_millis());
                 return Ok(());
             }
+            perf_println!("⏱️ PROJ_DIAG: ensure_pq_segment_loaded seg={} CACHE MISS (cache has {} segments, self={:p}) — loading via searcher fast fields",
+                seg_ord, cache_len, self);
         }
-        // Lock released — do async IO without holding it
+        // Lock released — do column reads without holding it
 
-        let seg_metas = self.cached_index.searchable_segment_metas().unwrap_or_default();
-        let seg_meta = seg_metas.get(seg_ord as usize)
-            .ok_or_else(|| anyhow::anyhow!("Segment ordinal {} out of range (have {})", seg_ord, seg_metas.len()))?;
-        let fast_path = seg_meta.relative_path(tantivy::index::SegmentComponent::FastFields);
+        // Use the existing cached_searcher → SegmentReader → FastFieldReaders path.
+        // This goes through HotDirectory/StorageDirectory which does byte-range level reads,
+        // fetching only the SSTable index + the 2 __pq column byte ranges — NOT the entire .fast file.
+        //
+        // Must use async path: HotDirectory delegates to StorageDirectory for bytes not in
+        // the hotcache, and StorageDirectory only supports async reads.
+        // Pattern: list_dynamic_column_handles (async) → read_bytes_async → open_u64_lenient (sync, now cached)
+        let t_cols = std::time::Instant::now();
+        let segment_reader = self.cached_searcher.segment_reader(seg_ord);
+        let fast_fields = segment_reader.fast_fields();
 
-        let range = self.bundle_file_offsets.get(&fast_path)
-            .ok_or_else(|| anyhow::anyhow!(".fast file {} not found in bundle offsets", fast_path.display()))?;
+        let file_hash_field = crate::parquet_companion::indexing::PARQUET_FILE_HASH_FIELD;
+        let row_field = crate::parquet_companion::indexing::PARQUET_ROW_IN_FILE_FIELD;
 
-        let split_path = std::path::Path::new(&self.split_uri).file_name()
-            .map(|f| PathBuf::from(f))
-            .unwrap_or_else(|| PathBuf::from(&self.split_uri));
+        // Step 1: Get column handles asynchronously (reads SSTable index only)
+        let file_hash_handles = fast_fields.list_dynamic_column_handles(file_hash_field).await
+            .map_err(|e| anyhow::anyhow!("Failed to list {} column handles: {}", file_hash_field, e))?;
+        let row_handles = fast_fields.list_dynamic_column_handles(row_field).await
+            .map_err(|e| anyhow::anyhow!("Failed to list {} column handles: {}", row_field, e))?;
 
-        let fast_bytes = self.cached_storage
-            .get_slice(&split_path, range.start as usize..range.end as usize)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to read .fast for {}: {}", fast_path.display(), e))?;
+        let file_hash_handle = file_hash_handles.into_iter().next()
+            .ok_or_else(|| anyhow::anyhow!("No column handle found for {}", file_hash_field))?;
+        let row_handle = row_handles.into_iter().next()
+            .ok_or_else(|| anyhow::anyhow!("No column handle found for {}", row_field))?;
 
-        let body = crate::parquet_companion::transcode::strip_tantivy_footer(&fast_bytes)
-            .map_err(|e| anyhow::anyhow!("Failed to strip footer from {}: {}", fast_path.display(), e))?;
+        // Step 2: Read column bytes asynchronously (fetches only these columns' byte ranges)
+        let (file_hash_bytes, row_bytes) = tokio::try_join!(
+            file_hash_handle.file_slice().read_bytes_async(),
+            row_handle.file_slice().read_bytes_async(),
+        ).map_err(|e| anyhow::anyhow!("Failed to read __pq column bytes: {}", e))?;
 
-        let columnar = tantivy::columnar::ColumnarReader::open(body.to_vec())
-            .map_err(|e| anyhow::anyhow!("Failed to open columnar for {}: {}", fast_path.display(), e))?;
+        perf_println!("⏱️ PROJ_DIAG: ensure_pq_segment_loaded seg={} async column reads in {}ms ({}B + {}B)",
+            seg_ord, t_cols.elapsed().as_millis(), file_hash_bytes.len(), row_bytes.len());
 
-        let num_docs = columnar.num_rows();
+        // Step 3: Open Column<u64> handles (sync — bytes already in memory from step 2)
+        // These are lightweight handles backed by Arc<OwnedBytes>, supporting O(1) random access.
+        let file_hash_col: tantivy::columnar::Column<u64> = file_hash_handle.open_u64_lenient()
+            .map_err(|e| anyhow::anyhow!("Failed to open {} column: {}", file_hash_field, e))?
+            .ok_or_else(|| anyhow::anyhow!("{} column is not u64-compatible", file_hash_field))?;
+        let row_col: tantivy::columnar::Column<u64> = row_handle.open_u64_lenient()
+            .map_err(|e| anyhow::anyhow!("Failed to open {} column: {}", row_field, e))?
+            .ok_or_else(|| anyhow::anyhow!("{} column is not u64-compatible", row_field))?;
 
-        // Find the __pq columns
-        let mut file_hash_col = None;
-        let mut row_col = None;
-        for (name, handle) in columnar.list_columns()
-            .map_err(|e| anyhow::anyhow!("Failed to list columns: {}", e))?
-        {
-            if name == crate::parquet_companion::indexing::PARQUET_FILE_HASH_FIELD {
-                if let tantivy::columnar::DynamicColumn::U64(col) = handle.open()
-                    .map_err(|e| anyhow::anyhow!("Failed to open {} column: {}", name, e))? {
-                    file_hash_col = Some(col);
-                }
-            } else if name == crate::parquet_companion::indexing::PARQUET_ROW_IN_FILE_FIELD {
-                if let tantivy::columnar::DynamicColumn::U64(col) = handle.open()
-                    .map_err(|e| anyhow::anyhow!("Failed to open {} column: {}", name, e))? {
-                    row_col = Some(col);
-                }
-            }
-        }
-
-        let file_hash_col = file_hash_col
-            .ok_or_else(|| anyhow::anyhow!("Column {} not found in .fast",
-                crate::parquet_companion::indexing::PARQUET_FILE_HASH_FIELD))?;
-        let row_col = row_col
-            .ok_or_else(|| anyhow::anyhow!("Column {} not found in .fast",
-                crate::parquet_companion::indexing::PARQUET_ROW_IN_FILE_FIELD))?;
-
-        let mut seg_locations = Vec::with_capacity(num_docs as usize);
-        for doc_id in 0..num_docs {
-            let file_hash = file_hash_col.values_for_doc(doc_id).next().unwrap_or(0);
-            let row_in_file = row_col.values_for_doc(doc_id).next().unwrap_or(0);
-            seg_locations.push((file_hash, row_in_file));
-        }
-
+        let num_docs = segment_reader.num_docs() + segment_reader.num_deleted_docs();
         crate::debug_println!(
-            "📦 PARQUET_COMPANION: Lazy-loaded {} __pq locations for segment {}",
-            seg_locations.len(), fast_path.display()
+            "📦 PARQUET_COMPANION: Cached __pq column handles for segment {} ({} docs, O(1) random access)",
+            seg_ord, num_docs
         );
 
-        // Store under write lock (double-check to avoid overwriting a concurrent load)
-        let mut cache = self.pq_doc_locations.write().unwrap();
+        // Store column handles under write lock (double-check to avoid overwriting a concurrent load)
+        let mut cache = self.pq_columns.write().unwrap();
         while cache.len() <= seg_ord as usize {
             cache.push(None);
         }
         if cache[seg_ord as usize].is_none() {
-            cache[seg_ord as usize] = Some(seg_locations);
+            cache[seg_ord as usize] = Some((file_hash_col, row_col));
         }
 
+        perf_println!("⏱️ PROJ_DIAG: ensure_pq_segment_loaded seg={} TOTAL {}ms (self={:p})",
+            seg_ord, t0.elapsed().as_millis(), self);
         Ok(())
     }
 
-    /// Look up a pre-loaded __pq location. Must call ensure_pq_segment_loaded first.
+    /// Look up a __pq location via cached Column<u64> handles. O(1) random access.
+    /// Must call ensure_pq_segment_loaded first.
     pub(crate) fn get_pq_location(&self, seg_ord: u32, doc_id: u32) -> anyhow::Result<(u64, u64)> {
-        let cache = self.pq_doc_locations.read().unwrap();
-        cache.get(seg_ord as usize)
+        let cache = self.pq_columns.read().unwrap();
+        let (fh_col, row_col) = cache.get(seg_ord as usize)
             .and_then(|opt| opt.as_ref())
-            .and_then(|seg| seg.get(doc_id as usize))
-            .copied()
             .ok_or_else(|| anyhow::anyhow!(
-                "No __pq location for seg={} doc={} (segments={}, docs={})",
-                seg_ord, doc_id, cache.len(),
-                cache.get(seg_ord as usize).and_then(|o| o.as_ref()).map(|s| s.len()).unwrap_or(0)
-            ))
+                "No __pq columns for seg={} (segments={})",
+                seg_ord, cache.len()
+            ))?;
+        let file_hash = fh_col.values_for_doc(doc_id).next().unwrap_or(0);
+        let row_in_file = row_col.values_for_doc(doc_id).next().unwrap_or(0);
+        Ok((file_hash, row_in_file))
     }
 }
