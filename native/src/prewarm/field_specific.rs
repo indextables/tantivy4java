@@ -12,6 +12,36 @@ use crate::debug_println;
 use crate::split_searcher::CachedSearcherContext;
 use crate::utils::with_arc_safe;
 
+/// Expand a set of field names to include companion fields that exist in the schema.
+/// For field "X": also includes "X__uuids" and "_phash_X" if they exist.
+/// This ensures that field-specific prewarm also warms companion fields used by
+/// aggregations and doc retrieval, preventing query-time downloads.
+fn expand_companion_fields(
+    field_names: &HashSet<String>,
+    schema: &tantivy::schema::Schema,
+) -> HashSet<String> {
+    let mut expanded = field_names.clone();
+    let all_field_names: HashSet<String> = schema.fields()
+        .map(|(_, entry)| entry.name().to_string())
+        .collect();
+
+    for field in field_names.iter() {
+        // Check for __uuids companion (text_uuid_exactonly indexing mode)
+        let companion = format!("{}{}", field, crate::parquet_companion::string_indexing::COMPANION_SUFFIX);
+        if all_field_names.contains(&companion) {
+            debug_println!("🔥 PREWARM_FIELDS: Expanding '{}' → companion '{}'", field, companion);
+            expanded.insert(companion);
+        }
+        // Check for _phash_ companion (string hash optimization)
+        let phash = format!("{}{}", crate::parquet_companion::indexing::PHASH_FIELD_PREFIX, field);
+        if all_field_names.contains(&phash) {
+            debug_println!("🔥 PREWARM_FIELDS: Expanding '{}' → companion '{}'", field, phash);
+            expanded.insert(phash);
+        }
+    }
+    expanded
+}
+
 /// Field-specific term dictionary prewarming
 ///
 /// Only preloads term dictionaries for the specified fields, reducing cache usage
@@ -29,6 +59,9 @@ pub async fn prewarm_term_dictionaries_for_fields(
         (ctx.cached_searcher.clone(), ctx.cached_index.schema())
     })
     .ok_or_else(|| anyhow::anyhow!("Failed to access searcher context"))?;
+
+    // Expand field names to include companion fields (__uuids, _phash_)
+    let field_names = expand_companion_fields(field_names, &schema);
 
     // Find indexed text fields that match the filter
     let indexed_fields: HashSet<tantivy::schema::Field> = schema
@@ -156,6 +189,9 @@ pub async fn prewarm_postings_for_fields(
     })
     .ok_or_else(|| anyhow::anyhow!("Failed to access searcher context"))?;
 
+    // Expand field names to include companion fields (__uuids, _phash_)
+    let field_names = expand_companion_fields(field_names, &schema);
+
     let indexed_fields: HashSet<tantivy::schema::Field> = schema
         .fields()
         .filter_map(|(field, field_entry)| {
@@ -247,6 +283,9 @@ pub async fn prewarm_positions_for_fields(
         (ctx.cached_searcher.clone(), ctx.cached_index.schema())
     })
     .ok_or_else(|| anyhow::anyhow!("Failed to access searcher context"))?;
+
+    // Expand field names to include companion fields (__uuids, _phash_)
+    let field_names = expand_companion_fields(field_names, &schema);
 
     // Find all indexed fields that have positions (text fields with positions enabled)
     let indexed_fields: HashSet<tantivy::schema::Field> = schema
@@ -356,6 +395,9 @@ pub async fn prewarm_fieldnorms_for_fields(
 
     let schema = searcher.schema();
 
+    // Expand field names to include companion fields (__uuids, _phash_)
+    let field_names = expand_companion_fields(field_names, &schema);
+
     // Find text fields that match the filter (only text fields have fieldnorms)
     let matching_fields: Vec<tantivy::schema::Field> = schema
         .fields()
@@ -457,6 +499,9 @@ pub async fn prewarm_fastfields_for_fields(
     .ok_or_else(|| anyhow::anyhow!("Failed to access searcher context"))?;
 
     let schema = searcher.schema();
+
+    // Expand field names to include companion fields (__uuids, _phash_)
+    let field_names = expand_companion_fields(field_names, &schema);
 
     // Find fast fields that match the filter
     let matching_fields: Vec<String> = schema

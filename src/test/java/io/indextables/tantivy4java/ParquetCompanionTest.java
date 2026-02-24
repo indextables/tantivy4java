@@ -820,4 +820,55 @@ public class ParquetCompanionTest {
             System.out.println("[IP DISABLED test] Found " + result.getHits().size() + " hits");
         }
     }
+
+    // ---------------------------------------------------------------
+    // 23. Coalesce max gap config: single + batch doc retrieval
+    // ---------------------------------------------------------------
+    @Test
+    @Order(23)
+    void testCoalesceMaxGapConfig(@TempDir Path dir) throws Exception {
+        Path parquetFile = dir.resolve("data.parquet");
+        Path splitFile = dir.resolve("coalesce.split");
+
+        writeTestParquet(parquetFile.toString(), 20, 0);
+
+        ParquetCompanionConfig config = new ParquetCompanionConfig(dir.toString());
+        QuickwitSplit.SplitMetadata metadata = QuickwitSplit.createFromParquet(
+                Collections.singletonList(parquetFile.toString()),
+                splitFile.toString(), config);
+
+        // Create a cache manager with a small coalesce max gap (1KB)
+        SplitCacheManager.CacheConfig coalesceConfig =
+                new SplitCacheManager.CacheConfig("parquet-coalesce-test")
+                        .withMaxCacheSize(100_000_000)
+                        .withCoalesceMaxGap(1024);
+        try (SplitCacheManager coalesceMgr = SplitCacheManager.getInstance(coalesceConfig)) {
+            String splitUrl = "file://" + splitFile.toAbsolutePath();
+            try (SplitSearcher searcher = coalesceMgr.createSplitSearcher(splitUrl, metadata, dir.toString())) {
+                // Single doc retrieval
+                SplitQuery query = searcher.parseQuery("*");
+                SearchResult results = searcher.search(query, 5);
+                assertTrue(results.getHits().size() >= 3);
+
+                Document singleDoc = searcher.docProjected(
+                        results.getHits().get(0).getDocAddress(), "id", "name");
+                assertNotNull(singleDoc.getFirst("id"), "single doc should have id");
+                assertNotNull(singleDoc.getFirst("name"), "single doc should have name");
+
+                // Batch doc retrieval
+                io.indextables.tantivy4java.core.DocAddress[] addrs =
+                        new io.indextables.tantivy4java.core.DocAddress[3];
+                for (int i = 0; i < 3; i++) {
+                    addrs[i] = results.getHits().get(i).getDocAddress();
+                }
+                List<Document> batchDocs = searcher.docBatchProjected(addrs, "id", "name");
+                assertEquals(3, batchDocs.size(), "batch should return 3 documents");
+                for (Document doc : batchDocs) {
+                    assertNotNull(doc.getFirst("id"), "batch doc should have id");
+                    assertNotNull(doc.getFirst("name"), "batch doc should have name");
+                    assertNull(doc.getFirst("score"), "non-projected field should be absent");
+                }
+            }
+        }
+    }
 }

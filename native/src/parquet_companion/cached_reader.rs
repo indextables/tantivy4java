@@ -447,14 +447,29 @@ async fn fetch_ranges_with_coalescing(
         members: group_members,
     });
 
-    debug_println!(
-        "📖 PARQUET_READ: coalesced {} ranges into {} fetches for {:?} (gap={}KB, max={}MB)",
-        ranges.len(),
-        groups.len(),
-        path,
-        config.max_gap / 1024,
-        config.max_total / (1024 * 1024),
-    );
+    if *crate::debug::PERFLOG_ENABLED {
+        let total_useful: u64 = ranges.iter().map(|r| r.end - r.start).sum();
+        let total_fetched: u64 = groups.iter().map(|g| g.fetch_range.end - g.fetch_range.start).sum();
+        let waste_pct = if total_fetched > 0 {
+            ((total_fetched - total_useful) as f64 / total_fetched as f64 * 100.0) as u32
+        } else { 0 };
+        perf_println!(
+            "⏱️ PROJ_DIAG: coalesced {} ranges into {} groups for {:?} (gap={}KB, max={}MB) — useful={}B, fetched={}B, waste={}%",
+            ranges.len(), groups.len(),
+            path.file_name().unwrap_or_default(),
+            config.max_gap / 1024, config.max_total / (1024 * 1024),
+            total_useful, total_fetched, waste_pct
+        );
+        for (i, group) in groups.iter().enumerate() {
+            let group_size = group.fetch_range.end - group.fetch_range.start;
+            let member_bytes: u64 = group.members.iter().map(|(_, r)| r.end - r.start).sum();
+            perf_println!(
+                "⏱️ PROJ_DIAG:   group[{}]: fetch={}..{} ({}B), {} members ({}B useful, {}B gap)",
+                i, group.fetch_range.start, group.fetch_range.end, group_size,
+                group.members.len(), member_bytes, group_size - member_bytes
+            );
+        }
+    }
 
     // Fetch coalesced ranges in parallel
     let group_futs: Vec<_> = groups

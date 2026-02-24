@@ -79,6 +79,7 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_crea
     let mut split_footer_end: u64 = 0;
     let mut doc_mapping_json: Option<String> = None;
     let mut parquet_table_root: Option<String> = None;
+    let mut parquet_coalesce_max_gap: Option<u64> = None;
     let mut parquet_aws_config: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     let mut parquet_azure_config: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     
@@ -220,6 +221,20 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_crea
                     if !s.is_empty() {
                         debug_println!("RUST DEBUG: Extracted parquet_table_root from Java config: {}", s);
                         parquet_table_root = Some(s);
+                    }
+                }
+            }
+        }
+
+        // Extract parquet_coalesce_max_gap (String→u64) for parquet byte-range coalescing
+        if let Ok(ptr_obj) = env.call_method(&split_config_jobject, "get", "(Ljava/lang/Object;)Ljava/lang/Object;", &[(&env.new_string("parquet_coalesce_max_gap").unwrap()).into()]) {
+            let ptr_jobject = ptr_obj.l().unwrap();
+            if !ptr_jobject.is_null() {
+                if let Ok(ptr_str) = env.get_string((&ptr_jobject).into()) {
+                    let s: String = ptr_str.into();
+                    if let Ok(v) = s.parse::<u64>() {
+                        debug_println!("RUST DEBUG: Extracted parquet_coalesce_max_gap from Java config: {}", v);
+                        parquet_coalesce_max_gap = Some(v);
                     }
                 }
             }
@@ -839,6 +854,12 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_crea
                                 segment_fast_paths,
                                 parquet_metadata_cache: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
                                 parquet_byte_range_cache: crate::parquet_companion::cached_reader::new_byte_range_cache(),
+                                parquet_coalesce_config: parquet_coalesce_max_gap.map(|gap| {
+                                    crate::parquet_companion::cached_reader::CoalesceConfig {
+                                        max_gap: gap,
+                                        max_total: 8 * 1024 * 1024,
+                                    }
+                                }),
                                 parquet_file_hash_index,
                                 has_merge_safe_tracking,
                                 pq_columns: std::sync::Arc::new(std::sync::RwLock::new(Vec::new())),
