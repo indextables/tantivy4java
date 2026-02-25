@@ -717,6 +717,83 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_merge_QuickwitSpli
     });
 }
 
+/// JNI helper for tests: create a parquet file WITHOUT offset index (legacy format).
+/// Same schema as nativeWriteTestParquet but with offset index explicitly disabled,
+/// simulating legacy parquet files that don't have page-level offset information.
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_split_merge_QuickwitSplit_nativeWriteTestParquetNoPageIndex(
+    mut env: JNIEnv,
+    _class: JClass,
+    path: JString,
+    num_rows: jni::sys::jint,
+    id_offset: jni::sys::jlong,
+) {
+    convert_throwable(&mut env, |env| {
+        let path_str = jstring_to_string(env, &path)?;
+
+        use arrow_array::*;
+        use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+        use parquet::arrow::ArrowWriter;
+        use parquet::file::properties::WriterProperties;
+        use std::sync::Arc;
+
+        let num = num_rows as usize;
+        let offset = id_offset;
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+            Field::new("score", DataType::Float64, true),
+            Field::new("active", DataType::Boolean, true),
+            Field::new("category", DataType::Utf8, false),
+        ]));
+
+        let ids: Vec<i64> = (0..num).map(|i| offset + i as i64).collect();
+        let names: Vec<String> = (0..num)
+            .map(|i| format!("item_{}", offset + i as i64))
+            .collect();
+        let scores: Vec<f64> = (0..num).map(|i| (i as f64) * 1.5 + 10.0).collect();
+        let actives: Vec<bool> = (0..num).map(|i| i % 2 == 0).collect();
+        let categories: Vec<String> = (0..num)
+            .map(|i| format!("cat_{}", i % 5))
+            .collect();
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(ids)),
+                Arc::new(StringArray::from(
+                    names.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+                )),
+                Arc::new(Float64Array::from(scores)),
+                Arc::new(BooleanArray::from(actives)),
+                Arc::new(StringArray::from(
+                    categories.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .map_err(|e| anyhow!("Failed to create RecordBatch: {}", e))?;
+
+        // Explicitly disable offset index to simulate legacy parquet files
+        let props = WriterProperties::builder()
+            .set_offset_index_disabled(true)
+            .build();
+
+        let file = std::fs::File::create(&path_str)
+            .map_err(|e| anyhow!("Failed to create file '{}': {}", path_str, e))?;
+        let mut writer = ArrowWriter::try_new(file, schema, Some(props))
+            .map_err(|e| anyhow!("Failed to create ArrowWriter: {}", e))?;
+        writer
+            .write(&batch)
+            .map_err(|e| anyhow!("Failed to write batch: {}", e))?;
+        writer
+            .close()
+            .map_err(|e| anyhow!("Failed to close writer: {}", e))?;
+
+        Ok(())
+    });
+}
+
 /// JNI helper for tests: create a parquet file with ALL data types including complex ones.
 /// Schema: id (i64), name (utf8), score (f64), active (bool),
 ///         created_at (timestamp micros), tags (list<utf8>),

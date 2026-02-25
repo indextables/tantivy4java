@@ -15,6 +15,7 @@ use futures::future::{BoxFuture, FutureExt};
 use parquet::arrow::async_reader::AsyncFileReader;
 use parquet::arrow::arrow_reader::ArrowReaderOptions;
 use parquet::file::metadata::ParquetMetaData;
+use parquet::file::page_index::offset_index::{OffsetIndexMetaData, PageLocation};
 
 use quickwit_storage::Storage;
 
@@ -96,6 +97,9 @@ pub struct CachedParquetReader {
     byte_cache: Option<ByteRangeCache>,
     /// Coalescing parameters for byte-range merging
     coalesce_config: CoalesceConfig,
+    /// Manifest-sourced page locations to inject when metadata lacks an offset index.
+    /// Outer vec = row groups, inner vec = columns per row group, innermost = page locations.
+    manifest_page_locations: Option<Vec<Vec<Vec<super::manifest::PageLocationEntry>>>>,
 }
 
 impl CachedParquetReader {
@@ -112,6 +116,7 @@ impl CachedParquetReader {
             metadata: None,
             byte_cache: None,
             coalesce_config: CoalesceConfig::default(),
+            manifest_page_locations: None,
         }
     }
 
@@ -129,6 +134,7 @@ impl CachedParquetReader {
             metadata: Some(metadata),
             byte_cache: None,
             coalesce_config: CoalesceConfig::default(),
+            manifest_page_locations: None,
         }
     }
 
@@ -143,6 +149,17 @@ impl CachedParquetReader {
     /// Set coalescing parameters for byte-range merging.
     pub fn with_coalesce_config(mut self, config: CoalesceConfig) -> Self {
         self.coalesce_config = config;
+        self
+    }
+
+    /// Attach manifest-sourced page locations for read-time injection.
+    /// If the loaded metadata lacks an offset index, these will be
+    /// injected to enable page-level byte range reads.
+    pub fn with_manifest_page_locations(
+        mut self,
+        locations: Vec<Vec<Vec<super::manifest::PageLocationEntry>>>,
+    ) -> Self {
+        self.manifest_page_locations = Some(locations);
         self
     }
 
@@ -344,6 +361,46 @@ impl AsyncFileReader for CachedParquetReader {
                 .with_prefetch_hint(Some(64 * 1024)) // prefetch 64KB footer
                 .load_and_finish(&mut *self, file_size)
                 .await?;
+
+            // Inject manifest-sourced page locations if the metadata lacks an offset index
+            let metadata = if metadata.offset_index().is_none() {
+                if let Some(ref manifest_locs) = self.manifest_page_locations {
+                    let offset_index: Vec<Vec<OffsetIndexMetaData>> = manifest_locs
+                        .iter()
+                        .map(|rg_cols| {
+                            rg_cols
+                                .iter()
+                                .map(|col_pages| {
+                                    let page_locations: Vec<PageLocation> = col_pages
+                                        .iter()
+                                        .map(|pl| PageLocation {
+                                            offset: pl.offset,
+                                            compressed_page_size: pl.compressed_page_size,
+                                            first_row_index: pl.first_row_index,
+                                        })
+                                        .collect();
+                                    OffsetIndexMetaData {
+                                        page_locations,
+                                        unencoded_byte_array_data_bytes: None,
+                                    }
+                                })
+                                .collect()
+                        })
+                        .collect();
+                    perf_println!(
+                        "⏱️ PROJ_DIAG: injecting manifest offset_index: {} row_groups",
+                        offset_index.len()
+                    );
+                    metadata
+                        .into_builder()
+                        .set_offset_index(Some(offset_index))
+                        .build()
+                } else {
+                    metadata
+                }
+            } else {
+                metadata
+            };
 
             if *crate::debug::PERFLOG_ENABLED {
                 let has_offset_index = metadata.offset_index().is_some();

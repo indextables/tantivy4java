@@ -15,8 +15,8 @@ use quickwit_storage::Storage;
 use crate::perf_println;
 use super::cached_reader::{ByteRangeCache, CachedParquetReader, CoalesceConfig};
 use super::doc_retrieval::{
-    arrow_json_value, build_column_projection, build_row_selection_for_rows_in_selected_groups,
-    compute_row_group_filter,
+    arrow_json_value, attach_page_locations, build_column_projection,
+    build_row_selection_for_rows_in_selected_groups, compute_row_group_filter,
 };
 use super::docid_mapping::group_doc_addresses_by_file;
 use super::manifest::{ColumnMapping, ParquetManifest};
@@ -460,6 +460,7 @@ pub async fn batch_parquet_to_tant_buffer_by_groups(
                 } else {
                     reader
                 };
+                let reader = attach_page_locations(reader, file_entry);
 
                 let t_builder = std::time::Instant::now();
                 let builder = ParquetRecordBatchStreamBuilder::new(reader)
