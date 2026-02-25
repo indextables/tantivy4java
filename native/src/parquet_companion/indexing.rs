@@ -452,12 +452,22 @@ pub async fn create_split_from_parquet(
                 // index. Files WITH a native offset index will have it loaded
                 // directly from the footer by CachedParquetReader at read time.
                 let page_locs = if let Some(ref sf) = scan_file {
-                    // No offset index — compute by scanning Thrift page headers
+                    let col_desc = pq_metadata
+                        .file_metadata()
+                        .schema_descr()
+                        .column(col_idx);
+                    // Compute page locations for all column types:
+                    // - Flat columns: exact first_row_index from num_values
+                    // - Nested columns (List/Map/Struct): exact first_row_index
+                    //   via rep-level scanning (decompresses V1 pages at index time)
                     compute_page_locations_from_column_chunk(
                         sf,
                         col_meta.data_page_offset() as u64,
                         col_meta.compressed_size() as u64,
                         col_meta.dictionary_page_offset().map(|o| o as u64),
+                        col_desc.max_rep_level(),
+                        rg_meta.num_rows(),
+                        col_meta.compression(),
                     ).unwrap_or_else(|e| {
                         debug_println!(
                             "⚠️ INDEXING: Failed to compute page locations for col {} in rg {}: {}",

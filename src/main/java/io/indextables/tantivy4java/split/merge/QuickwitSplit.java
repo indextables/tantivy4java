@@ -1374,6 +1374,14 @@ public class QuickwitSplit {
     public static native void nativeWriteTestParquetNoPageIndex(String path, int numRows, long idOffset);
 
     /**
+     * Test helper: write a parquet file with List&lt;Utf8&gt; (array[string]) column and NO
+     * native offset index. Used to reproduce page index issues with nested columns.
+     * Schema: id (i64), name (utf8), event_type (list&lt;utf8&gt;).
+     * Array patterns: alternating 1-element and 3-element arrays.
+     */
+    public static native void nativeWriteTestParquetArrayNoPageIndex(String path, int numRows, long idOffset);
+
+    /**
      * Test helper: write a parquet file with ALL data types including complex ones.
      * Schema: id (i64), name (utf8), score (f64), active (bool),
      *         created_at (timestamp micros), tags (list&lt;utf8&gt;),

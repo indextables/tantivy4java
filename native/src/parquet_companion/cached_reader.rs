@@ -362,7 +362,9 @@ impl AsyncFileReader for CachedParquetReader {
                 .load_and_finish(&mut *self, file_size)
                 .await?;
 
-            // Inject manifest-sourced page locations if the metadata lacks an offset index
+            // Inject manifest-sourced page locations if the metadata lacks an offset index.
+            // Both flat and nested columns get per-page entries. For nested columns,
+            // exact first_row_index is computed at index time via rep-level scanning.
             let metadata = if metadata.offset_index().is_none() {
                 if let Some(ref manifest_locs) = self.manifest_page_locations {
                     let offset_index: Vec<Vec<OffsetIndexMetaData>> = manifest_locs

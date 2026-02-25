@@ -794,6 +794,100 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_merge_QuickwitSpli
     });
 }
 
+/// JNI helper for tests: create a parquet file with List<Utf8> (array[string]) column
+/// and NO native offset index, to reproduce page index issues with nested columns.
+/// Schema: id (i64), name (utf8), event_type (list<utf8>)
+/// Array patterns: alternating 1-element and 3-element arrays (matching production data).
+/// Offset index is explicitly disabled to force page location computation at indexing time.
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_split_merge_QuickwitSplit_nativeWriteTestParquetArrayNoPageIndex(
+    mut env: JNIEnv,
+    _class: JClass,
+    path: JString,
+    num_rows: jni::sys::jint,
+    id_offset: jni::sys::jlong,
+) {
+    let _ = convert_throwable(&mut env, |env| {
+        let path_str = jstring_to_string(env, &path)?;
+
+        use arrow_array::*;
+        use arrow_array::builder::{ListBuilder, StringBuilder};
+        use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+        use parquet::arrow::ArrowWriter;
+        use parquet::file::properties::WriterProperties;
+        use std::sync::Arc;
+
+        let num = num_rows as usize;
+        let offset = id_offset;
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+            Field::new(
+                "event_type",
+                DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+                true,
+            ),
+        ]));
+
+        let ids: Vec<i64> = (0..num).map(|i| offset + i as i64).collect();
+        let names: Vec<String> = (0..num)
+            .map(|i| format!("item_{}", offset + i as i64))
+            .collect();
+
+        // Build event_type: alternating 1-element and 3-element arrays
+        // (matching the production pattern that triggers the bug)
+        let mut et_builder = ListBuilder::new(StringBuilder::new());
+        for i in 0..num {
+            if i % 2 == 0 {
+                // 1-element array
+                et_builder.values().append_value(format!("evt_{}", offset + i as i64));
+                et_builder.append(true);
+            } else {
+                // 3-element array
+                et_builder.values().append_value(format!("evt_{}", offset + i as i64));
+                et_builder.values().append_value("login");
+                et_builder.values().append_value("auth");
+                et_builder.append(true);
+            }
+        }
+        let et_array = et_builder.finish();
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(ids)),
+                Arc::new(StringArray::from(
+                    names.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+                )),
+                Arc::new(et_array),
+            ],
+        )
+        .map_err(|e| anyhow!("Failed to create RecordBatch: {}", e))?;
+
+        // Disable offset index to simulate legacy parquet files.
+        // Use a small data page size to force multiple pages per column,
+        // which is required to trigger the first_row_index bug for nested columns.
+        let props = WriterProperties::builder()
+            .set_offset_index_disabled(true)
+            .set_data_page_size_limit(4096) // 4KB pages → many pages to exercise page selection
+            .build();
+
+        let file = std::fs::File::create(&path_str)
+            .map_err(|e| anyhow!("Failed to create file '{}': {}", path_str, e))?;
+        let mut writer = ArrowWriter::try_new(file, schema, Some(props))
+            .map_err(|e| anyhow!("Failed to create ArrowWriter: {}", e))?;
+        writer
+            .write(&batch)
+            .map_err(|e| anyhow!("Failed to write batch: {}", e))?;
+        writer
+            .close()
+            .map_err(|e| anyhow!("Failed to close writer: {}", e))?;
+
+        Ok(())
+    });
+}
+
 /// JNI helper for tests: create a parquet file with ALL data types including complex ones.
 /// Schema: id (i64), name (utf8), score (f64), active (bool),
 ///         created_at (timestamp micros), tags (list<utf8>),
