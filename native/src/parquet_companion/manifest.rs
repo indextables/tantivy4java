@@ -8,6 +8,66 @@ use serde::{Serialize, Deserialize};
 
 use super::string_indexing::{StringIndexingMode, CompanionFieldInfo};
 
+/// Page-level byte offset information for a single data page.
+/// Used to enable page-level byte range reads at query time for parquet files
+/// that lack a native offset index in their footer.
+#[derive(Debug, Clone)]
+pub struct PageLocationEntry {
+    /// Byte offset of the page within the parquet file
+    pub offset: i64,
+    /// Compressed page size in bytes (including page header)
+    pub compressed_page_size: i32,
+    /// Index of the first row in this page (relative to the row group)
+    pub first_row_index: i64,
+}
+
+/// Pack page locations into compact binary (20 bytes per entry, little-endian).
+fn pack_page_locations(locations: &[PageLocationEntry]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(locations.len() * 20);
+    for loc in locations {
+        buf.extend_from_slice(&loc.offset.to_le_bytes());
+        buf.extend_from_slice(&loc.compressed_page_size.to_le_bytes());
+        buf.extend_from_slice(&loc.first_row_index.to_le_bytes());
+    }
+    buf
+}
+
+/// Unpack page locations from compact binary (20 bytes per entry, little-endian).
+fn unpack_page_locations(bytes: &[u8]) -> Vec<PageLocationEntry> {
+    let mut locations = Vec::with_capacity(bytes.len() / 20);
+    let mut i = 0;
+    while i + 20 <= bytes.len() {
+        locations.push(PageLocationEntry {
+            offset: i64::from_le_bytes(bytes[i..i + 8].try_into().unwrap()),
+            compressed_page_size: i32::from_le_bytes(bytes[i + 8..i + 12].try_into().unwrap()),
+            first_row_index: i64::from_le_bytes(bytes[i + 12..i + 20].try_into().unwrap()),
+        });
+        i += 20;
+    }
+    locations
+}
+
+fn serialize_page_locations<S: serde::Serializer>(
+    locs: &Vec<PageLocationEntry>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    use base64::Engine;
+    let packed = pack_page_locations(locs);
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&packed);
+    serializer.serialize_str(&b64)
+}
+
+fn deserialize_page_locations<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<PageLocationEntry>, D::Error> {
+    use base64::Engine;
+    let b64: String = serde::Deserialize::deserialize(deserializer)?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(&b64)
+        .map_err(serde::de::Error::custom)?;
+    Ok(unpack_page_locations(&bytes))
+}
+
 /// Current manifest format version
 pub const SUPPORTED_MANIFEST_VERSION: u32 = 1;
 
@@ -83,6 +143,16 @@ pub struct ColumnChunkInfo {
     pub compressed_size: u64,
     /// Total uncompressed size
     pub uncompressed_size: u64,
+    /// Page-level offset information, stored as compact base64-encoded binary.
+    /// Each entry is 20 bytes: i64 offset + i32 compressed_page_size + i64 first_row_index (LE).
+    /// Empty for files with native offset index (used directly from footer).
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        serialize_with = "serialize_page_locations",
+        deserialize_with = "deserialize_page_locations"
+    )]
+    pub page_locations: Vec<PageLocationEntry>,
 }
 
 /// Maps a tantivy field to a parquet column
@@ -338,6 +408,73 @@ mod tests {
         assert_eq!(parsed.string_indexing_modes["message"], StringIndexingMode::TextUuidExactonly);
         assert_eq!(parsed.companion_hash_fields.len(), 1);
         assert_eq!(parsed.companion_hash_fields["message__uuids"].original_field_name, "message");
+    }
+
+    #[test]
+    fn test_page_locations_pack_unpack_roundtrip() {
+        let locations = vec![
+            PageLocationEntry { offset: 1000, compressed_page_size: 500, first_row_index: 0 },
+            PageLocationEntry { offset: 1500, compressed_page_size: 300, first_row_index: 100 },
+            PageLocationEntry { offset: 1800, compressed_page_size: 200, first_row_index: 200 },
+        ];
+        let packed = pack_page_locations(&locations);
+        assert_eq!(packed.len(), 60); // 3 * 20 bytes
+        let unpacked = unpack_page_locations(&packed);
+        assert_eq!(unpacked.len(), 3);
+        assert_eq!(unpacked[0].offset, 1000);
+        assert_eq!(unpacked[0].compressed_page_size, 500);
+        assert_eq!(unpacked[0].first_row_index, 0);
+        assert_eq!(unpacked[2].offset, 1800);
+        assert_eq!(unpacked[2].first_row_index, 200);
+    }
+
+    #[test]
+    fn test_column_chunk_info_serde_with_page_locations() {
+        let info = ColumnChunkInfo {
+            column_idx: 0,
+            column_name: "id".to_string(),
+            data_page_offset: 4096,
+            compressed_size: 1024,
+            uncompressed_size: 2048,
+            page_locations: vec![
+                PageLocationEntry { offset: 4096, compressed_page_size: 512, first_row_index: 0 },
+                PageLocationEntry { offset: 4608, compressed_page_size: 512, first_row_index: 50 },
+            ],
+        };
+        let json = serde_json::to_string(&info).unwrap();
+        assert!(json.contains("page_locations"));
+        let parsed: ColumnChunkInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.page_locations.len(), 2);
+        assert_eq!(parsed.page_locations[0].offset, 4096);
+        assert_eq!(parsed.page_locations[1].first_row_index, 50);
+    }
+
+    #[test]
+    fn test_column_chunk_info_serde_empty_page_locations_omitted() {
+        let info = ColumnChunkInfo {
+            column_idx: 0,
+            column_name: "id".to_string(),
+            data_page_offset: 4096,
+            compressed_size: 1024,
+            uncompressed_size: 2048,
+            page_locations: vec![],
+        };
+        let json = serde_json::to_string(&info).unwrap();
+        assert!(!json.contains("page_locations"), "empty page_locations should be omitted: {}", json);
+    }
+
+    #[test]
+    fn test_column_chunk_info_backward_compat_no_page_locations() {
+        // Old manifests without page_locations field should deserialize fine
+        let json = r#"{
+            "column_idx": 0,
+            "column_name": "id",
+            "data_page_offset": 4096,
+            "compressed_size": 1024,
+            "uncompressed_size": 2048
+        }"#;
+        let parsed: ColumnChunkInfo = serde_json::from_str(json).unwrap();
+        assert!(parsed.page_locations.is_empty());
     }
 
     #[test]

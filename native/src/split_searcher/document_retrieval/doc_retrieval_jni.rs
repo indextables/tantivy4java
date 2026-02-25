@@ -896,7 +896,7 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_nati
                     &storage,
                     Some(metadata_cache),
                     Some(byte_cache),
-                    None,
+                    ctx.parquet_coalesce_config,
                 )
                 .await
             })
@@ -1098,7 +1098,7 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_nati
                     &storage,
                     Some(metadata_cache),
                     Some(byte_cache),
-                    None,
+                    ctx.parquet_coalesce_config,
                 )
                 .await;
                 perf_println!(

@@ -19,6 +19,7 @@ use tantivy::TantivyDocument;
 use quickwit_storage::Storage;
 
 use super::manifest::*;
+use super::page_index::compute_page_locations_from_column_chunk;
 use super::schema_derivation::{
     SchemaDerivationConfig, derive_tantivy_schema_with_mapping, arrow_type_to_tantivy_type,
     arrow_type_to_parquet_type, validate_schema_consistency,
@@ -411,11 +412,29 @@ pub async fn create_split_from_parquet(
             .with_context(|| format!("Failed to open parquet file: {}", file_path))?;
 
         let pq_metadata = reader_builder.metadata().clone();
-        let has_offset_index = pq_metadata.row_groups().iter().any(|rg| {
-            rg.columns().iter().any(|c| c.offset_index_offset().is_some())
-        });
 
-        // Build row group entries
+        // Detect if the file has a native offset index by checking the column
+        // chunk metadata for offset_index_offset. This is present in the footer
+        // without needing to actually load the offset index data.
+        // Files WITH a native offset index don't need page locations stored in the
+        // manifest — the CachedParquetReader will load the offset index directly
+        // from the footer at read time via PageIndexPolicy::Optional.
+        let has_native_offset_index = pq_metadata.row_groups().first()
+            .map(|rg| rg.columns().first()
+                .map(|col| col.offset_index_offset().is_some())
+                .unwrap_or(false))
+            .unwrap_or(false);
+
+        // Open a separate file handle for page location scanning (only needed
+        // for files that lack a native offset index in their footer).
+        let scan_file = if !has_native_offset_index {
+            Some(std::fs::File::open(file_path)
+                .with_context(|| format!("Failed to re-open parquet file for page scanning: {}", file_path))?)
+        } else {
+            None
+        };
+
+        // Build row group entries with page-level offset information
         let mut row_groups = Vec::new();
         let mut rg_row_offset: u64 = 0;
         for (rg_idx, rg_meta) in pq_metadata.row_groups().iter().enumerate() {
@@ -428,12 +447,35 @@ pub async fn create_split_from_parquet(
                     .column(col_idx)
                     .name()
                     .to_string();
+
+                // Compute page locations only for files that lack a native offset
+                // index. Files WITH a native offset index will have it loaded
+                // directly from the footer by CachedParquetReader at read time.
+                let page_locs = if let Some(ref sf) = scan_file {
+                    // No offset index — compute by scanning Thrift page headers
+                    compute_page_locations_from_column_chunk(
+                        sf,
+                        col_meta.data_page_offset() as u64,
+                        col_meta.compressed_size() as u64,
+                        col_meta.dictionary_page_offset().map(|o| o as u64),
+                    ).unwrap_or_else(|e| {
+                        debug_println!(
+                            "⚠️ INDEXING: Failed to compute page locations for col {} in rg {}: {}",
+                            col_name, rg_idx, e
+                        );
+                        Vec::new()
+                    })
+                } else {
+                    Vec::new()
+                };
+
                 columns.push(ColumnChunkInfo {
                     column_idx: col_idx,
                     column_name: col_name,
                     data_page_offset: col_meta.data_page_offset() as u64,
                     compressed_size: col_meta.compressed_size() as u64,
                     uncompressed_size: col_meta.uncompressed_size() as u64,
+                    page_locations: page_locs,
                 });
             }
             row_groups.push(RowGroupEntry {
@@ -456,7 +498,7 @@ pub async fn create_split_from_parquet(
             file_size_bytes: file_size,
             row_offset: cumulative_row_offset,
             num_rows: file_num_rows,
-            has_offset_index,
+            has_offset_index: has_native_offset_index,
             row_groups,
         });
 

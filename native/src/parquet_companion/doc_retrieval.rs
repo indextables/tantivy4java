@@ -22,11 +22,61 @@ use quickwit_storage::Storage;
 
 use super::cached_reader::{CachedParquetReader, ByteRangeCache, CoalesceConfig};
 use super::docid_mapping::{translate_to_global_row, locate_row_in_file, group_doc_addresses_by_file};
-use super::manifest::ParquetManifest;
+use super::manifest::{ParquetManifest, ParquetFileEntry, PageLocationEntry};
 use super::transcode::MetadataCache;
 
 use crate::debug_println;
 use crate::perf_println;
+
+/// Extract page locations from manifest ColumnChunkInfo into the structure
+/// expected by CachedParquetReader: [row_group][column][page_location].
+/// Returns the nested structure and a flag indicating if any pages are present.
+fn build_manifest_page_locations(
+    file_entry: &ParquetFileEntry,
+) -> (Vec<Vec<Vec<PageLocationEntry>>>, bool) {
+    let mut has_any = false;
+    let locs: Vec<Vec<Vec<PageLocationEntry>>> = file_entry
+        .row_groups
+        .iter()
+        .map(|rg| {
+            rg.columns
+                .iter()
+                .map(|col| {
+                    if !col.page_locations.is_empty() {
+                        has_any = true;
+                    }
+                    col.page_locations.clone()
+                })
+                .collect()
+        })
+        .collect();
+    (locs, has_any)
+}
+
+/// Attach manifest page locations to a CachedParquetReader if available.
+pub(crate) fn attach_page_locations(
+    reader: CachedParquetReader,
+    file_entry: &ParquetFileEntry,
+) -> CachedParquetReader {
+    let (manifest_page_locs, has_manifest_pages) = build_manifest_page_locations(file_entry);
+    if has_manifest_pages {
+        let total_pages: usize = manifest_page_locs.iter()
+            .flat_map(|rg| rg.iter())
+            .map(|col| col.len())
+            .sum();
+        perf_println!(
+            "⏱️ PROJ_DIAG: attaching manifest page_locations: {} total pages for file {}",
+            total_pages, file_entry.relative_path
+        );
+        reader.with_manifest_page_locations(manifest_page_locs)
+    } else {
+        perf_println!(
+            "⏱️ PROJ_DIAG: no manifest page_locations for file {} (has_offset_index={})",
+            file_entry.relative_path, file_entry.has_offset_index
+        );
+        reader
+    }
+}
 
 /// Retrieve a single document from parquet files.
 ///
@@ -95,6 +145,7 @@ pub async fn retrieve_document_from_parquet(
     } else {
         reader
     };
+    let reader = attach_page_locations(reader, file_entry);
 
     let builder = ParquetRecordBatchStreamBuilder::new(reader)
         .await
@@ -236,6 +287,7 @@ pub async fn retrieve_document_by_location(
     let reader = if let Some(config) = coalesce_config {
         reader.with_coalesce_config(config)
     } else { reader };
+    let reader = attach_page_locations(reader, file_entry);
 
     let builder = ParquetRecordBatchStreamBuilder::new(reader)
         .await.context("Failed to create parquet stream builder")?;
@@ -368,6 +420,7 @@ pub async fn batch_retrieve_from_parquet(
                 } else {
                     reader
                 };
+                let reader = attach_page_locations(reader, file_entry);
 
                 let builder = ParquetRecordBatchStreamBuilder::new(reader)
                     .await

@@ -827,7 +827,13 @@ public class SplitSearcher implements AutoCloseable {
      */
     public CompletableFuture<Void> preloadParquetFastFields(String... columns) {
         return CompletableFuture.runAsync(() -> {
-            nativePrewarmParquetFastFields(nativePtr, columns);
+            boolean success = nativePrewarmParquetFastFields(nativePtr, columns);
+            if (!success) {
+                throw new RuntimeException(
+                    "preloadParquetFastFields failed — check stderr for details. "
+                    + "Common cause: parquet_table_root not set. "
+                    + "Configure via CacheConfig.withParquetTableRoot() or pass table root to createSplitSearcher().");
+            }
         });
     }
 
@@ -843,7 +849,13 @@ public class SplitSearcher implements AutoCloseable {
      */
     public CompletableFuture<Void> preloadParquetColumns(String... columns) {
         return CompletableFuture.runAsync(() -> {
-            nativePrewarmParquetColumns(nativePtr, columns);
+            boolean success = nativePrewarmParquetColumns(nativePtr, columns);
+            if (!success) {
+                throw new RuntimeException(
+                    "preloadParquetColumns failed — check stderr for details. "
+                    + "Common cause: parquet_table_root not set. "
+                    + "Configure via CacheConfig.withParquetTableRoot() or pass table root to createSplitSearcher().");
+            }
         });
     }
 

@@ -7,6 +7,7 @@ use jni::sys::{jlong, jobject, jboolean};
 use jni::JNIEnv;
 
 use crate::debug_println;
+use crate::perf_println;
 use crate::runtime_manager::block_on_operation;
 
 /// Preload index components into cache for improved search performance.
@@ -114,6 +115,26 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_prel
             }
         }
 
+        // After component prewarm, eagerly load __pq columns and warm all native
+        // fast field columns into L1 for companion splits.
+        // The FASTFIELD prewarm writes to L2 disk cache, but the CachingDirectory L1
+        // ByteRangeCache needs individual column byte ranges to avoid downloads at query time.
+        if let Some(ctx) = crate::utils::jlong_to_arc::<super::types::CachedSearcherContext>(searcher_ptr) {
+            if ctx.has_merge_safe_tracking && ctx.parquet_manifest.is_some() {
+                let num_segments = ctx.cached_searcher.segment_readers().len();
+                for seg_ord in 0..num_segments {
+                    if let Err(e) = ctx.ensure_pq_segment_loaded(seg_ord as u32).await {
+                        debug_println!("⚠️ PREWARM: Failed to pre-load __pq columns for seg {}: {}", seg_ord, e);
+                    }
+                }
+                debug_println!("✅ PREWARM: Pre-loaded __pq columns for {} segments", num_segments);
+            }
+            // Warm all native fast field columns into L1 CachingDirectory cache
+            if let Err(e) = ctx.warm_native_fast_fields_l1().await {
+                debug_println!("⚠️ PREWARM: Failed to warm native fast fields into L1: {}", e);
+            }
+        }
+
         if errors.is_empty() {
             Ok(())
         } else {
@@ -180,7 +201,7 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_prel
 
     // Perform the warmup using async runtime
     match block_on_operation(async move {
-        match component_name.as_str() {
+        let result = match component_name.as_str() {
             "TERM" => {
                 debug_println!("🔥 PREWARM_FIELDS: Warming up TERM for specific fields...");
                 crate::prewarm::prewarm_term_dictionaries_for_fields(searcher_ptr, &field_filter).await
@@ -209,7 +230,33 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_prel
             _ => {
                 Err(anyhow::anyhow!("Unsupported component for field-specific preloading: {}", component_name))
             }
+        };
+
+        // After field-specific prewarm, eagerly load __pq columns and warm native
+        // fast field columns into L1 for companion splits — scoped to requested fields
+        // plus their companion fields (_phash_*, *__uuids)
+        if result.is_ok() {
+            if let Some(ctx) = crate::utils::jlong_to_arc::<super::types::CachedSearcherContext>(searcher_ptr) {
+                if ctx.has_merge_safe_tracking && ctx.parquet_manifest.is_some() {
+                    let num_segments = ctx.cached_searcher.segment_readers().len();
+                    for seg_ord in 0..num_segments {
+                        if let Err(e) = ctx.ensure_pq_segment_loaded(seg_ord as u32).await {
+                            debug_println!("⚠️ PREWARM_FIELDS: Failed to pre-load __pq columns for seg {}: {}", seg_ord, e);
+                        }
+                    }
+                    debug_println!("✅ PREWARM_FIELDS: Pre-loaded __pq columns for {} segments", num_segments);
+                }
+                // Warm only the requested fields + their companion native fast field columns into L1
+                let schema = ctx.cached_searcher.index().schema();
+                let expanded = crate::prewarm::field_specific::expand_companion_fields(&field_filter, &schema);
+                let expanded_vec: Vec<String> = expanded.into_iter().collect();
+                if let Err(e) = ctx.warm_native_fast_fields_l1_for_fields(&expanded_vec).await {
+                    debug_println!("⚠️ PREWARM_FIELDS: Failed to warm native fast fields into L1: {}", e);
+                }
+            }
         }
+
+        result
     }) {
         Ok(_) => {
             debug_println!("✅ PREWARM_FIELDS: Field-specific warmup completed successfully");
@@ -388,7 +435,9 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_nati
             1
         }
         Err(e) => {
-            debug_println!("❌ PARQUET_PREWARM: Parquet fast field warmup failed: {}", e);
+            let msg = format!("PARQUET_FAST_FIELD_PREWARM failed: {}", e);
+            eprintln!("❌ {}", msg);
+            let _ = env.throw_new("java/lang/RuntimeException", &msg);
             0
         }
     }
@@ -458,62 +507,178 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_nati
             }
         };
 
-        // Determine which columns to prewarm
+        // Determine which column names to prewarm.
+        // Match by tantivy_field_name first, then fall back to parquet_column_name
+        // so callers can pass either name (e.g. "winlog_message" matches whether
+        // that's the tantivy name or the parquet column name).
         let columns_to_warm: Vec<&crate::parquet_companion::ColumnMapping> = match &requested_columns {
             Some(names) => manifest.column_mapping.iter()
-                .filter(|cm| names.contains(&cm.tantivy_field_name))
+                .filter(|cm| names.contains(&cm.tantivy_field_name)
+                           || names.contains(&cm.parquet_column_name))
                 .collect(),
             None => manifest.column_mapping.iter().collect(),
         };
 
-        debug_println!(
-            "📊 PARQUET_COL_PREWARM: Warming {} columns across {} files",
-            columns_to_warm.len(), manifest.parquet_files.len()
+        let warm_parquet_names: std::collections::HashSet<&str> = columns_to_warm.iter()
+            .map(|cm| cm.parquet_column_name.as_str())
+            .collect();
+
+        if columns_to_warm.is_empty() {
+            if let Some(ref names) = requested_columns {
+                let available: Vec<String> = manifest.column_mapping.iter()
+                    .map(|cm| format!("{}(pq:{})", cm.tantivy_field_name, cm.parquet_column_name))
+                    .collect();
+                eprintln!("⚠️ PARQUET_COL_PREWARM: Requested columns {:?} matched 0 of {} column mappings. Available: {:?}",
+                    names, manifest.column_mapping.len(), available);
+            }
+        }
+
+        perf_println!(
+            "⏱️ PARQUET_COL_PREWARM: Warming {} columns ({:?}) across {} files",
+            columns_to_warm.len(), warm_parquet_names, manifest.parquet_files.len()
         );
 
-        // Resolve parquet file paths using context's table_root (provided at read time)
-        let effective_root = context.parquet_table_root.as_deref()
-            .ok_or_else(|| anyhow::anyhow!("No parquet_table_root configured — required for parquet column prewarm"))?;
+        // For each parquet file, use CachedParquetReader to read columns.
+        // This populates both the L1 ByteRangeCache (used by doc retrieval) and
+        // the L2 disk cache (used across JVM restarts).
+        // IMPORTANT: Per-file errors are non-fatal — log and continue to next file.
+        // Previous implementation used `?` which would abort the entire prewarm if
+        // any single file failed (e.g. transient S3 error), leaving all subsequent
+        // files un-prewarmed.
+        let total_files = manifest.parquet_files.len();
+        let mut files_warmed = 0u32;
+        let mut files_failed = 0u32;
+        for (file_idx, file_entry) in manifest.parquet_files.iter().enumerate() {
+            let file_result: Result<u32, anyhow::Error> = async {
+                let path_buf = std::path::PathBuf::from(&file_entry.relative_path);
 
-        // For each parquet file, read the column chunks to populate cache
-        for file_entry in &manifest.parquet_files {
-            let file_path = resolve_parquet_path(effective_root, &file_entry.relative_path);
+                // Check metadata cache for a pre-loaded footer
+                let cached_meta = {
+                    context.parquet_metadata_cache.lock().ok()
+                        .and_then(|guard| guard.get(&path_buf).cloned())
+                };
 
-            for rg in &file_entry.row_groups {
-                for col_info in &rg.columns {
-                    // Check if this column is one we want to prewarm
-                    let should_warm = columns_to_warm.iter()
-                        .any(|cm| cm.parquet_column_name == col_info.column_name);
+                let reader = if let Some(meta) = cached_meta {
+                    debug_println!("📊 PARQUET_COL_PREWARM: file[{}] Using cached metadata for '{}'", file_idx, file_entry.relative_path);
+                    crate::parquet_companion::cached_reader::CachedParquetReader::with_metadata(
+                        storage.clone(),
+                        path_buf.clone(),
+                        file_entry.file_size_bytes,
+                        meta,
+                    )
+                } else {
+                    crate::parquet_companion::cached_reader::CachedParquetReader::new(
+                        storage.clone(),
+                        path_buf.clone(),
+                        file_entry.file_size_bytes,
+                    )
+                };
+                let reader = reader.with_byte_cache(context.parquet_byte_range_cache.clone());
+                let reader = if let Some(config) = context.parquet_coalesce_config {
+                    reader.with_coalesce_config(config)
+                } else {
+                    reader
+                };
 
-                    if !should_warm {
-                        continue;
-                    }
-
-                    // Read the column chunk data via storage (populates L2 cache)
-                    let start = col_info.data_page_offset as usize;
-                    let end = start + col_info.compressed_size as usize;
-                    let _data = storage.get_slice(
-                        &std::path::PathBuf::from(&file_path),
-                        start..end,
-                    ).await.map_err(|e| anyhow::anyhow!(
-                        "Failed to prewarm column '{}' in file '{}': {}",
-                        col_info.column_name, file_entry.relative_path, e
+                // Build the stream — this reads the footer and populates metadata
+                let builder = parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder::new(reader)
+                    .await
+                    .map_err(|e| anyhow::anyhow!(
+                        "Failed to create parquet stream builder for '{}': {}", file_entry.relative_path, e
                     ))?;
 
-                    debug_println!(
-                        "📊 PARQUET_COL_PREWARM: Warmed column '{}' rg={} ({} bytes)",
-                        col_info.column_name, rg.row_group_idx, col_info.compressed_size
-                    );
+                // Cache the footer in parquet_metadata_cache for doc retrieval
+                {
+                    if let Ok(mut guard) = context.parquet_metadata_cache.lock() {
+                        if !guard.contains_key(&path_buf) {
+                            guard.insert(path_buf.clone(), builder.metadata().clone());
+                            debug_println!("📊 PARQUET_COL_PREWARM: file[{}] Cached footer for '{}'", file_idx, file_entry.relative_path);
+                        }
+                    }
+                }
+
+                // Build column projection from warm_parquet_names
+                let parquet_schema = builder.schema().clone();
+                let parquet_file_schema = builder.parquet_schema().clone();
+                let col_indices: Vec<usize> = parquet_schema
+                    .fields()
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, field)| {
+                        if warm_parquet_names.contains(field.name().as_str()) {
+                            Some(i)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+
+                if col_indices.is_empty() {
+                    let file_cols: Vec<&str> = parquet_schema.fields().iter()
+                        .map(|f| f.name().as_str()).collect();
+                    perf_println!("⏱️ PARQUET_COL_PREWARM: file[{}] No matching columns in '{}' — wanted {:?}, file has {:?}",
+                        file_idx, file_entry.relative_path, warm_parquet_names, file_cols);
+                    return Ok(0);
+                }
+
+                let projection = parquet::arrow::ProjectionMask::roots(
+                    &parquet_file_schema,
+                    col_indices.iter().cloned(),
+                );
+
+                let stream = builder.with_projection(projection).build()
+                    .map_err(|e| anyhow::anyhow!(
+                        "Failed to build parquet stream for '{}': {}", file_entry.relative_path, e
+                    ))?;
+
+                // Read all batches — CachedParquetReader populates L1 ByteRangeCache
+                // with dictionary pages and data pages. Data itself is discarded.
+                use futures::StreamExt;
+                let mut stream = std::pin::pin!(stream);
+                let mut batch_count = 0u32;
+                while let Some(batch_result) = stream.next().await {
+                    let _batch = batch_result.map_err(|e| anyhow::anyhow!(
+                        "Failed to read batch from '{}': {}", file_entry.relative_path, e
+                    ))?;
+                    batch_count += 1;
+                }
+
+                Ok(batch_count)
+            }.await;
+
+            match file_result {
+                Ok(batch_count) => {
+                    if batch_count > 0 {
+                        perf_println!("⏱️ PARQUET_COL_PREWARM: file[{}/{}] '{}' OK ({} batches)",
+                            file_idx, total_files, file_entry.relative_path, batch_count);
+                    }
+                    files_warmed += 1;
+                }
+                Err(e) => {
+                    files_failed += 1;
+                    // Always log failures (not just debug) so production can diagnose
+                    eprintln!("⚠️ PARQUET_COL_PREWARM: file[{}/{}] '{}' FAILED: {}",
+                        file_idx, total_files, file_entry.relative_path, e);
                 }
             }
         }
 
-        debug_println!("📊 PARQUET_COL_PREWARM: All columns warmed successfully");
+        perf_println!("⏱️ PARQUET_COL_PREWARM: Completed — {}/{} files warmed, {} failed",
+            files_warmed, total_files, files_failed);
+
+        if files_failed > 0 {
+            debug_println!("⚠️ PARQUET_COL_PREWARM: {} of {} files failed — remaining files still warmed", files_failed, total_files);
+        } else {
+            debug_println!("📊 PARQUET_COL_PREWARM: All {} files warmed successfully (L1+L2)", total_files);
+        }
         Ok(())
     }) {
         Ok(_) => 1,
         Err(e) => {
-            debug_println!("❌ PARQUET_COL_PREWARM: Failed: {}", e);
+            let msg = format!("PARQUET_COL_PREWARM failed: {}", e);
+            eprintln!("❌ {}", msg);
+            // Throw a Java exception so the caller sees the error message
+            let _ = env.throw_new("java/lang/RuntimeException", &msg);
             0
         }
     }
@@ -556,12 +721,28 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_nati
         "fastFieldMode": format!("{:?}", manifest.fast_field_mode),
         "tableRoot": context.parquet_table_root.as_deref().unwrap_or(""),
         "fileSizes": manifest.parquet_files.iter()
-            .map(|f| serde_json::json!({
-                "path": &f.relative_path,
-                "sizeBytes": f.file_size_bytes,
-                "numRows": f.num_rows,
-                "numRowGroups": f.row_groups.len(),
-            }))
+            .map(|f| {
+                // Determine the source of page-level offset index for this file:
+                // - "native": file has offset index in its parquet footer (used at read time)
+                // - "manifest": page locations computed at indexing time and stored in manifest
+                // - "none": no page-level offset index available
+                let has_manifest_pages = f.row_groups.iter()
+                    .any(|rg| rg.columns.iter().any(|col| !col.page_locations.is_empty()));
+                let page_index_source = if f.has_offset_index {
+                    "native"
+                } else if has_manifest_pages {
+                    "manifest"
+                } else {
+                    "none"
+                };
+                serde_json::json!({
+                    "path": &f.relative_path,
+                    "sizeBytes": f.file_size_bytes,
+                    "numRows": f.num_rows,
+                    "numRowGroups": f.row_groups.len(),
+                    "pageIndexSource": page_index_source,
+                })
+            })
             .collect::<Vec<_>>(),
     });
 

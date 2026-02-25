@@ -1365,6 +1365,15 @@ public class QuickwitSplit {
     public static native void nativeWriteTestParquet(String path, int numRows, long idOffset);
 
     /**
+     * Test helper: write a parquet file WITHOUT offset index (legacy format).
+     * Same schema as nativeWriteTestParquet but with offset index explicitly disabled,
+     * simulating legacy parquet files that don't have page-level offset information.
+     * Schema: id (i64), name (utf8), score (f64), active (bool), category (utf8).
+     * Rows: numRows rows with ids starting from idOffset.
+     */
+    public static native void nativeWriteTestParquetNoPageIndex(String path, int numRows, long idOffset);
+
+    /**
      * Test helper: write a parquet file with ALL data types including complex ones.
      * Schema: id (i64), name (utf8), score (f64), active (bool),
      *         created_at (timestamp micros), tags (list&lt;utf8&gt;),

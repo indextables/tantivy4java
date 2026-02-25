@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use std::ops::Range;
 use quickwit_storage::{Storage, ByteRangeCache};
 use crate::perf_println;
+use crate::debug_println;
 use crate::standalone_searcher::StandaloneSearcher;
 use crate::parquet_companion::manifest::ParquetManifest;
 
@@ -90,6 +91,10 @@ pub(crate) struct CachedSearcherContext {
     // Dictionary pages are large (800KB-1MB) and must be fetched for every doc retrieval.
     // This cache ensures they're fetched from S3/Azure only once and reused across calls.
     pub(crate) parquet_byte_range_cache: crate::parquet_companion::cached_reader::ByteRangeCache,
+    // Parquet companion mode: optional coalesce configuration for byte-range merging.
+    // Controls max_gap between ranges that get merged into single fetch requests.
+    // None = use default (512KB gap). Smaller values reduce over-fetch for projected reads.
+    pub(crate) parquet_coalesce_config: Option<crate::parquet_companion::cached_reader::CoalesceConfig>,
     // Parquet companion mode: pre-built lookup from file path hash → file index.
     // Built once from manifest.parquet_files, used for O(1) fast-field-based doc resolution.
     pub(crate) parquet_file_hash_index: HashMap<u64, usize>,
@@ -198,6 +203,54 @@ impl CachedSearcherContext {
 
         perf_println!("⏱️ PROJ_DIAG: ensure_pq_segment_loaded seg={} TOTAL {}ms (self={:p})",
             seg_ord, t0.elapsed().as_millis(), self);
+        Ok(())
+    }
+
+    /// Warm all native fast field columns into L1 CachingDirectory cache.
+    /// The component-level FASTFIELD prewarm writes .fast files to L2 disk cache,
+    /// but the CachingDirectory's L1 ByteRangeCache needs individual column byte ranges
+    /// to be read through the async path. Without this, the first aggregation that touches
+    /// a native fast field column (e.g. _phash_*) triggers a storage download.
+    pub(crate) async fn warm_native_fast_fields_l1(&self) -> anyhow::Result<()> {
+        let schema = self.cached_searcher.index().schema();
+        let field_names: Vec<String> = schema.fields()
+            .map(|(_, entry)| entry.name().to_string())
+            .collect();
+        self.warm_native_fast_fields_l1_for_fields(&field_names).await
+    }
+
+    /// Warm specific native fast field columns into L1 CachingDirectory cache.
+    /// Only reads byte ranges for the given field names (and silently skips any
+    /// that don't have fast field data in the segment).
+    pub(crate) async fn warm_native_fast_fields_l1_for_fields(&self, field_names: &[String]) -> anyhow::Result<()> {
+        let num_segments = self.cached_searcher.segment_readers().len();
+        let mut total_bytes = 0usize;
+        let mut total_columns = 0usize;
+
+        for seg_ord in 0..num_segments {
+            let segment_reader = self.cached_searcher.segment_reader(seg_ord as u32);
+            let fast_fields = segment_reader.fast_fields();
+
+            for field_name in field_names {
+                let handles = match fast_fields.list_dynamic_column_handles(field_name).await {
+                    Ok(h) => h,
+                    Err(_) => continue, // field may not have fast field data
+                };
+                for handle in handles {
+                    let file_slice = handle.file_slice();
+                    match file_slice.read_bytes_async().await {
+                        Ok(bytes) => {
+                            total_bytes += bytes.len();
+                            total_columns += 1;
+                        }
+                        Err(_) => {} // skip on error
+                    }
+                }
+            }
+        }
+
+        debug_println!("✅ PREWARM: Warmed {} native fast field columns ({} bytes) into L1 across {} segments",
+            total_columns, total_bytes, num_segments);
         Ok(())
     }
 

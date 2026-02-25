@@ -99,6 +99,7 @@ public class SplitCacheManager implements AutoCloseable {
     private final BatchOptimizationConfig batchOptimization;
     private final String parquetTableRoot;
     private final ParquetCompanionConfig.ParquetStorageConfig parquetStorageConfig;
+    private final long coalesceMaxGapBytes;
 
     /**
      * Configuration for shared cache across multiple splits
@@ -114,6 +115,7 @@ public class SplitCacheManager implements AutoCloseable {
         private BatchOptimizationConfig batchOptimization = null; // null = use default when needed
         private String parquetTableRoot = null;
         private ParquetCompanionConfig.ParquetStorageConfig parquetStorageConfig = null;
+        private long coalesceMaxGapBytes = 0; // 0 = use Rust default (512KB)
 
         public CacheConfig(String cacheName) {
             this.cacheName = cacheName;
@@ -297,6 +299,24 @@ public class SplitCacheManager implements AutoCloseable {
             this.parquetStorageConfig = config;
             return this;
         }
+
+        /**
+         * Set the maximum gap (in bytes) for parquet byte-range coalescing.
+         * Controls how nearby byte ranges are merged into single fetch requests.
+         * <p>
+         * Default (0): uses Rust default of 512KB, good for cloud storage.
+         * For projected reads (few columns out of many), a smaller value like
+         * 64KB reduces over-fetch at the cost of more round-trips.
+         *
+         * @param maxGapBytes maximum gap in bytes, or 0 for Rust default
+         * @return this CacheConfig for method chaining
+         */
+        public CacheConfig withCoalesceMaxGap(long maxGapBytes) {
+            this.coalesceMaxGapBytes = maxGapBytes;
+            return this;
+        }
+
+        public long getCoalesceMaxGapBytes() { return coalesceMaxGapBytes; }
 
         public String getParquetTableRoot() { return parquetTableRoot; }
         public ParquetCompanionConfig.ParquetStorageConfig getParquetStorageConfig() { return parquetStorageConfig; }
@@ -770,6 +790,7 @@ public class SplitCacheManager implements AutoCloseable {
                 : BatchOptimizationConfig.balanced();
         this.parquetTableRoot = config.getParquetTableRoot();
         this.parquetStorageConfig = config.getParquetStorageConfig();
+        this.coalesceMaxGapBytes = config.getCoalesceMaxGapBytes();
         this.nativePtr = createNativeCacheManager(config);
     }
     
@@ -978,6 +999,12 @@ public class SplitCacheManager implements AutoCloseable {
         // CRITICAL: Extract docMappingJson and pass as "doc_mapping" key for tokenization performance
         if (metadata.getDocMappingJson() != null && !metadata.getDocMappingJson().trim().isEmpty()) {
             splitConfig.put("doc_mapping", metadata.getDocMappingJson());
+        }
+
+        // Parquet coalesce config
+        long effectiveCoalesceMaxGap = this.coalesceMaxGapBytes;
+        if (effectiveCoalesceMaxGap > 0) {
+            splitConfig.put("parquet_coalesce_max_gap", String.valueOf(effectiveCoalesceMaxGap));
         }
 
         // Pass the entire metadata object to the native layer

@@ -24,11 +24,12 @@ pub mod arrow_to_tant;
 pub mod hash_field_rewriter;
 pub mod hash_touchup;
 pub mod string_indexing;
+pub(crate) mod page_index;
 
 pub use manifest::{
     ParquetManifest, FastFieldMode, SegmentRowRange, ParquetFileEntry,
     RowGroupEntry, ColumnChunkInfo, ColumnMapping, ParquetStorageConfigMeta,
-    SUPPORTED_MANIFEST_VERSION,
+    PageLocationEntry, SUPPORTED_MANIFEST_VERSION,
 };
 pub use manifest_io::{serialize_manifest, deserialize_manifest, MANIFEST_FILENAME};
 pub use docid_mapping::{translate_to_global_row, locate_row_in_file, group_doc_addresses_by_file};
