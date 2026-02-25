@@ -888,6 +888,207 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_merge_QuickwitSpli
     });
 }
 
+/// JNI helper for tests: create a parquet file with VARIED array patterns and NO offset index.
+/// Schema: id (i64), name (utf8), event_type (list<utf8>, nullable).
+/// Array pattern cycles through: null, empty[], 1-element, 2-element, 3-element.
+/// Uses 4KB data page size to force many pages on the nested column.
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_split_merge_QuickwitSplit_nativeWriteTestParquetArrayVariedNoPageIndex(
+    mut env: JNIEnv,
+    _class: JClass,
+    path: JString,
+    num_rows: jni::sys::jint,
+    id_offset: jni::sys::jlong,
+) {
+    let _ = convert_throwable(&mut env, |env| {
+        let path_str = jstring_to_string(env, &path)?;
+
+        use arrow_array::*;
+        use arrow_array::builder::{ListBuilder, StringBuilder};
+        use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+        use parquet::arrow::ArrowWriter;
+        use parquet::file::properties::WriterProperties;
+        use std::sync::Arc;
+
+        let num = num_rows as usize;
+        let offset = id_offset;
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+            Field::new(
+                "event_type",
+                DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+                true, // nullable — allows null arrays
+            ),
+        ]));
+
+        let ids: Vec<i64> = (0..num).map(|i| offset + i as i64).collect();
+        let names: Vec<String> = (0..num)
+            .map(|i| format!("item_{}", offset + i as i64))
+            .collect();
+
+        // Build event_type cycling: null, empty[], [evt_N], [evt_N, "x"], [evt_N, "x", "y"]
+        let mut et_builder = ListBuilder::new(StringBuilder::new());
+        for i in 0..num {
+            match i % 5 {
+                0 => {
+                    // null array
+                    et_builder.append(false);
+                }
+                1 => {
+                    // empty array []
+                    et_builder.append(true);
+                }
+                2 => {
+                    // 1-element array
+                    et_builder.values().append_value(format!("evt_{}", offset + i as i64));
+                    et_builder.append(true);
+                }
+                3 => {
+                    // 2-element array
+                    et_builder.values().append_value(format!("evt_{}", offset + i as i64));
+                    et_builder.values().append_value("login");
+                    et_builder.append(true);
+                }
+                4 => {
+                    // 3-element array
+                    et_builder.values().append_value(format!("evt_{}", offset + i as i64));
+                    et_builder.values().append_value("login");
+                    et_builder.values().append_value("auth");
+                    et_builder.append(true);
+                }
+                _ => unreachable!(),
+            }
+        }
+        let et_array = et_builder.finish();
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(ids)),
+                Arc::new(StringArray::from(
+                    names.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+                )),
+                Arc::new(et_array),
+            ],
+        )
+        .map_err(|e| anyhow!("Failed to create RecordBatch: {}", e))?;
+
+        let props = WriterProperties::builder()
+            .set_offset_index_disabled(true)
+            .set_data_page_size_limit(4096)
+            .build();
+
+        let file = std::fs::File::create(&path_str)
+            .map_err(|e| anyhow!("Failed to create file '{}': {}", path_str, e))?;
+        let mut writer = ArrowWriter::try_new(file, schema, Some(props))
+            .map_err(|e| anyhow!("Failed to create ArrowWriter: {}", e))?;
+        writer
+            .write(&batch)
+            .map_err(|e| anyhow!("Failed to write batch: {}", e))?;
+        writer
+            .close()
+            .map_err(|e| anyhow!("Failed to close writer: {}", e))?;
+
+        Ok(())
+    });
+}
+
+/// JNI helper for tests: stress-test parquet with TINY pages (256B) and LARGE varied arrays.
+/// Schema: id (i64), name (utf8), event_type (list<utf8>, nullable).
+/// Array pattern: cycles null, empty[], and arrays of size 1..10.
+/// 256-byte pages + large arrays = maximum page boundary stress on nested columns.
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_split_merge_QuickwitSplit_nativeWriteTestParquetArrayStress(
+    mut env: JNIEnv,
+    _class: JClass,
+    path: JString,
+    num_rows: jni::sys::jint,
+    id_offset: jni::sys::jlong,
+) {
+    let _ = convert_throwable(&mut env, |env| {
+        let path_str = jstring_to_string(env, &path)?;
+
+        use arrow_array::*;
+        use arrow_array::builder::{ListBuilder, StringBuilder};
+        use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+        use parquet::arrow::ArrowWriter;
+        use parquet::file::properties::WriterProperties;
+        use std::sync::Arc;
+
+        let num = num_rows as usize;
+        let offset = id_offset;
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+            Field::new(
+                "event_type",
+                DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+                true,
+            ),
+        ]));
+
+        let ids: Vec<i64> = (0..num).map(|i| offset + i as i64).collect();
+        let names: Vec<String> = (0..num)
+            .map(|i| format!("item_{}", offset + i as i64))
+            .collect();
+
+        // Cycle: null, empty, then arrays of size 1..10
+        let mut et_builder = ListBuilder::new(StringBuilder::new());
+        for i in 0..num {
+            let pattern = i % 12;
+            if pattern == 0 {
+                et_builder.append(false); // null
+            } else if pattern == 1 {
+                et_builder.append(true); // empty []
+            } else {
+                let arr_size = pattern - 1; // 1..10
+                et_builder.values().append_value(format!("evt_{}", offset + i as i64));
+                for j in 1..arr_size {
+                    et_builder.values().append_value(format!("tag_{}", j));
+                }
+                et_builder.append(true);
+            }
+        }
+        let et_array = et_builder.finish();
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(ids)),
+                Arc::new(StringArray::from(
+                    names.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+                )),
+                Arc::new(et_array),
+            ],
+        )
+        .map_err(|e| anyhow!("Failed to create RecordBatch: {}", e))?;
+
+        // 256 byte page limit = maximum page boundary stress
+        // 100 row max row group size = multiple row groups for RowSelection stress
+        let props = WriterProperties::builder()
+            .set_offset_index_disabled(true)
+            .set_data_page_size_limit(256)
+            .set_max_row_group_size(100)
+            .build();
+
+        let file = std::fs::File::create(&path_str)
+            .map_err(|e| anyhow!("Failed to create file '{}': {}", path_str, e))?;
+        let mut writer = ArrowWriter::try_new(file, schema, Some(props))
+            .map_err(|e| anyhow!("Failed to create ArrowWriter: {}", e))?;
+        writer
+            .write(&batch)
+            .map_err(|e| anyhow!("Failed to write batch: {}", e))?;
+        writer
+            .close()
+            .map_err(|e| anyhow!("Failed to close writer: {}", e))?;
+
+        Ok(())
+    });
+}
+
 /// JNI helper for tests: create a parquet file with ALL data types including complex ones.
 /// Schema: id (i64), name (utf8), score (f64), active (bool),
 ///         created_at (timestamp micros), tags (list<utf8>),

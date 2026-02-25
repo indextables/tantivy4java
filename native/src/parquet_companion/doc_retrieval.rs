@@ -682,6 +682,21 @@ pub(crate) fn build_row_selection_for_rows_in_selected_groups(
 
     let rg_boundaries = compute_row_group_boundaries(metadata);
 
+    // If we are selecting ALL rows in all selected row groups, return None
+    // to skip RowSelection entirely. This avoids an arrow-rs bug where
+    // RowSelection + nested columns (List, Struct, Map) can return fewer
+    // rows than expected.
+    let total_rows_in_selected_groups: usize = rg_boundaries
+        .iter()
+        .enumerate()
+        .filter(|(idx, _)| rg_filter.map_or(true, |f| f[*idx]))
+        .map(|(_, b)| b.end - b.start)
+        .sum();
+
+    if sorted_file_rows.len() == total_rows_in_selected_groups {
+        return None; // All rows selected — skip RowSelection entirely
+    }
+
     // Compute the total row count in selected row groups, and build a mapping
     // from file-level row index to position within the selected-groups row space
     let mut selected_rows_total = 0usize;

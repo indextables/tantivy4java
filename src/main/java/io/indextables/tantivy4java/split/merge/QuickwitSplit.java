@@ -1382,6 +1382,21 @@ public class QuickwitSplit {
     public static native void nativeWriteTestParquetArrayNoPageIndex(String path, int numRows, long idOffset);
 
     /**
+     * Test helper: write a parquet file with varied List&lt;Utf8&gt; array patterns and NO
+     * native offset index. Cycles through: null, empty[], 1-element, 2-element, 3-element arrays.
+     * Schema: id (i64), name (utf8), event_type (list&lt;utf8&gt;, nullable).
+     * 4KB data page size forces many pages on the array column.
+     */
+    public static native void nativeWriteTestParquetArrayVariedNoPageIndex(String path, int numRows, long idOffset);
+
+    /**
+     * Test helper: stress-test with TINY pages (256B) and LARGE varied arrays (0..10 elements).
+     * Schema: id (i64), name (utf8), event_type (list&lt;utf8&gt;, nullable).
+     * 256-byte pages + large arrays = maximum page boundary stress on nested columns.
+     */
+    public static native void nativeWriteTestParquetArrayStress(String path, int numRows, long idOffset);
+
+    /**
      * Test helper: write a parquet file with ALL data types including complex ones.
      * Schema: id (i64), name (utf8), score (f64), active (bool),
      *         created_at (timestamp micros), tags (list&lt;utf8&gt;),

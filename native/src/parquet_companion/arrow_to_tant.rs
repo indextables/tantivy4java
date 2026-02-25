@@ -334,9 +334,11 @@ fn assemble_tant_buffer(doc_buffers: Vec<Option<Vec<u8>>>) -> Result<Vec<u8>> {
     for doc_opt in &doc_buffers {
         offsets.push(buffer.len() as u32);
         match doc_opt {
-            Some(doc_bytes) => buffer.extend_from_slice(doc_bytes),
-            None => {
-                // Empty document: field_count = 0
+            Some(doc_bytes) if !doc_bytes.is_empty() => buffer.extend_from_slice(doc_bytes),
+            _ => {
+                // Empty or missing document: write field_count = 0 (2 bytes).
+                // This prevents 0-byte documents from corrupting the offset table
+                // and causing "Unknown field type" errors in the Java reader.
                 buffer.extend_from_slice(&0u16.to_ne_bytes());
             }
         }
@@ -616,6 +618,13 @@ pub async fn batch_parquet_to_tant_buffer_by_groups(
                     "⏱️ PROJ_DIAG: file[{}] stream exhausted: {} batches, {} rows total, read took {}ms",
                     file_idx, batch_count, collected_rows.len(), t_read.elapsed().as_millis()
                 );
+
+                if collected_rows.len() != rows.len() {
+                    perf_println!(
+                        "⚠️ PROJ_DIAG: file[{}] ROW COUNT MISMATCH: parquet reader returned {} rows but expected {}",
+                        file_idx, collected_rows.len(), rows.len()
+                    );
+                }
 
                 perf_println!(
                     "⏱️ PROJ_DIAG: file[{}] TOTAL file processing took {}ms",
