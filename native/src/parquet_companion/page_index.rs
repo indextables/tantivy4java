@@ -92,6 +92,9 @@ pub fn compute_page_locations_from_column_chunk(
         file_offset: i64,
         total_page_size: i32,
         num_rows: i64,
+        /// Whether this page starts with continuation data from the previous page's
+        /// last row (first rep_level > 0). Only meaningful for nested columns.
+        starts_with_continuation: bool,
     }
 
     let mut pages: Vec<PageInfo> = Vec::new();
@@ -111,9 +114,9 @@ pub fn compute_page_locations_from_column_chunk(
 
         match header.page_type {
             PAGE_TYPE_DATA_PAGE => {
-                let num_rows = if !is_nested {
-                    // Flat column: num_values == num_rows
-                    header.num_values as i64
+                let (num_rows, starts_with_continuation) = if !is_nested {
+                    // Flat column: num_values == num_rows, never has continuation
+                    (header.num_values as i64, false)
                 } else {
                     // Nested V1 page: decompress and count rep_level == 0
                     let page_data_start = pos + header.header_size;
@@ -126,7 +129,7 @@ pub fn compute_page_locations_from_column_chunk(
                     }
                     let compressed_data = &buf[page_data_start..page_data_end];
 
-                    count_rows_in_v1_page(
+                    let info = count_rows_in_v1_page(
                         compressed_data,
                         header.uncompressed_page_size as usize,
                         &compression,
@@ -137,25 +140,42 @@ pub fn compute_page_locations_from_column_chunk(
                     .with_context(|| format!(
                         "Failed to count rows in V1 nested page at offset {}",
                         page_file_offset
-                    ))? as i64
+                    ))?;
+                    (info.num_rows as i64, info.starts_with_continuation)
                 };
                 pages.push(PageInfo {
                     file_offset: page_file_offset as i64,
                     total_page_size,
                     num_rows,
+                    starts_with_continuation,
                 });
             }
             PAGE_TYPE_DATA_PAGE_V2 => {
-                let num_rows = if !is_nested {
-                    header.num_values as i64
+                let (num_rows, starts_with_continuation) = if !is_nested {
+                    (header.num_values as i64, false)
                 } else {
-                    // V2 has explicit num_rows in header
-                    header.num_rows as i64
+                    // V2 has explicit num_rows in header.
+                    // Check first rep_level to detect continuation pages.
+                    // In V2, rep levels are stored uncompressed at the start of page data.
+                    let cont = if header.rep_levels_byte_length > 0 {
+                        let page_data_start = pos + header.header_size;
+                        let rep_end = page_data_start + header.rep_levels_byte_length as usize;
+                        if rep_end <= chunk_len {
+                            let rep_data = &buf[page_data_start..rep_end];
+                            !first_rep_is_zero(rep_data, bit_width)
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+                    (header.num_rows as i64, cont)
                 };
                 pages.push(PageInfo {
                     file_offset: page_file_offset as i64,
                     total_page_size,
                     num_rows,
+                    starts_with_continuation,
                 });
             }
             PAGE_TYPE_DICTIONARY_PAGE | PAGE_TYPE_INDEX_PAGE => {
@@ -171,11 +191,39 @@ pub fn compute_page_locations_from_column_chunk(
         pos += advance;
     }
 
+    // For nested columns, merge pages where a row spans a page boundary.
+    //
+    // The parquet spec requires that when an offset_index is present, pages must
+    // begin on row boundaries (rep_level=0). Files written without an offset index
+    // don't follow this constraint — a row with many array elements can span
+    // multiple pages. arrow-rs's scan_ranges() uses first_row_index to select
+    // pages and will miss continuation pages, causing decode errors.
+    //
+    // Fix: merge each continuation page (first rep_level > 0) into the preceding
+    // page so that no row straddles a merged page boundary.
+    let pages_to_use: Vec<PageInfo> = if is_nested {
+        let mut merged: Vec<PageInfo> = Vec::new();
+        for page in pages {
+            if page.starts_with_continuation && !merged.is_empty() {
+                // Extend the previous merged page to cover this continuation page
+                let prev = merged.last_mut().unwrap();
+                let new_end = page.file_offset + page.total_page_size as i64;
+                prev.total_page_size = (new_end - prev.file_offset) as i32;
+                prev.num_rows += page.num_rows;
+            } else {
+                merged.push(page);
+            }
+        }
+        merged
+    } else {
+        pages
+    };
+
     // Build locations with exact cumulative row counts
     let mut cumulative_rows: i64 = 0;
-    let mut locations = Vec::with_capacity(pages.len());
+    let mut locations = Vec::with_capacity(pages_to_use.len());
 
-    for page in &pages {
+    for page in &pages_to_use {
         locations.push(PageLocationEntry {
             offset: page.file_offset,
             compressed_page_size: page.total_page_size,
@@ -187,9 +235,20 @@ pub fn compute_page_locations_from_column_chunk(
     Ok(locations)
 }
 
+/// Result of counting rows in a nested page.
+struct NestedPageRowInfo {
+    /// Number of top-level rows that START in this page (rep_level == 0 count).
+    num_rows: usize,
+    /// Whether the first value in this page is a continuation of the previous
+    /// page's last row (first rep_level > 0). When true, the page's data begins
+    /// with elements belonging to a row that started in an earlier page.
+    starts_with_continuation: bool,
+}
+
 /// Count the number of rows in a DataPageV1 for a nested column by
 /// decompressing the page and counting rep_level == 0 in the RLE/Bit-Packed
-/// encoded repetition levels.
+/// encoded repetition levels. Also detects whether the page starts with
+/// continuation data from the previous page.
 fn count_rows_in_v1_page(
     compressed_data: &[u8],
     uncompressed_size: usize,
@@ -197,7 +256,7 @@ fn count_rows_in_v1_page(
     decompress_buf: &mut Vec<u8>,
     bit_width: u8,
     num_values: usize,
-) -> Result<usize> {
+) -> Result<NestedPageRowInfo> {
     let data: &[u8] = match *compression {
         Compression::UNCOMPRESSED => compressed_data,
         Compression::SNAPPY => {
@@ -238,7 +297,8 @@ fn count_rows_in_v1_page(
 }
 
 /// Parse the rep levels from decompressed V1 page data and count rows.
-fn count_rows_from_decompressed(data: &[u8], bit_width: u8, num_values: usize) -> Result<usize> {
+/// Returns row count and whether the page starts with continuation data.
+fn count_rows_from_decompressed(data: &[u8], bit_width: u8, num_values: usize) -> Result<NestedPageRowInfo> {
     // V1 page layout (after decompression):
     //   [4 bytes LE: rep_levels_length] [rep_levels_data] [def_levels...] [values...]
     if data.len() < 4 {
@@ -257,7 +317,45 @@ fn count_rows_from_decompressed(data: &[u8], bit_width: u8, num_values: usize) -
     }
 
     let rep_data = &data[4..4 + rep_levels_len];
-    Ok(count_rle_bp_zeros(rep_data, bit_width, num_values))
+    let num_rows = count_rle_bp_zeros(rep_data, bit_width, num_values);
+    let starts_with_continuation = rep_levels_len > 0 && !first_rep_is_zero(rep_data, bit_width);
+    Ok(NestedPageRowInfo { num_rows, starts_with_continuation })
+}
+
+/// Check whether the first repetition level in RLE/Bit-Packed hybrid data is zero.
+/// Returns true if the first rep_level is 0 (meaning a new row starts at the
+/// beginning of the page). Returns false if the first rep_level > 0 (continuation).
+fn first_rep_is_zero(rep_data: &[u8], bit_width: u8) -> bool {
+    if bit_width == 0 || rep_data.is_empty() {
+        return true; // bit_width 0 means all values are 0 (single level of nesting)
+    }
+
+    // Read the first RLE/Bit-Packed run header
+    let (header, vlen) = read_vlq(rep_data);
+    if vlen == 0 {
+        return true; // No data to read
+    }
+
+    if header & 1 == 0 {
+        // RLE run: the repeated value follows the header
+        let value_byte_width = ((bit_width as usize) + 7) / 8;
+        if vlen + value_byte_width > rep_data.len() {
+            return true; // Can't read value, assume start of row
+        }
+        let mut value: u64 = 0;
+        for i in 0..value_byte_width {
+            value |= (rep_data[vlen + i] as u64) << (i * 8);
+        }
+        value == 0
+    } else {
+        // Bit-packed run: values are packed starting after the header
+        if vlen >= rep_data.len() {
+            return true; // Can't read packed data
+        }
+        // First value is in the lowest bit_width bits of the first byte
+        let mask = (1u8 << bit_width) - 1;
+        (rep_data[vlen] & mask) == 0
+    }
 }
 
 /// Count the number of zero values in RLE/Bit-Packed hybrid encoded data.
@@ -402,6 +500,9 @@ struct ParsedPageHeader {
     /// For DataPageHeaderV2: the explicit num_rows field.
     /// 0 for V1 pages and dictionary/index pages.
     num_rows: i32,
+    /// For DataPageHeaderV2: byte length of uncompressed repetition levels.
+    /// 0 for V1 and dictionary/index pages.
+    rep_levels_byte_length: i32,
     /// Number of bytes consumed by the Thrift header encoding.
     header_size: usize,
 }
@@ -425,6 +526,7 @@ fn parse_page_header(data: &[u8]) -> Result<ParsedPageHeader> {
     let mut compressed_page_size: Option<i32> = None;
     let mut num_values: i32 = 0;
     let mut num_rows: i32 = 0;
+    let mut rep_levels_byte_length: i32 = 0;
 
     // Read struct fields until stop
     let mut last_field_id: i16 = 0;
@@ -467,10 +569,10 @@ fn parse_page_header(data: &[u8]) -> Result<ParsedPageHeader> {
             }
             8 => {
                 // data_page_header_v2: DataPageHeaderV2 struct
-                // fields: 1=num_values, 2=num_nulls, 3=num_rows
-                let (nv, nr) = read_data_page_v2_fields(&mut reader)?;
-                num_values = nv;
-                num_rows = nr;
+                let v2_info = read_data_page_v2_fields(&mut reader)?;
+                num_values = v2_info.num_values;
+                num_rows = v2_info.num_rows;
+                rep_levels_byte_length = v2_info.rep_levels_byte_length;
             }
             _ => {
                 reader.skip_field(field_type)?;
@@ -491,6 +593,7 @@ fn parse_page_header(data: &[u8]) -> Result<ParsedPageHeader> {
         compressed_page_size,
         num_values,
         num_rows,
+        rep_levels_byte_length,
         header_size: reader.position(),
     })
 }
@@ -520,7 +623,17 @@ fn read_first_i32_from_struct(reader: &mut ThriftReader) -> Result<i32> {
     Ok(result)
 }
 
-/// Read num_values (field 1) and num_rows (field 3) from a DataPageHeaderV2 struct.
+/// Parsed fields from a DataPageHeaderV2 struct.
+struct DataPageV2Info {
+    num_values: i32,
+    num_rows: i32,
+    /// Byte length of uncompressed repetition levels (field 6).
+    /// In V2 pages, rep levels are stored uncompressed at the start of the page data.
+    rep_levels_byte_length: i32,
+}
+
+/// Read num_values (field 1), num_rows (field 3), and rep_levels_byte_length (field 6)
+/// from a DataPageHeaderV2 struct.
 ///
 /// DataPageHeaderV2 layout (parquet.thrift):
 ///   1: required i32 num_values
@@ -531,9 +644,10 @@ fn read_first_i32_from_struct(reader: &mut ThriftReader) -> Result<i32> {
 ///   6: required i32 repetition_levels_byte_length
 ///   7: optional bool is_compressed
 ///   8: optional Statistics statistics
-fn read_data_page_v2_fields(reader: &mut ThriftReader) -> Result<(i32, i32)> {
+fn read_data_page_v2_fields(reader: &mut ThriftReader) -> Result<DataPageV2Info> {
     let mut num_values: i32 = 0;
     let mut num_rows: i32 = 0;
+    let mut rep_levels_byte_length: i32 = 0;
     let mut last_field_id: i16 = 0;
 
     loop {
@@ -546,11 +660,12 @@ fn read_data_page_v2_fields(reader: &mut ThriftReader) -> Result<(i32, i32)> {
         match field_id {
             1 => num_values = reader.read_i32()?,
             3 => num_rows = reader.read_i32()?,
+            6 => rep_levels_byte_length = reader.read_i32()?,
             _ => reader.skip_field(field_type)?,
         }
     }
 
-    Ok((num_values, num_rows))
+    Ok(DataPageV2Info { num_values, num_rows, rep_levels_byte_length })
 }
 
 // ─── Minimal Thrift Compact Protocol Parser ────────────────────────────────
@@ -1386,5 +1501,154 @@ mod tests {
     fn test_count_rle_bp_zeros_bit_width_zero() {
         // bit_width=0 means all values are implicitly 0
         assert_eq!(count_rle_bp_zeros(&[], 0, 100), 100);
+    }
+
+    /// Test that pages are merged for List columns with large arrays (650+ elements)
+    /// that span page boundaries. Without merging, arrow-rs's scan_ranges() would
+    /// miss continuation pages and produce decode errors.
+    #[test]
+    fn test_page_merging_large_array_elements() {
+        use parquet::file::properties::WriterProperties;
+        use parquet::arrow::ArrowWriter;
+        use arrow_array::*;
+        use arrow_array::builder::*;
+        use arrow_schema::{Schema, Field, DataType};
+        use std::sync::Arc;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("tags", DataType::List(Arc::new(
+                Field::new("item", DataType::Utf8, true)
+            )), true),
+        ]));
+
+        let num_rows = 100;
+        let elements_per_row = 700; // Large enough to span pages
+        let mut tmpfile = NamedTempFile::new().unwrap();
+
+        // Very small page size to force rows to span multiple pages
+        let props = WriterProperties::builder()
+            .set_data_page_size_limit(1024) // 1KB pages — a single row with 700 elements won't fit
+            .set_dictionary_enabled(false)
+            .set_max_row_group_size(num_rows)
+            .build();
+
+        let mut list_builder = ListBuilder::new(StringBuilder::new());
+        for i in 0..num_rows {
+            for j in 0..elements_per_row {
+                list_builder.values().append_value(format!("v_{}_{}", i, j));
+            }
+            list_builder.append(true);
+        }
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(list_builder.finish()) as ArrayRef],
+        ).unwrap();
+
+        let mut writer = ArrowWriter::try_new(
+            tmpfile.as_file_mut(),
+            schema.clone(),
+            Some(props),
+        ).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        // Compute page locations with merging
+        let file = std::fs::File::open(tmpfile.path()).unwrap();
+        let reader = parquet::file::serialized_reader::SerializedFileReader::new(file).unwrap();
+        let metadata = reader.metadata();
+        let rg = metadata.row_group(0);
+        let schema_descr = metadata.file_metadata().schema_descr();
+
+        // Find the list leaf column
+        let mut list_col_idx = None;
+        for i in 0..rg.num_columns() {
+            if schema_descr.column(i).max_rep_level() > 0 {
+                list_col_idx = Some(i);
+                break;
+            }
+        }
+        let col_idx = list_col_idx.expect("Should find list leaf column");
+        let col = rg.column(col_idx);
+        let col_desc = schema_descr.column(col_idx);
+
+        let file = std::fs::File::open(tmpfile.path()).unwrap();
+        let locations = compute_page_locations_from_column_chunk(
+            &file,
+            col.data_page_offset() as u64,
+            col.compressed_size() as u64,
+            col.dictionary_page_offset().map(|o| o as u64),
+            col_desc.max_rep_level(),
+            rg.num_rows(),
+            col.compression(),
+        ).unwrap();
+
+        // Validate standard invariants
+        assert_valid_locations(&locations, rg.num_rows(), "large_array_merged");
+
+        // Key check: first_row_index must be STRICTLY increasing for merged pages.
+        // This proves that continuation pages were merged and each merged page
+        // represents at least one complete new row.
+        for i in 1..locations.len() {
+            assert!(
+                locations[i].first_row_index > locations[i - 1].first_row_index,
+                "After merging, first_row_index should be strictly increasing: \
+                 page {} has fri={} but page {} has fri={}",
+                i, locations[i].first_row_index, i - 1, locations[i - 1].first_row_index
+            );
+        }
+
+        // With 700 elements per row at 1KB page limit, each row's data is ~10-15KB,
+        // spanning 10-15 pages. After merging, each merged "page" covers at least
+        // one row, so we should have at most num_rows merged pages.
+        assert!(
+            locations.len() <= num_rows,
+            "Merged page count ({}) should be <= num_rows ({})",
+            locations.len(), num_rows
+        );
+
+        // Each merged page's byte range should be contiguous and non-overlapping
+        for i in 1..locations.len() {
+            let prev_end = locations[i - 1].offset + locations[i - 1].compressed_page_size as i64;
+            assert!(
+                locations[i].offset >= prev_end,
+                "Merged pages should not overlap: page {} ends at {} but page {} starts at {}",
+                i - 1, prev_end, i, locations[i].offset
+            );
+        }
+    }
+
+    /// Test first_rep_is_zero with RLE-encoded zero value.
+    #[test]
+    fn test_first_rep_is_zero_rle_zero() {
+        // RLE: header=0x0A (5<<1|0 = 10), value=0x00 → first rep is 0
+        let data = [0x0A, 0x00];
+        assert!(first_rep_is_zero(&data, 1));
+    }
+
+    /// Test first_rep_is_zero with RLE-encoded non-zero value.
+    #[test]
+    fn test_first_rep_is_zero_rle_nonzero() {
+        // RLE: header=0x0A (5<<1|0 = 10), value=0x01 → first rep is 1
+        let data = [0x0A, 0x01];
+        assert!(!first_rep_is_zero(&data, 1));
+    }
+
+    /// Test first_rep_is_zero with bit-packed zero.
+    #[test]
+    fn test_first_rep_is_zero_bitpacked_zero() {
+        // Bit-packed: header=0x03 (1<<1|1 = 3, 1 group), first value = 0
+        // byte = 0b11111110 → lowest bit is 0
+        let data = [0x03, 0xFE];
+        assert!(first_rep_is_zero(&data, 1));
+    }
+
+    /// Test first_rep_is_zero with bit-packed non-zero.
+    #[test]
+    fn test_first_rep_is_zero_bitpacked_nonzero() {
+        // Bit-packed: header=0x03, first value = 1
+        // byte = 0b00000001 → lowest bit is 1
+        let data = [0x03, 0x01];
+        assert!(!first_rep_is_zero(&data, 1));
     }
 }
