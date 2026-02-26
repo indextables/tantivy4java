@@ -131,7 +131,7 @@ pub(crate) fn file_has_manifest_page_locs(file_entry: &ParquetFileEntry) -> bool
 /// Check if a projection includes any nested/complex Arrow types.
 /// Returns false if projection is None (all columns) since we can't know without schema scanning.
 /// For safety, None projection is treated as "may have nested" — callers should handle this.
-fn projection_has_nested(
+pub(crate) fn projection_has_nested(
     projection: &Option<Vec<usize>>,
     arrow_schema: &arrow_schema::Schema,
 ) -> bool {
@@ -153,23 +153,22 @@ fn projection_has_nested(
     }
 }
 
-/// Create a CachedParquetReader without page locations.
+/// Create a CachedParquetReader with optional pre-loaded metadata.
 fn create_reader(
     storage: &Arc<dyn Storage>,
     path_buf: &std::path::PathBuf,
     file_entry: &ParquetFileEntry,
-    cached_meta: &Option<Arc<parquet::file::metadata::ParquetMetaData>>,
+    metadata: Option<&Arc<parquet::file::metadata::ParquetMetaData>>,
     byte_cache: Option<&ByteRangeCache>,
     coalesce_config: Option<CoalesceConfig>,
 ) -> CachedParquetReader {
-    let reader = if let Some(ref meta) = cached_meta {
-        CachedParquetReader::with_metadata(
+    let reader = match metadata {
+        Some(meta) => CachedParquetReader::with_metadata(
             storage.clone(), path_buf.clone(), file_entry.file_size_bytes, meta.clone(),
-        )
-    } else {
-        CachedParquetReader::new(
+        ),
+        None => CachedParquetReader::new(
             storage.clone(), path_buf.clone(), file_entry.file_size_bytes,
-        )
+        ),
     };
     let reader = if let Some(bc) = byte_cache {
         reader.with_byte_cache(bc.clone())
@@ -179,24 +178,67 @@ fn create_reader(
     } else { reader }
 }
 
-/// Create a CachedParquetReader with pre-loaded metadata (avoids re-downloading footer).
-fn create_reader_with_metadata(
+/// Read a single row from a parquet file with given column indices.
+///
+/// If `inject_page_locs` is true, manifest page locations are attached to the reader
+/// (used for primitive columns where manifest locs are correct).
+/// If false, the reader falls back to full column chunk reads
+/// (used for nested columns where manifest locs have wrong first_row_index).
+async fn read_single_row(
     storage: &Arc<dyn Storage>,
     path_buf: &std::path::PathBuf,
     file_entry: &ParquetFileEntry,
     metadata: &Arc<parquet::file::metadata::ParquetMetaData>,
     byte_cache: Option<&ByteRangeCache>,
     coalesce_config: Option<CoalesceConfig>,
-) -> CachedParquetReader {
-    let reader = CachedParquetReader::with_metadata(
-        storage.clone(), path_buf.clone(), file_entry.file_size_bytes, metadata.clone(),
+    column_indices: &[usize],
+    row_in_file: usize,
+    projected_fields: Option<&[String]>,
+    inject_page_locs: bool,
+) -> Result<HashMap<String, serde_json::Value>> {
+    let reader = create_reader(
+        storage, path_buf, file_entry, Some(metadata), byte_cache, coalesce_config,
     );
-    let reader = if let Some(bc) = byte_cache {
-        reader.with_byte_cache(bc.clone())
-    } else { reader };
-    if let Some(config) = coalesce_config {
-        reader.with_coalesce_config(config)
-    } else { reader }
+    let reader = if inject_page_locs {
+        attach_page_locations(reader, file_entry)
+    } else {
+        reader
+    };
+    let builder = ParquetRecordBatchStreamBuilder::new(reader)
+        .await
+        .context("Failed to create stream builder for single-row read")?;
+
+    let parquet_file_schema = builder.parquet_schema().clone();
+    let builder = builder.with_projection(parquet::arrow::ProjectionMask::roots(
+        &parquet_file_schema,
+        column_indices.iter().cloned(),
+    ));
+
+    let rg_filter = compute_row_group_filter(&[row_in_file], metadata);
+    let builder = if let Some(ref filter) = rg_filter {
+        let selected_rgs: Vec<usize> = filter.iter().enumerate()
+            .filter(|(_, s)| **s).map(|(i, _)| i).collect();
+        builder.with_row_groups(selected_rgs)
+    } else { builder };
+
+    let row_selection = build_row_selection_for_rows_in_selected_groups(
+        &[row_in_file], metadata, rg_filter.as_deref(),
+    );
+    let builder = if let Some(selection) = row_selection {
+        builder.with_row_selection(selection)
+    } else {
+        builder.with_offset(row_in_file).with_limit(1)
+    };
+
+    let mut stream = builder.build().context("Failed to build stream for single-row read")?;
+    use futures::StreamExt;
+    if let Some(batch_result) = stream.next().await {
+        let batch = batch_result.context("Failed to read batch for single-row read")?;
+        if batch.num_rows() > 0 {
+            return extract_row_as_map(&batch, 0, projected_fields);
+        }
+    }
+    Ok(HashMap::new())
 }
 
 /// Retrieve a single document from parquet files.
@@ -226,157 +268,16 @@ pub async fn retrieve_document_from_parquet(
     let location = locate_row_in_file(global_row, manifest)
         .map_err(|e| anyhow::anyhow!("{}", e))?;
 
-    let file_entry = &manifest.parquet_files[location.file_idx];
-    // Use relative_path directly — the storage is rooted at table_root
-    let parquet_path = &file_entry.relative_path;
-
     debug_println!(
         "📖 PARQUET_DOC: Retrieving seg={} doc={} → global_row={} → file[{}]='{}' row_in_file={}",
-        segment_ord, doc_id, global_row, location.file_idx, parquet_path, location.row_in_file
+        segment_ord, doc_id, global_row, location.file_idx,
+        manifest.parquet_files[location.file_idx].relative_path, location.row_in_file
     );
 
-    // Check metadata cache first to avoid re-reading footer from S3/Azure
-    let path_buf = std::path::PathBuf::from(parquet_path);
-    let cached_meta = metadata_cache.and_then(|cache| {
-        cache.lock().ok().and_then(|guard| guard.get(&path_buf).cloned())
-    });
-
-    // Build reader WITHOUT page locations first to get metadata and schema.
-    // We'll decide whether to attach page locations after seeing the projection.
-    let reader = create_reader(
-        storage, &path_buf, file_entry, &cached_meta, byte_cache, coalesce_config,
-    );
-    let builder = ParquetRecordBatchStreamBuilder::new(reader)
-        .await
-        .context("Failed to create parquet stream builder")?;
-
-    // Cache the metadata for subsequent reads
-    let metadata_arc = builder.metadata().clone();
-    if let Some(cache) = metadata_cache {
-        if let Ok(mut guard) = cache.lock() {
-            if !guard.contains_key(&path_buf) {
-                guard.insert(path_buf.clone(), metadata_arc.clone());
-                debug_println!("📖 PARQUET_DOC: Cached metadata for {:?}", parquet_path);
-            }
-        }
-    }
-
-    let parquet_schema = builder.schema().clone();
-
-    // Build column projection
-    let projection = build_column_projection(
-        projected_fields,
-        &parquet_schema,
-        &manifest.column_mapping,
-    );
-
-    if let Some(ref proj) = projection {
-        if proj.is_empty() {
-            // No matching columns found - return empty document
-            return Ok(HashMap::new());
-        }
-    }
-
-    // Determine read strategy based on 3 cases:
-    //   Case A: file has native offset index → attach page locs (correct for all types)
-    //   Case B: manifest page locs, no nested in projection → attach page locs
-    //   Case C: manifest page locs, nested in projection → skip page locs entirely
-    let uses_manifest_locs = file_has_manifest_page_locs(file_entry);
-    let has_nested_in_proj = projection_has_nested(&projection, &parquet_schema);
-    let should_attach_page_locs = if !uses_manifest_locs {
-        // Case A (native offset index) or no page locs at all — always safe
-        true
-    } else if has_nested_in_proj {
-        // Case C — manifest page locs are wrong for nested columns,
-        // and arrow-rs requires all-or-nothing offset index. Skip entirely.
-        debug_println!(
-            "📖 PARQUET_DOC: Case C: skipping manifest page locs (nested columns in projection)"
-        );
-        false
-    } else {
-        // Case B — only primitives in projection, manifest locs are correct
-        true
-    };
-
-    // If we need page locs, rebuild the reader with them attached.
-    // The metadata is already cached so this doesn't re-download the footer.
-    let builder = if should_attach_page_locs {
-        let reader = create_reader_with_metadata(
-            storage, &path_buf, file_entry, &metadata_arc, byte_cache, coalesce_config,
-        );
-        let reader = attach_page_locations(reader, file_entry);
-        ParquetRecordBatchStreamBuilder::new(reader)
-            .await
-            .context("Failed to create parquet stream builder with page locs")?
-    } else {
-        // No page locs — use the original builder (reads full column chunks)
-        builder
-    };
-
-    // Build a RowSelection to read only the target row
-    let row_in_file = location.row_in_file as usize;
-
-    // Get metadata before consuming builder with projections
-    let parquet_metadata = builder.metadata().clone();
-    let parquet_file_schema = builder.parquet_schema().clone();
-
-    let builder = if let Some(ref proj) = projection {
-        // Use roots() not leaves() because build_column_projection returns top-level
-        // arrow field indices, not parquet leaf column indices. For schemas with nested
-        // types (List, Map, Struct), leaves diverge from top-level indices.
-        builder.with_projection(parquet::arrow::ProjectionMask::roots(
-            &parquet_file_schema,
-            proj.iter().cloned(),
-        ))
-    } else {
-        builder
-    };
-
-    // Step 1: Filter to only the target row group (avoids downloading column pages
-    // for ALL row groups — critical for large files on S3/Azure).
-    let rg_filter = compute_row_group_filter(&[row_in_file], &parquet_metadata);
-    let builder = if let Some(ref filter) = rg_filter {
-        let selected_rgs: Vec<usize> = filter
-            .iter()
-            .enumerate()
-            .filter(|(_, selected)| **selected)
-            .map(|(idx, _)| idx)
-            .collect();
-        debug_println!(
-            "📖 PARQUET_DOC: single-doc selecting row group(s) {:?} of {}",
-            selected_rgs, parquet_metadata.num_row_groups()
-        );
-        builder.with_row_groups(selected_rgs)
-    } else {
-        builder
-    };
-
-    // Step 2: Build RowSelection within the selected row group to skip to exact row
-    let row_selection = build_row_selection_for_rows_in_selected_groups(
-        &[row_in_file],
-        &parquet_metadata,
-        rg_filter.as_deref(),
-    );
-    let builder = if let Some(selection) = row_selection {
-        builder.with_row_selection(selection)
-    } else {
-        // Fallback: set offset and limit
-        builder.with_offset(row_in_file).with_limit(1)
-    };
-
-    let mut stream = builder.build()
-        .context("Failed to build parquet record batch stream")?;
-
-    // Read the first (and ideally only) batch
-    use futures::StreamExt;
-    if let Some(batch_result) = stream.next().await {
-        let batch = batch_result.context("Failed to read parquet record batch")?;
-        if batch.num_rows() > 0 {
-            return extract_row_as_map(&batch, 0, projected_fields);
-        }
-    }
-
-    Ok(HashMap::new())
+    retrieve_single_doc_inner(
+        manifest, location.file_idx, location.row_in_file as usize,
+        projected_fields, storage, metadata_cache, byte_cache, coalesce_config,
+    ).await
 }
 
 /// Retrieve a single document using pre-resolved file coordinates.
@@ -393,28 +294,58 @@ pub async fn retrieve_document_by_location(
     byte_cache: Option<&ByteRangeCache>,
     coalesce_config: Option<CoalesceConfig>,
 ) -> Result<HashMap<String, serde_json::Value>> {
-    let file_entry = manifest.parquet_files.get(file_idx)
-        .ok_or_else(|| anyhow::anyhow!("file_idx {} out of range (have {} files)",
-            file_idx, manifest.parquet_files.len()))?;
-    let parquet_path = &file_entry.relative_path;
+    if file_idx >= manifest.parquet_files.len() {
+        anyhow::bail!("file_idx {} out of range (have {} files)", file_idx, manifest.parquet_files.len());
+    }
 
     debug_println!(
         "📖 PARQUET_DOC: Retrieving by location → file[{}]='{}' row_in_file={}",
-        file_idx, parquet_path, row_in_file
+        file_idx, manifest.parquet_files[file_idx].relative_path, row_in_file
     );
 
-    let path_buf = std::path::PathBuf::from(parquet_path);
+    retrieve_single_doc_inner(
+        manifest, file_idx, row_in_file as usize,
+        projected_fields, storage, metadata_cache, byte_cache, coalesce_config,
+    ).await
+}
+
+/// Inner implementation for single-doc retrieval, shared by both
+/// `retrieve_document_from_parquet` (segment→global→file resolution) and
+/// `retrieve_document_by_location` (pre-resolved coordinates).
+///
+/// Implements the 3-case read strategy:
+///   Case A: Native offset index → single pass with page locs (correct for all types)
+///   Case B: Manifest page locs, primitives only → single pass with page locs
+///   Case C: Manifest page locs + nested columns → two-pass:
+///           primitives WITH page locs, nested WITHOUT (preserves page-level optimization)
+async fn retrieve_single_doc_inner(
+    manifest: &ParquetManifest,
+    file_idx: usize,
+    row_in_file: usize,
+    projected_fields: Option<&[String]>,
+    storage: &Arc<dyn Storage>,
+    metadata_cache: Option<&MetadataCache>,
+    byte_cache: Option<&ByteRangeCache>,
+    coalesce_config: Option<CoalesceConfig>,
+) -> Result<HashMap<String, serde_json::Value>> {
+    let file_entry = &manifest.parquet_files[file_idx];
+    let path_buf = std::path::PathBuf::from(&file_entry.relative_path);
+
+    // Check metadata cache first to avoid re-reading footer from S3/Azure
     let cached_meta = metadata_cache.and_then(|cache| {
         cache.lock().ok().and_then(|guard| guard.get(&path_buf).cloned())
     });
 
-    // Build reader WITHOUT page locations to get metadata and schema first.
+    // Build reader WITHOUT page locations first to get metadata and schema.
+    // We'll decide whether to attach page locations after seeing the projection.
     let reader = create_reader(
-        storage, &path_buf, file_entry, &cached_meta, byte_cache, coalesce_config,
+        storage, &path_buf, file_entry, cached_meta.as_ref(), byte_cache, coalesce_config,
     );
     let builder = ParquetRecordBatchStreamBuilder::new(reader)
-        .await.context("Failed to create parquet stream builder")?;
+        .await
+        .context("Failed to create parquet stream builder")?;
 
+    // Cache the metadata for subsequent reads
     let metadata_arc = builder.metadata().clone();
     if let Some(cache) = metadata_cache {
         if let Ok(mut guard) = cache.lock() {
@@ -425,61 +356,119 @@ pub async fn retrieve_document_by_location(
     }
 
     let parquet_schema = builder.schema().clone();
-    let projection = build_column_projection(projected_fields, &parquet_schema, &manifest.column_mapping);
+
+    // Build column projection
+    let projection = build_column_projection(
+        projected_fields,
+        &parquet_schema,
+        &manifest.column_mapping,
+    );
+
     if let Some(ref proj) = projection {
-        if proj.is_empty() { return Ok(HashMap::new()); }
+        if proj.is_empty() {
+            return Ok(HashMap::new());
+        }
     }
 
-    // 3-case strategy (same as retrieve_document_from_parquet)
+    // Determine read strategy
     let uses_manifest_locs = file_has_manifest_page_locs(file_entry);
     let has_nested_in_proj = projection_has_nested(&projection, &parquet_schema);
-    let should_attach_page_locs = if !uses_manifest_locs {
-        true // Case A
-    } else if has_nested_in_proj {
-        debug_println!("📖 PARQUET_DOC: Case C (by_location): skipping manifest page locs");
-        false // Case C
-    } else {
-        true // Case B
-    };
 
-    let builder = if should_attach_page_locs {
-        let reader = create_reader_with_metadata(
-            storage, &path_buf, file_entry, &metadata_arc, byte_cache, coalesce_config,
+    if uses_manifest_locs && has_nested_in_proj {
+        // Case C: Two-pass single-doc read.
+        // Primitives read with page locs (page-level optimization preserved).
+        // Nested read without page locs (manifest locs have wrong first_row_index).
+        let proj_indices = match &projection {
+            Some(indices) => indices.clone(),
+            None => (0..parquet_schema.fields().len()).collect(),
+        };
+        let (prim_indices, nested_indices) = split_projection_by_nesting(&proj_indices, &parquet_schema);
+
+        debug_println!(
+            "📖 PARQUET_DOC: Case C two-pass: prim={:?} nested={:?}",
+            prim_indices, nested_indices
         );
-        let reader = attach_page_locations(reader, file_entry);
-        ParquetRecordBatchStreamBuilder::new(reader)
-            .await.context("Failed to create stream builder with page locs")?
+
+        let (prim_result, nested_result) = futures::future::join(
+            async {
+                match &prim_indices {
+                    Some(indices) => read_single_row(
+                        storage, &path_buf, file_entry, &metadata_arc,
+                        byte_cache, coalesce_config, indices, row_in_file, projected_fields,
+                        true, // inject page locs for primitives
+                    ).await,
+                    None => Ok(HashMap::new()),
+                }
+            },
+            async {
+                match &nested_indices {
+                    Some(indices) => read_single_row(
+                        storage, &path_buf, file_entry, &metadata_arc,
+                        byte_cache, coalesce_config, indices, row_in_file, projected_fields,
+                        false, // no page locs for nested columns
+                    ).await,
+                    None => Ok(HashMap::new()),
+                }
+            },
+        ).await;
+
+        let mut result = prim_result.context("Failed reading primitive columns")?;
+        let nested_map = nested_result.context("Failed reading nested columns")?;
+        result.extend(nested_map);
+        return Ok(result);
+    }
+
+    // Case A or B: Single-pass with page location injection.
+    // For Case A (native offset index), page locs are always correct for all types.
+    // For Case B (manifest locs, primitives only), page locs are correct.
+    // If no manifest page locs at all, attach_page_locations is a no-op.
+    let reader = create_reader(
+        storage, &path_buf, file_entry, Some(&metadata_arc), byte_cache, coalesce_config,
+    );
+    let reader = attach_page_locations(reader, file_entry);
+    let builder = ParquetRecordBatchStreamBuilder::new(reader)
+        .await
+        .context("Failed to create parquet stream builder with page locs")?;
+
+    let parquet_file_schema = builder.parquet_schema().clone();
+    let parquet_metadata = builder.metadata().clone();
+
+    let builder = if let Some(ref proj) = projection {
+        builder.with_projection(parquet::arrow::ProjectionMask::roots(
+            &parquet_file_schema,
+            proj.iter().cloned(),
+        ))
     } else {
         builder
     };
 
-    let row_in_file_usize = row_in_file as usize;
-    let parquet_metadata = builder.metadata().clone();
-    let parquet_file_schema = builder.parquet_schema().clone();
-
-    let builder = if let Some(ref proj) = projection {
-        builder.with_projection(parquet::arrow::ProjectionMask::roots(
-            &parquet_file_schema, proj.iter().cloned(),
-        ))
-    } else { builder };
-
-    let rg_filter = compute_row_group_filter(&[row_in_file_usize], &parquet_metadata);
+    let rg_filter = compute_row_group_filter(&[row_in_file], &parquet_metadata);
     let builder = if let Some(ref filter) = rg_filter {
         let selected_rgs: Vec<usize> = filter.iter().enumerate()
-            .filter(|(_, s)| **s).map(|(i, _)| i).collect();
+            .filter(|(_, selected)| **selected)
+            .map(|(idx, _)| idx)
+            .collect();
+        debug_println!(
+            "📖 PARQUET_DOC: single-doc selecting row group(s) {:?} of {}",
+            selected_rgs, parquet_metadata.num_row_groups()
+        );
         builder.with_row_groups(selected_rgs)
-    } else { builder };
+    } else {
+        builder
+    };
 
     let row_selection = build_row_selection_for_rows_in_selected_groups(
-        &[row_in_file_usize], &parquet_metadata, rg_filter.as_deref(),
+        &[row_in_file], &parquet_metadata, rg_filter.as_deref(),
     );
     let builder = if let Some(selection) = row_selection {
         builder.with_row_selection(selection)
     } else {
-        builder.with_offset(row_in_file_usize).with_limit(1)
+        builder.with_offset(row_in_file).with_limit(1)
     };
 
-    let mut stream = builder.build().context("Failed to build parquet record batch stream")?;
+    let mut stream = builder.build()
+        .context("Failed to build parquet record batch stream")?;
+
     use futures::StreamExt;
     if let Some(batch_result) = stream.next().await {
         let batch = batch_result.context("Failed to read parquet record batch")?;
@@ -487,6 +476,7 @@ pub async fn retrieve_document_by_location(
             return extract_row_as_map(&batch, 0, projected_fields);
         }
     }
+
     Ok(HashMap::new())
 }
 
@@ -1402,5 +1392,230 @@ mod tests {
         let fields = vec!["nonexistent".to_string()];
         let result = build_column_projection(Some(&fields), &schema, &[]);
         assert_eq!(result, Some(vec![])); // Empty, no match
+    }
+
+    // --- Tests for nested column helpers ---
+
+    #[test]
+    fn test_is_nested_arrow_type_primitives() {
+        use arrow_schema::DataType;
+        assert!(!is_nested_arrow_type(&DataType::Int32));
+        assert!(!is_nested_arrow_type(&DataType::Int64));
+        assert!(!is_nested_arrow_type(&DataType::Utf8));
+        assert!(!is_nested_arrow_type(&DataType::Boolean));
+        assert!(!is_nested_arrow_type(&DataType::Float64));
+        assert!(!is_nested_arrow_type(&DataType::Date32));
+        assert!(!is_nested_arrow_type(&DataType::Binary));
+    }
+
+    #[test]
+    fn test_is_nested_arrow_type_nested() {
+        use arrow_schema::{DataType, Field};
+        let item = Arc::new(Field::new("item", DataType::Utf8, true));
+        assert!(is_nested_arrow_type(&DataType::List(item.clone())));
+        assert!(is_nested_arrow_type(&DataType::LargeList(item.clone())));
+        assert!(is_nested_arrow_type(&DataType::FixedSizeList(item.clone(), 3)));
+        assert!(is_nested_arrow_type(&DataType::Map(
+            Arc::new(Field::new("entries", DataType::Struct(
+                vec![
+                    Field::new("key", DataType::Utf8, false),
+                    Field::new("value", DataType::Int32, true),
+                ].into()
+            ), false)),
+            false,
+        )));
+        assert!(is_nested_arrow_type(&DataType::Struct(
+            vec![Field::new("x", DataType::Int32, false)].into()
+        )));
+    }
+
+    #[test]
+    fn test_split_projection_by_nesting_all_primitive() {
+        let schema = arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("id", arrow_schema::DataType::Int64, false),
+            arrow_schema::Field::new("name", arrow_schema::DataType::Utf8, false),
+        ]);
+        let (prim, nested) = split_projection_by_nesting(&[0, 1], &schema);
+        assert_eq!(prim, Some(vec![0, 1]));
+        assert_eq!(nested, None);
+    }
+
+    #[test]
+    fn test_split_projection_by_nesting_all_nested() {
+        let schema = arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("tags", arrow_schema::DataType::List(
+                Arc::new(arrow_schema::Field::new("item", arrow_schema::DataType::Utf8, true))
+            ), true),
+        ]);
+        let (prim, nested) = split_projection_by_nesting(&[0], &schema);
+        assert_eq!(prim, None);
+        assert_eq!(nested, Some(vec![0]));
+    }
+
+    #[test]
+    fn test_split_projection_by_nesting_mixed() {
+        let schema = arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("id", arrow_schema::DataType::Int64, false),
+            arrow_schema::Field::new("tags", arrow_schema::DataType::List(
+                Arc::new(arrow_schema::Field::new("item", arrow_schema::DataType::Utf8, true))
+            ), true),
+            arrow_schema::Field::new("name", arrow_schema::DataType::Utf8, false),
+            arrow_schema::Field::new("address", arrow_schema::DataType::Struct(
+                vec![arrow_schema::Field::new("city", arrow_schema::DataType::Utf8, true)].into()
+            ), true),
+        ]);
+        let (prim, nested) = split_projection_by_nesting(&[0, 1, 2, 3], &schema);
+        assert_eq!(prim, Some(vec![0, 2]));
+        assert_eq!(nested, Some(vec![1, 3]));
+    }
+
+    #[test]
+    fn test_split_projection_by_nesting_partial_projection() {
+        let schema = arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("id", arrow_schema::DataType::Int64, false),
+            arrow_schema::Field::new("tags", arrow_schema::DataType::List(
+                Arc::new(arrow_schema::Field::new("item", arrow_schema::DataType::Utf8, true))
+            ), true),
+            arrow_schema::Field::new("name", arrow_schema::DataType::Utf8, false),
+        ]);
+        // Only project index 1 (tags) and 2 (name)
+        let (prim, nested) = split_projection_by_nesting(&[1, 2], &schema);
+        assert_eq!(prim, Some(vec![2]));
+        assert_eq!(nested, Some(vec![1]));
+    }
+
+    #[test]
+    fn test_split_projection_by_nesting_empty() {
+        let schema = arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("id", arrow_schema::DataType::Int64, false),
+        ]);
+        let (prim, nested) = split_projection_by_nesting(&[], &schema);
+        assert_eq!(prim, None);
+        assert_eq!(nested, None);
+    }
+
+    #[test]
+    fn test_file_has_manifest_page_locs_with_native_index() {
+        use super::super::manifest::*;
+        let file_entry = ParquetFileEntry {
+            relative_path: "test.parquet".to_string(),
+            file_size_bytes: 1000,
+            row_offset: 0,
+            num_rows: 100,
+            has_offset_index: true, // native index
+            row_groups: vec![RowGroupEntry {
+                row_group_idx: 0,
+                num_rows: 100,
+                row_offset_in_file: 0,
+                columns: vec![ColumnChunkInfo {
+                    column_idx: 0,
+                    column_name: "id".to_string(),
+                    data_page_offset: 0,
+                    compressed_size: 500,
+                    uncompressed_size: 500,
+                    page_locations: vec![PageLocationEntry { offset: 0, compressed_page_size: 100, first_row_index: 0 }],
+                }],
+            }],
+        };
+        // Even though page_locations is non-empty, has_offset_index=true means native → returns false
+        assert!(!file_has_manifest_page_locs(&file_entry));
+    }
+
+    #[test]
+    fn test_file_has_manifest_page_locs_with_manifest_locs() {
+        use super::super::manifest::*;
+        let file_entry = ParquetFileEntry {
+            relative_path: "test.parquet".to_string(),
+            file_size_bytes: 1000,
+            row_offset: 0,
+            num_rows: 100,
+            has_offset_index: false,
+            row_groups: vec![RowGroupEntry {
+                row_group_idx: 0,
+                num_rows: 100,
+                row_offset_in_file: 0,
+                columns: vec![ColumnChunkInfo {
+                    column_idx: 0,
+                    column_name: "id".to_string(),
+                    data_page_offset: 0,
+                    compressed_size: 500,
+                    uncompressed_size: 500,
+                    page_locations: vec![PageLocationEntry { offset: 0, compressed_page_size: 100, first_row_index: 0 }],
+                }],
+            }],
+        };
+        assert!(file_has_manifest_page_locs(&file_entry));
+    }
+
+    #[test]
+    fn test_file_has_manifest_page_locs_empty_locs() {
+        use super::super::manifest::*;
+        let file_entry = ParquetFileEntry {
+            relative_path: "test.parquet".to_string(),
+            file_size_bytes: 1000,
+            row_offset: 0,
+            num_rows: 100,
+            has_offset_index: false,
+            row_groups: vec![RowGroupEntry {
+                row_group_idx: 0,
+                num_rows: 100,
+                row_offset_in_file: 0,
+                columns: vec![ColumnChunkInfo {
+                    column_idx: 0,
+                    column_name: "id".to_string(),
+                    data_page_offset: 0,
+                    compressed_size: 500,
+                    uncompressed_size: 500,
+                    page_locations: vec![], // empty
+                }],
+            }],
+        };
+        // No manifest page locs → false
+        assert!(!file_has_manifest_page_locs(&file_entry));
+    }
+
+    #[test]
+    fn test_projection_has_nested_with_some_nested() {
+        let schema = arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("id", arrow_schema::DataType::Int64, false),
+            arrow_schema::Field::new("tags", arrow_schema::DataType::List(
+                Arc::new(arrow_schema::Field::new("item", arrow_schema::DataType::Utf8, true))
+            ), true),
+        ]);
+        assert!(projection_has_nested(&Some(vec![0, 1]), &schema));
+        assert!(projection_has_nested(&Some(vec![1]), &schema));
+        assert!(!projection_has_nested(&Some(vec![0]), &schema));
+    }
+
+    #[test]
+    fn test_projection_has_nested_none_with_nested_schema() {
+        let schema = arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("id", arrow_schema::DataType::Int64, false),
+            arrow_schema::Field::new("tags", arrow_schema::DataType::List(
+                Arc::new(arrow_schema::Field::new("item", arrow_schema::DataType::Utf8, true))
+            ), true),
+        ]);
+        // None projection = all columns → should detect nested
+        assert!(projection_has_nested(&None, &schema));
+    }
+
+    #[test]
+    fn test_projection_has_nested_none_all_primitive() {
+        let schema = arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("id", arrow_schema::DataType::Int64, false),
+            arrow_schema::Field::new("name", arrow_schema::DataType::Utf8, false),
+        ]);
+        assert!(!projection_has_nested(&None, &schema));
+    }
+
+    #[test]
+    fn test_projection_has_nested_empty_projection() {
+        let schema = arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("tags", arrow_schema::DataType::List(
+                Arc::new(arrow_schema::Field::new("item", arrow_schema::DataType::Utf8, true))
+            ), true),
+        ]);
+        // Empty projection = no fields to check → false
+        assert!(!projection_has_nested(&Some(vec![]), &schema));
     }
 }
