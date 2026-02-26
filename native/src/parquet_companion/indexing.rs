@@ -451,20 +451,40 @@ pub async fn create_split_from_parquet(
                 // Compute page locations only for files that lack a native offset
                 // index. Files WITH a native offset index will have it loaded
                 // directly from the footer by CachedParquetReader at read time.
+                //
+                // IMPORTANT: Skip nested/repeated columns (List, Map, etc.) because
+                // their page headers report num_values as leaf-level element counts,
+                // not row counts. Using those to compute first_row_index would produce
+                // incorrect offsets that cause wrong-page fetches at read time.
+                let col_descr = pq_metadata
+                    .file_metadata()
+                    .schema_descr()
+                    .column(col_idx);
+                let is_nested_leaf = col_descr.max_rep_level() > 0;
+
                 let page_locs = if let Some(ref sf) = scan_file {
-                    // No offset index — compute by scanning Thrift page headers
-                    compute_page_locations_from_column_chunk(
-                        sf,
-                        col_meta.data_page_offset() as u64,
-                        col_meta.compressed_size() as u64,
-                        col_meta.dictionary_page_offset().map(|o| o as u64),
-                    ).unwrap_or_else(|e| {
+                    if is_nested_leaf {
+                        // Nested/repeated column — skip page location computation
                         debug_println!(
-                            "⚠️ INDEXING: Failed to compute page locations for col {} in rg {}: {}",
-                            col_name, rg_idx, e
+                            "⚠️ INDEXING: Skipping page location computation for nested column '{}' (max_rep_level={}) in rg {}",
+                            col_name, col_descr.max_rep_level(), rg_idx
                         );
                         Vec::new()
-                    })
+                    } else {
+                        // Primitive column — compute by scanning Thrift page headers
+                        compute_page_locations_from_column_chunk(
+                            sf,
+                            col_meta.data_page_offset() as u64,
+                            col_meta.compressed_size() as u64,
+                            col_meta.dictionary_page_offset().map(|o| o as u64),
+                        ).unwrap_or_else(|e| {
+                            debug_println!(
+                                "⚠️ INDEXING: Failed to compute page locations for col {} in rg {}: {}",
+                                col_name, rg_idx, e
+                            );
+                            Vec::new()
+                        })
+                    }
                 } else {
                     Vec::new()
                 };

@@ -9,6 +9,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use arrow_array::{Array, ArrayRef, RecordBatch};
 use arrow_schema::DataType;
+use futures::StreamExt;
 use parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder;
 use quickwit_storage::Storage;
 
@@ -17,6 +18,8 @@ use super::cached_reader::{ByteRangeCache, CachedParquetReader, CoalesceConfig};
 use super::doc_retrieval::{
     arrow_json_value, attach_page_locations, build_column_projection,
     build_row_selection_for_rows_in_selected_groups, compute_row_group_filter,
+    file_has_manifest_page_locs, is_nested_arrow_type, projection_has_nested,
+    split_projection_by_nesting,
 };
 use super::docid_mapping::group_doc_addresses_by_file;
 use super::manifest::{ColumnMapping, ParquetManifest};
@@ -382,6 +385,67 @@ pub async fn batch_parquet_to_tant_buffer(
     ).await
 }
 
+/// Merge two sequences of RecordBatches column-wise (horizontal concat).
+///
+/// Both sequences must have the same total row count (guaranteed by identical
+/// row group filter + row selection). The merged result has columns from both
+/// sequences: [prim_cols..., nested_cols...].
+///
+/// If batch counts match (expected), merge per-batch. If they differ (edge case),
+/// concatenate each sequence into one batch first, then merge.
+fn merge_batch_sequences(
+    prim_batches: Vec<RecordBatch>,
+    nested_batches: Vec<RecordBatch>,
+) -> Result<Vec<RecordBatch>> {
+    if prim_batches.is_empty() {
+        return Ok(nested_batches);
+    }
+    if nested_batches.is_empty() {
+        return Ok(prim_batches);
+    }
+
+    if prim_batches.len() == nested_batches.len() {
+        // Per-batch merge (common case — both streams produce same batch boundaries)
+        prim_batches
+            .into_iter()
+            .zip(nested_batches.into_iter())
+            .map(|(p, n)| merge_two_batches(p, n))
+            .collect()
+    } else {
+        // Batch counts differ — concatenate each sequence using arrow::compute
+        let prim_single = arrow::compute::concat_batches(
+            &prim_batches[0].schema(),
+            prim_batches.iter(),
+        )
+        .context("Failed to concat primitive batches")?;
+        let nested_single = arrow::compute::concat_batches(
+            &nested_batches[0].schema(),
+            nested_batches.iter(),
+        )
+        .context("Failed to concat nested batches")?;
+        Ok(vec![merge_two_batches(prim_single, nested_single)?])
+    }
+}
+
+/// Merge two RecordBatches horizontally (combine columns from both).
+fn merge_two_batches(a: RecordBatch, b: RecordBatch) -> Result<RecordBatch> {
+    anyhow::ensure!(
+        a.num_rows() == b.num_rows(),
+        "Row count mismatch in two-pass merge: primitive batch has {} rows, nested has {}",
+        a.num_rows(),
+        b.num_rows()
+    );
+    let mut fields = a.schema().fields().to_vec();
+    fields.extend(b.schema().fields().iter().cloned());
+    let merged_schema = Arc::new(arrow_schema::Schema::new(fields));
+
+    let mut columns: Vec<ArrayRef> = a.columns().to_vec();
+    columns.extend(b.columns().iter().cloned());
+
+    RecordBatch::try_new(merged_schema, columns)
+        .context("Failed to merge primitive and nested batches")
+}
+
 /// Core batch retrieval with pre-resolved file groups.
 ///
 /// Accepts groups already resolved via fast fields (or legacy segment→global→file).
@@ -436,32 +500,27 @@ pub async fn batch_parquet_to_tant_buffer_by_groups(
                 });
                 let meta_was_cached = cached_meta.is_some();
 
-                let reader = if let Some(meta) = cached_meta {
-                    CachedParquetReader::with_metadata(
-                        storage.clone(),
-                        path_buf.clone(),
-                        file_entry.file_size_bytes,
-                        meta,
-                    )
-                } else {
-                    CachedParquetReader::new(
-                        storage.clone(),
-                        path_buf.clone(),
-                        file_entry.file_size_bytes,
-                    )
+                // Helper: create a CachedParquetReader without page locations
+                let make_reader = |meta: Option<Arc<parquet::file::metadata::ParquetMetaData>>| {
+                    let r = if let Some(m) = meta {
+                        CachedParquetReader::with_metadata(
+                            storage.clone(), path_buf.clone(), file_entry.file_size_bytes, m,
+                        )
+                    } else {
+                        CachedParquetReader::new(
+                            storage.clone(), path_buf.clone(), file_entry.file_size_bytes,
+                        )
+                    };
+                    let r = if let Some(ref bc) = byte_cache {
+                        r.with_byte_cache(bc.clone())
+                    } else { r };
+                    if let Some(config) = coalesce_config {
+                        r.with_coalesce_config(config)
+                    } else { r }
                 };
-                let reader = if let Some(ref bc) = byte_cache {
-                    reader.with_byte_cache(bc.clone())
-                } else {
-                    reader
-                };
-                let reader = if let Some(config) = coalesce_config {
-                    reader.with_coalesce_config(config)
-                } else {
-                    reader
-                };
-                let reader = attach_page_locations(reader, file_entry);
 
+                // First pass: build reader WITHOUT page locations to get schema
+                let reader = make_reader(cached_meta);
                 let t_builder = std::time::Instant::now();
                 let builder = ParquetRecordBatchStreamBuilder::new(reader)
                     .await
@@ -471,18 +530,17 @@ pub async fn batch_parquet_to_tant_buffer_by_groups(
                     file_idx, t_builder.elapsed().as_millis(), meta_was_cached
                 );
 
+                let parquet_schema = builder.schema().clone();
+                let parquet_metadata = builder.metadata().clone();
+
                 // Cache the metadata for subsequent reads
                 if let Some(cache) = &metadata_cache {
                     if let Ok(mut guard) = cache.lock() {
                         if !guard.contains_key(&path_buf) {
-                            guard.insert(path_buf.clone(), builder.metadata().clone());
+                            guard.insert(path_buf.clone(), parquet_metadata.clone());
                         }
                     }
                 }
-
-                let parquet_schema = builder.schema().clone();
-                let parquet_metadata = builder.metadata().clone();
-                let parquet_file_schema = builder.parquet_schema().clone();
 
                 let total_parquet_columns = parquet_schema.fields().len();
                 perf_println!(
@@ -506,114 +564,168 @@ pub async fn batch_parquet_to_tant_buffer_by_groups(
                     total_parquet_columns
                 );
 
-                let builder = if let Some(ref proj) = projection {
-                    let mask = parquet::arrow::ProjectionMask::roots(
-                        &parquet_file_schema,
-                        proj.iter().cloned(),
-                    );
-                    perf_println!(
-                        "⏱️ PROJ_DIAG: file[{}] applying ProjectionMask with {} root indices",
-                        file_idx, proj.len()
-                    );
-                    builder.with_projection(mask)
-                } else {
-                    perf_println!(
-                        "⏱️ PROJ_DIAG: file[{}] NO projection applied (reading ALL {} columns)",
-                        file_idx, total_parquet_columns
-                    );
-                    builder
-                };
-
                 // Row indices within the file (already sorted by group_doc_addresses_by_file)
                 let row_indices: Vec<usize> =
                     rows.iter().map(|(_, row)| *row as usize).collect();
 
-                // Step 1: Determine which row groups contain our target rows
+                // Determine which row groups to read (shared by all passes)
                 let rg_filter = compute_row_group_filter(&row_indices, &parquet_metadata);
-
-                // Step 2: Apply row group filter
-                let builder = if let Some(ref filter) = rg_filter {
-                    let selected_rgs: Vec<usize> = filter
-                        .iter()
-                        .enumerate()
+                let selected_rgs: Option<Vec<usize>> = rg_filter.as_ref().map(|filter| {
+                    filter.iter().enumerate()
                         .filter(|(_, selected)| **selected)
                         .map(|(idx, _)| idx)
-                        .collect();
-
+                        .collect()
+                });
+                if let Some(ref rgs) = selected_rgs {
                     perf_println!(
                         "⏱️ PROJ_DIAG: file[{}] row_group_filter: selected {}/{} row groups (indices={:?})",
-                        file_idx, selected_rgs.len(), parquet_metadata.num_row_groups(), selected_rgs
+                        file_idx, rgs.len(), parquet_metadata.num_row_groups(), rgs
                     );
+                }
 
-                    builder.with_row_groups(selected_rgs)
-                } else {
-                    perf_println!(
-                        "⏱️ PROJ_DIAG: file[{}] row_group_filter: ALL {} row groups needed",
-                        file_idx, parquet_metadata.num_row_groups()
-                    );
-                    builder
-                };
-
-                // Step 3: Build RowSelection within the selected row groups
+                // Build RowSelection (shared by all passes)
                 let row_selection = build_row_selection_for_rows_in_selected_groups(
                     &row_indices,
                     &parquet_metadata,
                     rg_filter.as_deref(),
                 );
-                let has_row_selection = row_selection.is_some();
-                let builder = if let Some(selection) = row_selection {
-                    builder.with_row_selection(selection)
+                perf_println!(
+                    "⏱️ PROJ_DIAG: file[{}] row_selection present={}, target_rows={:?}",
+                    file_idx, row_selection.is_some(), row_indices
+                );
+
+                // --- 3-case read strategy ---
+                //
+                // Case A: file has native offset index OR no manifest page locs → single pass with page locs
+                // Case B: manifest page locs, no nested columns in projection → single pass with page locs
+                // Case C: manifest page locs AND nested columns in projection → TWO-PASS:
+                //         Pass 1: primitives with page loc injection
+                //         Pass 2: nested without page loc injection
+                //         Merge results column-wise
+
+                let uses_manifest_locs = file_has_manifest_page_locs(file_entry);
+                let has_nested_in_proj = projection_has_nested(&projection, &parquet_schema);
+
+                let need_two_pass = uses_manifest_locs && has_nested_in_proj;
+
+                // Helper: given a pre-configured reader, apply projection/filters, collect batches.
+                async fn build_and_collect(
+                    reader: CachedParquetReader,
+                    col_indices: Option<&Vec<usize>>,
+                    selected_rgs: &Option<Vec<usize>>,
+                    row_selection: Option<parquet::arrow::arrow_reader::RowSelection>,
+                ) -> Result<Vec<RecordBatch>> {
+                    let builder = ParquetRecordBatchStreamBuilder::new(reader)
+                        .await.context("Failed to create stream builder")?;
+                    let pq_schema = builder.parquet_schema().clone();
+                    let builder = match col_indices {
+                        Some(indices) => builder.with_projection(
+                            parquet::arrow::ProjectionMask::roots(&pq_schema, indices.iter().cloned()),
+                        ),
+                        None => builder,
+                    };
+                    let builder = match selected_rgs {
+                        Some(rgs) => builder.with_row_groups(rgs.clone()),
+                        None => builder,
+                    };
+                    let builder = match row_selection {
+                        Some(sel) => builder.with_row_selection(sel),
+                        None => builder,
+                    };
+                    builder.build().context("Failed to build stream")?
+                        .collect::<Vec<_>>().await
+                        .into_iter()
+                        .collect::<std::result::Result<Vec<_>, _>>()
+                        .context("Failed reading batches")
+                }
+
+                // Collect batches from the read(s)
+                let collected_batches: Vec<RecordBatch> = if need_two_pass {
+                    // Case C: Two-pass read
+                    let all_indices: Vec<usize> = if let Some(ref proj) = projection {
+                        proj.clone()
+                    } else {
+                        (0..parquet_schema.fields().len()).collect()
+                    };
+                    let (prim_indices, nested_indices) =
+                        split_projection_by_nesting(&all_indices, &parquet_schema);
+
+                    perf_println!(
+                        "⏱️ PROJ_DIAG: file[{}] Case C TWO-PASS: prim={:?}, nested={:?}",
+                        file_idx, prim_indices, nested_indices
+                    );
+
+                    match (prim_indices, nested_indices) {
+                        (Some(prim), Some(nested)) => {
+                            // Both primitive and nested — true two-pass, concurrent
+                            let prim_reader = make_reader(Some(parquet_metadata.clone()));
+                            let prim_reader = attach_page_locations(prim_reader, file_entry);
+                            let nested_reader = make_reader(Some(parquet_metadata.clone()));
+
+                            let (prim_batches, nested_batches) = futures::future::try_join(
+                                build_and_collect(prim_reader, Some(&prim), &selected_rgs, row_selection.clone()),
+                                build_and_collect(nested_reader, Some(&nested), &selected_rgs, row_selection),
+                            ).await?;
+
+                            perf_println!(
+                                "⏱️ PROJ_DIAG: file[{}] two-pass: {} prim batches ({} rows), {} nested batches ({} rows)",
+                                file_idx,
+                                prim_batches.len(),
+                                prim_batches.iter().map(|b| b.num_rows()).sum::<usize>(),
+                                nested_batches.len(),
+                                nested_batches.iter().map(|b| b.num_rows()).sum::<usize>(),
+                            );
+
+                            merge_batch_sequences(prim_batches, nested_batches)?
+                        }
+                        (Some(_prim), None) => {
+                            // Only primitives — single pass with page locs
+                            let reader = make_reader(Some(parquet_metadata.clone()));
+                            let reader = attach_page_locations(reader, file_entry);
+                            build_and_collect(reader, projection.as_ref(), &selected_rgs, row_selection).await?
+                        }
+                        (None, Some(_nested)) => {
+                            // Only nested — single pass WITHOUT page locs
+                            let reader = make_reader(Some(parquet_metadata.clone()));
+                            build_and_collect(reader, projection.as_ref(), &selected_rgs, row_selection).await?
+                        }
+                        (None, None) => Vec::new(), // Empty projection — no columns to read
+                    }
                 } else {
-                    builder
+                    // Case A or B: Single-pass with page location injection
+                    let reader = make_reader(Some(parquet_metadata.clone()));
+                    let reader = attach_page_locations(reader, file_entry);
+                    build_and_collect(reader, projection.as_ref(), &selected_rgs, row_selection).await?
                 };
-                perf_println!(
-                    "⏱️ PROJ_DIAG: file[{}] row_selection applied={}, target_rows={:?}",
-                    file_idx, has_row_selection, row_indices
-                );
 
-                let t_stream = std::time::Instant::now();
-                let mut stream = builder
-                    .build()
-                    .context("Failed to build parquet record batch stream")?;
-                perf_println!(
-                    "⏱️ PROJ_DIAG: file[{}] stream.build() took {}ms",
-                    file_idx, t_stream.elapsed().as_millis()
-                );
-
-                // Build column info AFTER projection is applied (schema may have fewer columns)
-                // We need to wait until we see the first batch to get the projected schema.
+                // Convert collected batches to TANT bytes
                 let mut column_info: Option<Vec<(String, u8)>> = None;
-
-                // Collect TANT bytes for each row
                 let mut collected_rows: Vec<Vec<u8>> = Vec::new();
                 let mut batch_count = 0u32;
-                use futures::StreamExt;
                 let t_read = std::time::Instant::now();
-                while let Some(batch_result) = stream.next().await {
-                    let batch = batch_result.context("Failed to read parquet batch")?;
+                for batch in &collected_batches {
                     batch_count += 1;
 
                     if batch_count == 1 && *crate::debug::PERFLOG_ENABLED {
                         let batch_schema = batch.schema();
                         let col_names: Vec<&str> = batch_schema.fields().iter().map(|f| f.name().as_str()).collect();
                         perf_println!(
-                            "⏱️ PROJ_DIAG: file[{}] FIRST stream.next() took {}ms — batch has {} rows, {} columns, names: {:?}",
-                            file_idx, t_read.elapsed().as_millis(), batch.num_rows(), batch.num_columns(), col_names
+                            "⏱️ PROJ_DIAG: file[{}] FIRST batch — {} rows, {} columns, names: {:?}",
+                            file_idx, batch.num_rows(), batch.num_columns(), col_names
                         );
                     }
 
-                    // Build column info lazily from the projected batch schema
                     let info = column_info.get_or_insert_with(|| {
                         build_column_info(&batch.schema(), &manifest.column_mapping)
                     });
 
                     for row_idx in 0..batch.num_rows() {
-                        let doc_bytes = extract_row_as_tant(&batch, row_idx, info)?;
+                        let doc_bytes = extract_row_as_tant(batch, row_idx, info)?;
                         collected_rows.push(doc_bytes);
                     }
                 }
                 perf_println!(
-                    "⏱️ PROJ_DIAG: file[{}] stream exhausted: {} batches, {} rows total, read took {}ms",
+                    "⏱️ PROJ_DIAG: file[{}] processed: {} batches, {} rows total, took {}ms",
                     file_idx, batch_count, collected_rows.len(), t_read.elapsed().as_millis()
                 );
 
@@ -991,6 +1103,110 @@ mod tests {
         let info = build_column_info(&arrow_schema, &[]);
         assert_eq!(info.len(), 1);
         assert_eq!(info[0], ("score".to_string(), FIELD_TYPE_FLOAT));
+    }
+
+    #[test]
+    fn test_merge_two_batches_combines_columns() {
+        let schema_a = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+        ]));
+        let schema_b = Arc::new(Schema::new(vec![
+            Field::new("tags", DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))), true),
+        ]));
+        let batch_a = RecordBatch::try_new(
+            schema_a,
+            vec![Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef],
+        ).unwrap();
+        let batch_b = RecordBatch::try_new(
+            schema_b,
+            vec![Arc::new({
+                let mut builder = arrow_array::builder::ListBuilder::new(arrow_array::builder::StringBuilder::new());
+                builder.values().append_value("a");
+                builder.append(true);
+                builder.values().append_value("b");
+                builder.append(true);
+                builder.append(false); // null
+                builder.finish()
+            }) as ArrayRef],
+        ).unwrap();
+
+        let merged = merge_two_batches(batch_a, batch_b).unwrap();
+        assert_eq!(merged.num_columns(), 2);
+        assert_eq!(merged.num_rows(), 3);
+        assert_eq!(merged.schema().field(0).name(), "id");
+        assert_eq!(merged.schema().field(1).name(), "tags");
+    }
+
+    #[test]
+    fn test_merge_two_batches_row_count_mismatch() {
+        let batch_a = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)])),
+            vec![Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef],
+        ).unwrap();
+        let batch_b = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("y", DataType::Int32, false)])),
+            vec![Arc::new(Int32Array::from(vec![10, 20, 30])) as ArrayRef],
+        ).unwrap();
+        // Different row counts → RecordBatch::try_new should fail
+        assert!(merge_two_batches(batch_a, batch_b).is_err());
+    }
+
+    #[test]
+    fn test_merge_batch_sequences_equal_counts() {
+        let make_batch = |name: &str, vals: Vec<i32>| {
+            RecordBatch::try_new(
+                Arc::new(Schema::new(vec![Field::new(name, DataType::Int32, false)])),
+                vec![Arc::new(Int32Array::from(vals)) as ArrayRef],
+            ).unwrap()
+        };
+
+        let prims = vec![make_batch("a", vec![1, 2]), make_batch("a", vec![3])];
+        let nested = vec![make_batch("b", vec![10, 20]), make_batch("b", vec![30])];
+        let merged = merge_batch_sequences(prims, nested).unwrap();
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].num_columns(), 2);
+        assert_eq!(merged[0].num_rows(), 2);
+        assert_eq!(merged[1].num_rows(), 1);
+    }
+
+    #[test]
+    fn test_merge_batch_sequences_unequal_counts() {
+        let make_batch = |name: &str, vals: Vec<i32>| {
+            RecordBatch::try_new(
+                Arc::new(Schema::new(vec![Field::new(name, DataType::Int32, false)])),
+                vec![Arc::new(Int32Array::from(vals)) as ArrayRef],
+            ).unwrap()
+        };
+
+        // 2 prim batches, 1 nested batch — different counts triggers concat path
+        let prims = vec![make_batch("a", vec![1, 2]), make_batch("a", vec![3])];
+        let nested = vec![make_batch("b", vec![10, 20, 30])];
+        let merged = merge_batch_sequences(prims, nested).unwrap();
+        assert_eq!(merged.len(), 1); // Concatenated into single batch
+        assert_eq!(merged[0].num_columns(), 2);
+        assert_eq!(merged[0].num_rows(), 3);
+    }
+
+    #[test]
+    fn test_merge_batch_sequences_empty_prim() {
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)])),
+            vec![Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef],
+        ).unwrap();
+        let merged = merge_batch_sequences(vec![], vec![batch.clone()]).unwrap();
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].num_columns(), 1);
+    }
+
+    #[test]
+    fn test_merge_batch_sequences_empty_nested() {
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)])),
+            vec![Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef],
+        ).unwrap();
+        let merged = merge_batch_sequences(vec![batch.clone()], vec![]).unwrap();
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].num_columns(), 1);
     }
 
     #[test]

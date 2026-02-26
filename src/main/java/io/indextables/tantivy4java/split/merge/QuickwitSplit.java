@@ -1382,6 +1382,13 @@ public class QuickwitSplit {
     public static native void nativeWriteTestParquetComplex(String path, int numRows, long idOffset);
 
     /**
+     * Test helper: write a complex parquet file WITHOUT a native offset index.
+     * Same schema as nativeWriteTestParquetComplex but with offset index disabled,
+     * simulating legacy parquet files that require manifest-sourced page locations.
+     */
+    public static native void nativeWriteTestParquetComplexNoPageIndex(String path, int numRows, long idOffset);
+
+    /**
      * Test helper: write a parquet file with IP address columns (stored as UTF8 strings).
      * Schema: id (i64), src_ip (utf8), dst_ip (utf8), port (i64), label (utf8)
      */
