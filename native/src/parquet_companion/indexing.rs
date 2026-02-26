@@ -456,25 +456,32 @@ pub async fn create_split_from_parquet(
                         .file_metadata()
                         .schema_descr()
                         .column(col_idx);
-                    // Compute page locations for all column types:
-                    // - Flat columns: exact first_row_index from num_values
-                    // - Nested columns (List/Map/Struct): exact first_row_index
-                    //   via rep-level scanning (decompresses V1 pages at index time)
-                    compute_page_locations_from_column_chunk(
-                        sf,
-                        col_meta.data_page_offset() as u64,
-                        col_meta.compressed_size() as u64,
-                        col_meta.dictionary_page_offset().map(|o| o as u64),
-                        col_desc.max_rep_level(),
-                        rg_meta.num_rows(),
-                        col_meta.compression(),
-                    ).unwrap_or_else(|e| {
+                    if col_desc.max_rep_level() > 0 {
+                        // Nested column (List/Map/Struct): skip page-level index.
+                        // V1 parquet doesn't guarantee accurate page boundaries
+                        // for nested types. CachedParquetReader will synthesize a
+                        // single full-chunk entry at read time, downloading the
+                        // entire column chunk.
                         debug_println!(
-                            "⚠️ INDEXING: Failed to compute page locations for col {} in rg {}: {}",
-                            col_name, rg_idx, e
+                            "📦 INDEXING: skipping page locations for nested col {} (max_rep_level={}) in rg {}",
+                            col_name, col_desc.max_rep_level(), rg_idx
                         );
                         Vec::new()
-                    })
+                    } else {
+                        // Flat column: exact first_row_index from num_values
+                        compute_page_locations_from_column_chunk(
+                            sf,
+                            col_meta.data_page_offset() as u64,
+                            col_meta.compressed_size() as u64,
+                            col_meta.dictionary_page_offset().map(|o| o as u64),
+                        ).unwrap_or_else(|e| {
+                            debug_println!(
+                                "⚠️ INDEXING: Failed to compute page locations for col {} in rg {}: {}",
+                                col_name, rg_idx, e
+                            );
+                            Vec::new()
+                        })
+                    }
                 } else {
                     Vec::new()
                 };
@@ -3065,5 +3072,126 @@ mod tests {
             "_phash_name should exist (not excluded)");
         assert!(schema.get_field(&format!("{}category", PHASH_FIELD_PREFIX)).is_err(),
             "_phash_category should NOT exist (excluded)");
+    }
+
+    /// Verify that indexing produces page_locations for flat columns but
+    /// empty page_locations for nested columns (List/Map/Struct) in V1
+    /// parquet files (no native offset index).
+    #[tokio::test]
+    async fn test_nested_columns_get_empty_page_locations() {
+        use arrow_array::*;
+        use arrow_array::builder::{ListBuilder, Int32Builder};
+        use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+        use parquet::arrow::ArrowWriter;
+        use parquet::file::properties::WriterProperties;
+        use std::sync::Arc;
+
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let pq_path = tmp_dir.path().join("mixed_columns.parquet");
+
+        // Schema: one flat column, one List<Int32> nested column
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new(
+                "tags",
+                DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+                true,
+            ),
+        ]));
+
+        // Write enough rows to create multiple data pages
+        let num_rows = 5000;
+        let ids: Vec<i64> = (0..num_rows).collect();
+
+        let mut list_builder = ListBuilder::new(Int32Builder::new());
+        for i in 0..num_rows {
+            let count = (i % 5) as usize + 1; // 1-5 elements per list
+            for j in 0..count {
+                list_builder.values().append_value((i * 10 + j as i64) as i32);
+            }
+            list_builder.append(true);
+        }
+
+        let batch = RecordBatch::try_new(schema.clone(), vec![
+            Arc::new(Int64Array::from(ids)),
+            Arc::new(list_builder.finish()),
+        ]).unwrap();
+
+        // V1 data pages: small page size to force multiple pages, and
+        // disable offset index to simulate a V1 file without native page index.
+        let props = WriterProperties::builder()
+            .set_data_page_size_limit(4096)
+            .set_write_batch_size(256)
+            .set_offset_index_disabled(true)
+            .build();
+
+        let file = std::fs::File::create(&pq_path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, schema, Some(props)).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        // Create split via indexing — includes manifest with page locations
+        let output_path = tmp_dir.path().join("nested_test.split");
+        let config = CreateFromParquetConfig {
+            table_root: tmp_dir.path().to_string_lossy().to_string(),
+            ..Default::default()
+        };
+        let storage: Arc<dyn quickwit_storage::Storage> =
+            Arc::new(quickwit_storage::RamStorage::default());
+
+        let result = create_split_from_parquet(
+            &[pq_path.to_string_lossy().to_string()],
+            output_path.to_str().unwrap(),
+            &config,
+            &storage,
+        ).await.expect("create_split_from_parquet should succeed");
+
+        assert!(result.metadata.num_docs > 0);
+
+        // Read back the manifest from the split bundle
+        let split_bytes = std::fs::read(&output_path).unwrap();
+        let file_slice = tantivy::directory::FileSlice::new(Arc::new(
+            tantivy::directory::OwnedBytes::new(split_bytes),
+        ));
+        let bundle = quickwit_directories::BundleDirectory::open_split(file_slice).unwrap();
+        use tantivy::directory::Directory;
+        use crate::parquet_companion::manifest_io::{MANIFEST_FILENAME, deserialize_manifest};
+        let manifest_path = std::path::PathBuf::from(MANIFEST_FILENAME);
+        let manifest_bytes = bundle.atomic_read(&manifest_path)
+            .expect("Should read manifest from bundle");
+        let manifest = deserialize_manifest(&manifest_bytes)
+            .expect("Should deserialize manifest");
+
+        // Verify the manifest
+        assert_eq!(manifest.parquet_files.len(), 1, "should have one file entry");
+        let file_entry = &manifest.parquet_files[0];
+        assert!(!file_entry.row_groups.is_empty(), "should have at least one row group");
+
+        for rg in &file_entry.row_groups {
+            assert!(rg.columns.len() >= 2, "should have at least 2 columns");
+
+            // Find flat and nested columns by index — column names come from
+            // the parquet schema_descr which uses leaf column names.
+            // Column 0 = "id" (flat, max_rep_level=0)
+            let id_col = &rg.columns[0];
+            // Remaining columns are from the nested "tags" list (max_rep_level>0)
+            let nested_cols: Vec<_> = rg.columns.iter().skip(1).collect();
+
+            // Flat column should have multiple page locations
+            assert!(
+                id_col.page_locations.len() > 1,
+                "flat column '{}' should have multiple page locations, got {}",
+                id_col.column_name, id_col.page_locations.len()
+            );
+
+            // All nested columns should have NO page locations (skipped at index time)
+            for nested_col in &nested_cols {
+                assert!(
+                    nested_col.page_locations.is_empty(),
+                    "nested column '{}' (idx={}) should have empty page_locations, got {}",
+                    nested_col.column_name, nested_col.column_idx, nested_col.page_locations.len()
+                );
+            }
+        }
     }
 }

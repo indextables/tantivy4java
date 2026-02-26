@@ -363,27 +363,51 @@ impl AsyncFileReader for CachedParquetReader {
                 .await?;
 
             // Inject manifest-sourced page locations if the metadata lacks an offset index.
-            // Both flat and nested columns get per-page entries. For nested columns,
-            // exact first_row_index is computed at index time via rep-level scanning.
+            // Flat columns get per-page entries from the manifest. Nested columns
+            // (max_rep_level > 0) or columns with empty manifest entries get a single
+            // full-chunk PageLocation so arrow-rs downloads the entire column chunk —
+            // V1 parquet doesn't guarantee accurate page boundaries for nested types.
             let metadata = if metadata.offset_index().is_none() {
                 if let Some(ref manifest_locs) = self.manifest_page_locations {
+                    let schema_descr = metadata.file_metadata().schema_descr();
                     let offset_index: Vec<Vec<OffsetIndexMetaData>> = manifest_locs
                         .iter()
-                        .map(|rg_cols| {
+                        .enumerate()
+                        .map(|(rg_idx, rg_cols)| {
                             rg_cols
                                 .iter()
-                                .map(|col_pages| {
-                                    let page_locations: Vec<PageLocation> = col_pages
-                                        .iter()
-                                        .map(|pl| PageLocation {
-                                            offset: pl.offset,
-                                            compressed_page_size: pl.compressed_page_size,
-                                            first_row_index: pl.first_row_index,
-                                        })
-                                        .collect();
-                                    OffsetIndexMetaData {
-                                        page_locations,
-                                        unencoded_byte_array_data_bytes: None,
+                                .enumerate()
+                                .map(|(col_idx, col_pages)| {
+                                    let is_nested = schema_descr.column(col_idx).max_rep_level() > 0;
+                                    if is_nested || col_pages.is_empty() {
+                                        // Nested column or missing manifest data:
+                                        // synthesize a single entry covering the
+                                        // whole column chunk so arrow-rs fetches
+                                        // the full range.
+                                        let col_meta = metadata.row_group(rg_idx).column(col_idx);
+                                        let (start, len) = col_meta.byte_range();
+                                        OffsetIndexMetaData {
+                                            page_locations: vec![PageLocation {
+                                                offset: start as i64,
+                                                compressed_page_size: len as i32,
+                                                first_row_index: 0,
+                                            }],
+                                            unencoded_byte_array_data_bytes: None,
+                                        }
+                                    } else {
+                                        // Flat column: use manifest page locations
+                                        let page_locations: Vec<PageLocation> = col_pages
+                                            .iter()
+                                            .map(|pl| PageLocation {
+                                                offset: pl.offset,
+                                                compressed_page_size: pl.compressed_page_size,
+                                                first_row_index: pl.first_row_index,
+                                            })
+                                            .collect();
+                                        OffsetIndexMetaData {
+                                            page_locations,
+                                            unencoded_byte_array_data_bytes: None,
+                                        }
                                     }
                                 })
                                 .collect()

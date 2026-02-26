@@ -31,6 +31,11 @@ use crate::perf_println;
 /// Extract page locations from manifest ColumnChunkInfo into the structure
 /// expected by CachedParquetReader: [row_group][column][page_location].
 /// Returns the nested structure and a flag indicating if any pages are present.
+///
+/// Note: nested columns (max_rep_level > 0) will have empty page_locations in
+/// the manifest because V1 parquet doesn't guarantee accurate page boundaries
+/// for complex types. CachedParquetReader::get_metadata() handles the fallback
+/// by synthesizing a single full-chunk PageLocation for such columns.
 fn build_manifest_page_locations(
     file_entry: &ParquetFileEntry,
 ) -> (Vec<Vec<Vec<PageLocationEntry>>>, bool) {
