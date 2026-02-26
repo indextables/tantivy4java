@@ -29,6 +29,44 @@ const PAGE_TYPE_INDEX_PAGE: i32 = 1;
 const PAGE_TYPE_DICTIONARY_PAGE: i32 = 2;
 const PAGE_TYPE_DATA_PAGE_V2: i32 = 3;
 
+/// Internal page info collected during page header scanning.
+struct PageInfo {
+    file_offset: i64,
+    total_page_size: i32,
+    num_rows: i64,
+    /// Whether this page starts with continuation data from the previous page's
+    /// last row (first rep_level > 0). Only meaningful for nested columns.
+    starts_with_continuation: bool,
+}
+
+/// Merge continuation pages for nested columns.
+///
+/// For nested columns (List/Map/Struct), a single row's data can span multiple
+/// pages when the row contains many array elements. The parquet spec requires
+/// that when an offset_index is present, pages must begin on row boundaries
+/// (rep_level=0). This function merges each continuation page (first rep_level > 0)
+/// into the preceding page so that no row straddles a merged page boundary.
+///
+/// For non-nested columns (`is_nested == false`), returns pages unchanged.
+fn merge_continuation_pages(pages: Vec<PageInfo>, is_nested: bool) -> Vec<PageInfo> {
+    if !is_nested {
+        return pages;
+    }
+    let mut merged: Vec<PageInfo> = Vec::new();
+    for page in pages {
+        if page.starts_with_continuation && !merged.is_empty() {
+            // Extend the previous merged page to cover this continuation page
+            let prev = merged.last_mut().unwrap();
+            let new_end = page.file_offset + page.total_page_size as i64;
+            prev.total_page_size = (new_end - prev.file_offset) as i32;
+            prev.num_rows += page.num_rows;
+        } else {
+            merged.push(page);
+        }
+    }
+    merged
+}
+
 /// Compute page locations for a single column chunk by scanning
 /// Thrift-encoded page headers from the raw column chunk bytes.
 ///
@@ -87,15 +125,6 @@ pub fn compute_page_locations_from_column_chunk(
 
     // Reusable decompression buffer for nested V1 pages
     let mut decompress_buf: Vec<u8> = Vec::new();
-
-    struct PageInfo {
-        file_offset: i64,
-        total_page_size: i32,
-        num_rows: i64,
-        /// Whether this page starts with continuation data from the previous page's
-        /// last row (first rep_level > 0). Only meaningful for nested columns.
-        starts_with_continuation: bool,
-    }
 
     let mut pages: Vec<PageInfo> = Vec::new();
     let mut pos: usize = 0;
@@ -192,32 +221,8 @@ pub fn compute_page_locations_from_column_chunk(
     }
 
     // For nested columns, merge pages where a row spans a page boundary.
-    //
-    // The parquet spec requires that when an offset_index is present, pages must
-    // begin on row boundaries (rep_level=0). Files written without an offset index
-    // don't follow this constraint — a row with many array elements can span
-    // multiple pages. arrow-rs's scan_ranges() uses first_row_index to select
-    // pages and will miss continuation pages, causing decode errors.
-    //
-    // Fix: merge each continuation page (first rep_level > 0) into the preceding
-    // page so that no row straddles a merged page boundary.
-    let pages_to_use: Vec<PageInfo> = if is_nested {
-        let mut merged: Vec<PageInfo> = Vec::new();
-        for page in pages {
-            if page.starts_with_continuation && !merged.is_empty() {
-                // Extend the previous merged page to cover this continuation page
-                let prev = merged.last_mut().unwrap();
-                let new_end = page.file_offset + page.total_page_size as i64;
-                prev.total_page_size = (new_end - prev.file_offset) as i32;
-                prev.num_rows += page.num_rows;
-            } else {
-                merged.push(page);
-            }
-        }
-        merged
-    } else {
-        pages
-    };
+    // See merge_continuation_pages() for details.
+    let pages_to_use = merge_continuation_pages(pages, is_nested);
 
     // Build locations with exact cumulative row counts
     let mut cumulative_rows: i64 = 0;
@@ -1650,5 +1655,150 @@ mod tests {
         // byte = 0b00000001 → lowest bit is 1
         let data = [0x03, 0x01];
         assert!(!first_rep_is_zero(&data, 1));
+    }
+
+    // ===================================================================
+    // Direct merge_continuation_pages tests with synthetic data
+    // ===================================================================
+
+    /// Test that merge_continuation_pages correctly merges continuation pages
+    /// for nested columns. Uses synthetic PageInfo data to guarantee the merging
+    /// code path is exercised regardless of parquet writer behavior.
+    #[test]
+    fn test_merge_continuation_pages_synthetic() {
+        // Scenario: a row with a large array spans 3 pages, then the next row
+        // starts a new page, then another row spans 2 pages.
+        //
+        // Page layout before merging:
+        //   Page 0: offset=100, size=1000, rows=1, continuation=false  (row 0 starts)
+        //   Page 1: offset=1100, size=800, rows=0, continuation=true   (row 0 continues)
+        //   Page 2: offset=1900, size=600, rows=0, continuation=true   (row 0 continues)
+        //   Page 3: offset=2500, size=500, rows=1, continuation=false  (row 1 starts)
+        //   Page 4: offset=3000, size=400, rows=1, continuation=false  (row 2 starts)
+        //   Page 5: offset=3400, size=700, rows=0, continuation=true   (row 2 continues)
+        let pages = vec![
+            PageInfo { file_offset: 100, total_page_size: 1000, num_rows: 1, starts_with_continuation: false },
+            PageInfo { file_offset: 1100, total_page_size: 800, num_rows: 0, starts_with_continuation: true },
+            PageInfo { file_offset: 1900, total_page_size: 600, num_rows: 0, starts_with_continuation: true },
+            PageInfo { file_offset: 2500, total_page_size: 500, num_rows: 1, starts_with_continuation: false },
+            PageInfo { file_offset: 3000, total_page_size: 400, num_rows: 1, starts_with_continuation: false },
+            PageInfo { file_offset: 3400, total_page_size: 700, num_rows: 0, starts_with_continuation: true },
+        ];
+
+        let merged = merge_continuation_pages(pages, true);
+
+        // After merging:
+        //   Merged 0: offset=100, size=2400 (100..2500), rows=1  (pages 0+1+2)
+        //   Merged 1: offset=2500, size=500, rows=1              (page 3, unchanged)
+        //   Merged 2: offset=3000, size=1100 (3000..4100), rows=1 (pages 4+5)
+        assert_eq!(merged.len(), 3, "Should have 3 merged pages");
+
+        // Merged page 0: covers pages 0, 1, 2
+        assert_eq!(merged[0].file_offset, 100);
+        assert_eq!(merged[0].total_page_size, 2400); // 2500 - 100
+        assert_eq!(merged[0].num_rows, 1);
+
+        // Merged page 1: page 3 standalone
+        assert_eq!(merged[1].file_offset, 2500);
+        assert_eq!(merged[1].total_page_size, 500);
+        assert_eq!(merged[1].num_rows, 1);
+
+        // Merged page 2: covers pages 4, 5
+        assert_eq!(merged[2].file_offset, 3000);
+        assert_eq!(merged[2].total_page_size, 1100); // 4100 - 3000
+        assert_eq!(merged[2].num_rows, 1);
+    }
+
+    /// Test that merge_continuation_pages is a no-op for non-nested columns.
+    #[test]
+    fn test_merge_continuation_pages_flat_column() {
+        let pages = vec![
+            PageInfo { file_offset: 0, total_page_size: 100, num_rows: 10, starts_with_continuation: false },
+            PageInfo { file_offset: 100, total_page_size: 100, num_rows: 10, starts_with_continuation: false },
+            PageInfo { file_offset: 200, total_page_size: 100, num_rows: 10, starts_with_continuation: false },
+        ];
+
+        let merged = merge_continuation_pages(pages, false);
+
+        assert_eq!(merged.len(), 3, "Flat columns should not be merged");
+        assert_eq!(merged[0].file_offset, 0);
+        assert_eq!(merged[1].file_offset, 100);
+        assert_eq!(merged[2].file_offset, 200);
+    }
+
+    /// Test merging when the continuation page adds rows (a new row starts mid-page
+    /// after the continuation data). This tests the num_rows accumulation logic.
+    #[test]
+    fn test_merge_continuation_pages_with_mixed_rows() {
+        // Scenario: page 1 continues from page 0's last row but also starts a new row
+        //   Page 0: offset=0, size=500, rows=3, continuation=false
+        //   Page 1: offset=500, size=500, rows=2, continuation=true  (continues row 2, then row 3 and 4 start)
+        //   Page 2: offset=1000, size=500, rows=5, continuation=false
+        let pages = vec![
+            PageInfo { file_offset: 0, total_page_size: 500, num_rows: 3, starts_with_continuation: false },
+            PageInfo { file_offset: 500, total_page_size: 500, num_rows: 2, starts_with_continuation: true },
+            PageInfo { file_offset: 1000, total_page_size: 500, num_rows: 5, starts_with_continuation: false },
+        ];
+
+        let merged = merge_continuation_pages(pages, true);
+
+        assert_eq!(merged.len(), 2, "Should merge page 0 and 1");
+
+        // Merged page 0: pages 0+1, rows = 3 + 2 = 5
+        assert_eq!(merged[0].file_offset, 0);
+        assert_eq!(merged[0].total_page_size, 1000); // 1000 - 0
+        assert_eq!(merged[0].num_rows, 5);
+
+        // Merged page 1: page 2 standalone
+        assert_eq!(merged[1].file_offset, 1000);
+        assert_eq!(merged[1].total_page_size, 500);
+        assert_eq!(merged[1].num_rows, 5);
+    }
+
+    /// Test edge case: all pages are continuations (except the first).
+    #[test]
+    fn test_merge_continuation_pages_all_continuations() {
+        let pages = vec![
+            PageInfo { file_offset: 0, total_page_size: 100, num_rows: 1, starts_with_continuation: false },
+            PageInfo { file_offset: 100, total_page_size: 100, num_rows: 0, starts_with_continuation: true },
+            PageInfo { file_offset: 200, total_page_size: 100, num_rows: 0, starts_with_continuation: true },
+            PageInfo { file_offset: 300, total_page_size: 100, num_rows: 0, starts_with_continuation: true },
+            PageInfo { file_offset: 400, total_page_size: 100, num_rows: 0, starts_with_continuation: true },
+        ];
+
+        let merged = merge_continuation_pages(pages, true);
+
+        // Everything should collapse into a single merged page
+        assert_eq!(merged.len(), 1, "All continuations should merge into one page");
+        assert_eq!(merged[0].file_offset, 0);
+        assert_eq!(merged[0].total_page_size, 500); // 500 - 0
+        assert_eq!(merged[0].num_rows, 1);
+    }
+
+    /// Test edge case: no continuation pages (nothing to merge).
+    #[test]
+    fn test_merge_continuation_pages_no_continuations() {
+        let pages = vec![
+            PageInfo { file_offset: 0, total_page_size: 200, num_rows: 5, starts_with_continuation: false },
+            PageInfo { file_offset: 200, total_page_size: 200, num_rows: 5, starts_with_continuation: false },
+            PageInfo { file_offset: 400, total_page_size: 200, num_rows: 5, starts_with_continuation: false },
+        ];
+
+        let merged = merge_continuation_pages(pages, true);
+
+        assert_eq!(merged.len(), 3, "No continuations means no merging");
+        for (i, m) in merged.iter().enumerate() {
+            assert_eq!(m.file_offset, (i * 200) as i64);
+            assert_eq!(m.total_page_size, 200);
+            assert_eq!(m.num_rows, 5);
+        }
+    }
+
+    /// Test edge case: empty page list.
+    #[test]
+    fn test_merge_continuation_pages_empty() {
+        let pages: Vec<PageInfo> = vec![];
+        let merged = merge_continuation_pages(pages, true);
+        assert!(merged.is_empty());
     }
 }
