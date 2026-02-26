@@ -228,13 +228,14 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_crea
 
         // Extract parquet_coalesce_max_gap (String→u64) for parquet byte-range coalescing
         if let Ok(ptr_obj) = env.call_method(&split_config_jobject, "get", "(Ljava/lang/Object;)Ljava/lang/Object;", &[(&env.new_string("parquet_coalesce_max_gap").unwrap()).into()]) {
-            let ptr_jobject = ptr_obj.l().unwrap();
-            if !ptr_jobject.is_null() {
-                if let Ok(ptr_str) = env.get_string((&ptr_jobject).into()) {
-                    let s: String = ptr_str.into();
-                    if let Ok(v) = s.parse::<u64>() {
-                        debug_println!("RUST DEBUG: Extracted parquet_coalesce_max_gap from Java config: {}", v);
-                        parquet_coalesce_max_gap = Some(v);
+            if let Ok(ptr_jobject) = ptr_obj.l() {
+                if !ptr_jobject.is_null() {
+                    if let Ok(ptr_str) = env.get_string((&ptr_jobject).into()) {
+                        let s: String = ptr_str.into();
+                        if let Ok(v) = s.parse::<u64>() {
+                            debug_println!("RUST DEBUG: Extracted parquet_coalesce_max_gap from Java config: {}", v);
+                            parquet_coalesce_max_gap = Some(v);
+                        }
                     }
                 }
             }

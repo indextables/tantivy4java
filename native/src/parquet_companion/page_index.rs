@@ -335,7 +335,7 @@ fn count_rle_bp_zeros(data: &[u8], bit_width: u8, total_values: usize) -> usize 
                 }
             } else {
                 // General: extract each value bit by bit
-                for i in 0..num_values_in_run {
+                'values: for i in 0..num_values_in_run {
                     let bit_offset = i * bit_width as usize;
                     let byte_idx = bit_offset / 8;
                     let bit_idx = bit_offset % 8;
@@ -344,7 +344,9 @@ fn count_rle_bp_zeros(data: &[u8], bit_width: u8, total_values: usize) -> usize 
                         let cur_byte = byte_idx + (bit_idx + b) / 8;
                         let cur_bit = (bit_idx + b) % 8;
                         if pos + cur_byte >= data.len() {
-                            break;
+                            // Truncated data — stop counting entirely rather than
+                            // reading a partial value that could be falsely zero.
+                            break 'values;
                         }
                         val |= (((data[pos + cur_byte] >> cur_bit) & 1) as u64) << b;
                     }
@@ -1288,5 +1290,101 @@ mod tests {
             "Expected multiple pages for {} rows with 256B page limit, got {}",
             num_rows, locations.len()
         );
+    }
+
+    // ===================================================================
+    // Error / malformed data tests
+    // ===================================================================
+
+    #[test]
+    fn test_count_rle_bp_zeros_empty_data() {
+        // Empty data should return 0 zeros
+        assert_eq!(count_rle_bp_zeros(&[], 1, 10), 0);
+    }
+
+    #[test]
+    fn test_count_rle_bp_zeros_truncated_rle_value() {
+        // RLE header says 5 values but no value byte follows (bit_width=1 → needs 1 byte)
+        let data = [0x0A]; // header=10 (5<<1|0), but missing value byte
+        // Should gracefully stop, not panic
+        assert_eq!(count_rle_bp_zeros(&data, 1, 5), 0);
+    }
+
+    #[test]
+    fn test_count_rle_bp_zeros_truncated_bitpacked() {
+        // Bit-packed header says 1 group (8 values) but no data bytes follow
+        let data = [0x03]; // header=3 (1<<1|1), but no packed bytes
+        // Should gracefully stop, not panic
+        assert_eq!(count_rle_bp_zeros(&data, 1, 8), 0);
+    }
+
+    #[test]
+    fn test_count_rle_bp_zeros_bitwidth_2_general_path() {
+        // Test bit_width=2 which takes the general bit-extraction path
+        // RLE run of 4 zeros: header=0x08 (4<<1|0=8), value byte=0x00
+        let data = [0x08, 0x00];
+        assert_eq!(count_rle_bp_zeros(&data, 2, 4), 4);
+
+        // RLE run of 4 with value=1: header=0x08, value byte=0x01
+        let data = [0x08, 0x01];
+        assert_eq!(count_rle_bp_zeros(&data, 2, 4), 0);
+
+        // Bit-packed with bit_width=2: 1 group, 8 values packed in 2 bytes
+        // Values: 0,1,2,3,0,1,2,3 → bits: 00 01 10 11 00 01 10 11
+        // Byte 0: 00_01_10_11 reversed per byte = 0b11_10_01_00 = 0xE4
+        // Byte 1: 00_01_10_11 reversed per byte = 0b11_10_01_00 = 0xE4
+        // Actually in little-endian bit order: val0=bits[0:1], val1=bits[2:3], ...
+        // val0=0 → 00, val1=1 → 01, val2=2 → 10, val3=3 → 11
+        // byte0 = 0b_11_10_01_00 = 0xE4
+        // val4=0 → 00, val5=1 → 01, val6=2 → 10, val7=3 → 11
+        // byte1 = 0b_11_10_01_00 = 0xE4
+        let data = [0x03, 0xE4, 0xE4]; // header=3 (1 group bit-packed)
+        assert_eq!(count_rle_bp_zeros(&data, 2, 8), 2); // val0=0 and val4=0
+    }
+
+    #[test]
+    fn test_count_rows_from_decompressed_too_short() {
+        // Data shorter than 4 bytes (rep_levels length prefix) should error
+        let result = count_rows_from_decompressed(&[0x00, 0x01], 1, 10);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_count_rows_from_decompressed_rep_len_exceeds_data() {
+        // rep_levels_len = 100 but only 6 bytes of data total
+        let data = [100u8, 0, 0, 0, 0, 0];
+        let result = count_rows_from_decompressed(&data, 1, 10);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_compute_page_locations_zero_size_chunk() {
+        // A column chunk with total_compressed_size = 0 should return empty
+        let tmpfile = tempfile::NamedTempFile::new().unwrap();
+        let file = std::fs::File::open(tmpfile.path()).unwrap();
+        let result = compute_page_locations_from_column_chunk(
+            &file,
+            0,    // data_page_offset
+            0,    // total_compressed_size = 0
+            None, // no dictionary
+            0,    // flat column
+            100,  // rg_num_rows
+            Compression::UNCOMPRESSED,
+        );
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_count_rle_bp_zeros_total_values_zero() {
+        // If total_values is 0, should return 0 regardless of data
+        let data = [0x0A, 0x00]; // would normally be 5 zeros
+        assert_eq!(count_rle_bp_zeros(&data, 1, 0), 0);
+    }
+
+    #[test]
+    fn test_count_rle_bp_zeros_bit_width_zero() {
+        // bit_width=0 means all values are implicitly 0
+        assert_eq!(count_rle_bp_zeros(&[], 0, 100), 100);
     }
 }

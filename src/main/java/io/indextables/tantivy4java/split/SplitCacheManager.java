@@ -312,6 +312,10 @@ public class SplitCacheManager implements AutoCloseable {
          * @return this CacheConfig for method chaining
          */
         public CacheConfig withCoalesceMaxGap(long maxGapBytes) {
+            if (maxGapBytes < 0) {
+                throw new IllegalArgumentException(
+                        "coalesceMaxGapBytes must be >= 0, got: " + maxGapBytes);
+            }
             this.coalesceMaxGapBytes = maxGapBytes;
             return this;
         }
