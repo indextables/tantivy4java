@@ -1170,7 +1170,6 @@ public class SplitSearcher implements AutoCloseable {
     private static native void closeNative(long nativePtr);
     // Parquet companion mode native methods
     private static native boolean nativeHasParquetManifest(long nativePtr);
-    private static native Object nativeDocProjected(long nativePtr, int segment, int docId, String[] fields);
     private static native byte[] nativeDocBatchProjected(long nativePtr, int[] segments, int[] docIds, String[] fields);
 
     // Smart Wildcard Optimization Statistics (for testing/monitoring)

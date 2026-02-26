@@ -21,7 +21,6 @@ use super::doc_retrieval::{
     file_has_manifest_page_locs, is_nested_arrow_type, projection_has_nested,
     split_projection_by_nesting,
 };
-use super::docid_mapping::group_doc_addresses_by_file;
 use super::manifest::{ColumnMapping, ParquetManifest};
 use super::transcode::MetadataCache;
 
@@ -357,32 +356,6 @@ fn assemble_tant_buffer(doc_buffers: Vec<Option<Vec<u8>>>) -> Result<Vec<u8>> {
     buffer.extend_from_slice(&MAGIC_NUMBER.to_ne_bytes());
 
     Ok(buffer)
-}
-
-/// Batch retrieve documents from parquet files and serialize directly to TANT binary format.
-///
-/// This is the core optimization: instead of the JSON round-trip path
-/// (Arrow → serde_json::Value → JSON bytes → Java Jackson parse → type conversion),
-/// this writes Arrow data directly to TANT binary format that Java's BatchDocumentReader
-/// can parse natively.
-///
-/// The function mirrors `batch_retrieve_from_parquet` in structure but produces TANT bytes
-/// instead of `Vec<HashMap<String, serde_json::Value>>`.
-pub async fn batch_parquet_to_tant_buffer(
-    addresses: &[(u32, u32)], // (segment_ord, doc_id)
-    projected_fields: Option<&[String]>,
-    manifest: &ParquetManifest,
-    storage: &Arc<dyn Storage>,
-    metadata_cache: Option<&MetadataCache>,
-    byte_cache: Option<&ByteRangeCache>,
-    coalesce_config: Option<CoalesceConfig>,
-) -> Result<Vec<u8>> {
-    let groups =
-        group_doc_addresses_by_file(addresses, manifest).map_err(|e| anyhow::anyhow!("{}", e))?;
-    batch_parquet_to_tant_buffer_by_groups(
-        groups, addresses.len(), projected_fields, manifest, storage,
-        metadata_cache, byte_cache, coalesce_config,
-    ).await
 }
 
 /// Merge two sequences of RecordBatches column-wise (horizontal concat).
