@@ -22,7 +22,6 @@ use parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder;
 use quickwit_storage::Storage;
 
 use super::cached_reader::{CachedParquetReader, ByteRangeCache, CoalesceConfig};
-use super::docid_mapping::{translate_to_global_row, locate_row_in_file, group_doc_addresses_by_file};
 use super::manifest::{ParquetManifest, ParquetFileEntry, PageLocationEntry};
 use super::transcode::MetadataCache;
 
@@ -241,49 +240,10 @@ async fn read_single_row(
     Ok(HashMap::new())
 }
 
-/// Retrieve a single document from parquet files.
-///
-/// # Arguments
-/// * `manifest` - The parquet manifest describing file locations
-/// * `segment_ord` - Tantivy segment ordinal
-/// * `doc_id` - Tantivy local document ID within the segment
-/// * `projected_fields` - Optional set of field names to retrieve (None = all)
-/// * `storage` - Storage instance for accessing parquet files
-/// * `metadata_cache` - Optional cache of parquet metadata per file path (avoids re-reading footer from S3)
-/// * `byte_cache` - Optional cache of fetched byte ranges (dictionary page reuse)
-/// * `coalesce_config` - Optional coalescing parameters (defaults to cloud-optimized settings)
-pub async fn retrieve_document_from_parquet(
-    manifest: &ParquetManifest,
-    segment_ord: u32,
-    doc_id: u32,
-    projected_fields: Option<&[String]>,
-    storage: &Arc<dyn Storage>,
-    metadata_cache: Option<&MetadataCache>,
-    byte_cache: Option<&ByteRangeCache>,
-    coalesce_config: Option<CoalesceConfig>,
-) -> Result<HashMap<String, serde_json::Value>> {
-    let global_row = translate_to_global_row(segment_ord, doc_id, manifest)
-        .map_err(|e| anyhow::anyhow!("{}", e))?;
-
-    let location = locate_row_in_file(global_row, manifest)
-        .map_err(|e| anyhow::anyhow!("{}", e))?;
-
-    debug_println!(
-        "📖 PARQUET_DOC: Retrieving seg={} doc={} → global_row={} → file[{}]='{}' row_in_file={}",
-        segment_ord, doc_id, global_row, location.file_idx,
-        manifest.parquet_files[location.file_idx].relative_path, location.row_in_file
-    );
-
-    retrieve_single_doc_inner(
-        manifest, location.file_idx, location.row_in_file as usize,
-        projected_fields, storage, metadata_cache, byte_cache, coalesce_config,
-    ).await
-}
-
 /// Retrieve a single document using pre-resolved file coordinates.
 ///
-/// Unlike `retrieve_document_from_parquet`, this skips the segment→global→file
-/// resolution and directly uses the file_idx and row_in_file from fast fields.
+/// Retrieves a single document using pre-resolved file coordinates (file_idx, row_in_file)
+/// typically obtained from __pq fast fields.
 pub async fn retrieve_document_by_location(
     manifest: &ParquetManifest,
     file_idx: usize,
@@ -309,9 +269,8 @@ pub async fn retrieve_document_by_location(
     ).await
 }
 
-/// Inner implementation for single-doc retrieval, shared by both
-/// `retrieve_document_from_parquet` (segment→global→file resolution) and
-/// `retrieve_document_by_location` (pre-resolved coordinates).
+/// Inner implementation for single-doc retrieval, called by
+/// `retrieve_document_by_location`.
 ///
 /// Implements the 3-case read strategy:
 ///   Case A: Native offset index → single pass with page locs (correct for all types)
@@ -478,212 +437,6 @@ async fn retrieve_single_doc_inner(
     }
 
     Ok(HashMap::new())
-}
-
-/// Batch retrieve multiple documents from parquet files.
-///
-/// Optimized for efficient column page access with groups of rows:
-///   1. Groups addresses by parquet file (minimizes file opens)
-///   2. Processes files in parallel using try_join_all
-///   3. Filters row groups: skips entire row groups with no selected rows
-///   4. Builds surgical RowSelection within selected row groups
-///   5. Uses column projection to only decode requested columns
-///   6. Coalesces nearby byte ranges to reduce S3/Azure round-trips
-pub async fn batch_retrieve_from_parquet(
-    addresses: &[(u32, u32)], // (segment_ord, doc_id)
-    projected_fields: Option<&[String]>,
-    manifest: &ParquetManifest,
-    storage: &Arc<dyn Storage>,
-    metadata_cache: Option<&MetadataCache>,
-    byte_cache: Option<&ByteRangeCache>,
-    coalesce_config: Option<CoalesceConfig>,
-) -> Result<Vec<HashMap<String, serde_json::Value>>> {
-    let groups = group_doc_addresses_by_file(addresses, manifest)
-        .map_err(|e| anyhow::anyhow!("{}", e))?;
-
-    let result_count = addresses.len();
-
-    // Share projected_fields across parallel tasks via Arc (avoid per-task Vec clone)
-    let projected_fields_shared: Option<Arc<[String]>> =
-        projected_fields.map(|f| f.into());
-
-    // Process each file's rows in parallel
-    let file_futures: Vec<_> = groups
-        .into_iter()
-        .map(|(file_idx, rows)| {
-            let storage = storage.clone();
-            let manifest = manifest.clone();
-            let projected_fields_owned = projected_fields_shared.clone();
-            let metadata_cache = metadata_cache.cloned();
-            let byte_cache = byte_cache.cloned();
-
-            async move {
-                let file_entry = &manifest.parquet_files[file_idx];
-                // Use relative_path directly — the storage is rooted at table_root
-                let parquet_path = &file_entry.relative_path;
-
-                debug_println!(
-                    "📖 PARQUET_BATCH: file[{}]='{}' retrieving {} rows",
-                    file_idx, parquet_path, rows.len()
-                );
-
-                // Check metadata cache to avoid re-reading footer from S3/Azure
-                let path_buf = std::path::PathBuf::from(parquet_path);
-                let cached_meta = metadata_cache.as_ref().and_then(|cache| {
-                    cache.lock().ok().and_then(|guard| guard.get(&path_buf).cloned())
-                });
-
-                let reader = if let Some(meta) = cached_meta {
-                    CachedParquetReader::with_metadata(
-                        storage.clone(),
-                        path_buf.clone(),
-                        file_entry.file_size_bytes,
-                        meta,
-                    )
-                } else {
-                    CachedParquetReader::new(
-                        storage.clone(),
-                        path_buf.clone(),
-                        file_entry.file_size_bytes,
-                    )
-                };
-                let reader = if let Some(ref bc) = byte_cache {
-                    reader.with_byte_cache(bc.clone())
-                } else {
-                    reader
-                };
-                let reader = if let Some(config) = coalesce_config {
-                    reader.with_coalesce_config(config)
-                } else {
-                    reader
-                };
-                let reader = attach_page_locations(reader, file_entry);
-
-                let builder = ParquetRecordBatchStreamBuilder::new(reader)
-                    .await
-                    .context("Failed to create parquet stream builder")?;
-
-                // Cache the metadata for subsequent reads
-                if let Some(cache) = &metadata_cache {
-                    if let Ok(mut guard) = cache.lock() {
-                        if !guard.contains_key(&path_buf) {
-                            guard.insert(path_buf.clone(), builder.metadata().clone());
-                        }
-                    }
-                }
-
-                let parquet_schema = builder.schema().clone();
-                let parquet_metadata = builder.metadata().clone();
-                let parquet_file_schema = builder.parquet_schema().clone();
-
-                // Build column projection
-                let proj_fields = projected_fields_owned.as_deref();
-                let projection = build_column_projection(
-                    proj_fields,
-                    &parquet_schema,
-                    &manifest.column_mapping,
-                );
-
-                let builder = if let Some(ref proj) = projection {
-                    // Use roots() not leaves() because build_column_projection returns top-level
-                    // arrow field indices, not parquet leaf column indices. For schemas with nested
-                    // types (List, Map, Struct), leaves diverge from top-level indices.
-                    builder.with_projection(parquet::arrow::ProjectionMask::roots(
-                        &parquet_file_schema,
-                        proj.iter().cloned(),
-                    ))
-                } else {
-                    builder
-                };
-
-                // Row indices within the file (already sorted by group_doc_addresses_by_file)
-                let row_indices: Vec<usize> = rows.iter().map(|(_, row)| *row as usize).collect();
-
-                // Step 1: Determine which row groups contain our target rows
-                let rg_filter = compute_row_group_filter(&row_indices, &parquet_metadata);
-
-                // Step 2: Apply row group filter to skip entire unneeded row groups
-                let builder = if let Some(ref filter) = rg_filter {
-                    let selected_rgs: Vec<usize> = filter
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, selected)| **selected)
-                        .map(|(idx, _)| idx)
-                        .collect();
-
-                    debug_println!(
-                        "📖 PARQUET_BATCH: file[{}] selecting {}/{} row groups",
-                        file_idx, selected_rgs.len(), parquet_metadata.num_row_groups()
-                    );
-
-                    builder.with_row_groups(selected_rgs)
-                } else {
-                    builder
-                };
-
-                // Step 3: Build RowSelection within the selected row groups
-                // This is relative to the selected row groups, not all row groups
-                let row_selection = build_row_selection_for_rows_in_selected_groups(
-                    &row_indices,
-                    &parquet_metadata,
-                    rg_filter.as_deref(),
-                );
-                let builder = if let Some(selection) = row_selection {
-                    builder.with_row_selection(selection)
-                } else {
-                    builder
-                };
-
-                let mut stream = builder.build()
-                    .context("Failed to build parquet record batch stream")?;
-
-                // Collect all rows from the stream
-                let mut collected_rows: Vec<HashMap<String, serde_json::Value>> = Vec::new();
-                use futures::StreamExt;
-                while let Some(batch_result) = stream.next().await {
-                    let batch = batch_result.context("Failed to read parquet batch")?;
-                    for row_idx in 0..batch.num_rows() {
-                        let row_map = extract_row_as_map(&batch, row_idx, proj_fields)?;
-                        collected_rows.push(row_map);
-                    }
-                }
-
-                debug_println!(
-                    "📖 PARQUET_BATCH: file[{}] collected {} rows (expected {})",
-                    file_idx, collected_rows.len(), rows.len()
-                );
-
-                // Return (original_index, row_data) pairs for reassembly.
-                // Use drain() to move HashMaps instead of cloning them.
-                let mut drain_iter = collected_rows.drain(..);
-                let indexed_results: Vec<(usize, HashMap<String, serde_json::Value>)> = rows
-                    .iter()
-                    .map(|(original_idx, _)| {
-                        let data = drain_iter.next().unwrap_or_default();
-                        (*original_idx, data)
-                    })
-                    .collect();
-
-                Ok::<_, anyhow::Error>(indexed_results)
-            }
-        })
-        .collect();
-
-    // Execute all file retrievals in parallel
-    let all_file_results = futures::future::try_join_all(file_futures).await?;
-
-    // Reassemble results in original order
-    let mut results: Vec<Option<HashMap<String, serde_json::Value>>> = vec![None; result_count];
-    for file_results in all_file_results {
-        for (original_idx, data) in file_results {
-            results[original_idx] = Some(data);
-        }
-    }
-
-    Ok(results
-        .into_iter()
-        .map(|opt| opt.unwrap_or_default())
-        .collect())
 }
 
 /// Build column projection indices from field names.
