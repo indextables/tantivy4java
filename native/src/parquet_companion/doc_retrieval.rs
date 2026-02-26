@@ -16,6 +16,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use arrow_array::{RecordBatch, Array, ArrayRef};
+use arrow_schema::DataType;
 use parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder;
 
 use quickwit_storage::Storage;
@@ -78,6 +79,126 @@ pub(crate) fn attach_page_locations(
     }
 }
 
+/// Check if an Arrow data type is a nested/complex type (List, LargeList, Map, Struct).
+/// These types have leaf columns where `num_values` counts elements, not rows.
+pub(crate) fn is_nested_arrow_type(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::List(_)
+            | DataType::LargeList(_)
+            | DataType::Map(_, _)
+            | DataType::Struct(_)
+            | DataType::FixedSizeList(_, _)
+    )
+}
+
+/// Split a set of projected Arrow root indices into primitive and nested groups.
+///
+/// Returns `(primitive_indices, nested_indices)` where either may be `None` if empty.
+/// Uses the Arrow schema to classify each projected field.
+pub(crate) fn split_projection_by_nesting(
+    projection: &[usize],
+    arrow_schema: &arrow_schema::Schema,
+) -> (Option<Vec<usize>>, Option<Vec<usize>>) {
+    let mut primitive = Vec::new();
+    let mut nested = Vec::new();
+    for &idx in projection {
+        if let Some(field) = arrow_schema.fields().get(idx) {
+            if is_nested_arrow_type(field.data_type()) {
+                nested.push(idx);
+            } else {
+                primitive.push(idx);
+            }
+        }
+    }
+    let prim = if primitive.is_empty() { None } else { Some(primitive) };
+    let nest = if nested.is_empty() { None } else { Some(nested) };
+    (prim, nest)
+}
+
+/// Check if a file uses manifest-sourced page locations (not native offset index)
+/// and any of those manifest page locations are non-empty.
+pub(crate) fn file_has_manifest_page_locs(file_entry: &ParquetFileEntry) -> bool {
+    if file_entry.has_offset_index {
+        return false; // Native offset index — always correct for all column types
+    }
+    // Check if any column has non-empty page locations in the manifest
+    file_entry.row_groups.iter().any(|rg| {
+        rg.columns.iter().any(|col| !col.page_locations.is_empty())
+    })
+}
+
+/// Check if a projection includes any nested/complex Arrow types.
+/// Returns false if projection is None (all columns) since we can't know without schema scanning.
+/// For safety, None projection is treated as "may have nested" — callers should handle this.
+fn projection_has_nested(
+    projection: &Option<Vec<usize>>,
+    arrow_schema: &arrow_schema::Schema,
+) -> bool {
+    match projection {
+        Some(indices) => indices.iter().any(|&idx| {
+            arrow_schema
+                .fields()
+                .get(idx)
+                .map(|f| is_nested_arrow_type(f.data_type()))
+                .unwrap_or(false)
+        }),
+        None => {
+            // No projection = all columns. Check if ANY field is nested.
+            arrow_schema
+                .fields()
+                .iter()
+                .any(|f| is_nested_arrow_type(f.data_type()))
+        }
+    }
+}
+
+/// Create a CachedParquetReader without page locations.
+fn create_reader(
+    storage: &Arc<dyn Storage>,
+    path_buf: &std::path::PathBuf,
+    file_entry: &ParquetFileEntry,
+    cached_meta: &Option<Arc<parquet::file::metadata::ParquetMetaData>>,
+    byte_cache: Option<&ByteRangeCache>,
+    coalesce_config: Option<CoalesceConfig>,
+) -> CachedParquetReader {
+    let reader = if let Some(ref meta) = cached_meta {
+        CachedParquetReader::with_metadata(
+            storage.clone(), path_buf.clone(), file_entry.file_size_bytes, meta.clone(),
+        )
+    } else {
+        CachedParquetReader::new(
+            storage.clone(), path_buf.clone(), file_entry.file_size_bytes,
+        )
+    };
+    let reader = if let Some(bc) = byte_cache {
+        reader.with_byte_cache(bc.clone())
+    } else { reader };
+    if let Some(config) = coalesce_config {
+        reader.with_coalesce_config(config)
+    } else { reader }
+}
+
+/// Create a CachedParquetReader with pre-loaded metadata (avoids re-downloading footer).
+fn create_reader_with_metadata(
+    storage: &Arc<dyn Storage>,
+    path_buf: &std::path::PathBuf,
+    file_entry: &ParquetFileEntry,
+    metadata: &Arc<parquet::file::metadata::ParquetMetaData>,
+    byte_cache: Option<&ByteRangeCache>,
+    coalesce_config: Option<CoalesceConfig>,
+) -> CachedParquetReader {
+    let reader = CachedParquetReader::with_metadata(
+        storage.clone(), path_buf.clone(), file_entry.file_size_bytes, metadata.clone(),
+    );
+    let reader = if let Some(bc) = byte_cache {
+        reader.with_byte_cache(bc.clone())
+    } else { reader };
+    if let Some(config) = coalesce_config {
+        reader.with_coalesce_config(config)
+    } else { reader }
+}
+
 /// Retrieve a single document from parquet files.
 ///
 /// # Arguments
@@ -120,42 +241,21 @@ pub async fn retrieve_document_from_parquet(
         cache.lock().ok().and_then(|guard| guard.get(&path_buf).cloned())
     });
 
-    let reader = if let Some(meta) = cached_meta {
-        debug_println!("📖 PARQUET_DOC: Using cached metadata for {:?}", parquet_path);
-        CachedParquetReader::with_metadata(
-            storage.clone(),
-            path_buf.clone(),
-            file_entry.file_size_bytes,
-            meta,
-        )
-    } else {
-        CachedParquetReader::new(
-            storage.clone(),
-            path_buf.clone(),
-            file_entry.file_size_bytes,
-        )
-    };
-    let reader = if let Some(bc) = byte_cache {
-        reader.with_byte_cache(bc.clone())
-    } else {
-        reader
-    };
-    let reader = if let Some(config) = coalesce_config {
-        reader.with_coalesce_config(config)
-    } else {
-        reader
-    };
-    let reader = attach_page_locations(reader, file_entry);
-
+    // Build reader WITHOUT page locations first to get metadata and schema.
+    // We'll decide whether to attach page locations after seeing the projection.
+    let reader = create_reader(
+        storage, &path_buf, file_entry, &cached_meta, byte_cache, coalesce_config,
+    );
     let builder = ParquetRecordBatchStreamBuilder::new(reader)
         .await
         .context("Failed to create parquet stream builder")?;
 
     // Cache the metadata for subsequent reads
+    let metadata_arc = builder.metadata().clone();
     if let Some(cache) = metadata_cache {
         if let Ok(mut guard) = cache.lock() {
             if !guard.contains_key(&path_buf) {
-                guard.insert(path_buf.clone(), builder.metadata().clone());
+                guard.insert(path_buf.clone(), metadata_arc.clone());
                 debug_println!("📖 PARQUET_DOC: Cached metadata for {:?}", parquet_path);
             }
         }
@@ -176,6 +276,42 @@ pub async fn retrieve_document_from_parquet(
             return Ok(HashMap::new());
         }
     }
+
+    // Determine read strategy based on 3 cases:
+    //   Case A: file has native offset index → attach page locs (correct for all types)
+    //   Case B: manifest page locs, no nested in projection → attach page locs
+    //   Case C: manifest page locs, nested in projection → skip page locs entirely
+    let uses_manifest_locs = file_has_manifest_page_locs(file_entry);
+    let has_nested_in_proj = projection_has_nested(&projection, &parquet_schema);
+    let should_attach_page_locs = if !uses_manifest_locs {
+        // Case A (native offset index) or no page locs at all — always safe
+        true
+    } else if has_nested_in_proj {
+        // Case C — manifest page locs are wrong for nested columns,
+        // and arrow-rs requires all-or-nothing offset index. Skip entirely.
+        debug_println!(
+            "📖 PARQUET_DOC: Case C: skipping manifest page locs (nested columns in projection)"
+        );
+        false
+    } else {
+        // Case B — only primitives in projection, manifest locs are correct
+        true
+    };
+
+    // If we need page locs, rebuild the reader with them attached.
+    // The metadata is already cached so this doesn't re-download the footer.
+    let builder = if should_attach_page_locs {
+        let reader = create_reader_with_metadata(
+            storage, &path_buf, file_entry, &metadata_arc, byte_cache, coalesce_config,
+        );
+        let reader = attach_page_locations(reader, file_entry);
+        ParquetRecordBatchStreamBuilder::new(reader)
+            .await
+            .context("Failed to create parquet stream builder with page locs")?
+    } else {
+        // No page locs — use the original builder (reads full column chunks)
+        builder
+    };
 
     // Build a RowSelection to read only the target row
     let row_in_file = location.row_in_file as usize;
@@ -272,30 +408,18 @@ pub async fn retrieve_document_by_location(
         cache.lock().ok().and_then(|guard| guard.get(&path_buf).cloned())
     });
 
-    let reader = if let Some(meta) = cached_meta {
-        CachedParquetReader::with_metadata(
-            storage.clone(), path_buf.clone(), file_entry.file_size_bytes, meta,
-        )
-    } else {
-        CachedParquetReader::new(
-            storage.clone(), path_buf.clone(), file_entry.file_size_bytes,
-        )
-    };
-    let reader = if let Some(bc) = byte_cache {
-        reader.with_byte_cache(bc.clone())
-    } else { reader };
-    let reader = if let Some(config) = coalesce_config {
-        reader.with_coalesce_config(config)
-    } else { reader };
-    let reader = attach_page_locations(reader, file_entry);
-
+    // Build reader WITHOUT page locations to get metadata and schema first.
+    let reader = create_reader(
+        storage, &path_buf, file_entry, &cached_meta, byte_cache, coalesce_config,
+    );
     let builder = ParquetRecordBatchStreamBuilder::new(reader)
         .await.context("Failed to create parquet stream builder")?;
 
+    let metadata_arc = builder.metadata().clone();
     if let Some(cache) = metadata_cache {
         if let Ok(mut guard) = cache.lock() {
             if !guard.contains_key(&path_buf) {
-                guard.insert(path_buf.clone(), builder.metadata().clone());
+                guard.insert(path_buf.clone(), metadata_arc.clone());
             }
         }
     }
@@ -305,6 +429,29 @@ pub async fn retrieve_document_by_location(
     if let Some(ref proj) = projection {
         if proj.is_empty() { return Ok(HashMap::new()); }
     }
+
+    // 3-case strategy (same as retrieve_document_from_parquet)
+    let uses_manifest_locs = file_has_manifest_page_locs(file_entry);
+    let has_nested_in_proj = projection_has_nested(&projection, &parquet_schema);
+    let should_attach_page_locs = if !uses_manifest_locs {
+        true // Case A
+    } else if has_nested_in_proj {
+        debug_println!("📖 PARQUET_DOC: Case C (by_location): skipping manifest page locs");
+        false // Case C
+    } else {
+        true // Case B
+    };
+
+    let builder = if should_attach_page_locs {
+        let reader = create_reader_with_metadata(
+            storage, &path_buf, file_entry, &metadata_arc, byte_cache, coalesce_config,
+        );
+        let reader = attach_page_locations(reader, file_entry);
+        ParquetRecordBatchStreamBuilder::new(reader)
+            .await.context("Failed to create stream builder with page locs")?
+    } else {
+        builder
+    };
 
     let row_in_file_usize = row_in_file as usize;
     let parquet_metadata = builder.metadata().clone();

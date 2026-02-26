@@ -921,6 +921,132 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_merge_QuickwitSpli
     });
 }
 
+/// JNI helper for tests: create a complex parquet file WITHOUT a native offset index.
+/// Same schema as nativeWriteTestParquetComplex but with offset index disabled,
+/// simulating legacy parquet files that require manifest-sourced page locations.
+/// This is the key scenario for testing the nested column page location fix:
+/// primitive columns get correct manifest page locs, nested columns get empty ones.
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_split_merge_QuickwitSplit_nativeWriteTestParquetComplexNoPageIndex(
+    mut env: JNIEnv,
+    _class: JClass,
+    path: JString,
+    num_rows: jni::sys::jint,
+    id_offset: jni::sys::jlong,
+) {
+    let _ = convert_throwable(&mut env, |env| {
+        let path_str = jstring_to_string(env, &path)?;
+
+        use arrow_array::*;
+        use arrow_array::builder::*;
+        use arrow_schema::{DataType, Field, Fields, Schema as ArrowSchema, TimeUnit};
+        use parquet::arrow::ArrowWriter;
+        use parquet::file::properties::WriterProperties;
+        use std::sync::Arc;
+
+        let num = num_rows as usize;
+        let offset = id_offset;
+
+        let tags_field = Field::new("item", DataType::Utf8, true);
+        let address_fields = Fields::from(vec![
+            Field::new("city", DataType::Utf8, true),
+            Field::new("zip", DataType::Utf8, true),
+        ]);
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+            Field::new("score", DataType::Float64, true),
+            Field::new("active", DataType::Boolean, true),
+            Field::new("created_at", DataType::Timestamp(TimeUnit::Microsecond, None), true),
+            Field::new("tags", DataType::List(Arc::new(tags_field)), true),
+            Field::new("address", DataType::Struct(address_fields.clone()), true),
+            Field::new("notes", DataType::Utf8, true),
+        ]));
+
+        let ids: Vec<i64> = (0..num).map(|i| offset + i as i64).collect();
+        let names: Vec<String> = (0..num).map(|i| format!("item_{}", offset + i as i64)).collect();
+        let scores: Vec<f64> = (0..num).map(|i| (i as f64) * 1.5 + 10.0).collect();
+        let actives: Vec<bool> = (0..num).map(|i| i % 2 == 0).collect();
+
+        let base_ts: i64 = 1704067200_000_000;
+        let timestamps: Vec<i64> = (0..num).map(|i| base_ts + (i as i64) * 3_600_000_000).collect();
+
+        let mut tags_builder = ListBuilder::new(StringBuilder::new());
+        for i in 0..num {
+            if i % 3 == 2 {
+                tags_builder.append(false);
+            } else if i % 2 == 0 {
+                tags_builder.values().append_value(format!("tag_a_{}", i));
+                tags_builder.values().append_value(format!("tag_b_{}", i));
+                tags_builder.append(true);
+            } else {
+                tags_builder.values().append_value(format!("tag_c_{}", i));
+                tags_builder.append(true);
+            }
+        }
+        let tags_array = tags_builder.finish();
+
+        let cities: Vec<Option<&str>> = (0..num).map(|i| {
+            match i % 3 {
+                0 => Some("New York"),
+                1 => Some("London"),
+                _ => Some("Tokyo"),
+            }
+        }).collect();
+        let zips: Vec<Option<&str>> = (0..num).map(|i| {
+            match i % 3 {
+                0 => Some("10001"),
+                1 => Some("EC1A"),
+                _ => Some("100-0001"),
+            }
+        }).collect();
+        let city_array = Arc::new(StringArray::from(cities)) as ArrayRef;
+        let zip_array = Arc::new(StringArray::from(zips)) as ArrayRef;
+        let address_array = StructArray::try_new(
+            address_fields,
+            vec![city_array, zip_array],
+            None,
+        ).map_err(|e| anyhow!("Failed to create struct array: {}", e))?;
+
+        let notes: Vec<Option<String>> = (0..num).map(|i| {
+            if i % 2 == 0 {
+                Some(format!("Note for item {}", offset + i as i64))
+            } else {
+                None
+            }
+        }).collect();
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(ids)),
+                Arc::new(StringArray::from(names.iter().map(|s| s.as_str()).collect::<Vec<_>>())),
+                Arc::new(Float64Array::from(scores)),
+                Arc::new(BooleanArray::from(actives)),
+                Arc::new(TimestampMicrosecondArray::from(timestamps)),
+                Arc::new(tags_array),
+                Arc::new(address_array),
+                Arc::new(StringArray::from(notes)),
+            ],
+        ).map_err(|e| anyhow!("Failed to create RecordBatch: {}", e))?;
+
+        // Explicitly disable offset index to simulate legacy parquet files
+        let props = WriterProperties::builder()
+            .set_offset_index_disabled(true)
+            .build();
+
+        let file = std::fs::File::create(&path_str)
+            .map_err(|e| anyhow!("Failed to create file '{}': {}", path_str, e))?;
+        let mut writer = ArrowWriter::try_new(file, schema, Some(props))
+            .map_err(|e| anyhow!("Failed to create ArrowWriter: {}", e))?;
+        writer.write(&batch).map_err(|e| anyhow!("Failed to write batch: {}", e))?;
+        writer.close().map_err(|e| anyhow!("Failed to close writer: {}", e))?;
+
+        Ok(())
+    });
+}
+
 /// JNI helper for tests: create a parquet file with IP address columns (stored as UTF8 strings).
 /// Schema: id (i64), src_ip (utf8), dst_ip (utf8), port (i64), label (utf8)
 #[no_mangle]
