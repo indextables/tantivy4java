@@ -1347,6 +1347,123 @@ public class QuickwitSplit {
         return nativeMergeSplits(resolvedSplitUrls, resolvedOutputPath, config);
     }
 
+    // --- Arrow FFI Split Creation (Streaming, Partition-Aware API) ---
+
+    /**
+     * Result for one partition's finalized split.
+     */
+    public static class PartitionSplitResult {
+        private final String partitionKey;
+        private final Map<String, String> partitionValues;
+        private final String splitPath;
+        private final String splitId;
+        private final long numDocs;
+        private final long footerStartOffset;
+        private final long footerEndOffset;
+
+        public PartitionSplitResult(String partitionKey, Map<String, String> partitionValues,
+                                    String splitPath, String splitId, long numDocs,
+                                    long footerStartOffset, long footerEndOffset) {
+            this.partitionKey = partitionKey;
+            this.partitionValues = partitionValues;
+            this.splitPath = splitPath;
+            this.splitId = splitId;
+            this.numDocs = numDocs;
+            this.footerStartOffset = footerStartOffset;
+            this.footerEndOffset = footerEndOffset;
+        }
+
+        /** Partition key (e.g. "event_date=2023-01-15/region=us"), empty for non-partitioned */
+        public String getPartitionKey() { return partitionKey; }
+        /** Partition column values (col_name → value) */
+        public Map<String, String> getPartitionValues() { return partitionValues; }
+        /** Local path where the split was written */
+        public String getSplitPath() { return splitPath; }
+        /** Quickwit split ID */
+        public String getSplitId() { return splitId; }
+        /** Number of documents in this split */
+        public long getNumDocs() { return numDocs; }
+        /** Footer start offset in the split file */
+        public long getFooterStartOffset() { return footerStartOffset; }
+        /** Footer end offset in the split file */
+        public long getFooterEndOffset() { return footerEndOffset; }
+
+        @Override
+        public String toString() {
+            return "PartitionSplitResult{partitionKey='" + partitionKey + "', splitPath='" + splitPath +
+                   "', numDocs=" + numDocs + "}";
+        }
+    }
+
+    /**
+     * Begin creating splits from Arrow columnar data.
+     * Supports multi-partition writes: batches may contain rows for multiple partitions.
+     * Rust routes rows to per-partition IndexWriters based on partition column values.
+     *
+     * @param schemaAddr memory address of FFI_ArrowSchema struct (full schema including partition cols)
+     * @param partitionColumns partition column names (empty array for non-partitioned tables)
+     * @param heapSize tantivy writer heap size per partition (use Index.Memory.DEFAULT_HEAP_SIZE)
+     * @return opaque handle for subsequent addBatch/finish/cancel calls
+     */
+    public static long beginSplitFromArrow(long schemaAddr, String[] partitionColumns, long heapSize) {
+        return nativeBeginSplitFromArrow(schemaAddr, partitionColumns, heapSize);
+    }
+
+    /**
+     * Add a batch of Arrow columnar data. Rows are automatically routed to the correct
+     * partition writer based on partition column values in the batch.
+     *
+     * @param handle from beginSplitFromArrow
+     * @param arrayAddr memory address of FFI_ArrowArray struct
+     * @param schemaAddr memory address of FFI_ArrowSchema struct
+     * @return cumulative document count (across all partitions)
+     */
+    public static long addArrowBatch(long handle, long arrayAddr, long schemaAddr) {
+        return nativeAddArrowBatch(handle, arrayAddr, schemaAddr);
+    }
+
+    /**
+     * Finalize ALL partition splits, writing each to outputDir.
+     * For partitioned tables, creates outputDir/partition_key/part-uuid.split for each partition.
+     * For non-partitioned, creates outputDir/part-uuid.split.
+     *
+     * @param handle from beginSplitFromArrow
+     * @param outputDir base directory for output split files
+     * @return list of PartitionSplitResult, one per partition (or one for non-partitioned)
+     */
+    @SuppressWarnings("unchecked")
+    public static List<PartitionSplitResult> finishAllSplits(long handle, String outputDir) {
+        Object raw = nativeFinishAllSplits(handle, outputDir);
+        if (raw == null) {
+            return new ArrayList<>();
+        }
+        List<Map<String, Object>> rawList = (List<Map<String, Object>>) raw;
+        List<PartitionSplitResult> results = new ArrayList<>();
+        for (Map<String, Object> map : rawList) {
+            String partitionKey = (String) map.get("partitionKey");
+            @SuppressWarnings("unchecked")
+            Map<String, String> partitionValues = (Map<String, String>) map.get("partitionValues");
+            String splitPath = (String) map.get("splitPath");
+            String splitId = (String) map.get("splitId");
+            long numDocs = ((Long) map.get("numDocs"));
+            long footerStartOffset = ((Long) map.get("footerStartOffset"));
+            long footerEndOffset = ((Long) map.get("footerEndOffset"));
+
+            results.add(new PartitionSplitResult(
+                partitionKey, partitionValues, splitPath, splitId, numDocs,
+                footerStartOffset, footerEndOffset));
+        }
+        return results;
+    }
+
+    /**
+     * Cancel an in-progress split creation, releasing ALL resources across all partitions.
+     * @param handle from beginSplitFromArrow
+     */
+    public static void cancelSplit(long handle) {
+        nativeCancelSplit(handle);
+    }
+
     // Native method declarations
     private static native SplitMetadata nativeConvertIndex(long indexPtr, String outputPath, SplitConfig config);
     private static native SplitMetadata nativeConvertIndexFromPath(String indexPath, String outputPath, SplitConfig config);
@@ -1356,6 +1473,12 @@ public class QuickwitSplit {
     private static native boolean nativeValidateSplit(String splitPath);
     private static native SplitMetadata nativeMergeSplits(List<String> splitUrls, String outputPath, MergeConfig config);
     private static native Object nativeCreateFromParquet(List<String> parquetFiles, String outputPath, String configJson);
+
+    // Arrow FFI split creation native methods
+    private static native long nativeBeginSplitFromArrow(long schemaAddr, String[] partitionColumns, long heapSize);
+    private static native long nativeAddArrowBatch(long handle, long arrayAddr, long schemaAddr);
+    private static native Object nativeFinishAllSplits(long handle, String outputDir);
+    private static native void nativeCancelSplit(long handle);
 
     /**
      * Test helper: create a parquet file with test data.
@@ -1425,4 +1548,35 @@ public class QuickwitSplit {
      *         category (utf8 — cycling "info"/"warn"/"error")
      */
     public static native void nativeWriteTestParquetForStringIndexing(String path, int numRows, long idOffset);
+
+    // Arrow FFI test helpers (test-only: Rust creates valid FFI structs)
+
+    /**
+     * Test helper: Export an Arrow schema as an FFI_ArrowSchema struct (with valid release callback).
+     * @param fieldNames column names
+     * @param fieldTypes column types: "int64", "utf8", "float64", "boolean"
+     * @return memory address of the FFI_ArrowSchema struct (consumed by beginSplitFromArrow)
+     */
+    public static native long nativeTestExportSchemaFfi(String[] fieldNames, String[] fieldTypes);
+
+    /**
+     * Test helper: Export a standard test batch as FFI structs.
+     * Schema: (id: Int64, name: Utf8, score: Float64, active: Boolean)
+     * @param numRows number of rows to generate
+     * @param idOffset starting value for sequential data
+     * @return long[2] = [arrayAddr, schemaAddr] (consumed by addArrowBatch)
+     */
+    public static native long[] nativeTestExportStandardBatchFfi(int numRows, long idOffset);
+
+    /**
+     * Test helper: Export a partition test batch as FFI structs.
+     * Schema: (id: Int64, name: Utf8, &lt;extraColName&gt;: Utf8)
+     * @param ids int64 values for the id column
+     * @param names string values for the name column
+     * @param extraColName name of the extra Utf8 column (e.g. "event_date")
+     * @param extraValues string values for the extra column
+     * @return long[2] = [arrayAddr, schemaAddr] (consumed by addArrowBatch)
+     */
+    public static native long[] nativeTestExportPartitionBatchFfi(
+            long[] ids, String[] names, String extraColName, String[] extraValues);
 }

@@ -27,6 +27,10 @@ pub struct SchemaDerivationConfig {
     pub json_fields: HashSet<String>,
     /// Whether to enable fieldnorms for text fields (default: false)
     pub fieldnorms_enabled: bool,
+    /// Whether to set STORED flag on all fields (default: false).
+    /// Standard splits need stored fields for document retrieval.
+    /// Companion mode omits it since parquet is the store.
+    pub store_fields: bool,
 }
 
 impl Default for SchemaDerivationConfig {
@@ -38,6 +42,7 @@ impl Default for SchemaDerivationConfig {
             ip_address_fields: HashSet::new(),
             json_fields: HashSet::new(),
             fieldnorms_enabled: false,
+            store_fields: false,
         }
     }
 }
@@ -117,6 +122,9 @@ fn add_field_for_arrow_type(
             DataType::Utf8 | DataType::LargeUtf8 => {
                 let mut opts = IpAddrOptions::default();
                 opts = opts.set_indexed();
+                if config.store_fields {
+                    opts = opts.set_stored();
+                }
                 if should_add_fast(config, name, data_type) {
                     opts = opts.set_fast();
                 }
@@ -164,7 +172,9 @@ fn add_field_for_arrow_type(
         DataType::Boolean => {
             let mut opts = NumericOptions::default();
             opts = opts.set_indexed();
-            // No set_stored() — parquet is the store in companion mode
+            if config.store_fields {
+                opts = opts.set_stored();
+            }
             if should_add_fast(config, name, data_type) {
                 opts = opts.set_fast();
             }
@@ -174,6 +184,9 @@ fn add_field_for_arrow_type(
         DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => {
             let mut opts = NumericOptions::default();
             opts = opts.set_indexed();
+            if config.store_fields {
+                opts = opts.set_stored();
+            }
             if should_add_fast(config, name, data_type) {
                 opts = opts.set_fast();
             }
@@ -183,6 +196,9 @@ fn add_field_for_arrow_type(
         DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 => {
             let mut opts = NumericOptions::default();
             opts = opts.set_indexed();
+            if config.store_fields {
+                opts = opts.set_stored();
+            }
             if should_add_fast(config, name, data_type) {
                 opts = opts.set_fast();
             }
@@ -192,6 +208,9 @@ fn add_field_for_arrow_type(
         DataType::Float32 | DataType::Float64 => {
             let mut opts = NumericOptions::default();
             opts = opts.set_indexed();
+            if config.store_fields {
+                opts = opts.set_stored();
+            }
             if should_add_fast(config, name, data_type) {
                 opts = opts.set_fast();
             }
@@ -248,7 +267,6 @@ fn add_field_for_arrow_type(
             } else {
                 // Standard tokenizer path
                 let tok = tokenizer.as_deref().unwrap_or("raw");
-                // Text fields: always indexed, never stored (parquet is the store)
                 let mut opts = TextOptions::default()
                     .set_indexing_options(
                         TextFieldIndexing::default()
@@ -256,6 +274,9 @@ fn add_field_for_arrow_type(
                             .set_index_option(IndexRecordOption::WithFreqsAndPositions)
                             .set_fieldnorms(config.fieldnorms_enabled),
                     );
+                if config.store_fields {
+                    opts = opts.set_stored();
+                }
                 if should_add_fast(config, name, data_type) {
                     opts = opts.set_fast(Some(tok));
                 }
@@ -267,6 +288,9 @@ fn add_field_for_arrow_type(
             // Decimal128: map to f64 for tantivy (lossy for values > 2^53)
             let mut opts = NumericOptions::default();
             opts = opts.set_indexed();
+            if config.store_fields {
+                opts = opts.set_stored();
+            }
             if should_add_fast(config, name, data_type) {
                 opts = opts.set_fast();
             }
@@ -283,6 +307,9 @@ fn add_field_for_arrow_type(
                         .set_index_option(IndexRecordOption::WithFreqsAndPositions)
                         .set_fieldnorms(config.fieldnorms_enabled),
                 );
+            if config.store_fields {
+                opts = opts.set_stored();
+            }
             if should_add_fast(config, name, data_type) {
                 opts = opts.set_fast(Some(tok));
             }
@@ -290,13 +317,19 @@ fn add_field_for_arrow_type(
         }
 
         DataType::Binary | DataType::LargeBinary | DataType::FixedSizeBinary(_) => {
-            // Bytes: indexed only, no stored (parquet is the store)
-            builder.add_bytes_field(name, INDEXED);
+            if config.store_fields {
+                builder.add_bytes_field(name, INDEXED | STORED);
+            } else {
+                builder.add_bytes_field(name, INDEXED);
+            }
         }
 
         DataType::Timestamp(_, _) | DataType::Date32 | DataType::Date64 => {
             let mut opts = DateOptions::default();
             opts = opts.set_indexed();
+            if config.store_fields {
+                opts = opts.set_stored();
+            }
             if should_add_fast(config, name, data_type) {
                 opts = opts.set_fast();
             }
