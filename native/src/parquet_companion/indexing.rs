@@ -200,6 +200,7 @@ pub async fn create_split_from_parquet(
         ip_address_fields: parquet_config.schema_config.ip_address_fields.clone(),
         json_fields: parquet_config.schema_config.json_fields.clone(),
         fieldnorms_enabled: parquet_config.schema_config.fieldnorms_enabled,
+        store_fields: false, // Companion mode: parquet is the store
     };
 
     let derived_schema = derive_tantivy_schema_with_mapping(&arrow_schema, &config, Some(&name_mapping))?;
@@ -706,7 +707,7 @@ pub async fn create_split_from_parquet(
 }
 
 /// Convert a single Arrow row into a tantivy Document.
-fn arrow_row_to_tantivy_doc(
+pub(crate) fn arrow_row_to_tantivy_doc(
     batch: &RecordBatch,
     batch_schema: &ArrowSchema,
     row_idx: usize,
@@ -764,7 +765,7 @@ fn arrow_row_to_tantivy_doc(
 /// If the field has a hash counterpart (`string_hash_fields`), also stores the xxHash64
 /// of the string value in the corresponding U64 fast field.
 #[allow(clippy::too_many_arguments)]
-fn add_arrow_value_to_doc(
+pub(crate) fn add_arrow_value_to_doc(
     doc: &mut TantivyDocument,
     field: Field,
     array: &ArrayRef,
@@ -1004,7 +1005,7 @@ fn add_arrow_value_to_doc(
 
 /// Handle string value indexing for all modes (standard, IP, JSON, compact indexing).
 #[allow(clippy::too_many_arguments)]
-fn add_string_value_to_doc(
+pub(crate) fn add_string_value_to_doc(
     doc: &mut TantivyDocument,
     field: Field,
     val: &str,
@@ -1129,7 +1130,7 @@ fn add_json_string_value(
 }
 
 /// Convert a complex Arrow type (List, Map, Struct) at a given row to a JSON value.
-fn convert_complex_to_json(array: &ArrayRef, row_idx: usize) -> Result<serde_json::Value> {
+pub(crate) fn convert_complex_to_json(array: &ArrayRef, row_idx: usize) -> Result<serde_json::Value> {
     use arrow_array::*;
     use arrow_schema::DataType;
 

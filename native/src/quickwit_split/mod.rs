@@ -89,19 +89,19 @@ use split_utils::create_quickwit_tokenizer_manager;
 /// Configuration for split conversion passed from Java
 #[derive(Debug, Clone)]
 pub(crate) struct SplitConfig {
-    index_uid: String,
-    source_id: String,
-    node_id: String,
-    doc_mapping_uid: String,
-    partition_id: u64,
-    time_range_start: Option<DateTime<Utc>>,
-    time_range_end: Option<DateTime<Utc>>,
-    tags: BTreeSet<String>,
-    metadata: HashMap<String, String>,
+    pub(crate) index_uid: String,
+    pub(crate) source_id: String,
+    pub(crate) node_id: String,
+    pub(crate) doc_mapping_uid: String,
+    pub(crate) partition_id: u64,
+    pub(crate) time_range_start: Option<DateTime<Utc>>,
+    pub(crate) time_range_end: Option<DateTime<Utc>>,
+    pub(crate) tags: BTreeSet<String>,
+    pub(crate) metadata: HashMap<String, String>,
     // New streaming configuration fields
-    streaming_chunk_size: u64,        // 64MB default for optimal I/O
-    enable_progress_tracking: bool,   // Enable detailed progress logging
-    enable_streaming_io: bool,        // Use streaming I/O instead of read_all()
+    pub(crate) streaming_chunk_size: u64,        // 64MB default for optimal I/O
+    pub(crate) enable_progress_tracking: bool,   // Enable detailed progress logging
+    pub(crate) enable_streaming_io: bool,        // Use streaming I/O instead of read_all()
 }
 
 /// Split metadata structure compatible with Quickwit format
@@ -213,7 +213,7 @@ pub(crate) fn default_split_config(index_uid: &str, source_id: &str, node_id: &s
     }
 }
 
-fn create_split_metadata(config: &SplitConfig, num_docs: usize, uncompressed_docs_size: u64) -> QuickwitSplitMetadata {
+pub(crate) fn create_split_metadata(config: &SplitConfig, num_docs: usize, uncompressed_docs_size: u64) -> QuickwitSplitMetadata {
     let split_id = Uuid::new_v4().to_string();
     let current_timestamp = Utc::now().timestamp();
     

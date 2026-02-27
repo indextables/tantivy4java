@@ -13,10 +13,10 @@ use chrono::Utc;
 use tantivy::directory::Directory;
 
 use crate::debug_println;
-use crate::utils::{convert_throwable, jstring_to_string, string_to_jstring};
+use crate::utils::{convert_throwable, jstring_to_string, string_to_jstring, arc_to_jlong, release_arc};
 use super::{
     SplitConfig, QuickwitSplitMetadata, QuickwitRuntimeManager,
-    convert_index_from_path_impl, create_java_split_metadata,
+    convert_index_from_path_impl, create_java_split_metadata, default_split_config,
 };
 use super::merge_config::{extract_merge_config, extract_string_list_from_jobject};
 use super::merge_impl::merge_splits_impl;
@@ -558,6 +558,7 @@ fn parse_create_from_parquet_config(json_str: &str) -> anyhow::Result<CreateFrom
             ip_address_fields,
             json_fields,
             fieldnorms_enabled,
+            store_fields: false, // Companion mode: parquet is the store
         },
         statistics_fields,
         statistics_truncate_length,
@@ -1654,4 +1655,396 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_merge_QuickwitSpli
 
         Ok(())
     });
+}
+
+
+// ============================================================================
+// Arrow FFI Split Creation JNI Entry Points
+// ============================================================================
+
+use std::sync::{Arc, Mutex};
+use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
+use crate::parquet_companion::arrow_ffi_import::{
+    ArrowFfiSplitContext, import_arrow_schema, import_arrow_batch,
+    begin_split_from_arrow, add_arrow_batch, finish_all_splits, cancel_split,
+    PartitionSplitResult,
+};
+use jni::sys::jlong;
+
+/// Begin creating splits from Arrow columnar data via FFI.
+///
+/// Imports the Arrow schema from the FFI address, extracts partition column names,
+/// and creates an ArrowFfiSplitContext with partition routing.
+///
+/// Returns a context handle for subsequent addBatch/finish/cancel calls.
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_split_merge_QuickwitSplit_nativeBeginSplitFromArrow(
+    mut env: JNIEnv,
+    _class: JClass,
+    schema_addr: jlong,
+    partition_columns: jni::sys::jobjectArray,
+    heap_size: jlong,
+) -> jlong {
+    convert_throwable(&mut env, |env| {
+        // Import Arrow schema from FFI address
+        let schema_ptr = schema_addr as *mut FFI_ArrowSchema;
+        let arrow_schema = import_arrow_schema(schema_ptr)?;
+
+        // Extract partition column names from Java String array
+        let partition_cols_obj = unsafe { jni::objects::JObjectArray::from_raw(partition_columns) };
+        let num_partition_cols = env.get_array_length(&partition_cols_obj)? as usize;
+        let mut partition_col_names = Vec::with_capacity(num_partition_cols);
+        for i in 0..num_partition_cols {
+            let jstr = env.get_object_array_element(&partition_cols_obj, i as i32)?;
+            let name = jstring_to_string(env, &jstr.into())?;
+            partition_col_names.push(name);
+        }
+
+        let heap = if heap_size <= 0 { 50_000_000usize } else { heap_size as usize };
+
+        debug_log!("ARROW_FFI_IMPORT: begin_split_from_arrow with {} columns, {} partition cols, heap={}",
+            arrow_schema.fields().len(), partition_col_names.len(), heap);
+
+        let ctx = begin_split_from_arrow(arrow_schema, &partition_col_names, heap)?;
+        let ctx_arc: Arc<Mutex<ArrowFfiSplitContext>> = Arc::new(Mutex::new(ctx));
+        let handle = arc_to_jlong(ctx_arc);
+
+        Ok(handle)
+    }).unwrap_or(0)
+}
+
+/// Add a batch of Arrow columnar data via FFI.
+///
+/// Imports the RecordBatch from FFI addresses, then routes rows to per-partition writers.
+/// Returns cumulative total doc count across all partitions.
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_split_merge_QuickwitSplit_nativeAddArrowBatch(
+    mut env: JNIEnv,
+    _class: JClass,
+    ctx_handle: jlong,
+    array_addr: jlong,
+    schema_addr: jlong,
+) -> jlong {
+    convert_throwable(&mut env, |_env| {
+        // Import RecordBatch from FFI
+        let array_ptr = array_addr as *mut FFI_ArrowArray;
+        let schema_ptr = schema_addr as *mut FFI_ArrowSchema;
+        let batch = import_arrow_batch(array_ptr, schema_ptr)?;
+
+        // Retrieve context from registry
+        let ctx_arc = crate::utils::jlong_to_arc::<Mutex<ArrowFfiSplitContext>>(ctx_handle)
+            .ok_or_else(|| anyhow!("Invalid context handle for addArrowBatch"))?;
+        let mut ctx = ctx_arc.lock()
+            .map_err(|e| anyhow!("Failed to lock context: {}", e))?;
+
+        let count = add_arrow_batch(&mut ctx, &batch)?;
+        Ok(count as jlong)
+    }).unwrap_or(-1)
+}
+
+/// Finalize ALL partition splits, writing each to outputDir.
+///
+/// Returns a Java ArrayList<HashMap<String, Object>> where each entry contains:
+/// - "partitionKey" → String
+/// - "partitionValues" → HashMap<String, String>
+/// - "splitPath" → String
+/// - "numDocs" → Long
+/// - "splitId" → String
+/// - "footerStartOffset" → Long
+/// - "footerEndOffset" → Long
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_split_merge_QuickwitSplit_nativeFinishAllSplits(
+    mut env: JNIEnv,
+    _class: JClass,
+    ctx_handle: jlong,
+    output_dir: JString,
+) -> jobject {
+    convert_throwable(&mut env, |env| {
+        let output_dir_str = jstring_to_string(env, &output_dir)?;
+
+        // Retrieve context clone from registry, then release the registry entry
+        let ctx_arc = crate::utils::jlong_to_arc::<Mutex<ArrowFfiSplitContext>>(ctx_handle)
+            .ok_or_else(|| anyhow!("Invalid context handle for finishAllSplits"))?;
+        release_arc(ctx_handle); // Remove from registry; ctx_arc is now the sole owner
+
+        // Extract the context from Arc<Mutex<>>
+        let ctx = Arc::try_unwrap(ctx_arc)
+            .map_err(|_| anyhow!("Context still has multiple references"))?
+            .into_inner()
+            .map_err(|e| anyhow!("Failed to unwrap mutex: {}", e))?;
+
+        // Create a default SplitConfig (JNI layer uses defaults; future: accept from Java)
+        let split_config = default_split_config("arrow-ffi", "arrow-ffi-source", "arrow-ffi-node");
+
+        // Run async finish in tokio runtime
+        let results = QuickwitRuntimeManager::global().handle()
+            .block_on(finish_all_splits(ctx, &output_dir_str, &split_config))?;
+
+        // Convert results to Java ArrayList<HashMap<String, Object>>
+        let array_list_class = env.find_class("java/util/ArrayList")?;
+        let result_list = env.new_object(&array_list_class, "()V", &[])?;
+
+        let hash_map_class = env.find_class("java/util/HashMap")?;
+
+        for result in &results {
+            let map = env.new_object(&hash_map_class, "()V", &[])?;
+
+            // partitionKey
+            let key_jstr = string_to_jstring(env, &result.partition_key)?;
+            let key_key = string_to_jstring(env, "partitionKey")?;
+            env.call_method(&map, "put",
+                "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+                &[JValue::Object(&key_key.into()), JValue::Object(&key_jstr.into())])?;
+
+            // splitPath
+            let path_jstr = string_to_jstring(env, &result.split_path)?;
+            let path_key = string_to_jstring(env, "splitPath")?;
+            env.call_method(&map, "put",
+                "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+                &[JValue::Object(&path_key.into()), JValue::Object(&path_jstr.into())])?;
+
+            // splitId
+            let id_jstr = string_to_jstring(env, &result.metadata.split_id)?;
+            let id_key = string_to_jstring(env, "splitId")?;
+            env.call_method(&map, "put",
+                "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+                &[JValue::Object(&id_key.into()), JValue::Object(&id_jstr.into())])?;
+
+            // numDocs as Long object
+            let long_class = env.find_class("java/lang/Long")?;
+            let num_docs_obj = env.new_object(&long_class, "(J)V",
+                &[JValue::Long(result.metadata.num_docs as i64)])?;
+            let num_docs_key = string_to_jstring(env, "numDocs")?;
+            env.call_method(&map, "put",
+                "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+                &[JValue::Object(&num_docs_key.into()), JValue::Object(&num_docs_obj)])?;
+
+            // footerStartOffset
+            let footer_start = result.metadata.footer_start_offset.unwrap_or(0) as i64;
+            let footer_start_obj = env.new_object(&long_class, "(J)V",
+                &[JValue::Long(footer_start)])?;
+            let footer_start_key = string_to_jstring(env, "footerStartOffset")?;
+            env.call_method(&map, "put",
+                "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+                &[JValue::Object(&footer_start_key.into()), JValue::Object(&footer_start_obj)])?;
+
+            // footerEndOffset
+            let footer_end = result.metadata.footer_end_offset.unwrap_or(0) as i64;
+            let footer_end_obj = env.new_object(&long_class, "(J)V",
+                &[JValue::Long(footer_end)])?;
+            let footer_end_key = string_to_jstring(env, "footerEndOffset")?;
+            env.call_method(&map, "put",
+                "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+                &[JValue::Object(&footer_end_key.into()), JValue::Object(&footer_end_obj)])?;
+
+            // partitionValues as nested HashMap
+            let pv_map = env.new_object(&hash_map_class, "()V", &[])?;
+            for (col, val) in &result.partition_values {
+                let col_jstr = string_to_jstring(env, col)?;
+                let val_jstr = string_to_jstring(env, val)?;
+                env.call_method(&pv_map, "put",
+                    "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+                    &[JValue::Object(&col_jstr.into()), JValue::Object(&val_jstr.into())])?;
+            }
+            let pv_key = string_to_jstring(env, "partitionValues")?;
+            env.call_method(&map, "put",
+                "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+                &[JValue::Object(&pv_key.into()), JValue::Object(&pv_map)])?;
+
+            // Add map to result list
+            env.call_method(&result_list, "add",
+                "(Ljava/lang/Object;)Z",
+                &[JValue::Object(&map)])?;
+        }
+
+        Ok(result_list.into_raw())
+    }).unwrap_or(std::ptr::null_mut())
+}
+
+/// Cancel an in-progress split creation, releasing ALL resources across all partitions.
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_split_merge_QuickwitSplit_nativeCancelSplit(
+    mut env: JNIEnv,
+    _class: JClass,
+    ctx_handle: jlong,
+) {
+    let _ = convert_throwable(&mut env, |_env| {
+        // Release from registry — dropping the Arc cleans up everything
+        release_arc(ctx_handle);
+        debug_log!("ARROW_FFI_IMPORT: Cancelled split creation via nativeCancelSplit");
+        Ok(())
+    });
+}
+
+// ============================================================================
+// Arrow FFI Test Helpers (test-only: create valid FFI structs from Rust)
+// ============================================================================
+
+use arrow_schema::{Schema as ArrowSchema, Field as ArrowField, DataType};
+use arrow_array::{Array, RecordBatch, StructArray, StringArray, Int64Array, Float64Array, BooleanArray};
+
+/// Test helper: Export an Arrow schema as an FFI_ArrowSchema struct with valid release callback.
+/// Supported types: "int64", "utf8", "float64", "boolean"
+/// Returns the memory address of the boxed FFI_ArrowSchema.
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_split_merge_QuickwitSplit_nativeTestExportSchemaFfi(
+    mut env: JNIEnv,
+    _class: JClass,
+    field_names: jni::sys::jobjectArray,
+    field_types: jni::sys::jobjectArray,
+) -> jlong {
+    convert_throwable(&mut env, |env| {
+        let names_arr = unsafe { jni::objects::JObjectArray::from_raw(field_names) };
+        let types_arr = unsafe { jni::objects::JObjectArray::from_raw(field_types) };
+        let num_fields = env.get_array_length(&names_arr)? as usize;
+
+        let mut fields = Vec::with_capacity(num_fields);
+        for i in 0..num_fields {
+            let name_obj = env.get_object_array_element(&names_arr, i as i32)?;
+            let type_obj = env.get_object_array_element(&types_arr, i as i32)?;
+            let name = jstring_to_string(env, &name_obj.into())?;
+            let type_str = jstring_to_string(env, &type_obj.into())?;
+
+            let data_type = match type_str.as_str() {
+                "int64" => DataType::Int64,
+                "utf8" => DataType::Utf8,
+                "float64" => DataType::Float64,
+                "boolean" => DataType::Boolean,
+                _ => return Err(anyhow!("Unsupported test field type: {}", type_str)),
+            };
+            fields.push(ArrowField::new(&name, data_type, true));
+        }
+
+        let schema = ArrowSchema::new(fields);
+        let ffi_schema = FFI_ArrowSchema::try_from(&schema)
+            .map_err(|e| anyhow!("Failed to export schema to FFI: {}", e))?;
+        let boxed = Box::new(ffi_schema);
+        Ok(Box::into_raw(boxed) as jlong)
+    }).unwrap_or(0)
+}
+
+/// Test helper: Export a standard test batch as FFI structs with valid release callbacks.
+/// Schema: (id: Int64, name: Utf8, score: Float64, active: Boolean)
+/// Data: sequential values starting from idOffset.
+/// Returns long[2] = [arrayAddr, schemaAddr]
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_split_merge_QuickwitSplit_nativeTestExportStandardBatchFfi(
+    mut env: JNIEnv,
+    _class: JClass,
+    num_rows: jni::sys::jint,
+    id_offset: jlong,
+) -> jni::sys::jlongArray {
+    convert_throwable(&mut env, |env| {
+        let n = num_rows as usize;
+        let offset = id_offset;
+
+        let ids: Vec<i64> = (offset..offset + n as i64).collect();
+        let names: Vec<String> = (0..n).map(|i| format!("name_{}", i as i64 + offset)).collect();
+        let scores: Vec<f64> = (0..n).map(|i| (i as f64) * 1.5 + offset as f64).collect();
+        let actives: Vec<bool> = (0..n).map(|i| i % 2 == 0).collect();
+
+        let schema = ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int64, false),
+            ArrowField::new("name", DataType::Utf8, false),
+            ArrowField::new("score", DataType::Float64, true),
+            ArrowField::new("active", DataType::Boolean, true),
+        ]);
+
+        let batch = RecordBatch::try_new(
+            std::sync::Arc::new(schema),
+            vec![
+                std::sync::Arc::new(Int64Array::from(ids)),
+                std::sync::Arc::new(StringArray::from(
+                    names.iter().map(|s| s.as_str()).collect::<Vec<_>>()
+                )),
+                std::sync::Arc::new(Float64Array::from(scores)),
+                std::sync::Arc::new(BooleanArray::from(actives)),
+            ],
+        ).map_err(|e| anyhow!("Failed to create test batch: {}", e))?;
+
+        let struct_array = StructArray::from(batch);
+        let data = struct_array.to_data();
+
+        let ffi_schema = FFI_ArrowSchema::try_from(data.data_type())
+            .map_err(|e| anyhow!("Failed to export batch schema to FFI: {}", e))?;
+        let ffi_array = FFI_ArrowArray::new(&data);
+
+        let array_addr = Box::into_raw(Box::new(ffi_array)) as jlong;
+        let schema_addr = Box::into_raw(Box::new(ffi_schema)) as jlong;
+
+        let result = env.new_long_array(2)?;
+        env.set_long_array_region(&result, 0, &[array_addr, schema_addr])?;
+        Ok(result.into_raw())
+    }).unwrap_or(std::ptr::null_mut())
+}
+
+/// Test helper: Export a partition test batch as FFI structs.
+/// Schema: (id: Int64, name: Utf8, <extraColName>: Utf8)
+/// Returns long[2] = [arrayAddr, schemaAddr]
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_split_merge_QuickwitSplit_nativeTestExportPartitionBatchFfi(
+    mut env: JNIEnv,
+    _class: JClass,
+    ids: jni::sys::jlongArray,
+    names: jni::sys::jobjectArray,
+    extra_col_name: JString,
+    extra_values: jni::sys::jobjectArray,
+) -> jni::sys::jlongArray {
+    convert_throwable(&mut env, |env| {
+        // Extract ids
+        let ids_arr = unsafe { jni::objects::JLongArray::from_raw(ids) };
+        let num_rows = env.get_array_length(&ids_arr)? as usize;
+        let mut id_values = vec![0i64; num_rows];
+        env.get_long_array_region(&ids_arr, 0, &mut id_values)?;
+
+        // Extract names
+        let names_arr = unsafe { jni::objects::JObjectArray::from_raw(names) };
+        let mut name_values = Vec::with_capacity(num_rows);
+        for i in 0..num_rows {
+            let obj = env.get_object_array_element(&names_arr, i as i32)?;
+            name_values.push(jstring_to_string(env, &obj.into())?);
+        }
+
+        // Extract extra column name and values
+        let extra_name = jstring_to_string(env, &extra_col_name)?;
+        let extra_arr = unsafe { jni::objects::JObjectArray::from_raw(extra_values) };
+        let mut extra_vals = Vec::with_capacity(num_rows);
+        for i in 0..num_rows {
+            let obj = env.get_object_array_element(&extra_arr, i as i32)?;
+            extra_vals.push(jstring_to_string(env, &obj.into())?);
+        }
+
+        let schema = ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int64, false),
+            ArrowField::new("name", DataType::Utf8, false),
+            ArrowField::new(&extra_name, DataType::Utf8, false),
+        ]);
+
+        let batch = RecordBatch::try_new(
+            std::sync::Arc::new(schema),
+            vec![
+                std::sync::Arc::new(Int64Array::from(id_values)),
+                std::sync::Arc::new(StringArray::from(
+                    name_values.iter().map(|s| s.as_str()).collect::<Vec<_>>()
+                )),
+                std::sync::Arc::new(StringArray::from(
+                    extra_vals.iter().map(|s| s.as_str()).collect::<Vec<_>>()
+                )),
+            ],
+        ).map_err(|e| anyhow!("Failed to create partition test batch: {}", e))?;
+
+        let struct_array = StructArray::from(batch);
+        let data = struct_array.to_data();
+
+        let ffi_schema = FFI_ArrowSchema::try_from(data.data_type())
+            .map_err(|e| anyhow!("Failed to export batch schema to FFI: {}", e))?;
+        let ffi_array = FFI_ArrowArray::new(&data);
+
+        let array_addr = Box::into_raw(Box::new(ffi_array)) as jlong;
+        let schema_addr = Box::into_raw(Box::new(ffi_schema)) as jlong;
+
+        let result = env.new_long_array(2)?;
+        env.set_long_array_region(&result, 0, &[array_addr, schema_addr])?;
+        Ok(result.into_raw())
+    }).unwrap_or(std::ptr::null_mut())
 }

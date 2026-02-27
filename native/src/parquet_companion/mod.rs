@@ -22,6 +22,7 @@ pub mod coalescing;
 pub mod field_extraction;
 pub mod arrow_to_tant;
 pub mod arrow_ffi_export;
+pub mod arrow_ffi_import;
 pub mod hash_field_rewriter;
 pub mod hash_touchup;
 pub mod string_indexing;
