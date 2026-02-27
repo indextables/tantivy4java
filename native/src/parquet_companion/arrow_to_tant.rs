@@ -419,6 +419,302 @@ fn merge_two_batches(a: RecordBatch, b: RecordBatch) -> Result<RecordBatch> {
         .context("Failed to merge primitive and nested batches")
 }
 
+/// Read parquet data for a single file as Arrow RecordBatches.
+///
+/// This is the shared parquet reading pipeline used by both the TANT serialization
+/// path and the Arrow FFI export path. It handles:
+/// - Metadata caching, column projection, row group filtering, row selection
+/// - Page location injection and the 3-case read strategy (A/B/C)
+/// - Two-pass reads for mixed primitive + nested column projections
+///
+/// Returns the collected RecordBatches for the file.
+pub async fn read_parquet_batches_for_file(
+    file_idx: usize,
+    rows: &[(usize, u64)],
+    projected_fields: Option<&[String]>,
+    manifest: &ParquetManifest,
+    storage: &Arc<dyn Storage>,
+    metadata_cache: Option<&MetadataCache>,
+    byte_cache: Option<&ByteRangeCache>,
+    coalesce_config: Option<CoalesceConfig>,
+) -> Result<Vec<RecordBatch>> {
+    let t_file = std::time::Instant::now();
+    let file_entry = &manifest.parquet_files[file_idx];
+    let parquet_path = &file_entry.relative_path;
+
+    perf_println!(
+        "⏱️ PROJ_DIAG: file[{}]='{}' retrieving {} rows, file_size={}",
+        file_idx, parquet_path, rows.len(), file_entry.file_size_bytes
+    );
+
+    // Check metadata cache to avoid re-reading footer from S3/Azure
+    let path_buf = std::path::PathBuf::from(parquet_path);
+    let cached_meta = metadata_cache.and_then(|cache| {
+        cache
+            .lock()
+            .ok()
+            .and_then(|guard| guard.get(&path_buf).cloned())
+    });
+    let meta_was_cached = cached_meta.is_some();
+
+    // Helper: create a CachedParquetReader without page locations
+    let make_reader = |meta: Option<Arc<parquet::file::metadata::ParquetMetaData>>| {
+        let r = if let Some(m) = meta {
+            CachedParquetReader::with_metadata(
+                storage.clone(), path_buf.clone(), file_entry.file_size_bytes, m,
+            )
+        } else {
+            CachedParquetReader::new(
+                storage.clone(), path_buf.clone(), file_entry.file_size_bytes,
+            )
+        };
+        let r = if let Some(bc) = byte_cache {
+            r.with_byte_cache(bc.clone())
+        } else { r };
+        if let Some(config) = coalesce_config {
+            r.with_coalesce_config(config)
+        } else { r }
+    };
+
+    // First pass: build reader WITHOUT page locations to get schema
+    let reader = make_reader(cached_meta);
+    let t_builder = std::time::Instant::now();
+    let builder = ParquetRecordBatchStreamBuilder::new(reader)
+        .await
+        .context("Failed to create parquet stream builder")?;
+    perf_println!(
+        "⏱️ PROJ_DIAG: file[{}] ParquetRecordBatchStreamBuilder::new took {}ms (metadata_cached={})",
+        file_idx, t_builder.elapsed().as_millis(), meta_was_cached
+    );
+
+    let parquet_schema = builder.schema().clone();
+    let parquet_metadata = builder.metadata().clone();
+
+    // Cache the metadata for subsequent reads
+    if let Some(cache) = metadata_cache {
+        if let Ok(mut guard) = cache.lock() {
+            if !guard.contains_key(&path_buf) {
+                guard.insert(path_buf.clone(), parquet_metadata.clone());
+            }
+        }
+    }
+
+    let total_parquet_columns = parquet_schema.fields().len();
+    perf_println!(
+        "⏱️ PROJ_DIAG: file[{}] parquet schema has {} columns, {} row groups",
+        file_idx, total_parquet_columns, parquet_metadata.num_row_groups()
+    );
+
+    // Build column projection
+    let projection = build_column_projection(
+        projected_fields,
+        &parquet_schema,
+        &manifest.column_mapping,
+    );
+
+    perf_println!(
+        "⏱️ PROJ_DIAG: file[{}] build_column_projection: input={:?}, output_indices={:?} (of {} total columns)",
+        file_idx,
+        projected_fields.map(|f| f.len()),
+        projection.as_ref().map(|p| p.clone()),
+        total_parquet_columns
+    );
+
+    // Row indices within the file (already sorted by group_doc_addresses_by_file)
+    let row_indices: Vec<usize> =
+        rows.iter().map(|(_, row)| *row as usize).collect();
+
+    // Determine which row groups to read (shared by all passes)
+    let rg_filter = compute_row_group_filter(&row_indices, &parquet_metadata);
+    let selected_rgs: Option<Vec<usize>> = rg_filter.as_ref().map(|filter| {
+        filter.iter().enumerate()
+            .filter(|(_, selected)| **selected)
+            .map(|(idx, _)| idx)
+            .collect()
+    });
+    if let Some(ref rgs) = selected_rgs {
+        perf_println!(
+            "⏱️ PROJ_DIAG: file[{}] row_group_filter: selected {}/{} row groups (indices={:?})",
+            file_idx, rgs.len(), parquet_metadata.num_row_groups(), rgs
+        );
+    }
+
+    // Build RowSelection (shared by all passes)
+    let row_selection = build_row_selection_for_rows_in_selected_groups(
+        &row_indices,
+        &parquet_metadata,
+        rg_filter.as_deref(),
+    );
+    perf_println!(
+        "⏱️ PROJ_DIAG: file[{}] row_selection present={}, target_rows={:?}",
+        file_idx, row_selection.is_some(), row_indices
+    );
+
+    // --- 3-case read strategy ---
+    //
+    // Case A: file has native offset index OR no manifest page locs → single pass with page locs
+    // Case B: manifest page locs, no nested columns in projection → single pass with page locs
+    // Case C: manifest page locs AND nested columns in projection → TWO-PASS:
+    //         Pass 1: primitives with page loc injection
+    //         Pass 2: nested without page loc injection
+    //         Merge results column-wise
+
+    let uses_manifest_locs = file_has_manifest_page_locs(file_entry);
+    let has_nested_in_proj = projection_has_nested(&projection, &parquet_schema);
+
+    let need_two_pass = uses_manifest_locs && has_nested_in_proj;
+
+    // Helper: given a pre-configured reader, apply projection/filters, collect batches.
+    async fn build_and_collect(
+        reader: CachedParquetReader,
+        col_indices: Option<&Vec<usize>>,
+        selected_rgs: &Option<Vec<usize>>,
+        row_selection: Option<parquet::arrow::arrow_reader::RowSelection>,
+    ) -> Result<Vec<RecordBatch>> {
+        let builder = ParquetRecordBatchStreamBuilder::new(reader)
+            .await.context("Failed to create stream builder")?;
+        let pq_schema = builder.parquet_schema().clone();
+        let builder = match col_indices {
+            Some(indices) => builder.with_projection(
+                parquet::arrow::ProjectionMask::roots(&pq_schema, indices.iter().cloned()),
+            ),
+            None => builder,
+        };
+        let builder = match selected_rgs {
+            Some(rgs) => builder.with_row_groups(rgs.clone()),
+            None => builder,
+        };
+        let builder = match row_selection {
+            Some(sel) => builder.with_row_selection(sel),
+            None => builder,
+        };
+        builder.build().context("Failed to build stream")?
+            .collect::<Vec<_>>().await
+            .into_iter()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .context("Failed reading batches")
+    }
+
+    // Collect batches from the read(s)
+    let collected_batches: Vec<RecordBatch> = if need_two_pass {
+        // Case C: Two-pass read
+        let all_indices: Vec<usize> = if let Some(ref proj) = projection {
+            proj.clone()
+        } else {
+            (0..parquet_schema.fields().len()).collect()
+        };
+        let (prim_indices, nested_indices) =
+            split_projection_by_nesting(&all_indices, &parquet_schema);
+
+        perf_println!(
+            "⏱️ PROJ_DIAG: file[{}] Case C TWO-PASS: prim={:?}, nested={:?}",
+            file_idx, prim_indices, nested_indices
+        );
+
+        match (prim_indices, nested_indices) {
+            (Some(prim), Some(nested)) => {
+                // Both primitive and nested — true two-pass, concurrent
+                let prim_reader = make_reader(Some(parquet_metadata.clone()));
+                let prim_reader = attach_page_locations(prim_reader, file_entry);
+                let nested_reader = make_reader(Some(parquet_metadata.clone()));
+
+                let (prim_batches, nested_batches) = futures::future::try_join(
+                    build_and_collect(prim_reader, Some(&prim), &selected_rgs, row_selection.clone()),
+                    build_and_collect(nested_reader, Some(&nested), &selected_rgs, row_selection),
+                ).await?;
+
+                perf_println!(
+                    "⏱️ PROJ_DIAG: file[{}] two-pass: {} prim batches ({} rows), {} nested batches ({} rows)",
+                    file_idx,
+                    prim_batches.len(),
+                    prim_batches.iter().map(|b| b.num_rows()).sum::<usize>(),
+                    nested_batches.len(),
+                    nested_batches.iter().map(|b| b.num_rows()).sum::<usize>(),
+                );
+
+                merge_batch_sequences(prim_batches, nested_batches)?
+            }
+            (Some(_prim), None) => {
+                // Only primitives — single pass with page locs
+                let reader = make_reader(Some(parquet_metadata.clone()));
+                let reader = attach_page_locations(reader, file_entry);
+                build_and_collect(reader, projection.as_ref(), &selected_rgs, row_selection).await?
+            }
+            (None, Some(_nested)) => {
+                // Only nested — single pass WITHOUT page locs
+                let reader = make_reader(Some(parquet_metadata.clone()));
+                build_and_collect(reader, projection.as_ref(), &selected_rgs, row_selection).await?
+            }
+            (None, None) => Vec::new(), // Empty projection — no columns to read
+        }
+    } else {
+        // Case A or B: Single-pass with page location injection
+        let reader = make_reader(Some(parquet_metadata.clone()));
+        let reader = attach_page_locations(reader, file_entry);
+        build_and_collect(reader, projection.as_ref(), &selected_rgs, row_selection).await?
+    };
+
+    perf_println!(
+        "⏱️ PROJ_DIAG: file[{}] read {} batches ({} rows total), took {}ms",
+        file_idx,
+        collected_batches.len(),
+        collected_batches.iter().map(|b| b.num_rows()).sum::<usize>(),
+        t_file.elapsed().as_millis()
+    );
+
+    Ok(collected_batches)
+}
+
+/// Read parquet data for multiple files in parallel, returning batches indexed by original position.
+///
+/// Returns a Vec of `(original_index, Vec<RecordBatch>)` pairs — one entry per requested document.
+/// Each inner Vec<RecordBatch> contains the batches from the file that document belongs to.
+/// This is the shared pipeline used by both TANT and Arrow FFI paths.
+///
+/// The returned Vec contains `(original_idx, batches_for_file, rows_for_file)` per file group.
+pub async fn read_parquet_batches_by_groups(
+    groups: std::collections::HashMap<usize, Vec<(usize, u64)>>,
+    projected_fields: Option<&[String]>,
+    manifest: &ParquetManifest,
+    storage: &Arc<dyn Storage>,
+    metadata_cache: Option<&MetadataCache>,
+    byte_cache: Option<&ByteRangeCache>,
+    coalesce_config: Option<CoalesceConfig>,
+) -> Result<Vec<(Vec<(usize, u64)>, Vec<RecordBatch>)>> {
+    // Share projected_fields across parallel tasks via Arc (avoid per-task Vec clone)
+    let projected_fields_shared: Option<Arc<[String]>> =
+        projected_fields.map(|f| f.into());
+
+    let file_futures: Vec<_> = groups
+        .into_iter()
+        .map(|(file_idx, rows)| {
+            let storage = storage.clone();
+            let manifest = manifest.clone();
+            let projected_fields_owned = projected_fields_shared.clone();
+            let metadata_cache = metadata_cache.cloned();
+            let byte_cache = byte_cache.cloned();
+
+            async move {
+                let proj_fields = projected_fields_owned.as_deref();
+                let batches = read_parquet_batches_for_file(
+                    file_idx,
+                    &rows,
+                    proj_fields.map(|s| s as &[String]),
+                    &manifest,
+                    &storage,
+                    metadata_cache.as_ref(),
+                    byte_cache.as_ref(),
+                    coalesce_config,
+                )
+                .await?;
+                Ok::<_, anyhow::Error>((rows, batches))
+            }
+        })
+        .collect();
+
+    futures::future::try_join_all(file_futures).await
+}
+
 /// Core batch retrieval with pre-resolved file groups.
 ///
 /// Accepts groups already resolved via fast fields (or legacy segment→global→file).
@@ -439,297 +735,41 @@ pub async fn batch_parquet_to_tant_buffer_by_groups(
         groups.len(), result_count, projected_fields
     );
 
-    // Share projected_fields across parallel tasks via Arc (avoid per-task Vec clone)
-    let projected_fields_shared: Option<Arc<[String]>> =
-        projected_fields.map(|f| f.into());
+    // Read parquet data using the shared pipeline
+    let file_results = read_parquet_batches_by_groups(
+        groups,
+        projected_fields,
+        manifest,
+        storage,
+        metadata_cache,
+        byte_cache,
+        coalesce_config,
+    )
+    .await?;
 
-    // Process each file's rows in parallel
-    let file_futures: Vec<_> = groups
-        .into_iter()
-        .map(|(file_idx, rows)| {
-            let storage = storage.clone();
-            let manifest = manifest.clone();
-            let projected_fields_owned = projected_fields_shared.clone();
-            let metadata_cache = metadata_cache.cloned();
-            let byte_cache = byte_cache.cloned();
-
-            async move {
-                let t_file = std::time::Instant::now();
-                let file_entry = &manifest.parquet_files[file_idx];
-                let parquet_path = &file_entry.relative_path;
-
-                perf_println!(
-                    "⏱️ PROJ_DIAG: file[{}]='{}' retrieving {} rows, file_size={}",
-                    file_idx, parquet_path, rows.len(), file_entry.file_size_bytes
-                );
-
-                // Check metadata cache to avoid re-reading footer from S3/Azure
-                let path_buf = std::path::PathBuf::from(parquet_path);
-                let cached_meta = metadata_cache.as_ref().and_then(|cache| {
-                    cache
-                        .lock()
-                        .ok()
-                        .and_then(|guard| guard.get(&path_buf).cloned())
-                });
-                let meta_was_cached = cached_meta.is_some();
-
-                // Helper: create a CachedParquetReader without page locations
-                let make_reader = |meta: Option<Arc<parquet::file::metadata::ParquetMetaData>>| {
-                    let r = if let Some(m) = meta {
-                        CachedParquetReader::with_metadata(
-                            storage.clone(), path_buf.clone(), file_entry.file_size_bytes, m,
-                        )
-                    } else {
-                        CachedParquetReader::new(
-                            storage.clone(), path_buf.clone(), file_entry.file_size_bytes,
-                        )
-                    };
-                    let r = if let Some(ref bc) = byte_cache {
-                        r.with_byte_cache(bc.clone())
-                    } else { r };
-                    if let Some(config) = coalesce_config {
-                        r.with_coalesce_config(config)
-                    } else { r }
-                };
-
-                // First pass: build reader WITHOUT page locations to get schema
-                let reader = make_reader(cached_meta);
-                let t_builder = std::time::Instant::now();
-                let builder = ParquetRecordBatchStreamBuilder::new(reader)
-                    .await
-                    .context("Failed to create parquet stream builder")?;
-                perf_println!(
-                    "⏱️ PROJ_DIAG: file[{}] ParquetRecordBatchStreamBuilder::new took {}ms (metadata_cached={})",
-                    file_idx, t_builder.elapsed().as_millis(), meta_was_cached
-                );
-
-                let parquet_schema = builder.schema().clone();
-                let parquet_metadata = builder.metadata().clone();
-
-                // Cache the metadata for subsequent reads
-                if let Some(cache) = &metadata_cache {
-                    if let Ok(mut guard) = cache.lock() {
-                        if !guard.contains_key(&path_buf) {
-                            guard.insert(path_buf.clone(), parquet_metadata.clone());
-                        }
-                    }
-                }
-
-                let total_parquet_columns = parquet_schema.fields().len();
-                perf_println!(
-                    "⏱️ PROJ_DIAG: file[{}] parquet schema has {} columns, {} row groups",
-                    file_idx, total_parquet_columns, parquet_metadata.num_row_groups()
-                );
-
-                // Build column projection
-                let proj_fields = projected_fields_owned.as_deref();
-                let projection = build_column_projection(
-                    proj_fields,
-                    &parquet_schema,
-                    &manifest.column_mapping,
-                );
-
-                perf_println!(
-                    "⏱️ PROJ_DIAG: file[{}] build_column_projection: input={:?}, output_indices={:?} (of {} total columns)",
-                    file_idx,
-                    proj_fields.map(|f| f.len()),
-                    projection.as_ref().map(|p| p.clone()),
-                    total_parquet_columns
-                );
-
-                // Row indices within the file (already sorted by group_doc_addresses_by_file)
-                let row_indices: Vec<usize> =
-                    rows.iter().map(|(_, row)| *row as usize).collect();
-
-                // Determine which row groups to read (shared by all passes)
-                let rg_filter = compute_row_group_filter(&row_indices, &parquet_metadata);
-                let selected_rgs: Option<Vec<usize>> = rg_filter.as_ref().map(|filter| {
-                    filter.iter().enumerate()
-                        .filter(|(_, selected)| **selected)
-                        .map(|(idx, _)| idx)
-                        .collect()
-                });
-                if let Some(ref rgs) = selected_rgs {
-                    perf_println!(
-                        "⏱️ PROJ_DIAG: file[{}] row_group_filter: selected {}/{} row groups (indices={:?})",
-                        file_idx, rgs.len(), parquet_metadata.num_row_groups(), rgs
-                    );
-                }
-
-                // Build RowSelection (shared by all passes)
-                let row_selection = build_row_selection_for_rows_in_selected_groups(
-                    &row_indices,
-                    &parquet_metadata,
-                    rg_filter.as_deref(),
-                );
-                perf_println!(
-                    "⏱️ PROJ_DIAG: file[{}] row_selection present={}, target_rows={:?}",
-                    file_idx, row_selection.is_some(), row_indices
-                );
-
-                // --- 3-case read strategy ---
-                //
-                // Case A: file has native offset index OR no manifest page locs → single pass with page locs
-                // Case B: manifest page locs, no nested columns in projection → single pass with page locs
-                // Case C: manifest page locs AND nested columns in projection → TWO-PASS:
-                //         Pass 1: primitives with page loc injection
-                //         Pass 2: nested without page loc injection
-                //         Merge results column-wise
-
-                let uses_manifest_locs = file_has_manifest_page_locs(file_entry);
-                let has_nested_in_proj = projection_has_nested(&projection, &parquet_schema);
-
-                let need_two_pass = uses_manifest_locs && has_nested_in_proj;
-
-                // Helper: given a pre-configured reader, apply projection/filters, collect batches.
-                async fn build_and_collect(
-                    reader: CachedParquetReader,
-                    col_indices: Option<&Vec<usize>>,
-                    selected_rgs: &Option<Vec<usize>>,
-                    row_selection: Option<parquet::arrow::arrow_reader::RowSelection>,
-                ) -> Result<Vec<RecordBatch>> {
-                    let builder = ParquetRecordBatchStreamBuilder::new(reader)
-                        .await.context("Failed to create stream builder")?;
-                    let pq_schema = builder.parquet_schema().clone();
-                    let builder = match col_indices {
-                        Some(indices) => builder.with_projection(
-                            parquet::arrow::ProjectionMask::roots(&pq_schema, indices.iter().cloned()),
-                        ),
-                        None => builder,
-                    };
-                    let builder = match selected_rgs {
-                        Some(rgs) => builder.with_row_groups(rgs.clone()),
-                        None => builder,
-                    };
-                    let builder = match row_selection {
-                        Some(sel) => builder.with_row_selection(sel),
-                        None => builder,
-                    };
-                    builder.build().context("Failed to build stream")?
-                        .collect::<Vec<_>>().await
-                        .into_iter()
-                        .collect::<std::result::Result<Vec<_>, _>>()
-                        .context("Failed reading batches")
-                }
-
-                // Collect batches from the read(s)
-                let collected_batches: Vec<RecordBatch> = if need_two_pass {
-                    // Case C: Two-pass read
-                    let all_indices: Vec<usize> = if let Some(ref proj) = projection {
-                        proj.clone()
-                    } else {
-                        (0..parquet_schema.fields().len()).collect()
-                    };
-                    let (prim_indices, nested_indices) =
-                        split_projection_by_nesting(&all_indices, &parquet_schema);
-
-                    perf_println!(
-                        "⏱️ PROJ_DIAG: file[{}] Case C TWO-PASS: prim={:?}, nested={:?}",
-                        file_idx, prim_indices, nested_indices
-                    );
-
-                    match (prim_indices, nested_indices) {
-                        (Some(prim), Some(nested)) => {
-                            // Both primitive and nested — true two-pass, concurrent
-                            let prim_reader = make_reader(Some(parquet_metadata.clone()));
-                            let prim_reader = attach_page_locations(prim_reader, file_entry);
-                            let nested_reader = make_reader(Some(parquet_metadata.clone()));
-
-                            let (prim_batches, nested_batches) = futures::future::try_join(
-                                build_and_collect(prim_reader, Some(&prim), &selected_rgs, row_selection.clone()),
-                                build_and_collect(nested_reader, Some(&nested), &selected_rgs, row_selection),
-                            ).await?;
-
-                            perf_println!(
-                                "⏱️ PROJ_DIAG: file[{}] two-pass: {} prim batches ({} rows), {} nested batches ({} rows)",
-                                file_idx,
-                                prim_batches.len(),
-                                prim_batches.iter().map(|b| b.num_rows()).sum::<usize>(),
-                                nested_batches.len(),
-                                nested_batches.iter().map(|b| b.num_rows()).sum::<usize>(),
-                            );
-
-                            merge_batch_sequences(prim_batches, nested_batches)?
-                        }
-                        (Some(_prim), None) => {
-                            // Only primitives — single pass with page locs
-                            let reader = make_reader(Some(parquet_metadata.clone()));
-                            let reader = attach_page_locations(reader, file_entry);
-                            build_and_collect(reader, projection.as_ref(), &selected_rgs, row_selection).await?
-                        }
-                        (None, Some(_nested)) => {
-                            // Only nested — single pass WITHOUT page locs
-                            let reader = make_reader(Some(parquet_metadata.clone()));
-                            build_and_collect(reader, projection.as_ref(), &selected_rgs, row_selection).await?
-                        }
-                        (None, None) => Vec::new(), // Empty projection — no columns to read
-                    }
-                } else {
-                    // Case A or B: Single-pass with page location injection
-                    let reader = make_reader(Some(parquet_metadata.clone()));
-                    let reader = attach_page_locations(reader, file_entry);
-                    build_and_collect(reader, projection.as_ref(), &selected_rgs, row_selection).await?
-                };
-
-                // Convert collected batches to TANT bytes
-                let mut column_info: Option<Vec<(String, u8)>> = None;
-                let mut collected_rows: Vec<Vec<u8>> = Vec::new();
-                let mut batch_count = 0u32;
-                let t_read = std::time::Instant::now();
-                for batch in &collected_batches {
-                    batch_count += 1;
-
-                    if batch_count == 1 && *crate::debug::PERFLOG_ENABLED {
-                        let batch_schema = batch.schema();
-                        let col_names: Vec<&str> = batch_schema.fields().iter().map(|f| f.name().as_str()).collect();
-                        perf_println!(
-                            "⏱️ PROJ_DIAG: file[{}] FIRST batch — {} rows, {} columns, names: {:?}",
-                            file_idx, batch.num_rows(), batch.num_columns(), col_names
-                        );
-                    }
-
-                    let info = column_info.get_or_insert_with(|| {
-                        build_column_info(&batch.schema(), &manifest.column_mapping)
-                    });
-
-                    for row_idx in 0..batch.num_rows() {
-                        let doc_bytes = extract_row_as_tant(batch, row_idx, info)?;
-                        collected_rows.push(doc_bytes);
-                    }
-                }
-                perf_println!(
-                    "⏱️ PROJ_DIAG: file[{}] processed: {} batches, {} rows total, took {}ms",
-                    file_idx, batch_count, collected_rows.len(), t_read.elapsed().as_millis()
-                );
-
-                perf_println!(
-                    "⏱️ PROJ_DIAG: file[{}] TOTAL file processing took {}ms",
-                    file_idx, t_file.elapsed().as_millis()
-                );
-
-                // Return (original_index, doc_bytes) pairs for reassembly
-                let mut drain_iter = collected_rows.drain(..);
-                let indexed_results: Vec<(usize, Vec<u8>)> = rows
-                    .iter()
-                    .map(|(original_idx, _)| {
-                        let data = drain_iter.next().unwrap_or_default();
-                        (*original_idx, data)
-                    })
-                    .collect();
-
-                Ok::<_, anyhow::Error>(indexed_results)
-            }
-        })
-        .collect();
-
-    // Execute all file retrievals in parallel
-    let all_file_results = futures::future::try_join_all(file_futures).await?;
-
-    // Reassemble results in original order
+    // Convert each file's batches to TANT bytes and pair with original indices
     let mut doc_buffers: Vec<Option<Vec<u8>>> = vec![None; result_count];
-    for file_results in all_file_results {
-        for (original_idx, doc_bytes) in file_results {
-            doc_buffers[original_idx] = Some(doc_bytes);
+
+    for (rows, collected_batches) in file_results {
+        let mut column_info: Option<Vec<(String, u8)>> = None;
+        let mut collected_rows: Vec<Vec<u8>> = Vec::new();
+
+        for batch in &collected_batches {
+            let info = column_info.get_or_insert_with(|| {
+                build_column_info(&batch.schema(), &manifest.column_mapping)
+            });
+
+            for row_idx in 0..batch.num_rows() {
+                let doc_bytes = extract_row_as_tant(batch, row_idx, info)?;
+                collected_rows.push(doc_bytes);
+            }
+        }
+
+        // Pair rows with original indices
+        let mut drain_iter = collected_rows.drain(..);
+        for (original_idx, _) in &rows {
+            let data = drain_iter.next().unwrap_or_default();
+            doc_buffers[*original_idx] = Some(data);
         }
     }
 

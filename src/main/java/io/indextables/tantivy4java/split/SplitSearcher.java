@@ -432,6 +432,62 @@ public class SplitSearcher implements AutoCloseable {
     }
 
     /**
+     * Returns true if this split supports Arrow FFI columnar retrieval
+     * (i.e., it's a parquet companion split with a parquet manifest).
+     *
+     * @return true if Arrow FFI export is available for this split
+     */
+    public boolean supportsArrowFfi() {
+        return hasParquetCompanion();
+    }
+
+    /**
+     * Retrieve companion mode documents as Arrow columnar data via the Arrow C Data Interface (FFI).
+     *
+     * <p>The caller must pre-allocate ArrowArray and ArrowSchema C structs (one per field)
+     * and pass their memory addresses. The native layer writes column data directly to
+     * these addresses with zero-copy semantics. This eliminates all serialization overhead
+     * compared to the TANT byte buffer path.</p>
+     *
+     * <p>Returns the number of rows written, or -1 if this split does not support Arrow FFI
+     * (non-companion splits should use {@link #docBatchProjected(DocAddress[], String...)} instead).</p>
+     *
+     * <p><b>Note:</b> This method has zero Arrow Java dependencies — it only passes {@code long[]}
+     * addresses through to JNI. The caller is responsible for allocating the C structs
+     * and extracting memory addresses (e.g., via Arrow Java's {@code ArrowArray.allocateNew()}).</p>
+     *
+     * @param docAddresses  document addresses from search hits
+     * @param arrayAddrs    pre-allocated ArrowArray memory addresses (one per field)
+     * @param schemaAddrs   pre-allocated ArrowSchema memory addresses (one per field)
+     * @param fields        field names to retrieve
+     * @return row count, or -1 if Arrow FFI not available for this split
+     */
+    public int docBatchArrowFfi(DocAddress[] docAddresses,
+                                long[] arrayAddrs, long[] schemaAddrs,
+                                String... fields) {
+        if (nativePtr == 0) {
+            throw new IllegalStateException("SplitSearcher has been closed or not properly initialized");
+        }
+        if (arrayAddrs == null || schemaAddrs == null) {
+            throw new IllegalArgumentException("arrayAddrs and schemaAddrs must not be null");
+        }
+        if (arrayAddrs.length != schemaAddrs.length) {
+            throw new IllegalArgumentException(
+                "arrayAddrs and schemaAddrs must have the same length: " +
+                arrayAddrs.length + " != " + schemaAddrs.length);
+        }
+        int[] segments = new int[docAddresses.length];
+        int[] docIds = new int[docAddresses.length];
+        for (int i = 0; i < docAddresses.length; i++) {
+            segments[i] = docAddresses[i].getSegmentOrd();
+            docIds[i] = docAddresses[i].getDoc();
+        }
+        return nativeDocBatchArrowFfi(nativePtr, segments, docIds,
+                fields != null && fields.length > 0 ? fields : null,
+                arrayAddrs, schemaAddrs);
+    }
+
+    /**
      * Retrieve multiple documents by their addresses in a single batch operation.
      * This is significantly more efficient than calling doc() multiple times,
      * especially for large numbers of documents.
@@ -1171,6 +1227,8 @@ public class SplitSearcher implements AutoCloseable {
     // Parquet companion mode native methods
     private static native boolean nativeHasParquetManifest(long nativePtr);
     private static native byte[] nativeDocBatchProjected(long nativePtr, int[] segments, int[] docIds, String[] fields);
+    private static native int nativeDocBatchArrowFfi(long nativePtr, int[] segments, int[] docIds, String[] fields,
+                                                     long[] arrayAddrs, long[] schemaAddrs);
 
     // Smart Wildcard Optimization Statistics (for testing/monitoring)
     private static native void resetSmartWildcardStats();
