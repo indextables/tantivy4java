@@ -328,26 +328,41 @@ pub(crate) fn parse_partition_values_from_path(path: &str) -> HashMap<String, St
     values
 }
 
-/// Simple percent-decoding for partition values.
+/// Percent-decoding for partition values, supporting multi-byte UTF-8.
+///
+/// Accumulates percent-encoded bytes and decodes them as a UTF-8 sequence,
+/// correctly handling characters like `%C3%A9` → `é`.
 fn percent_decode(s: &str) -> String {
-    let mut result = String::with_capacity(s.len());
-    let mut chars = s.chars();
-    while let Some(c) = chars.next() {
-        if c == '%' {
-            let hex: String = chars.by_ref().take(2).collect();
-            if hex.len() == 2 {
-                if let Ok(byte) = u8::from_str_radix(&hex, 16) {
-                    result.push(byte as char);
-                    continue;
-                }
+    let bytes = s.as_bytes();
+    let mut result = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            // Try to decode the two hex digits after %
+            let hi = bytes[i + 1];
+            let lo = bytes[i + 2];
+            if let (Some(h), Some(l)) = (hex_val(hi), hex_val(lo)) {
+                result.push(h << 4 | l);
+                i += 3;
+                continue;
             }
-            result.push('%');
-            result.push_str(&hex);
-        } else {
-            result.push(c);
         }
+        result.push(bytes[i]);
+        i += 1;
     }
-    result
+
+    String::from_utf8(result).unwrap_or_else(|_| s.to_string())
+}
+
+/// Convert an ASCII hex digit to its numeric value.
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
 }
 
 /// Normalize a table URL: ensure trailing slash and parse.
@@ -432,6 +447,16 @@ mod tests {
         assert_eq!(percent_decode("no%2Fslash"), "no/slash");
         assert_eq!(percent_decode("plain"), "plain");
         assert_eq!(percent_decode(""), "");
+    }
+
+    #[test]
+    fn test_percent_decode_multibyte_utf8() {
+        // é = U+00E9 = UTF-8 bytes C3 A9
+        assert_eq!(percent_decode("caf%C3%A9"), "café");
+        // ñ = U+00F1 = UTF-8 bytes C3 B1
+        assert_eq!(percent_decode("espa%C3%B1ol"), "español");
+        // 日 = U+65E5 = UTF-8 bytes E6 97 A5
+        assert_eq!(percent_decode("%E6%97%A5"), "日");
     }
 
     #[test]

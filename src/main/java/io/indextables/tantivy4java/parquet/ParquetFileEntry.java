@@ -6,6 +6,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import java.io.Serializable;
 import java.util.Collections;
 import java.util.Map;
+import java.util.logging.Logger;
 
 /**
  * A single parquet file entry with metadata, for Hive-style partitioned directories.
@@ -15,8 +16,7 @@ import java.util.Map;
 public class ParquetFileEntry implements Serializable {
 
     private static final long serialVersionUID = 1L;
-    private static final ObjectMapper MAPPER = new ObjectMapper();
-    private static final TypeReference<Map<String, String>> MAP_TYPE = new TypeReference<Map<String, String>>() {};
+    private static final transient Logger LOG = Logger.getLogger(ParquetFileEntry.class.getName());
 
     private final String path;
     private final long size;
@@ -54,15 +54,13 @@ public class ParquetFileEntry implements Serializable {
      */
     static ParquetFileEntry fromMap(Map<String, Object> map) {
         String path = (String) map.get("path");
-        long size = toLong(map.get("size"));
-        long lastModified = toLong(map.get("last_modified"));
+        if (path == null || path.isEmpty()) {
+            throw new IllegalStateException("ParquetFileEntry missing required 'path' field");
+        }
+        long size = ParquetTableInfo.toLong(map.get("size"));
+        long lastModified = ParquetTableInfo.toLong(map.get("last_modified"));
         Map<String, String> partitionValues = parsePartitionValues(map.get("partition_values"));
         return new ParquetFileEntry(path, size, lastModified, partitionValues);
-    }
-
-    private static long toLong(Object value) {
-        if (value instanceof Number) return ((Number) value).longValue();
-        return -1;
     }
 
     private static Map<String, String> parsePartitionValues(Object value) {
@@ -70,8 +68,10 @@ public class ParquetFileEntry implements Serializable {
         String jsonStr = value.toString();
         if (jsonStr.isEmpty() || "{}".equals(jsonStr)) return Collections.emptyMap();
         try {
-            return MAPPER.readValue(jsonStr, MAP_TYPE);
+            return new ObjectMapper().readValue(jsonStr,
+                    new TypeReference<Map<String, String>>() {});
         } catch (Exception e) {
+            LOG.fine("Failed to parse partition values JSON: " + e.getMessage());
             return Collections.emptyMap();
         }
     }

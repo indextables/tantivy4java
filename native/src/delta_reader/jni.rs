@@ -1,122 +1,18 @@
-// delta_reader/jni.rs - JNI entry point for Delta table file listing
+// delta_reader/jni.rs - JNI entry points for Delta table reading
 //
-// Bridges Java DeltaTableReader.nativeListFiles() to the Rust delta_reader
-// module, extracting credentials from a Java HashMap<String,String> and
-// returning file entries as a TANT byte buffer (jbyteArray).
+// Bridges Java DeltaTableReader native methods to the Rust delta_reader
+// module. Uses shared JNI helpers from common.rs.
 
 use jni::objects::{JClass, JObject, JString};
 use jni::sys::{jboolean, jbyteArray, jlong};
 use jni::JNIEnv;
 
-use crate::common::to_java_exception;
+use crate::common::{to_java_exception, build_storage_config, buffer_to_jbytearray, extract_string_list};
 use crate::debug_println;
 
-use super::engine::DeltaStorageConfig;
 use super::scan::{list_delta_files, read_delta_schema};
 use super::serialization::{serialize_delta_entries, serialize_delta_schema, serialize_snapshot_info, serialize_log_changes};
 use super::distributed::{get_snapshot_info, read_checkpoint_part, read_post_checkpoint_changes};
-
-/// Helper to extract a String value from a Java HashMap<String,String>.
-fn extract_string(env: &mut JNIEnv, map: &JObject, key: &str) -> Option<String> {
-    let key_jstr = env.new_string(key).ok()?;
-    let value = env
-        .call_method(
-            map,
-            "get",
-            "(Ljava/lang/Object;)Ljava/lang/Object;",
-            &[(&key_jstr).into()],
-        )
-        .ok()?
-        .l()
-        .ok()?;
-    if value.is_null() {
-        return None;
-    }
-    let value_jstr = JString::from(value);
-    let value_str = env.get_string(&value_jstr).ok()?;
-    Some(value_str.to_string_lossy().to_string())
-}
-
-/// Build a DeltaStorageConfig from a Java HashMap<String,String>.
-fn build_config(env: &mut JNIEnv, config_map: &JObject) -> DeltaStorageConfig {
-    if config_map.is_null() {
-        return DeltaStorageConfig::default();
-    }
-
-    DeltaStorageConfig {
-        aws_access_key: extract_string(env, config_map, "aws_access_key_id"),
-        aws_secret_key: extract_string(env, config_map, "aws_secret_access_key"),
-        aws_session_token: extract_string(env, config_map, "aws_session_token"),
-        aws_region: extract_string(env, config_map, "aws_region"),
-        aws_endpoint: extract_string(env, config_map, "aws_endpoint"),
-        aws_force_path_style: extract_string(env, config_map, "aws_force_path_style")
-            .map(|s| s == "true")
-            .unwrap_or(false),
-        azure_account_name: extract_string(env, config_map, "azure_account_name"),
-        azure_access_key: extract_string(env, config_map, "azure_access_key"),
-        azure_bearer_token: extract_string(env, config_map, "azure_bearer_token"),
-    }
-}
-
-/// Helper to return a TANT byte buffer as a jbyteArray.
-fn buffer_to_jbytearray(env: &mut JNIEnv, buffer: &[u8]) -> jbyteArray {
-    match env.new_byte_array(buffer.len() as i32) {
-        Ok(byte_array) => {
-            let byte_slice: &[i8] = unsafe {
-                std::slice::from_raw_parts(buffer.as_ptr() as *const i8, buffer.len())
-            };
-            if let Err(e) = env.set_byte_array_region(&byte_array, 0, byte_slice) {
-                to_java_exception(
-                    env,
-                    &anyhow::anyhow!("Failed to copy byte array: {}", e),
-                );
-                return std::ptr::null_mut();
-            }
-            byte_array.into_raw()
-        }
-        Err(e) => {
-            to_java_exception(
-                env,
-                &anyhow::anyhow!("Failed to allocate byte array: {}", e),
-            );
-            std::ptr::null_mut()
-        }
-    }
-}
-
-/// Extract a Java List<String> into a Vec<String>.
-fn extract_string_list(env: &mut JNIEnv, list: &JObject) -> Result<Vec<String>, anyhow::Error> {
-    if list.is_null() {
-        return Ok(Vec::new());
-    }
-
-    let size = env
-        .call_method(list, "size", "()I", &[])
-        .map_err(|e| anyhow::anyhow!("Failed to call size(): {}", e))?
-        .i()
-        .map_err(|e| anyhow::anyhow!("Failed to get size as int: {}", e))?;
-
-    let mut result = Vec::with_capacity(size as usize);
-    for i in 0..size {
-        let elem = env
-            .call_method(list, "get", "(I)Ljava/lang/Object;", &[jni::objects::JValue::Int(i)])
-            .map_err(|e| anyhow::anyhow!("Failed to call get({}): {}", i, e))?
-            .l()
-            .map_err(|e| anyhow::anyhow!("Failed to get element as object: {}", e))?;
-
-        if elem.is_null() {
-            continue;
-        }
-
-        let jstr = JString::from(elem);
-        let s = env
-            .get_string(&jstr)
-            .map_err(|e| anyhow::anyhow!("Failed to get string: {}", e))?;
-        result.push(s.to_string_lossy().to_string());
-    }
-
-    Ok(result)
-}
 
 // ─── Existing JNI entry points ──────────────────────────────────────────────
 
@@ -139,7 +35,7 @@ pub extern "system" fn Java_io_indextables_tantivy4java_delta_DeltaTableReader_n
         }
     };
 
-    let config = build_config(&mut env, &config_map);
+    let config = build_storage_config(&mut env, &config_map);
     let version_opt = if version < 0 { None } else { Some(version as u64) };
 
     debug_println!(
@@ -185,7 +81,7 @@ pub extern "system" fn Java_io_indextables_tantivy4java_delta_DeltaTableReader_n
         }
     };
 
-    let config = build_config(&mut env, &config_map);
+    let config = build_storage_config(&mut env, &config_map);
     let version_opt = if version < 0 { None } else { Some(version as u64) };
 
     debug_println!(
@@ -230,7 +126,7 @@ pub extern "system" fn Java_io_indextables_tantivy4java_delta_DeltaTableReader_n
         }
     };
 
-    let config = build_config(&mut env, &config_map);
+    let config = build_storage_config(&mut env, &config_map);
 
     match get_snapshot_info(&url_str, &config) {
         Ok(info) => {
@@ -276,7 +172,7 @@ pub extern "system" fn Java_io_indextables_tantivy4java_delta_DeltaTableReader_n
         }
     };
 
-    let config = build_config(&mut env, &config_map);
+    let config = build_storage_config(&mut env, &config_map);
 
     match read_checkpoint_part(&url_str, &config, &part) {
         Ok(entries) => {
@@ -309,7 +205,7 @@ pub extern "system" fn Java_io_indextables_tantivy4java_delta_DeltaTableReader_n
         }
     };
 
-    let config = build_config(&mut env, &config_map);
+    let config = build_storage_config(&mut env, &config_map);
 
     let commit_paths = match extract_string_list(&mut env, &commit_paths_array) {
         Ok(paths) => paths,

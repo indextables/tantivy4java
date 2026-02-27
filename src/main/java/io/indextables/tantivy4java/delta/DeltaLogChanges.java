@@ -6,6 +6,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.logging.Logger;
 
 /**
  * Post-checkpoint log changes for distributed Delta table scanning.
@@ -18,6 +19,7 @@ import java.util.Set;
 public class DeltaLogChanges implements Serializable {
 
     private static final long serialVersionUID = 1L;
+    private static final transient Logger LOG = Logger.getLogger(DeltaLogChanges.class.getName());
 
     private final List<DeltaFileEntry> addedFiles;
     private final Set<String> removedPaths;
@@ -55,10 +57,17 @@ public class DeltaLogChanges implements Serializable {
         }
 
         Map<String, Object> header = maps.get(0);
-        int numAdded = (int) toLong(header.get("num_added"));
-        int numRemoved = (int) toLong(header.get("num_removed"));
+        int numAdded = (int) DeltaSnapshotInfo.toLong(header.get("num_added"));
+        int numRemoved = (int) DeltaSnapshotInfo.toLong(header.get("num_removed"));
 
-        List<DeltaFileEntry> addedFiles = new java.util.ArrayList<>(numAdded);
+        int availableAdded = Math.min(numAdded, maps.size() - 1);
+        if (availableAdded < numAdded) {
+            LOG.warning(String.format(
+                    "DeltaLogChanges: header declares %d added files but only %d available in buffer",
+                    numAdded, availableAdded));
+        }
+
+        List<DeltaFileEntry> addedFiles = new java.util.ArrayList<>(availableAdded);
         for (int i = 1; i <= numAdded && i < maps.size(); i++) {
             addedFiles.add(DeltaFileEntry.fromMap(maps.get(i)));
         }
@@ -72,12 +81,5 @@ public class DeltaLogChanges implements Serializable {
         }
 
         return new DeltaLogChanges(addedFiles, removedPaths);
-    }
-
-    private static long toLong(Object value) {
-        if (value instanceof Number) {
-            return ((Number) value).longValue();
-        }
-        return 0;
     }
 }

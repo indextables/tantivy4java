@@ -8,6 +8,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import java.util.logging.Logger;
 
 /**
  * Lightweight table metadata for distributed Hive-style parquet directory scanning.
@@ -21,8 +22,7 @@ import java.util.Map;
 public class ParquetTableInfo implements Serializable {
 
     private static final long serialVersionUID = 1L;
-    private static final ObjectMapper MAPPER = new ObjectMapper();
-    private static final TypeReference<List<String>> LIST_TYPE = new TypeReference<List<String>>() {};
+    private static final transient Logger LOG = Logger.getLogger(ParquetTableInfo.class.getName());
 
     private final String schemaJson;
     private final List<String> partitionColumns;
@@ -103,7 +103,8 @@ public class ParquetTableInfo implements Serializable {
                 rootFiles, isPartitioned);
     }
 
-    private static long toLong(Object value) {
+    /** Parse a Number to long, returning 0 for non-numeric values. */
+    static long toLong(Object value) {
         if (value instanceof Number) return ((Number) value).longValue();
         return 0;
     }
@@ -118,8 +119,10 @@ public class ParquetTableInfo implements Serializable {
         String json = value.toString();
         if (json.isEmpty() || "[]".equals(json)) return Collections.emptyList();
         try {
-            return MAPPER.readValue(json, LIST_TYPE);
+            return new ObjectMapper().readValue(json,
+                    new TypeReference<List<String>>() {});
         } catch (Exception e) {
+            LOG.fine("Failed to parse JSON list: " + e.getMessage());
             return Collections.emptyList();
         }
     }

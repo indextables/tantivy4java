@@ -20,8 +20,6 @@ import java.util.Map;
 public class DeltaSnapshotInfo implements Serializable {
 
     private static final long serialVersionUID = 1L;
-    private static final ObjectMapper MAPPER = new ObjectMapper();
-    private static final TypeReference<List<String>> LIST_TYPE = new TypeReference<List<String>>() {};
 
     private final long version;
     private final String schemaJson;
@@ -86,7 +84,7 @@ public class DeltaSnapshotInfo implements Serializable {
                 checkpointPaths, commitPaths, numAddFiles);
     }
 
-    private static long toLong(Object value) {
+    static long toLong(Object value) {
         if (value instanceof Number) {
             return ((Number) value).longValue();
         }
@@ -98,7 +96,8 @@ public class DeltaSnapshotInfo implements Serializable {
         String json = value.toString();
         if (json.isEmpty() || "[]".equals(json)) return Collections.emptyList();
         try {
-            return MAPPER.readValue(json, LIST_TYPE);
+            return new ObjectMapper().readValue(json,
+                    new TypeReference<List<String>>() {});
         } catch (Exception e) {
             return Collections.emptyList();
         }

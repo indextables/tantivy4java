@@ -247,6 +247,9 @@ pub fn construct_checkpoint_paths(version: u64, parts: Option<u64>) -> Vec<Strin
 }
 
 /// List commit JSON files after a given checkpoint version.
+///
+/// Uses `list_with_delimiter` (not `list`) to get only immediate children of
+/// _delta_log/, avoiding recursion into subdirectories like _delta_log/_commits/.
 async fn list_commit_files_after(
     store: &Arc<dyn ObjectStore>,
     log_prefix: &str,
@@ -443,16 +446,20 @@ fn extract_add_files_from_batch(
 }
 
 /// Read post-checkpoint JSON commit files and apply log replay.
+///
+/// Canonical Delta log replay: process commits oldest-first. For each path,
+/// the last action (add or remove) across all commits wins. This correctly
+/// handles re-add-after-remove scenarios.
 async fn read_post_checkpoint_changes_async(
     store: &Arc<dyn ObjectStore>,
     log_prefix: &str,
     commit_paths: &[String],
 ) -> Result<DeltaLogChanges> {
-    let mut all_adds: Vec<(String, DeltaFileEntry)> = Vec::new(); // (path, entry) for dedup
-    let mut all_removes: HashSet<String> = HashSet::new();
+    // Per-path state: Some(entry) = last action was add, None = last action was remove.
+    let mut path_state: HashMap<String, Option<DeltaFileEntry>> = HashMap::new();
 
-    // Process commits newest-first for log replay
-    for commit_file in commit_paths.iter().rev() {
+    // Process commits oldest-first (commit_paths are already sorted ascending by version)
+    for commit_file in commit_paths {
         let path = make_log_path(log_prefix, commit_file);
         let result = store.get(&path).await
             .map_err(|e| anyhow::anyhow!("Failed to read commit {}: {}", commit_file, e))?;
@@ -488,38 +495,29 @@ async fn read_post_checkpoint_changes_async(
                         && !add["deletionVector"].is_null(),
                 };
 
-                all_adds.push((file_path, entry));
+                path_state.insert(file_path, Some(entry));
             } else if let Some(remove) = v.get("remove") {
-                if let Some(path) = remove["path"].as_str() {
-                    all_removes.insert(path.to_string());
+                if let Some(p) = remove["path"].as_str() {
+                    path_state.insert(p.to_string(), None);
                 }
             }
         }
     }
 
-    // Log replay: track seen paths, latest action wins
-    let mut seen = HashSet::new();
-    let mut final_adds = Vec::new();
+    // Partition final state into adds and removes
+    let mut added_files = Vec::new();
+    let mut removed_paths = HashSet::new();
 
-    for (path, entry) in all_adds.into_iter().rev() {
-        if seen.contains(&path) {
-            continue;
-        }
-        seen.insert(path.clone());
-        if !all_removes.contains(&path) {
-            final_adds.push(entry);
+    for (path, state) in path_state {
+        match state {
+            Some(entry) => added_files.push(entry),
+            None => { removed_paths.insert(path); }
         }
     }
 
-    // Remove paths that were seen in adds from removes
-    let final_removes: HashSet<String> = all_removes
-        .into_iter()
-        .filter(|p| !seen.contains(p))
-        .collect();
-
     Ok(DeltaLogChanges {
-        added_files: final_adds,
-        removed_paths: final_removes,
+        added_files,
+        removed_paths,
     })
 }
 

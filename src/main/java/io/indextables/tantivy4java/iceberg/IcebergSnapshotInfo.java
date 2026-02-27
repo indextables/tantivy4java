@@ -73,7 +73,7 @@ public class IcebergSnapshotInfo implements Serializable {
         }
 
         Map<String, Object> header = maps.get(0);
-        long snapshotId = toLong(header.get("snapshot_id"));
+        long snapshotId = IcebergFileEntry.toLong(header.get("snapshot_id"));
         String schemaJson = (String) header.get("schema_json");
         String partitionSpecJson = (String) header.get("partition_spec_json");
 
@@ -83,11 +83,6 @@ public class IcebergSnapshotInfo implements Serializable {
         }
 
         return new IcebergSnapshotInfo(snapshotId, schemaJson, partitionSpecJson, manifests);
-    }
-
-    private static long toLong(Object value) {
-        if (value instanceof Number) return ((Number) value).longValue();
-        return -1;
     }
 
     /**
@@ -147,18 +142,13 @@ public class IcebergSnapshotInfo implements Serializable {
         static ManifestFileInfo fromMap(Map<String, Object> map) {
             return new ManifestFileInfo(
                     (String) map.get("manifest_path"),
-                    toLong(map.get("manifest_length")),
-                    toLong(map.get("added_snapshot_id")),
-                    toLong(map.get("added_files_count")),
-                    toLong(map.get("existing_files_count")),
-                    toLong(map.get("deleted_files_count")),
-                    (int) toLong(map.get("partition_spec_id"))
+                    IcebergFileEntry.toLong(map.get("manifest_length")),
+                    IcebergFileEntry.toLong(map.get("added_snapshot_id")),
+                    IcebergFileEntry.toLong(map.get("added_files_count")),
+                    IcebergFileEntry.toLong(map.get("existing_files_count")),
+                    IcebergFileEntry.toLong(map.get("deleted_files_count")),
+                    (int) IcebergFileEntry.toLong(map.get("partition_spec_id"))
             );
-        }
-
-        private static long toLong(Object value) {
-            if (value instanceof Number) return ((Number) value).longValue();
-            return 0;
         }
     }
 }

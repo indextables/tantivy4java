@@ -6,6 +6,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import java.io.Serializable;
 import java.util.Collections;
 import java.util.Map;
+import java.util.logging.Logger;
 
 /**
  * Immutable data class representing a single active data file in an Iceberg table.
@@ -19,9 +20,7 @@ import java.util.Map;
 public class IcebergFileEntry implements Serializable {
 
     private static final long serialVersionUID = 1L;
-
-    private static final ObjectMapper MAPPER = new ObjectMapper();
-    private static final TypeReference<Map<String, String>> MAP_TYPE = new TypeReference<Map<String, String>>() {};
+    private static final transient Logger LOG = Logger.getLogger(IcebergFileEntry.class.getName());
 
     private final String path;
     private final String fileFormat;
@@ -105,6 +104,9 @@ public class IcebergFileEntry implements Serializable {
      */
     static IcebergFileEntry fromMap(Map<String, Object> map) {
         String path = (String) map.get("path");
+        if (path == null || path.isEmpty()) {
+            throw new IllegalStateException("IcebergFileEntry missing required 'path' field");
+        }
         String fileFormat = (String) map.getOrDefault("file_format", "parquet");
         long recordCount = toLong(map.get("record_count"));
         long fileSizeBytes = toLong(map.get("file_size_bytes"));
@@ -117,7 +119,7 @@ public class IcebergFileEntry implements Serializable {
                 partitionValues, contentType, snapshotId);
     }
 
-    private static long toLong(Object value) {
+    static long toLong(Object value) {
         if (value instanceof Number) {
             return ((Number) value).longValue();
         }
@@ -133,8 +135,10 @@ public class IcebergFileEntry implements Serializable {
             return Collections.emptyMap();
         }
         try {
-            return MAPPER.readValue(jsonStr, MAP_TYPE);
+            return new ObjectMapper().readValue(jsonStr,
+                    new TypeReference<Map<String, String>>() {});
         } catch (Exception e) {
+            LOG.fine("Failed to parse partition values JSON: " + e.getMessage());
             return Collections.emptyMap();
         }
     }

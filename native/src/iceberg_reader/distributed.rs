@@ -9,8 +9,8 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use iceberg::Catalog;
+use iceberg::io::FileIO;
 use iceberg::spec::ManifestStatus;
-use iceberg::table::Table;
 use iceberg::TableIdent;
 
 use crate::debug_println;
@@ -73,7 +73,9 @@ pub fn get_iceberg_snapshot_info(
         namespace, table_name, snapshot_id
     );
 
-    let rt = tokio::runtime::Runtime::new()
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
         .map_err(|e| anyhow::anyhow!("Failed to create Tokio runtime: {}", e))?;
 
     rt.block_on(async {
@@ -84,13 +86,12 @@ pub fn get_iceberg_snapshot_info(
 
 /// Executor-side: Read one manifest avro file and extract file entries.
 ///
-/// Reads a single manifest file from storage using the catalog's FileIO config.
-/// Returns Vec<IcebergFileEntry> — typically thousands per manifest.
+/// Creates a FileIO directly from config properties, avoiding the expensive
+/// catalog lookup + table load that would add 2 network round-trips per call.
+/// The config map's storage credential keys (s3.access-key-id, s3.region, etc.)
+/// are passed directly to FileIO.
 pub fn read_iceberg_manifest(
-    catalog_name: &str,
     config: &HashMap<String, String>,
-    namespace: &str,
-    table_name: &str,
     manifest_path: &str,
 ) -> Result<Vec<IcebergFileEntry>> {
     debug_println!(
@@ -98,17 +99,22 @@ pub fn read_iceberg_manifest(
         manifest_path
     );
 
-    let rt = tokio::runtime::Runtime::new()
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
         .map_err(|e| anyhow::anyhow!("Failed to create Tokio runtime: {}", e))?;
 
     rt.block_on(async {
-        let catalog = create_catalog(catalog_name, config).await?;
-        let ns = parse_namespace(namespace);
-        let table_ident = TableIdent::new(ns, table_name.to_string());
-        let table = catalog.load_table(&table_ident).await
-            .map_err(|e| anyhow::anyhow!("Failed to load table: {}", e))?;
+        // Build FileIO directly from config properties — no catalog or table load needed.
+        // The config map already contains the storage credential keys (s3.access-key-id,
+        // s3.secret-access-key, s3.region, adls.account-name, etc.) that FileIO needs.
+        let file_io = FileIO::from_path(manifest_path)
+            .map_err(|e| anyhow::anyhow!("Failed to create FileIO for {}: {}", manifest_path, e))?
+            .with_props(config.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+            .build()
+            .map_err(|e| anyhow::anyhow!("Failed to build FileIO: {}", e))?;
 
-        read_manifest_with_table(&table, manifest_path).await
+        read_manifest_with_file_io(&file_io, manifest_path).await
     })
 }
 
@@ -189,13 +195,11 @@ pub(crate) async fn get_snapshot_info_with_catalog(
     })
 }
 
-/// Read one manifest file using a Table's FileIO.
-async fn read_manifest_with_table(
-    table: &Table,
+/// Read one manifest file using a FileIO instance.
+async fn read_manifest_with_file_io(
+    file_io: &FileIO,
     manifest_path: &str,
 ) -> Result<Vec<IcebergFileEntry>> {
-    let file_io = table.file_io();
-
     let manifest_input = file_io.new_input(manifest_path)
         .map_err(|e| anyhow::anyhow!("Failed to open manifest {}: {}", manifest_path, e))?;
     let manifest_bytes = manifest_input.read().await
