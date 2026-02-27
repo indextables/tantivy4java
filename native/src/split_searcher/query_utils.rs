@@ -216,6 +216,16 @@ fn fix_bound_value(bound: &mut Value, target_type: &str, bound_name: &str) -> Re
                                         .map_err(|_| anyhow::anyhow!("Cannot parse '{}' as bool in {}", string_str, bound_name))?;
                                     serde_json::json!({"Bool": parsed})
                                 }
+                                "date" => {
+                                    // For date fields: if the value is numeric (raw timestamp micros),
+                                    // convert to Number. Otherwise keep as String for ISO8601 parsing.
+                                    if let Ok(parsed) = string_str.parse::<i64>() {
+                                        serde_json::json!({"Number": parsed})
+                                    } else {
+                                        // Keep as ISO8601 string — Quickwit handles date parsing
+                                        continue;
+                                    }
+                                }
                                 _ => {
                                     // Keep as string for other types
                                     continue;

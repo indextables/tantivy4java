@@ -281,6 +281,24 @@ fn convert_range_bound(
                         JsonLiteral::String(value)
                     }
                 }
+                "date" | "datetime" | "timestamp" => {
+                    // For date range queries: if the value looks like a raw timestamp
+                    // (i64 microseconds), pass as Number so Quickwit interprets it
+                    // as a numeric timestamp. Otherwise keep as String for ISO8601 parsing.
+                    if let Ok(parsed) = value.parse::<i64>() {
+                        debug_println!(
+                            "RUST DEBUG: Date field with numeric value '{}', converting to Number",
+                            value
+                        );
+                        JsonLiteral::Number(serde_json::Number::from(parsed))
+                    } else {
+                        debug_println!(
+                            "RUST DEBUG: Date field with string value '{}', passing as String for ISO8601 parsing",
+                            value
+                        );
+                        JsonLiteral::String(value)
+                    }
+                }
                 "ip" | "ipaddr" | "ip_addr" => {
                     // For IP address range queries, pass as string
                     // Quickwit's query execution handles IP parsing

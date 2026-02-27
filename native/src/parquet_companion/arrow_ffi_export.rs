@@ -14,7 +14,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
 use arrow_array::{RecordBatch, UInt32Array};
-use arrow_schema::{Field, Schema};
+use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use quickwit_storage::Storage;
 
 use crate::perf_println;
@@ -158,6 +158,7 @@ pub async fn batch_parquet_to_arrow_ffi(
     }
 
     let t_ffi = std::time::Instant::now();
+    let renamed_schema = renamed.schema();
     for (i, col) in renamed.columns().iter().enumerate() {
         // Validate addresses are non-null before unsafe write
         if array_addrs[i] == 0 || schema_addrs[i] == 0 {
@@ -167,25 +168,49 @@ pub async fn batch_parquet_to_arrow_ffi(
             );
         }
 
-        let data = if col.offset() != 0 {
+        // Normalize timestamps to microseconds (Spark only supports Timestamp(MICROSECOND))
+        let cast_col;
+        let col_for_export: &dyn arrow_array::Array = match col.data_type() {
+            DataType::Timestamp(unit, tz) if *unit != TimeUnit::Microsecond => {
+                let target = DataType::Timestamp(TimeUnit::Microsecond, tz.clone());
+                cast_col = arrow::compute::cast(col.as_ref(), &target)
+                    .context(format!("Failed to cast column {} from {:?} to Timestamp(Microsecond)", i, col.data_type()))?;
+                cast_col.as_ref()
+            }
+            _ => col.as_ref(),
+        };
+
+        let data = if col_for_export.offset() != 0 {
             // Non-zero offset: use take() to create an offset-0 copy
             // (required for FFI consumers that don't handle offsets)
             let take_indices = UInt32Array::from_iter_values(0..renamed.num_rows() as u32);
-            arrow::compute::take(col.as_ref(), &take_indices, None)
+            arrow::compute::take(col_for_export, &take_indices, None)
                 .context("Failed to normalize column offset via take()")?
                 .to_data()
         } else {
-            col.to_data()
+            col_for_export.to_data()
         };
 
         let array_ptr = array_addrs[i] as *mut FFI_ArrowArray;
         let schema_ptr = schema_addrs[i] as *mut FFI_ArrowSchema;
 
+        // Export schema from Field (includes name + type) not just DataType.
+        // If we cast a timestamp, create a field with the normalized type.
+        let orig_field = renamed_schema.field(i);
+        let export_field: Field = match orig_field.data_type() {
+            DataType::Timestamp(unit, tz) if *unit != TimeUnit::Microsecond => {
+                orig_field.as_ref().clone().with_data_type(
+                    DataType::Timestamp(TimeUnit::Microsecond, tz.clone()),
+                )
+            }
+            _ => orig_field.as_ref().clone(),
+        };
+
         unsafe {
             std::ptr::write_unaligned(array_ptr, FFI_ArrowArray::new(&data));
             std::ptr::write_unaligned(
                 schema_ptr,
-                FFI_ArrowSchema::try_from(data.data_type())
+                FFI_ArrowSchema::try_from(&export_field)
                     .map_err(|e| anyhow::anyhow!("FFI_ArrowSchema conversion failed for column {}: {}", i, e))?,
             );
         }
