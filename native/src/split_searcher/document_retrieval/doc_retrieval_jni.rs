@@ -939,111 +939,99 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_nati
         );
     }
 
-    // Extract JNI arrays
-    let (segments_vec, doc_ids_vec) = match extract_jni_int_arrays(&mut env, segments, doc_ids) {
-        Ok(result) => result,
-        Err(msg) => {
-            to_java_exception(&mut env, &anyhow::anyhow!("{}", msg));
-            return std::ptr::null_mut();
-        }
-    };
+    // Wrap core logic with convert_throwable to catch panics at the JNI boundary.
+    // Panics in async parquet I/O or Arrow compute would otherwise cross JNI → UB.
+    use crate::utils::convert_throwable;
+    convert_throwable(&mut env, |env| {
+        // Extract JNI arrays
+        let (segments_vec, doc_ids_vec) = extract_jni_int_arrays(env, segments, doc_ids)
+            .map_err(|msg| anyhow::anyhow!("{}", msg))?;
 
-    // Extract field names
-    let projected_fields = extract_jni_field_names(&mut env, field_names);
+        // Extract field names
+        let projected_fields = extract_jni_field_names(env, field_names);
 
-    let t_jni_total = std::time::Instant::now();
-    perf_println!(
-        "⏱️ PROJ_DIAG: === nativeDocBatchProjected START === {} docs, fields={:?}",
-        segments_vec.len(), projected_fields
-    );
+        let t_jni_total = std::time::Instant::now();
+        perf_println!(
+            "⏱️ PROJ_DIAG: === nativeDocBatchProjected START === {} docs, fields={:?}",
+            segments_vec.len(), projected_fields
+        );
 
-    // Build doc addresses
-    let addresses: Vec<(u32, u32)> = segments_vec
-        .iter()
-        .zip(doc_ids_vec.iter())
-        .map(|(&seg, &doc)| (seg, doc))
-        .collect();
+        // Build doc addresses
+        let addresses: Vec<(u32, u32)> = segments_vec
+            .iter()
+            .zip(doc_ids_vec.iter())
+            .map(|(&seg, &doc)| (seg, doc))
+            .collect();
 
-    // Batch retrieve: resolve all doc addresses via fast fields, then group by file
-    let result = with_arc_safe(searcher_ptr, |ctx: &Arc<CachedSearcherContext>| {
-        let manifest = ctx.parquet_manifest.as_ref().unwrap();
-        let storage = get_parquet_storage(ctx)?;
-        let metadata_cache = &ctx.parquet_metadata_cache;
-        let byte_cache = &ctx.parquet_byte_range_cache;
+        // Batch retrieve: resolve all doc addresses via fast fields, then group by file
+        let result = with_arc_safe(searcher_ptr, |ctx: &Arc<CachedSearcherContext>| {
+            let manifest = ctx.parquet_manifest.as_ref().unwrap();
+            let storage = get_parquet_storage(ctx)?;
+            let metadata_cache = &ctx.parquet_metadata_cache;
+            let byte_cache = &ctx.parquet_byte_range_cache;
 
-        let runtime = crate::runtime_manager::QuickwitRuntimeManager::global().handle();
-        let _guard = runtime.enter();
+            let runtime = crate::runtime_manager::QuickwitRuntimeManager::global().handle();
+            let _guard = runtime.enter();
 
-        tokio::task::block_in_place(|| {
-            runtime.block_on(async {
-                let groups = resolve_doc_addresses_to_groups(ctx, &addresses).await?;
+            tokio::task::block_in_place(|| {
+                runtime.block_on(async {
+                    let groups = resolve_doc_addresses_to_groups(ctx, &addresses).await?;
 
-                let t_parquet = std::time::Instant::now();
-                let result = crate::parquet_companion::arrow_to_tant::batch_parquet_to_tant_buffer_by_groups(
-                    groups,
-                    addresses.len(),
-                    projected_fields.as_deref(),
-                    manifest,
-                    &storage,
-                    Some(metadata_cache),
-                    Some(byte_cache),
-                    ctx.parquet_coalesce_config,
-                )
-                .await;
-                perf_println!(
-                    "⏱️ PROJ_DIAG: batch_parquet_to_tant_buffer_by_groups took {}ms",
-                    t_parquet.elapsed().as_millis()
-                );
-                result
+                    let t_parquet = std::time::Instant::now();
+                    let result = crate::parquet_companion::arrow_to_tant::batch_parquet_to_tant_buffer_by_groups(
+                        groups,
+                        addresses.len(),
+                        projected_fields.as_deref(),
+                        manifest,
+                        &storage,
+                        Some(metadata_cache),
+                        Some(byte_cache),
+                        ctx.parquet_coalesce_config,
+                    )
+                    .await;
+                    perf_println!(
+                        "⏱️ PROJ_DIAG: batch_parquet_to_tant_buffer_by_groups took {}ms",
+                        t_parquet.elapsed().as_millis()
+                    );
+                    result
+                })
             })
-        })
-    });
+        });
 
-    match result {
-        Some(Ok(tant_bytes)) => {
-            let t_jni_copy = std::time::Instant::now();
-            perf_println!(
-                "⏱️ PROJ_DIAG: serialized {} TANT bytes, copying to JNI byte array",
-                tant_bytes.len()
-            );
-            match env.new_byte_array(tant_bytes.len() as i32) {
-                Ok(byte_array) => {
-                    let byte_slice: &[i8] = unsafe {
-                        std::slice::from_raw_parts(tant_bytes.as_ptr() as *const i8, tant_bytes.len())
-                    };
-                    if let Err(e) = env.set_byte_array_region(&byte_array, 0, byte_slice) {
-                        to_java_exception(&mut env, &anyhow::anyhow!("Failed to set byte array data: {}", e));
-                        return std::ptr::null_mut();
-                    }
-                    perf_println!(
-                        "⏱️ PROJ_DIAG: JNI byte array copy took {}ms",
-                        t_jni_copy.elapsed().as_millis()
-                    );
-                    perf_println!(
-                        "⏱️ PROJ_DIAG: === nativeDocBatchProjected TOTAL took {}ms ===",
-                        t_jni_total.elapsed().as_millis()
-                    );
-                    byte_array.into_raw()
-                }
-                Err(e) => {
-                    to_java_exception(&mut env, &anyhow::anyhow!("Failed to create byte array: {}", e));
-                    std::ptr::null_mut()
-                }
+        match result {
+            Some(Ok(tant_bytes)) => {
+                let t_jni_copy = std::time::Instant::now();
+                perf_println!(
+                    "⏱️ PROJ_DIAG: serialized {} TANT bytes, copying to JNI byte array",
+                    tant_bytes.len()
+                );
+                let byte_array = env.new_byte_array(tant_bytes.len() as i32)
+                    .map_err(|e| anyhow::anyhow!("Failed to create byte array: {}", e))?;
+                let byte_slice: &[i8] = unsafe {
+                    std::slice::from_raw_parts(tant_bytes.as_ptr() as *const i8, tant_bytes.len())
+                };
+                env.set_byte_array_region(&byte_array, 0, byte_slice)
+                    .map_err(|e| anyhow::anyhow!("Failed to set byte array data: {}", e))?;
+                perf_println!(
+                    "⏱️ PROJ_DIAG: JNI byte array copy took {}ms",
+                    t_jni_copy.elapsed().as_millis()
+                );
+                perf_println!(
+                    "⏱️ PROJ_DIAG: === nativeDocBatchProjected TOTAL took {}ms ===",
+                    t_jni_total.elapsed().as_millis()
+                );
+                Ok(byte_array.into_raw())
             }
+            Some(Err(e)) => {
+                perf_println!(
+                    "⏱️ PROJ_DIAG: === nativeDocBatchProjected FAILED after {}ms: {} ===",
+                    t_jni_total.elapsed().as_millis(), e
+                );
+                Err(anyhow::anyhow!("Parquet batch retrieval failed: {}", e))
+            }
+            None => Err(anyhow::anyhow!("Searcher context not found")),
         }
-        Some(Err(e)) => {
-            perf_println!(
-                "⏱️ PROJ_DIAG: === nativeDocBatchProjected FAILED after {}ms: {} ===",
-                t_jni_total.elapsed().as_millis(), e
-            );
-            to_java_exception(&mut env, &anyhow::anyhow!("Parquet batch retrieval failed: {}", e));
-            std::ptr::null_mut()
-        }
-        None => {
-            to_java_exception(&mut env, &anyhow::anyhow!("Searcher context not found"));
-            std::ptr::null_mut()
-        }
-    }
+    }).unwrap_or(std::ptr::null_mut())
 }
 
 /// Arrow FFI document batch retrieval from parquet companion mode.
@@ -1082,124 +1070,99 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_nati
         return -1;
     }
 
-    // Extract segments and doc_ids
-    let (segments_vec, doc_ids_vec) = match extract_jni_int_arrays(&mut env, segments, doc_ids) {
-        Ok(result) => result,
-        Err(msg) => {
-            to_java_exception(&mut env, &anyhow::anyhow!("{}", msg));
-            return -1;
-        }
-    };
+    // Wrap core logic with convert_throwable to catch panics at the JNI boundary.
+    // Panics in async parquet I/O, Arrow compute, or FFI export would otherwise cross JNI → UB.
+    use crate::utils::convert_throwable;
+    convert_throwable(&mut env, |env| {
+        // Extract segments and doc_ids
+        let (segments_vec, doc_ids_vec) = extract_jni_int_arrays(env, segments, doc_ids)
+            .map_err(|msg| anyhow::anyhow!("{}", msg))?;
 
-    // Extract field names
-    let projected_fields = extract_jni_field_names(&mut env, field_names);
+        // Extract field names
+        let projected_fields = extract_jni_field_names(env, field_names);
 
-    // Extract array_addrs and schema_addrs (long[] → Vec<i64>)
-    let array_addrs_jni = unsafe { jni::objects::JLongArray::from_raw(array_addrs) };
-    let schema_addrs_jni = unsafe { jni::objects::JLongArray::from_raw(schema_addrs) };
+        // Extract array_addrs and schema_addrs (long[] → Vec<i64>)
+        let array_addrs_jni = unsafe { jni::objects::JLongArray::from_raw(array_addrs) };
+        let schema_addrs_jni = unsafe { jni::objects::JLongArray::from_raw(schema_addrs) };
 
-    let addrs_len = match env.get_array_length(&array_addrs_jni) {
-        Ok(len) => len as usize,
-        Err(e) => {
-            to_java_exception(
-                &mut env,
-                &anyhow::anyhow!("Failed to get array_addrs length: {}", e),
-            );
-            return -1;
-        }
-    };
+        let addrs_len = env.get_array_length(&array_addrs_jni)
+            .map_err(|e| anyhow::anyhow!("Failed to get array_addrs length: {}", e))? as usize;
 
-    let mut array_addrs_vec = vec![0i64; addrs_len];
-    if let Err(e) = env.get_long_array_region(&array_addrs_jni, 0, &mut array_addrs_vec) {
-        to_java_exception(
-            &mut env,
-            &anyhow::anyhow!("Failed to get array_addrs: {}", e),
+        let mut array_addrs_vec = vec![0i64; addrs_len];
+        env.get_long_array_region(&array_addrs_jni, 0, &mut array_addrs_vec)
+            .map_err(|e| anyhow::anyhow!("Failed to get array_addrs: {}", e))?;
+
+        let mut schema_addrs_vec = vec![0i64; addrs_len];
+        env.get_long_array_region(&schema_addrs_jni, 0, &mut schema_addrs_vec)
+            .map_err(|e| anyhow::anyhow!("Failed to get schema_addrs: {}", e))?;
+
+        let t_jni_total = std::time::Instant::now();
+        perf_println!(
+            "⏱️ FFI_DIAG: === nativeDocBatchArrowFfi START === {} docs, {} columns, fields={:?}",
+            segments_vec.len(), addrs_len, projected_fields
         );
-        return -1;
-    }
 
-    let mut schema_addrs_vec = vec![0i64; addrs_len];
-    if let Err(e) = env.get_long_array_region(&schema_addrs_jni, 0, &mut schema_addrs_vec) {
-        to_java_exception(
-            &mut env,
-            &anyhow::anyhow!("Failed to get schema_addrs: {}", e),
-        );
-        return -1;
-    }
+        // Build doc addresses
+        let addresses: Vec<(u32, u32)> = segments_vec
+            .iter()
+            .zip(doc_ids_vec.iter())
+            .map(|(&seg, &doc)| (seg, doc))
+            .collect();
 
-    let t_jni_total = std::time::Instant::now();
-    perf_println!(
-        "⏱️ FFI_DIAG: === nativeDocBatchArrowFfi START === {} docs, {} columns, fields={:?}",
-        segments_vec.len(), addrs_len, projected_fields
-    );
+        // Resolve addresses, read parquet, export via FFI
+        let result = with_arc_safe(searcher_ptr, |ctx: &Arc<CachedSearcherContext>| {
+            let manifest = ctx.parquet_manifest.as_ref().unwrap();
+            let storage = get_parquet_storage(ctx)?;
+            let metadata_cache = &ctx.parquet_metadata_cache;
+            let byte_cache = &ctx.parquet_byte_range_cache;
 
-    // Build doc addresses
-    let addresses: Vec<(u32, u32)> = segments_vec
-        .iter()
-        .zip(doc_ids_vec.iter())
-        .map(|(&seg, &doc)| (seg, doc))
-        .collect();
+            let runtime = crate::runtime_manager::QuickwitRuntimeManager::global().handle();
+            let _guard = runtime.enter();
 
-    // Resolve addresses, read parquet, export via FFI
-    let result = with_arc_safe(searcher_ptr, |ctx: &Arc<CachedSearcherContext>| {
-        let manifest = ctx.parquet_manifest.as_ref().unwrap();
-        let storage = get_parquet_storage(ctx)?;
-        let metadata_cache = &ctx.parquet_metadata_cache;
-        let byte_cache = &ctx.parquet_byte_range_cache;
+            tokio::task::block_in_place(|| {
+                runtime.block_on(async {
+                    let groups = resolve_doc_addresses_to_groups(ctx, &addresses).await?;
 
-        let runtime = crate::runtime_manager::QuickwitRuntimeManager::global().handle();
-        let _guard = runtime.enter();
-
-        tokio::task::block_in_place(|| {
-            runtime.block_on(async {
-                let groups = resolve_doc_addresses_to_groups(ctx, &addresses).await?;
-
-                let t_ffi = std::time::Instant::now();
-                let row_count =
-                    crate::parquet_companion::arrow_ffi_export::batch_parquet_to_arrow_ffi(
-                        groups,
-                        addresses.len(),
-                        projected_fields.as_deref(),
-                        manifest,
-                        &storage,
-                        Some(metadata_cache),
-                        Some(byte_cache),
-                        ctx.parquet_coalesce_config,
-                        &array_addrs_vec,
-                        &schema_addrs_vec,
-                    )
-                    .await?;
-                perf_println!(
-                    "⏱️ FFI_DIAG: batch_parquet_to_arrow_ffi returned {} rows, took {}ms",
-                    row_count, t_ffi.elapsed().as_millis()
-                );
-                Ok::<usize, anyhow::Error>(row_count)
+                    let t_ffi = std::time::Instant::now();
+                    let row_count =
+                        crate::parquet_companion::arrow_ffi_export::batch_parquet_to_arrow_ffi(
+                            groups,
+                            addresses.len(),
+                            projected_fields.as_deref(),
+                            manifest,
+                            &storage,
+                            Some(metadata_cache),
+                            Some(byte_cache),
+                            ctx.parquet_coalesce_config,
+                            &array_addrs_vec,
+                            &schema_addrs_vec,
+                        )
+                        .await?;
+                    perf_println!(
+                        "⏱️ FFI_DIAG: batch_parquet_to_arrow_ffi returned {} rows, took {}ms",
+                        row_count, t_ffi.elapsed().as_millis()
+                    );
+                    Ok::<usize, anyhow::Error>(row_count)
+                })
             })
-        })
-    });
+        });
 
-    match result {
-        Some(Ok(row_count)) => {
-            perf_println!(
-                "⏱️ FFI_DIAG: === nativeDocBatchArrowFfi TOTAL took {}ms, {} rows ===",
-                t_jni_total.elapsed().as_millis(), row_count
-            );
-            row_count as jint
+        match result {
+            Some(Ok(row_count)) => {
+                perf_println!(
+                    "⏱️ FFI_DIAG: === nativeDocBatchArrowFfi TOTAL took {}ms, {} rows ===",
+                    t_jni_total.elapsed().as_millis(), row_count
+                );
+                Ok(row_count as jint)
+            }
+            Some(Err(e)) => {
+                perf_println!(
+                    "⏱️ FFI_DIAG: === nativeDocBatchArrowFfi FAILED after {}ms: {} ===",
+                    t_jni_total.elapsed().as_millis(), e
+                );
+                Err(anyhow::anyhow!("Arrow FFI batch retrieval failed: {}", e))
+            }
+            None => Err(anyhow::anyhow!("Searcher context not found")),
         }
-        Some(Err(e)) => {
-            perf_println!(
-                "⏱️ FFI_DIAG: === nativeDocBatchArrowFfi FAILED after {}ms: {} ===",
-                t_jni_total.elapsed().as_millis(), e
-            );
-            to_java_exception(
-                &mut env,
-                &anyhow::anyhow!("Arrow FFI batch retrieval failed: {}", e),
-            );
-            -1
-        }
-        None => {
-            to_java_exception(&mut env, &anyhow::anyhow!("Searcher context not found"));
-            -1
-        }
-    }
+    }).unwrap_or(-1)
 }

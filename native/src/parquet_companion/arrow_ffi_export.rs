@@ -107,37 +107,51 @@ pub async fn batch_parquet_to_arrow_ffi(
     }
 
     // Step 3: Concatenate all batches into a single RecordBatch
+    // Optimization: skip concat when there's only one batch (avoids buffer copy)
     let t_concat = std::time::Instant::now();
-    let first_schema = all_batches[0].schema();
-    let combined = arrow::compute::concat_batches(&first_schema, all_batches.iter())
-        .context("Failed to concatenate record batches")?;
+    let combined = if all_batches.len() == 1 {
+        perf_println!("⏱️ FFI_DIAG: single batch — skipping concat_batches");
+        all_batches.into_iter().next().unwrap()
+    } else {
+        let first_schema = all_batches[0].schema();
+        arrow::compute::concat_batches(&first_schema, all_batches.iter())
+            .context("Failed to concatenate record batches")?
+    };
     perf_println!(
         "⏱️ FFI_DIAG: concat_batches: {} rows, {} columns, took {}ms",
         combined.num_rows(), combined.num_columns(), t_concat.elapsed().as_millis()
     );
 
     // Step 4: Reorder rows to match original request order
-    // Build permutation: output_position[i] = source_row that should go to position i
+    // Optimization: skip reorder when rows are already in identity order
     let t_reorder = std::time::Instant::now();
-    let mut perm: Vec<(usize, usize)> = row_to_original
-        .iter()
-        .enumerate()
-        .map(|(src_row, &orig_idx)| (orig_idx, src_row))
-        .collect();
-    perm.sort_by_key(|(orig_idx, _)| *orig_idx);
+    let needs_reorder = !is_identity_permutation(&row_to_original);
 
-    let indices = UInt32Array::from_iter_values(perm.iter().map(|(_, src_row)| *src_row as u32));
-    let reordered_columns: Vec<_> = combined
-        .columns()
-        .iter()
-        .map(|col| arrow::compute::take(col.as_ref(), &indices, None))
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .context("Failed to reorder columns via take()")?;
-    let reordered = RecordBatch::try_new(combined.schema(), reordered_columns)
-        .context("Failed to create reordered RecordBatch")?;
+    let reordered = if needs_reorder {
+        // Build permutation: output_position[i] = source_row that should go to position i
+        let mut perm: Vec<(usize, usize)> = row_to_original
+            .iter()
+            .enumerate()
+            .map(|(src_row, &orig_idx)| (orig_idx, src_row))
+            .collect();
+        perm.sort_by_key(|(orig_idx, _)| *orig_idx);
+
+        let indices = UInt32Array::from_iter_values(perm.iter().map(|(_, src_row)| *src_row as u32));
+        let reordered_columns: Vec<_> = combined
+            .columns()
+            .iter()
+            .map(|col| arrow::compute::take(col.as_ref(), &indices, None))
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .context("Failed to reorder columns via take()")?;
+        RecordBatch::try_new(combined.schema(), reordered_columns)
+            .context("Failed to create reordered RecordBatch")?
+    } else {
+        perf_println!("⏱️ FFI_DIAG: rows already in order — skipping take() reorder");
+        combined
+    };
     perf_println!(
-        "⏱️ FFI_DIAG: row reorder took {}ms",
-        t_reorder.elapsed().as_millis()
+        "⏱️ FFI_DIAG: row reorder took {}ms (needed={})",
+        t_reorder.elapsed().as_millis(), needs_reorder
     );
 
     // Step 5: Rename columns from parquet names to tantivy field names
@@ -229,6 +243,12 @@ pub async fn batch_parquet_to_arrow_ffi(
     Ok(row_count)
 }
 
+/// Check if a permutation is the identity [0, 1, 2, ..., n-1].
+/// Used to skip the reorder step when rows are already in request order.
+fn is_identity_permutation(perm: &[usize]) -> bool {
+    perm.iter().enumerate().all(|(i, &val)| val == i)
+}
+
 /// Rename RecordBatch columns from parquet names to tantivy field names.
 ///
 /// This is a zero-copy operation — only the schema metadata changes, the data
@@ -313,6 +333,53 @@ mod tests {
         assert_eq!(field_names, vec!["name", "score", "unmapped_col"]);
         assert_eq!(renamed.num_rows(), 2);
         assert_eq!(renamed.num_columns(), 3);
+    }
+
+    #[test]
+    fn test_is_identity_permutation_true() {
+        assert!(is_identity_permutation(&[]));
+        assert!(is_identity_permutation(&[0]));
+        assert!(is_identity_permutation(&[0, 1]));
+        assert!(is_identity_permutation(&[0, 1, 2, 3, 4]));
+    }
+
+    #[test]
+    fn test_is_identity_permutation_false() {
+        assert!(!is_identity_permutation(&[1]));
+        assert!(!is_identity_permutation(&[1, 0]));
+        assert!(!is_identity_permutation(&[0, 2, 1]));
+        assert!(!is_identity_permutation(&[0, 1, 2, 4, 3]));
+    }
+
+    #[test]
+    fn test_single_batch_same_as_concat() {
+        // Verify that a single-batch input produces the same result whether
+        // we go through concat_batches or skip it.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, false),
+            Field::new("b", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![10, 20, 30])),
+                Arc::new(StringArray::from(vec!["x", "y", "z"])),
+            ],
+        )
+        .unwrap();
+
+        // Single-batch path: just take the batch
+        let single_path = batch.clone();
+
+        // Multi-batch path: concat with itself (single element)
+        let concat_path =
+            arrow::compute::concat_batches(&schema, std::iter::once(&batch)).unwrap();
+
+        assert_eq!(single_path.num_rows(), concat_path.num_rows());
+        assert_eq!(single_path.num_columns(), concat_path.num_columns());
+        for i in 0..single_path.num_columns() {
+            assert_eq!(single_path.column(i).as_ref(), concat_path.column(i).as_ref());
+        }
     }
 
     #[test]
