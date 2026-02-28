@@ -281,40 +281,44 @@ pub fn construct_checkpoint_paths(version: u64, parts: Option<u64>) -> Vec<Strin
 
 /// List commit JSON files after a given checkpoint version.
 ///
-/// Uses `list_with_delimiter` (not `list`) to get only immediate children of
-/// _delta_log/, avoiding recursion into subdirectories like _delta_log/_commits/.
+/// Uses sequential HEAD probing instead of listing the entire `_delta_log/`
+/// directory. Delta commit files follow a strict sequential naming convention
+/// (`{version:020}.json`), so we probe starting from `checkpoint_version + 1`
+/// and stop at the first missing version.
+///
+/// This is O(k) where k = number of post-checkpoint commits (typically 0-10),
+/// instead of O(n) where n = total objects in `_delta_log/` (can be 200K+).
 async fn list_commit_files_after(
     store: &Arc<dyn ObjectStore>,
     log_prefix: &str,
     checkpoint_version: u64,
 ) -> Result<Vec<String>> {
-    let prefix = ObjectPath::from(format!("{}/", log_prefix));
-    let list_result = store.list_with_delimiter(Some(&prefix)).await?;
+    let mut commit_files = Vec::new();
+    let mut version = checkpoint_version + 1;
 
-    let mut commit_files: Vec<(u64, String)> = Vec::new();
-
-    for obj_meta in &list_result.objects {
-        let filename = obj_meta
-            .location
-            .filename()
-            .unwrap_or_default()
-            .to_string();
-
-        // Match pattern: {version:020}.json
-        if filename.ends_with(".json") && !filename.contains("checkpoint") {
-            if let Some(version_str) = filename.strip_suffix(".json") {
-                if let Ok(v) = version_str.parse::<u64>() {
-                    if v > checkpoint_version {
-                        commit_files.push((v, filename));
-                    }
-                }
+    loop {
+        let filename = format!("{:020}.json", version);
+        let path = ObjectPath::from(format!("{}/{}", log_prefix, filename));
+        match store.head(&path).await {
+            Ok(_) => {
+                commit_files.push(filename);
+                version += 1;
             }
+            Err(object_store::Error::NotFound { .. }) => break,
+            Err(e) => return Err(anyhow::anyhow!(
+                "Failed to check commit file {}: {}", filename, e
+            )),
         }
     }
 
-    // Sort by version ascending
-    commit_files.sort_by_key(|(v, _)| *v);
-    Ok(commit_files.into_iter().map(|(_, f)| f).collect())
+    debug_println!(
+        "🔧 DELTA_DIST: Found {} post-checkpoint commits via sequential probe (versions {}..{})",
+        commit_files.len(),
+        checkpoint_version + 1,
+        version - 1
+    );
+
+    Ok(commit_files)
 }
 
 /// Read metaData from the first checkpoint part (column-projected, single row).
