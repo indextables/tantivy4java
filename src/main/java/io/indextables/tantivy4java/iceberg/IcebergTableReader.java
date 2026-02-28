@@ -188,6 +188,10 @@ public class IcebergTableReader {
         byte[] bytes = nativeListFiles(catalogName, namespace, tableName, snapshotId,
                 config != null ? config : Collections.emptyMap(), compact, predicateJson);
 
+        if (bytes == null) {
+            throw new RuntimeException("Native listFiles returned null (check preceding exception)");
+        }
+
         ByteBuffer buffer = ByteBuffer.wrap(bytes);
         buffer.order(ByteOrder.nativeOrder());
 
@@ -235,6 +239,10 @@ public class IcebergTableReader {
         byte[] bytes = nativeReadSchema(catalogName, namespace, tableName, snapshotId,
                 config != null ? config : Collections.emptyMap());
 
+        if (bytes == null) {
+            throw new RuntimeException("Native readSchema returned null (check preceding exception)");
+        }
+
         ByteBuffer buffer = ByteBuffer.wrap(bytes);
         buffer.order(ByteOrder.nativeOrder());
 
@@ -276,6 +284,10 @@ public class IcebergTableReader {
 
         byte[] bytes = nativeListSnapshots(catalogName, namespace, tableName,
                 config != null ? config : Collections.emptyMap());
+
+        if (bytes == null) {
+            throw new RuntimeException("Native listSnapshots returned null (check preceding exception)");
+        }
 
         ByteBuffer buffer = ByteBuffer.wrap(bytes);
         buffer.order(ByteOrder.nativeOrder());
@@ -348,6 +360,10 @@ public class IcebergTableReader {
         byte[] bytes = nativeGetSnapshotInfo(catalogName, namespace, tableName, snapshotId,
                 config != null ? config : Collections.emptyMap());
 
+        if (bytes == null) {
+            throw new RuntimeException("Native getSnapshotInfo returned null (check preceding exception)");
+        }
+
         ByteBuffer buffer = ByteBuffer.wrap(bytes);
         buffer.order(ByteOrder.nativeOrder());
 
@@ -417,6 +433,10 @@ public class IcebergTableReader {
         String predicateJson = filter != null ? filter.toJson() : null;
         byte[] bytes = nativeReadManifestFile(catalogName, namespace, tableName, manifestPath,
                 config != null ? config : Collections.emptyMap(), compact, predicateJson);
+
+        if (bytes == null) {
+            throw new RuntimeException("Native readManifestFile returned null (check preceding exception)");
+        }
 
         ByteBuffer buffer = ByteBuffer.wrap(bytes);
         buffer.order(ByteOrder.nativeOrder());

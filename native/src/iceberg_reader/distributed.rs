@@ -312,26 +312,36 @@ pub fn read_iceberg_manifest_arrow_ffi(
         (Arc::new(Int64Array::from(snap_ids)), Field::new("snapshot_id", DataType::Int64, false)),
     ];
 
-    // 4. Export each column via FFI
-    for (i, (array, field)) in arrays.iter().enumerate() {
+    // 4. Validate ALL addresses upfront before writing anything.
+    //    This prevents partial writes if a later address is null — either all
+    //    columns are exported or none are.
+    for i in 0..NUM_COLS {
         if array_addrs[i] == 0 || schema_addrs[i] == 0 {
             anyhow::bail!(
                 "Null FFI address for column {}: array_addr={}, schema_addr={}",
                 i, array_addrs[i], schema_addrs[i]
             );
         }
+    }
 
+    // 5. Build FFI structs in a temporary vec first, then write all at once.
+    //    If any schema conversion fails, nothing is written.
+    let mut ffi_pairs: Vec<(FFI_ArrowArray, FFI_ArrowSchema)> = Vec::with_capacity(NUM_COLS);
+    for (i, (array, field)) in arrays.iter().enumerate() {
         let data = array.to_data();
+        let ffi_array = FFI_ArrowArray::new(&data);
+        let ffi_schema = FFI_ArrowSchema::try_from(field)
+            .map_err(|e| anyhow::anyhow!("FFI_ArrowSchema failed for col {}: {}", i, e))?;
+        ffi_pairs.push((ffi_array, ffi_schema));
+    }
+
+    // 6. All FFI structs built successfully — write them all out.
+    for (i, (ffi_array, ffi_schema)) in ffi_pairs.into_iter().enumerate() {
         let array_ptr = array_addrs[i] as *mut FFI_ArrowArray;
         let schema_ptr = schema_addrs[i] as *mut FFI_ArrowSchema;
-
         unsafe {
-            std::ptr::write_unaligned(array_ptr, FFI_ArrowArray::new(&data));
-            std::ptr::write_unaligned(
-                schema_ptr,
-                FFI_ArrowSchema::try_from(field)
-                    .map_err(|e| anyhow::anyhow!("FFI_ArrowSchema failed for col {}: {}", i, e))?,
-            );
+            std::ptr::write_unaligned(array_ptr, ffi_array);
+            std::ptr::write_unaligned(schema_ptr, ffi_schema);
         }
     }
 

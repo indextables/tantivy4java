@@ -98,12 +98,14 @@ public class DeltaFileEntry implements Serializable {
         return false;
     }
 
+    private static final ObjectMapper MAPPER = new ObjectMapper();
+
     private static Map<String, String> parsePartitionValues(Object value) {
         if (value == null) return Collections.emptyMap();
         String jsonStr = value.toString();
         if (jsonStr.isEmpty() || "{}".equals(jsonStr)) return Collections.emptyMap();
         try {
-            return new ObjectMapper().readValue(jsonStr,
+            return MAPPER.readValue(jsonStr,
                     new TypeReference<Map<String, String>>() {});
         } catch (Exception e) {
             return Collections.emptyMap();

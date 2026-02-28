@@ -126,6 +126,8 @@ public class IcebergFileEntry implements Serializable {
         return -1;
     }
 
+    private static final ObjectMapper MAPPER = new ObjectMapper();
+
     private static Map<String, String> parsePartitionValues(Object value) {
         if (value == null) {
             return Collections.emptyMap();
@@ -135,7 +137,7 @@ public class IcebergFileEntry implements Serializable {
             return Collections.emptyMap();
         }
         try {
-            return new ObjectMapper().readValue(jsonStr,
+            return MAPPER.readValue(jsonStr,
                     new TypeReference<Map<String, String>>() {});
         } catch (Exception e) {
             LOG.fine("Failed to parse partition values JSON: " + e.getMessage());

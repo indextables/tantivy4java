@@ -43,6 +43,16 @@ pub fn extract_string(env: &mut JNIEnv, map: &JObject, key: &str) -> Option<Stri
 ///
 /// On failure, throws a Java RuntimeException and returns null.
 pub fn buffer_to_jbytearray(env: &mut JNIEnv, buffer: &[u8]) -> jbyteArray {
+    if buffer.len() > i32::MAX as usize {
+        to_java_exception(
+            env,
+            &anyhow::anyhow!(
+                "Buffer too large for Java byte array: {} bytes exceeds i32::MAX",
+                buffer.len()
+            ),
+        );
+        return std::ptr::null_mut();
+    }
     match env.new_byte_array(buffer.len() as i32) {
         Ok(byte_array) => {
             let byte_slice: &[i8] = unsafe {
@@ -279,20 +289,43 @@ pub enum PartitionPredicate {
 }
 
 /// Compare two string values with optional numeric interpretation.
+///
+/// When a numeric type is specified but values fail to parse, falls back to
+/// string comparison with a debug warning. NaN values are treated as greater
+/// than all other values (consistent with f64::total_cmp behavior).
 fn compare(a: &str, b: &str, cmp_type: &CompareType) -> std::cmp::Ordering {
     match cmp_type {
         CompareType::Long => {
-            if let (Ok(av), Ok(bv)) = (a.parse::<i64>(), b.parse::<i64>()) {
-                return av.cmp(&bv);
+            match (a.parse::<i64>(), b.parse::<i64>()) {
+                (Ok(av), Ok(bv)) => av.cmp(&bv),
+                _ => {
+                    // Numeric parse failed — fall back to string comparison.
+                    // This handles cases like partition values that look numeric
+                    // but contain unexpected characters.
+                    crate::debug_println!(
+                        "⚠️ PREDICATE: Long parse failed for '{}' vs '{}', falling back to string",
+                        a, b
+                    );
+                    a.cmp(b)
+                }
             }
-            // Fall back to string comparison if parse fails
-            a.cmp(b)
         }
         CompareType::Double => {
-            if let (Ok(av), Ok(bv)) = (a.parse::<f64>(), b.parse::<f64>()) {
-                return av.partial_cmp(&bv).unwrap_or(std::cmp::Ordering::Equal);
+            match (a.parse::<f64>(), b.parse::<f64>()) {
+                (Ok(av), Ok(bv)) => {
+                    // Use total_cmp for consistent NaN handling:
+                    // NaN is treated as greater than all values, providing
+                    // deterministic ordering instead of Ordering::Equal.
+                    av.total_cmp(&bv)
+                }
+                _ => {
+                    crate::debug_println!(
+                        "⚠️ PREDICATE: Double parse failed for '{}' vs '{}', falling back to string",
+                        a, b
+                    );
+                    a.cmp(b)
+                }
             }
-            a.cmp(b)
         }
         CompareType::String => a.cmp(b),
     }
@@ -790,5 +823,198 @@ mod tests {
         };
         // Lexicographic: "10" < "9"
         assert!(!pred_str.evaluate(&pv(&[("id", "10")])));
+    }
+
+    #[test]
+    fn test_double_nan_handling() {
+        // NaN should not cause Ordering::Equal — total_cmp treats NaN as greater than all values
+        let pred = PartitionPredicate::Gt {
+            column: "score".into(),
+            value: "NaN".into(),
+            r#type: CompareType::Double,
+        };
+        // "1.0" > "NaN" should be false (NaN is treated as > everything)
+        assert!(!pred.evaluate(&pv(&[("score", "1.0")])));
+
+        // NaN > "1.0" should be true
+        let pred2 = PartitionPredicate::Gt {
+            column: "score".into(),
+            value: "1.0".into(),
+            r#type: CompareType::Double,
+        };
+        assert!(pred2.evaluate(&pv(&[("score", "NaN")])));
+    }
+
+    #[test]
+    fn test_double_parse_failure_fallback() {
+        // Non-numeric values with Double type should fall back to string comparison
+        let pred = PartitionPredicate::Gt {
+            column: "val".into(),
+            value: "abc".into(),
+            r#type: CompareType::Double,
+        };
+        // "xyz" > "abc" lexicographically
+        assert!(pred.evaluate(&pv(&[("val", "xyz")])));
+        // "aaa" < "abc" lexicographically
+        assert!(!pred.evaluate(&pv(&[("val", "aaa")])));
+    }
+
+    #[test]
+    fn test_empty_and_or_evaluation() {
+        // Empty And (if constructed manually in Rust) — all() on empty = true
+        let pred = PartitionPredicate::And { filters: vec![] };
+        assert!(pred.evaluate(&pv(&[("x", "1")])));
+
+        // Empty Or (if constructed manually in Rust) — any() on empty = false
+        let pred = PartitionPredicate::Or { filters: vec![] };
+        assert!(!pred.evaluate(&pv(&[("x", "1")])));
+    }
+
+    // -- Date partition filtering tests --
+    // Partition values are always strings. ISO 8601 dates (YYYY-MM-DD) are
+    // lexicographically sortable, so string comparison works correctly.
+    // Epoch-based date partitions work with CompareType::Long.
+
+    #[test]
+    fn test_date_iso8601_string_eq() {
+        let pred = PartitionPredicate::Eq {
+            column: "date".into(),
+            value: "2024-06-15".into(),
+        };
+        assert!(pred.evaluate(&pv(&[("date", "2024-06-15")])));
+        assert!(!pred.evaluate(&pv(&[("date", "2024-06-16")])));
+    }
+
+    #[test]
+    fn test_date_iso8601_string_range() {
+        // String comparison on ISO 8601 dates produces correct ordering
+        let pred = PartitionPredicate::Gte {
+            column: "date".into(),
+            value: "2024-01-01".into(),
+            r#type: CompareType::String,
+        };
+        assert!(pred.evaluate(&pv(&[("date", "2024-01-01")])));  // equal
+        assert!(pred.evaluate(&pv(&[("date", "2024-06-15")])));  // after
+        assert!(pred.evaluate(&pv(&[("date", "2024-12-31")])));  // end of year
+        assert!(!pred.evaluate(&pv(&[("date", "2023-12-31")]))); // previous year
+    }
+
+    #[test]
+    fn test_date_iso8601_between_range() {
+        // Common pattern: filter dates in Q1 2024
+        let pred = PartitionPredicate::And {
+            filters: vec![
+                PartitionPredicate::Gte {
+                    column: "date".into(),
+                    value: "2024-01-01".into(),
+                    r#type: CompareType::String,
+                },
+                PartitionPredicate::Lt {
+                    column: "date".into(),
+                    value: "2024-04-01".into(),
+                    r#type: CompareType::String,
+                },
+            ],
+        };
+        assert!(pred.evaluate(&pv(&[("date", "2024-01-01")])));  // start of Q1
+        assert!(pred.evaluate(&pv(&[("date", "2024-02-14")])));  // mid Q1
+        assert!(pred.evaluate(&pv(&[("date", "2024-03-31")])));  // end of Q1
+        assert!(!pred.evaluate(&pv(&[("date", "2024-04-01")]))); // start of Q2
+        assert!(!pred.evaluate(&pv(&[("date", "2023-12-31")]))); // before range
+    }
+
+    #[test]
+    fn test_date_year_month_day_partition_columns() {
+        // Hive-style partitioning: year=2024/month=06/day=15
+        let pred = PartitionPredicate::And {
+            filters: vec![
+                PartitionPredicate::Eq {
+                    column: "year".into(),
+                    value: "2024".into(),
+                },
+                PartitionPredicate::Gte {
+                    column: "month".into(),
+                    value: "6".into(),
+                    r#type: CompareType::Long,
+                },
+                PartitionPredicate::Lte {
+                    column: "month".into(),
+                    value: "9".into(),
+                    r#type: CompareType::Long,
+                },
+            ],
+        };
+        // Summer months in 2024
+        assert!(pred.evaluate(&pv(&[("year", "2024"), ("month", "6"), ("day", "1")])));
+        assert!(pred.evaluate(&pv(&[("year", "2024"), ("month", "9"), ("day", "30")])));
+        assert!(!pred.evaluate(&pv(&[("year", "2024"), ("month", "1"), ("day", "15")])));
+        assert!(!pred.evaluate(&pv(&[("year", "2024"), ("month", "12"), ("day", "25")])));
+        assert!(!pred.evaluate(&pv(&[("year", "2023"), ("month", "7"), ("day", "4")])));
+    }
+
+    #[test]
+    fn test_date_epoch_millis_long_comparison() {
+        // Some tables partition by epoch millis (e.g., 1704067200000 = 2024-01-01T00:00:00Z)
+        let pred = PartitionPredicate::Gte {
+            column: "timestamp_ms".into(),
+            value: "1704067200000".into(),  // 2024-01-01
+            r#type: CompareType::Long,
+        };
+        assert!(pred.evaluate(&pv(&[("timestamp_ms", "1704067200000")])));  // exactly 2024-01-01
+        assert!(pred.evaluate(&pv(&[("timestamp_ms", "1719792000000")])));  // 2024-07-01
+        assert!(!pred.evaluate(&pv(&[("timestamp_ms", "1672531200000")]))); // 2023-01-01
+    }
+
+    #[test]
+    fn test_date_epoch_days_long_comparison() {
+        // Some tables partition by epoch days (e.g., Delta date type)
+        // Day 19723 = 2024-01-01 (days since 1970-01-01)
+        let pred = PartitionPredicate::And {
+            filters: vec![
+                PartitionPredicate::Gte {
+                    column: "date_days".into(),
+                    value: "19723".into(),  // 2024-01-01
+                    r#type: CompareType::Long,
+                },
+                PartitionPredicate::Lt {
+                    column: "date_days".into(),
+                    value: "19814".into(),  // 2024-04-01
+                    r#type: CompareType::Long,
+                },
+            ],
+        };
+        assert!(pred.evaluate(&pv(&[("date_days", "19723")])));   // 2024-01-01
+        assert!(pred.evaluate(&pv(&[("date_days", "19750")])));   // mid-range
+        assert!(!pred.evaluate(&pv(&[("date_days", "19814")])));  // 2024-04-01 (exclusive)
+        assert!(!pred.evaluate(&pv(&[("date_days", "19358")])));  // 2023-01-01
+    }
+
+    #[test]
+    fn test_date_in_set() {
+        // Filter for specific dates
+        let pred = PartitionPredicate::In {
+            column: "date".into(),
+            values: vec![
+                "2024-01-01".into(),
+                "2024-07-04".into(),
+                "2024-12-25".into(),
+            ],
+        };
+        assert!(pred.evaluate(&pv(&[("date", "2024-01-01")])));
+        assert!(pred.evaluate(&pv(&[("date", "2024-12-25")])));
+        assert!(!pred.evaluate(&pv(&[("date", "2024-06-15")])));
+    }
+
+    #[test]
+    fn test_date_iso8601_with_time() {
+        // ISO 8601 with time component — still lexicographically sortable
+        let pred = PartitionPredicate::Gte {
+            column: "timestamp".into(),
+            value: "2024-01-01T00:00:00Z".into(),
+            r#type: CompareType::String,
+        };
+        assert!(pred.evaluate(&pv(&[("timestamp", "2024-01-01T00:00:00Z")])));
+        assert!(pred.evaluate(&pv(&[("timestamp", "2024-06-15T12:30:00Z")])));
+        assert!(!pred.evaluate(&pv(&[("timestamp", "2023-12-31T23:59:59Z")])));
     }
 }

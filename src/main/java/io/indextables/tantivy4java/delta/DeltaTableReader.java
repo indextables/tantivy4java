@@ -153,6 +153,10 @@ public class DeltaTableReader {
         byte[] bytes = nativeListFiles(tableUrl, version,
                 config != null ? config : Collections.emptyMap(), compact, predicateJson);
 
+        if (bytes == null) {
+            throw new RuntimeException("Native listFiles returned null (check preceding exception)");
+        }
+
         ByteBuffer buffer = ByteBuffer.wrap(bytes);
         buffer.order(ByteOrder.nativeOrder());
 
@@ -210,6 +214,10 @@ public class DeltaTableReader {
 
         byte[] bytes = nativeReadSchema(tableUrl, version, config != null ? config : Collections.emptyMap());
 
+        if (bytes == null) {
+            throw new RuntimeException("Native readSchema returned null (check preceding exception)");
+        }
+
         // Parse TANT byte buffer
         ByteBuffer buffer = ByteBuffer.wrap(bytes);
         buffer.order(ByteOrder.nativeOrder());
@@ -261,6 +269,10 @@ public class DeltaTableReader {
         }
 
         byte[] bytes = nativeGetSnapshotInfo(tableUrl, config != null ? config : Collections.emptyMap());
+
+        if (bytes == null) {
+            throw new RuntimeException("Native getSnapshotInfo returned null (check preceding exception)");
+        }
 
         ByteBuffer buffer = ByteBuffer.wrap(bytes);
         buffer.order(ByteOrder.nativeOrder());
@@ -315,6 +327,10 @@ public class DeltaTableReader {
         byte[] bytes = nativeReadCheckpointPart(tableUrl,
                 config != null ? config : Collections.emptyMap(), partPath, predicateJson);
 
+        if (bytes == null) {
+            throw new RuntimeException("Native readCheckpointPart returned null (check preceding exception)");
+        }
+
         ByteBuffer buffer = ByteBuffer.wrap(bytes);
         buffer.order(ByteOrder.nativeOrder());
 
@@ -365,6 +381,10 @@ public class DeltaTableReader {
                 config != null ? config : Collections.emptyMap(),
                 commitPaths != null ? commitPaths : Collections.emptyList(),
                 predicateJson);
+
+        if (bytes == null) {
+            throw new RuntimeException("Native readPostCheckpointChanges returned null (check preceding exception)");
+        }
 
         ByteBuffer buffer = ByteBuffer.wrap(bytes);
         buffer.order(ByteOrder.nativeOrder());

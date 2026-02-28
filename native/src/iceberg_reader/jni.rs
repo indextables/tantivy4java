@@ -265,6 +265,9 @@ pub extern "system" fn Java_io_indextables_tantivy4java_iceberg_IcebergTableRead
 ) -> jbyteArray {
     debug_println!("🔧 ICEBERG_JNI: nativeReadManifestFile called");
 
+    // catalog_name, namespace, table_name are accepted for API consistency with
+    // listFiles/getSnapshotInfo but not needed — manifest path + config are sufficient.
+    // We still extract them to validate the JNI strings aren't corrupted.
     let _catalog_str = match get_jstring(&mut env, &catalog_name, "catalog name") {
         Ok(s) => s, Err(()) => return std::ptr::null_mut(),
     };
@@ -329,6 +332,8 @@ pub extern "system" fn Java_io_indextables_tantivy4java_iceberg_IcebergTableRead
 ) -> jint {
     debug_println!("🔧 ICEBERG_JNI: nativeReadManifestFileArrowFfi called");
 
+    // catalog_name, namespace, table_name accepted for API consistency but not needed
+    // for manifest reading — manifest path + config are sufficient.
     let _catalog_str = match get_jstring(&mut env, &catalog_name, "catalog name") {
         Ok(s) => s, Err(()) => return -1,
     };
@@ -362,14 +367,14 @@ pub extern "system" fn Java_io_indextables_tantivy4java_iceberg_IcebergTableRead
     let arr_addrs = match extract_jlong_array(&mut env, &array_addrs) {
         Ok(a) => a,
         Err(e) => {
-            to_java_exception(&mut env, &anyhow::anyhow!("Failed to read array_addrs: {}", e));
+            to_java_exception(&mut env, &e);
             return -1;
         }
     };
     let sch_addrs = match extract_jlong_array(&mut env, &schema_addrs) {
         Ok(a) => a,
         Err(e) => {
-            to_java_exception(&mut env, &anyhow::anyhow!("Failed to read schema_addrs: {}", e));
+            to_java_exception(&mut env, &e);
             return -1;
         }
     };
@@ -393,14 +398,14 @@ pub extern "system" fn Java_io_indextables_tantivy4java_iceberg_IcebergTableRead
 }
 
 /// Extract a Java long[] into a Vec<i64>.
-fn extract_jlong_array(env: &mut JNIEnv, arr: &jlongArray) -> Result<Vec<i64>, String> {
+fn extract_jlong_array(env: &mut JNIEnv, arr: &jlongArray) -> anyhow::Result<Vec<i64>> {
     let safe_arr = unsafe { jni::objects::JLongArray::from_raw(*arr) };
     let len = env
         .get_array_length(&safe_arr)
-        .map_err(|e| format!("Failed to get array length: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Failed to get array length: {}", e))?;
     let mut buf = vec![0i64; len as usize];
     env.get_long_array_region(&safe_arr, 0, &mut buf)
-        .map_err(|e| format!("Failed to read long array: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Failed to read long array: {}", e))?;
     // Prevent the safe wrapper from freeing the original Java array reference
     std::mem::forget(safe_arr);
     Ok(buf)

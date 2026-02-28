@@ -458,8 +458,13 @@ async fn read_post_checkpoint_changes_async(
     // Per-path state: Some(entry) = last action was add, None = last action was remove.
     let mut path_state: HashMap<String, Option<DeltaFileEntry>> = HashMap::new();
 
-    // Process commits oldest-first (commit_paths are already sorted ascending by version)
-    for commit_file in commit_paths {
+    // Ensure commits are processed oldest-first. Sorting by filename is correct
+    // because Delta commit filenames are zero-padded version numbers
+    // (e.g., "00000000000000000001.json").
+    let mut sorted_paths = commit_paths.to_vec();
+    sorted_paths.sort();
+
+    for commit_file in &sorted_paths {
         let path = make_log_path(log_prefix, commit_file);
         let result = store.get(&path).await
             .map_err(|e| anyhow::anyhow!("Failed to read commit {}: {}", commit_file, e))?;
@@ -788,26 +793,36 @@ pub fn read_checkpoint_part_arrow_ffi(
         (Arc::new(BooleanArray::from(has_dvs)), Field::new("has_deletion_vector", DataType::Boolean, false)),
     ];
 
-    // 4. Export each column via FFI
-    for (i, (array, field)) in arrays.iter().enumerate() {
+    // 4. Validate ALL addresses upfront before writing anything.
+    //    This prevents partial writes if a later address is null — either all
+    //    columns are exported or none are.
+    for i in 0..NUM_COLS {
         if array_addrs[i] == 0 || schema_addrs[i] == 0 {
             anyhow::bail!(
                 "Null FFI address for column {}: array_addr={}, schema_addr={}",
                 i, array_addrs[i], schema_addrs[i]
             );
         }
+    }
 
+    // 5. Build FFI structs in a temporary vec first, then write all at once.
+    //    If any schema conversion fails, nothing is written.
+    let mut ffi_pairs: Vec<(FFI_ArrowArray, FFI_ArrowSchema)> = Vec::with_capacity(NUM_COLS);
+    for (i, (array, field)) in arrays.iter().enumerate() {
         let data = array.to_data();
+        let ffi_array = FFI_ArrowArray::new(&data);
+        let ffi_schema = FFI_ArrowSchema::try_from(field)
+            .map_err(|e| anyhow::anyhow!("FFI_ArrowSchema failed for col {}: {}", i, e))?;
+        ffi_pairs.push((ffi_array, ffi_schema));
+    }
+
+    // 6. All FFI structs built successfully — write them all out.
+    for (i, (ffi_array, ffi_schema)) in ffi_pairs.into_iter().enumerate() {
         let array_ptr = array_addrs[i] as *mut FFI_ArrowArray;
         let schema_ptr = schema_addrs[i] as *mut FFI_ArrowSchema;
-
         unsafe {
-            std::ptr::write_unaligned(array_ptr, FFI_ArrowArray::new(&data));
-            std::ptr::write_unaligned(
-                schema_ptr,
-                FFI_ArrowSchema::try_from(field)
-                    .map_err(|e| anyhow::anyhow!("FFI_ArrowSchema failed for col {}: {}", i, e))?,
-            );
+            std::ptr::write_unaligned(array_ptr, ffi_array);
+            std::ptr::write_unaligned(schema_ptr, ffi_schema);
         }
     }
 

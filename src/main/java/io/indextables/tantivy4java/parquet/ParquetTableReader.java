@@ -79,6 +79,10 @@ public class ParquetTableReader {
         byte[] bytes = nativeGetTableInfo(tableUrl,
                 config != null ? config : Collections.emptyMap(), predicateJson);
 
+        if (bytes == null) {
+            throw new RuntimeException("Native getTableInfo returned null (check preceding exception)");
+        }
+
         ByteBuffer buffer = ByteBuffer.wrap(bytes);
         buffer.order(ByteOrder.nativeOrder());
 
@@ -127,6 +131,10 @@ public class ParquetTableReader {
         byte[] bytes = nativeListPartitionFiles(tableUrl,
                 config != null ? config : Collections.emptyMap(), partitionPrefix,
                 predicateJson);
+
+        if (bytes == null) {
+            throw new RuntimeException("Native listPartitionFiles returned null (check preceding exception)");
+        }
 
         ByteBuffer buffer = ByteBuffer.wrap(bytes);
         buffer.order(ByteOrder.nativeOrder());
