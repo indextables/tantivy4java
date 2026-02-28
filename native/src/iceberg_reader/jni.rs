@@ -4,14 +4,17 @@
 // module. Uses shared JNI helpers from common.rs.
 
 use jni::objects::{JClass, JObject, JString};
-use jni::sys::{jboolean, jbyteArray, jlong};
+use jni::sys::{jboolean, jbyteArray, jint, jlong, jlongArray};
 use jni::JNIEnv;
 
-use crate::common::{to_java_exception, extract_hashmap, buffer_to_jbytearray};
+use crate::common::{
+    to_java_exception, extract_hashmap, buffer_to_jbytearray,
+    extract_optional_jstring, parse_optional_predicate, filter_by_predicate,
+};
 use crate::debug_println;
 
 use super::scan::{list_iceberg_files, read_iceberg_schema, list_iceberg_snapshots};
-use super::distributed::{get_iceberg_snapshot_info, read_iceberg_manifest};
+use super::distributed::{get_iceberg_snapshot_info, read_iceberg_manifest, read_iceberg_manifest_arrow_ffi};
 use super::serialization::{
     serialize_iceberg_entries, serialize_iceberg_schema, serialize_iceberg_snapshots,
     serialize_iceberg_snapshot_info,
@@ -40,6 +43,7 @@ pub extern "system" fn Java_io_indextables_tantivy4java_iceberg_IcebergTableRead
     snapshot_id: jlong,
     config_map: JObject,
     compact: jboolean,
+    predicate_json: JString,
 ) -> jbyteArray {
     debug_println!("🔧 ICEBERG_JNI: nativeListFiles called (compact={})", compact != 0);
 
@@ -53,6 +57,15 @@ pub extern "system" fn Java_io_indextables_tantivy4java_iceberg_IcebergTableRead
         Ok(s) => s, Err(()) => return std::ptr::null_mut(),
     };
 
+    let pred_str = extract_optional_jstring(&mut env, &predicate_json);
+    let predicate = match parse_optional_predicate(pred_str.as_deref()) {
+        Ok(p) => p,
+        Err(e) => {
+            to_java_exception(&mut env, &e);
+            return std::ptr::null_mut();
+        }
+    };
+
     let config = match extract_hashmap(&mut env, &config_map) {
         Ok(m) => m,
         Err(e) => {
@@ -63,15 +76,11 @@ pub extern "system" fn Java_io_indextables_tantivy4java_iceberg_IcebergTableRead
 
     let snap_opt = if snapshot_id < 0 { None } else { Some(snapshot_id) };
 
-    debug_println!(
-        "🔧 ICEBERG_JNI: catalog={}, ns={}, table={}, snapshot={:?}, config_keys={}",
-        catalog_str, namespace_str, table_str, snap_opt, config.len()
-    );
-
     match list_iceberg_files(&catalog_str, &config, &namespace_str, &table_str, snap_opt) {
         Ok((entries, actual_snap_id)) => {
+            let entries = filter_by_predicate(entries, &predicate, |e| &e.partition_values);
             debug_println!(
-                "🔧 ICEBERG_JNI: Listed {} files at snapshot {}",
+                "🔧 ICEBERG_JNI: Listed {} files at snapshot {} (after filtering)",
                 entries.len(), actual_snap_id
             );
             let buffer = serialize_iceberg_entries(&entries, actual_snap_id, compact != 0);
@@ -252,20 +261,30 @@ pub extern "system" fn Java_io_indextables_tantivy4java_iceberg_IcebergTableRead
     manifest_path: JString,
     config_map: JObject,
     compact: jboolean,
+    predicate_json: JString,
 ) -> jbyteArray {
     debug_println!("🔧 ICEBERG_JNI: nativeReadManifestFile called");
 
-    let catalog_str = match get_jstring(&mut env, &catalog_name, "catalog name") {
+    let _catalog_str = match get_jstring(&mut env, &catalog_name, "catalog name") {
         Ok(s) => s, Err(()) => return std::ptr::null_mut(),
     };
-    let namespace_str = match get_jstring(&mut env, &namespace, "namespace") {
+    let _namespace_str = match get_jstring(&mut env, &namespace, "namespace") {
         Ok(s) => s, Err(()) => return std::ptr::null_mut(),
     };
-    let table_str = match get_jstring(&mut env, &table_name, "table name") {
+    let _table_str = match get_jstring(&mut env, &table_name, "table name") {
         Ok(s) => s, Err(()) => return std::ptr::null_mut(),
     };
     let manifest_str = match get_jstring(&mut env, &manifest_path, "manifest path") {
         Ok(s) => s, Err(()) => return std::ptr::null_mut(),
+    };
+
+    let pred_str = extract_optional_jstring(&mut env, &predicate_json);
+    let predicate = match parse_optional_predicate(pred_str.as_deref()) {
+        Ok(p) => p,
+        Err(e) => {
+            to_java_exception(&mut env, &e);
+            return std::ptr::null_mut();
+        }
     };
 
     let config = match extract_hashmap(&mut env, &config_map) {
@@ -276,15 +295,11 @@ pub extern "system" fn Java_io_indextables_tantivy4java_iceberg_IcebergTableRead
         }
     };
 
-    debug_println!(
-        "🔧 ICEBERG_JNI: readManifestFile catalog={}, ns={}, table={}, manifest={}",
-        catalog_str, namespace_str, table_str, manifest_str
-    );
-
     match read_iceberg_manifest(&config, &manifest_str) {
         Ok(entries) => {
+            let entries = filter_by_predicate(entries, &predicate, |e| &e.partition_values);
             debug_println!(
-                "🔧 ICEBERG_JNI: Read {} entries from manifest",
+                "🔧 ICEBERG_JNI: Read {} entries from manifest (after filtering)",
                 entries.len()
             );
             let buffer = serialize_iceberg_entries(&entries, 0, compact != 0);
@@ -295,4 +310,98 @@ pub extern "system" fn Java_io_indextables_tantivy4java_iceberg_IcebergTableRead
             std::ptr::null_mut()
         }
     }
+}
+
+// ── Arrow FFI entry point ─────────────────────────────────────────────────────
+
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_iceberg_IcebergTableReader_nativeReadManifestFileArrowFfi(
+    mut env: JNIEnv,
+    _class: JClass,
+    catalog_name: JString,
+    namespace: JString,
+    table_name: JString,
+    manifest_path: JString,
+    config_map: JObject,
+    predicate_json: JString,
+    array_addrs: jlongArray,
+    schema_addrs: jlongArray,
+) -> jint {
+    debug_println!("🔧 ICEBERG_JNI: nativeReadManifestFileArrowFfi called");
+
+    let _catalog_str = match get_jstring(&mut env, &catalog_name, "catalog name") {
+        Ok(s) => s, Err(()) => return -1,
+    };
+    let _namespace_str = match get_jstring(&mut env, &namespace, "namespace") {
+        Ok(s) => s, Err(()) => return -1,
+    };
+    let _table_str = match get_jstring(&mut env, &table_name, "table name") {
+        Ok(s) => s, Err(()) => return -1,
+    };
+    let manifest_str = match get_jstring(&mut env, &manifest_path, "manifest path") {
+        Ok(s) => s, Err(()) => return -1,
+    };
+
+    let pred_str = extract_optional_jstring(&mut env, &predicate_json);
+    let predicate = match parse_optional_predicate(pred_str.as_deref()) {
+        Ok(p) => p,
+        Err(e) => {
+            to_java_exception(&mut env, &e);
+            return -1;
+        }
+    };
+
+    let config = match extract_hashmap(&mut env, &config_map) {
+        Ok(m) => m,
+        Err(e) => {
+            to_java_exception(&mut env, &anyhow::anyhow!("Failed to extract config map: {}", e));
+            return -1;
+        }
+    };
+
+    let arr_addrs = match extract_jlong_array(&mut env, &array_addrs) {
+        Ok(a) => a,
+        Err(e) => {
+            to_java_exception(&mut env, &anyhow::anyhow!("Failed to read array_addrs: {}", e));
+            return -1;
+        }
+    };
+    let sch_addrs = match extract_jlong_array(&mut env, &schema_addrs) {
+        Ok(a) => a,
+        Err(e) => {
+            to_java_exception(&mut env, &anyhow::anyhow!("Failed to read schema_addrs: {}", e));
+            return -1;
+        }
+    };
+
+    match read_iceberg_manifest_arrow_ffi(
+        &config,
+        &manifest_str,
+        predicate.as_ref(),
+        &arr_addrs,
+        &sch_addrs,
+    ) {
+        Ok(num_rows) => {
+            debug_println!("🔧 ICEBERG_JNI: Arrow FFI exported {} rows", num_rows);
+            num_rows as jint
+        }
+        Err(e) => {
+            to_java_exception(&mut env, &e);
+            -1
+        }
+    }
+}
+
+/// Extract a Java long[] into a Vec<i64>.
+fn extract_jlong_array(env: &mut JNIEnv, arr: &jlongArray) -> Result<Vec<i64>, String> {
+    let safe_arr = unsafe { jni::objects::JLongArray::from_raw(*arr) };
+    let len = env
+        .get_array_length(&safe_arr)
+        .map_err(|e| format!("Failed to get array length: {}", e))?;
+    let mut buf = vec![0i64; len as usize];
+    env.get_long_array_region(&safe_arr, 0, &mut buf)
+        .map_err(|e| format!("Failed to read long array: {}", e))?;
+    // Prevent the safe wrapper from freeing the original Java array reference
+    std::mem::forget(safe_arr);
+    Ok(buf)
 }

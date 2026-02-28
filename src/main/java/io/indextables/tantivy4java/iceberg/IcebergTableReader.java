@@ -1,6 +1,7 @@
 package io.indextables.tantivy4java.iceberg;
 
 import io.indextables.tantivy4java.batch.BatchDocumentReader;
+import io.indextables.tantivy4java.filter.PartitionFilter;
 
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
@@ -162,10 +163,30 @@ public class IcebergTableReader {
     public static List<IcebergFileEntry> listFiles(
             String catalogName, String namespace, String tableName,
             Map<String, String> config, long snapshotId, boolean compact) {
+        return listFiles(catalogName, namespace, tableName, config, snapshotId, compact, null);
+    }
+
+    /**
+     * List active data files with partition predicate filtering.
+     *
+     * @param catalogName catalog identifier
+     * @param namespace   Iceberg namespace
+     * @param tableName   table name
+     * @param config      catalog and storage configuration
+     * @param snapshotId  snapshot ID (-1 for current)
+     * @param compact     if true, skip partition_values and content_type
+     * @param filter      partition filter (null for no filtering)
+     * @return list of matching data file entries
+     */
+    public static List<IcebergFileEntry> listFiles(
+            String catalogName, String namespace, String tableName,
+            Map<String, String> config, long snapshotId, boolean compact,
+            PartitionFilter filter) {
         validateParams(catalogName, namespace, tableName, config);
 
+        String predicateJson = filter != null ? filter.toJson() : null;
         byte[] bytes = nativeListFiles(catalogName, namespace, tableName, snapshotId,
-                config != null ? config : Collections.emptyMap(), compact);
+                config != null ? config : Collections.emptyMap(), compact, predicateJson);
 
         ByteBuffer buffer = ByteBuffer.wrap(bytes);
         buffer.order(ByteOrder.nativeOrder());
@@ -369,13 +390,33 @@ public class IcebergTableReader {
     public static List<IcebergFileEntry> readManifestFile(
             String catalogName, String namespace, String tableName,
             Map<String, String> config, String manifestPath, boolean compact) {
+        return readManifestFile(catalogName, namespace, tableName, config, manifestPath, compact, null);
+    }
+
+    /**
+     * Read one manifest file with partition predicate filtering.
+     *
+     * @param catalogName  catalog identifier
+     * @param namespace    Iceberg namespace
+     * @param tableName    table name
+     * @param config       catalog and storage configuration
+     * @param manifestPath full path to the manifest avro file
+     * @param compact      if true, skip partition_values and content_type
+     * @param filter       partition filter (null for no filtering)
+     * @return list of matching file entries from this manifest
+     */
+    public static List<IcebergFileEntry> readManifestFile(
+            String catalogName, String namespace, String tableName,
+            Map<String, String> config, String manifestPath, boolean compact,
+            PartitionFilter filter) {
         validateParams(catalogName, namespace, tableName, config);
         if (manifestPath == null || manifestPath.isEmpty()) {
             throw new IllegalArgumentException("manifestPath must not be null or empty");
         }
 
+        String predicateJson = filter != null ? filter.toJson() : null;
         byte[] bytes = nativeReadManifestFile(catalogName, namespace, tableName, manifestPath,
-                config != null ? config : Collections.emptyMap(), compact);
+                config != null ? config : Collections.emptyMap(), compact, predicateJson);
 
         ByteBuffer buffer = ByteBuffer.wrap(bytes);
         buffer.order(ByteOrder.nativeOrder());
@@ -390,11 +431,56 @@ public class IcebergTableReader {
         return entries;
     }
 
+    // ── Arrow FFI ──────────────────────────────────────────────────────────────
+
+    /**
+     * Read an Iceberg manifest file and export entries via Arrow FFI.
+     *
+     * <p>Builds a flat RecordBatch with 7 columns:
+     * path (Utf8), file_format (Utf8), record_count (Int64),
+     * file_size_bytes (Int64), partition_values (Utf8/JSON),
+     * content_type (Utf8), snapshot_id (Int64).
+     *
+     * <p>The caller must pre-allocate FFI_ArrowArray and FFI_ArrowSchema structs
+     * for each column and pass their memory addresses.
+     *
+     * @param catalogName  catalog identifier
+     * @param namespace    Iceberg namespace
+     * @param tableName    table name
+     * @param config       catalog and storage configuration
+     * @param manifestPath full path to the manifest avro file
+     * @param filter       partition filter (null for no filtering)
+     * @param arrayAddrs   pre-allocated FFI_ArrowArray addresses (7 columns)
+     * @param schemaAddrs  pre-allocated FFI_ArrowSchema addresses (7 columns)
+     * @return number of rows written, or -1 on error
+     */
+    public static int readManifestFileArrowFfi(
+            String catalogName, String namespace, String tableName,
+            Map<String, String> config, String manifestPath,
+            PartitionFilter filter, long[] arrayAddrs, long[] schemaAddrs) {
+        validateParams(catalogName, namespace, tableName, config);
+        if (manifestPath == null || manifestPath.isEmpty()) {
+            throw new IllegalArgumentException("manifestPath must not be null or empty");
+        }
+        if (arrayAddrs == null || arrayAddrs.length < 7) {
+            throw new IllegalArgumentException("arrayAddrs must have at least 7 elements");
+        }
+        if (schemaAddrs == null || schemaAddrs.length < 7) {
+            throw new IllegalArgumentException("schemaAddrs must have at least 7 elements");
+        }
+
+        String predicateJson = filter != null ? filter.toJson() : null;
+        return nativeReadManifestFileArrowFfi(catalogName, namespace, tableName,
+                manifestPath, config != null ? config : Collections.emptyMap(),
+                predicateJson, arrayAddrs, schemaAddrs);
+    }
+
     // ── Native methods ────────────────────────────────────────────────────────
 
     private static native byte[] nativeListFiles(
             String catalogName, String namespace, String tableName,
-            long snapshotId, Map<String, String> config, boolean compact);
+            long snapshotId, Map<String, String> config, boolean compact,
+            String predicateJson);
 
     private static native byte[] nativeReadSchema(
             String catalogName, String namespace, String tableName,
@@ -410,5 +496,11 @@ public class IcebergTableReader {
 
     private static native byte[] nativeReadManifestFile(
             String catalogName, String namespace, String tableName,
-            String manifestPath, Map<String, String> config, boolean compact);
+            String manifestPath, Map<String, String> config, boolean compact,
+            String predicateJson);
+
+    private static native int nativeReadManifestFileArrowFfi(
+            String catalogName, String namespace, String tableName,
+            String manifestPath, Map<String, String> config,
+            String predicateJson, long[] arrayAddrs, long[] schemaAddrs);
 }

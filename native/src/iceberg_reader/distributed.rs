@@ -249,6 +249,95 @@ async fn read_manifest_with_file_io(
     Ok(entries)
 }
 
+// ─── Arrow FFI export ────────────────────────────────────────────────────────
+
+/// Read an Iceberg manifest and export filtered entries via Arrow FFI.
+///
+/// Builds a flat RecordBatch with 7 columns:
+///   path (Utf8), file_format (Utf8), record_count (Int64),
+///   file_size_bytes (Int64), partition_values (Utf8/JSON),
+///   content_type (Utf8), snapshot_id (Int64)
+///
+/// Returns the number of rows written.
+pub fn read_iceberg_manifest_arrow_ffi(
+    config: &HashMap<String, String>,
+    manifest_path: &str,
+    predicate: Option<&crate::common::PartitionPredicate>,
+    array_addrs: &[i64],
+    schema_addrs: &[i64],
+) -> Result<usize> {
+    use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
+    use arrow_array::{StringArray, Int64Array, Array};
+    use arrow_schema::{DataType, Field};
+
+    const NUM_COLS: usize = 7;
+
+    if array_addrs.len() < NUM_COLS || schema_addrs.len() < NUM_COLS {
+        anyhow::bail!(
+            "Insufficient FFI addresses: need {} but got {} array_addrs and {} schema_addrs",
+            NUM_COLS, array_addrs.len(), schema_addrs.len()
+        );
+    }
+
+    // 1. Read manifest → Vec<IcebergFileEntry>
+    let entries = read_iceberg_manifest(config, manifest_path)?;
+
+    // 2. Apply partition predicate filter
+    let entries: Vec<IcebergFileEntry> = match predicate {
+        Some(pred) => entries.into_iter().filter(|e| pred.evaluate(&e.partition_values)).collect(),
+        None => entries,
+    };
+
+    let num_rows = entries.len();
+
+    // 3. Build flat Arrow arrays
+    let paths: Vec<&str> = entries.iter().map(|e| e.path.as_str()).collect();
+    let formats: Vec<&str> = entries.iter().map(|e| e.file_format.as_str()).collect();
+    let rec_counts: Vec<i64> = entries.iter().map(|e| e.record_count).collect();
+    let file_sizes: Vec<i64> = entries.iter().map(|e| e.file_size_bytes).collect();
+    let pvs: Vec<String> = entries.iter().map(|e| {
+        serde_json::to_string(&e.partition_values).unwrap_or_else(|_| "{}".to_string())
+    }).collect();
+    let pv_refs: Vec<&str> = pvs.iter().map(|s| s.as_str()).collect();
+    let content_types: Vec<&str> = entries.iter().map(|e| e.content_type.as_str()).collect();
+    let snap_ids: Vec<i64> = entries.iter().map(|e| e.snapshot_id).collect();
+
+    let arrays: Vec<(Arc<dyn Array>, Field)> = vec![
+        (Arc::new(StringArray::from(paths)), Field::new("path", DataType::Utf8, false)),
+        (Arc::new(StringArray::from(formats)), Field::new("file_format", DataType::Utf8, false)),
+        (Arc::new(Int64Array::from(rec_counts)), Field::new("record_count", DataType::Int64, false)),
+        (Arc::new(Int64Array::from(file_sizes)), Field::new("file_size_bytes", DataType::Int64, false)),
+        (Arc::new(StringArray::from(pv_refs)), Field::new("partition_values", DataType::Utf8, false)),
+        (Arc::new(StringArray::from(content_types)), Field::new("content_type", DataType::Utf8, false)),
+        (Arc::new(Int64Array::from(snap_ids)), Field::new("snapshot_id", DataType::Int64, false)),
+    ];
+
+    // 4. Export each column via FFI
+    for (i, (array, field)) in arrays.iter().enumerate() {
+        if array_addrs[i] == 0 || schema_addrs[i] == 0 {
+            anyhow::bail!(
+                "Null FFI address for column {}: array_addr={}, schema_addr={}",
+                i, array_addrs[i], schema_addrs[i]
+            );
+        }
+
+        let data = array.to_data();
+        let array_ptr = array_addrs[i] as *mut FFI_ArrowArray;
+        let schema_ptr = schema_addrs[i] as *mut FFI_ArrowSchema;
+
+        unsafe {
+            std::ptr::write_unaligned(array_ptr, FFI_ArrowArray::new(&data));
+            std::ptr::write_unaligned(
+                schema_ptr,
+                FFI_ArrowSchema::try_from(field)
+                    .map_err(|e| anyhow::anyhow!("FFI_ArrowSchema failed for col {}: {}", i, e))?,
+            );
+        }
+    }
+
+    Ok(num_rows)
+}
+
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

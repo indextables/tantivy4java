@@ -1,6 +1,7 @@
 package io.indextables.tantivy4java.parquet;
 
 import io.indextables.tantivy4java.batch.BatchDocumentReader;
+import io.indextables.tantivy4java.filter.PartitionFilter;
 
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
@@ -53,12 +54,30 @@ public class ParquetTableReader {
      * @return table metadata with partition directories and schema
      */
     public static ParquetTableInfo getTableInfo(String tableUrl, Map<String, String> config) {
+        return getTableInfo(tableUrl, config, null);
+    }
+
+    /**
+     * Get lightweight table metadata with partition predicate filtering.
+     *
+     * <p>Partition directories are pruned by parsing partition values from
+     * directory names and testing against the predicate — this is the biggest
+     * win for Hive tables, as it eliminates entire LIST calls on executors.
+     *
+     * @param tableUrl table root URL (local path, file://, s3://, or azure://)
+     * @param config   credential and storage configuration
+     * @param filter   partition filter (null for no filtering)
+     * @return table metadata with filtered partition directories and schema
+     */
+    public static ParquetTableInfo getTableInfo(
+            String tableUrl, Map<String, String> config, PartitionFilter filter) {
         if (tableUrl == null || tableUrl.isEmpty()) {
             throw new IllegalArgumentException("tableUrl must not be null or empty");
         }
 
+        String predicateJson = filter != null ? filter.toJson() : null;
         byte[] bytes = nativeGetTableInfo(tableUrl,
-                config != null ? config : Collections.emptyMap());
+                config != null ? config : Collections.emptyMap(), predicateJson);
 
         ByteBuffer buffer = ByteBuffer.wrap(bytes);
         buffer.order(ByteOrder.nativeOrder());
@@ -82,6 +101,21 @@ public class ParquetTableReader {
      */
     public static List<ParquetFileEntry> listPartitionFiles(
             String tableUrl, Map<String, String> config, String partitionPrefix) {
+        return listPartitionFiles(tableUrl, config, partitionPrefix, null);
+    }
+
+    /**
+     * List all .parquet files under a single partition directory with filtering.
+     *
+     * @param tableUrl        table root URL
+     * @param config          credential and storage configuration
+     * @param partitionPrefix partition directory prefix (e.g. "year=2024/month=01/")
+     * @param filter          partition filter (null for no filtering)
+     * @return list of matching parquet file entries with partition values
+     */
+    public static List<ParquetFileEntry> listPartitionFiles(
+            String tableUrl, Map<String, String> config, String partitionPrefix,
+            PartitionFilter filter) {
         if (tableUrl == null || tableUrl.isEmpty()) {
             throw new IllegalArgumentException("tableUrl must not be null or empty");
         }
@@ -89,8 +123,10 @@ public class ParquetTableReader {
             throw new IllegalArgumentException("partitionPrefix must not be null or empty");
         }
 
+        String predicateJson = filter != null ? filter.toJson() : null;
         byte[] bytes = nativeListPartitionFiles(tableUrl,
-                config != null ? config : Collections.emptyMap(), partitionPrefix);
+                config != null ? config : Collections.emptyMap(), partitionPrefix,
+                predicateJson);
 
         ByteBuffer buffer = ByteBuffer.wrap(bytes);
         buffer.order(ByteOrder.nativeOrder());
@@ -107,7 +143,9 @@ public class ParquetTableReader {
 
     // ── Native methods ───────────────────────────────────────────────────────
 
-    private static native byte[] nativeGetTableInfo(String tableUrl, Map<String, String> config);
+    private static native byte[] nativeGetTableInfo(
+            String tableUrl, Map<String, String> config, String predicateJson);
     private static native byte[] nativeListPartitionFiles(
-            String tableUrl, Map<String, String> config, String partitionPrefix);
+            String tableUrl, Map<String, String> config, String partitionPrefix,
+            String predicateJson);
 }
