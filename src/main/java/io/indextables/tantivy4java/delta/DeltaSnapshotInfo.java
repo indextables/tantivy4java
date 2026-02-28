@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 
 import java.io.Serializable;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -27,10 +28,12 @@ public class DeltaSnapshotInfo implements Serializable {
     private final List<String> checkpointPartPaths;
     private final List<String> commitFilePaths;
     private final long numAddFiles;
+    /** Physical column name → logical column name mapping for Delta column mapping mode. */
+    private final Map<String, String> columnNameMapping;
 
     DeltaSnapshotInfo(long version, String schemaJson, List<String> partitionColumns,
                       List<String> checkpointPartPaths, List<String> commitFilePaths,
-                      long numAddFiles) {
+                      long numAddFiles, Map<String, String> columnNameMapping) {
         this.version = version;
         this.schemaJson = schemaJson;
         this.partitionColumns = partitionColumns != null
@@ -43,6 +46,9 @@ public class DeltaSnapshotInfo implements Serializable {
                 ? Collections.unmodifiableList(commitFilePaths)
                 : Collections.emptyList();
         this.numAddFiles = numAddFiles;
+        this.columnNameMapping = columnNameMapping != null
+                ? Collections.unmodifiableMap(columnNameMapping)
+                : Collections.emptyMap();
     }
 
     /** Checkpoint version. */
@@ -63,6 +69,27 @@ public class DeltaSnapshotInfo implements Serializable {
     /** Number of add file entries recorded in _last_checkpoint, or -1 if unknown. */
     public long getNumAddFiles() { return numAddFiles; }
 
+    /**
+     * Physical column name → logical column name mapping.
+     * Empty if the table does not use Delta column mapping mode.
+     */
+    public Map<String, String> getColumnNameMapping() { return columnNameMapping; }
+
+    /**
+     * Column mapping as a JSON string for passing back to native methods.
+     * Returns null if the mapping is empty (no column mapping).
+     */
+    public String getColumnNameMappingJson() {
+        if (columnNameMapping.isEmpty()) {
+            return null;
+        }
+        try {
+            return new ObjectMapper().writeValueAsString(columnNameMapping);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
     @Override
     public String toString() {
         return String.format("DeltaSnapshotInfo{version=%d, checkpoints=%d, commits=%d, numAddFiles=%d}",
@@ -79,9 +106,10 @@ public class DeltaSnapshotInfo implements Serializable {
         List<String> checkpointPaths = parseJsonList(map.get("checkpoint_part_paths_json"));
         List<String> commitPaths = parseJsonList(map.get("commit_file_paths_json"));
         long numAddFiles = toLong(map.get("num_add_files"));
+        Map<String, String> columnMapping = parseJsonMap(map.get("column_mapping_json"));
 
         return new DeltaSnapshotInfo(version, schemaJson, partitionColumns,
-                checkpointPaths, commitPaths, numAddFiles);
+                checkpointPaths, commitPaths, numAddFiles, columnMapping);
     }
 
     static long toLong(Object value) {
@@ -100,6 +128,18 @@ public class DeltaSnapshotInfo implements Serializable {
                     new TypeReference<List<String>>() {});
         } catch (Exception e) {
             return Collections.emptyList();
+        }
+    }
+
+    private static Map<String, String> parseJsonMap(Object value) {
+        if (value == null) return Collections.emptyMap();
+        String json = value.toString();
+        if (json.isEmpty() || "{}".equals(json)) return Collections.emptyMap();
+        try {
+            return new ObjectMapper().readValue(json,
+                    new TypeReference<Map<String, String>>() {});
+        } catch (Exception e) {
+            return Collections.emptyMap();
         }
     }
 }

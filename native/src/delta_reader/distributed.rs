@@ -32,7 +32,7 @@ pub struct DeltaSnapshotInfo {
     pub version: u64,
     /// Schema JSON from the first checkpoint part's metaData row
     pub schema_json: String,
-    /// Partition column names from the metaData row
+    /// Partition column names from the metaData row (translated to logical names)
     pub partition_columns: Vec<String>,
     /// Paths to checkpoint parquet parts (relative to _delta_log/)
     pub checkpoint_part_paths: Vec<String>,
@@ -40,6 +40,9 @@ pub struct DeltaSnapshotInfo {
     pub commit_file_paths: Vec<String>,
     /// Total number of add files recorded in _last_checkpoint (if available)
     pub num_add_files: Option<u64>,
+    /// Physical column name → logical column name mapping for Delta column mapping mode.
+    /// Empty if the table does not use column mapping.
+    pub column_mapping: HashMap<String, String>,
 }
 
 /// Post-checkpoint add/remove changes from JSON commit files.
@@ -118,6 +121,23 @@ pub fn get_snapshot_info(
         let (schema_json, partition_columns) =
             read_metadata_from_checkpoint(&store, &first_part_obj_path).await?;
 
+        // Step 5: Build column mapping and translate partition column names
+        let column_mapping = build_column_mapping(&schema_json);
+        let partition_columns = if column_mapping.is_empty() {
+            partition_columns
+        } else {
+            partition_columns
+                .into_iter()
+                .map(|col| column_mapping.get(&col).cloned().unwrap_or(col))
+                .collect()
+        };
+
+        debug_println!(
+            "🔧 DELTA_DIST: Column mapping has {} entries, partition_columns={:?}",
+            column_mapping.len(),
+            partition_columns
+        );
+
         Ok(DeltaSnapshotInfo {
             version: checkpoint_info.version,
             schema_json,
@@ -125,6 +145,7 @@ pub fn get_snapshot_info(
             checkpoint_part_paths,
             commit_file_paths,
             num_add_files: checkpoint_info.num_of_add_files,
+            column_mapping,
         })
     })
 }
@@ -133,10 +154,14 @@ pub fn get_snapshot_info(
 ///
 /// Reads ONE checkpoint parquet file, projects only the `add` column, and
 /// extracts DeltaFileEntry structs. Typically ~54K entries per part for large tables.
+///
+/// If `column_mapping` is non-empty, partition value keys are translated from
+/// physical to logical names before being returned.
 pub fn read_checkpoint_part(
     url_str: &str,
     config: &DeltaStorageConfig,
     part_path: &str,
+    column_mapping: &HashMap<String, String>,
 ) -> Result<Vec<DeltaFileEntry>> {
     debug_println!("🔧 DELTA_DIST: read_checkpoint_part part={}", part_path);
 
@@ -150,7 +175,9 @@ pub fn read_checkpoint_part(
         .build()?;
 
     rt.block_on(async {
-        read_checkpoint_part_async(&store, &obj_path).await
+        let mut entries = read_checkpoint_part_async(&store, &obj_path).await?;
+        apply_column_mapping(&mut entries, column_mapping);
+        Ok(entries)
     })
 }
 
@@ -158,10 +185,14 @@ pub fn read_checkpoint_part(
 ///
 /// Reads commit JSON files after the checkpoint, parses add/remove actions,
 /// and applies log replay (latest action per path wins).
+///
+/// If `column_mapping` is non-empty, partition value keys in added files are
+/// translated from physical to logical names.
 pub fn read_post_checkpoint_changes(
     url_str: &str,
     config: &DeltaStorageConfig,
     commit_paths: &[String],
+    column_mapping: &HashMap<String, String>,
 ) -> Result<DeltaLogChanges> {
     debug_println!(
         "🔧 DELTA_DIST: read_post_checkpoint_changes, {} commits",
@@ -184,7 +215,9 @@ pub fn read_post_checkpoint_changes(
         .build()?;
 
     rt.block_on(async {
-        read_post_checkpoint_changes_async(&store, &log_prefix, commit_paths).await
+        let mut changes = read_post_checkpoint_changes_async(&store, &log_prefix, commit_paths).await?;
+        apply_column_mapping(&mut changes.added_files, column_mapping);
+        Ok(changes)
     })
 }
 
@@ -712,6 +745,71 @@ fn parse_partition_values_json(value: Option<&serde_json::Value>) -> HashMap<Str
     }
 }
 
+// ─── Column mapping helpers ─────────────────────────────────────────────────
+
+/// Parse Delta schema JSON to build a physical_name → logical_name mapping.
+///
+/// Delta tables with `delta.columnMapping.mode = 'name'` store physical column
+/// IDs (UUIDs like `col-350d02e8-...`) in checkpoint/commit files instead of
+/// logical column names. This function extracts the mapping from schema metadata.
+///
+/// Returns an empty map if no column mapping metadata is found.
+pub fn build_column_mapping(schema_json: &str) -> HashMap<String, String> {
+    let v: serde_json::Value = match serde_json::from_str(schema_json) {
+        Ok(v) => v,
+        Err(_) => return HashMap::new(),
+    };
+
+    let mut mapping = HashMap::new();
+    if let Some(fields) = v.get("fields").and_then(|f| f.as_array()) {
+        for field in fields {
+            let logical_name = match field.get("name").and_then(|n| n.as_str()) {
+                Some(n) => n,
+                None => continue,
+            };
+            if let Some(metadata) = field.get("metadata").and_then(|m| m.as_object()) {
+                if let Some(physical_name) = metadata
+                    .get("delta.columnMapping.physicalName")
+                    .and_then(|p| p.as_str())
+                {
+                    mapping.insert(physical_name.to_string(), logical_name.to_string());
+                }
+            }
+        }
+    }
+
+    mapping
+}
+
+/// Translate partition value keys from physical to logical names using the mapping.
+///
+/// No-op if the mapping is empty. Only keys found in the mapping are translated;
+/// keys not in the mapping are left unchanged (handles mixed physical + logical).
+pub fn apply_column_mapping(entries: &mut [DeltaFileEntry], mapping: &HashMap<String, String>) {
+    if mapping.is_empty() {
+        return;
+    }
+    for entry in entries.iter_mut() {
+        let old_pvs = std::mem::take(&mut entry.partition_values);
+        for (key, value) in old_pvs {
+            let logical_key = mapping.get(&key).cloned().unwrap_or(key);
+            entry.partition_values.insert(logical_key, value);
+        }
+    }
+}
+
+/// Parse a column mapping JSON string (`{"col-xxx":"kdate",...}`) into a HashMap.
+///
+/// Returns an empty map if the input is None, empty, or invalid JSON.
+pub fn parse_column_mapping_json(json: Option<&str>) -> HashMap<String, String> {
+    match json {
+        Some(s) if !s.is_empty() && s != "{}" => {
+            serde_json::from_str(s).unwrap_or_default()
+        }
+        _ => HashMap::new(),
+    }
+}
+
 // ─── Path helpers ───────────────────────────────────────────────────────────
 
 /// Get the _delta_log prefix for an object store path.
@@ -746,6 +844,7 @@ pub fn read_checkpoint_part_arrow_ffi(
     config: &DeltaStorageConfig,
     part_path: &str,
     predicate: Option<&crate::common::PartitionPredicate>,
+    column_mapping: &HashMap<String, String>,
     array_addrs: &[i64],
     schema_addrs: &[i64],
 ) -> Result<usize> {
@@ -762,8 +861,8 @@ pub fn read_checkpoint_part_arrow_ffi(
         );
     }
 
-    // 1. Read checkpoint → Vec<DeltaFileEntry>
-    let entries = read_checkpoint_part(url_str, config, part_path)?;
+    // 1. Read checkpoint → Vec<DeltaFileEntry> (with column mapping applied)
+    let entries = read_checkpoint_part(url_str, config, part_path, column_mapping)?;
 
     // 2. Apply partition predicate filter
     let entries: Vec<DeltaFileEntry> = match predicate {
@@ -935,6 +1034,7 @@ mod tests {
             "file:///tmp/nonexistent_table",
             &config,
             &[],
+            &HashMap::new(),
         ).unwrap();
         assert!(changes.added_files.is_empty());
         assert!(changes.removed_paths.is_empty());
@@ -1232,6 +1332,7 @@ mod tests {
                 "00000000000000000001.json".to_string(),
                 "00000000000000000002.json".to_string(),
             ],
+            &HashMap::new(),
         ).unwrap();
 
         assert_eq!(changes.added_files.len(), 2);
@@ -1241,5 +1342,173 @@ mod tests {
         let paths: Vec<&str> = changes.added_files.iter().map(|f| f.path.as_str()).collect();
         assert!(paths.contains(&"part-00001.parquet"));
         assert!(paths.contains(&"part-00002.parquet"));
+    }
+
+    // ─── Column mapping tests ────────────────────────────────────────────
+
+    #[test]
+    fn test_build_column_mapping_with_physical_names() {
+        let schema_json = r#"{
+            "type": "struct",
+            "fields": [
+                {
+                    "name": "kdate",
+                    "type": "string",
+                    "nullable": true,
+                    "metadata": {
+                        "delta.columnMapping.physicalName": "col-350d02e8-4a5c-4cfd-af33-68919953e591",
+                        "delta.columnMapping.id": 3
+                    }
+                },
+                {
+                    "name": "id",
+                    "type": "long",
+                    "nullable": false,
+                    "metadata": {
+                        "delta.columnMapping.physicalName": "col-aaa11111-2222-3333-4444-555566667777",
+                        "delta.columnMapping.id": 1
+                    }
+                }
+            ]
+        }"#;
+
+        let mapping = build_column_mapping(schema_json);
+        assert_eq!(mapping.len(), 2);
+        assert_eq!(
+            mapping.get("col-350d02e8-4a5c-4cfd-af33-68919953e591").unwrap(),
+            "kdate"
+        );
+        assert_eq!(
+            mapping.get("col-aaa11111-2222-3333-4444-555566667777").unwrap(),
+            "id"
+        );
+    }
+
+    #[test]
+    fn test_build_column_mapping_no_mapping() {
+        // Schema without column mapping metadata → empty map
+        let schema_json = r#"{
+            "type": "struct",
+            "fields": [
+                {"name": "id", "type": "long", "nullable": false, "metadata": {}},
+                {"name": "name", "type": "string", "nullable": true, "metadata": {}}
+            ]
+        }"#;
+
+        let mapping = build_column_mapping(schema_json);
+        assert!(mapping.is_empty());
+    }
+
+    #[test]
+    fn test_build_column_mapping_invalid_json() {
+        let mapping = build_column_mapping("not valid json");
+        assert!(mapping.is_empty());
+    }
+
+    #[test]
+    fn test_apply_column_mapping() {
+        let mut entries = vec![
+            DeltaFileEntry {
+                path: "part-0.parquet".to_string(),
+                size: 1000,
+                modification_time: 0,
+                num_records: Some(10),
+                partition_values: {
+                    let mut m = HashMap::new();
+                    m.insert("col-aaa".to_string(), "2024-01-01".to_string());
+                    m.insert("col-bbb".to_string(), "us-east".to_string());
+                    m
+                },
+                has_deletion_vector: false,
+            },
+        ];
+
+        let mut mapping = HashMap::new();
+        mapping.insert("col-aaa".to_string(), "kdate".to_string());
+        mapping.insert("col-bbb".to_string(), "region".to_string());
+
+        apply_column_mapping(&mut entries, &mapping);
+
+        assert_eq!(entries[0].partition_values.get("kdate").unwrap(), "2024-01-01");
+        assert_eq!(entries[0].partition_values.get("region").unwrap(), "us-east");
+        assert!(!entries[0].partition_values.contains_key("col-aaa"));
+        assert!(!entries[0].partition_values.contains_key("col-bbb"));
+    }
+
+    #[test]
+    fn test_apply_column_mapping_empty() {
+        let mut entries = vec![
+            DeltaFileEntry {
+                path: "part-0.parquet".to_string(),
+                size: 1000,
+                modification_time: 0,
+                num_records: Some(10),
+                partition_values: {
+                    let mut m = HashMap::new();
+                    m.insert("year".to_string(), "2024".to_string());
+                    m
+                },
+                has_deletion_vector: false,
+            },
+        ];
+
+        let mapping = HashMap::new();
+        apply_column_mapping(&mut entries, &mapping);
+
+        // No-op: original keys preserved
+        assert_eq!(entries[0].partition_values.get("year").unwrap(), "2024");
+    }
+
+    #[test]
+    fn test_apply_column_mapping_partial() {
+        // Mixed physical + logical keys — only mapped ones translate
+        let mut entries = vec![
+            DeltaFileEntry {
+                path: "part-0.parquet".to_string(),
+                size: 1000,
+                modification_time: 0,
+                num_records: None,
+                partition_values: {
+                    let mut m = HashMap::new();
+                    m.insert("col-aaa".to_string(), "2024-01-01".to_string());
+                    m.insert("already_logical".to_string(), "foo".to_string());
+                    m
+                },
+                has_deletion_vector: false,
+            },
+        ];
+
+        let mut mapping = HashMap::new();
+        mapping.insert("col-aaa".to_string(), "kdate".to_string());
+
+        apply_column_mapping(&mut entries, &mapping);
+
+        assert_eq!(entries[0].partition_values.get("kdate").unwrap(), "2024-01-01");
+        assert_eq!(entries[0].partition_values.get("already_logical").unwrap(), "foo");
+        assert!(!entries[0].partition_values.contains_key("col-aaa"));
+    }
+
+    #[test]
+    fn test_parse_column_mapping_json() {
+        let json = r#"{"col-aaa":"kdate","col-bbb":"region"}"#;
+        let mapping = parse_column_mapping_json(Some(json));
+        assert_eq!(mapping.len(), 2);
+        assert_eq!(mapping.get("col-aaa").unwrap(), "kdate");
+        assert_eq!(mapping.get("col-bbb").unwrap(), "region");
+    }
+
+    #[test]
+    fn test_parse_column_mapping_json_none() {
+        let mapping = parse_column_mapping_json(None);
+        assert!(mapping.is_empty());
+    }
+
+    #[test]
+    fn test_parse_column_mapping_json_empty() {
+        let mapping = parse_column_mapping_json(Some("{}"));
+        assert!(mapping.is_empty());
+
+        let mapping = parse_column_mapping_json(Some(""));
+        assert!(mapping.is_empty());
     }
 }

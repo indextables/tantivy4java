@@ -15,7 +15,7 @@ use crate::debug_println;
 
 use super::scan::{list_delta_files, read_delta_schema};
 use super::serialization::{serialize_delta_entries, serialize_delta_schema, serialize_snapshot_info, serialize_log_changes};
-use super::distributed::{get_snapshot_info, read_checkpoint_part, read_post_checkpoint_changes, read_checkpoint_part_arrow_ffi};
+use super::distributed::{get_snapshot_info, read_checkpoint_part, read_post_checkpoint_changes, read_checkpoint_part_arrow_ffi, parse_column_mapping_json};
 
 // ─── Existing JNI entry points ──────────────────────────────────────────────
 
@@ -169,6 +169,7 @@ pub extern "system" fn Java_io_indextables_tantivy4java_delta_DeltaTableReader_n
     config_map: JObject,
     part_path: JString,
     predicate_json: JString,
+    column_mapping_json: JString,
 ) -> jbyteArray {
     debug_println!("🔧 DELTA_JNI: nativeReadCheckpointPart called");
 
@@ -197,9 +198,12 @@ pub extern "system" fn Java_io_indextables_tantivy4java_delta_DeltaTableReader_n
         }
     };
 
+    let cm_str = extract_optional_jstring(&mut env, &column_mapping_json);
+    let column_mapping = parse_column_mapping_json(cm_str.as_deref());
+
     let config = build_storage_config(&mut env, &config_map);
 
-    match read_checkpoint_part(&url_str, &config, &part) {
+    match read_checkpoint_part(&url_str, &config, &part, &column_mapping) {
         Ok(entries) => {
             let entries = filter_by_predicate(entries, &predicate, |e| &e.partition_values);
             debug_println!("🔧 DELTA_JNI: Read {} entries from checkpoint part (after filtering)", entries.len());
@@ -221,6 +225,7 @@ pub extern "system" fn Java_io_indextables_tantivy4java_delta_DeltaTableReader_n
     config_map: JObject,
     commit_paths_array: JObject,
     predicate_json: JString,
+    column_mapping_json: JString,
 ) -> jbyteArray {
     debug_println!("🔧 DELTA_JNI: nativeReadPostCheckpointChanges called");
 
@@ -241,6 +246,9 @@ pub extern "system" fn Java_io_indextables_tantivy4java_delta_DeltaTableReader_n
         }
     };
 
+    let cm_str = extract_optional_jstring(&mut env, &column_mapping_json);
+    let column_mapping = parse_column_mapping_json(cm_str.as_deref());
+
     let config = build_storage_config(&mut env, &config_map);
 
     let commit_paths = match extract_string_list(&mut env, &commit_paths_array) {
@@ -251,7 +259,7 @@ pub extern "system" fn Java_io_indextables_tantivy4java_delta_DeltaTableReader_n
         }
     };
 
-    match read_post_checkpoint_changes(&url_str, &config, &commit_paths) {
+    match read_post_checkpoint_changes(&url_str, &config, &commit_paths, &column_mapping) {
         Ok(mut changes) => {
             changes.added_files = filter_by_predicate(
                 changes.added_files, &predicate, |e| &e.partition_values,
@@ -281,6 +289,7 @@ pub extern "system" fn Java_io_indextables_tantivy4java_delta_DeltaTableReader_n
     config_map: JObject,
     part_path: JString,
     predicate_json: JString,
+    column_mapping_json: JString,
     array_addrs: jlongArray,
     schema_addrs: jlongArray,
 ) -> jint {
@@ -311,6 +320,9 @@ pub extern "system" fn Java_io_indextables_tantivy4java_delta_DeltaTableReader_n
         }
     };
 
+    let cm_str = extract_optional_jstring(&mut env, &column_mapping_json);
+    let column_mapping = parse_column_mapping_json(cm_str.as_deref());
+
     let config = build_storage_config(&mut env, &config_map);
 
     // Extract long[] arrays from JNI
@@ -334,6 +346,7 @@ pub extern "system" fn Java_io_indextables_tantivy4java_delta_DeltaTableReader_n
         &config,
         &part,
         predicate.as_ref(),
+        &column_mapping,
         &arr_addrs,
         &sch_addrs,
     ) {

@@ -175,7 +175,7 @@ pub fn serialize_snapshot_info(info: &super::distributed::DeltaSnapshotInfo) -> 
     let mut offsets = Vec::with_capacity(1);
     offsets.push(buf.len() as u32);
 
-    let field_count: u16 = 6;
+    let field_count: u16 = 7;
     buf.extend_from_slice(&field_count.to_ne_bytes());
 
     // 1. version (INTEGER)
@@ -205,6 +205,11 @@ pub fn serialize_snapshot_info(info: &super::distributed::DeltaSnapshotInfo) -> 
     write_field_header(&mut buf, "num_add_files", FIELD_TYPE_INTEGER, 1);
     let num_add = info.num_add_files.map(|n| n as i64).unwrap_or(-1i64);
     buf.extend_from_slice(&num_add.to_ne_bytes());
+
+    // 7. column_mapping_json (JSON) — physical → logical name mapping
+    write_field_header(&mut buf, "column_mapping_json", FIELD_TYPE_JSON, 1);
+    let cm_json = serde_json::to_string(&info.column_mapping).unwrap_or_else(|_| "{}".to_string());
+    write_string(&mut buf, &cm_json);
 
     // Offset table
     let offset_table_start = buf.len() as u32;
