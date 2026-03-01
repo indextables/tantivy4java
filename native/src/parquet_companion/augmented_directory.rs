@@ -307,7 +307,7 @@ impl ParquetAugmentedDirectory {
                 "📊 AUGMENTED_DIR: Writing {} bytes to L2 disk cache (component='{}')",
                 wrapped_bytes.len(), component
             );
-            cache.put(storage_loc, split_id, component, None, &wrapped_bytes);
+            cache.put_query_path(storage_loc, split_id, component, None, &wrapped_bytes);
         }
 
         self.insert_transcoded(

@@ -179,8 +179,8 @@ impl StorageWithPersistentCache {
                 result[offset_in_result..offset_in_result + len].copy_from_slice(gap_data.as_slice());
             }
 
-            // Cache this gap in L2 for future requests
-            self.disk_cache.put(
+            // Cache this gap in L2 for future requests (query-path: may drop if full)
+            self.disk_cache.put_query_path(
                 &self.storage_loc,
                 &self.split_id,
                 &component,
@@ -268,11 +268,11 @@ impl Storage for StorageWithPersistentCache {
         // Record download metrics for programmatic verification
         record_query_download(bytes.len() as u64);
 
-        // Cache in L2 disk cache
+        // Cache in L2 disk cache (query-path: may drop if full)
         let disk_range = byte_range.start as u64..byte_range.end as u64;
         debug_println!("💾 L2_STORE: Writing to disk cache - storage_loc={}, split_id={}, component={}, range={:?}, size={}",
                  self.storage_loc, self.split_id, component, disk_range, bytes.len());
-        self.disk_cache.put(&self.storage_loc, &self.split_id, &component, Some(disk_range), bytes.as_slice());
+        self.disk_cache.put_query_path(&self.storage_loc, &self.split_id, &component, Some(disk_range), bytes.as_slice());
 
         Ok(bytes)
     }

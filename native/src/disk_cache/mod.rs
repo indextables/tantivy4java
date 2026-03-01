@@ -39,7 +39,7 @@ pub mod write_ops;
 mod tests;
 
 // Re-exports
-pub use types::{CompressionAlgorithm, DiskCacheConfig, ComponentEntry, DEFAULT_MMAP_CACHE_SIZE};
+pub use types::{CompressionAlgorithm, DiskCacheConfig, ComponentEntry, DEFAULT_MMAP_CACHE_SIZE, WriteQueueMode};
 pub use range_index::{CachedRange, CachedSegment, CoalesceResult};
 pub use manifest::{SplitEntry, SplitState, CacheManifest};
 
@@ -48,7 +48,7 @@ use std::fs::{self, File};
 use std::io::{self, Read};
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::Duration;
 
 use crate::debug_println;
@@ -57,7 +57,101 @@ use tantivy::directory::OwnedBytes;
 use lru::SplitLruTable;
 use mmap_cache::MmapCache;
 use background::WriteRequest;
-use path_helpers::CACHE_SUBDIR;
+
+/// Abstraction over the write channel sender supporting both fragment-based
+/// (bounded sync_channel) and size-based (unbounded channel + byte counter) modes.
+pub(crate) enum WriteSender {
+    /// Fragment-based: bounded sync_channel with N slots.
+    Fragment(std::sync::mpsc::SyncSender<WriteRequest>),
+    /// Size-based: unbounded channel + byte counter for backpressure.
+    SizeBased {
+        tx: std::sync::mpsc::Sender<WriteRequest>,
+        queued_bytes: Arc<AtomicU64>,
+        max_bytes: u64,
+        backpressure: Arc<(Mutex<()>, Condvar)>,
+    },
+}
+
+impl WriteSender {
+    /// Send a write request, blocking if backpressure is needed.
+    /// For `Put` requests in size-based mode, tracks data size for backpressure.
+    fn send(&self, req: WriteRequest) -> Result<(), ()> {
+        match self {
+            WriteSender::Fragment(tx) => tx.send(req).map_err(|_| ()),
+            WriteSender::SizeBased {
+                tx,
+                queued_bytes,
+                max_bytes,
+                backpressure,
+            } => {
+                // Track bytes for Put requests
+                let data_len = match &req {
+                    WriteRequest::Put { data, .. } => data.len() as u64,
+                    _ => 0,
+                };
+
+                if data_len > 0 {
+                    // Wait until queued bytes are below the limit
+                    let (lock, cvar) = &**backpressure;
+                    let mut guard = lock.lock().unwrap();
+                    while queued_bytes.load(Ordering::Acquire) + data_len > *max_bytes {
+                        guard = cvar.wait(guard).unwrap();
+                    }
+                    queued_bytes.fetch_add(data_len, Ordering::Release);
+                }
+
+                tx.send(req).map_err(|_| ())
+            }
+        }
+    }
+
+    /// Try to send without blocking (used in Drop).
+    fn try_send(&self, req: WriteRequest) -> Result<(), ()> {
+        match self {
+            WriteSender::Fragment(tx) => tx.try_send(req).map_err(|_| ()),
+            WriteSender::SizeBased { tx, queued_bytes, .. } => {
+                let data_len = match &req {
+                    WriteRequest::Put { data, .. } => data.len() as u64,
+                    _ => 0,
+                };
+                if data_len > 0 {
+                    queued_bytes.fetch_add(data_len, Ordering::Release);
+                }
+                tx.send(req).map_err(|_| ())
+            }
+        }
+    }
+
+    /// Send a Put request if the queue has capacity, otherwise drop it silently.
+    /// Returns `true` if enqueued, `false` if dropped.
+    /// Non-Put requests are always sent (they're small control messages).
+    fn send_or_drop(&self, req: WriteRequest) -> bool {
+        match self {
+            WriteSender::Fragment(tx) => tx.try_send(req).is_ok(),
+            WriteSender::SizeBased {
+                tx,
+                queued_bytes,
+                max_bytes,
+                ..
+            } => {
+                let data_len = match &req {
+                    WriteRequest::Put { data, .. } => data.len() as u64,
+                    _ => 0,
+                };
+
+                if data_len > 0 && queued_bytes.load(Ordering::Acquire) + data_len > *max_bytes {
+                    // Queue is over capacity — drop the write
+                    return false;
+                }
+
+                if data_len > 0 {
+                    queued_bytes.fetch_add(data_len, Ordering::Release);
+                }
+                tx.send(req).is_ok()
+            }
+        }
+    }
+}
 
 /// L2 Disk Cache implementation
 pub struct L2DiskCache {
@@ -68,8 +162,8 @@ pub struct L2DiskCache {
     lru_table: Mutex<SplitLruTable>,
     /// Memory-mapped file cache for fast random access
     mmap_cache: Mutex<MmapCache>,
-    /// Bounded channel to prevent OOM during bulk prewarm operations.
-    write_tx: std::sync::mpsc::SyncSender<WriteRequest>,
+    /// Write channel sender with configurable backpressure mode.
+    write_tx: WriteSender,
     total_bytes: AtomicU64,
     max_bytes: u64,
     /// Shutdown flag for background threads
@@ -105,9 +199,25 @@ impl L2DiskCache {
             split_states.insert(split_key.clone(), SplitState::from_entry(split_entry));
         }
 
-        // Create BOUNDED background writer channel to prevent OOM during bulk prewarm.
-        const WRITE_QUEUE_CAPACITY: usize = 16;
-        let (write_tx, write_rx) = std::sync::mpsc::sync_channel(WRITE_QUEUE_CAPACITY);
+        // Create background writer channel based on configured mode.
+        let (write_tx, write_rx, size_based_state) = match &config.write_queue_mode {
+            WriteQueueMode::Fragment { capacity } => {
+                let (tx, rx) = std::sync::mpsc::sync_channel(*capacity);
+                (WriteSender::Fragment(tx), rx, None)
+            }
+            WriteQueueMode::SizeBased { max_bytes } => {
+                let (tx, rx) = std::sync::mpsc::channel();
+                let queued_bytes = Arc::new(AtomicU64::new(0));
+                let backpressure = Arc::new((Mutex::new(()), Condvar::new()));
+                let sender = WriteSender::SizeBased {
+                    tx,
+                    queued_bytes: Arc::clone(&queued_bytes),
+                    max_bytes: *max_bytes,
+                    backpressure: Arc::clone(&backpressure),
+                };
+                (sender, rx, Some((queued_bytes, backpressure)))
+            }
+        };
         let shutdown_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         // Determine mmap cache size (use default if 0)
@@ -136,7 +246,7 @@ impl L2DiskCache {
         // Start background writer (uses Weak reference - doesn't prevent Drop)
         let cache_weak = Arc::downgrade(&cache);
         let writer_handle = std::thread::spawn(move || {
-            Self::background_writer_static(write_rx, cache_weak);
+            Self::background_writer_static(write_rx, cache_weak, size_based_state);
         });
 
         if let Ok(mut handles) = cache.thread_handles.lock() {
@@ -290,7 +400,9 @@ impl L2DiskCache {
         )
     }
 
-    /// Cache data (async write via background thread)
+    /// Cache data (async write via background thread).
+    /// Blocks if the write queue is full (backpressure).
+    /// Use this for prewarm operations where data must be written.
     pub fn put(
         &self,
         storage_loc: &str,
@@ -308,7 +420,7 @@ impl L2DiskCache {
             self.trigger_eviction((self.max_bytes * 90) / 100);
         }
 
-        // Send to background writer with BACKPRESSURE.
+        // Send to background writer with backpressure.
         let _ = self.write_tx.send(WriteRequest::Put {
             storage_loc: storage_loc.to_string(),
             split_id: split_id.to_string(),
@@ -316,6 +428,56 @@ impl L2DiskCache {
             byte_range: byte_range.map(|r| r.start..r.end),
             data: data.to_vec(),
         });
+    }
+
+    /// Cache data if the write queue has capacity, otherwise drop silently.
+    /// Returns `true` if the write was enqueued, `false` if dropped.
+    /// Use this for query-path opportunistic caching where dropping is acceptable.
+    pub fn put_if_ready(
+        &self,
+        storage_loc: &str,
+        split_id: &str,
+        component: &str,
+        byte_range: Option<Range<u64>>,
+        data: &[u8],
+    ) -> bool {
+        let current = self.total_bytes.load(Ordering::Relaxed);
+        let new_size = data.len() as u64;
+
+        if current + new_size > (self.max_bytes * 95) / 100 {
+            self.trigger_eviction((self.max_bytes * 90) / 100);
+        }
+
+        self.write_tx.send_or_drop(WriteRequest::Put {
+            storage_loc: storage_loc.to_string(),
+            split_id: split_id.to_string(),
+            component: component.to_string(),
+            byte_range: byte_range.map(|r| r.start..r.end),
+            data: data.to_vec(),
+        })
+    }
+
+    /// Whether non-prewarm writes should be dropped when the queue is full.
+    pub fn drop_writes_when_full(&self) -> bool {
+        self.config.drop_writes_when_full
+    }
+
+    /// Cache data for the query path — blocks or drops depending on config.
+    /// When `drop_writes_when_full` is enabled, silently drops writes if the queue is full.
+    /// When disabled, behaves identically to `put()` (blocks until enqueued).
+    pub fn put_query_path(
+        &self,
+        storage_loc: &str,
+        split_id: &str,
+        component: &str,
+        byte_range: Option<Range<u64>>,
+        data: &[u8],
+    ) {
+        if self.config.drop_writes_when_full {
+            self.put_if_ready(storage_loc, split_id, component, byte_range, data);
+        } else {
+            self.put(storage_loc, split_id, component, byte_range, data);
+        }
     }
 
     /// Evict a split from cache

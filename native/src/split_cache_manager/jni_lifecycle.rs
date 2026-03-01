@@ -10,7 +10,7 @@ use jni::JNIEnv;
 use quickwit_config::S3StorageConfig;
 
 use crate::debug_println;
-use crate::disk_cache::{CompressionAlgorithm, DiskCacheConfig};
+use crate::disk_cache::{CompressionAlgorithm, DiskCacheConfig, WriteQueueMode};
 
 use super::manager::{GlobalSplitCacheManager, BATCH_METRICS, CACHE_MANAGERS};
 
@@ -200,6 +200,33 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_
             // Set the global flag for L1 cache disabling
             crate::global_cache::set_disable_l1_cache(disable_l1_cache);
 
+            // Extract write queue mode (0=FRAGMENT, 1=SIZE_BASED)
+            let wq_mode_ordinal =
+                match env.call_method(&tiered_config_obj, "getWriteQueueModeOrdinal", "()I", &[]) {
+                    Ok(result) => result.i().unwrap(),
+                    _ => 0, // FRAGMENT
+                };
+            let wq_capacity =
+                match env.call_method(&tiered_config_obj, "getWriteQueueCapacity", "()I", &[]) {
+                    Ok(result) => result.i().unwrap() as usize,
+                    _ => 16,
+                };
+            let wq_max_bytes =
+                match env.call_method(&tiered_config_obj, "getWriteQueueMaxBytes", "()J", &[]) {
+                    Ok(result) => result.j().unwrap() as u64,
+                    _ => 2_147_483_648,
+                };
+            let write_queue_mode = match wq_mode_ordinal {
+                1 => WriteQueueMode::SizeBased { max_bytes: wq_max_bytes },
+                _ => WriteQueueMode::Fragment { capacity: wq_capacity },
+            };
+            let drop_writes_when_full =
+                match env.call_method(&tiered_config_obj, "isDropWritesWhenFull", "()Z", &[]) {
+                    Ok(result) => result.z().unwrap_or(false),
+                    _ => false,
+                };
+            debug_println!("RUST DEBUG: write_queue_mode={:?}, drop_writes_when_full={}", write_queue_mode, drop_writes_when_full);
+
             // Create disk cache config if we have a path
             debug_println!("RUST DEBUG: disk_path is_some={}", disk_path.is_some());
             if let Some(path) = disk_path {
@@ -219,6 +246,8 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_
                     min_compress_size,
                     manifest_sync_interval_secs: manifest_sync_interval,
                     mmap_cache_size: 0, // Use default (1024)
+                    write_queue_mode,
+                    drop_writes_when_full,
                 };
 
                 debug_println!("RUST DEBUG: Calling set_disk_cache with path: {}", path);
