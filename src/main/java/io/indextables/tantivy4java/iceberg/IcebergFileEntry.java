@@ -3,8 +3,10 @@ package io.indextables.tantivy4java.iceberg;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
+import java.io.Serializable;
 import java.util.Collections;
 import java.util.Map;
+import java.util.logging.Logger;
 
 /**
  * Immutable data class representing a single active data file in an Iceberg table.
@@ -12,11 +14,13 @@ import java.util.Map;
  * <p>Instances are returned by {@link IcebergTableReader#listFiles} and contain
  * metadata from the Iceberg manifest including file path, format, record count,
  * size, partition values, content type, and the snapshot that added the file.
+ *
+ * <p>Implements {@link Serializable} for Spark broadcast/shuffle.
  */
-public class IcebergFileEntry {
+public class IcebergFileEntry implements Serializable {
 
-    private static final ObjectMapper MAPPER = new ObjectMapper();
-    private static final TypeReference<Map<String, String>> MAP_TYPE = new TypeReference<Map<String, String>>() {};
+    private static final long serialVersionUID = 1L;
+    private static final transient Logger LOG = Logger.getLogger(IcebergFileEntry.class.getName());
 
     private final String path;
     private final String fileFormat;
@@ -26,8 +30,8 @@ public class IcebergFileEntry {
     private final String contentType;
     private final long snapshotId;
 
-    IcebergFileEntry(String path, String fileFormat, long recordCount, long fileSizeBytes,
-                     Map<String, String> partitionValues, String contentType, long snapshotId) {
+    public IcebergFileEntry(String path, String fileFormat, long recordCount, long fileSizeBytes,
+                            Map<String, String> partitionValues, String contentType, long snapshotId) {
         this.path = path;
         this.fileFormat = fileFormat;
         this.recordCount = recordCount;
@@ -100,6 +104,9 @@ public class IcebergFileEntry {
      */
     static IcebergFileEntry fromMap(Map<String, Object> map) {
         String path = (String) map.get("path");
+        if (path == null || path.isEmpty()) {
+            throw new IllegalStateException("IcebergFileEntry missing required 'path' field");
+        }
         String fileFormat = (String) map.getOrDefault("file_format", "parquet");
         long recordCount = toLong(map.get("record_count"));
         long fileSizeBytes = toLong(map.get("file_size_bytes"));
@@ -112,12 +119,14 @@ public class IcebergFileEntry {
                 partitionValues, contentType, snapshotId);
     }
 
-    private static long toLong(Object value) {
+    static long toLong(Object value) {
         if (value instanceof Number) {
             return ((Number) value).longValue();
         }
         return -1;
     }
+
+    private static final ObjectMapper MAPPER = new ObjectMapper();
 
     private static Map<String, String> parsePartitionValues(Object value) {
         if (value == null) {
@@ -128,8 +137,10 @@ public class IcebergFileEntry {
             return Collections.emptyMap();
         }
         try {
-            return MAPPER.readValue(jsonStr, MAP_TYPE);
+            return MAPPER.readValue(jsonStr,
+                    new TypeReference<Map<String, String>>() {});
         } catch (Exception e) {
+            LOG.fine("Failed to parse partition values JSON: " + e.getMessage());
             return Collections.emptyMap();
         }
     }

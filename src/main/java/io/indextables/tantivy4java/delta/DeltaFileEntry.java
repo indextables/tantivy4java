@@ -3,6 +3,7 @@ package io.indextables.tantivy4java.delta;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
+import java.io.Serializable;
 import java.util.Collections;
 import java.util.Map;
 
@@ -12,11 +13,12 @@ import java.util.Map;
  * <p>Instances are returned by {@link DeltaTableReader#listFiles(String)} and contain
  * metadata from the Delta transaction log including file path, size, record count,
  * partition values, and deletion vector status.
+ *
+ * <p>Implements {@link Serializable} for Spark broadcast/shuffle.
  */
-public class DeltaFileEntry {
+public class DeltaFileEntry implements Serializable {
 
-    private static final ObjectMapper MAPPER = new ObjectMapper();
-    private static final TypeReference<Map<String, String>> MAP_TYPE = new TypeReference<Map<String, String>>() {};
+    private static final long serialVersionUID = 1L;
 
     private final String path;
     private final long size;
@@ -26,8 +28,8 @@ public class DeltaFileEntry {
     private final boolean hasDeletionVector;
     private final long tableVersion;
 
-    DeltaFileEntry(String path, long size, long modificationTime, long numRecords,
-                   Map<String, String> partitionValues, boolean hasDeletionVector, long tableVersion) {
+    public DeltaFileEntry(String path, long size, long modificationTime, long numRecords,
+                          Map<String, String> partitionValues, boolean hasDeletionVector, long tableVersion) {
         this.path = path;
         this.size = size;
         this.modificationTime = modificationTime;
@@ -39,61 +41,29 @@ public class DeltaFileEntry {
         this.tableVersion = tableVersion;
     }
 
-    /**
-     * @return parquet file path relative to the table root
-     */
-    public String getPath() {
-        return path;
-    }
+    /** @return parquet file path relative to the table root */
+    public String getPath() { return path; }
 
-    /**
-     * @return file size in bytes
-     */
-    public long getSize() {
-        return size;
-    }
+    /** @return file size in bytes */
+    public long getSize() { return size; }
 
-    /**
-     * @return epoch milliseconds when the file was created
-     */
-    public long getModificationTime() {
-        return modificationTime;
-    }
+    /** @return epoch milliseconds when the file was created */
+    public long getModificationTime() { return modificationTime; }
 
-    /**
-     * @return number of records in the file, or -1 if unknown
-     */
-    public long getNumRecords() {
-        return numRecords;
-    }
+    /** @return number of records in the file, or -1 if unknown */
+    public long getNumRecords() { return numRecords; }
 
-    /**
-     * @return true if record count information is available
-     */
-    public boolean hasNumRecords() {
-        return numRecords >= 0;
-    }
+    /** @return true if record count information is available */
+    public boolean hasNumRecords() { return numRecords >= 0; }
 
-    /**
-     * @return partition column name to value mapping (empty if unpartitioned)
-     */
-    public Map<String, String> getPartitionValues() {
-        return partitionValues;
-    }
+    /** @return partition column name to value mapping (empty if unpartitioned) */
+    public Map<String, String> getPartitionValues() { return partitionValues; }
 
-    /**
-     * @return true if this file has an associated deletion vector
-     */
-    public boolean hasDeletionVector() {
-        return hasDeletionVector;
-    }
+    /** @return true if this file has an associated deletion vector */
+    public boolean hasDeletionVector() { return hasDeletionVector; }
 
-    /**
-     * @return the Delta table snapshot version this file listing was read from
-     */
-    public long getTableVersion() {
-        return tableVersion;
-    }
+    /** @return the Delta table snapshot version this file listing was read from */
+    public long getTableVersion() { return tableVersion; }
 
     @Override
     public String toString() {
@@ -107,23 +77,18 @@ public class DeltaFileEntry {
      */
     static DeltaFileEntry fromMap(Map<String, Object> map) {
         String path = (String) map.get("path");
-        long size = toLong(map.get("size"));
-        long modificationTime = toLong(map.get("modification_time"));
-        long numRecords = toLong(map.get("num_records"));
+        if (path == null || path.isEmpty()) {
+            throw new IllegalStateException("DeltaFileEntry missing required 'path' field");
+        }
+        long size = DeltaSnapshotInfo.toLong(map.get("size"));
+        long modificationTime = DeltaSnapshotInfo.toLong(map.get("modification_time"));
+        long numRecords = DeltaSnapshotInfo.toLong(map.get("num_records"));
         boolean hasDv = toBoolean(map.get("has_deletion_vector"));
-        long version = toLong(map.get("table_version"));
+        long version = DeltaSnapshotInfo.toLong(map.get("table_version"));
 
-        // Parse partition_values JSON string
         Map<String, String> partitionValues = parsePartitionValues(map.get("partition_values"));
 
         return new DeltaFileEntry(path, size, modificationTime, numRecords, partitionValues, hasDv, version);
-    }
-
-    private static long toLong(Object value) {
-        if (value instanceof Number) {
-            return ((Number) value).longValue();
-        }
-        return -1;
     }
 
     private static boolean toBoolean(Object value) {
@@ -133,16 +98,15 @@ public class DeltaFileEntry {
         return false;
     }
 
+    private static final ObjectMapper MAPPER = new ObjectMapper();
+
     private static Map<String, String> parsePartitionValues(Object value) {
-        if (value == null) {
-            return Collections.emptyMap();
-        }
+        if (value == null) return Collections.emptyMap();
         String jsonStr = value.toString();
-        if (jsonStr.isEmpty() || "{}".equals(jsonStr)) {
-            return Collections.emptyMap();
-        }
+        if (jsonStr.isEmpty() || "{}".equals(jsonStr)) return Collections.emptyMap();
         try {
-            return MAPPER.readValue(jsonStr, MAP_TYPE);
+            return MAPPER.readValue(jsonStr,
+                    new TypeReference<Map<String, String>>() {});
         } catch (Exception e) {
             return Collections.emptyMap();
         }

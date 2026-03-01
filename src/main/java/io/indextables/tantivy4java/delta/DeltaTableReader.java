@@ -1,6 +1,7 @@
 package io.indextables.tantivy4java.delta;
 
 import io.indextables.tantivy4java.batch.BatchDocumentReader;
+import io.indextables.tantivy4java.filter.PartitionFilter;
 
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
@@ -128,21 +129,40 @@ public class DeltaTableReader {
      * @throws RuntimeException if the table cannot be read
      */
     public static List<DeltaFileEntry> listFiles(String tableUrl, Map<String, String> config, long version, boolean compact) {
+        return listFiles(tableUrl, config, version, compact, null);
+    }
+
+    /**
+     * List active parquet files with partition predicate filtering.
+     *
+     * @param tableUrl table location
+     * @param config   credential and storage configuration
+     * @param version  snapshot version to read (-1 for latest)
+     * @param compact  if true, skip partition_values and has_deletion_vector fields
+     * @param filter   partition filter (null for no filtering)
+     * @return list of matching file entries
+     * @throws RuntimeException if the table cannot be read
+     */
+    public static List<DeltaFileEntry> listFiles(String tableUrl, Map<String, String> config,
+            long version, boolean compact, PartitionFilter filter) {
         if (tableUrl == null || tableUrl.isEmpty()) {
             throw new IllegalArgumentException("tableUrl must not be null or empty");
         }
 
-        // Call native layer (Rust handles URL normalization for bare paths, file://, s3://, etc.)
-        byte[] bytes = nativeListFiles(tableUrl, version, config != null ? config : Collections.emptyMap(), compact);
+        String predicateJson = filter != null ? filter.toJson() : null;
+        byte[] bytes = nativeListFiles(tableUrl, version,
+                config != null ? config : Collections.emptyMap(), compact, predicateJson);
 
-        // Parse TANT byte buffer → List<Map<String, Object>>
+        if (bytes == null) {
+            throw new RuntimeException("Native listFiles returned null (check preceding exception)");
+        }
+
         ByteBuffer buffer = ByteBuffer.wrap(bytes);
         buffer.order(ByteOrder.nativeOrder());
 
         BatchDocumentReader reader = new BatchDocumentReader();
         List<Map<String, Object>> maps = reader.parseToMaps(buffer);
 
-        // Convert to DeltaFileEntry list
         List<DeltaFileEntry> entries = new ArrayList<>(maps.size());
         for (Map<String, Object> map : maps) {
             entries.add(DeltaFileEntry.fromMap(map));
@@ -194,6 +214,10 @@ public class DeltaTableReader {
 
         byte[] bytes = nativeReadSchema(tableUrl, version, config != null ? config : Collections.emptyMap());
 
+        if (bytes == null) {
+            throw new RuntimeException("Native readSchema returned null (check preceding exception)");
+        }
+
         // Parse TANT byte buffer
         ByteBuffer buffer = ByteBuffer.wrap(bytes);
         buffer.order(ByteOrder.nativeOrder());
@@ -226,6 +250,260 @@ public class DeltaTableReader {
         return -1;
     }
 
-    private static native byte[] nativeListFiles(String tableUrl, long version, Map<String, String> config, boolean compact);
+    // ── Distributed scanning primitives ──────────────────────────────────────
+
+    /**
+     * Get lightweight snapshot metadata for distributed scanning.
+     *
+     * <p>Reads {@code _last_checkpoint} and lists commit files — does NOT read
+     * checkpoint contents. Returns paths that can be distributed to executors
+     * via {@link #readCheckpointPart(String, Map, String)}.
+     *
+     * @param tableUrl table location (local path, file://, s3://, or azure://)
+     * @param config   credential and storage configuration
+     * @return snapshot metadata with checkpoint part paths and commit file paths
+     */
+    public static DeltaSnapshotInfo getSnapshotInfo(String tableUrl, Map<String, String> config) {
+        if (tableUrl == null || tableUrl.isEmpty()) {
+            throw new IllegalArgumentException("tableUrl must not be null or empty");
+        }
+
+        byte[] bytes = nativeGetSnapshotInfo(tableUrl, config != null ? config : Collections.emptyMap());
+
+        if (bytes == null) {
+            throw new RuntimeException("Native getSnapshotInfo returned null (check preceding exception)");
+        }
+
+        ByteBuffer buffer = ByteBuffer.wrap(bytes);
+        buffer.order(ByteOrder.nativeOrder());
+
+        BatchDocumentReader reader = new BatchDocumentReader();
+        List<Map<String, Object>> maps = reader.parseToMaps(buffer);
+
+        if (maps.isEmpty()) {
+            throw new RuntimeException("Empty snapshot info response from native layer");
+        }
+
+        return DeltaSnapshotInfo.fromMap(maps.get(0));
+    }
+
+    /**
+     * Read one checkpoint parquet part and extract file entries.
+     *
+     * <p>Designed for executor-side use: reads a single checkpoint parquet file
+     * and returns the {@code add} file entries. Each checkpoint part typically
+     * contains ~54K entries.
+     *
+     * @param tableUrl table location
+     * @param config   credential and storage configuration
+     * @param partPath checkpoint parquet file path (relative to _delta_log/)
+     * @return list of file entries from this checkpoint part
+     */
+    public static List<DeltaFileEntry> readCheckpointPart(
+            String tableUrl, Map<String, String> config, String partPath) {
+        return readCheckpointPart(tableUrl, config, partPath, null);
+    }
+
+    /**
+     * Read one checkpoint parquet part with partition predicate filtering.
+     *
+     * @param tableUrl table location
+     * @param config   credential and storage configuration
+     * @param partPath checkpoint parquet file path (relative to _delta_log/)
+     * @param filter   partition filter (null for no filtering)
+     * @return list of matching file entries from this checkpoint part
+     */
+    public static List<DeltaFileEntry> readCheckpointPart(
+            String tableUrl, Map<String, String> config, String partPath,
+            PartitionFilter filter) {
+        return readCheckpointPart(tableUrl, config, partPath, filter, null);
+    }
+
+    /**
+     * Read post-checkpoint JSON commit changes.
+     *
+     * <p>Reads JSON commit files after the checkpoint and returns added/removed
+     * file entries. Designed for driver-side use (typically small data).
+     *
+     * @param tableUrl    table location
+     * @param config      credential and storage configuration
+     * @param commitPaths list of JSON commit file paths (from {@link DeltaSnapshotInfo#getCommitFilePaths()})
+     * @return log changes with added files and removed paths
+     */
+    public static DeltaLogChanges readPostCheckpointChanges(
+            String tableUrl, Map<String, String> config, List<String> commitPaths) {
+        return readPostCheckpointChanges(tableUrl, config, commitPaths, null);
+    }
+
+    /**
+     * Read post-checkpoint JSON commit changes with partition predicate filtering.
+     *
+     * @param tableUrl    table location
+     * @param config      credential and storage configuration
+     * @param commitPaths list of JSON commit file paths
+     * @param filter      partition filter (null for no filtering)
+     * @return log changes with matching added files and removed paths
+     */
+    public static DeltaLogChanges readPostCheckpointChanges(
+            String tableUrl, Map<String, String> config, List<String> commitPaths,
+            PartitionFilter filter) {
+        return readPostCheckpointChanges(tableUrl, config, commitPaths, filter, null);
+    }
+
+    // ── Arrow FFI methods ─────────────────────────────────────────────────────
+
+    /**
+     * Read a checkpoint part and export file entries via Arrow FFI (zero-copy to Spark).
+     *
+     * <p>Instead of the TANT serialization path, this builds a flat RecordBatch from the
+     * filtered checkpoint entries and exports columns via the Arrow C Data Interface.
+     * The consumer (e.g., Spark) provides pre-allocated FFI struct addresses.
+     *
+     * <p>Arrow schema: 6 columns — path (Utf8), size (Int64), modification_time (Int64),
+     * num_records (Int64), partition_values (Utf8/JSON), has_deletion_vector (Boolean).
+     *
+     * @param tableUrl    table location
+     * @param config      credential and storage configuration
+     * @param partPath    checkpoint parquet file path (relative to _delta_log/)
+     * @param filter      partition filter (null for no filtering)
+     * @param arrayAddrs  pre-allocated FFI_ArrowArray addresses (6 elements)
+     * @param schemaAddrs pre-allocated FFI_ArrowSchema addresses (6 elements)
+     * @return number of rows written, or -1 if FFI not supported
+     */
+    public static int readCheckpointPartArrowFfi(
+            String tableUrl, Map<String, String> config, String partPath,
+            PartitionFilter filter, long[] arrayAddrs, long[] schemaAddrs) {
+        return readCheckpointPartArrowFfi(tableUrl, config, partPath, filter, null, arrayAddrs, schemaAddrs);
+    }
+
+    // ── Overloads with DeltaSnapshotInfo (column mapping support) ──────────
+
+    /**
+     * Read one checkpoint parquet part with partition filtering and column mapping.
+     *
+     * <p>Column mapping translates physical column IDs back to logical names
+     * before predicate evaluation, fixing Delta tables with
+     * {@code delta.columnMapping.mode = 'name'}.
+     *
+     * @param tableUrl     table location
+     * @param config       credential and storage configuration
+     * @param partPath     checkpoint parquet file path (relative to _delta_log/)
+     * @param filter       partition filter (null for no filtering)
+     * @param snapshotInfo snapshot info containing column name mapping
+     * @return list of matching file entries from this checkpoint part
+     */
+    public static List<DeltaFileEntry> readCheckpointPart(
+            String tableUrl, Map<String, String> config, String partPath,
+            PartitionFilter filter, DeltaSnapshotInfo snapshotInfo) {
+        if (tableUrl == null || tableUrl.isEmpty()) {
+            throw new IllegalArgumentException("tableUrl must not be null or empty");
+        }
+        if (partPath == null || partPath.isEmpty()) {
+            throw new IllegalArgumentException("partPath must not be null or empty");
+        }
+
+        String predicateJson = filter != null ? filter.toJson() : null;
+        String columnMappingJson = snapshotInfo != null ? snapshotInfo.getColumnNameMappingJson() : null;
+        byte[] bytes = nativeReadCheckpointPart(tableUrl,
+                config != null ? config : Collections.emptyMap(), partPath,
+                predicateJson, columnMappingJson);
+
+        if (bytes == null) {
+            throw new RuntimeException("Native readCheckpointPart returned null (check preceding exception)");
+        }
+
+        ByteBuffer buffer = ByteBuffer.wrap(bytes);
+        buffer.order(ByteOrder.nativeOrder());
+
+        BatchDocumentReader reader = new BatchDocumentReader();
+        List<Map<String, Object>> maps = reader.parseToMaps(buffer);
+
+        List<DeltaFileEntry> entries = new ArrayList<>(maps.size());
+        for (Map<String, Object> map : maps) {
+            entries.add(DeltaFileEntry.fromMap(map));
+        }
+        return entries;
+    }
+
+    /**
+     * Read post-checkpoint JSON commit changes with partition filtering and column mapping.
+     *
+     * @param tableUrl     table location
+     * @param config       credential and storage configuration
+     * @param commitPaths  list of JSON commit file paths
+     * @param filter       partition filter (null for no filtering)
+     * @param snapshotInfo snapshot info containing column name mapping
+     * @return log changes with matching added files and removed paths
+     */
+    public static DeltaLogChanges readPostCheckpointChanges(
+            String tableUrl, Map<String, String> config, List<String> commitPaths,
+            PartitionFilter filter, DeltaSnapshotInfo snapshotInfo) {
+        if (tableUrl == null || tableUrl.isEmpty()) {
+            throw new IllegalArgumentException("tableUrl must not be null or empty");
+        }
+
+        String predicateJson = filter != null ? filter.toJson() : null;
+        String columnMappingJson = snapshotInfo != null ? snapshotInfo.getColumnNameMappingJson() : null;
+        byte[] bytes = nativeReadPostCheckpointChanges(tableUrl,
+                config != null ? config : Collections.emptyMap(),
+                commitPaths != null ? commitPaths : Collections.emptyList(),
+                predicateJson, columnMappingJson);
+
+        if (bytes == null) {
+            throw new RuntimeException("Native readPostCheckpointChanges returned null (check preceding exception)");
+        }
+
+        ByteBuffer buffer = ByteBuffer.wrap(bytes);
+        buffer.order(ByteOrder.nativeOrder());
+
+        BatchDocumentReader reader = new BatchDocumentReader();
+        List<Map<String, Object>> maps = reader.parseToMaps(buffer);
+
+        return DeltaLogChanges.fromMaps(maps);
+    }
+
+    /**
+     * Read a checkpoint part with column mapping and export via Arrow FFI.
+     *
+     * @param tableUrl     table location
+     * @param config       credential and storage configuration
+     * @param partPath     checkpoint parquet file path (relative to _delta_log/)
+     * @param filter       partition filter (null for no filtering)
+     * @param snapshotInfo snapshot info containing column name mapping
+     * @param arrayAddrs   pre-allocated FFI_ArrowArray addresses (6 elements)
+     * @param schemaAddrs  pre-allocated FFI_ArrowSchema addresses (6 elements)
+     * @return number of rows written, or -1 if FFI not supported
+     */
+    public static int readCheckpointPartArrowFfi(
+            String tableUrl, Map<String, String> config, String partPath,
+            PartitionFilter filter, DeltaSnapshotInfo snapshotInfo,
+            long[] arrayAddrs, long[] schemaAddrs) {
+        if (tableUrl == null || tableUrl.isEmpty()) {
+            throw new IllegalArgumentException("tableUrl must not be null or empty");
+        }
+        if (partPath == null || partPath.isEmpty()) {
+            throw new IllegalArgumentException("partPath must not be null or empty");
+        }
+        if (arrayAddrs == null || arrayAddrs.length < 6) {
+            throw new IllegalArgumentException("arrayAddrs must have at least 6 elements");
+        }
+        if (schemaAddrs == null || schemaAddrs.length < 6) {
+            throw new IllegalArgumentException("schemaAddrs must have at least 6 elements");
+        }
+
+        String predicateJson = filter != null ? filter.toJson() : null;
+        String columnMappingJson = snapshotInfo != null ? snapshotInfo.getColumnNameMappingJson() : null;
+        return nativeReadCheckpointPartArrowFfi(tableUrl,
+                config != null ? config : Collections.emptyMap(),
+                partPath, predicateJson, columnMappingJson, arrayAddrs, schemaAddrs);
+    }
+
+    // ── Native methods ───────────────────────────────────────────────────────
+
+    private static native byte[] nativeListFiles(String tableUrl, long version, Map<String, String> config, boolean compact, String predicateJson);
     private static native byte[] nativeReadSchema(String tableUrl, long version, Map<String, String> config);
+    private static native byte[] nativeGetSnapshotInfo(String tableUrl, Map<String, String> config);
+    private static native byte[] nativeReadCheckpointPart(String tableUrl, Map<String, String> config, String partPath, String predicateJson, String columnMappingJson);
+    private static native byte[] nativeReadPostCheckpointChanges(String tableUrl, Map<String, String> config, List<String> commitPaths, String predicateJson, String columnMappingJson);
+    private static native int nativeReadCheckpointPartArrowFfi(String tableUrl, Map<String, String> config, String partPath, String predicateJson, String columnMappingJson, long[] arrayAddrs, long[] schemaAddrs);
 }

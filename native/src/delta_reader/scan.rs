@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 use anyhow::Result;
+use serde_json;
 use url::Url;
 
 use delta_kernel::snapshot::Snapshot;
@@ -71,6 +72,10 @@ pub fn list_delta_files(
     let actual_version = snapshot.version();
     debug_println!("🔧 DELTA_SCAN: Snapshot at version {}", actual_version);
 
+    // Read schema before building scan (scan_builder consumes snapshot)
+    let schema = snapshot.schema();
+    let schema_json = serde_json::to_string(schema.as_ref()).unwrap_or_default();
+
     // Build scan over the snapshot (scan_builder takes Arc<Snapshot>)
     let scan = snapshot.scan_builder().build()?;
 
@@ -86,6 +91,18 @@ pub fn list_delta_files(
     }
 
     debug_println!("🔧 DELTA_SCAN: Found {} active files at version {}", entries.len(), actual_version);
+
+    // Defensive column mapping: delta-kernel's ScanFile likely already uses logical
+    // names, but apply mapping just in case to handle edge cases.
+    let column_mapping = super::distributed::build_column_mapping(&schema_json);
+    if !column_mapping.is_empty() {
+        debug_println!(
+            "🔧 DELTA_SCAN: Applying defensive column mapping ({} entries)",
+            column_mapping.len()
+        );
+        super::distributed::apply_column_mapping(&mut entries, &column_mapping);
+    }
+
     Ok((entries, actual_version))
 }
 
@@ -169,7 +186,7 @@ pub fn read_delta_schema(
 /// IMPORTANT: The URL must end with a trailing slash so that `Url::join()`
 /// appends child paths instead of replacing the last segment. Delta-kernel
 /// internally does `table_root.join("_delta_log/")` which requires this.
-fn normalize_url(url_str: &str) -> Result<Url> {
+pub(crate) fn normalize_url(url_str: &str) -> Result<Url> {
     if url_str.starts_with("s3://")
         || url_str.starts_with("s3a://")
         || url_str.starts_with("az://")

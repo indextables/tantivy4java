@@ -240,6 +240,78 @@ fn write_string(buf: &mut Vec<u8>, s: &str) {
     buf.extend_from_slice(bytes);
 }
 
+/// Serialize an IcebergSnapshotInfo into the TANT byte buffer format.
+///
+/// Document 0: header with snapshot_id, schema_json, partition_spec_json, manifest_count
+/// Documents 1..N: one per manifest with manifest metadata
+pub fn serialize_iceberg_snapshot_info(info: &super::distributed::IcebergSnapshotInfo) -> Vec<u8> {
+    let doc_count = 1 + info.manifest_entries.len();
+    let estimated = 4 + doc_count * 300 + info.schema_json.len() + 12;
+    let mut buf = Vec::with_capacity(estimated);
+
+    buf.extend_from_slice(&MAGIC_NUMBER.to_ne_bytes());
+
+    let mut offsets = Vec::with_capacity(doc_count);
+
+    // Document 0: header
+    offsets.push(buf.len() as u32);
+    {
+        let field_count: u16 = 4;
+        buf.extend_from_slice(&field_count.to_ne_bytes());
+
+        write_field_header(&mut buf, "snapshot_id", FIELD_TYPE_INTEGER, 1);
+        buf.extend_from_slice(&info.snapshot_id.to_ne_bytes());
+
+        write_field_header(&mut buf, "schema_json", FIELD_TYPE_TEXT, 1);
+        write_string(&mut buf, &info.schema_json);
+
+        write_field_header(&mut buf, "partition_spec_json", FIELD_TYPE_TEXT, 1);
+        write_string(&mut buf, &info.partition_spec_json);
+
+        write_field_header(&mut buf, "manifest_count", FIELD_TYPE_INTEGER, 1);
+        buf.extend_from_slice(&(info.manifest_entries.len() as i64).to_ne_bytes());
+    }
+
+    // Documents 1..N: manifest entries
+    for mf in &info.manifest_entries {
+        offsets.push(buf.len() as u32);
+        let field_count: u16 = 7;
+        buf.extend_from_slice(&field_count.to_ne_bytes());
+
+        write_field_header(&mut buf, "manifest_path", FIELD_TYPE_TEXT, 1);
+        write_string(&mut buf, &mf.manifest_path);
+
+        write_field_header(&mut buf, "manifest_length", FIELD_TYPE_INTEGER, 1);
+        buf.extend_from_slice(&mf.manifest_length.to_ne_bytes());
+
+        write_field_header(&mut buf, "added_snapshot_id", FIELD_TYPE_INTEGER, 1);
+        buf.extend_from_slice(&mf.added_snapshot_id.to_ne_bytes());
+
+        write_field_header(&mut buf, "added_files_count", FIELD_TYPE_INTEGER, 1);
+        buf.extend_from_slice(&mf.added_files_count.to_ne_bytes());
+
+        write_field_header(&mut buf, "existing_files_count", FIELD_TYPE_INTEGER, 1);
+        buf.extend_from_slice(&mf.existing_files_count.to_ne_bytes());
+
+        write_field_header(&mut buf, "deleted_files_count", FIELD_TYPE_INTEGER, 1);
+        buf.extend_from_slice(&mf.deleted_files_count.to_ne_bytes());
+
+        write_field_header(&mut buf, "partition_spec_id", FIELD_TYPE_INTEGER, 1);
+        buf.extend_from_slice(&(mf.partition_spec_id as i64).to_ne_bytes());
+    }
+
+    // Offset table + footer
+    let offset_table_start = buf.len() as u32;
+    for offset in &offsets {
+        buf.extend_from_slice(&offset.to_ne_bytes());
+    }
+    buf.extend_from_slice(&offset_table_start.to_ne_bytes());
+    buf.extend_from_slice(&(doc_count as u32).to_ne_bytes());
+    buf.extend_from_slice(&MAGIC_NUMBER.to_ne_bytes());
+
+    buf
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
