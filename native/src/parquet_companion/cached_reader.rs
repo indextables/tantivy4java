@@ -184,6 +184,7 @@ impl CachedParquetReader {
             }
         }
     }
+
 }
 
 /// A group of byte ranges that have been coalesced into a single fetch
@@ -204,9 +205,9 @@ impl AsyncFileReader for CachedParquetReader {
             path.file_name().unwrap_or_default(), range.start, range.end, byte_size
         );
 
-        // Check cache first
+        // Check L1 in-memory cache first
         if let Some(cached) = self.cache_get(&range) {
-            perf_println!("⏱️ PROJ_DIAG: get_bytes CACHE HIT {} bytes", cached.len());
+            perf_println!("⏱️ PROJ_DIAG: get_bytes L1 CACHE HIT {} bytes", cached.len());
             return async move { Ok(cached) }.boxed();
         }
 
@@ -236,7 +237,7 @@ impl AsyncFileReader for CachedParquetReader {
             // avoids the allocation+copy of .to_vec()
             let bytes = Bytes::from_owner(owned_bytes);
 
-            // Cache the result
+            // Cache in L1 in-memory cache
             if let Some(cache) = byte_cache {
                 let key = (path_for_cache, range.start, range.end);
                 if let Ok(mut guard) = cache.lock() {
@@ -261,7 +262,7 @@ impl AsyncFileReader for CachedParquetReader {
             path.file_name().unwrap_or_default(), ranges.len(), total_requested
         );
 
-        // Partition ranges into cached and uncached
+        // Partition ranges into cached and uncached (check L1, then L2)
         let mut results: Vec<Option<Bytes>> = vec![None; ranges.len()];
         let mut uncached_indices: Vec<usize> = Vec::new();
         let mut uncached_ranges: Vec<Range<u64>> = Vec::new();
@@ -313,13 +314,14 @@ impl AsyncFileReader for CachedParquetReader {
             // Cache and fill results
             for (fetch_idx, orig_idx) in uncached_indices.into_iter().enumerate() {
                 let bytes = fetched[fetch_idx].clone();
+                let range = &uncached_ranges[fetch_idx];
 
-                // Cache the fetched bytes
+                // Cache in L1 in-memory cache
                 if let Some(ref cache) = byte_cache {
                     let key = (
                         path_for_cache.clone(),
-                        uncached_ranges[fetch_idx].start,
-                        uncached_ranges[fetch_idx].end,
+                        range.start,
+                        range.end,
                     );
                     if let Ok(mut guard) = cache.lock() {
                         guard.put(key, bytes.clone());

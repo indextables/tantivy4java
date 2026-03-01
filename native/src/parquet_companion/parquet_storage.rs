@@ -45,10 +45,15 @@ impl Default for ParquetStorageConfig {
 
 /// Create a Storage instance for accessing parquet files.
 /// Reuses the existing storage resolver infrastructure and shares the L2 disk cache.
+///
+/// Returns `(wrapped_storage, prewarm_storage)`:
+/// - `wrapped_storage`: Storage wrapped with L2 disk cache (for query-path reads)
+/// - `prewarm_storage`: Prewarm-mode clone if cache wrapper was applied, None otherwise.
+///   Uses blocking `put()` for guaranteed L2 writes and records prewarm metrics.
 pub fn create_parquet_storage(
     config: &ParquetStorageConfig,
     table_root: &str,
-) -> Result<Arc<dyn Storage>> {
+) -> Result<(Arc<dyn Storage>, Option<Arc<dyn Storage>>)> {
     debug_println!("🔧 PARQUET_STORAGE: Creating storage for table_root: {}", table_root);
 
     let storage_resolver = if config.aws_access_key.is_some() && config.aws_secret_key.is_some() {
@@ -83,21 +88,24 @@ pub fn create_parquet_storage(
     })?;
 
     // Wrap with L2 disk cache if available (shares cache with split storage)
-    let resolved_storage: Arc<dyn Storage> = match crate::global_cache::get_global_disk_cache() {
+    // Create prewarm variant that uses blocking put() and prewarm metrics
+    let (resolved_storage, prewarm_storage): (Arc<dyn Storage>, Option<Arc<dyn Storage>>) = match crate::global_cache::get_global_disk_cache() {
         Some(disk_cache) => {
             debug_println!("🔧 PARQUET_STORAGE: Wrapping with L2 disk cache");
-            Arc::new(crate::persistent_cache_storage::StorageWithPersistentCache::with_disk_cache_only(
+            let wrapped = Arc::new(crate::persistent_cache_storage::StorageWithPersistentCache::with_disk_cache_only(
                 storage,
                 disk_cache,
                 table_root.to_string(),
                 format!("parquet-{}", table_root),
-            ))
+            ));
+            let prewarm = wrapped.for_prewarm();
+            (wrapped, Some(prewarm as Arc<dyn Storage>))
         }
         None => {
             debug_println!("🔧 PARQUET_STORAGE: No disk cache, using raw storage");
-            storage
+            (storage, None)
         }
     };
 
-    Ok(resolved_storage)
+    Ok((resolved_storage, prewarm_storage))
 }

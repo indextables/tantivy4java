@@ -54,6 +54,9 @@ pub(crate) struct CachedSearcherContext {
     pub(crate) footer_end: u64,
     pub(crate) doc_mapping_json: Option<String>,
     pub(crate) cached_storage: Arc<dyn Storage>,
+    /// Prewarm-mode storage: same L2 cache keys + metrics pipeline as cached_storage,
+    /// but uses blocking `put()` for guaranteed writes and `record_prewarm_download()`.
+    pub(crate) prewarm_storage: Option<Arc<dyn Storage>>,
     pub(crate) cached_index: Arc<tantivy::Index>,
     pub(crate) cached_searcher: Arc<tantivy::Searcher>,
     // 🚀 BATCH OPTIMIZATION FIX: Store ByteRangeCache and bundle file offsets
@@ -67,6 +70,9 @@ pub(crate) struct CachedSearcherContext {
     // Parquet companion mode: optional storage for accessing parquet files (used in Phase 2+)
     #[allow(dead_code)]
     pub(crate) parquet_storage: Option<Arc<dyn Storage>>,
+    /// Prewarm-mode parquet storage: same L2 cache keys + metrics pipeline as parquet_storage,
+    /// but uses blocking `put()` for guaranteed writes and `record_prewarm_download()`.
+    pub(crate) prewarm_parquet_storage: Option<Arc<dyn Storage>>,
     // Phase 2: Optional augmented directory for fast field transcoding from parquet
     pub(crate) augmented_directory: Option<Arc<crate::parquet_companion::augmented_directory::ParquetAugmentedDirectory>>,
     // Parquet companion mode: split overrides (meta.json + fast field data)
