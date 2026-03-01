@@ -115,6 +115,15 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_prel
             }
         }
 
+        // Flush L2 disk cache to ensure all prewarm writes are committed before returning.
+        // Without this, the background writer thread may not have written all data to disk
+        // by the time the caller runs a query, causing L2 cache misses.
+        if let Some(disk_cache) = crate::global_cache::get_global_disk_cache() {
+            debug_println!("🔥 PREWARM: Flushing L2 disk cache to commit prewarm writes...");
+            disk_cache.flush_async().await;
+            debug_println!("✅ PREWARM: L2 disk cache flushed");
+        }
+
         // After component prewarm, eagerly load __pq columns and warm all native
         // fast field columns into L1 for companion splits.
         // The FASTFIELD prewarm writes to L2 disk cache, but the CachingDirectory L1
@@ -231,6 +240,15 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_prel
                 Err(anyhow::anyhow!("Unsupported component for field-specific preloading: {}", component_name))
             }
         };
+
+        // Flush L2 disk cache to ensure all prewarm writes are committed before returning.
+        if result.is_ok() {
+            if let Some(disk_cache) = crate::global_cache::get_global_disk_cache() {
+                debug_println!("🔥 PREWARM_FIELDS: Flushing L2 disk cache...");
+                disk_cache.flush_async().await;
+                debug_println!("✅ PREWARM_FIELDS: L2 disk cache flushed");
+            }
+        }
 
         // After field-specific prewarm, eagerly load __pq columns and warm native
         // fast field columns into L1 for companion splits — scoped to requested fields
@@ -491,7 +509,10 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_nati
             None => return Err(anyhow::anyhow!("No parquet manifest available")),
         };
 
-        let storage = match &context.parquet_storage {
+        // Use prewarm_parquet_storage (prewarm-mode StorageWithPersistentCache) which
+        // uses blocking put() for guaranteed L2 writes and records prewarm metrics.
+        // Falls back to regular parquet_storage if prewarm variant is not available.
+        let storage = match context.prewarm_parquet_storage.as_ref().or(context.parquet_storage.as_ref()) {
             Some(s) => s.clone(),
             None => {
                 let reason = if context.parquet_table_root.is_none() {
@@ -580,7 +601,11 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_nati
                     reader
                 };
 
-                // Build the stream — this reads the footer and populates metadata
+                // Build the stream — reads the footer, populates metadata.
+                // When storage is prewarm-mode StorageWithPersistentCache, reads go through:
+                //   1. L2 disk cache check (short-circuit on hit)
+                //   2. L3 fetch on miss, with blocking put() to L2 and prewarm metrics
+                // CachedParquetReader's L1 ByteRangeCache still provides in-process reuse.
                 let builder = parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder::new(reader)
                     .await
                     .map_err(|e| anyhow::anyhow!(
@@ -671,6 +696,13 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_nati
         } else {
             debug_println!("📊 PARQUET_COL_PREWARM: All {} files warmed successfully (L1+L2)", total_files);
         }
+
+        // Flush L2 disk cache to ensure all prewarm writes are committed before returning.
+        if let Some(disk_cache) = crate::global_cache::get_global_disk_cache() {
+            debug_println!("📊 PARQUET_COL_PREWARM: Flushing L2 disk cache...");
+            disk_cache.flush_async().await;
+        }
+
         Ok(())
     }) {
         Ok(_) => 1,

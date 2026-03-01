@@ -9,58 +9,44 @@ use std::sync::Arc;
 use quickwit_storage::Storage;
 
 use crate::debug_println;
-use crate::disk_cache::L2DiskCache;
+use crate::global_cache::get_global_disk_cache;
 
 use super::helpers::parse_split_uri;
 
-/// Helper function to cache all files with a given extension from the bundle.
+/// Cache all files with a given extension from the bundle into L2 disk cache.
 ///
-/// This implements DISK-ONLY caching as the primary prewarm strategy.
-/// Data is written ONLY to L2DiskCache - bypassing L1 memory cache.
-///
-/// # Memory-Safe Prewarm Design
-///
-/// The L1 ByteRangeCache now uses bounded capacity with automatic eviction when full.
-/// However, for large prewarm operations, we still prefer writing directly to L2DiskCache:
-/// 1. Populate persistent disk cache for fast reads across JVM restarts
-/// 2. Avoid L1 churn during bulk prewarm operations
-/// 3. Allow subsequent searches to find data in L2 and populate L1 on-demand
-///
-/// Note: L1 is now bounded (default 256MB, configurable via TANTIVY4JAVA_L1_CACHE_MB)
-/// and will auto-evict when full, so OOM is no longer a risk. However, direct L2
-/// writes are still preferred for prewarm efficiency.
+/// Reads through `storage` which should be a prewarm-mode `StorageWithPersistentCache`
+/// when L2 disk cache is configured. The storage layer handles:
+/// - L2 cache check (returns cached data without hitting object storage)
+/// - L3 fetch on miss (downloads from S3/Azure)
+/// - L2 write with blocking `put()` (guaranteed write, never dropped)
+/// - Prewarm metric recording via `record_prewarm_download()`
 ///
 /// **IMPORTANT**: If no disk cache is configured, prewarm is a NO-OP.
 /// Configure TieredCacheConfig with a disk cache path to enable prewarm functionality.
 ///
-/// # Arguments
-/// * `extension` - File extension to match (e.g., "term", "store", "fast")
-/// * `storage` - Storage backend for reading files
-/// * `split_uri` - Full URI of the split file (e.g., "s3://bucket/path/split.split")
-/// * `bundle_offsets` - Map of inner paths to bundle byte ranges
-/// * `disk_cache` - L2 disk cache to populate (if None, prewarm is skipped)
-///
-/// # Returns
-/// Tuple of (success_count, failure_count)
+/// Uses O(1) manifest `exists()` checks to skip already-cached files, avoiding
+/// unnecessary disk I/O from reading cached data only to discard it.
 pub(crate) async fn cache_files_by_extension(
     extension: &str,
     storage: Arc<dyn Storage>,
     split_uri: &str,
     bundle_offsets: &HashMap<PathBuf, Range<u64>>,
-    disk_cache: Option<Arc<L2DiskCache>>,
 ) -> (usize, usize) {
-    // MEMORY SAFETY: If no disk cache, skip prewarm entirely to prevent OOM
-    let disk_cache = match disk_cache {
-        Some(dc) => dc,
+    // If no disk cache is configured, prewarm is a NO-OP — avoid downloading
+    // data from S3/Azure just to discard it.
+    let disk_cache = match get_global_disk_cache() {
+        Some(dc) => Some(dc),
         None => {
             debug_println!(
-                "⚠️ PREWARM_SKIP: No disk cache configured - skipping .{} prewarm to prevent OOM",
+                "⚠️ PREWARM_SKIP: No disk cache configured - skipping .{} prewarm",
                 extension
             );
             debug_println!("   Configure TieredCacheConfig.withDiskCachePath() to enable prewarm");
             return (0, 0);
         }
     };
+
     // Find all files with the given extension
     let files: Vec<_> = bundle_offsets
         .iter()
@@ -76,9 +62,6 @@ pub(crate) async fn cache_files_by_extension(
         return (0, 0);
     }
 
-    // Parse split_uri into storage_loc and split_id for L2 disk cache
-    let (storage_loc, split_id) = parse_split_uri(split_uri);
-
     // Extract just the filename for storage operations
     let split_filename = if let Some(last_slash_pos) = split_uri.rfind('/') {
         &split_uri[last_slash_pos + 1..]
@@ -87,17 +70,12 @@ pub(crate) async fn cache_files_by_extension(
     };
     let split_path = PathBuf::from(split_filename);
 
-    debug_println!(
-        "🔥 PREWARM_DISK: Found {} .{} files to cache (L2 disk-only)",
-        files.len(),
-        extension
-    );
+    // Parse split_uri into storage_loc and split_id for L2 disk cache exists() checks.
+    // These MUST match the keys used by StorageWithPersistentCache to ensure
+    // prewarm and query cache lookups are consistent.
+    let (storage_loc, split_id) = parse_split_uri(split_uri);
 
-    let mut warm_up_futures = Vec::new();
-    let mut already_cached_count = 0;
-
-    // Extract component name from split_path for cache key consistency
-    // StorageWithPersistentCache uses extract_component(path) which returns the filename
+    // Extract component name for cache key consistency with StorageWithPersistentCache
     let storage_component = split_path
         .file_name()
         .and_then(|n| n.to_str())
@@ -110,45 +88,39 @@ pub(crate) async fn cache_files_by_extension(
         })
         .unwrap_or_else(|| "unknown".to_string());
 
+    debug_println!(
+        "🔥 PREWARM_DISK: Found {} .{} files to cache via prewarm-mode storage",
+        files.len(),
+        extension
+    );
+
+    let mut warm_up_futures = Vec::new();
+    let mut already_cached_count = 0;
+
     for (inner_path, bundle_range) in files {
         let bundle_start = bundle_range.start as usize;
         let bundle_end = bundle_range.end as usize;
         let file_length = bundle_end - bundle_start;
 
-        // CRITICAL FIX: Use the SAME cache key format as StorageWithPersistentCache!
-        // StorageWithPersistentCache caches with:
-        //   - component = split filename (e.g., "mysplit.split")
-        //   - range = bundle_start..bundle_end (absolute offset in split file)
-        // NOT with inner path and relative range, which was causing cache key mismatches!
+        // O(1) manifest check: skip already-cached files to avoid unnecessary disk reads.
+        // exists() is a lightweight manifest lookup (~1μs) vs get_slice() which would
+        // read the entire file from disk via mmap just to discard the data.
         let cache_range = bundle_start as u64..bundle_end as u64;
-
-        debug_println!(
-            "🔑 PREWARM_CACHE_KEY: storage_loc='{}', split_id='{}', component='{}', range={:?}",
-            storage_loc,
-            split_id,
-            storage_component,
-            cache_range
-        );
-
-        // Check if data is already in L2 disk cache - skip download if so
-        // Uses the same key format as StorageWithPersistentCache
-        // IMPORTANT: Use exists() instead of get().is_some() to avoid expensive file I/O!
-        // get() copies the entire file contents just to check if it exists, while
-        // exists() only checks the manifest (O(1) vs O(file_size))
-        if disk_cache.exists(
-            &storage_loc,
-            &split_id,
-            &storage_component,
-            Some(cache_range.clone()),
-        ) {
-            debug_println!(
-                "⏭️ PREWARM_DISK: Skipping '{}' ({} bytes) - already in disk cache (range {:?})",
-                inner_path.display(),
-                file_length,
-                cache_range
-            );
-            already_cached_count += 1;
-            continue;
+        if let Some(ref dc) = disk_cache {
+            if dc.exists(
+                &storage_loc,
+                &split_id,
+                &storage_component,
+                Some(cache_range),
+            ) {
+                debug_println!(
+                    "⏭️ PREWARM_DISK: Skipping '{}' ({} bytes) - already in disk cache",
+                    inner_path.display(),
+                    file_length,
+                );
+                already_cached_count += 1;
+                continue;
+            }
         }
 
         let storage = storage.clone();
@@ -156,22 +128,24 @@ pub(crate) async fn cache_files_by_extension(
         let inner_path = inner_path.clone();
 
         debug_println!(
-            "🔥 PREWARM_DISK: Queuing '{}' ({} bytes) for download (range {:?})",
+            "🔥 PREWARM_DISK: Queuing '{}' ({} bytes) for prewarm (range {}..{})",
             inner_path.display(),
             file_length,
-            cache_range
+            bundle_start,
+            bundle_end
         );
 
         warm_up_futures.push(async move {
+            // Read through prewarm-mode StorageWithPersistentCache:
+            // - Checks L2 cache first (returns immediately on hit)
+            // - On miss: fetches from L3, records prewarm metrics, writes to L2 with blocking put()
+            // We discard the returned data — the purpose is to populate L2.
             match storage.get_slice(&split_path, bundle_start..bundle_end).await {
-                Ok(_bytes) => {
-                    // NOTE: Download recording AND caching is done by StorageWithPersistentCache::get_slice()
-                    // We don't cache here because StorageWithPersistentCache already handles it with
-                    // the correct cache key format (component=split_filename, range=bundle_range)
+                Ok(bytes) => {
                     debug_println!(
-                        "✅ PREWARM_DISK: Downloaded '{}' ({} bytes) - cached by storage layer",
+                        "✅ PREWARM_DISK: Prewarmed '{}' ({} bytes)",
                         inner_path.display(),
-                        _bytes.len()
+                        bytes.len()
                     );
                     Ok(())
                 }
@@ -193,10 +167,6 @@ pub(crate) async fn cache_files_by_extension(
 
     // Success = already cached + newly downloaded
     let success_count = already_cached_count + downloaded_count;
-
-    // NOTE: We no longer flush here - the background timer syncs every 1 second when dirty.
-    // This allows parallel prewarmssto run without serializing on flush.
-    // The manifest_dirty flag is set by the background writer after each successful write.
 
     debug_println!(
         "🔥 PREWARM_CACHE: .{} files - {} already cached, {} downloaded, {} failed",

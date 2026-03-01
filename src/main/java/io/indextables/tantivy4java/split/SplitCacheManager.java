@@ -500,6 +500,14 @@ public class SplitCacheManager implements AutoCloseable {
      *     .withTieredCache(tieredConfig);  // 100GB L2
      * }</pre>
      */
+    /** Write queue backpressure strategy (mutually exclusive). */
+    public enum WriteQueueMode {
+        /** Bounded sync_channel with N fragment slots (default). */
+        FRAGMENT,
+        /** Unbounded channel, backpressure by total queued bytes. */
+        SIZE_BASED
+    }
+
     public static class TieredCacheConfig {
         private String diskCachePath;
         private long maxDiskSizeBytes = 0;  // 0 = auto (2/3 of available disk space)
@@ -507,6 +515,10 @@ public class SplitCacheManager implements AutoCloseable {
         private int minCompressSizeBytes = 4096;  // Skip compression below 4KB
         private int manifestSyncIntervalSecs = 30;  // Sync manifest every 30 seconds
         private boolean disableL1Cache = false;  // Debugging: disable L1 ByteRangeCache
+        private WriteQueueMode writeQueueMode = WriteQueueMode.FRAGMENT;
+        private int writeQueueCapacity = 16;              // used ONLY when mode=FRAGMENT
+        private long writeQueueMaxBytes = 2_147_483_648L; // used ONLY when mode=SIZE_BASED
+        private boolean dropWritesWhenFull = false;        // query-path writes drop instead of block
 
         /**
          * Set the disk cache directory path.
@@ -620,6 +632,55 @@ public class SplitCacheManager implements AutoCloseable {
             return this;
         }
 
+        /**
+         * Set fragment-based write queue mode with the given capacity.
+         *
+         * <p>This is the default mode. The write queue uses a bounded channel with N slots.
+         * Each slot holds one write request (typically a component ~10MB), so N slots ≈ N*10MB RAM.
+         *
+         * @param capacity number of fragment slots (default: 16)
+         * @return this TieredCacheConfig for method chaining
+         */
+        public TieredCacheConfig withWriteQueueFragmentCapacity(int capacity) {
+            this.writeQueueMode = WriteQueueMode.FRAGMENT;
+            this.writeQueueCapacity = capacity;
+            return this;
+        }
+
+        /**
+         * Set size-based write queue mode with the given byte limit.
+         *
+         * <p>Uses an unbounded channel with backpressure based on total queued bytes.
+         * When queued bytes exceed the limit, senders block until the background writer
+         * drains enough data. This provides more precise memory control than fragment mode.
+         *
+         * @param maxBytes maximum total queued bytes before backpressure kicks in (default: 2GB)
+         * @return this TieredCacheConfig for method chaining
+         */
+        public TieredCacheConfig withWriteQueueSizeLimit(long maxBytes) {
+            this.writeQueueMode = WriteQueueMode.SIZE_BASED;
+            this.writeQueueMaxBytes = maxBytes;
+            return this;
+        }
+
+        /**
+         * Enable dropping query-path writes when the write queue is full.
+         *
+         * <p>When enabled, query-path cache writes (data fetched during searches) are
+         * silently dropped if the write queue is at capacity, instead of blocking the
+         * search thread. Prewarm operations always block regardless of this setting.
+         *
+         * <p>This is useful for latency-sensitive workloads where search responsiveness
+         * is more important than disk cache fill rate.
+         *
+         * @param drop true to drop writes when full, false to block (default: false)
+         * @return this TieredCacheConfig for method chaining
+         */
+        public TieredCacheConfig withDropWritesWhenFull(boolean drop) {
+            this.dropWritesWhenFull = drop;
+            return this;
+        }
+
         // Getters
         public String getDiskCachePath() { return diskCachePath; }
         public long getMaxDiskSizeBytes() { return maxDiskSizeBytes; }
@@ -627,6 +688,15 @@ public class SplitCacheManager implements AutoCloseable {
         public int getMinCompressSizeBytes() { return minCompressSizeBytes; }
         public int getManifestSyncIntervalSecs() { return manifestSyncIntervalSecs; }
         public boolean isDisableL1Cache() { return disableL1Cache; }
+
+        /** @return write queue mode ordinal (0=FRAGMENT, 1=SIZE_BASED) for native layer */
+        public int getWriteQueueModeOrdinal() { return writeQueueMode.ordinal(); }
+        /** @return fragment slot capacity (only meaningful when mode=FRAGMENT) */
+        public int getWriteQueueCapacity() { return writeQueueCapacity; }
+        /** @return max queued bytes (only meaningful when mode=SIZE_BASED) */
+        public long getWriteQueueMaxBytes() { return writeQueueMaxBytes; }
+        /** @return whether query-path writes are dropped when the queue is full */
+        public boolean isDropWritesWhenFull() { return dropWritesWhenFull; }
 
         /**
          * Convert compression algorithm to ordinal for native layer.

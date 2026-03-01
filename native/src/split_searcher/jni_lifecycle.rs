@@ -426,21 +426,23 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_crea
                     };
 
                     debug_println!("RUST TRACE: Checking disk cache for tiered storage wrapper (split_uri={})", split_uri);
-                    let resolved_storage: Arc<dyn Storage> = match get_global_disk_cache() {
+                    let (resolved_storage, prewarm_storage): (Arc<dyn Storage>, Option<Arc<dyn Storage>>) = match get_global_disk_cache() {
                         Some(disk_cache) => {
                             debug_println!("RUST TRACE: Creating StorageWithPersistentCache with L2 only for {}", split_uri);
                             debug_println!("🔄 TIERED_CACHE: Wrapping storage with L2 disk cache (no redundant L1)");
-                            Arc::new(StorageWithPersistentCache::with_disk_cache_only(
+                            let wrapped = Arc::new(StorageWithPersistentCache::with_disk_cache_only(
                                 raw_storage,
                                 disk_cache,
                                 split_uri.clone(),
                                 split_id_for_cache,
-                            ))
+                            ));
+                            let prewarm = wrapped.for_prewarm();
+                            (wrapped, Some(prewarm as Arc<dyn Storage>))
                         }
                         None => {
                             // No disk cache configured - use raw storage directly
                             debug_println!("RUST DEBUG: No disk cache configured - using raw storage");
-                            raw_storage
+                            (raw_storage, None)
                         }
                     };
                     debug_println!("🔥 STORAGE WRAPPED: Storage wrapped with tiered cache, instance: {:p}", Arc::as_ptr(&resolved_storage));
@@ -616,7 +618,7 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_crea
                                 None
                             };
 
-                            let parquet_storage: Option<Arc<dyn Storage>> = if let Some(ref table_root) = effective_parquet_table_root {
+                            let (parquet_storage, prewarm_parquet_storage): (Option<Arc<dyn Storage>>, Option<Arc<dyn Storage>>) = if let Some(ref table_root) = effective_parquet_table_root {
                                 let pq_storage_config = {
                                     use crate::parquet_companion::parquet_storage::ParquetStorageConfig;
                                     let effective_aws = if !parquet_aws_config.is_empty() { &parquet_aws_config } else { &aws_config };
@@ -642,19 +644,19 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_crea
                                 debug_println!("📦 PARQUET_COMPANION: Creating parquet storage for table_root='{}' (uri='{}')", table_root, table_uri);
 
                                 match crate::parquet_companion::parquet_storage::create_parquet_storage(&pq_storage_config, &table_uri) {
-                                    Ok(storage) => {
+                                    Ok((storage, prewarm)) => {
                                         debug_println!("📦 PARQUET_COMPANION: Parquet storage created for '{}'", table_uri);
-                                        Some(storage)
+                                        (Some(storage), prewarm)
                                     }
                                     Err(e) => {
                                         eprintln!("WARNING: PARQUET_COMPANION: Failed to create parquet storage for '{}': {}. \
                                                    Doc retrieval/prewarm will fail for this split.", table_uri, e);
                                         debug_println!("⚠️ PARQUET_COMPANION: Failed to create parquet storage for '{}': {}", table_uri, e);
-                                        None
+                                        (None, None)
                                     }
                                 }
                             } else {
-                                None
+                                (None, None)
                             };
 
                             let (cached_index, augmented_directory, split_overrides, parquet_meta_json, segment_fast_paths) = {
@@ -840,6 +842,7 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_crea
                                 footer_end: split_footer_end,
                                 doc_mapping_json,
                                 cached_storage: resolved_storage,
+                                prewarm_storage,
                                 cached_index: std::sync::Arc::new(cached_index),
                                 cached_searcher,
                                 byte_range_cache,
@@ -847,6 +850,7 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_crea
                                 parquet_manifest,
                                 parquet_table_root: effective_parquet_table_root,
                                 parquet_storage,
+                                prewarm_parquet_storage,
                                 augmented_directory,
                                 split_overrides,
                                 parquet_meta_json,

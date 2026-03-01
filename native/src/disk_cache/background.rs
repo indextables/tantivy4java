@@ -2,7 +2,8 @@
 // Extracted from mod.rs during refactoring
 
 use std::ops::Range;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use crate::debug_println;
@@ -31,19 +32,26 @@ pub(crate) enum WriteRequest {
 impl L2DiskCache {
     /// Background writer thread with parallel async I/O
     ///
-    /// Uses std::sync::mpsc::Receiver for bounded channel with backpressure.
+    /// Uses std::sync::mpsc::Receiver for both bounded and unbounded channels.
     /// Spawns async write tasks on a tokio runtime with num_cpus worker threads.
     /// A semaphore limits concurrent writes to num_cpus for optimal parallelism.
     ///
-    /// Backpressure flow:
+    /// Backpressure flow (fragment mode):
     /// 1. Sender calls put() → sync_channel.send() blocks if queue full
     /// 2. This thread recv()s requests from the bounded queue
     /// 3. Before spawning write task, acquires semaphore permit
     /// 4. If all writers busy, blocks on semaphore → recv loop stalls
     /// 5. Bounded channel fills up → senders block
+    ///
+    /// Backpressure flow (size-based mode):
+    /// 1. Sender checks queued byte counter, waits on Condvar if over limit
+    /// 2. This thread recv()s requests from the unbounded queue
+    /// 3. After completing a Put write, subtracts data.len() from counter
+    /// 4. Notifies Condvar so blocked senders can proceed
     pub(crate) fn background_writer_static(
         rx: std::sync::mpsc::Receiver<WriteRequest>,
         cache_weak: std::sync::Weak<Self>,
+        size_based_state: Option<(Arc<AtomicU64>, Arc<(Mutex<()>, Condvar)>)>,
     ) {
         let num_writers = num_cpus::get();
         debug_println!("🚀 L2DiskCache: Starting {} parallel async writers", num_writers);
@@ -82,6 +90,10 @@ impl L2DiskCache {
                         Err(_) => continue, // Semaphore closed
                     };
 
+                    // Clone size-based state for the async task
+                    let sb_state = size_based_state.clone();
+                    let data_len = data.len() as u64;
+
                     // Spawn async write task
                     runtime.spawn(async move {
                         match cache
@@ -102,6 +114,14 @@ impl L2DiskCache {
                                 debug_println!("Disk cache write error: {}", e);
                             }
                         }
+
+                        // For size-based mode: drain bytes and notify waiting senders
+                        if let Some((queued_bytes, backpressure)) = sb_state {
+                            queued_bytes.fetch_sub(data_len, Ordering::Release);
+                            let (_lock, cvar) = &*backpressure;
+                            cvar.notify_all();
+                        }
+
                         drop(permit); // Release permit when write completes
                     });
                 }

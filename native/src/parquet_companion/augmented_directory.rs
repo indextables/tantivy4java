@@ -307,6 +307,9 @@ impl ParquetAugmentedDirectory {
                 "📊 AUGMENTED_DIR: Writing {} bytes to L2 disk cache (component='{}')",
                 wrapped_bytes.len(), component
             );
+            // Use blocking put() instead of put_query_path() because this is a prewarm path.
+            // put_query_path() may silently drop writes when drop_writes_when_full is enabled,
+            // but prewarm must guarantee the data lands in disk cache.
             cache.put(storage_loc, split_id, component, None, &wrapped_bytes);
         }
 

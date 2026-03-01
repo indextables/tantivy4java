@@ -23,7 +23,7 @@ use tokio::io::AsyncRead;
 
 use crate::debug_println;
 use crate::disk_cache::{L2DiskCache, CoalesceResult, CachedSegment};
-use crate::global_cache::record_query_download;
+use crate::global_cache::{record_query_download, record_prewarm_download};
 
 /// Statistics for L2 disk cache with coalescing
 #[derive(Debug, Default)]
@@ -81,6 +81,10 @@ pub struct StorageWithPersistentCache {
     split_id: String,
     /// Statistics
     pub stats: Arc<TieredCacheStats>,
+    /// When true, uses blocking `put()` for L2 writes (guaranteed) and records
+    /// prewarm metrics. When false (default), uses `put_query_path()` which may
+    /// drop writes when the queue is full if `drop_writes_when_full` is enabled.
+    prewarm_mode: bool,
 }
 
 impl StorageWithPersistentCache {
@@ -102,7 +106,25 @@ impl StorageWithPersistentCache {
             storage_loc,
             split_id,
             stats: Arc::new(TieredCacheStats::default()),
+            prewarm_mode: false,
         }
+    }
+
+    /// Create a prewarm-mode clone of this storage wrapper.
+    ///
+    /// The prewarm variant shares the same underlying storage, disk cache, cache keys,
+    /// and stats, but differs in two ways:
+    /// - L2 writes use blocking `put()` (guaranteed write, never dropped)
+    /// - Downloads are recorded via `record_prewarm_download()` instead of `record_query_download()`
+    pub fn for_prewarm(self: &Arc<Self>) -> Arc<Self> {
+        Arc::new(Self {
+            storage: self.storage.clone(),
+            disk_cache: self.disk_cache.clone(),
+            storage_loc: self.storage_loc.clone(),
+            split_id: self.split_id.clone(),
+            stats: self.stats.clone(),
+            prewarm_mode: true,
+        })
     }
 
     /// Extract component name from path (e.g., ".term" -> "term")
@@ -137,6 +159,31 @@ impl StorageWithPersistentCache {
         OwnedBytes::new(result)
     }
 
+    /// Record a download metric and write data to L2 disk cache.
+    ///
+    /// In prewarm mode: uses blocking `put()` (guaranteed write) and `record_prewarm_download()`.
+    /// In query mode: uses `put_query_path()` (may drop if full) and `record_query_download()`.
+    fn record_and_cache(
+        &self,
+        component: &str,
+        byte_range: Option<Range<u64>>,
+        data: &[u8],
+    ) {
+        if self.prewarm_mode {
+            record_prewarm_download(data.len() as u64);
+            self.disk_cache.put(
+                &self.storage_loc, &self.split_id, component,
+                byte_range, data,
+            );
+        } else {
+            record_query_download(data.len() as u64);
+            self.disk_cache.put_query_path(
+                &self.storage_loc, &self.split_id, component,
+                byte_range, data,
+            );
+        }
+    }
+
     /// Fetch gaps from S3 and combine with cached segments
     ///
     /// This is the key coalescing operation:
@@ -169,8 +216,7 @@ impl StorageWithPersistentCache {
             let gap_usize = gap.start as usize..gap.end as usize;
             let gap_data = self.storage.get_slice(path, gap_usize).await?;
 
-            // Record download metrics for programmatic verification
-            record_query_download(gap_data.len() as u64);
+            self.record_and_cache(&component, Some(gap.clone()), gap_data.as_slice());
 
             // Insert gap data into result buffer
             let offset_in_result = (gap.start - requested.start) as usize;
@@ -178,15 +224,6 @@ impl StorageWithPersistentCache {
             if offset_in_result + len <= result.len() {
                 result[offset_in_result..offset_in_result + len].copy_from_slice(gap_data.as_slice());
             }
-
-            // Cache this gap in L2 for future requests
-            self.disk_cache.put(
-                &self.storage_loc,
-                &self.split_id,
-                &component,
-                Some(gap.clone()),
-                gap_data.as_slice()
-            );
             debug_println!("💾 L2_STORE_GAP: Cached gap {:?} ({} bytes)", gap, len);
         }
 
@@ -265,14 +302,11 @@ impl Storage for StorageWithPersistentCache {
 
         let bytes = self.storage.get_slice(path, byte_range.clone()).await?;
 
-        // Record download metrics for programmatic verification
-        record_query_download(bytes.len() as u64);
-
-        // Cache in L2 disk cache
+        // Record download metrics and write to L2 cache based on mode
         let disk_range = byte_range.start as u64..byte_range.end as u64;
-        debug_println!("💾 L2_STORE: Writing to disk cache - storage_loc={}, split_id={}, component={}, range={:?}, size={}",
-                 self.storage_loc, self.split_id, component, disk_range, bytes.len());
-        self.disk_cache.put(&self.storage_loc, &self.split_id, &component, Some(disk_range), bytes.as_slice());
+        debug_println!("💾 L2_STORE: Writing to disk cache - storage_loc={}, split_id={}, component={}, range={:?}, size={}, prewarm={}",
+                 self.storage_loc, self.split_id, component, disk_range, bytes.len(), self.prewarm_mode);
+        self.record_and_cache(&component, Some(disk_range), bytes.as_slice());
 
         Ok(bytes)
     }

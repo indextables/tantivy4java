@@ -36,6 +36,21 @@ impl CompressionAlgorithm {
     }
 }
 
+/// Write queue backpressure mode (mutually exclusive).
+#[derive(Debug, Clone)]
+pub enum WriteQueueMode {
+    /// Bounded sync_channel with N fragment slots (default: 16).
+    Fragment { capacity: usize },
+    /// Unbounded channel, backpressure by total queued bytes (default: 2GB).
+    SizeBased { max_bytes: u64 },
+}
+
+impl Default for WriteQueueMode {
+    fn default() -> Self {
+        WriteQueueMode::Fragment { capacity: 16 }
+    }
+}
+
 /// Configuration for the L2 disk cache
 #[derive(Debug, Clone)]
 pub struct DiskCacheConfig {
@@ -53,6 +68,11 @@ pub struct DiskCacheConfig {
     /// Higher values use more file descriptors but improve random access performance.
     /// Production systems with high fd limits can safely use 2048-4096.
     pub mmap_cache_size: usize,
+    /// Write queue backpressure mode.
+    pub write_queue_mode: WriteQueueMode,
+    /// When true, non-prewarm (query-path) writes are dropped if the write queue is full
+    /// instead of blocking. Prewarm writes always block. Default: false (all writes block).
+    pub drop_writes_when_full: bool,
 }
 
 impl Default for DiskCacheConfig {
@@ -64,6 +84,8 @@ impl Default for DiskCacheConfig {
             min_compress_size: 4096, // 4KB
             manifest_sync_interval_secs: 30,
             mmap_cache_size: DEFAULT_MMAP_CACHE_SIZE,
+            write_queue_mode: WriteQueueMode::default(),
+            drop_writes_when_full: false,
         }
     }
 }

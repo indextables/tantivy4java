@@ -8,6 +8,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import java.nio.file.Path;
 import java.nio.file.Files;
+import java.util.concurrent.atomic.AtomicInteger;
 import static org.junit.jupiter.api.Assertions.*;
 
 /**
@@ -695,5 +696,331 @@ public class TieredDiskCacheTest {
         }
 
         System.out.println("✅ Concurrent disk cache access test complete!");
+    }
+
+    // ── Write Queue Configuration Tests ────────────────────────────────
+
+    @Test
+    void testWriteQueueModeDefaults() {
+        SplitCacheManager.TieredCacheConfig config = new SplitCacheManager.TieredCacheConfig();
+
+        // Default mode is FRAGMENT
+        assertEquals(0, config.getWriteQueueModeOrdinal(), "Default mode should be FRAGMENT (ordinal 0)");
+        assertEquals(16, config.getWriteQueueCapacity(), "Default fragment capacity should be 16");
+        assertEquals(2_147_483_648L, config.getWriteQueueMaxBytes(), "Default max bytes should be 2GB");
+        assertFalse(config.isDropWritesWhenFull(), "Drop writes should be disabled by default");
+    }
+
+    @Test
+    void testWriteQueueFragmentCapacityBuilder() {
+        SplitCacheManager.TieredCacheConfig config = new SplitCacheManager.TieredCacheConfig()
+            .withWriteQueueFragmentCapacity(32);
+
+        assertEquals(SplitCacheManager.WriteQueueMode.FRAGMENT, getMode(config));
+        assertEquals(0, config.getWriteQueueModeOrdinal());
+        assertEquals(32, config.getWriteQueueCapacity());
+    }
+
+    @Test
+    void testWriteQueueSizeLimitBuilder() {
+        SplitCacheManager.TieredCacheConfig config = new SplitCacheManager.TieredCacheConfig()
+            .withWriteQueueSizeLimit(500_000_000L);
+
+        assertEquals(SplitCacheManager.WriteQueueMode.SIZE_BASED, getMode(config));
+        assertEquals(1, config.getWriteQueueModeOrdinal());
+        assertEquals(500_000_000L, config.getWriteQueueMaxBytes());
+    }
+
+    @Test
+    void testWriteQueueModeLastCallWins() {
+        // If both are called, last call wins
+        SplitCacheManager.TieredCacheConfig config = new SplitCacheManager.TieredCacheConfig()
+            .withWriteQueueFragmentCapacity(8)
+            .withWriteQueueSizeLimit(1_000_000_000L);
+
+        assertEquals(1, config.getWriteQueueModeOrdinal(), "Last call (SIZE_BASED) should win");
+
+        SplitCacheManager.TieredCacheConfig config2 = new SplitCacheManager.TieredCacheConfig()
+            .withWriteQueueSizeLimit(1_000_000_000L)
+            .withWriteQueueFragmentCapacity(8);
+
+        assertEquals(0, config2.getWriteQueueModeOrdinal(), "Last call (FRAGMENT) should win");
+    }
+
+    @Test
+    void testDropWritesWhenFullBuilder() {
+        SplitCacheManager.TieredCacheConfig config = new SplitCacheManager.TieredCacheConfig()
+            .withDropWritesWhenFull(true);
+
+        assertTrue(config.isDropWritesWhenFull());
+
+        SplitCacheManager.TieredCacheConfig config2 = new SplitCacheManager.TieredCacheConfig()
+            .withDropWritesWhenFull(false);
+
+        assertFalse(config2.isDropWritesWhenFull());
+    }
+
+    /**
+     * End-to-end: Fragment mode with custom capacity flows through JNI to Rust.
+     * Creates a SplitCacheManager with fragment capacity=32, searches a real split,
+     * and verifies data is cached to disk.
+     */
+    @Test
+    void testFragmentModeEndToEnd(@TempDir Path tempDir) throws Exception {
+        Path indexPath = tempDir.resolve("frag_e2e_index");
+        Path splitPath = tempDir.resolve("frag_e2e.split");
+        String diskCachePath = tempDir.resolve("frag_e2e_cache").toString();
+
+        QuickwitSplit.SplitMetadata metadata = createTestSplit(indexPath, splitPath);
+        String splitUri = "file://" + splitPath.toAbsolutePath();
+
+        SplitCacheManager.TieredCacheConfig tieredConfig = new SplitCacheManager.TieredCacheConfig()
+            .withDiskCachePath(diskCachePath)
+            .withMaxDiskSize(100_000_000L)
+            .withWriteQueueFragmentCapacity(32);
+
+        assertEquals(0, tieredConfig.getWriteQueueModeOrdinal(), "Should be FRAGMENT mode");
+        assertEquals(32, tieredConfig.getWriteQueueCapacity());
+
+        // Session 1: populate disk cache
+        try (SplitCacheManager cm = SplitCacheManager.getInstance(
+                new SplitCacheManager.CacheConfig("frag-e2e-" + System.currentTimeMillis())
+                    .withMaxCacheSize(10_000_000)
+                    .withTieredCache(tieredConfig));
+             SplitSearcher searcher = cm.createSplitSearcher(splitUri, metadata)) {
+
+            assertTrue(cm.isDiskCacheEnabled(), "Disk cache should be enabled");
+
+            var result = searcher.search(searcher.parseQuery("content:searchable"), 10);
+            assertTrue(result.getHits().size() > 0, "Should find documents");
+
+            // Give background writer time to flush
+            Thread.sleep(200);
+        }
+
+        // Verify disk cache has content
+        long cacheSize = Files.walk(Path.of(diskCachePath))
+            .filter(Files::isRegularFile)
+            .mapToLong(p -> p.toFile().length())
+            .sum();
+        assertTrue(cacheSize > 0, "Disk cache should have data after fragment-mode search");
+        System.out.println("✅ Fragment mode E2E: disk cache populated with " + cacheSize + " bytes");
+
+        // Session 2: verify cached data serves queries
+        SplitCacheManager.resetStorageDownloadMetrics();
+        try (SplitCacheManager cm2 = SplitCacheManager.getInstance(
+                new SplitCacheManager.CacheConfig("frag-e2e-2-" + System.currentTimeMillis())
+                    .withMaxCacheSize(10_000_000)
+                    .withTieredCache(tieredConfig));
+             SplitSearcher searcher2 = cm2.createSplitSearcher(splitUri, metadata)) {
+
+            var result2 = searcher2.search(searcher2.parseQuery("content:searchable"), 10);
+            assertTrue(result2.getHits().size() > 0, "Session 2 should find documents from cache");
+        }
+        System.out.println("✅ Fragment mode E2E: session 2 served from disk cache");
+    }
+
+    /**
+     * End-to-end: Size-based mode flows through JNI to Rust.
+     * Creates a SplitCacheManager with size-based 500MB limit, searches a real split,
+     * and verifies data is cached to disk.
+     */
+    @Test
+    void testSizeBasedModeEndToEnd(@TempDir Path tempDir) throws Exception {
+        Path indexPath = tempDir.resolve("sb_e2e_index");
+        Path splitPath = tempDir.resolve("sb_e2e.split");
+        String diskCachePath = tempDir.resolve("sb_e2e_cache").toString();
+
+        QuickwitSplit.SplitMetadata metadata = createTestSplit(indexPath, splitPath);
+        String splitUri = "file://" + splitPath.toAbsolutePath();
+
+        SplitCacheManager.TieredCacheConfig tieredConfig = new SplitCacheManager.TieredCacheConfig()
+            .withDiskCachePath(diskCachePath)
+            .withMaxDiskSize(100_000_000L)
+            .withWriteQueueSizeLimit(500_000_000L);
+
+        assertEquals(1, tieredConfig.getWriteQueueModeOrdinal(), "Should be SIZE_BASED mode");
+        assertEquals(500_000_000L, tieredConfig.getWriteQueueMaxBytes());
+
+        // Session 1: populate disk cache
+        try (SplitCacheManager cm = SplitCacheManager.getInstance(
+                new SplitCacheManager.CacheConfig("sb-e2e-" + System.currentTimeMillis())
+                    .withMaxCacheSize(10_000_000)
+                    .withTieredCache(tieredConfig));
+             SplitSearcher searcher = cm.createSplitSearcher(splitUri, metadata)) {
+
+            assertTrue(cm.isDiskCacheEnabled(), "Disk cache should be enabled");
+
+            var result = searcher.search(searcher.parseQuery("content:searchable"), 10);
+            assertTrue(result.getHits().size() > 0, "Should find documents");
+
+            Thread.sleep(200);
+        }
+
+        // Verify disk cache has content
+        long cacheSize = Files.walk(Path.of(diskCachePath))
+            .filter(Files::isRegularFile)
+            .mapToLong(p -> p.toFile().length())
+            .sum();
+        assertTrue(cacheSize > 0, "Disk cache should have data after size-based-mode search");
+        System.out.println("✅ Size-based mode E2E: disk cache populated with " + cacheSize + " bytes");
+
+        // Session 2: verify cached data serves queries
+        try (SplitCacheManager cm2 = SplitCacheManager.getInstance(
+                new SplitCacheManager.CacheConfig("sb-e2e-2-" + System.currentTimeMillis())
+                    .withMaxCacheSize(10_000_000)
+                    .withTieredCache(tieredConfig));
+             SplitSearcher searcher2 = cm2.createSplitSearcher(splitUri, metadata)) {
+
+            var result2 = searcher2.search(searcher2.parseQuery("content:searchable"), 10);
+            assertTrue(result2.getHits().size() > 0, "Session 2 should find documents from cache");
+        }
+        System.out.println("✅ Size-based mode E2E: session 2 served from disk cache");
+    }
+
+    /**
+     * End-to-end: dropWritesWhenFull=true still caches data when queue is not full.
+     * Verifies the option flows through JNI and doesn't break normal caching.
+     */
+    @Test
+    void testDropWritesWhenFullEndToEnd(@TempDir Path tempDir) throws Exception {
+        Path indexPath = tempDir.resolve("drop_e2e_index");
+        Path splitPath = tempDir.resolve("drop_e2e.split");
+        String diskCachePath = tempDir.resolve("drop_e2e_cache").toString();
+
+        QuickwitSplit.SplitMetadata metadata = createTestSplit(indexPath, splitPath);
+        String splitUri = "file://" + splitPath.toAbsolutePath();
+
+        SplitCacheManager.TieredCacheConfig tieredConfig = new SplitCacheManager.TieredCacheConfig()
+            .withDiskCachePath(diskCachePath)
+            .withMaxDiskSize(100_000_000L)
+            .withDropWritesWhenFull(true);
+
+        assertTrue(tieredConfig.isDropWritesWhenFull());
+
+        // Session 1: populate cache (under normal load, queue won't be full)
+        try (SplitCacheManager cm = SplitCacheManager.getInstance(
+                new SplitCacheManager.CacheConfig("drop-e2e-" + System.currentTimeMillis())
+                    .withMaxCacheSize(10_000_000)
+                    .withTieredCache(tieredConfig));
+             SplitSearcher searcher = cm.createSplitSearcher(splitUri, metadata)) {
+
+            assertTrue(cm.isDiskCacheEnabled());
+
+            // Multiple searches to give the cache data to write
+            for (int i = 0; i < 3; i++) {
+                var result = searcher.search(searcher.parseQuery("content:searchable"), 10);
+                assertTrue(result.getHits().size() > 0);
+            }
+
+            Thread.sleep(300);
+        }
+
+        // Disk cache should have data (under light load, nothing gets dropped)
+        long cacheSize = Files.walk(Path.of(diskCachePath))
+            .filter(Files::isRegularFile)
+            .mapToLong(p -> p.toFile().length())
+            .sum();
+        assertTrue(cacheSize > 0,
+            "With dropWritesWhenFull=true under light load, data should still be cached");
+        System.out.println("✅ dropWritesWhenFull E2E: disk cache populated with " + cacheSize + " bytes");
+    }
+
+    /**
+     * End-to-end: Prewarm with size-based mode + drop enabled, verify disk cache populated.
+     * Prewarm should always block (never drop), then second session served from disk cache.
+     */
+    @Test
+    void testPrewarmWithSizeBasedModeEndToEnd(@TempDir Path tempDir) throws Exception {
+        Path indexPath = tempDir.resolve("prewarm_sb_index");
+        Path splitPath = tempDir.resolve("prewarm_sb.split");
+        String diskCachePath = tempDir.resolve("prewarm_sb_cache").toString();
+
+        QuickwitSplit.SplitMetadata metadata = createTestSplit(indexPath, splitPath);
+        String splitUri = "file://" + splitPath.toAbsolutePath();
+
+        SplitCacheManager.TieredCacheConfig tieredConfig = new SplitCacheManager.TieredCacheConfig()
+            .withDiskCachePath(diskCachePath)
+            .withMaxDiskSize(100_000_000L)
+            .withWriteQueueSizeLimit(100_000_000L)
+            .withDropWritesWhenFull(true); // Even with drop enabled, prewarm must block
+
+        // Session 1: prewarm all components — verify disk cache gets populated
+        long diskCacheBytesAfterPrewarm;
+        try (SplitCacheManager cm = SplitCacheManager.getInstance(
+                new SplitCacheManager.CacheConfig("prewarm-sb-" + System.currentTimeMillis())
+                    .withMaxCacheSize(10_000_000)
+                    .withTieredCache(tieredConfig));
+             SplitSearcher searcher = cm.createSplitSearcher(splitUri, metadata)) {
+
+            // Prewarm all components — uses blocking put(), not put_query_path()
+            searcher.preloadComponents(
+                SplitSearcher.IndexComponent.TERM,
+                SplitSearcher.IndexComponent.POSTINGS,
+                SplitSearcher.IndexComponent.FASTFIELD,
+                SplitSearcher.IndexComponent.FIELDNORM,
+                SplitSearcher.IndexComponent.STORE
+            ).join();
+
+            SplitCacheManager.DiskCacheStats stats = cm.getDiskCacheStats();
+            diskCacheBytesAfterPrewarm = stats.getTotalBytes();
+            assertTrue(stats.isEnabled(), "Disk cache should be enabled");
+            assertTrue(diskCacheBytesAfterPrewarm > 0,
+                "Phase 1 prewarm should have populated disk cache");
+            System.out.println("✅ Phase 1 prewarm: disk cache has " +
+                diskCacheBytesAfterPrewarm + " bytes, " + stats.getComponentCount() + " components");
+        }
+
+        // Session 2: fresh manager, same disk cache — should find data from cache
+        try (SplitCacheManager cm2 = SplitCacheManager.getInstance(
+                new SplitCacheManager.CacheConfig("prewarm-sb-2-" + System.currentTimeMillis())
+                    .withMaxCacheSize(10_000_000)
+                    .withTieredCache(tieredConfig));
+             SplitSearcher searcher2 = cm2.createSplitSearcher(splitUri, metadata)) {
+
+            var result = searcher2.search(searcher2.parseQuery("content:searchable"), 10);
+            assertTrue(result.getHits().size() > 0, "Should find documents from disk cache");
+            System.out.println("✅ Phase 2 search: found " + result.getHits().size() +
+                " results from disk cache");
+        }
+    }
+
+    // ── Helpers ──────────────────────────────────────────────────────────
+
+    /** Helper to get WriteQueueMode from ordinal. */
+    private SplitCacheManager.WriteQueueMode getMode(SplitCacheManager.TieredCacheConfig config) {
+        return SplitCacheManager.WriteQueueMode.values()[config.getWriteQueueModeOrdinal()];
+    }
+
+    /** Create a test split with 200 documents for integration tests. */
+    private QuickwitSplit.SplitMetadata createTestSplit(Path indexPath, Path splitPath) throws Exception {
+        try (SchemaBuilder builder = new SchemaBuilder()) {
+            builder.addTextField("title", true, false, "default", "position");
+            builder.addTextField("content", true, false, "default", "position");
+            builder.addIntegerField("id", true, true, false);
+
+            try (Schema schema = builder.build();
+                 Index index = new Index(schema, indexPath.toString(), false)) {
+
+                try (IndexWriter writer = index.writer(Index.Memory.DEFAULT_HEAP_SIZE, 1)) {
+                    for (int i = 0; i < 200; i++) {
+                        try (Document doc = new Document()) {
+                            doc.addText("title", "Test Document " + i);
+                            doc.addText("content", "This document contains searchable content " +
+                                "for write queue integration testing. Document number " + i);
+                            doc.addInteger("id", i);
+                            writer.addDocument(doc);
+                        }
+                    }
+                    writer.commit();
+                }
+                index.reload();
+
+                QuickwitSplit.SplitConfig splitConfig = new QuickwitSplit.SplitConfig(
+                    "wq-test-index", "wq-test-source", "wq-test-node");
+                return QuickwitSplit.convertIndexFromPath(
+                    indexPath.toString(), splitPath.toString(), splitConfig);
+            }
+        }
     }
 }

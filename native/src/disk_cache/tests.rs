@@ -415,4 +415,228 @@ mod tests {
 
         assert_eq!(cache.get_split_count(), 3);
     }
+
+    // --- Write Queue Mode Tests ---
+
+    #[test]
+    fn test_fragment_mode_custom_capacity() {
+        use crate::disk_cache::types::WriteQueueMode;
+
+        let temp_dir = TempDir::new().unwrap();
+        let config = DiskCacheConfig {
+            root_path: temp_dir.path().to_path_buf(),
+            write_queue_mode: WriteQueueMode::Fragment { capacity: 4 },
+            ..Default::default()
+        };
+        let cache = L2DiskCache::new(config).unwrap();
+
+        let data: Vec<u8> = (0..10000).map(|i| (i % 256) as u8).collect();
+
+        // Write several items — with capacity=4, this tests that the bounded
+        // channel works and items eventually drain
+        for i in 0..8 {
+            cache.put("s3://bucket", &format!("split-frag-{}", i), "term", None, &data);
+        }
+        cache.flush_blocking();
+
+        // All writes should complete
+        for i in 0..8 {
+            let retrieved = cache.get("s3://bucket", &format!("split-frag-{}", i), "term", None);
+            assert!(retrieved.is_some(), "split-frag-{} should be cached", i);
+            assert_eq!(retrieved.unwrap().as_slice(), data.as_slice());
+        }
+        assert_eq!(cache.get_split_count(), 8);
+    }
+
+    #[test]
+    fn test_size_based_mode_put_get() {
+        use crate::disk_cache::types::WriteQueueMode;
+
+        let temp_dir = TempDir::new().unwrap();
+        let config = DiskCacheConfig {
+            root_path: temp_dir.path().to_path_buf(),
+            write_queue_mode: WriteQueueMode::SizeBased { max_bytes: 500_000 },
+            ..Default::default()
+        };
+        let cache = L2DiskCache::new(config).unwrap();
+
+        let data: Vec<u8> = (0..10000).map(|i| (i % 256) as u8).collect();
+
+        cache.put("s3://bucket", "split-sb-001", "term", None, &data);
+        cache.flush_blocking();
+
+        let retrieved = cache.get("s3://bucket", "split-sb-001", "term", None);
+        assert!(retrieved.is_some());
+        assert_eq!(retrieved.unwrap().as_slice(), data.as_slice());
+    }
+
+    #[test]
+    fn test_size_based_mode_backpressure() {
+        use crate::disk_cache::types::WriteQueueMode;
+        use std::sync::Arc;
+        use std::thread;
+
+        let temp_dir = TempDir::new().unwrap();
+        // Set max_bytes very low (50KB) so backpressure triggers quickly
+        let config = DiskCacheConfig {
+            root_path: temp_dir.path().to_path_buf(),
+            write_queue_mode: WriteQueueMode::SizeBased { max_bytes: 50_000 },
+            ..Default::default()
+        };
+        let cache = Arc::new(L2DiskCache::new(config).unwrap());
+
+        let data: Vec<u8> = (0..10000).map(|i| (i % 256) as u8).collect();
+
+        // Blast many writes — total data (10 * 10KB = 100KB) exceeds 50KB limit
+        // so backpressure should throttle senders
+        let cache_clone = Arc::clone(&cache);
+        let data_clone = data.clone();
+        let writer = thread::spawn(move || {
+            for i in 0..10 {
+                cache_clone.put("s3://bucket", &format!("split-bp-{}", i), "term", None, &data_clone);
+            }
+        });
+
+        writer.join().unwrap();
+        cache.flush_blocking();
+
+        // All writes should eventually complete
+        for i in 0..10 {
+            let retrieved = cache.get("s3://bucket", &format!("split-bp-{}", i), "term", None);
+            assert!(retrieved.is_some(), "split-bp-{} should be cached", i);
+            assert_eq!(retrieved.unwrap().as_slice(), data.as_slice());
+        }
+    }
+
+    #[test]
+    fn test_size_based_mode_evict_and_flush() {
+        use crate::disk_cache::types::WriteQueueMode;
+
+        let temp_dir = TempDir::new().unwrap();
+        let config = DiskCacheConfig {
+            root_path: temp_dir.path().to_path_buf(),
+            write_queue_mode: WriteQueueMode::SizeBased { max_bytes: 1_000_000 },
+            ..Default::default()
+        };
+        let cache = L2DiskCache::new(config).unwrap();
+
+        let data: Vec<u8> = (0..10000).map(|i| (i % 256) as u8).collect();
+
+        cache.put("s3://bucket", "split-sbf-001", "term", None, &data);
+        cache.put("s3://bucket", "split-sbf-001", "idx", None, &data);
+        cache.flush_blocking();
+
+        assert_eq!(cache.get_split_count(), 1);
+        assert_eq!(cache.get_component_count(), 2);
+
+        // Evict via size-based sender
+        cache.evict_split("s3://bucket", "split-sbf-001");
+        cache.flush_blocking();
+
+        assert_eq!(cache.get_split_count(), 0);
+        assert!(cache.get("s3://bucket", "split-sbf-001", "term", None).is_none());
+
+        // Flush via size-based sender
+        cache.put("s3://bucket", "split-sbf-002", "term", None, &data);
+        cache.flush_blocking();
+        assert!(cache.get("s3://bucket", "split-sbf-002", "term", None).is_some());
+    }
+
+    #[test]
+    fn test_write_queue_mode_default() {
+        use crate::disk_cache::types::WriteQueueMode;
+
+        // Verify default is Fragment { capacity: 16 }
+        let mode = WriteQueueMode::default();
+        match mode {
+            WriteQueueMode::Fragment { capacity } => assert_eq!(capacity, 16),
+            _ => panic!("Default should be Fragment"),
+        }
+
+        // Verify DiskCacheConfig default includes it
+        let config = DiskCacheConfig::default();
+        match config.write_queue_mode {
+            WriteQueueMode::Fragment { capacity } => assert_eq!(capacity, 16),
+            _ => panic!("DiskCacheConfig default should use Fragment mode"),
+        }
+
+        // Verify drop_writes_when_full defaults to false
+        assert!(!config.drop_writes_when_full);
+    }
+
+    #[test]
+    fn test_put_if_ready_drops_when_full() {
+        use crate::disk_cache::types::WriteQueueMode;
+
+        let temp_dir = TempDir::new().unwrap();
+        // Use fragment mode with capacity=1 so it fills up easily
+        let config = DiskCacheConfig {
+            root_path: temp_dir.path().to_path_buf(),
+            write_queue_mode: WriteQueueMode::Fragment { capacity: 1 },
+            ..Default::default()
+        };
+        let cache = L2DiskCache::new(config).unwrap();
+
+        // Use large data to increase likelihood of queue being full
+        let data: Vec<u8> = (0..100_000).map(|i| (i % 256) as u8).collect();
+
+        // Fill the queue: put a blocking write first to occupy the single slot,
+        // then immediately try non-blocking writes that should drop.
+        cache.put("s3://bucket", "split-pir-block", "term", None, &data);
+
+        // Blast non-blocking writes — with capacity=1, most should drop
+        let mut dropped = 0usize;
+        for i in 0..50 {
+            if !cache.put_if_ready("s3://bucket", &format!("split-pir-{}", i + 10), "term", None, &data) {
+                dropped += 1;
+            }
+        }
+        // With capacity=1, we expect at least some drops
+        assert!(dropped > 0, "Expected at least some writes to be dropped with capacity=1, but all {} succeeded", 50);
+
+        cache.flush_blocking();
+        // The blocking write should have completed
+        assert!(cache.get("s3://bucket", "split-pir-block", "term", None).is_some());
+    }
+
+    #[test]
+    fn test_put_query_path_with_drop_enabled() {
+        use crate::disk_cache::types::WriteQueueMode;
+
+        let temp_dir = TempDir::new().unwrap();
+        let config = DiskCacheConfig {
+            root_path: temp_dir.path().to_path_buf(),
+            write_queue_mode: WriteQueueMode::Fragment { capacity: 1 },
+            drop_writes_when_full: true,
+            ..Default::default()
+        };
+        let cache = L2DiskCache::new(config).unwrap();
+        assert!(cache.drop_writes_when_full());
+
+        let data: Vec<u8> = (0..10000).map(|i| (i % 256) as u8).collect();
+
+        // put_query_path should use put_if_ready (non-blocking) since drop is enabled
+        cache.put_query_path("s3://bucket", "split-qp-001", "term", None, &data);
+        cache.flush_blocking();
+        assert!(cache.get("s3://bucket", "split-qp-001", "term", None).is_some());
+    }
+
+    #[test]
+    fn test_put_query_path_without_drop() {
+        let temp_dir = TempDir::new().unwrap();
+        let config = DiskCacheConfig {
+            root_path: temp_dir.path().to_path_buf(),
+            drop_writes_when_full: false,
+            ..Default::default()
+        };
+        let cache = L2DiskCache::new(config).unwrap();
+        assert!(!cache.drop_writes_when_full());
+
+        let data: Vec<u8> = (0..10000).map(|i| (i % 256) as u8).collect();
+
+        // put_query_path should use put (blocking) since drop is disabled
+        cache.put_query_path("s3://bucket", "split-qp-002", "term", None, &data);
+        cache.flush_blocking();
+        assert!(cache.get("s3://bucket", "split-qp-002", "term", None).is_some());
+    }
 }
