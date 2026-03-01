@@ -437,7 +437,7 @@ mod tests {
         for i in 0..8 {
             cache.put("s3://bucket", &format!("split-frag-{}", i), "term", None, &data);
         }
-        std::thread::sleep(Duration::from_millis(300));
+        cache.flush_blocking();
 
         // All writes should complete
         for i in 0..8 {
@@ -463,7 +463,7 @@ mod tests {
         let data: Vec<u8> = (0..10000).map(|i| (i % 256) as u8).collect();
 
         cache.put("s3://bucket", "split-sb-001", "term", None, &data);
-        std::thread::sleep(Duration::from_millis(100));
+        cache.flush_blocking();
 
         let retrieved = cache.get("s3://bucket", "split-sb-001", "term", None);
         assert!(retrieved.is_some());
@@ -498,7 +498,7 @@ mod tests {
         });
 
         writer.join().unwrap();
-        std::thread::sleep(Duration::from_millis(500));
+        cache.flush_blocking();
 
         // All writes should eventually complete
         for i in 0..10 {
@@ -524,14 +524,14 @@ mod tests {
 
         cache.put("s3://bucket", "split-sbf-001", "term", None, &data);
         cache.put("s3://bucket", "split-sbf-001", "idx", None, &data);
-        std::thread::sleep(Duration::from_millis(100));
+        cache.flush_blocking();
 
         assert_eq!(cache.get_split_count(), 1);
         assert_eq!(cache.get_component_count(), 2);
 
         // Evict via size-based sender
         cache.evict_split("s3://bucket", "split-sbf-001");
-        std::thread::sleep(Duration::from_millis(100));
+        cache.flush_blocking();
 
         assert_eq!(cache.get_split_count(), 0);
         assert!(cache.get("s3://bucket", "split-sbf-001", "term", None).is_none());
@@ -577,26 +577,26 @@ mod tests {
         };
         let cache = L2DiskCache::new(config).unwrap();
 
-        let data: Vec<u8> = (0..10000).map(|i| (i % 256) as u8).collect();
+        // Use large data to increase likelihood of queue being full
+        let data: Vec<u8> = (0..100_000).map(|i| (i % 256) as u8).collect();
 
-        // First put_if_ready should succeed (queue empty)
-        let ok = cache.put_if_ready("s3://bucket", "split-pir-001", "term", None, &data);
-        assert!(ok, "First put_if_ready should succeed");
+        // Fill the queue: put a blocking write first to occupy the single slot,
+        // then immediately try non-blocking writes that should drop.
+        cache.put("s3://bucket", "split-pir-block", "term", None, &data);
 
-        // Blast more — some may drop since capacity=1 and background writer may lag
-        let mut dropped = 0;
-        for i in 0..20 {
+        // Blast non-blocking writes — with capacity=1, most should drop
+        let mut dropped = 0usize;
+        for i in 0..50 {
             if !cache.put_if_ready("s3://bucket", &format!("split-pir-{}", i + 10), "term", None, &data) {
                 dropped += 1;
             }
         }
-        // We expect at least some drops with capacity=1
-        // (can't guarantee exact number due to timing)
-        assert!(dropped >= 0); // Always true, but documents intent
+        // With capacity=1, we expect at least some drops
+        assert!(dropped > 0, "Expected at least some writes to be dropped with capacity=1, but all {} succeeded", 50);
 
-        std::thread::sleep(Duration::from_millis(300));
-        // At least the first write should have completed
-        assert!(cache.get("s3://bucket", "split-pir-001", "term", None).is_some());
+        cache.flush_blocking();
+        // The blocking write should have completed
+        assert!(cache.get("s3://bucket", "split-pir-block", "term", None).is_some());
     }
 
     #[test]
@@ -617,7 +617,7 @@ mod tests {
 
         // put_query_path should use put_if_ready (non-blocking) since drop is enabled
         cache.put_query_path("s3://bucket", "split-qp-001", "term", None, &data);
-        std::thread::sleep(Duration::from_millis(100));
+        cache.flush_blocking();
         assert!(cache.get("s3://bucket", "split-qp-001", "term", None).is_some());
     }
 
@@ -636,7 +636,7 @@ mod tests {
 
         // put_query_path should use put (blocking) since drop is disabled
         cache.put_query_path("s3://bucket", "split-qp-002", "term", None, &data);
-        std::thread::sleep(Duration::from_millis(100));
+        cache.flush_blocking();
         assert!(cache.get("s3://bucket", "split-qp-002", "term", None).is_some());
     }
 }

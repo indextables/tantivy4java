@@ -9,6 +9,9 @@ use std::sync::Arc;
 use quickwit_storage::Storage;
 
 use crate::debug_println;
+use crate::global_cache::get_global_disk_cache;
+
+use super::helpers::parse_split_uri;
 
 /// Cache all files with a given extension from the bundle into L2 disk cache.
 ///
@@ -19,15 +22,31 @@ use crate::debug_println;
 /// - L2 write with blocking `put()` (guaranteed write, never dropped)
 /// - Prewarm metric recording via `record_prewarm_download()`
 ///
-/// When no disk cache is configured (storage is raw), reads go directly to object storage
-/// and data is discarded (no caching). This is a no-op in practice since without a cache
-/// there's nothing to prewarm into.
+/// **IMPORTANT**: If no disk cache is configured, prewarm is a NO-OP.
+/// Configure TieredCacheConfig with a disk cache path to enable prewarm functionality.
+///
+/// Uses O(1) manifest `exists()` checks to skip already-cached files, avoiding
+/// unnecessary disk I/O from reading cached data only to discard it.
 pub(crate) async fn cache_files_by_extension(
     extension: &str,
     storage: Arc<dyn Storage>,
     split_uri: &str,
     bundle_offsets: &HashMap<PathBuf, Range<u64>>,
 ) -> (usize, usize) {
+    // If no disk cache is configured, prewarm is a NO-OP — avoid downloading
+    // data from S3/Azure just to discard it.
+    let disk_cache = match get_global_disk_cache() {
+        Some(dc) => Some(dc),
+        None => {
+            debug_println!(
+                "⚠️ PREWARM_SKIP: No disk cache configured - skipping .{} prewarm",
+                extension
+            );
+            debug_println!("   Configure TieredCacheConfig.withDiskCachePath() to enable prewarm");
+            return (0, 0);
+        }
+    };
+
     // Find all files with the given extension
     let files: Vec<_> = bundle_offsets
         .iter()
@@ -51,6 +70,24 @@ pub(crate) async fn cache_files_by_extension(
     };
     let split_path = PathBuf::from(split_filename);
 
+    // Parse split_uri into storage_loc and split_id for L2 disk cache exists() checks.
+    // These MUST match the keys used by StorageWithPersistentCache to ensure
+    // prewarm and query cache lookups are consistent.
+    let (storage_loc, split_id) = parse_split_uri(split_uri);
+
+    // Extract component name for cache key consistency with StorageWithPersistentCache
+    let storage_component = split_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|s| {
+            if s.starts_with('.') {
+                s[1..].to_string()
+            } else {
+                s.to_string()
+            }
+        })
+        .unwrap_or_else(|| "unknown".to_string());
+
     debug_println!(
         "🔥 PREWARM_DISK: Found {} .{} files to cache via prewarm-mode storage",
         files.len(),
@@ -58,11 +95,33 @@ pub(crate) async fn cache_files_by_extension(
     );
 
     let mut warm_up_futures = Vec::new();
+    let mut already_cached_count = 0;
 
     for (inner_path, bundle_range) in files {
         let bundle_start = bundle_range.start as usize;
         let bundle_end = bundle_range.end as usize;
         let file_length = bundle_end - bundle_start;
+
+        // O(1) manifest check: skip already-cached files to avoid unnecessary disk reads.
+        // exists() is a lightweight manifest lookup (~1μs) vs get_slice() which would
+        // read the entire file from disk via mmap just to discard the data.
+        let cache_range = bundle_start as u64..bundle_end as u64;
+        if let Some(ref dc) = disk_cache {
+            if dc.exists(
+                &storage_loc,
+                &split_id,
+                &storage_component,
+                Some(cache_range),
+            ) {
+                debug_println!(
+                    "⏭️ PREWARM_DISK: Skipping '{}' ({} bytes) - already in disk cache",
+                    inner_path.display(),
+                    file_length,
+                );
+                already_cached_count += 1;
+                continue;
+            }
+        }
 
         let storage = storage.clone();
         let split_path = split_path.clone();
@@ -103,13 +162,17 @@ pub(crate) async fn cache_files_by_extension(
     }
 
     let results = futures::future::join_all(warm_up_futures).await;
-    let success_count = results.iter().filter(|r| r.is_ok()).count();
-    let failure_count = results.len() - success_count;
+    let downloaded_count = results.iter().filter(|r| r.is_ok()).count();
+    let failure_count = results.len() - downloaded_count;
+
+    // Success = already cached + newly downloaded
+    let success_count = already_cached_count + downloaded_count;
 
     debug_println!(
-        "🔥 PREWARM_CACHE: .{} files - {} success, {} failed",
+        "🔥 PREWARM_CACHE: .{} files - {} already cached, {} downloaded, {} failed",
         extension,
-        success_count,
+        already_cached_count,
+        downloaded_count,
         failure_count
     );
 

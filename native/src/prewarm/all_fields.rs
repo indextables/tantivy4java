@@ -18,8 +18,8 @@ use super::cache_extension::cache_files_by_extension;
 /// 2. StorageWithPersistentCache handles L2 cache check/write and prewarm metrics
 /// 3. L2DiskCache serves sub-range queries via mmap for efficiency
 ///
-/// **IMPORTANT**: If no disk cache is configured, reads go to object storage
-/// but data is not persisted. Configure TieredCacheConfig with a disk cache path.
+/// **IMPORTANT**: If no disk cache is configured, prewarm is a NO-OP.
+/// Configure TieredCacheConfig with a disk cache path to enable prewarm.
 pub async fn prewarm_term_dictionaries_impl(searcher_ptr: jlong) -> anyhow::Result<()> {
     debug_println!("🔥 PREWARM_TERM: Starting term dictionary warmup (disk-only)");
 
@@ -28,7 +28,7 @@ pub async fn prewarm_term_dictionaries_impl(searcher_ptr: jlong) -> anyhow::Resu
     let (storage, bundle_offsets, split_uri) =
         with_arc_safe(searcher_ptr, |ctx: &Arc<CachedSearcherContext>| {
             (
-                ctx.prewarm_storage.clone().unwrap_or_else(|| ctx.cached_storage.clone()),
+                ctx.prewarm_or_cached_storage(),
                 ctx.bundle_file_offsets.clone(),
                 ctx.split_uri.clone(),
             )
@@ -67,7 +67,7 @@ pub async fn prewarm_postings_impl(searcher_ptr: jlong) -> anyhow::Result<()> {
     let (storage, bundle_offsets, split_uri) =
         with_arc_safe(searcher_ptr, |ctx: &Arc<CachedSearcherContext>| {
             (
-                ctx.prewarm_storage.clone().unwrap_or_else(|| ctx.cached_storage.clone()),
+                ctx.prewarm_or_cached_storage(),
                 ctx.bundle_file_offsets.clone(),
                 ctx.split_uri.clone(),
             )
@@ -117,7 +117,7 @@ pub async fn prewarm_fieldnorms_impl(searcher_ptr: jlong) -> anyhow::Result<()> 
     let (storage, bundle_offsets, split_uri) =
         with_arc_safe(searcher_ptr, |ctx: &Arc<CachedSearcherContext>| {
             (
-                ctx.prewarm_storage.clone().unwrap_or_else(|| ctx.cached_storage.clone()),
+                ctx.prewarm_or_cached_storage(),
                 ctx.bundle_file_offsets.clone(),
                 ctx.split_uri.clone(),
             )
@@ -155,7 +155,7 @@ pub async fn prewarm_fastfields_impl(searcher_ptr: jlong) -> anyhow::Result<()> 
     let (storage, bundle_offsets, split_uri) =
         with_arc_safe(searcher_ptr, |ctx: &Arc<CachedSearcherContext>| {
             (
-                ctx.prewarm_storage.clone().unwrap_or_else(|| ctx.cached_storage.clone()),
+                ctx.prewarm_or_cached_storage(),
                 ctx.bundle_file_offsets.clone(),
                 ctx.split_uri.clone(),
             )
@@ -196,7 +196,7 @@ pub async fn prewarm_store_impl(searcher_ptr: jlong) -> anyhow::Result<()> {
     let (storage, bundle_offsets, split_uri) =
         with_arc_safe(searcher_ptr, |ctx: &Arc<CachedSearcherContext>| {
             (
-                ctx.prewarm_storage.clone().unwrap_or_else(|| ctx.cached_storage.clone()),
+                ctx.prewarm_or_cached_storage(),
                 ctx.bundle_file_offsets.clone(),
                 ctx.split_uri.clone(),
             )

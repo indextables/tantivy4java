@@ -117,6 +117,15 @@ pub(crate) struct CachedSearcherContext {
 }
 
 impl CachedSearcherContext {
+    /// Get the prewarm-mode storage, falling back to query-mode cached_storage.
+    ///
+    /// Prewarm-mode storage uses blocking `put()` for guaranteed L2 writes and
+    /// records downloads via `record_prewarm_download()`. Falls back to the
+    /// query-mode `cached_storage` when no disk cache is configured.
+    pub(crate) fn prewarm_or_cached_storage(&self) -> Arc<dyn Storage> {
+        self.prewarm_storage.clone().unwrap_or_else(|| self.cached_storage.clone())
+    }
+
     /// Clear the L1 ByteRangeCache to free memory.
     ///
     /// This should be called after prewarm operations to prevent unbounded memory growth.

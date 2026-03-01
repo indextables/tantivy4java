@@ -105,7 +105,13 @@ impl WriteSender {
         }
     }
 
-    /// Try to send without blocking (used in Drop).
+    /// Try to send without blocking (used in Drop/shutdown paths).
+    ///
+    /// In Fragment mode, uses the bounded channel's `try_send` (may fail if full).
+    /// In SizeBased mode, unconditionally enqueues — the unbounded channel only fails
+    /// if the receiver is disconnected (shutdown). Bytes are tracked optimistically;
+    /// if `tx.send()` fails during shutdown, the counter drifts but is harmless since
+    /// no further reads will occur.
     fn try_send(&self, req: WriteRequest) -> Result<(), ()> {
         match self {
             WriteSender::Fragment(tx) => tx.try_send(req).map_err(|_| ()),
@@ -125,6 +131,11 @@ impl WriteSender {
     /// Send a Put request if the queue has capacity, otherwise drop it silently.
     /// Returns `true` if enqueued, `false` if dropped.
     /// Non-Put requests are always sent (they're small control messages).
+    ///
+    /// Note: In SizeBased mode, the check-then-add is not atomic, so concurrent
+    /// `send_or_drop` calls may momentarily exceed `max_bytes`. This is acceptable
+    /// for a best-effort query-path operation — the background writer will drain
+    /// the excess and restore the invariant.
     fn send_or_drop(&self, req: WriteRequest) -> bool {
         match self {
             WriteSender::Fragment(tx) => tx.try_send(req).is_ok(),

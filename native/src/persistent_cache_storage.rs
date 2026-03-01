@@ -159,6 +159,31 @@ impl StorageWithPersistentCache {
         OwnedBytes::new(result)
     }
 
+    /// Record a download metric and write data to L2 disk cache.
+    ///
+    /// In prewarm mode: uses blocking `put()` (guaranteed write) and `record_prewarm_download()`.
+    /// In query mode: uses `put_query_path()` (may drop if full) and `record_query_download()`.
+    fn record_and_cache(
+        &self,
+        component: &str,
+        byte_range: Option<Range<u64>>,
+        data: &[u8],
+    ) {
+        if self.prewarm_mode {
+            record_prewarm_download(data.len() as u64);
+            self.disk_cache.put(
+                &self.storage_loc, &self.split_id, component,
+                byte_range, data,
+            );
+        } else {
+            record_query_download(data.len() as u64);
+            self.disk_cache.put_query_path(
+                &self.storage_loc, &self.split_id, component,
+                byte_range, data,
+            );
+        }
+    }
+
     /// Fetch gaps from S3 and combine with cached segments
     ///
     /// This is the key coalescing operation:
@@ -191,20 +216,7 @@ impl StorageWithPersistentCache {
             let gap_usize = gap.start as usize..gap.end as usize;
             let gap_data = self.storage.get_slice(path, gap_usize).await?;
 
-            // Record download metrics and write to L2 cache based on mode
-            if self.prewarm_mode {
-                record_prewarm_download(gap_data.len() as u64);
-                self.disk_cache.put(
-                    &self.storage_loc, &self.split_id, &component,
-                    Some(gap.clone()), gap_data.as_slice(),
-                );
-            } else {
-                record_query_download(gap_data.len() as u64);
-                self.disk_cache.put_query_path(
-                    &self.storage_loc, &self.split_id, &component,
-                    Some(gap.clone()), gap_data.as_slice(),
-                );
-            }
+            self.record_and_cache(&component, Some(gap.clone()), gap_data.as_slice());
 
             // Insert gap data into result buffer
             let offset_in_result = (gap.start - requested.start) as usize;
@@ -294,13 +306,7 @@ impl Storage for StorageWithPersistentCache {
         let disk_range = byte_range.start as u64..byte_range.end as u64;
         debug_println!("💾 L2_STORE: Writing to disk cache - storage_loc={}, split_id={}, component={}, range={:?}, size={}, prewarm={}",
                  self.storage_loc, self.split_id, component, disk_range, bytes.len(), self.prewarm_mode);
-        if self.prewarm_mode {
-            record_prewarm_download(bytes.len() as u64);
-            self.disk_cache.put(&self.storage_loc, &self.split_id, &component, Some(disk_range), bytes.as_slice());
-        } else {
-            record_query_download(bytes.len() as u64);
-            self.disk_cache.put_query_path(&self.storage_loc, &self.split_id, &component, Some(disk_range), bytes.as_slice());
-        }
+        self.record_and_cache(&component, Some(disk_range), bytes.as_slice());
 
         Ok(bytes)
     }

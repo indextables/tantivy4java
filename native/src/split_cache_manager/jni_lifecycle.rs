@@ -204,17 +204,26 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_
             let wq_mode_ordinal =
                 match env.call_method(&tiered_config_obj, "getWriteQueueModeOrdinal", "()I", &[]) {
                     Ok(result) => result.i().unwrap(),
-                    _ => 0, // FRAGMENT
+                    Err(e) => {
+                        debug_println!("RUST DEBUG: Failed to get writeQueueModeOrdinal: {:?}, defaulting to FRAGMENT", e);
+                        0 // FRAGMENT
+                    }
                 };
             let wq_capacity =
                 match env.call_method(&tiered_config_obj, "getWriteQueueCapacity", "()I", &[]) {
                     Ok(result) => result.i().unwrap() as usize,
-                    _ => 16,
+                    Err(e) => {
+                        debug_println!("RUST DEBUG: Failed to get writeQueueCapacity: {:?}, defaulting to 16", e);
+                        16
+                    }
                 };
             let wq_max_bytes =
                 match env.call_method(&tiered_config_obj, "getWriteQueueMaxBytes", "()J", &[]) {
                     Ok(result) => result.j().unwrap() as u64,
-                    _ => 2_147_483_648,
+                    Err(e) => {
+                        debug_println!("RUST DEBUG: Failed to get writeQueueMaxBytes: {:?}, defaulting to 2GB", e);
+                        2_147_483_648
+                    }
                 };
             let write_queue_mode = match wq_mode_ordinal {
                 1 => WriteQueueMode::SizeBased { max_bytes: wq_max_bytes },
@@ -223,7 +232,10 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_
             let drop_writes_when_full =
                 match env.call_method(&tiered_config_obj, "isDropWritesWhenFull", "()Z", &[]) {
                     Ok(result) => result.z().unwrap_or(false),
-                    _ => false,
+                    Err(e) => {
+                        debug_println!("RUST DEBUG: Failed to get dropWritesWhenFull: {:?}, defaulting to false", e);
+                        false
+                    }
                 };
             debug_println!("RUST DEBUG: write_queue_mode={:?}, drop_writes_when_full={}", write_queue_mode, drop_writes_when_full);
 
