@@ -15,7 +15,8 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, bail};
 use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
 use arrow_array::{RecordBatch, StructArray, Array, StringArray, BooleanArray, Int32Array, Int64Array, Float64Array};
-use arrow_schema::{DataType, Schema as ArrowSchema, SchemaRef};
+use arrow_array::types::TimestampMicrosecondType;
+use arrow_schema::{DataType, Schema as ArrowSchema, SchemaRef, TimeUnit};
 use tantivy::{Index, IndexWriter, TantivyDocument};
 use tantivy::schema::{Schema as TantivySchema, Field};
 use uuid::Uuid;
@@ -353,6 +354,54 @@ fn extract_partition_value(batch: &RecordBatch, col_idx: usize, row_idx: usize) 
             let arr = array.as_any().downcast_ref::<Float64Array>()
                 .ok_or_else(|| anyhow::anyhow!("Expected Float64Array for partition column"))?;
             Ok(arr.value(row_idx).to_string())
+        }
+        DataType::Date32 => {
+            // Date32 stores days since Unix epoch (1970-01-01) as i32 → convert to YYYY-MM-DD
+            let arr = array.as_any().downcast_ref::<arrow_array::Date32Array>()
+                .ok_or_else(|| anyhow::anyhow!("Expected Date32Array for partition column"))?;
+            let days = arr.value(row_idx);
+            let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+            let date = epoch + chrono::Duration::days(days as i64);
+            Ok(date.format("%Y-%m-%d").to_string())
+        }
+        DataType::Timestamp(TimeUnit::Microsecond, _) => {
+            // Timestamp(μs) stores microseconds since epoch as i64 → convert to YYYY-MM-DD HH:MM:SS
+            let arr = array.as_any().downcast_ref::<arrow_array::PrimitiveArray<TimestampMicrosecondType>>()
+                .ok_or_else(|| anyhow::anyhow!("Expected TimestampMicrosecondArray for partition column"))?;
+            let micros = arr.value(row_idx);
+            let secs = micros / 1_000_000;
+            let nanos = ((micros % 1_000_000) * 1_000) as u32;
+            let dt = chrono::DateTime::from_timestamp(secs, nanos)
+                .ok_or_else(|| anyhow::anyhow!("Invalid timestamp microseconds: {}", micros))?;
+            Ok(dt.format("%Y-%m-%d %H:%M:%S").to_string())
+        }
+        DataType::Timestamp(TimeUnit::Millisecond, _) => {
+            let arr = array.as_any().downcast_ref::<arrow_array::PrimitiveArray<arrow_array::types::TimestampMillisecondType>>()
+                .ok_or_else(|| anyhow::anyhow!("Expected TimestampMillisecondArray for partition column"))?;
+            let millis = arr.value(row_idx);
+            let secs = millis / 1_000;
+            let nanos = ((millis % 1_000) * 1_000_000) as u32;
+            let dt = chrono::DateTime::from_timestamp(secs, nanos)
+                .ok_or_else(|| anyhow::anyhow!("Invalid timestamp milliseconds: {}", millis))?;
+            Ok(dt.format("%Y-%m-%d %H:%M:%S").to_string())
+        }
+        DataType::Timestamp(TimeUnit::Second, _) => {
+            let arr = array.as_any().downcast_ref::<arrow_array::PrimitiveArray<arrow_array::types::TimestampSecondType>>()
+                .ok_or_else(|| anyhow::anyhow!("Expected TimestampSecondArray for partition column"))?;
+            let secs = arr.value(row_idx);
+            let dt = chrono::DateTime::from_timestamp(secs, 0)
+                .ok_or_else(|| anyhow::anyhow!("Invalid timestamp seconds: {}", secs))?;
+            Ok(dt.format("%Y-%m-%d %H:%M:%S").to_string())
+        }
+        DataType::Timestamp(TimeUnit::Nanosecond, _) => {
+            let arr = array.as_any().downcast_ref::<arrow_array::PrimitiveArray<arrow_array::types::TimestampNanosecondType>>()
+                .ok_or_else(|| anyhow::anyhow!("Expected TimestampNanosecondArray for partition column"))?;
+            let nanos = arr.value(row_idx);
+            let secs = nanos / 1_000_000_000;
+            let sub_nanos = (nanos % 1_000_000_000) as u32;
+            let dt = chrono::DateTime::from_timestamp(secs, sub_nanos)
+                .ok_or_else(|| anyhow::anyhow!("Invalid timestamp nanoseconds: {}", nanos))?;
+            Ok(dt.format("%Y-%m-%d %H:%M:%S").to_string())
         }
         dt => bail!("Unsupported partition column type: {:?}", dt),
     }
