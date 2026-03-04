@@ -55,6 +55,9 @@ pub(crate) struct ArrowFfiSplitContext {
     heap_size: usize,
     total_doc_count: u64,
     total_batch_count: u64,
+    /// Schema derivation config (field type overrides, tokenizers, etc.)
+    /// Stored here so add_arrow_batch can use the same config as schema derivation.
+    schema_config: SchemaDerivationConfig,
 }
 
 /// Per-partition state: each partition gets its own Index + IndexWriter + temp dir.
@@ -119,16 +122,98 @@ pub(crate) fn import_arrow_batch(
     Ok(RecordBatch::from(struct_array))
 }
 
+/// Parse a field configuration JSON array into a SchemaDerivationConfig.
+///
+/// Expected format:
+/// ```json
+/// [
+///   {"name": "id", "type": "i64", "fast": true, "indexed": true, "stored": true},
+///   {"name": "content", "type": "text", "tokenizer": "default", "record": "position"},
+///   {"name": "metadata", "type": "json"},
+///   {"name": "ip_addr", "type": "ip", "fast": true}
+/// ]
+/// ```
+///
+/// Type overrides applied to SchemaDerivationConfig:
+/// - "json" → json_fields
+/// - "ip" → ip_address_fields
+/// - "text" with tokenizer → tokenizer_overrides (defaults to "default" if no tokenizer specified)
+/// - "text" with tokenizer "raw" → no override (raw is already the default)
+pub(crate) fn parse_field_config_json(json_str: &str) -> Result<SchemaDerivationConfig> {
+    let fields: Vec<serde_json::Value> = serde_json::from_str(json_str)
+        .context("Failed to parse field config JSON array")?;
+
+    let mut config = SchemaDerivationConfig {
+        fast_field_mode: FastFieldMode::Disabled, // All fields get native fast access
+        store_fields: true,                       // Standard splits: docs stored in tantivy
+        ..Default::default()
+    };
+
+    for field_obj in &fields {
+        let name = field_obj.get("name")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("Field config entry missing 'name': {}", field_obj))?;
+
+        let field_type = field_obj.get("type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+
+        match field_type {
+            "json" => {
+                config.json_fields.insert(name.to_string());
+            }
+            "ip" => {
+                config.ip_address_fields.insert(name.to_string());
+            }
+            "text" => {
+                // Text fields need a tokenizer for full-text search.
+                // Default to "default" tokenizer (which lowercases + tokenizes).
+                let tokenizer = field_obj.get("tokenizer")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("default");
+                // Only add override if not "raw" (raw is already the schema derivation default)
+                if tokenizer != "raw" {
+                    config.tokenizer_overrides.insert(name.to_string(), tokenizer.to_string());
+                }
+            }
+            // For other types (i64, f64, bool, datetime, bytes, string, etc.)
+            // the Arrow type mapping handles them correctly already.
+            _ => {}
+        }
+    }
+
+    debug_println!(
+        "ARROW_FFI_IMPORT: Parsed field config: {} json fields, {} ip fields, {} tokenizer overrides",
+        config.json_fields.len(), config.ip_address_fields.len(), config.tokenizer_overrides.len()
+    );
+
+    Ok(config)
+}
+
 /// Begin creating splits from Arrow columnar data.
 ///
 /// Accepts the full Arrow schema (including partition columns) + list of partition column names.
 /// Identifies partition columns in the schema; builds field_mapping for non-partition columns only.
 /// Derives tantivy schema with STORED flag set on all fields (standard split behavior).
+///
+/// If `field_config_json` is provided, it overrides the default Arrow→Tantivy type mapping
+/// for specific fields (e.g. Utf8 → JSON, Utf8 → IP, tokenizer selection for text fields).
 pub(crate) fn begin_split_from_arrow(
     arrow_schema: ArrowSchema,
     partition_col_names: &[String],
     heap_size: usize,
+    field_config_json: Option<&str>,
 ) -> Result<ArrowFfiSplitContext> {
+    // Parse field config if provided, otherwise use defaults
+    let config = match field_config_json {
+        Some(json) if !json.is_empty() => parse_field_config_json(json)?,
+        _ => SchemaDerivationConfig {
+            fast_field_mode: FastFieldMode::Disabled, // All fields get fast access
+            store_fields: true,                       // Standard splits: docs stored in tantivy
+            ..Default::default()
+        },
+    };
+
     // Identify partition column indices
     let mut partition_col_indices = Vec::new();
     for name in partition_col_names {
@@ -150,12 +235,7 @@ pub(crate) fn begin_split_from_arrow(
         .collect();
     let non_partition_schema = ArrowSchema::new(non_partition_fields);
 
-    // Derive tantivy schema with STORED flag (standard splits store docs in tantivy)
-    let config = SchemaDerivationConfig {
-        fast_field_mode: FastFieldMode::Disabled, // All fields get fast access
-        store_fields: true,                       // Standard splits: docs stored in tantivy
-        ..Default::default()
-    };
+    // Derive tantivy schema using the (possibly overridden) config
     let tantivy_schema = derive_tantivy_schema_with_mapping(&non_partition_schema, &config, None)?;
 
     // Build field mapping: Arrow column index → tantivy field
@@ -195,6 +275,7 @@ pub(crate) fn begin_split_from_arrow(
         heap_size,
         total_doc_count: 0,
         total_batch_count: 0,
+        schema_config: config,
     })
 }
 
@@ -287,13 +368,9 @@ pub(crate) fn add_arrow_batch(ctx: &mut ArrowFfiSplitContext, batch: &RecordBatc
         );
     }
 
-    // Empty pass-through configs for standard splits (no companion-mode features)
+    // Use the config from context (populated from field_config_json if provided)
     let name_mapping: NameMapping = HashMap::new();
-    let schema_derivation_config = SchemaDerivationConfig {
-        fast_field_mode: FastFieldMode::Disabled,
-        store_fields: true,
-        ..Default::default()
-    };
+    let schema_derivation_config = &ctx.schema_config;
     let string_hash_fields: HashMap<String, String> = HashMap::new();
     let mut accumulators: HashMap<String, StatisticsAccumulator> = HashMap::new();
     let string_indexing_modes: HashMap<String, StringIndexingMode> = HashMap::new();
@@ -313,7 +390,7 @@ pub(crate) fn add_arrow_batch(ctx: &mut ArrowFfiSplitContext, batch: &RecordBatc
                 &ctx.field_mapping,
                 &ctx.tantivy_schema,
                 &name_mapping,
-                &schema_derivation_config,
+                schema_derivation_config,
                 &string_hash_fields,
                 &mut accumulators,
                 &string_indexing_modes,
@@ -351,7 +428,7 @@ pub(crate) fn add_arrow_batch(ctx: &mut ArrowFfiSplitContext, batch: &RecordBatc
                 &ctx.field_mapping,
                 &ctx.tantivy_schema,
                 &name_mapping,
-                &schema_derivation_config,
+                schema_derivation_config,
                 &string_hash_fields,
                 &mut accumulators,
                 &string_indexing_modes,
@@ -605,7 +682,7 @@ mod tests {
     #[test]
     fn test_begin_creates_schema() {
         let schema = test_schema();
-        let ctx = begin_split_from_arrow(schema, &[], 50_000_000).unwrap();
+        let ctx = begin_split_from_arrow(schema, &[], 50_000_000, None).unwrap();
 
         // Verify tantivy schema has all 4 fields
         assert!(ctx.tantivy_schema.get_field("id").is_ok());
@@ -631,7 +708,7 @@ mod tests {
     #[test]
     fn test_add_single_batch() {
         let schema = test_schema();
-        let mut ctx = begin_split_from_arrow(schema, &[], 50_000_000).unwrap();
+        let mut ctx = begin_split_from_arrow(schema, &[], 50_000_000, None).unwrap();
 
         let batch = test_batch(10, 0);
         let count = add_arrow_batch(&mut ctx, &batch).unwrap();
@@ -644,7 +721,7 @@ mod tests {
     #[test]
     fn test_add_multiple_batches() {
         let schema = test_schema();
-        let mut ctx = begin_split_from_arrow(schema, &[], 50_000_000).unwrap();
+        let mut ctx = begin_split_from_arrow(schema, &[], 50_000_000, None).unwrap();
 
         let batch1 = test_batch(100, 0);
         let batch2 = test_batch(100, 100);
@@ -669,7 +746,7 @@ mod tests {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
             let schema = test_schema();
-            let mut ctx = begin_split_from_arrow(schema, &[], 50_000_000).unwrap();
+            let mut ctx = begin_split_from_arrow(schema, &[], 50_000_000, None).unwrap();
 
             let batch = test_batch(50, 0);
             add_arrow_batch(&mut ctx, &batch).unwrap();
@@ -690,7 +767,7 @@ mod tests {
     #[test]
     fn test_cancel_cleans_up() {
         let schema = test_schema();
-        let mut ctx = begin_split_from_arrow(schema, &[], 50_000_000).unwrap();
+        let mut ctx = begin_split_from_arrow(schema, &[], 50_000_000, None).unwrap();
 
         // Record the temp dir path before cancel
         let temp_path = ctx.default_writer.as_ref().unwrap().index_dir.path().to_path_buf();
@@ -708,7 +785,7 @@ mod tests {
     #[test]
     fn test_schema_mismatch_rejected() {
         let schema = test_schema();
-        let mut ctx = begin_split_from_arrow(schema, &[], 50_000_000).unwrap();
+        let mut ctx = begin_split_from_arrow(schema, &[], 50_000_000, None).unwrap();
 
         // Create a batch with different number of columns
         let wrong_schema = ArrowSchema::new(vec![
@@ -733,7 +810,7 @@ mod tests {
     #[test]
     fn test_all_field_types() {
         let schema = test_schema();
-        let mut ctx = begin_split_from_arrow(schema, &[], 50_000_000).unwrap();
+        let mut ctx = begin_split_from_arrow(schema, &[], 50_000_000, None).unwrap();
 
         // Create batch with all supported types
         let batch = RecordBatch::try_new(
@@ -760,7 +837,7 @@ mod tests {
         runtime.block_on(async {
             let schema = partitioned_schema();
             let partition_cols = vec!["event_date".to_string()];
-            let mut ctx = begin_split_from_arrow(schema, &partition_cols, 50_000_000).unwrap();
+            let mut ctx = begin_split_from_arrow(schema, &partition_cols, 50_000_000, None).unwrap();
 
             // All rows have same partition value
             let batch = partitioned_batch(
@@ -789,7 +866,7 @@ mod tests {
         runtime.block_on(async {
             let schema = partitioned_schema();
             let partition_cols = vec!["event_date".to_string()];
-            let mut ctx = begin_split_from_arrow(schema, &partition_cols, 50_000_000).unwrap();
+            let mut ctx = begin_split_from_arrow(schema, &partition_cols, 50_000_000, None).unwrap();
 
             // 3 distinct partition values
             let batch = partitioned_batch(
@@ -820,7 +897,7 @@ mod tests {
         runtime.block_on(async {
             let schema = partitioned_schema();
             let partition_cols = vec!["event_date".to_string()];
-            let mut ctx = begin_split_from_arrow(schema, &partition_cols, 50_000_000).unwrap();
+            let mut ctx = begin_split_from_arrow(schema, &partition_cols, 50_000_000, None).unwrap();
 
             // Batch 1: partition A rows
             let batch1 = partitioned_batch(
@@ -869,7 +946,7 @@ mod tests {
     fn test_partition_columns_excluded_from_index() {
         let schema = partitioned_schema();
         let partition_cols = vec!["event_date".to_string()];
-        let ctx = begin_split_from_arrow(schema, &partition_cols, 50_000_000).unwrap();
+        let ctx = begin_split_from_arrow(schema, &partition_cols, 50_000_000, None).unwrap();
 
         // event_date should NOT be in the tantivy schema (it's a partition column)
         assert!(ctx.tantivy_schema.get_field("event_date").is_err());
@@ -898,7 +975,7 @@ mod tests {
                 ArrowField::new("region", DataType::Utf8, false),
             ]);
             let partition_cols = vec!["event_date".to_string(), "region".to_string()];
-            let mut ctx = begin_split_from_arrow(schema, &partition_cols, 50_000_000).unwrap();
+            let mut ctx = begin_split_from_arrow(schema, &partition_cols, 50_000_000, None).unwrap();
 
             let batch = RecordBatch::try_new(
                 Arc::new(ArrowSchema::new(vec![
