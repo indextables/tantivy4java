@@ -1561,6 +1561,30 @@ public class QuickwitSplit {
     }
 
     /**
+     * Finalize ALL partition splits, returning raw result maps from the native layer.
+     * Each map contains all fields from finishAllSplits plus optional statistics:
+     * <ul>
+     *   <li>"minValues" → Map&lt;String, String&gt; per-column min values (present if stats enabled via fieldConfigJson)</li>
+     *   <li>"maxValues" → Map&lt;String, String&gt; per-column max values (present if stats enabled via fieldConfigJson)</li>
+     *   <li>"partitionKey", "splitPath", "splitId", "numDocs", "footerStartOffset", "footerEndOffset",
+     *       "docMappingJson", "uncompressedSizeBytes", "hotcacheStartOffset", "hotcacheLength",
+     *       "createTimestamp", "maturity", "numMergeOps", "deleteOpstamp", "partitionValues"</li>
+     * </ul>
+     *
+     * @param handle from beginSplitFromArrow
+     * @param outputDir base directory for output split files
+     * @return list of raw result maps, one per partition (or one for non-partitioned). Empty list on error.
+     */
+    @SuppressWarnings("unchecked")
+    public static List<Map<String, Object>> finishAllSplitsRaw(long handle, String outputDir) {
+        Object raw = nativeFinishAllSplits(handle, outputDir);
+        if (raw == null) {
+            return new ArrayList<>();
+        }
+        return (List<Map<String, Object>>) raw;
+    }
+
+    /**
      * Roll (finalize) one partition's current split and start a new writer for it.
      * This enables maxRowsPerSplit support: when a partition reaches its row limit,
      * call this to produce a split file and continue writing into a fresh index.

@@ -26,7 +26,7 @@ use super::indexing::{arrow_row_to_tantivy_doc, add_arrow_value_to_doc, add_stri
 use super::manifest::FastFieldMode;
 use super::name_mapping::NameMapping;
 use super::schema_derivation::{SchemaDerivationConfig, derive_tantivy_schema_with_mapping};
-use super::statistics::StatisticsAccumulator;
+use super::statistics::{StatisticsAccumulator, ColumnStatisticsResult};
 use super::string_indexing::StringIndexingMode;
 use crate::quickwit_split::{
     SplitConfig, QuickwitSplitMetadata, FooterOffsets,
@@ -68,6 +68,9 @@ pub(crate) struct ArrowFfiSplitContext {
     output_dir: Option<String>,
     /// Splits that were auto-rolled during addArrowBatch due to max_docs_per_split threshold.
     pub(crate) rolled_splits: Vec<PartitionSplitResult>,
+    /// Column names for which to compute min/max statistics (empty = none).
+    /// Populated from the "stats" flag in fieldConfigJson.
+    stats_columns: std::collections::HashSet<String>,
 }
 
 /// Per-partition state: each partition gets its own Index + IndexWriter + temp dir.
@@ -78,6 +81,8 @@ struct PartitionWriter {
     doc_count: u64,
     /// Partition column values for this partition (col_name → string value)
     partition_values: HashMap<String, String>,
+    /// Per-column statistics accumulators (populated when stats_columns is non-empty)
+    accumulators: HashMap<String, StatisticsAccumulator>,
 }
 
 struct FieldMapping {
@@ -98,6 +103,10 @@ pub(crate) struct PartitionSplitResult {
     pub split_path: String,
     /// Split metadata
     pub metadata: QuickwitSplitMetadata,
+    /// Per-column min values (column name → string representation). Empty if stats not enabled.
+    pub min_values: HashMap<String, String>,
+    /// Per-column max values (column name → string representation). Empty if stats not enabled.
+    pub max_values: HashMap<String, String>,
 }
 
 /// Import an Arrow schema from an FFI pointer, taking ownership.
@@ -149,7 +158,14 @@ pub(crate) fn import_arrow_batch(
 /// - "ip" → ip_address_fields
 /// - "text" with tokenizer → tokenizer_overrides (defaults to "default" if no tokenizer specified)
 /// - "text" with tokenizer "raw" → no override (raw is already the default)
-pub(crate) fn parse_field_config_json(json_str: &str) -> Result<SchemaDerivationConfig> {
+/// Result of parsing field config JSON: schema derivation config + stats column set.
+pub(crate) struct FieldConfigParseResult {
+    pub config: SchemaDerivationConfig,
+    /// Column names that have "stats": true. Empty if no stats requested.
+    pub stats_columns: std::collections::HashSet<String>,
+}
+
+pub(crate) fn parse_field_config_json(json_str: &str) -> Result<FieldConfigParseResult> {
     let fields: Vec<serde_json::Value> = serde_json::from_str(json_str)
         .context("Failed to parse field config JSON array")?;
 
@@ -158,6 +174,7 @@ pub(crate) fn parse_field_config_json(json_str: &str) -> Result<SchemaDerivation
         store_fields: true,                       // Standard splits: docs stored in tantivy
         ..Default::default()
     };
+    let mut stats_columns = std::collections::HashSet::new();
 
     for field_obj in &fields {
         let name = field_obj.get("name")
@@ -168,6 +185,11 @@ pub(crate) fn parse_field_config_json(json_str: &str) -> Result<SchemaDerivation
             .and_then(|v| v.as_str())
             .unwrap_or("");
 
+        // Check "stats" flag (defaults to false)
+        if field_obj.get("stats").and_then(|v| v.as_bool()).unwrap_or(false) {
+            stats_columns.insert(name.to_string());
+        }
+
         match field_type {
             "json" => {
                 config.json_fields.insert(name.to_string());
@@ -176,28 +198,23 @@ pub(crate) fn parse_field_config_json(json_str: &str) -> Result<SchemaDerivation
                 config.ip_address_fields.insert(name.to_string());
             }
             "text" => {
-                // Text fields need a tokenizer for full-text search.
-                // Default to "default" tokenizer (which lowercases + tokenizes).
                 let tokenizer = field_obj.get("tokenizer")
                     .and_then(|v| v.as_str())
                     .unwrap_or("default");
-                // Only add override if not "raw" (raw is already the schema derivation default)
                 if tokenizer != "raw" {
                     config.tokenizer_overrides.insert(name.to_string(), tokenizer.to_string());
                 }
             }
-            // For other types (i64, f64, bool, datetime, bytes, string, etc.)
-            // the Arrow type mapping handles them correctly already.
             _ => {}
         }
     }
 
     debug_println!(
-        "ARROW_FFI_IMPORT: Parsed field config: {} json fields, {} ip fields, {} tokenizer overrides",
-        config.json_fields.len(), config.ip_address_fields.len(), config.tokenizer_overrides.len()
+        "ARROW_FFI_IMPORT: Parsed field config: {} json fields, {} ip fields, {} tokenizer overrides, {} stats columns",
+        config.json_fields.len(), config.ip_address_fields.len(), config.tokenizer_overrides.len(), stats_columns.len()
     );
 
-    Ok(config)
+    Ok(FieldConfigParseResult { config, stats_columns })
 }
 
 /// Begin creating splits from Arrow columnar data.
@@ -217,13 +234,16 @@ pub(crate) fn begin_split_from_arrow(
     output_dir: Option<String>,
 ) -> Result<ArrowFfiSplitContext> {
     // Parse field config if provided, otherwise use defaults
-    let config = match field_config_json {
-        Some(json) if !json.is_empty() => parse_field_config_json(json)?,
-        _ => SchemaDerivationConfig {
-            fast_field_mode: FastFieldMode::Disabled, // All fields get fast access
-            store_fields: true,                       // Standard splits: docs stored in tantivy
+    let (config, stats_columns) = match field_config_json {
+        Some(json) if !json.is_empty() => {
+            let parsed = parse_field_config_json(json)?;
+            (parsed.config, parsed.stats_columns)
+        }
+        _ => (SchemaDerivationConfig {
+            fast_field_mode: FastFieldMode::Disabled,
+            store_fields: true,
             ..Default::default()
-        },
+        }, std::collections::HashSet::new()),
     };
 
     // Identify partition column indices
@@ -271,7 +291,7 @@ pub(crate) fn begin_split_from_arrow(
 
     // For non-partitioned tables, create single writer immediately
     let default_writer = if partition_col_names.is_empty() {
-        Some(create_partition_writer(&tantivy_schema, heap_size, HashMap::new())?)
+        Some(create_partition_writer(&tantivy_schema, heap_size, HashMap::new(), &stats_columns, &field_mapping)?)
     } else {
         None
     };
@@ -291,14 +311,18 @@ pub(crate) fn begin_split_from_arrow(
         max_docs_per_split,
         output_dir,
         rolled_splits: Vec::new(),
+        stats_columns,
     })
 }
 
 /// Create a new PartitionWriter with its own temp dir, Index, and single-threaded IndexWriter.
+/// If `stats_columns` is non-empty, initializes StatisticsAccumulators for each eligible column.
 fn create_partition_writer(
     tantivy_schema: &TantivySchema,
     heap_size: usize,
     partition_values: HashMap<String, String>,
+    stats_columns: &std::collections::HashSet<String>,
+    field_mapping: &[FieldMapping],
 ) -> Result<PartitionWriter> {
     let index_dir = tempfile::tempdir()
         .context("Failed to create temp directory for partition writer")?;
@@ -314,12 +338,35 @@ fn create_partition_writer(
     let writer = index.writer_with_num_threads(1, heap_size)
         .context("Failed to create index writer for partition")?;
 
+    // Initialize statistics accumulators for requested columns
+    let mut accumulators = HashMap::new();
+    if !stats_columns.is_empty() {
+        for mapping in field_mapping {
+            if stats_columns.contains(&mapping.field_name) {
+                let field_type = match &mapping.data_type {
+                    DataType::Int32 | DataType::Int64 => "i64",
+                    DataType::Float32 | DataType::Float64 => "f64",
+                    DataType::Boolean => "bool",
+                    DataType::Utf8 | DataType::LargeUtf8 => "text",
+                    DataType::Date32 => "datetime",
+                    DataType::Timestamp(_, _) => "datetime",
+                    _ => continue, // Skip non-eligible types
+                };
+                accumulators.insert(
+                    mapping.field_name.clone(),
+                    StatisticsAccumulator::new(&mapping.field_name, field_type, 0),
+                );
+            }
+        }
+    }
+
     Ok(PartitionWriter {
         index,
         writer,
         index_dir,
         doc_count: 0,
         partition_values,
+        accumulators,
     })
 }
 
@@ -440,7 +487,6 @@ pub(crate) async fn add_arrow_batch(ctx: &mut ArrowFfiSplitContext, batch: &Reco
     let name_mapping: NameMapping = HashMap::new();
     let schema_derivation_config = &ctx.schema_config;
     let string_hash_fields: HashMap<String, String> = HashMap::new();
-    let mut accumulators: HashMap<String, StatisticsAccumulator> = HashMap::new();
     let string_indexing_modes: HashMap<String, StringIndexingMode> = HashMap::new();
     let compiled_regexes: HashMap<String, regex::Regex> = HashMap::new();
 
@@ -463,7 +509,7 @@ pub(crate) async fn add_arrow_batch(ctx: &mut ArrowFfiSplitContext, batch: &Reco
                 &name_mapping,
                 schema_derivation_config,
                 &string_hash_fields,
-                &mut accumulators,
+                &mut pw.accumulators,
                 &string_indexing_modes,
                 &compiled_regexes,
             )?;
@@ -486,7 +532,8 @@ pub(crate) async fn add_arrow_batch(ctx: &mut ArrowFfiSplitContext, batch: &Reco
                 );
                 ctx.rolled_splits.push(result);
                 ctx.default_writer = Some(create_partition_writer(
-                    &ctx.tantivy_schema, ctx.heap_size, HashMap::new())?);
+                    &ctx.tantivy_schema, ctx.heap_size, HashMap::new(),
+                    &ctx.stats_columns, &ctx.field_mapping)?);
             }
         }
     } else {
@@ -505,7 +552,8 @@ pub(crate) async fn add_arrow_batch(ctx: &mut ArrowFfiSplitContext, batch: &Reco
                 for (name, value) in ctx.partition_col_names.iter().zip(partition_values_vec.iter()) {
                     partition_values_map.insert(name.clone(), value.clone());
                 }
-                let pw = create_partition_writer(&ctx.tantivy_schema, ctx.heap_size, partition_values_map)?;
+                let pw = create_partition_writer(&ctx.tantivy_schema, ctx.heap_size, partition_values_map,
+                    &ctx.stats_columns, &ctx.field_mapping)?;
                 ctx.partition_writers.insert(partition_key.clone(), pw);
                 debug_println!("ARROW_FFI_IMPORT: Created new partition writer for '{}'", partition_key);
             }
@@ -520,7 +568,7 @@ pub(crate) async fn add_arrow_batch(ctx: &mut ArrowFfiSplitContext, batch: &Reco
                     &name_mapping,
                     schema_derivation_config,
                     &string_hash_fields,
-                    &mut accumulators,
+                    &mut pw.accumulators,
                     &string_indexing_modes,
                     &compiled_regexes,
                 )?;
@@ -548,7 +596,8 @@ pub(crate) async fn add_arrow_batch(ctx: &mut ArrowFfiSplitContext, batch: &Reco
                         );
                         ctx.rolled_splits.push(result);
                         let new_pw = create_partition_writer(
-                            &ctx.tantivy_schema, ctx.heap_size, partition_values)?;
+                            &ctx.tantivy_schema, ctx.heap_size, partition_values,
+                            &ctx.stats_columns, &ctx.field_mapping)?;
                         ctx.partition_writers.insert(partition_key.clone(), new_pw);
                     }
                 }
@@ -682,9 +731,40 @@ async fn finalize_partition_writer_into_split(
     metadata.hotcache_start_offset = Some(footer.hotcache_start_offset);
     metadata.hotcache_length = Some(footer.hotcache_length);
 
+    // Finalize statistics accumulators into string min/max maps
+    let mut min_values = HashMap::new();
+    let mut max_values = HashMap::new();
+    for (col_name, acc) in pw.accumulators.drain() {
+        let stats = acc.finalize();
+        // Convert typed min/max to string representation
+        if let Some(v) = stats.min_long {
+            min_values.insert(col_name.clone(), v.to_string());
+        } else if let Some(v) = stats.min_double {
+            min_values.insert(col_name.clone(), v.to_string());
+        } else if let Some(v) = &stats.min_string {
+            min_values.insert(col_name.clone(), v.clone());
+        } else if let Some(v) = stats.min_timestamp_micros {
+            min_values.insert(col_name.clone(), v.to_string());
+        } else if let Some(v) = stats.min_bool {
+            min_values.insert(col_name.clone(), v.to_string());
+        }
+
+        if let Some(v) = stats.max_long {
+            max_values.insert(col_name.clone(), v.to_string());
+        } else if let Some(v) = stats.max_double {
+            max_values.insert(col_name.clone(), v.to_string());
+        } else if let Some(v) = &stats.max_string {
+            max_values.insert(col_name.clone(), v.clone());
+        } else if let Some(v) = stats.max_timestamp_micros {
+            max_values.insert(col_name.clone(), v.to_string());
+        } else if let Some(v) = stats.max_bool {
+            max_values.insert(col_name.clone(), v.to_string());
+        }
+    }
+
     debug_println!(
-        "ARROW_FFI_IMPORT: Finalized partition '{}' with {} docs → {}",
-        partition_key, num_docs, output_path.display()
+        "ARROW_FFI_IMPORT: Finalized partition '{}' with {} docs → {} (stats: {} min, {} max)",
+        partition_key, num_docs, output_path.display(), min_values.len(), max_values.len()
     );
 
     Ok(PartitionSplitResult {
@@ -692,6 +772,8 @@ async fn finalize_partition_writer_into_split(
         partition_values,
         split_path: output_path.to_string_lossy().to_string(),
         metadata,
+        min_values,
+        max_values,
     })
 }
 
@@ -846,6 +928,35 @@ pub(crate) async fn roll_partition_split(
     metadata.hotcache_start_offset = Some(footer.hotcache_start_offset);
     metadata.hotcache_length = Some(footer.hotcache_length);
 
+    // Finalize statistics accumulators from the rolled writer
+    let mut min_values = HashMap::new();
+    let mut max_values = HashMap::new();
+    for (col_name, acc) in pw.accumulators.drain() {
+        let stats = acc.finalize();
+        if let Some(v) = stats.min_long {
+            min_values.insert(col_name.clone(), v.to_string());
+        } else if let Some(v) = stats.min_double {
+            min_values.insert(col_name.clone(), v.to_string());
+        } else if let Some(v) = &stats.min_string {
+            min_values.insert(col_name.clone(), v.clone());
+        } else if let Some(v) = stats.min_timestamp_micros {
+            min_values.insert(col_name.clone(), v.to_string());
+        } else if let Some(v) = stats.min_bool {
+            min_values.insert(col_name.clone(), v.to_string());
+        }
+        if let Some(v) = stats.max_long {
+            max_values.insert(col_name.clone(), v.to_string());
+        } else if let Some(v) = stats.max_double {
+            max_values.insert(col_name.clone(), v.to_string());
+        } else if let Some(v) = &stats.max_string {
+            max_values.insert(col_name.clone(), v.clone());
+        } else if let Some(v) = stats.max_timestamp_micros {
+            max_values.insert(col_name.clone(), v.to_string());
+        } else if let Some(v) = stats.max_bool {
+            max_values.insert(col_name.clone(), v.to_string());
+        }
+    }
+
     debug_println!(
         "ARROW_FFI_IMPORT: Rolled partition '{}' with {} docs → {}",
         partition_key, num_docs, output_path.display()
@@ -854,10 +965,12 @@ pub(crate) async fn roll_partition_split(
     // Create a fresh writer for this partition so writing can continue
     if partition_key.is_empty() {
         ctx.default_writer = Some(create_partition_writer(
-            &ctx.tantivy_schema, ctx.heap_size, HashMap::new())?);
+            &ctx.tantivy_schema, ctx.heap_size, HashMap::new(),
+            &ctx.stats_columns, &ctx.field_mapping)?);
     } else {
         let new_pw = create_partition_writer(
-            &ctx.tantivy_schema, ctx.heap_size, partition_values.clone())?;
+            &ctx.tantivy_schema, ctx.heap_size, partition_values.clone(),
+            &ctx.stats_columns, &ctx.field_mapping)?;
         ctx.partition_writers.insert(partition_key.to_string(), new_pw);
     }
 
@@ -866,6 +979,8 @@ pub(crate) async fn roll_partition_split(
         partition_values,
         split_path: output_path.to_string_lossy().to_string(),
         metadata,
+        min_values,
+        max_values,
     })
 }
 
@@ -1279,6 +1394,132 @@ mod tests {
             assert!(keys.contains(&"event_date=2023-01-15/region=us"));
             assert!(keys.contains(&"event_date=2023-01-15/region=eu"));
             assert!(keys.contains(&"event_date=2023-01-16/region=us"));
+        });
+    }
+
+    #[test]
+    fn test_statistics_basic() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let schema = test_schema();
+            let field_config = r#"[
+                {"name": "id", "type": "i64", "stats": true},
+                {"name": "name", "type": "text", "tokenizer": "raw", "stats": true},
+                {"name": "score", "type": "f64", "stats": true},
+                {"name": "active", "type": "bool", "stats": true}
+            ]"#;
+
+            let mut ctx = begin_split_from_arrow(
+                schema, &[], 50_000_000, Some(field_config), 0, None,
+            ).unwrap();
+
+            // Add batch: ids 0..5, names name_0..name_4, scores 0.0..6.0, active alternating
+            let batch = test_batch(5, 0);
+            add_arrow_batch(&mut ctx, &batch).await.unwrap();
+
+            // Add batch: ids 10..15
+            let batch2 = test_batch(5, 10);
+            add_arrow_batch(&mut ctx, &batch2).await.unwrap();
+
+            let output_dir = tempfile::tempdir().unwrap();
+            let split_config = default_split_config("test", "test-source", "test-node");
+            let results = finish_all_splits(ctx, output_dir.path().to_str().unwrap(), &split_config).await.unwrap();
+
+            assert_eq!(results.len(), 1);
+            let result = &results[0];
+
+            // Verify min/max statistics
+            assert_eq!(result.min_values.get("id"), Some(&"0".to_string()));
+            assert_eq!(result.max_values.get("id"), Some(&"14".to_string()));
+
+            assert_eq!(result.min_values.get("score"), Some(&"0".to_string()));
+            // max score: batch1 has 0,1.5,3,4.5,6; batch2 has 10,11.5,13,14.5,16
+            assert_eq!(result.max_values.get("score"), Some(&"16".to_string()));
+
+            // name_0 < name_10 < name_14 etc (lexicographic)
+            assert!(result.min_values.contains_key("name"));
+            assert!(result.max_values.contains_key("name"));
+
+            // bool: false and true both present
+            assert_eq!(result.min_values.get("active"), Some(&"false".to_string()));
+            assert_eq!(result.max_values.get("active"), Some(&"true".to_string()));
+        });
+    }
+
+    #[test]
+    fn test_statistics_not_enabled() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let schema = test_schema();
+            // No stats flags
+            let mut ctx = begin_split_from_arrow(
+                schema, &[], 50_000_000, None, 0, None,
+            ).unwrap();
+
+            let batch = test_batch(5, 0);
+            add_arrow_batch(&mut ctx, &batch).await.unwrap();
+
+            let output_dir = tempfile::tempdir().unwrap();
+            let split_config = default_split_config("test", "test-source", "test-node");
+            let results = finish_all_splits(ctx, output_dir.path().to_str().unwrap(), &split_config).await.unwrap();
+
+            assert_eq!(results.len(), 1);
+            // No statistics when not enabled
+            assert!(results[0].min_values.is_empty());
+            assert!(results[0].max_values.is_empty());
+        });
+    }
+
+    #[test]
+    fn test_statistics_partitioned() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let schema = partitioned_schema();
+            let field_config = r#"[
+                {"name": "id", "type": "i64", "stats": true},
+                {"name": "name", "type": "text", "tokenizer": "raw", "stats": true}
+            ]"#;
+
+            let mut ctx = begin_split_from_arrow(
+                schema,
+                &["event_date".to_string()],
+                50_000_000,
+                Some(field_config),
+                0, None,
+            ).unwrap();
+
+            let batch = partitioned_batch(
+                vec![1, 2, 3, 4],
+                vec!["alice", "bob", "charlie", "dave"],
+                vec!["2023-01-15", "2023-01-15", "2023-01-16", "2023-01-16"],
+            );
+            add_arrow_batch(&mut ctx, &batch).await.unwrap();
+
+            let output_dir = tempfile::tempdir().unwrap();
+            let split_config = default_split_config("test", "test-source", "test-node");
+            let results = finish_all_splits(ctx, output_dir.path().to_str().unwrap(), &split_config).await.unwrap();
+
+            assert_eq!(results.len(), 2);
+
+            // Each partition should have its own statistics
+            for result in &results {
+                assert!(!result.min_values.is_empty());
+                assert!(!result.max_values.is_empty());
+                assert!(result.min_values.contains_key("id"));
+                assert!(result.max_values.contains_key("id"));
+                assert!(result.min_values.contains_key("name"));
+                assert!(result.max_values.contains_key("name"));
+            }
+
+            // Find partition for 2023-01-15 (ids 1, 2)
+            let p1 = results.iter().find(|r| r.partition_key == "event_date=2023-01-15").unwrap();
+            assert_eq!(p1.min_values.get("id"), Some(&"1".to_string()));
+            assert_eq!(p1.max_values.get("id"), Some(&"2".to_string()));
+
+            // Find partition for 2023-01-16 (ids 3, 4)
+            let p2 = results.iter().find(|r| r.partition_key == "event_date=2023-01-16").unwrap();
+            assert_eq!(p2.min_values.get("id"), Some(&"3".to_string()));
+            assert_eq!(p2.max_values.get("id"), Some(&"4".to_string()));
         });
     }
 }

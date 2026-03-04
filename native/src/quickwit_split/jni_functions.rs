@@ -1942,6 +1942,38 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_merge_QuickwitSpli
                 "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
                 &[JValue::Object(&pv_key.into()), JValue::Object(&pv_map)])?;
 
+            // minValues as nested HashMap<String, String>
+            if !result.min_values.is_empty() {
+                let min_map = env.new_object(&hash_map_class, "()V", &[])?;
+                for (col, val) in &result.min_values {
+                    let col_jstr = string_to_jstring(env, col)?;
+                    let val_jstr = string_to_jstring(env, val)?;
+                    env.call_method(&min_map, "put",
+                        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+                        &[JValue::Object(&col_jstr.into()), JValue::Object(&val_jstr.into())])?;
+                }
+                let min_key = string_to_jstring(env, "minValues")?;
+                env.call_method(&map, "put",
+                    "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+                    &[JValue::Object(&min_key.into()), JValue::Object(&min_map)])?;
+            }
+
+            // maxValues as nested HashMap<String, String>
+            if !result.max_values.is_empty() {
+                let max_map = env.new_object(&hash_map_class, "()V", &[])?;
+                for (col, val) in &result.max_values {
+                    let col_jstr = string_to_jstring(env, col)?;
+                    let val_jstr = string_to_jstring(env, val)?;
+                    env.call_method(&max_map, "put",
+                        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+                        &[JValue::Object(&col_jstr.into()), JValue::Object(&val_jstr.into())])?;
+                }
+                let max_key = string_to_jstring(env, "maxValues")?;
+                env.call_method(&map, "put",
+                    "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+                    &[JValue::Object(&max_key.into()), JValue::Object(&max_map)])?;
+            }
+
             // Add map to result list
             env.call_method(&result_list, "add",
                 "(Ljava/lang/Object;)Z",
@@ -2107,6 +2139,38 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_merge_QuickwitSpli
         env.call_method(&map, "put",
             "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
             &[JValue::Object(&pv_key.into()), JValue::Object(&pv_map)])?;
+
+        // minValues as nested HashMap<String, String>
+        if !result.min_values.is_empty() {
+            let min_map = env.new_object(&hash_map_class, "()V", &[])?;
+            for (col, val) in &result.min_values {
+                let col_jstr = string_to_jstring(env, col)?;
+                let val_jstr = string_to_jstring(env, val)?;
+                env.call_method(&min_map, "put",
+                    "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+                    &[JValue::Object(&col_jstr.into()), JValue::Object(&val_jstr.into())])?;
+            }
+            let min_key = string_to_jstring(env, "minValues")?;
+            env.call_method(&map, "put",
+                "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+                &[JValue::Object(&min_key.into()), JValue::Object(&min_map)])?;
+        }
+
+        // maxValues as nested HashMap<String, String>
+        if !result.max_values.is_empty() {
+            let max_map = env.new_object(&hash_map_class, "()V", &[])?;
+            for (col, val) in &result.max_values {
+                let col_jstr = string_to_jstring(env, col)?;
+                let val_jstr = string_to_jstring(env, val)?;
+                env.call_method(&max_map, "put",
+                    "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+                    &[JValue::Object(&col_jstr.into()), JValue::Object(&val_jstr.into())])?;
+            }
+            let max_key = string_to_jstring(env, "maxValues")?;
+            env.call_method(&map, "put",
+                "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+                &[JValue::Object(&max_key.into()), JValue::Object(&max_map)])?;
+        }
 
         Ok(map.into_raw())
     }).unwrap_or(std::ptr::null_mut())
