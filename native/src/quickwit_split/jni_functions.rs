@@ -1837,6 +1837,15 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_merge_QuickwitSpli
                 "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
                 &[JValue::Object(&footer_end_key.into()), JValue::Object(&footer_end_obj)])?;
 
+            // docMappingJson (may be None if extraction failed)
+            if let Some(ref doc_mapping_json) = result.metadata.doc_mapping_json {
+                let dmj_jstr = string_to_jstring(env, doc_mapping_json)?;
+                let dmj_key = string_to_jstring(env, "docMappingJson")?;
+                env.call_method(&map, "put",
+                    "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+                    &[JValue::Object(&dmj_key.into()), JValue::Object(&dmj_jstr.into())])?;
+            }
+
             // partitionValues as nested HashMap
             let pv_map = env.new_object(&hash_map_class, "()V", &[])?;
             for (col, val) in &result.partition_values {

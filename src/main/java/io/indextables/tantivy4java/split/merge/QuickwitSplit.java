@@ -1360,10 +1360,12 @@ public class QuickwitSplit {
         private final long numDocs;
         private final long footerStartOffset;
         private final long footerEndOffset;
+        private final String docMappingJson;
 
         public PartitionSplitResult(String partitionKey, Map<String, String> partitionValues,
                                     String splitPath, String splitId, long numDocs,
-                                    long footerStartOffset, long footerEndOffset) {
+                                    long footerStartOffset, long footerEndOffset,
+                                    String docMappingJson) {
             this.partitionKey = partitionKey;
             this.partitionValues = partitionValues;
             this.splitPath = splitPath;
@@ -1371,6 +1373,7 @@ public class QuickwitSplit {
             this.numDocs = numDocs;
             this.footerStartOffset = footerStartOffset;
             this.footerEndOffset = footerEndOffset;
+            this.docMappingJson = docMappingJson;
         }
 
         /** Partition key (e.g. "event_date=2023-01-15/region=us"), empty for non-partitioned */
@@ -1387,6 +1390,8 @@ public class QuickwitSplit {
         public long getFooterStartOffset() { return footerStartOffset; }
         /** Footer end offset in the split file */
         public long getFooterEndOffset() { return footerEndOffset; }
+        /** Doc mapping JSON with field metadata (fast, indexed, stored, type info). May be null. */
+        public String getDocMappingJson() { return docMappingJson; }
 
         @Override
         public String toString() {
@@ -1448,10 +1453,11 @@ public class QuickwitSplit {
             long numDocs = ((Long) map.get("numDocs"));
             long footerStartOffset = ((Long) map.get("footerStartOffset"));
             long footerEndOffset = ((Long) map.get("footerEndOffset"));
+            String docMappingJson = (String) map.get("docMappingJson");
 
             results.add(new PartitionSplitResult(
                 partitionKey, partitionValues, splitPath, splitId, numDocs,
-                footerStartOffset, footerEndOffset));
+                footerStartOffset, footerEndOffset, docMappingJson));
         }
         return results;
     }
