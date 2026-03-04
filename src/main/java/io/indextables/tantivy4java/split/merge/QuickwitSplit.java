@@ -1442,7 +1442,7 @@ public class QuickwitSplit {
      * @return opaque handle for subsequent addBatch/finish/cancel calls
      */
     public static long beginSplitFromArrow(long schemaAddr, String[] partitionColumns, long heapSize) {
-        return nativeBeginSplitFromArrow(schemaAddr, partitionColumns, heapSize, null);
+        return nativeBeginSplitFromArrow(schemaAddr, partitionColumns, heapSize, null, 0, null);
     }
 
     /**
@@ -1474,7 +1474,33 @@ public class QuickwitSplit {
      */
     public static long beginSplitFromArrow(long schemaAddr, String[] partitionColumns,
                                             long heapSize, String fieldConfigJson) {
-        return nativeBeginSplitFromArrow(schemaAddr, partitionColumns, heapSize, fieldConfigJson);
+        return nativeBeginSplitFromArrow(schemaAddr, partitionColumns, heapSize, fieldConfigJson, 0, null);
+    }
+
+    /**
+     * Begin creating splits from Arrow columnar data with field configuration and split rolling.
+     * <p>
+     * When maxDocsPerSplit is set (> 0), partitions are automatically rolled (finalized into
+     * split files) when their document count reaches the threshold. Rolled splits are accumulated
+     * internally and returned together with remaining splits by finishAllSplits().
+     * The rolling is handled inside Rust since the caller cannot see per-partition doc counts.
+     * <p>
+     * outputDir must be provided when maxDocsPerSplit > 0, as Rust needs to know where to
+     * write rolled split files during addArrowBatch calls.
+     *
+     * @param schemaAddr memory address of FFI_ArrowSchema struct
+     * @param partitionColumns partition column names (empty array for non-partitioned tables)
+     * @param heapSize tantivy writer heap size per partition
+     * @param fieldConfigJson JSON array of per-field configuration, or null for defaults
+     * @param maxDocsPerSplit max documents per split (0 = unlimited, no auto-rolling)
+     * @param outputDir base directory for auto-rolled split files (required when maxDocsPerSplit > 0)
+     * @return opaque handle for subsequent addBatch/finish/cancel calls
+     */
+    public static long beginSplitFromArrow(long schemaAddr, String[] partitionColumns,
+                                            long heapSize, String fieldConfigJson,
+                                            long maxDocsPerSplit, String outputDir) {
+        return nativeBeginSplitFromArrow(schemaAddr, partitionColumns, heapSize, fieldConfigJson,
+                                          maxDocsPerSplit, outputDir);
     }
 
     /**
@@ -1535,6 +1561,50 @@ public class QuickwitSplit {
     }
 
     /**
+     * Roll (finalize) one partition's current split and start a new writer for it.
+     * This enables maxRowsPerSplit support: when a partition reaches its row limit,
+     * call this to produce a split file and continue writing into a fresh index.
+     * <p>
+     * For non-partitioned tables, pass an empty string as partitionKey.
+     * The handle remains valid for continued addArrowBatch calls after rolling.
+     *
+     * @param handle from beginSplitFromArrow
+     * @param partitionKey partition key to roll (e.g. "event_date=2023-01-15"), or "" for non-partitioned
+     * @param outputDir base directory for the output split file
+     * @return the finalized split's result
+     */
+    @SuppressWarnings("unchecked")
+    public static PartitionSplitResult rollPartitionSplit(long handle, String partitionKey, String outputDir) {
+        Object raw = nativeRollPartitionSplit(handle, partitionKey, outputDir);
+        if (raw == null) {
+            return null;
+        }
+        Map<String, Object> map = (Map<String, Object>) raw;
+        String pk = (String) map.get("partitionKey");
+        @SuppressWarnings("unchecked")
+        Map<String, String> partitionValues = (Map<String, String>) map.get("partitionValues");
+        String splitPath = (String) map.get("splitPath");
+        String splitId = (String) map.get("splitId");
+        long numDocs = ((Long) map.get("numDocs"));
+        long footerStartOffset = ((Long) map.get("footerStartOffset"));
+        long footerEndOffset = ((Long) map.get("footerEndOffset"));
+        String docMappingJson = (String) map.get("docMappingJson");
+        long uncompressedSizeBytes = map.containsKey("uncompressedSizeBytes") ? ((Long) map.get("uncompressedSizeBytes")) : 0L;
+        long hotcacheStartOffset = map.containsKey("hotcacheStartOffset") ? ((Long) map.get("hotcacheStartOffset")) : 0L;
+        long hotcacheLength = map.containsKey("hotcacheLength") ? ((Long) map.get("hotcacheLength")) : 0L;
+        long createTimestamp = map.containsKey("createTimestamp") ? ((Long) map.get("createTimestamp")) : 0L;
+        String maturity = (String) map.getOrDefault("maturity", "Mature");
+        int numMergeOps = map.containsKey("numMergeOps") ? ((Long) map.get("numMergeOps")).intValue() : 0;
+        long deleteOpstamp = map.containsKey("deleteOpstamp") ? ((Long) map.get("deleteOpstamp")) : 0L;
+
+        return new PartitionSplitResult(
+            pk, partitionValues, splitPath, splitId, numDocs,
+            footerStartOffset, footerEndOffset, docMappingJson,
+            uncompressedSizeBytes, hotcacheStartOffset, hotcacheLength,
+            createTimestamp, maturity, numMergeOps, deleteOpstamp);
+    }
+
+    /**
      * Cancel an in-progress split creation, releasing ALL resources across all partitions.
      * @param handle from beginSplitFromArrow
      */
@@ -1553,9 +1623,10 @@ public class QuickwitSplit {
     private static native Object nativeCreateFromParquet(List<String> parquetFiles, String outputPath, String configJson);
 
     // Arrow FFI split creation native methods
-    private static native long nativeBeginSplitFromArrow(long schemaAddr, String[] partitionColumns, long heapSize, String fieldConfigJson);
+    private static native long nativeBeginSplitFromArrow(long schemaAddr, String[] partitionColumns, long heapSize, String fieldConfigJson, long maxDocsPerSplit, String outputDir);
     private static native long nativeAddArrowBatch(long handle, long arrayAddr, long schemaAddr);
     private static native Object nativeFinishAllSplits(long handle, String outputDir);
+    private static native Object nativeRollPartitionSplit(long handle, String partitionKey, String outputDir);
     private static native void nativeCancelSplit(long handle);
 
     /**
