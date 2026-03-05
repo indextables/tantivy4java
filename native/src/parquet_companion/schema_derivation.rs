@@ -146,7 +146,8 @@ fn add_field_for_arrow_type(
     if config.json_fields.contains(name) {
         match data_type {
             DataType::Utf8 | DataType::LargeUtf8 => {
-                // STRING column forced to JSON: stored + indexed with "default" tokenizer
+                // STRING column forced to JSON: stored + indexed + fast
+                // Fast fields are required for range queries on numeric sub-fields
                 let opts = JsonObjectOptions::default()
                     .set_stored()
                     .set_indexing_options(
@@ -154,7 +155,8 @@ fn add_field_for_arrow_type(
                             .set_tokenizer("default")
                             .set_index_option(IndexRecordOption::Basic)
                             .set_fieldnorms(config.fieldnorms_enabled),
-                    );
+                    )
+                    .set_fast(None);
                 builder.add_json_field(name, opts);
                 return Ok(());
             }
@@ -337,6 +339,8 @@ fn add_field_for_arrow_type(
         }
 
         DataType::List(_) | DataType::LargeList(_) | DataType::Map(_, _) | DataType::Struct(_) => {
+            // Complex types → JSON object field: stored + indexed + fast
+            // Fast fields are required for range queries on numeric sub-fields
             let opts = JsonObjectOptions::default()
                 .set_stored()
                 .set_indexing_options(
@@ -344,7 +348,8 @@ fn add_field_for_arrow_type(
                         .set_tokenizer("default")
                         .set_index_option(IndexRecordOption::Basic)
                         .set_fieldnorms(config.fieldnorms_enabled),
-                );
+                )
+                .set_fast(None);
             builder.add_json_field(name, opts);
         }
 
@@ -1086,20 +1091,20 @@ mod tests {
     }
 
     #[test]
-    fn test_json_fields_not_fast() {
-        // JSON fields should never be fast (same as complex types like List/Map/Struct)
+    fn test_json_fields_are_fast() {
+        // JSON fields must be fast to support range queries on numeric sub-fields
         let arrow = ArrowSchema::new(vec![
             Field::new("payload", DataType::Utf8, true),
         ]);
         let mut config = SchemaDerivationConfig::default();
-        config.fast_field_mode = FastFieldMode::Disabled; // All native fast
+        config.fast_field_mode = FastFieldMode::Disabled;
         config.json_fields.insert("payload".to_string());
 
         let schema = derive_tantivy_schema(&arrow, &config).unwrap();
 
         let payload_field = schema.get_field("payload").unwrap();
         let payload_entry = schema.get_field_entry(payload_field);
-        assert!(!payload_entry.is_fast(), "JSON fields should not be fast");
+        assert!(payload_entry.is_fast(), "JSON fields should be fast for range queries on sub-fields");
     }
 
     #[test]
