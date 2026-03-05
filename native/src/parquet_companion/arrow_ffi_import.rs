@@ -352,6 +352,9 @@ fn create_partition_writer(
                     DataType::Timestamp(_, _) => "datetime",
                     _ => continue, // Skip non-eligible types
                 };
+                // truncate_length=0 means no truncation at the native layer.
+                // The JVM side applies StatisticsTruncation before writing to
+                // the transaction log (default: 32 chars, configurable).
                 accumulators.insert(
                     mapping.field_name.clone(),
                     StatisticsAccumulator::new(&mapping.field_name, field_type, 0),
