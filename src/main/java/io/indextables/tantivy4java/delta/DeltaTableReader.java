@@ -498,6 +498,77 @@ public class DeltaTableReader {
                 partPath, predicateJson, columnMappingJson, arrayAddrs, schemaAddrs);
     }
 
+    // ── Streaming / incremental version methods ───────────────────────────────
+
+    /**
+     * Return the current (latest committed) version of a Delta table.
+     *
+     * <p>Cost: one GET (_last_checkpoint) + O(k) HEAD probes where k is the number of
+     * post-checkpoint commits (typically 0–10). No parquet reads. Safe to call on
+     * every streaming poll cycle.
+     *
+     * @param tableUrl table location (local path, file://, s3://, or azure://)
+     * @param config   credential and storage configuration
+     * @return current version number
+     * @throws RuntimeException if the table has no commits or the native call fails
+     */
+    public static long getCurrentVersion(String tableUrl, Map<String, String> config) {
+        if (tableUrl == null || tableUrl.isEmpty()) {
+            throw new IllegalArgumentException("tableUrl must not be null or empty");
+        }
+        long version = nativeGetCurrentVersion(tableUrl,
+                config != null ? config : Collections.emptyMap());
+        if (version < 0) {
+            throw new RuntimeException("Native getCurrentVersion returned error (check preceding exception)");
+        }
+        return version;
+    }
+
+    /**
+     * Return file changes between two Delta table versions.
+     *
+     * <p>Reads commit JSON files for versions {@code (fromVersion+1 .. toVersion]} and
+     * applies log replay (latest action per path wins). No checkpoint parquet is read.
+     *
+     * <p>If {@code snapshotInfo} is non-null and has column mapping, partition value keys
+     * in the returned added files are translated from physical to logical names.
+     *
+     * @param tableUrl     table location
+     * @param config       credential and storage configuration
+     * @param fromVersion  exclusive lower bound (changes AFTER this version are returned)
+     * @param toVersion    inclusive upper bound
+     * @param snapshotInfo snapshot info containing column name mapping (may be null)
+     * @return changes (added files and removed paths) between the two versions
+     */
+    public static DeltaLogChanges getChangesBetween(
+            String tableUrl, Map<String, String> config,
+            long fromVersion, long toVersion,
+            DeltaSnapshotInfo snapshotInfo) {
+        if (tableUrl == null || tableUrl.isEmpty()) {
+            throw new IllegalArgumentException("tableUrl must not be null or empty");
+        }
+        if (fromVersion < 0 || toVersion < 0) {
+            throw new IllegalArgumentException("fromVersion and toVersion must be non-negative");
+        }
+
+        String columnMappingJson = snapshotInfo != null ? snapshotInfo.getColumnNameMappingJson() : null;
+        byte[] bytes = nativeGetChangesBetween(tableUrl,
+                config != null ? config : Collections.emptyMap(),
+                fromVersion, toVersion, columnMappingJson);
+
+        if (bytes == null) {
+            throw new RuntimeException("Native getChangesBetween returned null (check preceding exception)");
+        }
+
+        ByteBuffer buffer = ByteBuffer.wrap(bytes);
+        buffer.order(ByteOrder.nativeOrder());
+
+        BatchDocumentReader reader = new BatchDocumentReader();
+        List<Map<String, Object>> maps = reader.parseToMaps(buffer);
+
+        return DeltaLogChanges.fromMaps(maps);
+    }
+
     // ── Native methods ───────────────────────────────────────────────────────
 
     private static native byte[] nativeListFiles(String tableUrl, long version, Map<String, String> config, boolean compact, String predicateJson);
@@ -506,4 +577,6 @@ public class DeltaTableReader {
     private static native byte[] nativeReadCheckpointPart(String tableUrl, Map<String, String> config, String partPath, String predicateJson, String columnMappingJson);
     private static native byte[] nativeReadPostCheckpointChanges(String tableUrl, Map<String, String> config, List<String> commitPaths, String predicateJson, String columnMappingJson);
     private static native int nativeReadCheckpointPartArrowFfi(String tableUrl, Map<String, String> config, String partPath, String predicateJson, String columnMappingJson, long[] arrayAddrs, long[] schemaAddrs);
+    private static native long nativeGetCurrentVersion(String tableUrl, Map<String, String> config);
+    private static native byte[] nativeGetChangesBetween(String tableUrl, Map<String, String> config, long fromVersion, long toVersion, String columnMappingJson);
 }

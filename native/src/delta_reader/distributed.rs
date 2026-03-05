@@ -4,10 +4,12 @@
 // by splitting the work into lightweight driver-side metadata discovery and
 // parallelizable executor-side checkpoint part reading.
 //
-// Three primitives:
+// Five primitives:
 //   1. get_snapshot_info()         — Driver: reads _last_checkpoint + lists commits
 //   2. read_checkpoint_part()      — Executor: reads ONE checkpoint parquet part
 //   3. read_post_checkpoint_changes() — Driver: reads post-checkpoint JSON commits
+//   4. get_current_version()       — Cheap version check (HEAD probes only, no parquet)
+//   5. get_changes_between()       — Incremental changes between two versions
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -221,6 +223,87 @@ pub fn read_post_checkpoint_changes(
     })
 }
 
+/// Get the current (latest committed) version of a Delta table.
+///
+/// Cost: 1 GET (_last_checkpoint) + O(k) HEAD probes where k = post-checkpoint commits.
+/// No parquet reads. Safe to call on every streaming poll cycle.
+///
+/// Returns the version number of the most recently committed transaction.
+pub fn get_current_version(
+    url_str: &str,
+    config: &DeltaStorageConfig,
+) -> Result<u64> {
+    debug_println!("🔧 DELTA_DIST: get_current_version url={}", url_str);
+
+    let url = normalize_url(url_str)?;
+    let store = create_object_store(&url, config)?;
+    let log_prefix = delta_log_prefix(&url);
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+
+    rt.block_on(async {
+        let checkpoint_info = read_last_checkpoint(&store, &log_prefix).await?;
+
+        let base_version = match checkpoint_info {
+            Some(cp) => cp.version,
+            None => {
+                // No checkpoint — probe from version 0 to find the latest
+                find_latest_version_from_zero(&store, &log_prefix).await?
+                    .ok_or_else(|| anyhow::anyhow!(
+                        "No commits found in Delta table {}", url_str
+                    ))?
+            }
+        };
+
+        let commit_files = list_commit_files_after(&store, &log_prefix, base_version).await?;
+        let current_version = base_version + commit_files.len() as u64;
+
+        debug_println!(
+            "🔧 DELTA_DIST: Current version={} (checkpoint={}, +{} commits)",
+            current_version, base_version, commit_files.len()
+        );
+
+        Ok(current_version)
+    })
+}
+
+/// Get file changes between two Delta table versions (exclusive of from, inclusive of to).
+///
+/// Reads commit JSON files for versions `(from_version+1 ..= to_version)` and applies
+/// log replay (latest action per path wins). Does NOT read any checkpoint parquet.
+///
+/// If `column_mapping` is non-empty, partition value keys in added files are
+/// translated from physical to logical names.
+///
+/// Returns an empty `DeltaLogChanges` if `from_version >= to_version`.
+pub fn get_changes_between(
+    url_str: &str,
+    config: &DeltaStorageConfig,
+    from_version: u64,
+    to_version: u64,
+    column_mapping: &HashMap<String, String>,
+) -> Result<DeltaLogChanges> {
+    debug_println!(
+        "🔧 DELTA_DIST: get_changes_between url={}, from={}, to={}",
+        url_str, from_version, to_version
+    );
+
+    if from_version >= to_version {
+        return Ok(DeltaLogChanges {
+            added_files: Vec::new(),
+            removed_paths: HashSet::new(),
+        });
+    }
+
+    let commit_paths: Vec<String> = (from_version + 1..=to_version)
+        .map(|v| format!("{:020}.json", v))
+        .collect();
+
+    read_post_checkpoint_changes(url_str, config, &commit_paths, column_mapping)
+}
+
 // ─── Internal async functions ───────────────────────────────────────────────
 
 /// Read and parse _delta_log/_last_checkpoint.
@@ -319,6 +402,26 @@ async fn list_commit_files_after(
     );
 
     Ok(commit_files)
+}
+
+/// Find the current version of a table that has no _last_checkpoint.
+///
+/// Checks if version 0 exists, then counts how many sequential versions follow.
+/// Returns None if no commit files exist at all (empty or uninitialized table).
+async fn find_latest_version_from_zero(
+    store: &Arc<dyn ObjectStore>,
+    log_prefix: &str,
+) -> Result<Option<u64>> {
+    let v0_path = ObjectPath::from(format!("{}/{:020}.json", log_prefix, 0u64));
+    match store.head(&v0_path).await {
+        Ok(_) => {
+            // Version 0 exists; count how many more come after it
+            let subsequent = list_commit_files_after(store, log_prefix, 0).await?;
+            Ok(Some(subsequent.len() as u64))
+        }
+        Err(object_store::Error::NotFound { .. }) => Ok(None),
+        Err(e) => Err(anyhow::anyhow!("Failed to check version 0 of Delta log: {}", e)),
+    }
 }
 
 /// Read metaData from the first checkpoint part (column-projected, single row).
@@ -1514,5 +1617,112 @@ mod tests {
 
         let mapping = parse_column_mapping_json(Some(""));
         assert!(mapping.is_empty());
+    }
+
+    #[test]
+    fn test_get_current_version_no_commits() {
+        // A table directory with no commit files should return an error
+        let tmp = tempfile::tempdir().unwrap();
+        let table_dir = tmp.path().join("empty_table");
+        let delta_log = table_dir.join("_delta_log");
+        std::fs::create_dir_all(&delta_log).unwrap();
+
+        let config = DeltaStorageConfig::default();
+        let url = format!("file://{}", table_dir.display());
+        let result = get_current_version(&url, &config);
+        assert!(result.is_err(), "Expected error for empty table");
+    }
+
+    #[test]
+    fn test_get_current_version_from_commits_only() {
+        // Table with commits but no checkpoint
+        let tmp = tempfile::tempdir().unwrap();
+        let table_dir = tmp.path().join("no_checkpoint_table");
+        let delta_log = table_dir.join("_delta_log");
+        std::fs::create_dir_all(&delta_log).unwrap();
+
+        // Write 3 commit files: versions 0, 1, 2
+        for v in 0u64..=2 {
+            let commit_path = delta_log.join(format!("{:020}.json", v));
+            std::fs::write(&commit_path, format!(
+                r#"{{"add":{{"path":"part-{}.parquet","size":100,"modificationTime":0,"dataChange":true}}}}"#,
+                v
+            )).unwrap();
+        }
+
+        let config = DeltaStorageConfig::default();
+        let url = format!("file://{}", table_dir.display());
+        let version = get_current_version(&url, &config).unwrap();
+        assert_eq!(version, 2, "Expected current version 2");
+    }
+
+    #[test]
+    fn test_get_changes_between_same_version() {
+        // from == to should return empty changes without touching the filesystem
+        let config = DeltaStorageConfig::default();
+        let changes = get_changes_between(
+            "file:///tmp/nonexistent",
+            &config,
+            5,
+            5,
+            &HashMap::new(),
+        ).unwrap();
+        assert!(changes.added_files.is_empty());
+        assert!(changes.removed_paths.is_empty());
+    }
+
+    #[test]
+    fn test_get_changes_between_from_exceeds_to() {
+        // from > to should also return empty (no-op)
+        let config = DeltaStorageConfig::default();
+        let changes = get_changes_between(
+            "file:///tmp/nonexistent",
+            &config,
+            10,
+            5,
+            &HashMap::new(),
+        ).unwrap();
+        assert!(changes.added_files.is_empty());
+        assert!(changes.removed_paths.is_empty());
+    }
+
+    #[test]
+    fn test_get_changes_between_local() {
+        // Write 4 commit files; read changes from version 1 to 3 (commits 2 and 3)
+        let tmp = tempfile::tempdir().unwrap();
+        let table_dir = tmp.path().join("changes_table");
+        let delta_log = table_dir.join("_delta_log");
+        std::fs::create_dir_all(&delta_log).unwrap();
+
+        // Version 0: initial
+        std::fs::write(delta_log.join(format!("{:020}.json", 0u64)),
+            r#"{"add":{"path":"part-0.parquet","size":100,"modificationTime":0,"dataChange":true,"partitionValues":{}}}"#
+        ).unwrap();
+        // Version 1: add part-1
+        std::fs::write(delta_log.join(format!("{:020}.json", 1u64)),
+            r#"{"add":{"path":"part-1.parquet","size":200,"modificationTime":0,"dataChange":true,"partitionValues":{}}}"#
+        ).unwrap();
+        // Version 2: add part-2, remove part-0
+        std::fs::write(delta_log.join(format!("{:020}.json", 2u64)),
+            "{\"add\":{\"path\":\"part-2.parquet\",\"size\":300,\"modificationTime\":0,\"dataChange\":true,\"partitionValues\":{}}}\n{\"remove\":{\"path\":\"part-0.parquet\",\"deletionTimestamp\":0,\"dataChange\":true}}"
+        ).unwrap();
+        // Version 3: add part-3
+        std::fs::write(delta_log.join(format!("{:020}.json", 3u64)),
+            r#"{"add":{"path":"part-3.parquet","size":400,"modificationTime":0,"dataChange":true,"partitionValues":{}}}"#
+        ).unwrap();
+
+        let config = DeltaStorageConfig::default();
+        let url = format!("file://{}", table_dir.display());
+
+        // Changes from version 1 to 3 should include part-2, part-3 as added
+        // and part-0 as removed (from version 2's remove action)
+        let changes = get_changes_between(&url, &config, 1, 3, &HashMap::new()).unwrap();
+
+        let added_paths: std::collections::HashSet<String> =
+            changes.added_files.iter().map(|e| e.path.clone()).collect();
+        assert!(added_paths.contains("part-2.parquet"), "Expected part-2.parquet in added");
+        assert!(added_paths.contains("part-3.parquet"), "Expected part-3.parquet in added");
+        assert!(!added_paths.contains("part-1.parquet"), "part-1 is before from_version");
+        assert!(changes.removed_paths.contains("part-0.parquet"), "Expected part-0.parquet in removed");
     }
 }
