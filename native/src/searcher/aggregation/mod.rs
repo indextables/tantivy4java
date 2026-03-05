@@ -7,7 +7,7 @@
 mod bucket_results;
 mod byte_parsing;
 mod deserialize;
-mod json_helpers;
+pub(crate) mod json_helpers;
 mod metric_results;
 mod sub_aggregations;
 

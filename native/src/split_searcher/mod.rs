@@ -14,7 +14,9 @@ pub mod jni_lifecycle;
 pub mod jni_search;
 pub mod jni_prewarm;
 pub mod jni_utils;
+pub mod jni_agg_arrow;
 pub mod async_impl;
+pub mod aggregation_arrow_ffi;
 
 // Re-exports - items used by other modules in the crate
 pub(crate) use types::CachedSearcherContext;

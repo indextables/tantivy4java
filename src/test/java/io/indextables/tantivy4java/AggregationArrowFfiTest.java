@@ -1,0 +1,611 @@
+package io.indextables.tantivy4java;
+
+import io.indextables.tantivy4java.core.*;
+import io.indextables.tantivy4java.split.*;
+import io.indextables.tantivy4java.split.merge.*;
+
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.io.TempDir;
+import static org.junit.jupiter.api.Assertions.*;
+
+import java.nio.file.Path;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
+import java.util.*;
+
+/**
+ * Test suite for Aggregation Arrow FFI export.
+ *
+ * Tests the new API that executes aggregations, optionally across multiple splits,
+ * merges intermediate results in Rust, and returns the final result as an Arrow
+ * RecordBatch via the C Data Interface.
+ *
+ * Uses a native read-back helper (nativeReadAggArrowColumnsAsJson) to validate
+ * actual column data values through the FFI round-trip.
+ */
+public class AggregationArrowFfiTest {
+
+    private SplitCacheManager cacheManager;
+    private SplitSearcher searcher;
+    private String splitPath;
+
+    @TempDir
+    Path tempDir;
+
+    @BeforeEach
+    public void setUp() throws Exception {
+        String uniqueId = "agg_arrow_ffi_" + System.nanoTime();
+        String indexPath = tempDir.resolve(uniqueId + "_index").toString();
+        splitPath = tempDir.resolve(uniqueId + ".split").toString();
+
+        try (SchemaBuilder builder = new SchemaBuilder()) {
+            builder
+                .addTextField("status", true, true, "raw", "position")
+                .addTextField("category", true, true, "raw", "position")
+                .addIntegerField("score", true, true, true)
+                .addIntegerField("count", true, true, true)
+                .addDateField("timestamp", true, true, true);
+
+            try (Schema schema = builder.build()) {
+                try (Index index = new Index(schema, indexPath, false)) {
+                    try (IndexWriter writer = index.writer(Index.Memory.DEFAULT_HEAP_SIZE, 1)) {
+                        addDoc(writer, "ok", "A", 85, 1, "2024-01-01T00:00:00Z");
+                        addDoc(writer, "ok", "A", 75, 2, "2024-01-02T00:00:00Z");
+                        addDoc(writer, "ok", "B", 95, 3, "2024-01-03T00:00:00Z");
+                        addDoc(writer, "error", "B", 60, 4, "2024-02-01T00:00:00Z");
+                        addDoc(writer, "error", "A", 90, 5, "2024-02-02T00:00:00Z");
+                        writer.commit();
+                    }
+
+                    QuickwitSplit.SplitConfig config = new QuickwitSplit.SplitConfig(
+                        uniqueId, "test-source", "test-node");
+                    QuickwitSplit.SplitMetadata metadata =
+                        QuickwitSplit.convertIndexFromPath(indexPath, splitPath, config);
+
+                    String uniqueCacheName = uniqueId + "-cache";
+                    SplitCacheManager.CacheConfig cacheConfig =
+                        new SplitCacheManager.CacheConfig(uniqueCacheName);
+                    cacheManager = SplitCacheManager.getInstance(cacheConfig);
+                    searcher = cacheManager.createSplitSearcher("file://" + splitPath, metadata);
+                }
+            }
+        }
+    }
+
+    @AfterEach
+    public void tearDown() {
+        if (searcher != null) searcher.close();
+    }
+
+    private void addDoc(IndexWriter writer, String status, String category, int score, int count,
+                        String timestamp) throws Exception {
+        try (Document doc = new Document()) {
+            doc.addText("status", status);
+            doc.addText("category", category);
+            doc.addInteger("score", score);
+            doc.addInteger("count", count);
+            LocalDateTime dt = LocalDateTime.parse(timestamp, DateTimeFormatter.ISO_DATE_TIME);
+            doc.addDate("timestamp", dt);
+            writer.addDocument(doc);
+        }
+    }
+
+    // ---- Native read-back helper ----
+    private static native String nativeReadAggArrowColumnsAsJson(
+        long[] arrayAddrs, long[] schemaAddrs, int numCols, int numRows);
+
+    // ---- Schema Query Tests ----
+
+    @Test
+    @DisplayName("Schema query for terms aggregation returns correct structure")
+    public void testSchemaQueryTerms() {
+        String queryAst = "{\"type\":\"match_all\"}";
+        String aggJson = "{\"status_terms\":{\"terms\":{\"field\":\"status\",\"size\":100}}}";
+
+        String schemaJson = searcher.getAggregationArrowSchema(queryAst, "status_terms", aggJson);
+        assertNotNull(schemaJson, "Schema JSON should not be null");
+
+        assertTrue(schemaJson.contains("\"key\""), "Should have key column");
+        assertTrue(schemaJson.contains("\"doc_count\""), "Should have doc_count column");
+        assertTrue(schemaJson.contains("\"row_count\":2"), "Should have 2 rows");
+    }
+
+    @Test
+    @DisplayName("Schema query for stats aggregation returns 5 metric columns")
+    public void testSchemaQueryStats() {
+        String queryAst = "{\"type\":\"match_all\"}";
+        String aggJson = "{\"score_stats\":{\"stats\":{\"field\":\"score\"}}}";
+
+        String schemaJson = searcher.getAggregationArrowSchema(queryAst, "score_stats", aggJson);
+        assertNotNull(schemaJson);
+
+        assertTrue(schemaJson.contains("\"count\""), "Should have count column");
+        assertTrue(schemaJson.contains("\"sum\""), "Should have sum column");
+        assertTrue(schemaJson.contains("\"min\""), "Should have min column");
+        assertTrue(schemaJson.contains("\"max\""), "Should have max column");
+        assertTrue(schemaJson.contains("\"avg\""), "Should have avg column");
+        assertTrue(schemaJson.contains("\"row_count\":1"), "Stats should have 1 row");
+    }
+
+    @Test
+    @DisplayName("Schema query for histogram aggregation")
+    public void testSchemaQueryHistogram() {
+        String queryAst = "{\"type\":\"match_all\"}";
+        String aggJson = "{\"score_hist\":{\"histogram\":{\"field\":\"score\",\"interval\":20}}}";
+
+        String schemaJson = searcher.getAggregationArrowSchema(queryAst, "score_hist", aggJson);
+        assertNotNull(schemaJson);
+
+        assertTrue(schemaJson.contains("\"key\""), "Should have key column");
+        assertTrue(schemaJson.contains("\"doc_count\""), "Should have doc_count column");
+        assertFalse(schemaJson.contains("\"row_count\":0"), "Should have at least 1 bucket");
+    }
+
+    @Test
+    @DisplayName("Schema query for terms with sub-aggregation")
+    public void testSchemaQueryTermsWithSubAgg() {
+        String queryAst = "{\"type\":\"match_all\"}";
+        String aggJson = "{\"status_terms\":{\"terms\":{\"field\":\"status\",\"size\":100}," +
+            "\"aggs\":{\"avg_score\":{\"avg\":{\"field\":\"score\"}}}}}";
+
+        String schemaJson = searcher.getAggregationArrowSchema(queryAst, "status_terms", aggJson);
+        assertNotNull(schemaJson);
+
+        assertTrue(schemaJson.contains("\"key\""), "Should have key column");
+        assertTrue(schemaJson.contains("\"doc_count\""), "Should have doc_count column");
+        assertTrue(schemaJson.contains("\"avg_score\""), "Should have avg_score sub-agg column");
+    }
+
+    // ---- Single-Split Arrow FFI Tests with Data Validation ----
+
+    @Test
+    @DisplayName("Single-split terms aggregation: verify row count and column data via FFI")
+    public void testSingleSplitTermsFfi() {
+        String queryAst = "{\"type\":\"match_all\"}";
+        String aggJson = "{\"status_terms\":{\"terms\":{\"field\":\"status\",\"size\":100}}}";
+
+        int numCols = 2;
+        long[] arrayAddrs = new long[numCols];
+        long[] schemaAddrs = new long[numCols];
+        allocateFfiBuffers(arrayAddrs, schemaAddrs, numCols);
+        try {
+            int rowCount = searcher.aggregateArrowFfi(queryAst, "status_terms", aggJson,
+                    arrayAddrs, schemaAddrs);
+            assertEquals(2, rowCount, "Should have 2 rows (ok, error)");
+
+            // Read back actual column data
+            String json = nativeReadAggArrowColumnsAsJson(arrayAddrs, schemaAddrs, numCols, rowCount);
+            assertNotNull(json, "Read-back JSON should not be null");
+
+            // Parse and validate
+            Map<String, Object> result = parseJson(json);
+            List<Map<String, Object>> columns = getColumns(result);
+            assertEquals(2, columns.size());
+
+            // Key column
+            assertEquals("key", columns.get(0).get("name"));
+            List<?> keys = (List<?>) columns.get(0).get("values");
+            assertTrue(keys.contains("ok"), "Should contain 'ok' key");
+            assertTrue(keys.contains("error"), "Should contain 'error' key");
+
+            // Doc count column
+            assertEquals("doc_count", columns.get(1).get("name"));
+            List<?> counts = (List<?>) columns.get(1).get("values");
+            // ok=3 docs, error=2 docs — order may vary by tantivy
+            long okIndex = keys.indexOf("ok");
+            long errorIndex = keys.indexOf("error");
+            assertEquals(3L, ((Number) counts.get((int) okIndex)).longValue(), "ok should have 3 docs");
+            assertEquals(2L, ((Number) counts.get((int) errorIndex)).longValue(), "error should have 2 docs");
+        } finally {
+            freeFfiBuffers(arrayAddrs, schemaAddrs, numCols);
+        }
+    }
+
+    @Test
+    @DisplayName("Single-split stats aggregation: verify metric values via FFI")
+    public void testSingleSplitStatsFfi() {
+        String queryAst = "{\"type\":\"match_all\"}";
+        String aggJson = "{\"score_stats\":{\"stats\":{\"field\":\"score\"}}}";
+
+        int numCols = 5; // count, sum, min, max, avg
+        long[] arrayAddrs = new long[numCols];
+        long[] schemaAddrs = new long[numCols];
+        allocateFfiBuffers(arrayAddrs, schemaAddrs, numCols);
+        try {
+            int rowCount = searcher.aggregateArrowFfi(queryAst, "score_stats", aggJson,
+                    arrayAddrs, schemaAddrs);
+            assertEquals(1, rowCount, "Stats should have exactly 1 row");
+
+            // Read back actual data
+            String json = nativeReadAggArrowColumnsAsJson(arrayAddrs, schemaAddrs, numCols, rowCount);
+            Map<String, Object> result = parseJson(json);
+            List<Map<String, Object>> columns = getColumns(result);
+            assertEquals(5, columns.size());
+
+            // scores: 85, 75, 95, 60, 90
+            // count=5, sum=405, min=60, max=95, avg=81
+            Map<String, Object> colMap = columnsByName(columns);
+            assertEquals(5L, getSingleLong(colMap, "count"), "count should be 5");
+            assertEquals(405.0, getSingleDouble(colMap, "sum"), 0.1, "sum should be 405");
+            assertEquals(60.0, getSingleDouble(colMap, "min"), 0.1, "min should be 60");
+            assertEquals(95.0, getSingleDouble(colMap, "max"), 0.1, "max should be 95");
+            assertEquals(81.0, getSingleDouble(colMap, "avg"), 0.1, "avg should be 81");
+        } finally {
+            freeFfiBuffers(arrayAddrs, schemaAddrs, numCols);
+        }
+    }
+
+    @Test
+    @DisplayName("Single-split histogram aggregation: verify bucket data via FFI")
+    public void testSingleSplitHistogramFfi() {
+        String queryAst = "{\"type\":\"match_all\"}";
+        String aggJson = "{\"score_hist\":{\"histogram\":{\"field\":\"score\",\"interval\":20}}}";
+
+        int numCols = 2; // key, doc_count
+        long[] arrayAddrs = new long[numCols];
+        long[] schemaAddrs = new long[numCols];
+        allocateFfiBuffers(arrayAddrs, schemaAddrs, numCols);
+        try {
+            int rowCount = searcher.aggregateArrowFfi(queryAst, "score_hist", aggJson,
+                    arrayAddrs, schemaAddrs);
+            assertTrue(rowCount > 0, "Histogram should have at least 1 bucket");
+
+            String json = nativeReadAggArrowColumnsAsJson(arrayAddrs, schemaAddrs, numCols, rowCount);
+            Map<String, Object> result = parseJson(json);
+            List<Map<String, Object>> columns = getColumns(result);
+
+            // Verify bucket keys are Float64 and doc_counts are Int64
+            assertEquals("key", columns.get(0).get("name"));
+            List<?> keys = (List<?>) columns.get(0).get("values");
+            List<?> counts = (List<?>) columns.get(1).get("values");
+
+            // Total doc count across all buckets should be 5
+            long totalDocs = 0;
+            for (Object c : counts) {
+                totalDocs += ((Number) c).longValue();
+            }
+            assertEquals(5, totalDocs, "Total docs across histogram buckets should be 5");
+        } finally {
+            freeFfiBuffers(arrayAddrs, schemaAddrs, numCols);
+        }
+    }
+
+    @Test
+    @DisplayName("Single-split terms with sub-aggregation: verify flattened columns via FFI")
+    public void testSingleSplitTermsWithSubAggFfi() {
+        String queryAst = "{\"type\":\"match_all\"}";
+        String aggJson = "{\"status_terms\":{\"terms\":{\"field\":\"status\",\"size\":100}," +
+            "\"aggs\":{\"avg_score\":{\"avg\":{\"field\":\"score\"}}}}}";
+
+        int numCols = 3; // key, doc_count, avg_score
+        long[] arrayAddrs = new long[numCols];
+        long[] schemaAddrs = new long[numCols];
+        allocateFfiBuffers(arrayAddrs, schemaAddrs, numCols);
+        try {
+            int rowCount = searcher.aggregateArrowFfi(queryAst, "status_terms", aggJson,
+                    arrayAddrs, schemaAddrs);
+            assertEquals(2, rowCount, "Should have 2 term buckets");
+
+            String json = nativeReadAggArrowColumnsAsJson(arrayAddrs, schemaAddrs, numCols, rowCount);
+            Map<String, Object> result = parseJson(json);
+            List<Map<String, Object>> columns = getColumns(result);
+            assertEquals(3, columns.size(), "Should have 3 columns: key, doc_count, avg_score");
+
+            // Find columns by name
+            Map<String, Object> colMap = columnsByName(columns);
+            assertNotNull(colMap.get("key"), "Should have key column");
+            assertNotNull(colMap.get("doc_count"), "Should have doc_count column");
+            assertNotNull(colMap.get("avg_score"), "Should have avg_score sub-agg column");
+
+            // Validate sub-agg values
+            List<?> keys = getColumnValues(colMap, "key");
+            List<?> avgScores = getColumnValues(colMap, "avg_score");
+            int okIdx = keys.indexOf("ok");
+            int errorIdx = keys.indexOf("error");
+            assertTrue(okIdx >= 0 && errorIdx >= 0, "Both keys should be present");
+
+            // ok: scores 85, 75, 95 → avg = 85.0
+            double okAvg = ((Number) avgScores.get(okIdx)).doubleValue();
+            assertEquals(85.0, okAvg, 0.1, "ok avg_score should be 85.0");
+
+            // error: scores 60, 90 → avg = 75.0
+            double errorAvg = ((Number) avgScores.get(errorIdx)).doubleValue();
+            assertEquals(75.0, errorAvg, 0.1, "error avg_score should be 75.0");
+        } finally {
+            freeFfiBuffers(arrayAddrs, schemaAddrs, numCols);
+        }
+    }
+
+    @Test
+    @DisplayName("Single-split date_histogram aggregation: verify timestamp buckets via FFI")
+    public void testSingleSplitDateHistogramFfi() {
+        String queryAst = "{\"type\":\"match_all\"}";
+        // Monthly buckets: should produce 2 buckets (Jan 2024, Feb 2024)
+        String aggJson = "{\"ts_hist\":{\"date_histogram\":{\"field\":\"timestamp\"," +
+            "\"fixed_interval\":\"30d\"}}}";
+
+        // Schema query first to verify it's a date histogram
+        String schemaJson = searcher.getAggregationArrowSchema(queryAst, "ts_hist", aggJson);
+        assertNotNull(schemaJson);
+        assertTrue(schemaJson.contains("\"key\""), "Should have key column");
+        assertTrue(schemaJson.contains("\"doc_count\""), "Should have doc_count column");
+
+        int numCols = 2;
+        long[] arrayAddrs = new long[numCols];
+        long[] schemaAddrs = new long[numCols];
+        allocateFfiBuffers(arrayAddrs, schemaAddrs, numCols);
+        try {
+            int rowCount = searcher.aggregateArrowFfi(queryAst, "ts_hist", aggJson,
+                    arrayAddrs, schemaAddrs);
+            assertTrue(rowCount > 0, "Date histogram should have at least 1 bucket");
+
+            String json = nativeReadAggArrowColumnsAsJson(arrayAddrs, schemaAddrs, numCols, rowCount);
+            Map<String, Object> result = parseJson(json);
+            List<Map<String, Object>> columns = getColumns(result);
+
+            // Key column should be Timestamp(Microsecond)
+            String keyType = (String) columns.get(0).get("type");
+            assertTrue(keyType.contains("Timestamp"), "Key should be Timestamp type, got: " + keyType);
+
+            // doc_count column
+            List<?> counts = (List<?>) columns.get(1).get("values");
+            long totalDocs = 0;
+            for (Object c : counts) {
+                totalDocs += ((Number) c).longValue();
+            }
+            assertEquals(5, totalDocs, "Total docs across date histogram buckets should be 5");
+        } finally {
+            freeFfiBuffers(arrayAddrs, schemaAddrs, numCols);
+        }
+    }
+
+    @Test
+    @DisplayName("Empty result returns 0 rows gracefully")
+    public void testEmptyResult() {
+        String queryAst = "{\"type\":\"term\",\"field\":\"status\",\"value\":\"nonexistent\"}";
+        String aggJson = "{\"status_terms\":{\"terms\":{\"field\":\"status\",\"size\":100}}}";
+
+        int numCols = 2;
+        long[] arrayAddrs = new long[numCols];
+        long[] schemaAddrs = new long[numCols];
+        allocateFfiBuffers(arrayAddrs, schemaAddrs, numCols);
+        try {
+            int rowCount = searcher.aggregateArrowFfi(queryAst, "status_terms", aggJson,
+                    arrayAddrs, schemaAddrs);
+            assertEquals(0, rowCount, "No matching docs should produce 0 buckets");
+        } finally {
+            freeFfiBuffers(arrayAddrs, schemaAddrs, numCols);
+        }
+    }
+
+    // ---- Multi-Split Tests with Value Verification ----
+
+    @Test
+    @DisplayName("Multi-split terms merge: verify combined doc_count values")
+    public void testMultiSplitTermsMerge() throws Exception {
+        String uniqueId2 = "agg_arrow_ffi2_" + System.nanoTime();
+        String indexPath2 = tempDir.resolve(uniqueId2 + "_index").toString();
+        String splitPath2 = tempDir.resolve(uniqueId2 + ".split").toString();
+
+        try (SchemaBuilder builder = new SchemaBuilder()) {
+            builder
+                .addTextField("status", true, true, "raw", "position")
+                .addTextField("category", true, true, "raw", "position")
+                .addIntegerField("score", true, true, true)
+                .addIntegerField("count", true, true, true)
+                .addDateField("timestamp", true, true, true);
+
+            try (Schema schema = builder.build()) {
+                try (Index index = new Index(schema, indexPath2, false)) {
+                    try (IndexWriter writer = index.writer(Index.Memory.DEFAULT_HEAP_SIZE, 1)) {
+                        addDoc(writer, "ok", "C", 50, 6, "2024-03-01T00:00:00Z");
+                        addDoc(writer, "error", "C", 40, 7, "2024-03-02T00:00:00Z");
+                        addDoc(writer, "error", "D", 30, 8, "2024-03-03T00:00:00Z");
+                        writer.commit();
+                    }
+
+                    QuickwitSplit.SplitConfig config2 = new QuickwitSplit.SplitConfig(
+                        uniqueId2, "test-source", "test-node");
+                    QuickwitSplit.SplitMetadata metadata2 =
+                        QuickwitSplit.convertIndexFromPath(indexPath2, splitPath2, config2);
+
+                    SplitSearcher searcher2 = cacheManager.createSplitSearcher(
+                        "file://" + splitPath2, metadata2);
+
+                    try {
+                        String queryAst = "{\"type\":\"match_all\"}";
+                        String aggJson = "{\"status_terms\":{\"terms\":{\"field\":\"status\",\"size\":100}}}";
+
+                        int numCols = 2;
+                        long[] arrayAddrs = new long[numCols];
+                        long[] schemaAddrs = new long[numCols];
+                        allocateFfiBuffers(arrayAddrs, schemaAddrs, numCols);
+                        try {
+                            int rowCount = cacheManager.multiSplitAggregateArrowFfi(
+                                java.util.Arrays.asList(searcher, searcher2),
+                                queryAst, "status_terms", aggJson,
+                                arrayAddrs, schemaAddrs);
+                            assertEquals(2, rowCount,
+                                "Merged terms should have 2 unique keys (ok, error)");
+
+                            // Verify actual merged values
+                            String json = nativeReadAggArrowColumnsAsJson(
+                                arrayAddrs, schemaAddrs, numCols, rowCount);
+                            Map<String, Object> result = parseJson(json);
+                            List<Map<String, Object>> columns = getColumns(result);
+
+                            List<?> keys = (List<?>) columns.get(0).get("values");
+                            List<?> counts = (List<?>) columns.get(1).get("values");
+
+                            int okIdx = keys.indexOf("ok");
+                            int errorIdx = keys.indexOf("error");
+                            assertTrue(okIdx >= 0 && errorIdx >= 0);
+
+                            // Split 1: ok=3, error=2; Split 2: ok=1, error=2
+                            // Merged: ok=4, error=4
+                            assertEquals(4L, ((Number) counts.get(okIdx)).longValue(),
+                                "Merged ok count should be 4 (3+1)");
+                            assertEquals(4L, ((Number) counts.get(errorIdx)).longValue(),
+                                "Merged error count should be 4 (2+2)");
+                        } finally {
+                            freeFfiBuffers(arrayAddrs, schemaAddrs, numCols);
+                        }
+                    } finally {
+                        searcher2.close();
+                    }
+                }
+            }
+        }
+    }
+
+    @Test
+    @DisplayName("Multi-split stats merge: verify combined metric values")
+    public void testMultiSplitStatsMerge() throws Exception {
+        String uniqueId2 = "agg_arrow_stats2_" + System.nanoTime();
+        String indexPath2 = tempDir.resolve(uniqueId2 + "_index").toString();
+        String splitPath2 = tempDir.resolve(uniqueId2 + ".split").toString();
+
+        try (SchemaBuilder builder = new SchemaBuilder()) {
+            builder
+                .addTextField("status", true, true, "raw", "position")
+                .addTextField("category", true, true, "raw", "position")
+                .addIntegerField("score", true, true, true)
+                .addIntegerField("count", true, true, true)
+                .addDateField("timestamp", true, true, true);
+
+            try (Schema schema = builder.build()) {
+                try (Index index = new Index(schema, indexPath2, false)) {
+                    try (IndexWriter writer = index.writer(Index.Memory.DEFAULT_HEAP_SIZE, 1)) {
+                        addDoc(writer, "ok", "C", 50, 6, "2024-03-01T00:00:00Z");
+                        addDoc(writer, "ok", "C", 40, 7, "2024-03-02T00:00:00Z");
+                        writer.commit();
+                    }
+
+                    QuickwitSplit.SplitConfig config2 = new QuickwitSplit.SplitConfig(
+                        uniqueId2, "test-source", "test-node");
+                    QuickwitSplit.SplitMetadata metadata2 =
+                        QuickwitSplit.convertIndexFromPath(indexPath2, splitPath2, config2);
+
+                    SplitSearcher searcher2 = cacheManager.createSplitSearcher(
+                        "file://" + splitPath2, metadata2);
+
+                    try {
+                        String queryAst = "{\"type\":\"match_all\"}";
+                        String aggJson = "{\"score_stats\":{\"stats\":{\"field\":\"score\"}}}";
+
+                        int numCols = 5;
+                        long[] arrayAddrs = new long[numCols];
+                        long[] schemaAddrs = new long[numCols];
+                        allocateFfiBuffers(arrayAddrs, schemaAddrs, numCols);
+                        try {
+                            int rowCount = cacheManager.multiSplitAggregateArrowFfi(
+                                java.util.Arrays.asList(searcher, searcher2),
+                                queryAst, "score_stats", aggJson,
+                                arrayAddrs, schemaAddrs);
+                            assertEquals(1, rowCount, "Stats should always produce 1 row");
+
+                            // Verify actual merged stats
+                            String json = nativeReadAggArrowColumnsAsJson(
+                                arrayAddrs, schemaAddrs, numCols, rowCount);
+                            Map<String, Object> result = parseJson(json);
+                            List<Map<String, Object>> columns = getColumns(result);
+                            Map<String, Object> colMap = columnsByName(columns);
+
+                            // Split 1: scores 85,75,95,60,90 (count=5, sum=405, min=60, max=95)
+                            // Split 2: scores 50,40 (count=2, sum=90, min=40, max=50)
+                            // Merged: count=7, sum=495, min=40, max=95, avg=495/7=70.71
+                            assertEquals(7L, getSingleLong(colMap, "count"), "Merged count should be 7");
+                            assertEquals(495.0, getSingleDouble(colMap, "sum"), 0.1, "Merged sum should be 495");
+                            assertEquals(40.0, getSingleDouble(colMap, "min"), 0.1, "Merged min should be 40");
+                            assertEquals(95.0, getSingleDouble(colMap, "max"), 0.1, "Merged max should be 95");
+                            assertEquals(70.71, getSingleDouble(colMap, "avg"), 0.1, "Merged avg should be ~70.71");
+                        } finally {
+                            freeFfiBuffers(arrayAddrs, schemaAddrs, numCols);
+                        }
+                    } finally {
+                        searcher2.close();
+                    }
+                }
+            }
+        }
+    }
+
+    // ---- Memory Allocation Helpers ----
+    // Arrow FFI_ArrowArray is ~128 bytes, FFI_ArrowSchema is ~72 bytes.
+    // We allocate 256 bytes per struct to be safe.
+
+    private static final int FFI_STRUCT_SIZE = 256;
+    private static final sun.misc.Unsafe UNSAFE;
+
+    static {
+        try {
+            java.lang.reflect.Field f = sun.misc.Unsafe.class.getDeclaredField("theUnsafe");
+            f.setAccessible(true);
+            UNSAFE = (sun.misc.Unsafe) f.get(null);
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to get Unsafe instance", e);
+        }
+    }
+
+    private static void allocateFfiBuffers(long[] arrayAddrs, long[] schemaAddrs, int numCols) {
+        for (int i = 0; i < numCols; i++) {
+            arrayAddrs[i] = UNSAFE.allocateMemory(FFI_STRUCT_SIZE);
+            UNSAFE.setMemory(arrayAddrs[i], FFI_STRUCT_SIZE, (byte) 0);
+            schemaAddrs[i] = UNSAFE.allocateMemory(FFI_STRUCT_SIZE);
+            UNSAFE.setMemory(schemaAddrs[i], FFI_STRUCT_SIZE, (byte) 0);
+        }
+    }
+
+    private static void freeFfiBuffers(long[] arrayAddrs, long[] schemaAddrs, int numCols) {
+        for (int i = 0; i < numCols; i++) {
+            if (arrayAddrs[i] != 0) UNSAFE.freeMemory(arrayAddrs[i]);
+            if (schemaAddrs[i] != 0) UNSAFE.freeMemory(schemaAddrs[i]);
+        }
+    }
+
+    // ---- JSON Parsing Helpers ----
+
+    @SuppressWarnings("unchecked")
+    private Map<String, Object> parseJson(String json) {
+        try {
+            return new com.fasterxml.jackson.databind.ObjectMapper().readValue(json, Map.class);
+        } catch (Exception e) {
+            fail("Failed to parse JSON: " + json + " — " + e.getMessage());
+            return null;
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private List<Map<String, Object>> getColumns(Map<String, Object> parsed) {
+        return (List<Map<String, Object>>) parsed.get("columns");
+    }
+
+    private Map<String, Object> columnsByName(List<Map<String, Object>> columns) {
+        Map<String, Object> map = new HashMap<>();
+        for (Map<String, Object> col : columns) {
+            map.put((String) col.get("name"), col);
+        }
+        return map;
+    }
+
+    @SuppressWarnings("unchecked")
+    private List<?> getColumnValues(Map<String, Object> colMap, String name) {
+        Map<String, Object> col = (Map<String, Object>) colMap.get(name);
+        return (List<?>) col.get("values");
+    }
+
+    @SuppressWarnings("unchecked")
+    private long getSingleLong(Map<String, Object> colMap, String name) {
+        List<?> values = getColumnValues(colMap, name);
+        return ((Number) values.get(0)).longValue();
+    }
+
+    @SuppressWarnings("unchecked")
+    private double getSingleDouble(Map<String, Object> colMap, String name) {
+        List<?> values = getColumnValues(colMap, name);
+        return ((Number) values.get(0)).doubleValue();
+    }
+}

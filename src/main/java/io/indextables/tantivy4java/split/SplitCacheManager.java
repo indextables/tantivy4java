@@ -1136,6 +1136,39 @@ public class SplitCacheManager implements AutoCloseable {
     }
     
     /**
+     * Execute an aggregation across multiple splits, merge intermediate results in Rust,
+     * and export the final result as Arrow columnar data via FFI.
+     *
+     * <p>This is the most efficient way to compute aggregations across many splits:
+     * each split's intermediate aggregation result is collected and merged entirely
+     * in native code, with the final result exported as a single Arrow RecordBatch.</p>
+     *
+     * @param searchers     list of SplitSearcher instances to aggregate across
+     * @param queryAstJson  query in Quickwit QueryAst JSON format
+     * @param aggName       name of the aggregation to export
+     * @param aggJson       aggregation request JSON
+     * @param arrayAddrs    pre-allocated ArrowArray memory addresses (one per column)
+     * @param schemaAddrs   pre-allocated ArrowSchema memory addresses (one per column)
+     * @return number of rows written
+     */
+    public int multiSplitAggregateArrowFfi(List<SplitSearcher> searchers,
+                                            String queryAstJson, String aggName, String aggJson,
+                                            long[] arrayAddrs, long[] schemaAddrs) {
+        if (nativePtr == 0) {
+            throw new IllegalStateException("CacheManager has been closed");
+        }
+        if (searchers == null || searchers.isEmpty()) {
+            throw new IllegalArgumentException("searchers must not be null or empty");
+        }
+        long[] searcherPtrs = new long[searchers.size()];
+        for (int i = 0; i < searchers.size(); i++) {
+            searcherPtrs[i] = searchers.get(i).getNativePtr();
+        }
+        return nativeMultiSplitAggregateArrowFfi(nativePtr, searcherPtrs,
+                queryAstJson, aggName, aggJson, arrayAddrs, schemaAddrs);
+    }
+
+    /**
      * Remove a split searcher from management
      */
     void removeSplitSearcher(String splitPath) {
@@ -1435,6 +1468,9 @@ public class SplitCacheManager implements AutoCloseable {
     private static native void forceEvictionNative(long ptr, long targetSizeBytes);
     private static native SearchResult searchAcrossAllSplitsNative(long ptr, long queryPtr, int totalLimit);
     private static native SearchResult searchAcrossSplitsNative(long ptr, List<String> splitPaths, long queryPtr, int totalLimit);
+    private static native int nativeMultiSplitAggregateArrowFfi(long ptr, long[] searcherPtrs,
+                                                                 String queryAstJson, String aggName, String aggJson,
+                                                                 long[] arrayAddrs, long[] schemaAddrs);
 
     // Batch optimization metrics native methods
     static native long nativeGetBatchMetricsTotalOperations();
