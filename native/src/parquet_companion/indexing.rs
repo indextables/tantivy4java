@@ -982,15 +982,28 @@ pub(crate) fn add_arrow_value_to_doc(
             doc.add_bytes(field, arr.value(row_idx));
         }
 
-        DataType::List(_) | DataType::LargeList(_) | DataType::Map(_, _) | DataType::Struct(_) => {
-            // Convert complex types to JSON, then to tantivy OwnedValue
-            let json_value = convert_complex_to_json(array, row_idx)?;
-            let json_str = serde_json::to_string(&json_value)?;
-            if let Ok(owned) = serde_json::from_str::<tantivy::schema::OwnedValue>(&json_str) {
-                if let tantivy::schema::OwnedValue::Object(obj) = owned {
-                    let json_map: std::collections::BTreeMap<String, tantivy::schema::OwnedValue> =
-                        obj.into_iter().collect();
-                    doc.add_object(field, json_map);
+        DataType::List(_) | DataType::LargeList(_) | DataType::FixedSizeList(_, _)
+        | DataType::Map(_, _) | DataType::Struct(_) => {
+            // Direct Arrow → OwnedValue conversion (no JSON intermediate)
+            let owned = convert_arrow_to_owned_value(array, row_idx)?;
+            match owned {
+                tantivy::schema::OwnedValue::Object(entries) => {
+                    doc.add_object(field, entries.into_iter().collect());
+                }
+                tantivy::schema::OwnedValue::Array(_) => {
+                    // Top-level List column: wrap in object since tantivy JSON fields require root objects
+                    let mut wrapper = std::collections::BTreeMap::new();
+                    wrapper.insert(field_name.to_string(), owned);
+                    doc.add_object(field, wrapper);
+                }
+                tantivy::schema::OwnedValue::Null => {
+                    // null — skip
+                }
+                _ => {
+                    // Scalar at top level from a complex column — wrap in object
+                    let mut wrapper = std::collections::BTreeMap::new();
+                    wrapper.insert(field_name.to_string(), owned);
+                    doc.add_object(field, wrapper);
                 }
             }
         }
@@ -1130,6 +1143,11 @@ fn add_json_string_value(
 }
 
 /// Convert a complex Arrow type (List, Map, Struct) at a given row to a JSON value.
+///
+/// **Deprecated**: Prefer `convert_arrow_to_owned_value` which produces `OwnedValue` directly
+/// without the Arrow → serde_json::Value → String → OwnedValue round-trip.
+/// This function is retained for the TANT binary serialization path where a JSON string
+/// representation is still needed.
 pub(crate) fn convert_complex_to_json(array: &ArrayRef, row_idx: usize) -> Result<serde_json::Value> {
     use arrow_array::*;
     use arrow_schema::DataType;
@@ -1217,6 +1235,291 @@ pub(crate) fn convert_complex_to_json(array: &ArrayRef, row_idx: usize) -> Resul
 
         _ => Ok(serde_json::Value::Null),
     }
+}
+
+/// Convert an Arrow array value directly to tantivy `OwnedValue`, bypassing JSON serialization.
+///
+/// This is the Arrow-native replacement for the previous pipeline:
+///   `convert_complex_to_json` → `serde_json::to_string` → `serde_json::from_str::<OwnedValue>`
+///
+/// By constructing `OwnedValue` directly from Arrow arrays, we eliminate:
+/// - serde_json::Value tree allocation
+/// - JSON string serialization
+/// - JSON string re-parsing back to OwnedValue
+///
+/// Supports all Arrow types that can appear inside complex structures (Struct, List, Map)
+/// including nested combinations of arbitrary depth.
+pub(crate) fn convert_arrow_to_owned_value(
+    array: &ArrayRef,
+    row_idx: usize,
+) -> Result<tantivy::schema::OwnedValue> {
+    use arrow_array::*;
+    use arrow_schema::DataType;
+    use tantivy::schema::OwnedValue;
+
+    if array.is_null(row_idx) {
+        return Ok(OwnedValue::Null);
+    }
+
+    match array.data_type() {
+        DataType::Struct(fields) => {
+            let struct_arr = array.as_any().downcast_ref::<StructArray>()
+                .ok_or_else(|| anyhow::anyhow!("Expected StructArray"))?;
+            let mut entries = Vec::with_capacity(fields.len());
+            for (i, field) in fields.iter().enumerate() {
+                let col = struct_arr.column(i);
+                if !col.is_null(row_idx) {
+                    let val = convert_arrow_to_owned_value(col, row_idx)?;
+                    entries.push((field.name().clone(), val));
+                }
+            }
+            Ok(OwnedValue::Object(entries))
+        }
+
+        DataType::List(_) | DataType::LargeList(_) => {
+            let inner = get_list_inner_array(array, row_idx)?;
+            let mut items = Vec::with_capacity(inner.len());
+            for i in 0..inner.len() {
+                items.push(convert_arrow_to_owned_value(&inner, i)?);
+            }
+            Ok(OwnedValue::Array(items))
+        }
+
+        DataType::FixedSizeList(_, _) => {
+            let fsl = array.as_any().downcast_ref::<FixedSizeListArray>()
+                .ok_or_else(|| anyhow::anyhow!("Expected FixedSizeListArray"))?;
+            let inner = fsl.value(row_idx);
+            let mut items = Vec::with_capacity(inner.len());
+            for i in 0..inner.len() {
+                items.push(convert_arrow_to_owned_value(&inner, i)?);
+            }
+            Ok(OwnedValue::Array(items))
+        }
+
+        DataType::Map(_, _) => {
+            let map_arr = array.as_any().downcast_ref::<MapArray>()
+                .ok_or_else(|| anyhow::anyhow!("Expected MapArray"))?;
+            let entries_arr = map_arr.value(row_idx);
+            let struct_arr = entries_arr.as_any().downcast_ref::<StructArray>()
+                .ok_or_else(|| anyhow::anyhow!("Expected StructArray inside Map"))?;
+            let keys = struct_arr.column(0);
+            let values = struct_arr.column(1);
+            let mut entries = Vec::with_capacity(struct_arr.len());
+            for i in 0..struct_arr.len() {
+                if let Some(key_str) = arrow_scalar_to_string(keys, i)? {
+                    let val = convert_arrow_to_owned_value(values, i)?;
+                    entries.push((key_str, val));
+                }
+            }
+            Ok(OwnedValue::Object(entries))
+        }
+
+        // ── Leaf scalar types (inside nested structures) ──
+
+        DataType::Boolean => {
+            let arr = array.as_any().downcast_ref::<BooleanArray>()
+                .ok_or_else(|| anyhow::anyhow!("Expected BooleanArray"))?;
+            Ok(OwnedValue::Bool(arr.value(row_idx)))
+        }
+
+        DataType::Int8 => {
+            let arr = array.as_any().downcast_ref::<Int8Array>()
+                .ok_or_else(|| anyhow::anyhow!("Expected Int8Array"))?;
+            Ok(OwnedValue::I64(arr.value(row_idx) as i64))
+        }
+        DataType::Int16 => {
+            let arr = array.as_any().downcast_ref::<Int16Array>()
+                .ok_or_else(|| anyhow::anyhow!("Expected Int16Array"))?;
+            Ok(OwnedValue::I64(arr.value(row_idx) as i64))
+        }
+        DataType::Int32 => {
+            let arr = array.as_any().downcast_ref::<Int32Array>()
+                .ok_or_else(|| anyhow::anyhow!("Expected Int32Array"))?;
+            Ok(OwnedValue::I64(arr.value(row_idx) as i64))
+        }
+        DataType::Int64 => {
+            let arr = array.as_any().downcast_ref::<Int64Array>()
+                .ok_or_else(|| anyhow::anyhow!("Expected Int64Array"))?;
+            Ok(OwnedValue::I64(arr.value(row_idx)))
+        }
+
+        DataType::UInt8 => {
+            let arr = array.as_any().downcast_ref::<UInt8Array>()
+                .ok_or_else(|| anyhow::anyhow!("Expected UInt8Array"))?;
+            Ok(OwnedValue::U64(arr.value(row_idx) as u64))
+        }
+        DataType::UInt16 => {
+            let arr = array.as_any().downcast_ref::<UInt16Array>()
+                .ok_or_else(|| anyhow::anyhow!("Expected UInt16Array"))?;
+            Ok(OwnedValue::U64(arr.value(row_idx) as u64))
+        }
+        DataType::UInt32 => {
+            let arr = array.as_any().downcast_ref::<UInt32Array>()
+                .ok_or_else(|| anyhow::anyhow!("Expected UInt32Array"))?;
+            Ok(OwnedValue::U64(arr.value(row_idx) as u64))
+        }
+        DataType::UInt64 => {
+            let arr = array.as_any().downcast_ref::<UInt64Array>()
+                .ok_or_else(|| anyhow::anyhow!("Expected UInt64Array"))?;
+            Ok(OwnedValue::U64(arr.value(row_idx)))
+        }
+
+        DataType::Float32 => {
+            let arr = array.as_any().downcast_ref::<Float32Array>()
+                .ok_or_else(|| anyhow::anyhow!("Expected Float32Array"))?;
+            Ok(OwnedValue::F64(arr.value(row_idx) as f64))
+        }
+        DataType::Float64 => {
+            let arr = array.as_any().downcast_ref::<Float64Array>()
+                .ok_or_else(|| anyhow::anyhow!("Expected Float64Array"))?;
+            Ok(OwnedValue::F64(arr.value(row_idx)))
+        }
+
+        DataType::Utf8 => {
+            let arr = array.as_any().downcast_ref::<StringArray>()
+                .ok_or_else(|| anyhow::anyhow!("Expected StringArray"))?;
+            Ok(OwnedValue::Str(arr.value(row_idx).to_string()))
+        }
+        DataType::LargeUtf8 => {
+            let arr = array.as_any().downcast_ref::<LargeStringArray>()
+                .ok_or_else(|| anyhow::anyhow!("Expected LargeStringArray"))?;
+            Ok(OwnedValue::Str(arr.value(row_idx).to_string()))
+        }
+
+        DataType::Binary => {
+            let arr = array.as_any().downcast_ref::<BinaryArray>()
+                .ok_or_else(|| anyhow::anyhow!("Expected BinaryArray"))?;
+            Ok(OwnedValue::Bytes(arr.value(row_idx).to_vec()))
+        }
+        DataType::LargeBinary => {
+            let arr = array.as_any().downcast_ref::<LargeBinaryArray>()
+                .ok_or_else(|| anyhow::anyhow!("Expected LargeBinaryArray"))?;
+            Ok(OwnedValue::Bytes(arr.value(row_idx).to_vec()))
+        }
+        DataType::FixedSizeBinary(_) => {
+            let arr = array.as_any().downcast_ref::<FixedSizeBinaryArray>()
+                .ok_or_else(|| anyhow::anyhow!("Expected FixedSizeBinaryArray"))?;
+            Ok(OwnedValue::Bytes(arr.value(row_idx).to_vec()))
+        }
+
+        DataType::Decimal128(_, scale) => {
+            let arr = array.as_any().downcast_ref::<Decimal128Array>()
+                .ok_or_else(|| anyhow::anyhow!("Expected Decimal128Array"))?;
+            let raw = arr.value(row_idx) as f64;
+            Ok(OwnedValue::F64(raw / 10f64.powi(*scale as i32)))
+        }
+        DataType::Decimal256(_, scale) => {
+            let arr = array.as_any().downcast_ref::<Decimal256Array>()
+                .ok_or_else(|| anyhow::anyhow!("Expected Decimal256Array"))?;
+            let raw = arr.value(row_idx);
+            let val: f64 = raw.to_string().parse::<f64>().unwrap_or(0.0)
+                / 10f64.powi(*scale as i32);
+            Ok(OwnedValue::F64(val))
+        }
+
+        DataType::Timestamp(unit, _) => {
+            let micros = match unit {
+                TimeUnit::Second => {
+                    let arr = array.as_any().downcast_ref::<TimestampSecondArray>()
+                        .ok_or_else(|| anyhow::anyhow!("Expected TimestampSecondArray"))?;
+                    arr.value(row_idx) * 1_000_000
+                }
+                TimeUnit::Millisecond => {
+                    let arr = array.as_any().downcast_ref::<TimestampMillisecondArray>()
+                        .ok_or_else(|| anyhow::anyhow!("Expected TimestampMillisecondArray"))?;
+                    arr.value(row_idx) * 1_000
+                }
+                TimeUnit::Microsecond => {
+                    let arr = array.as_any().downcast_ref::<TimestampMicrosecondArray>()
+                        .ok_or_else(|| anyhow::anyhow!("Expected TimestampMicrosecondArray"))?;
+                    arr.value(row_idx)
+                }
+                TimeUnit::Nanosecond => {
+                    let arr = array.as_any().downcast_ref::<TimestampNanosecondArray>()
+                        .ok_or_else(|| anyhow::anyhow!("Expected TimestampNanosecondArray"))?;
+                    arr.value(row_idx) / 1_000
+                }
+            };
+            Ok(OwnedValue::Date(tantivy::DateTime::from_timestamp_micros(micros)))
+        }
+
+        DataType::Date32 => {
+            let arr = array.as_any().downcast_ref::<Date32Array>()
+                .ok_or_else(|| anyhow::anyhow!("Expected Date32Array"))?;
+            let micros = arr.value(row_idx) as i64 * 86_400 * 1_000_000;
+            Ok(OwnedValue::Date(tantivy::DateTime::from_timestamp_micros(micros)))
+        }
+        DataType::Date64 => {
+            let arr = array.as_any().downcast_ref::<Date64Array>()
+                .ok_or_else(|| anyhow::anyhow!("Expected Date64Array"))?;
+            let micros = arr.value(row_idx) * 1_000;
+            Ok(OwnedValue::Date(tantivy::DateTime::from_timestamp_micros(micros)))
+        }
+
+        dt => {
+            anyhow::bail!("Unsupported Arrow type in complex structure: {:?}", dt)
+        }
+    }
+}
+
+/// Extract inner array from List or LargeList at a given row.
+fn get_list_inner_array(array: &ArrayRef, row_idx: usize) -> Result<ArrayRef> {
+    use arrow_array::*;
+    if let Some(list) = array.as_any().downcast_ref::<ListArray>() {
+        Ok(list.value(row_idx))
+    } else if let Some(list) = array.as_any().downcast_ref::<LargeListArray>() {
+        Ok(list.value(row_idx))
+    } else {
+        anyhow::bail!("Expected ListArray or LargeListArray")
+    }
+}
+
+/// Extract a string representation from a Map key array.
+/// Map keys must be string-coercible (Utf8, Int, etc.) since tantivy JSON objects use string keys.
+fn arrow_scalar_to_string(array: &ArrayRef, row_idx: usize) -> Result<Option<String>> {
+    use arrow_array::*;
+    use arrow_schema::DataType;
+
+    if array.is_null(row_idx) {
+        return Ok(None);
+    }
+    match array.data_type() {
+        DataType::Utf8 => {
+            let arr = array.as_any().downcast_ref::<StringArray>()
+                .ok_or_else(|| anyhow::anyhow!("Expected StringArray for Map key"))?;
+            Ok(Some(arr.value(row_idx).to_string()))
+        }
+        DataType::LargeUtf8 => {
+            let arr = array.as_any().downcast_ref::<LargeStringArray>()
+                .ok_or_else(|| anyhow::anyhow!("Expected LargeStringArray for Map key"))?;
+            Ok(Some(arr.value(row_idx).to_string()))
+        }
+        DataType::Int32 => {
+            let arr = array.as_any().downcast_ref::<Int32Array>()
+                .ok_or_else(|| anyhow::anyhow!("Expected Int32Array for Map key"))?;
+            Ok(Some(arr.value(row_idx).to_string()))
+        }
+        DataType::Int64 => {
+            let arr = array.as_any().downcast_ref::<Int64Array>()
+                .ok_or_else(|| anyhow::anyhow!("Expected Int64Array for Map key"))?;
+            Ok(Some(arr.value(row_idx).to_string()))
+        }
+        DataType::Boolean => {
+            let arr = array.as_any().downcast_ref::<BooleanArray>()
+                .ok_or_else(|| anyhow::anyhow!("Expected BooleanArray for Map key"))?;
+            Ok(Some(arr.value(row_idx).to_string()))
+        }
+        dt => anyhow::bail!("Unsupported Map key type: {:?} (must be string-coercible)", dt),
+    }
+}
+
+/// Check whether an Arrow DataType is a complex/nested type that requires OwnedValue conversion.
+pub(crate) fn is_complex_arrow_type(dt: &DataType) -> bool {
+    matches!(
+        dt,
+        DataType::List(_) | DataType::LargeList(_) | DataType::FixedSizeList(_, _)
+        | DataType::Map(_, _) | DataType::Struct(_)
+    )
 }
 
 /// Build column mapping from Arrow schema and name mapping.

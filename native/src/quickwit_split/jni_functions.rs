@@ -2195,8 +2195,9 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_merge_QuickwitSpli
 // Arrow FFI Test Helpers (test-only: create valid FFI structs from Rust)
 // ============================================================================
 
-use arrow_schema::{Schema as ArrowSchema, Field as ArrowField, DataType};
-use arrow_array::{Array, RecordBatch, StructArray, StringArray, Int64Array, Float64Array, BooleanArray};
+use arrow_schema::{Schema as ArrowSchema, Field as ArrowField, Fields, DataType};
+use arrow_array::{Array, ArrayRef, RecordBatch, StructArray, StringArray, Int64Array, Float64Array, BooleanArray};
+use arrow_array::builder::{ListBuilder, StringBuilder, MapBuilder};
 
 /// Test helper: Export an Arrow schema as an FFI_ArrowSchema struct with valid release callback.
 /// Supported types: "int64", "utf8", "float64", "boolean"
@@ -2362,4 +2363,148 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_merge_QuickwitSpli
         env.set_long_array_region(&result, 0, &[array_addr, schema_addr])?;
         Ok(result.into_raw())
     }).unwrap_or(std::ptr::null_mut())
+}
+
+/// Test helper: Export an Arrow schema with complex types as FFI_ArrowSchema.
+/// Schema: (id: Int64, name: Utf8, metadata: Struct{city: Utf8, score: Int64},
+///          tags: List<Utf8>, properties: Map<Utf8, Utf8>)
+/// Returns the memory address of the boxed FFI_ArrowSchema.
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_split_merge_QuickwitSplit_nativeTestExportComplexSchemaFfi(
+    mut env: JNIEnv,
+    _class: JClass,
+) -> jlong {
+    convert_throwable(&mut env, |_env| {
+        let schema = build_complex_test_schema();
+        let ffi_schema = FFI_ArrowSchema::try_from(&schema)
+            .map_err(|e| anyhow!("Failed to export complex schema to FFI: {}", e))?;
+        let boxed = Box::new(ffi_schema);
+        Ok(Box::into_raw(boxed) as jlong)
+    }).unwrap_or(0)
+}
+
+/// Test helper: Export a batch with complex Arrow types as FFI structs.
+/// Schema: (id: Int64, name: Utf8, metadata: Struct{city: Utf8, score: Int64},
+///          tags: List<Utf8>, properties: Map<Utf8, Utf8>)
+/// Returns long[2] = [arrayAddr, schemaAddr]
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_split_merge_QuickwitSplit_nativeTestExportComplexBatchFfi(
+    mut env: JNIEnv,
+    _class: JClass,
+    num_rows: jni::sys::jint,
+    id_offset: jlong,
+) -> jni::sys::jlongArray {
+    convert_throwable(&mut env, |env| {
+        let n = num_rows as usize;
+        let offset = id_offset;
+
+        // Simple columns
+        let ids: Vec<i64> = (offset..offset + n as i64).collect();
+        let names: Vec<String> = (0..n).map(|i| format!("person_{}", i as i64 + offset)).collect();
+
+        // Struct column: metadata {city: Utf8, score: Int64}
+        let cities = vec!["new york", "london", "tokyo", "paris", "berlin"];
+        let city_values: Vec<String> = (0..n).map(|i| cities[i % cities.len()].to_string()).collect();
+        let score_values: Vec<i64> = (0..n).map(|i| (i as i64 + offset) * 10).collect();
+
+        let city_array = std::sync::Arc::new(StringArray::from(
+            city_values.iter().map(|s| s.as_str()).collect::<Vec<_>>()
+        )) as ArrayRef;
+        let score_array = std::sync::Arc::new(Int64Array::from(score_values)) as ArrayRef;
+
+        let metadata_fields = Fields::from(vec![
+            ArrowField::new("city", DataType::Utf8, true),
+            ArrowField::new("score", DataType::Int64, true),
+        ]);
+        let metadata_array = StructArray::try_new(
+            metadata_fields,
+            vec![city_array, score_array],
+            None,
+        ).map_err(|e| anyhow!("Failed to create metadata struct array: {}", e))?;
+
+        // List column: tags List<Utf8>
+        let tag_pool = vec!["rust", "java", "search", "index", "arrow", "ffi"];
+        let mut tags_builder = ListBuilder::new(StringBuilder::new());
+        for i in 0..n {
+            let num_tags = (i % 3) + 1;
+            for j in 0..num_tags {
+                tags_builder.values().append_value(&tag_pool[(i + j) % tag_pool.len()]);
+            }
+            tags_builder.append(true);
+        }
+        let tags_array = tags_builder.finish();
+
+        // Map column: properties Map<Utf8, Utf8>
+        let mut map_builder = MapBuilder::new(
+            None,
+            StringBuilder::new(),
+            StringBuilder::new(),
+        );
+        for i in 0..n {
+            map_builder.keys().append_value(format!("key_{}", i));
+            map_builder.values().append_value(format!("val_{}", i));
+            if i % 2 == 0 {
+                map_builder.keys().append_value("extra");
+                map_builder.values().append_value(format!("extra_{}", i));
+            }
+            map_builder.append(true).map_err(|e| anyhow!("Map append error: {}", e))?;
+        }
+        let properties_array = map_builder.finish();
+
+        let schema = build_complex_test_schema();
+
+        let batch = RecordBatch::try_new(
+            std::sync::Arc::new(schema),
+            vec![
+                std::sync::Arc::new(Int64Array::from(ids)),
+                std::sync::Arc::new(StringArray::from(
+                    names.iter().map(|s| s.as_str()).collect::<Vec<_>>()
+                )),
+                std::sync::Arc::new(metadata_array),
+                std::sync::Arc::new(tags_array),
+                std::sync::Arc::new(properties_array),
+            ],
+        ).map_err(|e| anyhow!("Failed to create complex test batch: {}", e))?;
+
+        let struct_array = StructArray::from(batch);
+        let data = struct_array.to_data();
+
+        let ffi_schema = FFI_ArrowSchema::try_from(data.data_type())
+            .map_err(|e| anyhow!("Failed to export complex batch schema to FFI: {}", e))?;
+        let ffi_array = FFI_ArrowArray::new(&data);
+
+        let array_addr = Box::into_raw(Box::new(ffi_array)) as jlong;
+        let schema_addr = Box::into_raw(Box::new(ffi_schema)) as jlong;
+
+        let result = env.new_long_array(2)?;
+        env.set_long_array_region(&result, 0, &[array_addr, schema_addr])?;
+        Ok(result.into_raw())
+    }).unwrap_or(std::ptr::null_mut())
+}
+
+/// Shared schema definition for complex type test helpers.
+fn build_complex_test_schema() -> ArrowSchema {
+    let metadata_fields = Fields::from(vec![
+        ArrowField::new("city", DataType::Utf8, true),
+        ArrowField::new("score", DataType::Int64, true),
+    ]);
+
+    let map_field = ArrowField::new(
+        "entries",
+        DataType::Struct(Fields::from(vec![
+            ArrowField::new("keys", DataType::Utf8, false),
+            ArrowField::new("values", DataType::Utf8, true),
+        ])),
+        false,
+    );
+
+    ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::Int64, false),
+        ArrowField::new("name", DataType::Utf8, false),
+        ArrowField::new("metadata", DataType::Struct(metadata_fields), true),
+        ArrowField::new("tags", DataType::List(std::sync::Arc::new(
+            ArrowField::new("item", DataType::Utf8, true)
+        )), true),
+        ArrowField::new("properties", DataType::Map(std::sync::Arc::new(map_field), false), true),
+    ])
 }
