@@ -338,7 +338,7 @@ fn add_field_for_arrow_type(
             builder.add_date_field(name, opts);
         }
 
-        DataType::List(_) | DataType::LargeList(_) | DataType::Map(_, _) | DataType::Struct(_) => {
+        DataType::List(_) | DataType::LargeList(_) | DataType::FixedSizeList(_, _) | DataType::Map(_, _) | DataType::Struct(_) => {
             // Complex types → JSON object field: stored + indexed + fast
             // Fast fields are required for range queries on numeric sub-fields
             let opts = JsonObjectOptions::default()

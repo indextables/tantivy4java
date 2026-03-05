@@ -233,6 +233,11 @@ pub(crate) fn begin_split_from_arrow(
     max_docs_per_split: u64,
     output_dir: Option<String>,
 ) -> Result<ArrowFfiSplitContext> {
+    // Validate: max_docs_per_split > 0 requires output_dir for auto-rolling
+    if max_docs_per_split > 0 && output_dir.is_none() {
+        bail!("max_docs_per_split={} requires output_dir to be set for auto-rolling splits", max_docs_per_split);
+    }
+
     // Parse field config if provided, otherwise use defaults
     let (config, stats_columns) = match field_config_json {
         Some(json) if !json.is_empty() => {
@@ -419,8 +424,8 @@ fn extract_partition_value(batch: &RecordBatch, col_idx: usize, row_idx: usize) 
             let arr = array.as_any().downcast_ref::<arrow_array::PrimitiveArray<TimestampMicrosecondType>>()
                 .ok_or_else(|| anyhow::anyhow!("Expected TimestampMicrosecondArray for partition column"))?;
             let micros = arr.value(row_idx);
-            let secs = micros / 1_000_000;
-            let nanos = ((micros % 1_000_000) * 1_000) as u32;
+            let secs = micros.div_euclid(1_000_000);
+            let nanos = (micros.rem_euclid(1_000_000) * 1_000) as u32;
             let dt = chrono::DateTime::from_timestamp(secs, nanos)
                 .ok_or_else(|| anyhow::anyhow!("Invalid timestamp microseconds: {}", micros))?;
             Ok(dt.format("%Y-%m-%d %H:%M:%S").to_string())
@@ -429,8 +434,8 @@ fn extract_partition_value(batch: &RecordBatch, col_idx: usize, row_idx: usize) 
             let arr = array.as_any().downcast_ref::<arrow_array::PrimitiveArray<arrow_array::types::TimestampMillisecondType>>()
                 .ok_or_else(|| anyhow::anyhow!("Expected TimestampMillisecondArray for partition column"))?;
             let millis = arr.value(row_idx);
-            let secs = millis / 1_000;
-            let nanos = ((millis % 1_000) * 1_000_000) as u32;
+            let secs = millis.div_euclid(1_000);
+            let nanos = (millis.rem_euclid(1_000) * 1_000_000) as u32;
             let dt = chrono::DateTime::from_timestamp(secs, nanos)
                 .ok_or_else(|| anyhow::anyhow!("Invalid timestamp milliseconds: {}", millis))?;
             Ok(dt.format("%Y-%m-%d %H:%M:%S").to_string())
@@ -447,8 +452,8 @@ fn extract_partition_value(batch: &RecordBatch, col_idx: usize, row_idx: usize) 
             let arr = array.as_any().downcast_ref::<arrow_array::PrimitiveArray<arrow_array::types::TimestampNanosecondType>>()
                 .ok_or_else(|| anyhow::anyhow!("Expected TimestampNanosecondArray for partition column"))?;
             let nanos = arr.value(row_idx);
-            let secs = nanos / 1_000_000_000;
-            let sub_nanos = (nanos % 1_000_000_000) as u32;
+            let secs = nanos.div_euclid(1_000_000_000);
+            let sub_nanos = nanos.rem_euclid(1_000_000_000) as u32;
             let dt = chrono::DateTime::from_timestamp(secs, sub_nanos)
                 .ok_or_else(|| anyhow::anyhow!("Invalid timestamp nanoseconds: {}", nanos))?;
             Ok(dt.format("%Y-%m-%d %H:%M:%S").to_string())
@@ -744,8 +749,43 @@ fn build_doc_from_arrow_row(
     Ok(doc)
 }
 
+/// Convert statistics accumulators into string min/max maps.
+fn finalize_statistics_to_string_maps(
+    accumulators: &mut HashMap<String, StatisticsAccumulator>,
+) -> (HashMap<String, String>, HashMap<String, String>) {
+    let mut min_values = HashMap::new();
+    let mut max_values = HashMap::new();
+    for (col_name, acc) in accumulators.drain() {
+        let stats = acc.finalize();
+        if let Some(v) = stats.min_long {
+            min_values.insert(col_name.clone(), v.to_string());
+        } else if let Some(v) = stats.min_double {
+            min_values.insert(col_name.clone(), v.to_string());
+        } else if let Some(v) = &stats.min_string {
+            min_values.insert(col_name.clone(), v.clone());
+        } else if let Some(v) = stats.min_timestamp_micros {
+            min_values.insert(col_name.clone(), v.to_string());
+        } else if let Some(v) = stats.min_bool {
+            min_values.insert(col_name.clone(), v.to_string());
+        }
+
+        if let Some(v) = stats.max_long {
+            max_values.insert(col_name.clone(), v.to_string());
+        } else if let Some(v) = stats.max_double {
+            max_values.insert(col_name.clone(), v.to_string());
+        } else if let Some(v) = &stats.max_string {
+            max_values.insert(col_name.clone(), v.clone());
+        } else if let Some(v) = stats.max_timestamp_micros {
+            max_values.insert(col_name.clone(), v.to_string());
+        } else if let Some(v) = stats.max_bool {
+            max_values.insert(col_name.clone(), v.to_string());
+        }
+    }
+    (min_values, max_values)
+}
+
 /// Finalize a single PartitionWriter into a split file. Shared helper used by
-/// both auto-rolling in add_arrow_batch and finish_all_splits.
+/// both auto-rolling in add_arrow_batch, finish_all_splits, and roll_partition_split.
 async fn finalize_partition_writer_into_split(
     mut pw: PartitionWriter,
     partition_key: &str,
@@ -823,36 +863,7 @@ async fn finalize_partition_writer_into_split(
     metadata.hotcache_start_offset = Some(footer.hotcache_start_offset);
     metadata.hotcache_length = Some(footer.hotcache_length);
 
-    // Finalize statistics accumulators into string min/max maps
-    let mut min_values = HashMap::new();
-    let mut max_values = HashMap::new();
-    for (col_name, acc) in pw.accumulators.drain() {
-        let stats = acc.finalize();
-        // Convert typed min/max to string representation
-        if let Some(v) = stats.min_long {
-            min_values.insert(col_name.clone(), v.to_string());
-        } else if let Some(v) = stats.min_double {
-            min_values.insert(col_name.clone(), v.to_string());
-        } else if let Some(v) = &stats.min_string {
-            min_values.insert(col_name.clone(), v.clone());
-        } else if let Some(v) = stats.min_timestamp_micros {
-            min_values.insert(col_name.clone(), v.to_string());
-        } else if let Some(v) = stats.min_bool {
-            min_values.insert(col_name.clone(), v.to_string());
-        }
-
-        if let Some(v) = stats.max_long {
-            max_values.insert(col_name.clone(), v.to_string());
-        } else if let Some(v) = stats.max_double {
-            max_values.insert(col_name.clone(), v.to_string());
-        } else if let Some(v) = &stats.max_string {
-            max_values.insert(col_name.clone(), v.clone());
-        } else if let Some(v) = stats.max_timestamp_micros {
-            max_values.insert(col_name.clone(), v.to_string());
-        } else if let Some(v) = stats.max_bool {
-            max_values.insert(col_name.clone(), v.to_string());
-        }
-    }
+    let (min_values, max_values) = finalize_statistics_to_string_maps(&mut pw.accumulators);
 
     debug_println!(
         "ARROW_FFI_IMPORT: Finalized partition '{}' with {} docs → {} (stats: {} min, {} max)",
@@ -924,8 +935,6 @@ pub(crate) async fn roll_partition_split(
     output_dir: &str,
     split_config: &SplitConfig,
 ) -> Result<PartitionSplitResult> {
-    let output_base = PathBuf::from(output_dir);
-
     // Take the writer out of the context
     let (pw, partition_values) = if partition_key.is_empty() {
         // Non-partitioned: take default_writer
@@ -943,119 +952,10 @@ pub(crate) async fn roll_partition_split(
         (pw, values)
     };
 
-    // Finalize the writer
-    let mut pw = pw;
-    pw.writer.commit()
-        .context("Failed to commit index writer during roll")?;
-    pw.writer.wait_merging_threads()
-        .map_err(|e| anyhow::anyhow!("Failed waiting for merge threads during roll: {}", e))?;
-
-    // Construct output path
-    let split_filename = format!("part-{}.split", Uuid::new_v4());
-    let output_path = if partition_key.is_empty() {
-        output_base.join(&split_filename)
-    } else {
-        let partition_dir = output_base.join(partition_key);
-        std::fs::create_dir_all(&partition_dir)
-            .context("Failed to create partition output directory during roll")?;
-        partition_dir.join(&split_filename)
-    };
-
-    // Get doc count
-    let reader = pw.index.reader()
-        .map_err(|e| anyhow::anyhow!("Failed to create index reader: {}", e))?;
-    reader.reload()
-        .map_err(|e| anyhow::anyhow!("Failed to reload index reader: {}", e))?;
-    let num_docs = reader.searcher().num_docs() as usize;
-
-    // Calculate uncompressed size
-    let index_dir_path = pw.index_dir.path().to_path_buf();
-    let mut total_size = 0u64;
-    if let Ok(entries) = std::fs::read_dir(&index_dir_path) {
-        for entry in entries.flatten() {
-            if let Ok(meta) = entry.metadata() {
-                if meta.is_file() {
-                    total_size += meta.len();
-                }
-            }
-        }
-    }
-
-    // Create split metadata
-    let mut metadata = QuickwitSplitMetadata {
-        split_id: Uuid::new_v4().to_string(),
-        index_uid: split_config.index_uid.clone(),
-        source_id: split_config.source_id.clone(),
-        node_id: split_config.node_id.clone(),
-        doc_mapping_uid: split_config.doc_mapping_uid.clone(),
-        partition_id: split_config.partition_id,
-        num_docs,
-        uncompressed_docs_size_in_bytes: total_size,
-        time_range: None,
-        create_timestamp: chrono::Utc::now().timestamp(),
-        maturity: "Mature".to_string(),
-        tags: split_config.tags.clone(),
-        delete_opstamp: 0,
-        num_merge_ops: 0,
-        footer_start_offset: None,
-        footer_end_offset: None,
-        hotcache_start_offset: None,
-        hotcache_length: None,
-        doc_mapping_json: None,
-        skipped_splits: Vec::new(),
-    };
-
-    if let Ok(doc_mapping_json) = extract_doc_mapping_from_index(&pw.index) {
-        metadata.doc_mapping_json = Some(doc_mapping_json);
-    }
-
-    let footer = create_quickwit_split(
-        &pw.index,
-        &index_dir_path,
-        &output_path,
-        &metadata,
-        split_config,
-        None,
+    // Delegate to the shared finalization helper
+    let result = finalize_partition_writer_into_split(
+        pw, partition_key, partition_values.clone(), output_dir, split_config,
     ).await?;
-
-    metadata.footer_start_offset = Some(footer.footer_start_offset);
-    metadata.footer_end_offset = Some(footer.footer_end_offset);
-    metadata.hotcache_start_offset = Some(footer.hotcache_start_offset);
-    metadata.hotcache_length = Some(footer.hotcache_length);
-
-    // Finalize statistics accumulators from the rolled writer
-    let mut min_values = HashMap::new();
-    let mut max_values = HashMap::new();
-    for (col_name, acc) in pw.accumulators.drain() {
-        let stats = acc.finalize();
-        if let Some(v) = stats.min_long {
-            min_values.insert(col_name.clone(), v.to_string());
-        } else if let Some(v) = stats.min_double {
-            min_values.insert(col_name.clone(), v.to_string());
-        } else if let Some(v) = &stats.min_string {
-            min_values.insert(col_name.clone(), v.clone());
-        } else if let Some(v) = stats.min_timestamp_micros {
-            min_values.insert(col_name.clone(), v.to_string());
-        } else if let Some(v) = stats.min_bool {
-            min_values.insert(col_name.clone(), v.to_string());
-        }
-        if let Some(v) = stats.max_long {
-            max_values.insert(col_name.clone(), v.to_string());
-        } else if let Some(v) = stats.max_double {
-            max_values.insert(col_name.clone(), v.to_string());
-        } else if let Some(v) = &stats.max_string {
-            max_values.insert(col_name.clone(), v.clone());
-        } else if let Some(v) = stats.max_timestamp_micros {
-            max_values.insert(col_name.clone(), v.to_string());
-        } else if let Some(v) = stats.max_bool {
-            max_values.insert(col_name.clone(), v.to_string());
-        }
-    }
-
-    debug_println!(
-        "ARROW_FFI_IMPORT: Rolled partition '{}' with {} docs → {}",
-        partition_key, num_docs, output_path.display()
-    );
 
     // Create a fresh writer for this partition so writing can continue
     if partition_key.is_empty() {
@@ -1064,19 +964,12 @@ pub(crate) async fn roll_partition_split(
             &ctx.stats_columns, &ctx.field_mapping)?);
     } else {
         let new_pw = create_partition_writer(
-            &ctx.tantivy_schema, ctx.heap_size, partition_values.clone(),
+            &ctx.tantivy_schema, ctx.heap_size, partition_values,
             &ctx.stats_columns, &ctx.field_mapping)?;
         ctx.partition_writers.insert(partition_key.to_string(), new_pw);
     }
 
-    Ok(PartitionSplitResult {
-        partition_key: partition_key.to_string(),
-        partition_values,
-        split_path: output_path.to_string_lossy().to_string(),
-        metadata,
-        min_values,
-        max_values,
-    })
+    Ok(result)
 }
 
 /// Cancel an in-progress split creation, releasing ALL resources across all partitions.
