@@ -6,7 +6,7 @@
 use std::collections::{HashMap, HashSet};
 use anyhow::{Context, Result};
 use arrow_schema::{DataType, Schema as ArrowSchema};
-use tantivy::schema::{Schema, SchemaBuilder};
+use tantivy::schema::{DateTimePrecision, Schema, SchemaBuilder};
 
 use super::manifest::FastFieldMode;
 use super::string_indexing::{self, StringIndexingMode};
@@ -148,11 +148,12 @@ fn add_field_for_arrow_type(
             DataType::Utf8 | DataType::LargeUtf8 => {
                 // STRING column forced to JSON: stored + indexed + fast
                 // Fast fields are required for range queries on numeric sub-fields
+                // Use "raw" tokenizer to match TANT batch path behavior (exact string matching)
                 let opts = JsonObjectOptions::default()
                     .set_stored()
                     .set_indexing_options(
                         TextFieldIndexing::default()
-                            .set_tokenizer("default")
+                            .set_tokenizer("raw")
                             .set_index_option(IndexRecordOption::Basic)
                             .set_fieldnorms(config.fieldnorms_enabled),
                     )
@@ -329,6 +330,7 @@ fn add_field_for_arrow_type(
         DataType::Timestamp(_, _) | DataType::Date32 | DataType::Date64 => {
             let mut opts = DateOptions::default();
             opts = opts.set_indexed();
+            opts = opts.set_precision(DateTimePrecision::Microseconds);
             if config.store_fields {
                 opts = opts.set_stored();
             }
@@ -341,11 +343,12 @@ fn add_field_for_arrow_type(
         DataType::List(_) | DataType::LargeList(_) | DataType::FixedSizeList(_, _) | DataType::Map(_, _) | DataType::Struct(_) => {
             // Complex types → JSON object field: stored + indexed + fast
             // Fast fields are required for range queries on numeric sub-fields
+            // Use "raw" tokenizer to match TANT batch path behavior (exact string matching)
             let opts = JsonObjectOptions::default()
                 .set_stored()
                 .set_indexing_options(
                     TextFieldIndexing::default()
-                        .set_tokenizer("default")
+                        .set_tokenizer("raw")
                         .set_index_option(IndexRecordOption::Basic)
                         .set_fieldnorms(config.fieldnorms_enabled),
                 )
