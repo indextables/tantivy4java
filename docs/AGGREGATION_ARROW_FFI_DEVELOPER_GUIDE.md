@@ -1,5 +1,7 @@
 # Aggregation Arrow FFI Export — Developer Guide
 
+**Since:** tantivy4java 0.31.2
+
 ## Overview
 
 tantivy4java provides Arrow FFI export for aggregation results, enabling zero-copy transfer of aggregation data from the native Rust layer to JVM consumers as Arrow columnar arrays. This eliminates the per-result JNI overhead of extracting aggregation values one at a time.

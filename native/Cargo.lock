@@ -6819,7 +6819,7 @@ dependencies = [
 
 [[package]]
 name = "tantivy4java"
-version = "0.24.0"
+version = "0.31.2"
 dependencies = [
  "anyhow",
  "arrow",
