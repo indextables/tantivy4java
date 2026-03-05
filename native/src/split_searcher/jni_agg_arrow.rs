@@ -414,6 +414,192 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_nati
     }
 }
 
+/// Multi-split, multi-aggregation single-pass: search each split once with ALL aggregations,
+/// merge intermediate results, then export each named aggregation as its own Arrow RecordBatch.
+///
+/// aggNamesJson: JSON array of aggregation names, e.g. ["count_0", "sum_1", "min_2"]
+/// colCountsPerAgg: int array with number of columns per aggregation (in same order as aggNames)
+/// arrayAddrs/schemaAddrs: laid out sequentially — first colCounts[0] for agg 0, then colCounts[1] for agg 1, etc.
+///
+/// Returns: JSON string with per-aggregation row counts, e.g. {"count_0":1,"sum_1":1,"min_2":1}
+///
+/// Java signature: nativeMultiSplitMultiAggregateArrowFfi(long cacheManagerPtr,
+///     long[] searcherPtrs, String queryAstJson, String aggNamesJson, String aggJson,
+///     int[] colCountsPerAgg, long[] arrayAddrs, long[] schemaAddrs) → String
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_nativeMultiSplitMultiAggregateArrowFfi(
+    mut env: JNIEnv,
+    _class: JClass,
+    _cache_mgr_ptr: jlong,
+    searcher_ptrs: JLongArray,
+    query_ast_json: JString,
+    agg_names_json: JString,
+    agg_json: JString,
+    col_counts_per_agg: jni::objects::JIntArray,
+    array_addrs: JLongArray,
+    schema_addrs: JLongArray,
+) -> jstring {
+    let t0 = std::time::Instant::now();
+    perf_println!("⏱️ AGG_FFI: nativeMultiSplitMultiAggregateArrowFfi START");
+
+    let result: Result<String, anyhow::Error> = (|| {
+        let query_json: String = env
+            .get_string(&query_ast_json)
+            .map_err(|e| anyhow::anyhow!("Failed to get query JSON: {}", e))?
+            .into();
+        let agg_names_str: String = env
+            .get_string(&agg_names_json)
+            .map_err(|e| anyhow::anyhow!("Failed to get agg names JSON: {}", e))?
+            .into();
+        let agg_json_str: String = env
+            .get_string(&agg_json)
+            .map_err(|e| anyhow::anyhow!("Failed to get agg JSON: {}", e))?
+            .into();
+
+        let agg_names: Vec<String> = serde_json::from_str(&agg_names_str)
+            .map_err(|e| anyhow::anyhow!("Failed to parse agg names JSON: {}", e))?;
+
+        // Get col counts per agg
+        let col_counts_elems = unsafe {
+            env.get_array_elements(&col_counts_per_agg, jni::objects::ReleaseMode::NoCopyBack)
+                .map_err(|e| anyhow::anyhow!("Failed to get col counts: {}", e))?
+        };
+        let col_counts_slice: &[i32] = unsafe {
+            std::slice::from_raw_parts(col_counts_elems.as_ptr(), col_counts_elems.len())
+        };
+
+        if agg_names.len() != col_counts_slice.len() {
+            anyhow::bail!(
+                "aggNames length ({}) != colCountsPerAgg length ({})",
+                agg_names.len(),
+                col_counts_slice.len()
+            );
+        }
+
+        let ptrs = unsafe {
+            env.get_array_elements(&searcher_ptrs, jni::objects::ReleaseMode::NoCopyBack)
+                .map_err(|e| anyhow::anyhow!("Failed to get searcher ptrs: {}", e))?
+        };
+        let ptr_slice: &[i64] =
+            unsafe { std::slice::from_raw_parts(ptrs.as_ptr(), ptrs.len()) };
+
+        let arr_addrs_elems = unsafe {
+            env.get_array_elements(&array_addrs, jni::objects::ReleaseMode::NoCopyBack)
+                .map_err(|e| anyhow::anyhow!("Failed to get array addrs: {}", e))?
+        };
+        let sch_addrs_elems = unsafe {
+            env.get_array_elements(&schema_addrs, jni::objects::ReleaseMode::NoCopyBack)
+                .map_err(|e| anyhow::anyhow!("Failed to get schema addrs: {}", e))?
+        };
+        let all_arr: &[i64] = unsafe {
+            std::slice::from_raw_parts(arr_addrs_elems.as_ptr(), arr_addrs_elems.len())
+        };
+        let all_sch: &[i64] = unsafe {
+            std::slice::from_raw_parts(sch_addrs_elems.as_ptr(), sch_addrs_elems.len())
+        };
+
+        // Search each split ONCE and collect intermediate bytes
+        let ptrs_owned: Vec<jlong> = ptr_slice.to_vec();
+        let query_json_owned = query_json.clone();
+        let agg_json_owned = agg_json_str.clone();
+
+        let intermediate_bytes_vec: Vec<Vec<u8>> = block_on_operation(async move {
+            let mut results = Vec::with_capacity(ptrs_owned.len());
+            for &sptr in &ptrs_owned {
+                let ctx = perform_search_async_impl_leaf_response_with_aggregations(
+                    sptr,
+                    query_json_owned.clone(),
+                    0,
+                    Some(agg_json_owned.clone()),
+                )
+                .await?;
+                if let Some(bytes) = ctx.leaf_response.intermediate_aggregation_result {
+                    results.push(bytes);
+                }
+            }
+            Ok::<Vec<Vec<u8>>, anyhow::Error>(results)
+        })?;
+
+        if intermediate_bytes_vec.is_empty() {
+            anyhow::bail!("No splits returned aggregation results");
+        }
+
+        // Merge all intermediate results
+        let mut merged: IntermediateAggregationResults =
+            postcard::from_bytes(&intermediate_bytes_vec[0])?;
+        for (i, bytes) in intermediate_bytes_vec.iter().enumerate().skip(1) {
+            let next: IntermediateAggregationResults = postcard::from_bytes(bytes)?;
+            merged.merge_fruits(next).map_err(|e| {
+                anyhow::anyhow!("Failed to merge intermediate[{}]: {}", i, e)
+            })?;
+        }
+
+        // Finalize
+        let aggregations: Aggregations = serde_json::from_str(&agg_json_str)?;
+        let limits = AggregationLimitsGuard::new(Some(50_000_000), Some(65_000));
+        let final_results: AggregationResults =
+            merged.into_final_result(aggregations, limits)?;
+
+        // Export each named aggregation to its FFI address slice
+        let mut offset = 0usize;
+        let mut row_counts = serde_json::Map::new();
+
+        for (idx, agg_name) in agg_names.iter().enumerate() {
+            let num_cols = col_counts_slice[idx] as usize;
+            let arr_slice = &all_arr[offset..offset + num_cols];
+            let sch_slice = &all_sch[offset..offset + num_cols];
+            offset += num_cols;
+
+            let agg_result = final_results
+                .0
+                .get(agg_name)
+                .ok_or_else(|| {
+                    let available: Vec<&String> = final_results.0.keys().collect();
+                    anyhow::anyhow!(
+                        "Aggregation '{}' not found. Available: {:?}",
+                        agg_name,
+                        available
+                    )
+                })?;
+
+            let is_date_hist = is_date_histogram_aggregation(&agg_json_str, agg_name);
+            let batch = aggregation_result_to_record_batch(agg_name, agg_result, is_date_hist)?;
+            let row_count = export_record_batch_ffi(&batch, arr_slice, sch_slice)?;
+            row_counts.insert(agg_name.clone(), serde_json::json!(row_count));
+        }
+
+        perf_println!(
+            "⏱️ AGG_FFI: nativeMultiSplitMultiAggregateArrowFfi DONE — {} splits, {} aggs, {}ms",
+            ptr_slice.len(),
+            agg_names.len(),
+            t0.elapsed().as_millis()
+        );
+
+        Ok(serde_json::Value::Object(row_counts).to_string())
+    })();
+
+    match result {
+        Ok(json) => match env.new_string(&json) {
+            Ok(s) => s.into_raw(),
+            Err(e) => {
+                to_java_exception(
+                    &mut env,
+                    &anyhow::anyhow!("Failed to create Java string: {}", e),
+                );
+                std::ptr::null_mut()
+            }
+        },
+        Err(e) => {
+            perf_println!(
+                "⏱️ AGG_FFI: nativeMultiSplitMultiAggregateArrowFfi FAILED: {}",
+                e
+            );
+            to_java_exception(&mut env, &e);
+            std::ptr::null_mut()
+        }
+    }
+}
+
 /// Test helper: read back Arrow FFI column data as JSON for validation.
 ///
 /// Takes the arrayAddrs and schemaAddrs that were previously written by aggregateArrowFfi

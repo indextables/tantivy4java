@@ -76,7 +76,18 @@ Arrow output (flattened cross-product):
 | error        | B            | 1                 | 60.0                |
 ```
 
-**Scope:** Exactly one level of nested Terms sub-aggregation within Terms, Histogram, or DateHistogram. Deeper nesting is not supported — use the object-based API for those cases.
+**N-dimensional GROUP BY (FR-A):** Nesting depth is unlimited. For `GROUP BY a, b, c` (3 fields), `MultiTermsAggregation` generates 3 levels of nested Terms, and the Arrow FFI output produces `key_0:Utf8, key_1:Utf8, key_2:Utf8, doc_count:Int64, {metric_sub_aggs}:Float64...`. Each GROUP BY dimension gets its own `key_N` column.
+
+**Example:** `GROUP BY region, category, quarter` with `AVG(sales)`:
+```
+Arrow output:
+| key_0 (Utf8) | key_1 (Utf8)  | key_2 (Utf8) | doc_count | avg_sales |
+|--------------|---------------|--------------|-----------|-----------|
+| US           | Electronics   | Q1           | 10        | 100.0     |
+| US           | Electronics   | Q2           | 20        | 200.0     |
+| US           | Books         | Q1           | 5         | 50.0      |
+| UK           | Electronics   | Q1           | 8         | 80.0      |
+```
 
 ## API Reference
 
@@ -138,6 +149,65 @@ This is significantly faster than the alternative of running N separate aggregat
 - Only 1 JNI crossing instead of O(N * buckets)
 - Intermediate merge happens in native code with zero serialization overhead
 - Final result is exported as a single Arrow RecordBatch
+
+### SplitCacheManager — Multi-Split, Multi-Aggregation Single-Pass (FR-C)
+
+```java
+// Search each split ONCE with multiple aggregations, merge, export all as Arrow FFI
+String queryAst = "{\"type\":\"match_all\"}";
+String combinedAggJson = "{\"score_stats\":{\"stats\":{\"field\":\"score\"}}," +
+    "\"status_terms\":{\"terms\":{\"field\":\"status\",\"size\":100}}}";
+
+List<String> aggNames = Arrays.asList("score_stats", "status_terms");
+int[] colCounts = {5, 2}; // stats=5 cols (count,sum,min,max,avg), terms=2 cols (key,doc_count)
+int totalCols = 7;
+
+long[] arrayAddrs = new long[totalCols];
+long[] schemaAddrs = new long[totalCols];
+// ... allocate all 7 FFI buffers ...
+
+// Single call: searches each split once, merges, exports both aggregations
+String resultJson = cacheManager.multiSplitMultiAggregateArrowFfi(
+    searchers, queryAst, aggNames, combinedAggJson, colCounts,
+    arrayAddrs, schemaAddrs);
+// resultJson: {"score_stats":1,"status_terms":2}  (row counts per agg)
+
+// FFI addresses are laid out sequentially:
+// arrayAddrs[0..4] → score_stats columns (count, sum, min, max, avg)
+// arrayAddrs[5..6] → status_terms columns (key, doc_count)
+```
+
+For 3 aggregations across 100 splits: **100 searches** instead of 300.
+
+This is significantly faster than calling `multiSplitAggregateArrowFfi()` once per aggregation, because:
+- Each split is searched only once with the combined aggregation JSON
+- All intermediate results are merged in a single native pass
+- Multiple RecordBatches are exported to sequential FFI address ranges in one JNI call
+
+## Bucket Sub-Aggregation API (FR-B)
+
+All bucket aggregation types now support named sub-aggregations consistently:
+
+```java
+// TermsAggregation (existing)
+termsAgg.addSubAggregation("sum_revenue", new SumAggregation("revenue"));
+
+// HistogramAggregation (new named overload)
+histAgg.addSubAggregation("avg_price", new AverageAggregation("price"));
+
+// DateHistogramAggregation (new named overload)
+dateHistAgg.addSubAggregation("min_value", new MinAggregation("value"));
+
+// RangeAggregation (new — previously had no sub-agg support)
+rangeAgg.addSubAggregation("total_count", new CountAggregation("*"));
+```
+
+Arrow FFI export includes sub-aggregation columns for all bucket types:
+```
+Histogram:      key:Float64, doc_count:Int64, avg_price:Float64
+DateHistogram:  key:Timestamp(us), doc_count:Int64, min_value:Float64
+Range:          key:Utf8, doc_count:Int64, from:Float64, to:Float64, total_count:Float64
+```
 
 ## Complete Example
 
@@ -213,7 +283,7 @@ int rowCount = cacheManager.multiSplitAggregateArrowFfi(
 | `native/src/split_searcher/mod.rs` | Module registration |
 | `SplitSearcher.java` | `getAggregationArrowSchema()`, `aggregateArrowFfi()` |
 | `SplitCacheManager.java` | `multiSplitAggregateArrowFfi()` |
-| `AggregationArrowFfiTest.java` | Integration tests (14 tests) |
+| `AggregationArrowFfiTest.java` | Integration tests (17 tests) |
 
 ### Rust Conversion Pipeline
 
@@ -342,7 +412,7 @@ Run the Rust unit tests:
 cd native && cargo test --lib aggregation_arrow_ffi
 ```
 
-### Test Coverage (14 Java integration tests + 9 Rust unit tests)
+### Test Coverage (17 Java integration tests + 10 Rust unit tests)
 
 | Test | What It Validates |
 |------|-------------------|
@@ -360,6 +430,9 @@ cd native && cargo test --lib aggregation_arrow_ffi
 | `testMultiSplitStatsMerge` | Multi-split merge: validates merged count=7, sum=495, min=40, max=95, avg=70.71 |
 | `testNestedTermsFlattening` | FR-2: Terms→Terms cross-product flattening with metric sub-agg validation |
 | `testNestedDateHistogramTermsFlattening` | FR-2: DateHistogram→Terms cross-product with Timestamp key_0 type |
+| `testThreeColumnGroupBy` | FR-A: N-dimensional GROUP BY schema validation (key_0, key_1, no key_2 for 2-level) |
+| `testHistogramWithNamedSubAgg` | FR-B: Histogram sub-agg column present in FFI output |
+| `testMultiSplitMultiAggSinglePass` | FR-C: Single-pass multi-agg across splits with merged value validation |
 
 ### Test Read-Back Helper
 

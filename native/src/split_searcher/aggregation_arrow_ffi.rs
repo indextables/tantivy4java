@@ -414,67 +414,133 @@ fn extract_inner_buckets(bucket: &BucketResult) -> Vec<&BucketEntry> {
     }
 }
 
-/// Flatten Terms → nested Terms into cross-product rows.
-/// Produces: key_0:Utf8, key_1:Utf8, doc_count:Int64, {metric_sub_aggs}:Float64...
+/// Count the depth of nested bucket sub-aggregations (Terms chains).
+/// Returns the total number of key levels (including the leaf bucket level).
+fn count_nesting_depth(buckets: &[BucketEntry]) -> usize {
+    let first = match buckets.first() {
+        Some(b) => b,
+        None => return 0,
+    };
+    match find_nested_bucket_sub_agg(Some(&first.sub_aggregation)) {
+        Some((_, ref nested)) => {
+            let inner = extract_inner_buckets(nested);
+            // Borrow the inner entries to get owned BucketEntry references
+            let inner_owned: Vec<BucketEntry> = inner.into_iter().cloned().collect();
+            1 + count_nesting_depth(&inner_owned)
+        }
+        None => 1, // Leaf level (has only metric sub-aggs or nothing)
+    }
+}
+
+/// Recursively collect all flattened rows from N levels of nested Terms buckets.
+/// Each row has N key strings + doc_count + metric sub-agg values.
+fn collect_nested_rows(
+    buckets: &[BucketEntry],
+    prefix_keys: &[String],
+    depth: usize,
+    metric_names: &[String],
+    key_columns: &mut Vec<Vec<String>>,
+    doc_count_values: &mut Vec<i64>,
+    metric_values: &mut Vec<Vec<Option<f64>>>,
+) {
+    for bucket in buckets {
+        let mut current_keys = prefix_keys.to_vec();
+        current_keys.push(key_to_string(&bucket.key));
+
+        if current_keys.len() == depth {
+            // Leaf level: emit a row
+            for (col_idx, key_val) in current_keys.iter().enumerate() {
+                key_columns[col_idx].push(key_val.clone());
+            }
+            doc_count_values.push(bucket.doc_count as i64);
+            for (i, name) in metric_names.iter().enumerate() {
+                metric_values[i].push(extract_metric_value(&bucket.sub_aggregation, name));
+            }
+        } else {
+            // Intermediate level: recurse into nested bucket sub-agg
+            let inner_buckets: Vec<&BucketEntry> = bucket
+                .sub_aggregation
+                .0
+                .values()
+                .find_map(|r| match r {
+                    AggregationResult::BucketResult(b) => Some(extract_inner_buckets(b)),
+                    _ => None,
+                })
+                .unwrap_or_default();
+
+            let inner_owned: Vec<BucketEntry> = inner_buckets.into_iter().cloned().collect();
+            collect_nested_rows(
+                &inner_owned,
+                &current_keys,
+                depth,
+                metric_names,
+                key_columns,
+                doc_count_values,
+                metric_values,
+            );
+        }
+    }
+}
+
+/// Find the innermost (leaf) metric sub-aggregation names by walking the nesting chain.
+fn find_leaf_metric_names(buckets: &[BucketEntry]) -> Vec<String> {
+    let first = match buckets.first() {
+        Some(b) => b,
+        None => return Vec::new(),
+    };
+    match find_nested_bucket_sub_agg(Some(&first.sub_aggregation)) {
+        Some((_, ref nested)) => {
+            let inner = extract_inner_buckets(nested);
+            let inner_owned: Vec<BucketEntry> = inner.into_iter().cloned().collect();
+            find_leaf_metric_names(&inner_owned)
+        }
+        None => collect_metric_sub_agg_names(Some(&first.sub_aggregation)),
+    }
+}
+
+/// Flatten Terms → nested Terms (N levels deep) into cross-product rows.
+/// Produces: key_0:Utf8, key_1:Utf8, ..., key_N-1:Utf8, doc_count:Int64, {metric_sub_aggs}:Float64...
 fn flatten_nested_bucket_terms(
     outer_buckets: &[BucketEntry],
     _nested_name: &str,
-    nested_template: &BucketResult,
+    _nested_template: &BucketResult,
 ) -> Result<RecordBatch> {
-    // Get inner metric sub-agg names from the innermost bucket
-    let inner_metric_names = match nested_template {
-        BucketResult::Terms { buckets, .. } => {
-            collect_metric_sub_agg_names(buckets.first().map(|b| &b.sub_aggregation))
-        }
-        _ => Vec::new(),
-    };
+    // Determine total nesting depth (number of key columns)
+    let depth = count_nesting_depth(outer_buckets);
+    let metric_names = find_leaf_metric_names(outer_buckets);
 
-    let mut fields = vec![
-        Field::new("key_0", DataType::Utf8, false),
-        Field::new("key_1", DataType::Utf8, false),
-        Field::new("doc_count", DataType::Int64, false),
-    ];
-    for name in &inner_metric_names {
+    // Build schema: key_0, key_1, ..., key_N-1, doc_count, metric_sub_aggs...
+    let mut fields: Vec<Field> = (0..depth)
+        .map(|i| Field::new(format!("key_{}", i), DataType::Utf8, false))
+        .collect();
+    fields.push(Field::new("doc_count", DataType::Int64, false));
+    for name in &metric_names {
         fields.push(Field::new(name, DataType::Float64, true));
     }
     let schema = Arc::new(Schema::new(fields));
 
-    let mut key_0_values: Vec<String> = Vec::new();
-    let mut key_1_values: Vec<String> = Vec::new();
+    // Collect rows recursively
+    let mut key_columns: Vec<Vec<String>> = (0..depth).map(|_| Vec::new()).collect();
     let mut doc_count_values: Vec<i64> = Vec::new();
     let mut metric_values: Vec<Vec<Option<f64>>> =
-        inner_metric_names.iter().map(|_| Vec::new()).collect();
+        metric_names.iter().map(|_| Vec::new()).collect();
 
-    for outer in outer_buckets {
-        let outer_key = key_to_string(&outer.key);
+    collect_nested_rows(
+        outer_buckets,
+        &[],
+        depth,
+        &metric_names,
+        &mut key_columns,
+        &mut doc_count_values,
+        &mut metric_values,
+    );
 
-        // Find the nested bucket result in this outer bucket's sub_aggregation
-        let inner_buckets: Vec<&BucketEntry> = outer
-            .sub_aggregation
-            .0
-            .values()
-            .find_map(|r| match r {
-                AggregationResult::BucketResult(b) => Some(extract_inner_buckets(b)),
-                _ => None,
-            })
-            .unwrap_or_default();
-
-        for inner in &inner_buckets {
-            key_0_values.push(outer_key.clone());
-            key_1_values.push(key_to_string(&inner.key));
-            doc_count_values.push(inner.doc_count as i64);
-
-            for (i, name) in inner_metric_names.iter().enumerate() {
-                metric_values[i].push(extract_metric_value(&inner.sub_aggregation, name));
-            }
-        }
-    }
-
-    let mut columns: Vec<Arc<dyn arrow_array::Array>> = vec![
-        Arc::new(StringArray::from(key_0_values)),
-        Arc::new(StringArray::from(key_1_values)),
-        Arc::new(Int64Array::from(doc_count_values)),
-    ];
+    // Build Arrow columns
+    let mut columns: Vec<Arc<dyn arrow_array::Array>> = key_columns
+        .into_iter()
+        .map(|col| Arc::new(StringArray::from(col)) as Arc<dyn arrow_array::Array>)
+        .collect();
+    columns.push(Arc::new(Int64Array::from(doc_count_values)));
     for vals in &metric_values {
         columns.push(Arc::new(Float64Array::from(vals.clone())));
     }
@@ -483,68 +549,108 @@ fn flatten_nested_bucket_terms(
         .context("Failed to create flattened nested Terms RecordBatch")
 }
 
-/// Flatten Histogram/DateHistogram → nested Terms into cross-product rows.
-/// Produces: key_0:Float64|Timestamp(us), key_1:Utf8, doc_count:Int64, {metric_sub_aggs}:Float64...
+/// Flatten Histogram/DateHistogram → nested Terms (N levels deep) into cross-product rows.
+/// key_0 is Float64|Timestamp(us), remaining key_1..key_N-1 are Utf8 from nested Terms.
 fn flatten_nested_bucket_histogram(
     outer_entries: &[&BucketEntry],
     _nested_name: &str,
-    nested_template: &BucketResult,
+    _nested_template: &BucketResult,
     is_date_histogram: bool,
 ) -> Result<RecordBatch> {
-    let inner_metric_names = match nested_template {
-        BucketResult::Terms { buckets, .. } => {
-            collect_metric_sub_agg_names(buckets.first().map(|b| &b.sub_aggregation))
-        }
-        _ => Vec::new(),
+    // Get the inner Terms buckets from first outer entry to determine nesting depth
+    let first_inner: Vec<BucketEntry> = outer_entries
+        .first()
+        .and_then(|e| {
+            e.sub_aggregation.0.values().find_map(|r| match r {
+                AggregationResult::BucketResult(b) => {
+                    Some(extract_inner_buckets(b).into_iter().cloned().collect::<Vec<_>>())
+                }
+                _ => None,
+            })
+        })
+        .unwrap_or_default();
+
+    // Inner depth = how many nested Terms levels inside the histogram
+    let inner_depth = if first_inner.is_empty() {
+        1
+    } else {
+        count_nesting_depth(&first_inner)
+    };
+    let total_key_cols = 1 + inner_depth; // outer histogram key + inner Terms keys
+    let metric_names = if first_inner.is_empty() {
+        Vec::new()
+    } else {
+        find_leaf_metric_names(&first_inner)
     };
 
+    // Build schema
     let key_0_type = if is_date_histogram {
         DataType::Timestamp(TimeUnit::Microsecond, None)
     } else {
         DataType::Float64
     };
-
-    let mut fields = vec![
-        Field::new("key_0", key_0_type.clone(), false),
-        Field::new("key_1", DataType::Utf8, false),
-        Field::new("doc_count", DataType::Int64, false),
-    ];
-    for name in &inner_metric_names {
+    let mut fields = vec![Field::new("key_0", key_0_type, false)];
+    for i in 1..total_key_cols {
+        fields.push(Field::new(format!("key_{}", i), DataType::Utf8, false));
+    }
+    fields.push(Field::new("doc_count", DataType::Int64, false));
+    for name in &metric_names {
         fields.push(Field::new(name, DataType::Float64, true));
     }
     let schema = Arc::new(Schema::new(fields));
 
+    // Collect rows
     let mut key_0_f64: Vec<f64> = Vec::new();
     let mut key_0_ts: Vec<i64> = Vec::new();
-    let mut key_1_values: Vec<String> = Vec::new();
+    let mut inner_key_columns: Vec<Vec<String>> = (0..inner_depth).map(|_| Vec::new()).collect();
     let mut doc_count_values: Vec<i64> = Vec::new();
     let mut metric_values: Vec<Vec<Option<f64>>> =
-        inner_metric_names.iter().map(|_| Vec::new()).collect();
+        metric_names.iter().map(|_| Vec::new()).collect();
 
     for outer in outer_entries {
-        let inner_buckets: Vec<&BucketEntry> = outer
+        let inner_buckets: Vec<BucketEntry> = outer
             .sub_aggregation
             .0
             .values()
             .find_map(|r| match r {
-                AggregationResult::BucketResult(b) => Some(extract_inner_buckets(b)),
+                AggregationResult::BucketResult(b) => {
+                    Some(extract_inner_buckets(b).into_iter().cloned().collect::<Vec<_>>())
+                }
                 _ => None,
             })
             .unwrap_or_default();
 
-        for inner in &inner_buckets {
+        // Use the recursive collector for the inner Terms chain
+        let mut inner_keys: Vec<Vec<String>> = (0..inner_depth).map(|_| Vec::new()).collect();
+        let mut inner_docs: Vec<i64> = Vec::new();
+        let mut inner_metrics: Vec<Vec<Option<f64>>> =
+            metric_names.iter().map(|_| Vec::new()).collect();
+
+        collect_nested_rows(
+            &inner_buckets,
+            &[],
+            inner_depth,
+            &metric_names,
+            &mut inner_keys,
+            &mut inner_docs,
+            &mut inner_metrics,
+        );
+
+        let num_inner_rows = inner_docs.len();
+        for _ in 0..num_inner_rows {
             if is_date_histogram {
                 let ms = key_to_f64(&outer.key) as i64;
-                key_0_ts.push(ms * 1000); // ms → µs
+                key_0_ts.push(ms * 1000);
             } else {
                 key_0_f64.push(key_to_f64(&outer.key));
             }
-            key_1_values.push(key_to_string(&inner.key));
-            doc_count_values.push(inner.doc_count as i64);
-
-            for (i, name) in inner_metric_names.iter().enumerate() {
-                metric_values[i].push(extract_metric_value(&inner.sub_aggregation, name));
-            }
+        }
+        for (col_idx, col) in inner_keys.into_iter().enumerate() {
+            inner_key_columns[col_idx].extend(col);
+        }
+        doc_count_values.extend(inner_docs);
+        for (i, vals) in inner_metrics.into_iter().enumerate() {
+            metric_values[i].extend(vals);
         }
     }
 
@@ -554,11 +660,11 @@ fn flatten_nested_bucket_histogram(
         Arc::new(Float64Array::from(key_0_f64))
     };
 
-    let mut columns: Vec<Arc<dyn arrow_array::Array>> = vec![
-        key_0_col,
-        Arc::new(StringArray::from(key_1_values)),
-        Arc::new(Int64Array::from(doc_count_values)),
-    ];
+    let mut columns: Vec<Arc<dyn arrow_array::Array>> = vec![key_0_col];
+    for col in inner_key_columns {
+        columns.push(Arc::new(StringArray::from(col)));
+    }
+    columns.push(Arc::new(Int64Array::from(doc_count_values)));
     for vals in &metric_values {
         columns.push(Arc::new(Float64Array::from(vals.clone())));
     }
@@ -925,6 +1031,118 @@ mod tests {
         assert!((avg.value(0) - 50.0).abs() < 0.01);
         assert!((avg.value(1) - 30.0).abs() < 0.01);
         assert!((avg.value(2) - 40.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_nested_3_level_terms_flattening() {
+        // 3-level: region → category → quarter with avg_sales
+        let make_leaf = |quarter: &str, count: u64, avg: f64| -> BucketEntry {
+            let sub = vec![(
+                "avg_sales".to_string(),
+                AggregationResult::MetricResult(MetricResult::Average(
+                    SingleMetricResult { value: Some(avg) },
+                )),
+            )]
+            .into_iter()
+            .collect();
+            BucketEntry {
+                key: Key::Str(quarter.to_string()),
+                doc_count: count,
+                key_as_string: None,
+                sub_aggregation: AggregationResults(sub),
+            }
+        };
+
+        let make_mid = |categories: Vec<(&str, Vec<BucketEntry>)>| -> AggregationResults {
+            let inner_buckets: Vec<BucketEntry> = categories
+                .into_iter()
+                .map(|(cat, quarters)| {
+                    let nested = BucketResult::Terms {
+                        buckets: quarters,
+                        sum_other_doc_count: 0,
+                        doc_count_error_upper_bound: None,
+                    };
+                    let map = vec![(
+                        "quarter_terms".to_string(),
+                        AggregationResult::BucketResult(nested),
+                    )]
+                    .into_iter()
+                    .collect();
+                    BucketEntry {
+                        key: Key::Str(cat.to_string()),
+                        doc_count: 0,
+                        key_as_string: None,
+                        sub_aggregation: AggregationResults(map),
+                    }
+                })
+                .collect();
+            let mid_result = BucketResult::Terms {
+                buckets: inner_buckets,
+                sum_other_doc_count: 0,
+                doc_count_error_upper_bound: None,
+            };
+            let map = vec![(
+                "category_terms".to_string(),
+                AggregationResult::BucketResult(mid_result),
+            )]
+            .into_iter()
+            .collect();
+            AggregationResults(map)
+        };
+
+        let outer_buckets = vec![
+            BucketEntry {
+                key: Key::Str("US".to_string()),
+                doc_count: 0,
+                key_as_string: None,
+                sub_aggregation: make_mid(vec![
+                    ("Electronics", vec![make_leaf("Q1", 10, 100.0), make_leaf("Q2", 20, 200.0)]),
+                    ("Books", vec![make_leaf("Q1", 5, 50.0)]),
+                ]),
+            },
+            BucketEntry {
+                key: Key::Str("UK".to_string()),
+                doc_count: 0,
+                key_as_string: None,
+                sub_aggregation: make_mid(vec![
+                    ("Electronics", vec![make_leaf("Q1", 8, 80.0)]),
+                ]),
+            },
+        ];
+
+        let result = AggregationResult::BucketResult(BucketResult::Terms {
+            buckets: outer_buckets,
+            sum_other_doc_count: 0,
+            doc_count_error_upper_bound: None,
+        });
+        let batch = aggregation_result_to_record_batch("nested3", &result, false).unwrap();
+
+        // Should flatten to 4 rows: US/Electronics/Q1, US/Electronics/Q2, US/Books/Q1, UK/Electronics/Q1
+        assert_eq!(batch.num_rows(), 4);
+        // Columns: key_0, key_1, key_2, doc_count, avg_sales
+        assert_eq!(batch.num_columns(), 5);
+        assert_eq!(batch.schema().field(0).name(), "key_0");
+        assert_eq!(batch.schema().field(1).name(), "key_1");
+        assert_eq!(batch.schema().field(2).name(), "key_2");
+        assert_eq!(batch.schema().field(3).name(), "doc_count");
+        assert_eq!(batch.schema().field(4).name(), "avg_sales");
+
+        let key0 = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+        let key1 = batch.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+        let key2 = batch.column(2).as_any().downcast_ref::<StringArray>().unwrap();
+        let counts = batch.column(3).as_any().downcast_ref::<Int64Array>().unwrap();
+
+        // Row 0: US / Electronics / Q1
+        assert_eq!(key0.value(0), "US");
+        assert_eq!(key1.value(0), "Electronics");
+        assert_eq!(key2.value(0), "Q1");
+        assert_eq!(counts.value(0), 10);
+
+        // Row 3: UK / Electronics / Q1
+        assert_eq!(key0.value(3), "UK");
+        assert_eq!(key1.value(3), "Electronics");
+        assert_eq!(key2.value(3), "Q1");
+        assert_eq!(counts.value(3), 8);
     }
 
     #[test]
