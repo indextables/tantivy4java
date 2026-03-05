@@ -1360,10 +1360,22 @@ public class QuickwitSplit {
         private final long numDocs;
         private final long footerStartOffset;
         private final long footerEndOffset;
+        private final String docMappingJson;
+        private final long uncompressedSizeBytes;
+        private final long hotcacheStartOffset;
+        private final long hotcacheLength;
+        private final long createTimestamp;
+        private final String maturity;
+        private final int numMergeOps;
+        private final long deleteOpstamp;
 
         public PartitionSplitResult(String partitionKey, Map<String, String> partitionValues,
                                     String splitPath, String splitId, long numDocs,
-                                    long footerStartOffset, long footerEndOffset) {
+                                    long footerStartOffset, long footerEndOffset,
+                                    String docMappingJson, long uncompressedSizeBytes,
+                                    long hotcacheStartOffset, long hotcacheLength,
+                                    long createTimestamp, String maturity,
+                                    int numMergeOps, long deleteOpstamp) {
             this.partitionKey = partitionKey;
             this.partitionValues = partitionValues;
             this.splitPath = splitPath;
@@ -1371,6 +1383,14 @@ public class QuickwitSplit {
             this.numDocs = numDocs;
             this.footerStartOffset = footerStartOffset;
             this.footerEndOffset = footerEndOffset;
+            this.docMappingJson = docMappingJson;
+            this.uncompressedSizeBytes = uncompressedSizeBytes;
+            this.hotcacheStartOffset = hotcacheStartOffset;
+            this.hotcacheLength = hotcacheLength;
+            this.createTimestamp = createTimestamp;
+            this.maturity = maturity;
+            this.numMergeOps = numMergeOps;
+            this.deleteOpstamp = deleteOpstamp;
         }
 
         /** Partition key (e.g. "event_date=2023-01-15/region=us"), empty for non-partitioned */
@@ -1387,6 +1407,22 @@ public class QuickwitSplit {
         public long getFooterStartOffset() { return footerStartOffset; }
         /** Footer end offset in the split file */
         public long getFooterEndOffset() { return footerEndOffset; }
+        /** Doc mapping JSON with field metadata (fast, indexed, stored, type info). May be null. */
+        public String getDocMappingJson() { return docMappingJson; }
+        /** Uncompressed size of all index files in bytes */
+        public long getUncompressedSizeBytes() { return uncompressedSizeBytes; }
+        /** Hotcache start offset in the split file */
+        public long getHotcacheStartOffset() { return hotcacheStartOffset; }
+        /** Hotcache length in bytes */
+        public long getHotcacheLength() { return hotcacheLength; }
+        /** Unix timestamp (seconds) when the split was created */
+        public long getCreateTimestamp() { return createTimestamp; }
+        /** Split maturity: "Mature" or "Immature" */
+        public String getMaturity() { return maturity; }
+        /** Number of merge operations applied to this split */
+        public int getNumMergeOps() { return numMergeOps; }
+        /** Delete opstamp for tracking deletes */
+        public long getDeleteOpstamp() { return deleteOpstamp; }
 
         @Override
         public String toString() {
@@ -1406,7 +1442,65 @@ public class QuickwitSplit {
      * @return opaque handle for subsequent addBatch/finish/cancel calls
      */
     public static long beginSplitFromArrow(long schemaAddr, String[] partitionColumns, long heapSize) {
-        return nativeBeginSplitFromArrow(schemaAddr, partitionColumns, heapSize);
+        return nativeBeginSplitFromArrow(schemaAddr, partitionColumns, heapSize, null, 0, null);
+    }
+
+    /**
+     * Begin creating splits from Arrow columnar data with field configuration.
+     * <p>
+     * The fieldConfigJson parameter tells Rust how each field should be indexed,
+     * resolving the Arrow type ambiguity (e.g. Utf8 could be text, json, ip, or string).
+     * Without this, all Utf8 columns default to text with "raw" tokenizer (no full-text search).
+     * <p>
+     * Expected JSON format:
+     * <pre>
+     * [
+     *   {"name": "id", "type": "i64"},
+     *   {"name": "content", "type": "text", "tokenizer": "default"},
+     *   {"name": "metadata", "type": "json"},
+     *   {"name": "ip_addr", "type": "ip"},
+     *   {"name": "category", "type": "text", "tokenizer": "raw"}
+     * ]
+     * </pre>
+     * <p>
+     * Supported type values: "text", "json", "ip", "i64", "f64", "bool", "datetime", "bytes".
+     * Only "text", "json", and "ip" have meaningful overrides — other types are inferred from Arrow.
+     *
+     * @param schemaAddr memory address of FFI_ArrowSchema struct
+     * @param partitionColumns partition column names (empty array for non-partitioned tables)
+     * @param heapSize tantivy writer heap size per partition
+     * @param fieldConfigJson JSON array of per-field configuration, or null for defaults
+     * @return opaque handle for subsequent addBatch/finish/cancel calls
+     */
+    public static long beginSplitFromArrow(long schemaAddr, String[] partitionColumns,
+                                            long heapSize, String fieldConfigJson) {
+        return nativeBeginSplitFromArrow(schemaAddr, partitionColumns, heapSize, fieldConfigJson, 0, null);
+    }
+
+    /**
+     * Begin creating splits from Arrow columnar data with field configuration and split rolling.
+     * <p>
+     * When maxDocsPerSplit is set (> 0), partitions are automatically rolled (finalized into
+     * split files) when their document count reaches the threshold. Rolled splits are accumulated
+     * internally and returned together with remaining splits by finishAllSplits().
+     * The rolling is handled inside Rust since the caller cannot see per-partition doc counts.
+     * <p>
+     * outputDir must be provided when maxDocsPerSplit > 0, as Rust needs to know where to
+     * write rolled split files during addArrowBatch calls.
+     *
+     * @param schemaAddr memory address of FFI_ArrowSchema struct
+     * @param partitionColumns partition column names (empty array for non-partitioned tables)
+     * @param heapSize tantivy writer heap size per partition
+     * @param fieldConfigJson JSON array of per-field configuration, or null for defaults
+     * @param maxDocsPerSplit max documents per split (0 = unlimited, no auto-rolling)
+     * @param outputDir base directory for auto-rolled split files (required when maxDocsPerSplit > 0)
+     * @return opaque handle for subsequent addBatch/finish/cancel calls
+     */
+    public static long beginSplitFromArrow(long schemaAddr, String[] partitionColumns,
+                                            long heapSize, String fieldConfigJson,
+                                            long maxDocsPerSplit, String outputDir) {
+        return nativeBeginSplitFromArrow(schemaAddr, partitionColumns, heapSize, fieldConfigJson,
+                                          maxDocsPerSplit, outputDir);
     }
 
     /**
@@ -1448,12 +1542,90 @@ public class QuickwitSplit {
             long numDocs = ((Long) map.get("numDocs"));
             long footerStartOffset = ((Long) map.get("footerStartOffset"));
             long footerEndOffset = ((Long) map.get("footerEndOffset"));
+            String docMappingJson = (String) map.get("docMappingJson");
+            long uncompressedSizeBytes = map.containsKey("uncompressedSizeBytes") ? ((Long) map.get("uncompressedSizeBytes")) : 0L;
+            long hotcacheStartOffset = map.containsKey("hotcacheStartOffset") ? ((Long) map.get("hotcacheStartOffset")) : 0L;
+            long hotcacheLength = map.containsKey("hotcacheLength") ? ((Long) map.get("hotcacheLength")) : 0L;
+            long createTimestamp = map.containsKey("createTimestamp") ? ((Long) map.get("createTimestamp")) : 0L;
+            String maturity = (String) map.getOrDefault("maturity", "Mature");
+            int numMergeOps = map.containsKey("numMergeOps") ? ((Long) map.get("numMergeOps")).intValue() : 0;
+            long deleteOpstamp = map.containsKey("deleteOpstamp") ? ((Long) map.get("deleteOpstamp")) : 0L;
 
             results.add(new PartitionSplitResult(
                 partitionKey, partitionValues, splitPath, splitId, numDocs,
-                footerStartOffset, footerEndOffset));
+                footerStartOffset, footerEndOffset, docMappingJson,
+                uncompressedSizeBytes, hotcacheStartOffset, hotcacheLength,
+                createTimestamp, maturity, numMergeOps, deleteOpstamp));
         }
         return results;
+    }
+
+    /**
+     * Finalize ALL partition splits, returning raw result maps from the native layer.
+     * Each map contains all fields from finishAllSplits plus optional statistics:
+     * <ul>
+     *   <li>"minValues" → Map&lt;String, String&gt; per-column min values (present if stats enabled via fieldConfigJson)</li>
+     *   <li>"maxValues" → Map&lt;String, String&gt; per-column max values (present if stats enabled via fieldConfigJson)</li>
+     *   <li>"partitionKey", "splitPath", "splitId", "numDocs", "footerStartOffset", "footerEndOffset",
+     *       "docMappingJson", "uncompressedSizeBytes", "hotcacheStartOffset", "hotcacheLength",
+     *       "createTimestamp", "maturity", "numMergeOps", "deleteOpstamp", "partitionValues"</li>
+     * </ul>
+     *
+     * @param handle from beginSplitFromArrow
+     * @param outputDir base directory for output split files
+     * @return list of raw result maps, one per partition (or one for non-partitioned). Empty list on error.
+     */
+    @SuppressWarnings("unchecked")
+    public static List<Map<String, Object>> finishAllSplitsRaw(long handle, String outputDir) {
+        Object raw = nativeFinishAllSplits(handle, outputDir);
+        if (raw == null) {
+            return new ArrayList<>();
+        }
+        return (List<Map<String, Object>>) raw;
+    }
+
+    /**
+     * Roll (finalize) one partition's current split and start a new writer for it.
+     * This enables maxRowsPerSplit support: when a partition reaches its row limit,
+     * call this to produce a split file and continue writing into a fresh index.
+     * <p>
+     * For non-partitioned tables, pass an empty string as partitionKey.
+     * The handle remains valid for continued addArrowBatch calls after rolling.
+     *
+     * @param handle from beginSplitFromArrow
+     * @param partitionKey partition key to roll (e.g. "event_date=2023-01-15"), or "" for non-partitioned
+     * @param outputDir base directory for the output split file
+     * @return the finalized split's result
+     */
+    @SuppressWarnings("unchecked")
+    public static PartitionSplitResult rollPartitionSplit(long handle, String partitionKey, String outputDir) {
+        Object raw = nativeRollPartitionSplit(handle, partitionKey, outputDir);
+        if (raw == null) {
+            return null;
+        }
+        Map<String, Object> map = (Map<String, Object>) raw;
+        String pk = (String) map.get("partitionKey");
+        @SuppressWarnings("unchecked")
+        Map<String, String> partitionValues = (Map<String, String>) map.get("partitionValues");
+        String splitPath = (String) map.get("splitPath");
+        String splitId = (String) map.get("splitId");
+        long numDocs = ((Long) map.get("numDocs"));
+        long footerStartOffset = ((Long) map.get("footerStartOffset"));
+        long footerEndOffset = ((Long) map.get("footerEndOffset"));
+        String docMappingJson = (String) map.get("docMappingJson");
+        long uncompressedSizeBytes = map.containsKey("uncompressedSizeBytes") ? ((Long) map.get("uncompressedSizeBytes")) : 0L;
+        long hotcacheStartOffset = map.containsKey("hotcacheStartOffset") ? ((Long) map.get("hotcacheStartOffset")) : 0L;
+        long hotcacheLength = map.containsKey("hotcacheLength") ? ((Long) map.get("hotcacheLength")) : 0L;
+        long createTimestamp = map.containsKey("createTimestamp") ? ((Long) map.get("createTimestamp")) : 0L;
+        String maturity = (String) map.getOrDefault("maturity", "Mature");
+        int numMergeOps = map.containsKey("numMergeOps") ? ((Long) map.get("numMergeOps")).intValue() : 0;
+        long deleteOpstamp = map.containsKey("deleteOpstamp") ? ((Long) map.get("deleteOpstamp")) : 0L;
+
+        return new PartitionSplitResult(
+            pk, partitionValues, splitPath, splitId, numDocs,
+            footerStartOffset, footerEndOffset, docMappingJson,
+            uncompressedSizeBytes, hotcacheStartOffset, hotcacheLength,
+            createTimestamp, maturity, numMergeOps, deleteOpstamp);
     }
 
     /**
@@ -1475,9 +1647,10 @@ public class QuickwitSplit {
     private static native Object nativeCreateFromParquet(List<String> parquetFiles, String outputPath, String configJson);
 
     // Arrow FFI split creation native methods
-    private static native long nativeBeginSplitFromArrow(long schemaAddr, String[] partitionColumns, long heapSize);
+    private static native long nativeBeginSplitFromArrow(long schemaAddr, String[] partitionColumns, long heapSize, String fieldConfigJson, long maxDocsPerSplit, String outputDir);
     private static native long nativeAddArrowBatch(long handle, long arrayAddr, long schemaAddr);
     private static native Object nativeFinishAllSplits(long handle, String outputDir);
+    private static native Object nativeRollPartitionSplit(long handle, String partitionKey, String outputDir);
     private static native void nativeCancelSplit(long handle);
 
     /**

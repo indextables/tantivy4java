@@ -1666,8 +1666,8 @@ use std::sync::{Arc, Mutex};
 use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
 use crate::parquet_companion::arrow_ffi_import::{
     ArrowFfiSplitContext, import_arrow_schema, import_arrow_batch,
-    begin_split_from_arrow, add_arrow_batch, finish_all_splits, cancel_split,
-    PartitionSplitResult,
+    begin_split_from_arrow, add_arrow_batch, finish_all_splits, roll_partition_split,
+    cancel_split, PartitionSplitResult,
 };
 use jni::sys::jlong;
 
@@ -1684,6 +1684,9 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_merge_QuickwitSpli
     schema_addr: jlong,
     partition_columns: jni::sys::jobjectArray,
     heap_size: jlong,
+    field_config_json: JString,
+    max_docs_per_split: jlong,
+    output_dir: JString,
 ) -> jlong {
     convert_throwable(&mut env, |env| {
         // Import Arrow schema from FFI address
@@ -1702,10 +1705,32 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_merge_QuickwitSpli
 
         let heap = if heap_size <= 0 { 50_000_000usize } else { heap_size as usize };
 
-        debug_log!("ARROW_FFI_IMPORT: begin_split_from_arrow with {} columns, {} partition cols, heap={}",
-            arrow_schema.fields().len(), partition_col_names.len(), heap);
+        // Extract optional field config JSON
+        let field_config: Option<String> = if field_config_json.is_null() {
+            None
+        } else {
+            Some(jstring_to_string(env, &field_config_json)?)
+        };
 
-        let ctx = begin_split_from_arrow(arrow_schema, &partition_col_names, heap)?;
+        let max_docs: u64 = if max_docs_per_split <= 0 { 0 } else { max_docs_per_split as u64 };
+
+        let out_dir: Option<String> = if output_dir.is_null() {
+            None
+        } else {
+            Some(jstring_to_string(env, &output_dir)?)
+        };
+
+        debug_log!("ARROW_FFI_IMPORT: begin_split_from_arrow with {} columns, {} partition cols, heap={}, field_config={}, max_docs_per_split={}",
+            arrow_schema.fields().len(), partition_col_names.len(), heap, field_config.is_some(), max_docs);
+
+        let ctx = begin_split_from_arrow(
+            arrow_schema,
+            &partition_col_names,
+            heap,
+            field_config.as_deref(),
+            max_docs,
+            out_dir,
+        )?;
         let ctx_arc: Arc<Mutex<ArrowFfiSplitContext>> = Arc::new(Mutex::new(ctx));
         let handle = arc_to_jlong(ctx_arc);
 
@@ -1737,7 +1762,9 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_merge_QuickwitSpli
         let mut ctx = ctx_arc.lock()
             .map_err(|e| anyhow!("Failed to lock context: {}", e))?;
 
-        let count = add_arrow_batch(&mut ctx, &batch)?;
+        // add_arrow_batch is async because auto-rolling may create split files
+        let count = QuickwitRuntimeManager::global().handle()
+            .block_on(add_arrow_batch(&mut ctx, &batch))?;
         Ok(count as jlong)
     }).unwrap_or(-1)
 }
@@ -1837,6 +1864,70 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_merge_QuickwitSpli
                 "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
                 &[JValue::Object(&footer_end_key.into()), JValue::Object(&footer_end_obj)])?;
 
+            // docMappingJson (may be None if extraction failed)
+            if let Some(ref doc_mapping_json) = result.metadata.doc_mapping_json {
+                let dmj_jstr = string_to_jstring(env, doc_mapping_json)?;
+                let dmj_key = string_to_jstring(env, "docMappingJson")?;
+                env.call_method(&map, "put",
+                    "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+                    &[JValue::Object(&dmj_key.into()), JValue::Object(&dmj_jstr.into())])?;
+            }
+
+            // uncompressedSizeBytes
+            let usize_obj = env.new_object(&long_class, "(J)V",
+                &[JValue::Long(result.metadata.uncompressed_docs_size_in_bytes as i64)])?;
+            let usize_key = string_to_jstring(env, "uncompressedSizeBytes")?;
+            env.call_method(&map, "put",
+                "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+                &[JValue::Object(&usize_key.into()), JValue::Object(&usize_obj)])?;
+
+            // hotcacheStartOffset
+            let hc_start = result.metadata.hotcache_start_offset.unwrap_or(0) as i64;
+            let hc_start_obj = env.new_object(&long_class, "(J)V", &[JValue::Long(hc_start)])?;
+            let hc_start_key = string_to_jstring(env, "hotcacheStartOffset")?;
+            env.call_method(&map, "put",
+                "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+                &[JValue::Object(&hc_start_key.into()), JValue::Object(&hc_start_obj)])?;
+
+            // hotcacheLength
+            let hc_len = result.metadata.hotcache_length.unwrap_or(0) as i64;
+            let hc_len_obj = env.new_object(&long_class, "(J)V", &[JValue::Long(hc_len)])?;
+            let hc_len_key = string_to_jstring(env, "hotcacheLength")?;
+            env.call_method(&map, "put",
+                "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+                &[JValue::Object(&hc_len_key.into()), JValue::Object(&hc_len_obj)])?;
+
+            // createTimestamp
+            let ts_obj = env.new_object(&long_class, "(J)V",
+                &[JValue::Long(result.metadata.create_timestamp)])?;
+            let ts_key = string_to_jstring(env, "createTimestamp")?;
+            env.call_method(&map, "put",
+                "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+                &[JValue::Object(&ts_key.into()), JValue::Object(&ts_obj)])?;
+
+            // maturity
+            let mat_jstr = string_to_jstring(env, &result.metadata.maturity)?;
+            let mat_key = string_to_jstring(env, "maturity")?;
+            env.call_method(&map, "put",
+                "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+                &[JValue::Object(&mat_key.into()), JValue::Object(&mat_jstr.into())])?;
+
+            // numMergeOps
+            let nmo_obj = env.new_object(&long_class, "(J)V",
+                &[JValue::Long(result.metadata.num_merge_ops as i64)])?;
+            let nmo_key = string_to_jstring(env, "numMergeOps")?;
+            env.call_method(&map, "put",
+                "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+                &[JValue::Object(&nmo_key.into()), JValue::Object(&nmo_obj)])?;
+
+            // deleteOpstamp
+            let do_obj = env.new_object(&long_class, "(J)V",
+                &[JValue::Long(result.metadata.delete_opstamp as i64)])?;
+            let do_key = string_to_jstring(env, "deleteOpstamp")?;
+            env.call_method(&map, "put",
+                "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+                &[JValue::Object(&do_key.into()), JValue::Object(&do_obj)])?;
+
             // partitionValues as nested HashMap
             let pv_map = env.new_object(&hash_map_class, "()V", &[])?;
             for (col, val) in &result.partition_values {
@@ -1851,6 +1942,38 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_merge_QuickwitSpli
                 "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
                 &[JValue::Object(&pv_key.into()), JValue::Object(&pv_map)])?;
 
+            // minValues as nested HashMap<String, String>
+            if !result.min_values.is_empty() {
+                let min_map = env.new_object(&hash_map_class, "()V", &[])?;
+                for (col, val) in &result.min_values {
+                    let col_jstr = string_to_jstring(env, col)?;
+                    let val_jstr = string_to_jstring(env, val)?;
+                    env.call_method(&min_map, "put",
+                        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+                        &[JValue::Object(&col_jstr.into()), JValue::Object(&val_jstr.into())])?;
+                }
+                let min_key = string_to_jstring(env, "minValues")?;
+                env.call_method(&map, "put",
+                    "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+                    &[JValue::Object(&min_key.into()), JValue::Object(&min_map)])?;
+            }
+
+            // maxValues as nested HashMap<String, String>
+            if !result.max_values.is_empty() {
+                let max_map = env.new_object(&hash_map_class, "()V", &[])?;
+                for (col, val) in &result.max_values {
+                    let col_jstr = string_to_jstring(env, col)?;
+                    let val_jstr = string_to_jstring(env, val)?;
+                    env.call_method(&max_map, "put",
+                        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+                        &[JValue::Object(&col_jstr.into()), JValue::Object(&val_jstr.into())])?;
+                }
+                let max_key = string_to_jstring(env, "maxValues")?;
+                env.call_method(&map, "put",
+                    "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+                    &[JValue::Object(&max_key.into()), JValue::Object(&max_map)])?;
+            }
+
             // Add map to result list
             env.call_method(&result_list, "add",
                 "(Ljava/lang/Object;)Z",
@@ -1858,6 +1981,198 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_merge_QuickwitSpli
         }
 
         Ok(result_list.into_raw())
+    }).unwrap_or(std::ptr::null_mut())
+}
+
+/// Roll (finalize) one partition's split and start a new writer, enabling maxRowsPerSplit.
+///
+/// Returns a Java HashMap<String, Object> with the same keys as finishAllSplits entries.
+/// The context remains valid for continued batch insertion.
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_split_merge_QuickwitSplit_nativeRollPartitionSplit(
+    mut env: JNIEnv,
+    _class: JClass,
+    ctx_handle: jlong,
+    partition_key: JString,
+    output_dir: JString,
+) -> jobject {
+    convert_throwable(&mut env, |env| {
+        let partition_key_str = jstring_to_string(env, &partition_key)?;
+        let output_dir_str = jstring_to_string(env, &output_dir)?;
+
+        let ctx_arc = crate::utils::jlong_to_arc::<Mutex<ArrowFfiSplitContext>>(ctx_handle)
+            .ok_or_else(|| anyhow!("Invalid context handle for rollPartitionSplit"))?;
+        let mut ctx = ctx_arc.lock()
+            .map_err(|e| anyhow!("Failed to lock context: {}", e))?;
+
+        let split_config = default_split_config("arrow-ffi", "arrow-ffi-source", "arrow-ffi-node");
+
+        let result = QuickwitRuntimeManager::global().handle()
+            .block_on(roll_partition_split(
+                &mut ctx, &partition_key_str, &output_dir_str, &split_config,
+            ))?;
+
+        // Convert single result to Java HashMap<String, Object>
+        let hash_map_class = env.find_class("java/util/HashMap")?;
+        let map = env.new_object(&hash_map_class, "()V", &[])?;
+        let long_class = env.find_class("java/lang/Long")?;
+
+        // partitionKey
+        let key_jstr = string_to_jstring(env, &result.partition_key)?;
+        let key_key = string_to_jstring(env, "partitionKey")?;
+        env.call_method(&map, "put",
+            "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+            &[JValue::Object(&key_key.into()), JValue::Object(&key_jstr.into())])?;
+
+        // splitPath
+        let path_jstr = string_to_jstring(env, &result.split_path)?;
+        let path_key = string_to_jstring(env, "splitPath")?;
+        env.call_method(&map, "put",
+            "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+            &[JValue::Object(&path_key.into()), JValue::Object(&path_jstr.into())])?;
+
+        // splitId
+        let id_jstr = string_to_jstring(env, &result.metadata.split_id)?;
+        let id_key = string_to_jstring(env, "splitId")?;
+        env.call_method(&map, "put",
+            "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+            &[JValue::Object(&id_key.into()), JValue::Object(&id_jstr.into())])?;
+
+        // numDocs
+        let num_docs_obj = env.new_object(&long_class, "(J)V",
+            &[JValue::Long(result.metadata.num_docs as i64)])?;
+        let num_docs_key = string_to_jstring(env, "numDocs")?;
+        env.call_method(&map, "put",
+            "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+            &[JValue::Object(&num_docs_key.into()), JValue::Object(&num_docs_obj)])?;
+
+        // footerStartOffset
+        let footer_start = result.metadata.footer_start_offset.unwrap_or(0) as i64;
+        let footer_start_obj = env.new_object(&long_class, "(J)V", &[JValue::Long(footer_start)])?;
+        let footer_start_key = string_to_jstring(env, "footerStartOffset")?;
+        env.call_method(&map, "put",
+            "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+            &[JValue::Object(&footer_start_key.into()), JValue::Object(&footer_start_obj)])?;
+
+        // footerEndOffset
+        let footer_end = result.metadata.footer_end_offset.unwrap_or(0) as i64;
+        let footer_end_obj = env.new_object(&long_class, "(J)V", &[JValue::Long(footer_end)])?;
+        let footer_end_key = string_to_jstring(env, "footerEndOffset")?;
+        env.call_method(&map, "put",
+            "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+            &[JValue::Object(&footer_end_key.into()), JValue::Object(&footer_end_obj)])?;
+
+        // docMappingJson
+        if let Some(ref doc_mapping_json) = result.metadata.doc_mapping_json {
+            let dmj_jstr = string_to_jstring(env, doc_mapping_json)?;
+            let dmj_key = string_to_jstring(env, "docMappingJson")?;
+            env.call_method(&map, "put",
+                "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+                &[JValue::Object(&dmj_key.into()), JValue::Object(&dmj_jstr.into())])?;
+        }
+
+        // uncompressedSizeBytes
+        let usize_obj = env.new_object(&long_class, "(J)V",
+            &[JValue::Long(result.metadata.uncompressed_docs_size_in_bytes as i64)])?;
+        let usize_key = string_to_jstring(env, "uncompressedSizeBytes")?;
+        env.call_method(&map, "put",
+            "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+            &[JValue::Object(&usize_key.into()), JValue::Object(&usize_obj)])?;
+
+        // hotcacheStartOffset
+        let hc_start = result.metadata.hotcache_start_offset.unwrap_or(0) as i64;
+        let hc_start_obj = env.new_object(&long_class, "(J)V", &[JValue::Long(hc_start)])?;
+        let hc_start_key = string_to_jstring(env, "hotcacheStartOffset")?;
+        env.call_method(&map, "put",
+            "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+            &[JValue::Object(&hc_start_key.into()), JValue::Object(&hc_start_obj)])?;
+
+        // hotcacheLength
+        let hc_len = result.metadata.hotcache_length.unwrap_or(0) as i64;
+        let hc_len_obj = env.new_object(&long_class, "(J)V", &[JValue::Long(hc_len)])?;
+        let hc_len_key = string_to_jstring(env, "hotcacheLength")?;
+        env.call_method(&map, "put",
+            "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+            &[JValue::Object(&hc_len_key.into()), JValue::Object(&hc_len_obj)])?;
+
+        // createTimestamp
+        let ts_obj = env.new_object(&long_class, "(J)V",
+            &[JValue::Long(result.metadata.create_timestamp)])?;
+        let ts_key = string_to_jstring(env, "createTimestamp")?;
+        env.call_method(&map, "put",
+            "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+            &[JValue::Object(&ts_key.into()), JValue::Object(&ts_obj)])?;
+
+        // maturity
+        let mat_jstr = string_to_jstring(env, &result.metadata.maturity)?;
+        let mat_key = string_to_jstring(env, "maturity")?;
+        env.call_method(&map, "put",
+            "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+            &[JValue::Object(&mat_key.into()), JValue::Object(&mat_jstr.into())])?;
+
+        // numMergeOps
+        let nmo_obj = env.new_object(&long_class, "(J)V",
+            &[JValue::Long(result.metadata.num_merge_ops as i64)])?;
+        let nmo_key = string_to_jstring(env, "numMergeOps")?;
+        env.call_method(&map, "put",
+            "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+            &[JValue::Object(&nmo_key.into()), JValue::Object(&nmo_obj)])?;
+
+        // deleteOpstamp
+        let do_obj = env.new_object(&long_class, "(J)V",
+            &[JValue::Long(result.metadata.delete_opstamp as i64)])?;
+        let do_key = string_to_jstring(env, "deleteOpstamp")?;
+        env.call_method(&map, "put",
+            "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+            &[JValue::Object(&do_key.into()), JValue::Object(&do_obj)])?;
+
+        // partitionValues
+        let pv_map = env.new_object(&hash_map_class, "()V", &[])?;
+        for (col, val) in &result.partition_values {
+            let col_jstr = string_to_jstring(env, col)?;
+            let val_jstr = string_to_jstring(env, val)?;
+            env.call_method(&pv_map, "put",
+                "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+                &[JValue::Object(&col_jstr.into()), JValue::Object(&val_jstr.into())])?;
+        }
+        let pv_key = string_to_jstring(env, "partitionValues")?;
+        env.call_method(&map, "put",
+            "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+            &[JValue::Object(&pv_key.into()), JValue::Object(&pv_map)])?;
+
+        // minValues as nested HashMap<String, String>
+        if !result.min_values.is_empty() {
+            let min_map = env.new_object(&hash_map_class, "()V", &[])?;
+            for (col, val) in &result.min_values {
+                let col_jstr = string_to_jstring(env, col)?;
+                let val_jstr = string_to_jstring(env, val)?;
+                env.call_method(&min_map, "put",
+                    "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+                    &[JValue::Object(&col_jstr.into()), JValue::Object(&val_jstr.into())])?;
+            }
+            let min_key = string_to_jstring(env, "minValues")?;
+            env.call_method(&map, "put",
+                "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+                &[JValue::Object(&min_key.into()), JValue::Object(&min_map)])?;
+        }
+
+        // maxValues as nested HashMap<String, String>
+        if !result.max_values.is_empty() {
+            let max_map = env.new_object(&hash_map_class, "()V", &[])?;
+            for (col, val) in &result.max_values {
+                let col_jstr = string_to_jstring(env, col)?;
+                let val_jstr = string_to_jstring(env, val)?;
+                env.call_method(&max_map, "put",
+                    "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+                    &[JValue::Object(&col_jstr.into()), JValue::Object(&val_jstr.into())])?;
+            }
+            let max_key = string_to_jstring(env, "maxValues")?;
+            env.call_method(&map, "put",
+                "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+                &[JValue::Object(&max_key.into()), JValue::Object(&max_map)])?;
+        }
+
+        Ok(map.into_raw())
     }).unwrap_or(std::ptr::null_mut())
 }
 
