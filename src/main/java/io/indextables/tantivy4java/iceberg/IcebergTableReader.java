@@ -343,6 +343,32 @@ public class IcebergTableReader {
     }
 
     /**
+     * Cheap current snapshot ID probe for streaming pre-poll.
+     *
+     * <p>Cost: 1 catalog metadata read (table JSON) to resolve the current snapshot ID.
+     * Does NOT load the manifest list, saving one network round-trip compared to
+     * {@link #getSnapshotInfo}. Used by the streaming sync manager to skip a full
+     * sync cycle when the snapshot ID has not changed since the last sync.
+     *
+     * @param catalogName catalog identifier
+     * @param namespace   Iceberg namespace
+     * @param tableName   table name
+     * @param config      catalog and storage configuration
+     * @return current snapshot ID
+     * @throws RuntimeException if the table has no snapshot or the catalog is unreachable
+     */
+    public static long getCurrentSnapshotId(
+            String catalogName, String namespace, String tableName, Map<String, String> config) {
+        validateParams(catalogName, namespace, tableName, config);
+        long id = nativeGetCurrentSnapshotId(catalogName, namespace, tableName,
+                config != null ? config : Collections.emptyMap());
+        if (id < 0) {
+            throw new RuntimeException("nativeGetCurrentSnapshotId returned -1 (check preceding exception)");
+        }
+        return id;
+    }
+
+    /**
      * Get lightweight snapshot metadata for distributed scanning.
      *
      * @param catalogName catalog identifier
@@ -567,4 +593,8 @@ public class IcebergTableReader {
             String catalogName, String namespace, String tableName,
             String manifestPath, Map<String, String> config,
             String predicateJson, long[] arrayAddrs, long[] schemaAddrs);
+
+    private static native long nativeGetCurrentSnapshotId(
+            String catalogName, String namespace, String tableName,
+            Map<String, String> config);
 }

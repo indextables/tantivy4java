@@ -14,7 +14,7 @@ use crate::common::{
 use crate::debug_println;
 
 use super::scan::{list_iceberg_files, read_iceberg_schema, list_iceberg_snapshots};
-use super::distributed::{get_iceberg_snapshot_info, read_iceberg_manifest, read_iceberg_manifest_arrow_ffi};
+use super::distributed::{get_current_iceberg_snapshot_id, get_iceberg_snapshot_info, read_iceberg_manifest, read_iceberg_manifest_arrow_ffi};
 use super::serialization::{
     serialize_iceberg_entries, serialize_iceberg_schema, serialize_iceberg_snapshots,
     serialize_iceberg_snapshot_info,
@@ -197,6 +197,37 @@ pub extern "system" fn Java_io_indextables_tantivy4java_iceberg_IcebergTableRead
 }
 
 // ── Distributed scanning JNI entry points ────────────────────────────────────
+
+/// Cheap snapshot ID probe. Returns the current snapshot ID as jlong, or -1 on error.
+/// Does not load the manifest list — only reads table metadata JSON.
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_iceberg_IcebergTableReader_nativeGetCurrentSnapshotId(
+    mut env: JNIEnv,
+    _class: JClass,
+    catalog_name: JString,
+    namespace: JString,
+    table_name: JString,
+    config_map: JObject,
+) -> jlong {
+    let catalog_str = match get_jstring(&mut env, &catalog_name, "catalog name") {
+        Ok(s) => s, Err(()) => return -1,
+    };
+    let namespace_str = match get_jstring(&mut env, &namespace, "namespace") {
+        Ok(s) => s, Err(()) => return -1,
+    };
+    let table_str = match get_jstring(&mut env, &table_name, "table name") {
+        Ok(s) => s, Err(()) => return -1,
+    };
+    let config = match extract_hashmap(&mut env, &config_map) {
+        Ok(m) => m,
+        Err(_) => return -1,
+    };
+
+    match get_current_iceberg_snapshot_id(&catalog_str, &config, &namespace_str, &table_str) {
+        Ok(id) => id,
+        Err(_) => -1,
+    }
+}
 
 #[no_mangle]
 pub extern "system" fn Java_io_indextables_tantivy4java_iceberg_IcebergTableReader_nativeGetSnapshotInfo(

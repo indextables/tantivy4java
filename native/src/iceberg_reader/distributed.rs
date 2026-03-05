@@ -84,6 +84,42 @@ pub fn get_iceberg_snapshot_info(
     })
 }
 
+/// Driver-side cheap probe: return the current snapshot ID without loading the manifest list.
+///
+/// Cost: 1 catalog metadata read (table JSON) to get the current snapshot ID.
+/// Avoids the manifest list load that get_iceberg_snapshot_info() performs.
+/// Used by the streaming sync manager to check whether the table has changed since the
+/// last sync without paying the cost of a full getSnapshotInfo() call.
+///
+/// Returns Err if the table has no current snapshot or the catalog is unreachable.
+pub fn get_current_iceberg_snapshot_id(
+    catalog_name: &str,
+    config: &HashMap<String, String>,
+    namespace: &str,
+    table_name: &str,
+) -> Result<i64> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| anyhow::anyhow!("Failed to create Tokio runtime: {}", e))?;
+
+    rt.block_on(async {
+        let catalog = create_catalog(catalog_name, config).await?;
+        let ns = parse_namespace(namespace);
+        let table_ident = TableIdent::new(ns, table_name.to_string());
+        let table = catalog
+            .load_table(&table_ident)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to load table {}.{}: {}", namespace, table_name, e))?;
+        let snapshot_id = table
+            .metadata()
+            .current_snapshot()
+            .ok_or_else(|| anyhow::anyhow!("Table {}.{} has no current snapshot", namespace, table_name))?
+            .snapshot_id();
+        Ok(snapshot_id)
+    })
+}
+
 /// Executor-side: Read one manifest avro file and extract file entries.
 ///
 /// Creates a FileIO directly from config properties, avoiding the expensive
