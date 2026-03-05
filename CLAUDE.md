@@ -150,8 +150,8 @@ long expectedSize = fieldSizes.get("score.fastfield");
 - **✅ TermsAggregation** - Fully implemented and working
 - **✅ HistogramAggregation** - Fully implemented with arbitrary bucket sizes, extended_bounds, hard_bounds, keyed, and sub-aggregation support
 - **✅ DateHistogramAggregation** - Fully implemented with fixed_interval (ms, s, m, h, d), offset, hard_bounds, min_doc_count, keyed, and sub-aggregation support
-- **❌ RangeAggregation** - Not implemented in native layer. Returns empty aggregation map.
-- **Note**: Terms, Histogram, and DateHistogram aggregations work correctly with SplitSearcher for Quickwit split files.
+- **✅ RangeAggregation** - Fully implemented with key, doc_count, from, to columns and sub-aggregation support via both object API and Arrow FFI
+- **Note**: All four aggregation types (Terms, Histogram, DateHistogram, Range) work correctly with SplitSearcher for Quickwit split files, including via Arrow FFI export.
 
 **📊 Test Coverage Analysis:**
 - **Core Functionality**: 100% passing (20+ critical tests)

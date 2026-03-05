@@ -842,6 +842,319 @@ public class AggregationArrowFfiTest {
         }
     }
 
+    // ---- BUG-1: 3-Level Nested Terms End-to-End ----
+
+    @Test
+    @DisplayName("BUG-1: 3-level nested terms produces key_0, key_1, key_2 columns")
+    public void testThreeLevelNestedTermsEndToEnd() throws Exception {
+        // Create a separate split with 3 text fast fields
+        String uniqueId = "bug1_3level_" + System.nanoTime();
+        String indexPath = tempDir.resolve(uniqueId + "_index").toString();
+        String bug1SplitPath = tempDir.resolve(uniqueId + ".split").toString();
+
+        try (SchemaBuilder builder = new SchemaBuilder()) {
+            builder
+                .addTextField("region", true, true, "raw", "position")
+                .addTextField("category", true, true, "raw", "position")
+                .addTextField("quarter", true, true, "raw", "position")
+                .addIntegerField("sales", true, true, true);
+
+            try (Schema schema = builder.build()) {
+                try (Index index = new Index(schema, indexPath, false)) {
+                    try (IndexWriter writer = index.writer(Index.Memory.DEFAULT_HEAP_SIZE, 1)) {
+                        // 4 distinct (region, category, quarter) groups
+                        addDoc3Level(writer, "US", "Electronics", "Q1", 100);
+                        addDoc3Level(writer, "US", "Electronics", "Q2", 200);
+                        addDoc3Level(writer, "US", "Books", "Q1", 50);
+                        addDoc3Level(writer, "UK", "Electronics", "Q1", 80);
+                        writer.commit();
+                    }
+
+                    QuickwitSplit.SplitConfig config = new QuickwitSplit.SplitConfig(
+                        uniqueId, "test-source", "test-node");
+                    QuickwitSplit.SplitMetadata metadata =
+                        QuickwitSplit.convertIndexFromPath(indexPath, bug1SplitPath, config);
+
+                    String cacheName = uniqueId + "-cache";
+                    SplitCacheManager.CacheConfig cacheConfig =
+                        new SplitCacheManager.CacheConfig(cacheName);
+                    SplitCacheManager bug1CacheManager = SplitCacheManager.getInstance(cacheConfig);
+                    SplitSearcher bug1Searcher = bug1CacheManager.createSplitSearcher(
+                        "file://" + bug1SplitPath, metadata);
+
+                    try {
+                        String queryAst = "{\"type\":\"match_all\"}";
+                        // 3-level nested: region → category → quarter, with sum(sales) metric
+                        String aggJson = "{\"region_terms\":{\"terms\":{\"field\":\"region\",\"size\":1000}," +
+                            "\"aggs\":{\"category_terms\":{\"terms\":{\"field\":\"category\",\"size\":1000}," +
+                            "\"aggs\":{\"quarter_terms\":{\"terms\":{\"field\":\"quarter\",\"size\":1000}," +
+                            "\"aggs\":{\"sum_sales\":{\"sum\":{\"field\":\"sales\"}}}}}}}}}";
+
+                        // First check schema
+                        String schemaJson = bug1Searcher.getAggregationArrowSchema(
+                            queryAst, "region_terms", aggJson);
+                        assertNotNull(schemaJson, "Schema should not be null");
+                        System.out.println("BUG-1 schema: " + schemaJson);
+
+                        assertTrue(schemaJson.contains("\"key_0\""), "Should have key_0 (region)");
+                        assertTrue(schemaJson.contains("\"key_1\""), "Should have key_1 (category)");
+                        assertTrue(schemaJson.contains("\"key_2\""),
+                            "BUG-1: Should have key_2 (quarter) for 3-level nesting. Schema: " + schemaJson);
+
+                        // Now do the FFI export
+                        int numCols = 5; // key_0, key_1, key_2, doc_count, sum_sales
+                        long[] arrayAddrs = new long[numCols];
+                        long[] schemaAddrs = new long[numCols];
+                        allocateFfiBuffers(arrayAddrs, schemaAddrs, numCols);
+                        try {
+                            int rowCount = bug1Searcher.aggregateArrowFfi(
+                                queryAst, "region_terms", aggJson, arrayAddrs, schemaAddrs);
+                            System.out.println("BUG-1 rowCount: " + rowCount);
+                            assertEquals(4, rowCount,
+                                "BUG-1: Should have 4 rows (4 distinct region/category/quarter combos)");
+
+                            String json = nativeReadAggArrowColumnsAsJson(
+                                arrayAddrs, schemaAddrs, numCols, rowCount);
+                            System.out.println("BUG-1 data: " + json);
+                            Map<String, Object> result = parseJson(json);
+                            List<Map<String, Object>> columns = getColumns(result);
+                            assertEquals(5, columns.size(), "Should have 5 columns");
+                            assertEquals("key_0", columns.get(0).get("name"));
+                            assertEquals("key_1", columns.get(1).get("name"));
+                            assertEquals("key_2", columns.get(2).get("name"));
+                            assertEquals("doc_count", columns.get(3).get("name"));
+                            assertEquals("sum_sales", columns.get(4).get("name"));
+                        } finally {
+                            freeFfiBuffers(arrayAddrs, schemaAddrs, numCols);
+                        }
+                    } finally {
+                        bug1Searcher.close();
+                    }
+                }
+            }
+        }
+    }
+
+    private void addDoc3Level(IndexWriter writer, String region, String category,
+                              String quarter, int sales) throws Exception {
+        try (Document doc = new Document()) {
+            doc.addText("region", region);
+            doc.addText("category", category);
+            doc.addText("quarter", quarter);
+            doc.addInteger("sales", sales);
+            writer.addDocument(doc);
+        }
+    }
+
+    // ---- Nested Bucket + Terms Flattening ----
+
+    @Test
+    @DisplayName("DateHistogram + nested Terms produces cross-product rows via FFI")
+    public void testDateHistogramNestedTermsFfi() {
+        // DateHistogram(timestamp, 1 month) → Terms(status) → Sum(score)
+        // Data: Jan=3 docs (ok:2, error:1), Feb=2 docs (error:2... well, error:1, error:1)
+        // Actually: Jan has ok/ok/ok, Feb has error/error. Let's check exact data:
+        // ok/A/85/1/2024-01-01, ok/A/75/2/2024-01-02, ok/B/95/3/2024-01-03,
+        // error/B/60/4/2024-02-01, error/A/90/5/2024-02-02
+        // By month: Jan → {ok:3 docs}, Feb → {error:2 docs}
+        String queryAst = "{\"type\":\"match_all\"}";
+        String aggJson = "{\"time_bucket\":{\"date_histogram\":{\"field\":\"timestamp\"," +
+            "\"fixed_interval\":\"30d\"}," +
+            "\"aggs\":{\"status_terms\":{\"terms\":{\"field\":\"status\",\"size\":100}," +
+            "\"aggs\":{\"sum_score\":{\"sum\":{\"field\":\"score\"}}}}}}}";
+
+        String schemaJson = searcher.getAggregationArrowSchema(queryAst, "time_bucket", aggJson);
+        System.out.println("DateHist+Terms schema: " + schemaJson);
+        assertNotNull(schemaJson);
+        assertTrue(schemaJson.contains("\"key_0\""), "Should have key_0 (timestamp)");
+        assertTrue(schemaJson.contains("\"key_1\""), "Should have key_1 (status term)");
+        assertTrue(schemaJson.contains("\"doc_count\""), "Should have doc_count");
+        assertTrue(schemaJson.contains("\"sum_score\""), "Should have sum_score metric");
+
+        // Schema: key_0(Timestamp), key_1(Utf8), doc_count(Int64), sum_score(Float64)
+        int numCols = 4;
+        long[] arrayAddrs = new long[numCols];
+        long[] schemaAddrs = new long[numCols];
+        allocateFfiBuffers(arrayAddrs, schemaAddrs, numCols);
+        try {
+            int rowCount = searcher.aggregateArrowFfi(queryAst, "time_bucket", aggJson,
+                    arrayAddrs, schemaAddrs);
+            System.out.println("DateHist+Terms rowCount: " + rowCount);
+            assertTrue(rowCount >= 2,
+                "Should have cross-product rows (at least 2: Jan/ok + Feb/error). Got: " + rowCount);
+
+            String json = nativeReadAggArrowColumnsAsJson(arrayAddrs, schemaAddrs, numCols, rowCount);
+            System.out.println("DateHist+Terms data: " + json);
+            Map<String, Object> result = parseJson(json);
+            List<Map<String, Object>> columns = getColumns(result);
+            assertEquals(4, columns.size());
+            assertEquals("key_0", columns.get(0).get("name"));
+            assertEquals("key_1", columns.get(1).get("name"));
+            assertEquals("doc_count", columns.get(2).get("name"));
+            assertEquals("sum_score", columns.get(3).get("name"));
+        } finally {
+            freeFfiBuffers(arrayAddrs, schemaAddrs, numCols);
+        }
+    }
+
+    @Test
+    @DisplayName("Histogram + nested Terms produces cross-product rows via FFI")
+    public void testHistogramNestedTermsFfi() {
+        // Histogram(score, interval=50) → Terms(status)
+        String queryAst = "{\"type\":\"match_all\"}";
+        String aggJson = "{\"score_hist\":{\"histogram\":{\"field\":\"score\",\"interval\":50}," +
+            "\"aggs\":{\"status_terms\":{\"terms\":{\"field\":\"status\",\"size\":100}}}}}";
+
+        String schemaJson = searcher.getAggregationArrowSchema(queryAst, "score_hist", aggJson);
+        System.out.println("Hist+Terms schema: " + schemaJson);
+        assertNotNull(schemaJson);
+        assertTrue(schemaJson.contains("\"key_0\""), "Should have key_0 (histogram bucket)");
+        assertTrue(schemaJson.contains("\"key_1\""), "Should have key_1 (status term)");
+
+        int numCols = 3; // key_0(Float64), key_1(Utf8), doc_count(Int64)
+        long[] arrayAddrs = new long[numCols];
+        long[] schemaAddrs = new long[numCols];
+        allocateFfiBuffers(arrayAddrs, schemaAddrs, numCols);
+        try {
+            int rowCount = searcher.aggregateArrowFfi(queryAst, "score_hist", aggJson,
+                    arrayAddrs, schemaAddrs);
+            System.out.println("Hist+Terms rowCount: " + rowCount);
+            assertTrue(rowCount >= 2, "Should have cross-product rows. Got: " + rowCount);
+
+            String json = nativeReadAggArrowColumnsAsJson(arrayAddrs, schemaAddrs, numCols, rowCount);
+            System.out.println("Hist+Terms data: " + json);
+            Map<String, Object> result = parseJson(json);
+            List<Map<String, Object>> columns = getColumns(result);
+            assertEquals(3, columns.size());
+            assertEquals("key_0", columns.get(0).get("name"));
+            assertEquals("key_1", columns.get(1).get("name"));
+            assertEquals("doc_count", columns.get(2).get("name"));
+        } finally {
+            freeFfiBuffers(arrayAddrs, schemaAddrs, numCols);
+        }
+    }
+
+    @Test
+    @DisplayName("Range + nested Terms produces cross-product rows via FFI")
+    public void testRangeNestedTermsFfi() {
+        // Range(score) → Terms(status) → Sum(count)
+        String queryAst = "{\"type\":\"match_all\"}";
+        String aggJson = "{\"score_range\":{\"range\":{\"field\":\"score\"," +
+            "\"ranges\":[{\"key\":\"low\",\"to\":80.0},{\"key\":\"high\",\"from\":80.0}]}," +
+            "\"aggs\":{\"status_terms\":{\"terms\":{\"field\":\"status\",\"size\":100}," +
+            "\"aggs\":{\"sum_count\":{\"sum\":{\"field\":\"count\"}}}}}}}";
+
+        String schemaJson = searcher.getAggregationArrowSchema(queryAst, "score_range", aggJson);
+        System.out.println("Range+Terms schema: " + schemaJson);
+        assertNotNull(schemaJson);
+        assertTrue(schemaJson.contains("\"key_0\""), "Should have key_0 (range key)");
+        assertTrue(schemaJson.contains("\"from\""), "Should have from column");
+        assertTrue(schemaJson.contains("\"to\""), "Should have to column");
+        assertTrue(schemaJson.contains("\"key_1\""), "Should have key_1 (status term)");
+        assertTrue(schemaJson.contains("\"sum_count\""), "Should have sum_count metric");
+
+        // Schema: key_0(Utf8), from(f64), to(f64), key_1(Utf8), doc_count(Int64), sum_count(Float64)
+        int numCols = 6;
+        long[] arrayAddrs = new long[numCols];
+        long[] schemaAddrs = new long[numCols];
+        allocateFfiBuffers(arrayAddrs, schemaAddrs, numCols);
+        try {
+            int rowCount = searcher.aggregateArrowFfi(queryAst, "score_range", aggJson,
+                    arrayAddrs, schemaAddrs);
+            System.out.println("Range+Terms rowCount: " + rowCount);
+            // low (<80): scores 75,60 → status ok:1, error:1 = 2 rows
+            // high (>=80): scores 85,95,90 → status ok:2, error:1 = 2 rows
+            // Total: 4 cross-product rows
+            assertTrue(rowCount >= 3,
+                "Should have cross-product rows (at least 3). Got: " + rowCount);
+
+            String json = nativeReadAggArrowColumnsAsJson(arrayAddrs, schemaAddrs, numCols, rowCount);
+            System.out.println("Range+Terms data: " + json);
+            Map<String, Object> result = parseJson(json);
+            List<Map<String, Object>> columns = getColumns(result);
+            assertEquals(6, columns.size());
+            assertEquals("key_0", columns.get(0).get("name"));
+            assertEquals("from", columns.get(1).get("name"));
+            assertEquals("to", columns.get(2).get("name"));
+            assertEquals("key_1", columns.get(3).get("name"));
+            assertEquals("doc_count", columns.get(4).get("name"));
+            assertEquals("sum_count", columns.get(5).get("name"));
+
+            // Verify total doc count = 5
+            @SuppressWarnings("unchecked")
+            List<Number> docCounts = (List<Number>) ((Map<String, Object>) columns.get(4)).get("values");
+            long totalDocs = docCounts.stream().mapToLong(Number::longValue).sum();
+            assertEquals(5, totalDocs, "Total docs across all range+term combos should be 5");
+        } finally {
+            freeFfiBuffers(arrayAddrs, schemaAddrs, numCols);
+        }
+    }
+
+    // ---- BUG-2: Range Aggregation via FFI ----
+
+    @Test
+    @DisplayName("BUG-2: Range aggregation returns rows via Arrow FFI")
+    public void testRangeAggregationFfi() {
+        // The default split has score field with values: 85, 75, 95, 60, 90
+        String queryAst = "{\"type\":\"match_all\"}";
+        String aggJson = "{\"score_range\":{\"range\":{\"field\":\"score\"," +
+            "\"ranges\":[" +
+            "{\"key\":\"low\",\"to\":70.0}," +
+            "{\"key\":\"mid\",\"from\":70.0,\"to\":90.0}," +
+            "{\"key\":\"high\",\"from\":90.0}" +
+            "]}}}";
+
+        // First check schema
+        String schemaJson = searcher.getAggregationArrowSchema(
+            queryAst, "score_range", aggJson);
+        assertNotNull(schemaJson, "Schema should not be null");
+        System.out.println("BUG-2 schema: " + schemaJson);
+
+        // Range should have: key, doc_count, from, to
+        assertTrue(schemaJson.contains("\"key\""), "Should have key column. Schema: " + schemaJson);
+        assertTrue(schemaJson.contains("\"doc_count\""), "Should have doc_count column");
+
+        int numCols = 4; // key, doc_count, from, to
+        long[] arrayAddrs = new long[numCols];
+        long[] schemaAddrs = new long[numCols];
+        allocateFfiBuffers(arrayAddrs, schemaAddrs, numCols);
+        try {
+            int rowCount = searcher.aggregateArrowFfi(
+                queryAst, "score_range", aggJson, arrayAddrs, schemaAddrs);
+            System.out.println("BUG-2 rowCount: " + rowCount);
+            assertTrue(rowCount >= 3,
+                "BUG-2: Range aggregation should return at least 3 rows (one per range bucket). Got: " + rowCount);
+
+            String json = nativeReadAggArrowColumnsAsJson(
+                arrayAddrs, schemaAddrs, numCols, rowCount);
+            System.out.println("BUG-2 data: " + json);
+            Map<String, Object> result = parseJson(json);
+            List<Map<String, Object>> columns = getColumns(result);
+            Map<String, Object> colMap = columnsByName(columns);
+
+            assertNotNull(colMap.get("key"), "Should have key column");
+            assertNotNull(colMap.get("doc_count"), "Should have doc_count column");
+            assertNotNull(colMap.get("from"), "Should have from column");
+            assertNotNull(colMap.get("to"), "Should have to column");
+
+            // Verify bucket values: score values are 85, 75, 95, 60, 90
+            // low (<70): 60 → 1 doc
+            // mid (70-90): 85, 75 → 2 docs
+            // high (>=90): 95, 90 → 2 docs
+            @SuppressWarnings("unchecked")
+            List<String> keys = (List<String>) ((Map<String, Object>) colMap.get("key")).get("values");
+            @SuppressWarnings("unchecked")
+            List<Number> docCounts = (List<Number>) ((Map<String, Object>) colMap.get("doc_count")).get("values");
+
+            assertEquals(3, keys.size(), "Should have 3 range buckets");
+            // Verify total doc count across all buckets = 5
+            long totalDocs = docCounts.stream().mapToLong(Number::longValue).sum();
+            assertEquals(5, totalDocs, "Total docs across range buckets should be 5");
+        } finally {
+            freeFfiBuffers(arrayAddrs, schemaAddrs, numCols);
+        }
+    }
+
     // ---- Memory Allocation Helpers ----
     // Arrow FFI_ArrowArray is ~128 bytes, FFI_ArrowSchema is ~72 bytes.
     // We allocate 256 bytes per struct to be safe.

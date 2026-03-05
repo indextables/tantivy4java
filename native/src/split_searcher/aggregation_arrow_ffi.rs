@@ -345,6 +345,13 @@ fn range_to_record_batch(
         BucketEntries::HashMap(m) => m.values().collect(),
     };
 
+    // Check for nested bucket sub-aggregation (Range → nested Terms flattening)
+    if let Some(nested) =
+        find_nested_bucket_sub_agg(entries.first().map(|b| &b.sub_aggregation))
+    {
+        return flatten_nested_bucket_range(&entries, &nested.0, &nested.1);
+    }
+
     let sub_agg_names = collect_metric_sub_agg_names(
         entries.first().map(|b| &b.sub_aggregation),
     );
@@ -671,6 +678,122 @@ fn flatten_nested_bucket_histogram(
 
     RecordBatch::try_new(schema, columns)
         .context("Failed to create flattened nested Histogram RecordBatch")
+}
+
+/// Flatten Range → nested Terms (N levels deep) into cross-product rows.
+/// key_0 is the range key (Utf8), then from/to, then nested terms keys, doc_count, metrics.
+/// Schema: key_0:Utf8, from:f64, to:f64, key_1:Utf8, ..., key_N:Utf8, doc_count:i64, metrics...
+fn flatten_nested_bucket_range(
+    outer_entries: &[&RangeBucketEntry],
+    _nested_name: &str,
+    _nested_template: &BucketResult,
+) -> Result<RecordBatch> {
+    // Get inner Terms buckets from first entry to determine nesting depth
+    let first_inner: Vec<BucketEntry> = outer_entries
+        .first()
+        .and_then(|e| {
+            e.sub_aggregation.0.values().find_map(|r| match r {
+                AggregationResult::BucketResult(b) => {
+                    Some(extract_inner_buckets(b).into_iter().cloned().collect::<Vec<_>>())
+                }
+                _ => None,
+            })
+        })
+        .unwrap_or_default();
+
+    let inner_depth = if first_inner.is_empty() {
+        1
+    } else {
+        count_nesting_depth(&first_inner)
+    };
+    let metric_names = if first_inner.is_empty() {
+        Vec::new()
+    } else {
+        find_leaf_metric_names(&first_inner)
+    };
+
+    // Build schema: key_0 (range key), from, to, key_1..key_N (nested terms), doc_count, metrics
+    let mut fields = vec![
+        Field::new("key_0", DataType::Utf8, false),
+        Field::new("from", DataType::Float64, true),
+        Field::new("to", DataType::Float64, true),
+    ];
+    for i in 0..inner_depth {
+        fields.push(Field::new(format!("key_{}", i + 1), DataType::Utf8, false));
+    }
+    fields.push(Field::new("doc_count", DataType::Int64, false));
+    for name in &metric_names {
+        fields.push(Field::new(name, DataType::Float64, true));
+    }
+    let schema = Arc::new(Schema::new(fields));
+
+    // Collect rows
+    let mut key_0_values: Vec<String> = Vec::new();
+    let mut from_values: Vec<Option<f64>> = Vec::new();
+    let mut to_values: Vec<Option<f64>> = Vec::new();
+    let mut inner_key_columns: Vec<Vec<String>> = (0..inner_depth).map(|_| Vec::new()).collect();
+    let mut doc_count_values: Vec<i64> = Vec::new();
+    let mut metric_values: Vec<Vec<Option<f64>>> =
+        metric_names.iter().map(|_| Vec::new()).collect();
+
+    for outer in outer_entries {
+        let inner_buckets: Vec<BucketEntry> = outer
+            .sub_aggregation
+            .0
+            .values()
+            .find_map(|r| match r {
+                AggregationResult::BucketResult(b) => {
+                    Some(extract_inner_buckets(b).into_iter().cloned().collect::<Vec<_>>())
+                }
+                _ => None,
+            })
+            .unwrap_or_default();
+
+        let mut inner_keys: Vec<Vec<String>> = (0..inner_depth).map(|_| Vec::new()).collect();
+        let mut inner_docs: Vec<i64> = Vec::new();
+        let mut inner_metrics: Vec<Vec<Option<f64>>> =
+            metric_names.iter().map(|_| Vec::new()).collect();
+
+        collect_nested_rows(
+            &inner_buckets,
+            &[],
+            inner_depth,
+            &metric_names,
+            &mut inner_keys,
+            &mut inner_docs,
+            &mut inner_metrics,
+        );
+
+        let num_inner_rows = inner_docs.len();
+        for _ in 0..num_inner_rows {
+            key_0_values.push(key_to_string(&outer.key));
+            from_values.push(outer.from);
+            to_values.push(outer.to);
+        }
+        for (col_idx, col) in inner_keys.into_iter().enumerate() {
+            inner_key_columns[col_idx].extend(col);
+        }
+        doc_count_values.extend(inner_docs);
+        for (i, vals) in inner_metrics.into_iter().enumerate() {
+            metric_values[i].extend(vals);
+        }
+    }
+
+    let mut columns: Vec<Arc<dyn arrow_array::Array>> = vec![
+        Arc::new(StringArray::from(key_0_values)),
+        Arc::new(Float64Array::from(from_values)),
+        Arc::new(Float64Array::from(to_values)),
+    ];
+    for col in inner_key_columns {
+        columns.push(Arc::new(StringArray::from(col)));
+    }
+    columns.push(Arc::new(Int64Array::from(doc_count_values)));
+    for vals in &metric_values {
+        columns.push(Arc::new(Float64Array::from(vals.clone())));
+    }
+
+    RecordBatch::try_new(schema, columns)
+        .context("Failed to create flattened nested Range RecordBatch")
 }
 
 // ---- Helpers ----
