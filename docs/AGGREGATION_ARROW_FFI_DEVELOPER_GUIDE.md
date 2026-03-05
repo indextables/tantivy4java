@@ -47,7 +47,34 @@ Java allocates C structs (ArrowArray + ArrowSchema per column)
 | **DateHistogram** | `key:Timestamp(us), doc_count:Int64, {sub_agg}:Float64...` | N buckets |
 | **Range** | `key:Utf8, doc_count:Int64, from:Float64, to:Float64, {sub_agg}:Float64...` | N ranges |
 
-**Sub-aggregations:** One level of metric sub-aggregations is flattened as additional Float64 columns. Nested bucket sub-aggregations are not supported in Arrow output (use the object-based API for those).
+**Sub-aggregations:** One level of metric sub-aggregations is flattened as additional Float64 columns.
+
+### Nested Bucket Sub-Aggregation Flattening (FR-2)
+
+When a bucket aggregation has a **nested Terms bucket sub-aggregation**, the results are automatically flattened into cross-product rows. This supports SQL-style multi-column GROUP BY queries.
+
+| Outer Aggregation | Nested Inner | Arrow Columns | Row Count |
+|---|---|---|---|
+| **Terms → Terms** | `key_0:Utf8, key_1:Utf8, doc_count:Int64, {metric_sub_aggs}:Float64...` | outer × inner |
+| **DateHistogram → Terms** | `key_0:Timestamp(us), key_1:Utf8, doc_count:Int64, {metric_sub_aggs}:Float64...` | outer × inner |
+| **Histogram → Terms** | `key_0:Float64, key_1:Utf8, doc_count:Int64, {metric_sub_aggs}:Float64...` | outer × inner |
+
+**Example:** `GROUP BY status, category` with `AVG(score)`:
+```
+Aggregation JSON: {"status_terms":{"terms":{"field":"status","size":100},
+  "aggs":{"category_terms":{"terms":{"field":"category","size":100},
+    "aggs":{"avg_score":{"avg":{"field":"score"}}}}}}}
+
+Arrow output (flattened cross-product):
+| key_0 (Utf8) | key_1 (Utf8) | doc_count (Int64) | avg_score (Float64) |
+|--------------|--------------|-------------------|---------------------|
+| ok           | A            | 2                 | 80.0                |
+| ok           | B            | 1                 | 95.0                |
+| error        | A            | 1                 | 90.0                |
+| error        | B            | 1                 | 60.0                |
+```
+
+**Scope:** Exactly one level of nested Terms sub-aggregation within Terms, Histogram, or DateHistogram. Deeper nesting is not supported — use the object-based API for those cases.
 
 ## API Reference
 
@@ -184,7 +211,7 @@ int rowCount = cacheManager.multiSplitAggregateArrowFfi(
 | `native/src/split_searcher/mod.rs` | Module registration |
 | `SplitSearcher.java` | `getAggregationArrowSchema()`, `aggregateArrowFfi()` |
 | `SplitCacheManager.java` | `multiSplitAggregateArrowFfi()` |
-| `AggregationArrowFfiTest.java` | Integration tests (12 tests) |
+| `AggregationArrowFfiTest.java` | Integration tests (14 tests) |
 
 ### Rust Conversion Pipeline
 
@@ -196,8 +223,11 @@ AggregationResult (tantivy)
     │   └── Sum/Avg/Min/Max → 1-row RecordBatch (value: f64)
     └── BucketResult
         ├── Terms → N-row RecordBatch (key: Utf8, doc_count: i64, sub_aggs...)
+        │   └── (nested Terms) → cross-product RecordBatch (key_0: Utf8, key_1: Utf8, doc_count: i64, sub_aggs...)
         ├── Histogram → N-row RecordBatch (key: f64, doc_count: i64, sub_aggs...)
+        │   └── (nested Terms) → cross-product RecordBatch (key_0: f64, key_1: Utf8, doc_count: i64, sub_aggs...)
         ├── DateHistogram → N-row RecordBatch (key: Timestamp(us), doc_count: i64, sub_aggs...)
+        │   └── (nested Terms) → cross-product RecordBatch (key_0: Timestamp(us), key_1: Utf8, doc_count: i64, sub_aggs...)
         └── Range → N-row RecordBatch (key: Utf8, doc_count: i64, from: f64, to: f64, sub_aggs...)
 ```
 
@@ -237,9 +267,61 @@ The `aggJson` parameter uses Elasticsearch-compatible aggregation JSON:
 }
 ```
 
+## Nested Bucket Flattening Example
+
+### Multi-Column GROUP BY via Nested Terms
+
+```java
+// GROUP BY status, category with AVG(score)
+String queryAst = "{\"type\":\"match_all\"}";
+String aggJson = "{\"status_terms\":{\"terms\":{\"field\":\"status\",\"size\":100}," +
+    "\"aggs\":{\"category_terms\":{\"terms\":{\"field\":\"category\",\"size\":100}," +
+    "\"aggs\":{\"avg_score\":{\"avg\":{\"field\":\"score\"}}}}}}}";
+
+// Schema query returns the flattened structure
+String schemaJson = searcher.getAggregationArrowSchema(queryAst, "status_terms", aggJson);
+// {"columns":[
+//   {"name":"key_0","type":"Utf8"},       // outer key (status)
+//   {"name":"key_1","type":"Utf8"},       // inner key (category)
+//   {"name":"doc_count","type":"Int64"},  // inner bucket doc count
+//   {"name":"avg_score","type":"Float64"} // metric sub-agg
+// ],"row_count":4}
+
+int numCols = 4;
+long[] arrayAddrs = new long[numCols];
+long[] schemaAddrs = new long[numCols];
+// ... allocate ...
+
+int rowCount = searcher.aggregateArrowFfi(
+    queryAst, "status_terms", aggJson, arrayAddrs, schemaAddrs);
+// rowCount = 4 (cross-product of 2 statuses × 2 categories)
+
+// Column 0: key_0 (Utf8) — ["ok", "ok", "error", "error"]
+// Column 1: key_1 (Utf8) — ["A", "B", "A", "B"]
+// Column 2: doc_count (Int64) — [2, 1, 1, 1]
+// Column 3: avg_score (Float64) — [80.0, 95.0, 90.0, 60.0]
+```
+
+### DateHistogram × Terms (Time-Series GROUP BY)
+
+```java
+// GROUP BY date_histogram(timestamp, '30d'), status
+String aggJson = "{\"ts_hist\":{\"date_histogram\":{\"field\":\"timestamp\"," +
+    "\"fixed_interval\":\"30d\"}," +
+    "\"aggs\":{\"status_terms\":{\"terms\":{\"field\":\"status\",\"size\":100}}}}}";
+
+int rowCount = searcher.aggregateArrowFfi(
+    queryAst, "ts_hist", aggJson, arrayAddrs, schemaAddrs);
+
+// Column 0: key_0 (Timestamp(us)) — [2024-01-01, 2024-01-01, 2024-02-01, ...]
+// Column 1: key_1 (Utf8) — ["ok", "error", "ok", ...]
+// Column 2: doc_count (Int64) — [3, 0, 0, ...]
+```
+
 ## Limitations
 
-- **Sub-aggregations**: Only one level of metric sub-aggregations is flattened as columns. Nested bucket sub-aggregations are not supported in Arrow output.
+- **Metric sub-aggregations**: One level of metric sub-aggs flattened as Float64 columns.
+- **Nested bucket flattening**: One level of nested Terms sub-agg is flattened into cross-product rows. Deeper nesting is not supported in Arrow output.
 - **Range aggregation**: Not implemented in the native split search layer. Returns empty results.
 - **Fast fields required**: Terms/histogram aggregations require the target field to have `fast=true` in the schema.
 - **Zero Arrow Java dependency**: tantivy4java passes raw `long[]` addresses through JNI. The consumer must provide its own Arrow library for importing FFI structs.
@@ -258,7 +340,7 @@ Run the Rust unit tests:
 cd native && cargo test --lib aggregation_arrow_ffi
 ```
 
-### Test Coverage (12 Java integration tests)
+### Test Coverage (14 Java integration tests + 9 Rust unit tests)
 
 | Test | What It Validates |
 |------|-------------------|
@@ -274,6 +356,8 @@ cd native && cargo test --lib aggregation_arrow_ffi
 | `testEmptyResult` | Empty query returns 0 rows gracefully |
 | `testMultiSplitTermsMerge` | Multi-split merge: validates merged doc_counts (ok=4, error=4 from 3+1, 2+2) |
 | `testMultiSplitStatsMerge` | Multi-split merge: validates merged count=7, sum=495, min=40, max=95, avg=70.71 |
+| `testNestedTermsFlattening` | FR-2: Terms→Terms cross-product flattening with metric sub-agg validation |
+| `testNestedDateHistogramTermsFlattening` | FR-2: DateHistogram→Terms cross-product with Timestamp key_0 type |
 
 ### Test Read-Back Helper
 

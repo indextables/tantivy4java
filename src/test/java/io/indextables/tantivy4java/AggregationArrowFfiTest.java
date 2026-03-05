@@ -533,6 +533,137 @@ public class AggregationArrowFfiTest {
         }
     }
 
+    // ---- FR-2: Nested Bucket Sub-Aggregation Flattening Tests ----
+
+    @Test
+    @DisplayName("FR-2: Nested Terms→Terms flattening into cross-product rows")
+    public void testNestedTermsFlattening() {
+        // status has 2 values (ok, error), category has 2 values (A, B)
+        // Nested agg: group by status → group by category → avg(score)
+        String queryAst = "{\"type\":\"match_all\"}";
+        String aggJson = "{\"status_terms\":{\"terms\":{\"field\":\"status\",\"size\":100}," +
+            "\"aggs\":{\"category_terms\":{\"terms\":{\"field\":\"category\",\"size\":100}," +
+            "\"aggs\":{\"avg_score\":{\"avg\":{\"field\":\"score\"}}}}}}}";
+
+        // Schema query should reflect the flattened structure
+        String schemaJson = searcher.getAggregationArrowSchema(queryAst, "status_terms", aggJson);
+        assertNotNull(schemaJson);
+        assertTrue(schemaJson.contains("\"key_0\""), "Should have key_0 column (outer key)");
+        assertTrue(schemaJson.contains("\"key_1\""), "Should have key_1 column (inner key)");
+        assertTrue(schemaJson.contains("\"doc_count\""), "Should have doc_count column");
+        assertTrue(schemaJson.contains("\"avg_score\""), "Should have avg_score sub-agg column");
+
+        // 4 columns: key_0, key_1, doc_count, avg_score
+        int numCols = 4;
+        long[] arrayAddrs = new long[numCols];
+        long[] schemaAddrs = new long[numCols];
+        allocateFfiBuffers(arrayAddrs, schemaAddrs, numCols);
+        try {
+            int rowCount = searcher.aggregateArrowFfi(queryAst, "status_terms", aggJson,
+                    arrayAddrs, schemaAddrs);
+            // Cross-product: ok has {A, B}, error has {A, B} → up to 4 rows
+            assertTrue(rowCount >= 3, "Should have at least 3 cross-product rows, got " + rowCount);
+
+            String json = nativeReadAggArrowColumnsAsJson(arrayAddrs, schemaAddrs, numCols, rowCount);
+            Map<String, Object> result = parseJson(json);
+            List<Map<String, Object>> columns = getColumns(result);
+            assertEquals(4, columns.size(), "Should have 4 columns");
+
+            Map<String, Object> colMap = columnsByName(columns);
+            assertNotNull(colMap.get("key_0"), "Should have key_0 column");
+            assertNotNull(colMap.get("key_1"), "Should have key_1 column");
+            assertNotNull(colMap.get("doc_count"), "Should have doc_count column");
+            assertNotNull(colMap.get("avg_score"), "Should have avg_score column");
+
+            // Verify data: ok/A has docs (85, 75), ok/B has (95), error/B has (60), error/A has (90)
+            List<?> key0s = getColumnValues(colMap, "key_0");
+            List<?> key1s = getColumnValues(colMap, "key_1");
+            List<?> counts = getColumnValues(colMap, "doc_count");
+            List<?> avgs = getColumnValues(colMap, "avg_score");
+
+            // Find ok/A row and verify
+            for (int i = 0; i < rowCount; i++) {
+                String k0 = (String) key0s.get(i);
+                String k1 = (String) key1s.get(i);
+                long count = ((Number) counts.get(i)).longValue();
+                double avg = ((Number) avgs.get(i)).doubleValue();
+
+                if ("ok".equals(k0) && "A".equals(k1)) {
+                    assertEquals(2L, count, "ok/A should have 2 docs");
+                    assertEquals(80.0, avg, 0.1, "ok/A avg_score should be 80.0");
+                } else if ("ok".equals(k0) && "B".equals(k1)) {
+                    assertEquals(1L, count, "ok/B should have 1 doc");
+                    assertEquals(95.0, avg, 0.1, "ok/B avg_score should be 95.0");
+                } else if ("error".equals(k0) && "B".equals(k1)) {
+                    assertEquals(1L, count, "error/B should have 1 doc");
+                    assertEquals(60.0, avg, 0.1, "error/B avg_score should be 60.0");
+                } else if ("error".equals(k0) && "A".equals(k1)) {
+                    assertEquals(1L, count, "error/A should have 1 doc");
+                    assertEquals(90.0, avg, 0.1, "error/A avg_score should be 90.0");
+                }
+            }
+        } finally {
+            freeFfiBuffers(arrayAddrs, schemaAddrs, numCols);
+        }
+    }
+
+    @Test
+    @DisplayName("FR-2: Nested DateHistogram→Terms flattening into cross-product rows")
+    public void testNestedDateHistogramTermsFlattening() {
+        // date_histogram(timestamp, 30d) → terms(status)
+        String queryAst = "{\"type\":\"match_all\"}";
+        String aggJson = "{\"ts_hist\":{\"date_histogram\":{\"field\":\"timestamp\"," +
+            "\"fixed_interval\":\"30d\"}," +
+            "\"aggs\":{\"status_terms\":{\"terms\":{\"field\":\"status\",\"size\":100}}}}}";
+
+        // Schema should have key_0 (Timestamp), key_1 (Utf8), doc_count
+        String schemaJson = searcher.getAggregationArrowSchema(queryAst, "ts_hist", aggJson);
+        assertNotNull(schemaJson);
+        assertTrue(schemaJson.contains("\"key_0\""), "Should have key_0 column");
+        assertTrue(schemaJson.contains("\"key_1\""), "Should have key_1 column");
+
+        int numCols = 3; // key_0 (timestamp), key_1 (status), doc_count
+        long[] arrayAddrs = new long[numCols];
+        long[] schemaAddrs = new long[numCols];
+        allocateFfiBuffers(arrayAddrs, schemaAddrs, numCols);
+        try {
+            int rowCount = searcher.aggregateArrowFfi(queryAst, "ts_hist", aggJson,
+                    arrayAddrs, schemaAddrs);
+            assertTrue(rowCount >= 2, "Should have at least 2 cross-product rows, got " + rowCount);
+
+            String json = nativeReadAggArrowColumnsAsJson(arrayAddrs, schemaAddrs, numCols, rowCount);
+            Map<String, Object> result = parseJson(json);
+            List<Map<String, Object>> columns = getColumns(result);
+            assertEquals(3, columns.size());
+
+            // key_0 should be Timestamp type
+            String key0Type = (String) columns.get(0).get("type");
+            assertTrue(key0Type.contains("Timestamp"),
+                "key_0 should be Timestamp type, got: " + key0Type);
+
+            // key_1 should be Utf8 (status values)
+            Map<String, Object> colMap = columnsByName(columns);
+            List<?> key1s = getColumnValues(colMap, "key_1");
+            boolean hasOk = false, hasError = false;
+            for (Object k : key1s) {
+                if ("ok".equals(k)) hasOk = true;
+                if ("error".equals(k)) hasError = true;
+            }
+            assertTrue(hasOk, "Should contain 'ok' status in inner keys");
+            assertTrue(hasError, "Should contain 'error' status in inner keys");
+
+            // Total doc count across all rows should be 5
+            List<?> counts = getColumnValues(colMap, "doc_count");
+            long totalDocs = 0;
+            for (Object c : counts) {
+                totalDocs += ((Number) c).longValue();
+            }
+            assertEquals(5, totalDocs, "Total docs across flattened rows should be 5");
+        } finally {
+            freeFfiBuffers(arrayAddrs, schemaAddrs, numCols);
+        }
+    }
+
     // ---- Memory Allocation Helpers ----
     // Arrow FFI_ArrowArray is ~128 bytes, FFI_ArrowSchema is ~72 bytes.
     // We allocate 256 bytes per struct to be safe.
