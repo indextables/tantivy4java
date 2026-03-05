@@ -1752,4 +1752,22 @@ public class QuickwitSplit {
      */
     public static native long[] nativeTestExportPartitionBatchFfi(
             long[] ids, String[] names, String extraColName, String[] extraValues);
+
+    /**
+     * Test helper: Export an Arrow schema with complex types (Struct, List, Map) as FFI_ArrowSchema.
+     * Schema: (id: Int64, name: Utf8, metadata: Struct{city: Utf8, score: Int64},
+     *          tags: List&lt;Utf8&gt;, properties: Map&lt;Utf8, Utf8&gt;)
+     * @return memory address of the FFI_ArrowSchema struct (consumed by beginSplitFromArrow)
+     */
+    public static native long nativeTestExportComplexSchemaFfi();
+
+    /**
+     * Test helper: Export a batch with complex Arrow types (Struct, List, Map) as FFI structs.
+     * Schema: (id: Int64, name: Utf8, metadata: Struct{city: Utf8, score: Int64},
+     *          tags: List&lt;Utf8&gt;, properties: Map&lt;Utf8, Utf8&gt;)
+     * @param numRows number of rows to generate
+     * @param idOffset starting value for sequential data
+     * @return long[2] = [arrayAddr, schemaAddr] (consumed by addArrowBatch)
+     */
+    public static native long[] nativeTestExportComplexBatchFfi(int numRows, long idOffset);
 }

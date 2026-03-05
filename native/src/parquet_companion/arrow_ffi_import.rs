@@ -22,7 +22,7 @@ use tantivy::schema::{Schema as TantivySchema, Field};
 use uuid::Uuid;
 
 use crate::debug_println;
-use super::indexing::{arrow_row_to_tantivy_doc, add_arrow_value_to_doc, add_string_value_to_doc, convert_complex_to_json};
+use super::indexing::{arrow_row_to_tantivy_doc, add_arrow_value_to_doc, add_string_value_to_doc, convert_arrow_to_owned_value, is_complex_arrow_type};
 use super::manifest::FastFieldMode;
 use super::name_mapping::NameMapping;
 use super::schema_derivation::{SchemaDerivationConfig, derive_tantivy_schema_with_mapping};
@@ -466,6 +466,54 @@ fn build_partition_key(col_names: &[String], values: &[String]) -> String {
         .join("/")
 }
 
+/// Pre-built OwnedValue cache for complex columns in a single batch.
+/// Amortizes downcast and recursive conversion costs by processing each complex column
+/// once for the entire batch, rather than per-row.
+struct PrebuiltComplexColumns {
+    /// (field_mapping_index, values_per_row) — values[row_idx] is None for null rows.
+    columns: Vec<(usize, Vec<Option<tantivy::schema::OwnedValue>>)>,
+}
+
+impl PrebuiltComplexColumns {
+    /// Pre-process all complex columns in the batch.
+    /// Returns empty if no complex columns exist (zero overhead for simple-type-only batches).
+    fn build(batch: &RecordBatch, field_mapping: &[FieldMapping]) -> Result<Self> {
+        let mut columns = Vec::new();
+        for (mapping_idx, mapping) in field_mapping.iter().enumerate() {
+            if !is_complex_arrow_type(&mapping.data_type) {
+                continue;
+            }
+            let array = batch.column(mapping.arrow_col_idx);
+            let num_rows = batch.num_rows();
+            let mut values = Vec::with_capacity(num_rows);
+            for row_idx in 0..num_rows {
+                if array.is_null(row_idx) {
+                    values.push(None);
+                } else {
+                    values.push(Some(convert_arrow_to_owned_value(array, row_idx)?));
+                }
+            }
+            columns.push((mapping_idx, values));
+        }
+        Ok(PrebuiltComplexColumns { columns })
+    }
+
+    /// Look up a pre-built value for a given field mapping index and row.
+    /// Returns `Some(owned_value)` if this column was pre-built, `None` if it's a simple type.
+    fn get(&self, mapping_idx: usize, row_idx: usize) -> Option<&Option<tantivy::schema::OwnedValue>> {
+        for (idx, values) in &self.columns {
+            if *idx == mapping_idx {
+                return Some(&values[row_idx]);
+            }
+        }
+        None
+    }
+
+    fn is_empty(&self) -> bool {
+        self.columns.is_empty()
+    }
+}
+
 /// Add a batch of Arrow columnar data. Rows are automatically routed to the correct
 /// partition writer based on partition column values in the batch.
 ///
@@ -473,6 +521,9 @@ fn build_partition_key(col_names: &[String], values: &[String]) -> String {
 /// a row, it is automatically rolled: finalized into a split file and replaced with a fresh
 /// writer. Rolled splits accumulate in `ctx.rolled_splits` and are included in
 /// `finish_all_splits` results.
+///
+/// Complex Arrow types (Struct, List, Map) are pre-processed once per batch column via
+/// `PrebuiltComplexColumns`, eliminating redundant per-row downcast and recursive conversion.
 ///
 /// Returns cumulative total doc count across all partitions.
 pub(crate) async fn add_arrow_batch(ctx: &mut ArrowFfiSplitContext, batch: &RecordBatch) -> Result<u64> {
@@ -495,6 +546,11 @@ pub(crate) async fn add_arrow_batch(ctx: &mut ArrowFfiSplitContext, batch: &Reco
 
     let num_rows = batch.num_rows();
 
+    // Phase 2 optimization: pre-build OwnedValues for all complex columns in this batch.
+    // This converts each complex column once (column-major) instead of per-row,
+    // amortizing downcast overhead and improving cache locality.
+    let prebuilt = PrebuiltComplexColumns::build(batch, &ctx.field_mapping)?;
+
     let max_docs = ctx.max_docs_per_split;
     let split_config = default_split_config("arrow-ffi", "arrow-ffi-source", "arrow-ffi-node");
 
@@ -515,6 +571,7 @@ pub(crate) async fn add_arrow_batch(ctx: &mut ArrowFfiSplitContext, batch: &Reco
                 &mut pw.accumulators,
                 &string_indexing_modes,
                 &compiled_regexes,
+                &prebuilt,
             )?;
             pw.writer.add_document(doc)?;
             pw.doc_count += 1;
@@ -574,6 +631,7 @@ pub(crate) async fn add_arrow_batch(ctx: &mut ArrowFfiSplitContext, batch: &Reco
                     &mut pw.accumulators,
                     &string_indexing_modes,
                     &compiled_regexes,
+                    &prebuilt,
                 )?;
                 pw.writer.add_document(doc)?;
                 pw.doc_count += 1;
@@ -615,6 +673,9 @@ pub(crate) async fn add_arrow_batch(ctx: &mut ArrowFfiSplitContext, batch: &Reco
 
 /// Build a TantivyDocument from a single Arrow row using the field_mapping.
 /// Only non-partition columns are included.
+///
+/// For complex columns (Struct, List, Map), uses pre-built OwnedValues from
+/// `prebuilt` to avoid redundant per-row downcast and recursive conversion.
 #[allow(clippy::too_many_arguments)]
 fn build_doc_from_arrow_row(
     batch: &RecordBatch,
@@ -627,15 +688,43 @@ fn build_doc_from_arrow_row(
     accumulators: &mut HashMap<String, StatisticsAccumulator>,
     string_indexing_modes: &HashMap<String, StringIndexingMode>,
     compiled_regexes: &HashMap<String, regex::Regex>,
+    prebuilt: &PrebuiltComplexColumns,
 ) -> Result<TantivyDocument> {
     let mut doc = TantivyDocument::new();
 
-    for mapping in field_mapping {
+    for (mapping_idx, mapping) in field_mapping.iter().enumerate() {
         let array = batch.column(mapping.arrow_col_idx);
         if array.is_null(row_idx) {
             continue; // Skip null values — tantivy handles absent fields natively
         }
 
+        // Fast path: use pre-built OwnedValue for complex columns
+        if let Some(prebuilt_val) = prebuilt.get(mapping_idx, row_idx) {
+            if let Some(owned) = prebuilt_val {
+                match owned {
+                    tantivy::schema::OwnedValue::Object(entries) => {
+                        doc.add_object(
+                            mapping.tantivy_field,
+                            entries.iter().cloned().collect(),
+                        );
+                    }
+                    tantivy::schema::OwnedValue::Array(_) => {
+                        let mut wrapper = std::collections::BTreeMap::new();
+                        wrapper.insert(mapping.field_name.clone(), owned.clone());
+                        doc.add_object(mapping.tantivy_field, wrapper);
+                    }
+                    tantivy::schema::OwnedValue::Null => {}
+                    _ => {
+                        let mut wrapper = std::collections::BTreeMap::new();
+                        wrapper.insert(mapping.field_name.clone(), owned.clone());
+                        doc.add_object(mapping.tantivy_field, wrapper);
+                    }
+                }
+            }
+            continue;
+        }
+
+        // Standard path: process simple types inline
         add_arrow_value_to_doc(
             &mut doc,
             mapping.tantivy_field,
@@ -806,8 +895,11 @@ pub(crate) async fn finish_all_splits(
     };
 
     for (partition_key, partition_values, pw) in writers {
-        // Skip empty writers (can happen after auto-roll if no more rows were added)
-        if pw.doc_count == 0 {
+        // Skip empty partition writers that were created by auto-roll
+        // (a new writer was started after roll but no rows were added).
+        // However, always finalize the default (non-partitioned) writer — even with
+        // 0 docs — so callers always get a split result for their session.
+        if pw.doc_count == 0 && !partition_key.is_empty() {
             continue;
         }
         let result = finalize_partition_writer_into_split(

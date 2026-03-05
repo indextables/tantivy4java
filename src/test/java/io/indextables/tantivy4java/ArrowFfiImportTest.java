@@ -452,6 +452,182 @@ public class ArrowFfiImportTest {
     // Metadata and lifecycle tests
     // ====================================================================
 
+    // ====================================================================
+    // Complex type tests (Struct, List, Map)
+    // ====================================================================
+
+    @Test
+    @Order(30)
+    void testComplexTypesSingleBatch() throws Exception {
+        // Schema: id:Int64, name:Utf8, metadata:Struct{city:Utf8,score:Int64},
+        //         tags:List<Utf8>, properties:Map<Utf8,Utf8>
+        long schemaAddr = QuickwitSplit.nativeTestExportComplexSchemaFfi();
+        assertTrue(schemaAddr != 0, "Complex schema FFI export should return non-zero address");
+
+        long handle = QuickwitSplit.beginSplitFromArrow(schemaAddr, new String[]{},
+                Index.Memory.DEFAULT_HEAP_SIZE);
+        assertTrue(handle != 0, "beginSplitFromArrow should return non-zero handle");
+
+        // Add a batch of 20 rows with complex types
+        long[] batchAddrs = QuickwitSplit.nativeTestExportComplexBatchFfi(20, 0);
+        assertNotNull(batchAddrs);
+        assertEquals(2, batchAddrs.length);
+
+        long docCount = QuickwitSplit.addArrowBatch(handle, batchAddrs[0], batchAddrs[1]);
+        assertEquals(20, docCount, "Should have 20 docs after batch");
+
+        String outputDir = tempDir.resolve("complex_single").toString();
+        Files.createDirectories(Path.of(outputDir));
+        List<QuickwitSplit.PartitionSplitResult> results = QuickwitSplit.finishAllSplits(handle, outputDir);
+
+        assertNotNull(results);
+        assertEquals(1, results.size(), "Should produce exactly 1 split");
+        assertEquals(20, results.get(0).getNumDocs(), "Split should contain 20 docs");
+        assertTrue(Files.exists(Path.of(results.get(0).getSplitPath())), "Split file should exist");
+
+        System.out.println("testComplexTypesSingleBatch PASSED: 20 docs with Struct/List/Map columns");
+    }
+
+    @Test
+    @Order(31)
+    void testComplexTypesMultipleBatches() throws Exception {
+        long schemaAddr = QuickwitSplit.nativeTestExportComplexSchemaFfi();
+        long handle = QuickwitSplit.beginSplitFromArrow(schemaAddr, new String[]{},
+                Index.Memory.DEFAULT_HEAP_SIZE);
+
+        // Add 3 batches of 50 rows each
+        for (int i = 0; i < 3; i++) {
+            long[] batchAddrs = QuickwitSplit.nativeTestExportComplexBatchFfi(50, i * 50);
+            long docCount = QuickwitSplit.addArrowBatch(handle, batchAddrs[0], batchAddrs[1]);
+            assertEquals((i + 1) * 50, docCount,
+                    "Cumulative doc count should be " + ((i + 1) * 50));
+        }
+
+        String outputDir = tempDir.resolve("complex_multi").toString();
+        Files.createDirectories(Path.of(outputDir));
+        List<QuickwitSplit.PartitionSplitResult> results = QuickwitSplit.finishAllSplits(handle, outputDir);
+
+        assertEquals(1, results.size());
+        assertEquals(150, results.get(0).getNumDocs(), "Split should contain 150 docs total");
+
+        System.out.println("testComplexTypesMultipleBatches PASSED: 150 docs across 3 batches");
+    }
+
+    @Test
+    @Order(32)
+    void testComplexTypesSearchable() throws Exception {
+        long schemaAddr = QuickwitSplit.nativeTestExportComplexSchemaFfi();
+        long handle = QuickwitSplit.beginSplitFromArrow(schemaAddr, new String[]{},
+                Index.Memory.DEFAULT_HEAP_SIZE);
+
+        // Add 10 rows — cities cycle: new york, london, tokyo, paris, berlin
+        long[] batchAddrs = QuickwitSplit.nativeTestExportComplexBatchFfi(10, 0);
+        QuickwitSplit.addArrowBatch(handle, batchAddrs[0], batchAddrs[1]);
+
+        String outputDir = tempDir.resolve("complex_searchable").toString();
+        Files.createDirectories(Path.of(outputDir));
+        List<QuickwitSplit.PartitionSplitResult> results = QuickwitSplit.finishAllSplits(handle, outputDir);
+
+        assertEquals(1, results.size());
+        QuickwitSplit.PartitionSplitResult result = results.get(0);
+
+        QuickwitSplit.SplitMetadata metadata = new QuickwitSplit.SplitMetadata(
+                result.getFooterStartOffset(), result.getFooterEndOffset(), 0, 0);
+        String splitUri = "file://" + result.getSplitPath();
+
+        try (SplitSearcher searcher = cacheManager.createSplitSearcher(splitUri, metadata)) {
+            // Verify schema has expected fields
+            Schema schema = searcher.getSchema();
+            assertNotNull(schema);
+            assertTrue(schema.getFieldNames().contains("id"), "Schema should have 'id'");
+            assertTrue(schema.getFieldNames().contains("name"), "Schema should have 'name'");
+            // Complex fields should appear as JSON object fields
+            assertTrue(schema.getFieldNames().contains("metadata"), "Schema should have 'metadata'");
+            assertTrue(schema.getFieldNames().contains("tags"), "Schema should have 'tags'");
+            assertTrue(schema.getFieldNames().contains("properties"), "Schema should have 'properties'");
+
+            // Search for all documents
+            SplitQuery allQuery = searcher.parseQuery("*");
+            SearchResult allResults = searcher.search(allQuery, 100);
+            assertEquals(10, allResults.getHits().size(), "Should find all 10 documents");
+
+            // Search by simple field
+            SplitQuery nameQuery = new SplitTermQuery("name", "person_0");
+            SearchResult nameResults = searcher.search(nameQuery, 10);
+            assertTrue(nameResults.getHits().size() > 0, "Should find person_0");
+
+            // Search nested struct field (metadata.city) using dot-notation in parseQuery
+            // Cities cycle: "new york", "london", "tokyo", "paris", "berlin"
+            // With 10 rows: indices 0,5 → "new york", 1,6 → "london", etc.
+            // Use single-word city to avoid phrase query complexity
+            SplitQuery londonQuery = searcher.parseQuery("metadata.city:london");
+            SearchResult londonResults = searcher.search(londonQuery, 10);
+            assertTrue(londonResults.getHits().size() > 0,
+                    "Should find docs with metadata.city = 'london'");
+
+            SplitQuery tokyoQuery = searcher.parseQuery("metadata.city:tokyo");
+            SearchResult tokyoResults = searcher.search(tokyoQuery, 10);
+            assertTrue(tokyoResults.getHits().size() > 0,
+                    "Should find docs with metadata.city = 'tokyo'");
+
+            // Search tags (list field — tags are wrapped in synthetic object with column name key)
+            SplitQuery tagQuery = searcher.parseQuery("tags.tags:rust");
+            SearchResult tagResults = searcher.search(tagQuery, 10);
+            assertTrue(tagResults.getHits().size() > 0,
+                    "Should find docs with tag 'rust'");
+
+            System.out.println("testComplexTypesSearchable PASSED: all query types work on complex fields");
+            System.out.println("  All docs: " + allResults.getHits().size());
+            System.out.println("  city=london: " + londonResults.getHits().size());
+            System.out.println("  city=tokyo: " + tokyoResults.getHits().size());
+            System.out.println("  tag=rust: " + tagResults.getHits().size());
+        }
+    }
+
+    @Test
+    @Order(33)
+    void testComplexTypesDocRetrieval() throws Exception {
+        long schemaAddr = QuickwitSplit.nativeTestExportComplexSchemaFfi();
+        long handle = QuickwitSplit.beginSplitFromArrow(schemaAddr, new String[]{},
+                Index.Memory.DEFAULT_HEAP_SIZE);
+
+        long[] batchAddrs = QuickwitSplit.nativeTestExportComplexBatchFfi(5, 0);
+        QuickwitSplit.addArrowBatch(handle, batchAddrs[0], batchAddrs[1]);
+
+        String outputDir = tempDir.resolve("complex_doc_retrieval").toString();
+        Files.createDirectories(Path.of(outputDir));
+        List<QuickwitSplit.PartitionSplitResult> results = QuickwitSplit.finishAllSplits(handle, outputDir);
+
+        QuickwitSplit.PartitionSplitResult result = results.get(0);
+        QuickwitSplit.SplitMetadata metadata = new QuickwitSplit.SplitMetadata(
+                result.getFooterStartOffset(), result.getFooterEndOffset(), 0, 0);
+        String splitUri = "file://" + result.getSplitPath();
+
+        try (SplitSearcher searcher = cacheManager.createSplitSearcher(splitUri, metadata)) {
+            SplitQuery allQuery = searcher.parseQuery("*");
+            SearchResult allResults = searcher.search(allQuery, 10);
+
+            // Verify we can retrieve documents and access stored fields
+            for (SearchResult.Hit hit : allResults.getHits()) {
+                try (Document doc = searcher.doc(hit.getDocAddress())) {
+                    assertNotNull(doc, "Document should not be null");
+
+                    // Simple fields should be retrievable
+                    Object nameVal = doc.getFirst("name");
+                    assertNotNull(nameVal, "name field should be stored");
+                    assertTrue(nameVal.toString().startsWith("person_"),
+                            "name should start with 'person_'");
+                }
+            }
+        }
+
+        System.out.println("testComplexTypesDocRetrieval PASSED: docs retrievable with complex fields");
+    }
+
+    // ====================================================================
+    // Metadata and lifecycle tests
+    // ====================================================================
+
     @Test
     @Order(20)
     void testPartitionSplitResultMetadata() throws Exception {
