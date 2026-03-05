@@ -80,13 +80,13 @@ impl StatisticsAccumulator {
     }
 
     pub fn observe_string(&mut self, value: &str) {
-        let truncated_min = if value.len() > self.truncate_length {
+        let truncated_min = if self.truncate_length > 0 && value.len() > self.truncate_length {
             safe_truncate(value, self.truncate_length).to_string()
         } else {
             value.to_string()
         };
 
-        let truncated_max = if value.len() > self.truncate_length {
+        let truncated_max = if self.truncate_length > 0 && value.len() > self.truncate_length {
             truncate_ceiling(safe_truncate(value, self.truncate_length))
         } else {
             value.to_string()
@@ -363,6 +363,31 @@ mod tests {
         let result = acc.finalize();
         assert_eq!(result.min_string, Some("".to_string()));
         assert_eq!(result.max_string, Some("zzz".to_string()));
+    }
+
+    #[test]
+    fn test_string_no_truncation_when_zero() {
+        // truncate_length=0 means disabled — strings should not be truncated
+        let mut acc = StatisticsAccumulator::new("s", "Str", 0);
+        acc.observe_string("data.csv");
+        acc.observe_string("report.json");
+        acc.observe_string("config.json");
+        acc.observe_string("readme.txt");
+        acc.observe_string("schema.json");
+        let result = acc.finalize();
+        assert_eq!(result.min_string, Some("config.json".to_string()));
+        assert_eq!(result.max_string, Some("schema.json".to_string()));
+    }
+
+    #[test]
+    fn test_string_no_truncation_long_values_when_zero() {
+        // truncate_length=0 means disabled — even long strings pass through
+        let mut acc = StatisticsAccumulator::new("s", "Str", 0);
+        let long_val = "a".repeat(500);
+        acc.observe_string(&long_val);
+        let result = acc.finalize();
+        assert_eq!(result.min_string.as_ref().unwrap().len(), 500);
+        assert_eq!(result.max_string.as_ref().unwrap().len(), 500);
     }
 
     #[test]
