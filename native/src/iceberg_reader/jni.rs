@@ -225,7 +225,10 @@ pub extern "system" fn Java_io_indextables_tantivy4java_iceberg_IcebergTableRead
 
     match get_current_iceberg_snapshot_id(&catalog_str, &config, &namespace_str, &table_str) {
         Ok(id) => id,
-        Err(_) => -1,
+        Err(e) => {
+            to_java_exception(&mut env, &e);
+            -1
+        }
     }
 }
 

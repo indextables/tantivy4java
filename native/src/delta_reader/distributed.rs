@@ -249,7 +249,11 @@ pub fn get_current_version(
         let base_version = match checkpoint_info {
             Some(cp) => cp.version,
             None => {
-                // No checkpoint — probe from version 0 to find the latest
+                // No checkpoint — probe from version 0 to find the latest commit.
+                // This path is rarely hit in practice: Delta Lake creates a checkpoint every
+                // 10 commits by default, so most tables have a checkpoint. For tables that
+                // have never checkpointed, this lists all commit files from version 0 which
+                // may be slow (one LIST per 1000 files on S3) for very old uncompacted tables.
                 find_latest_version_from_zero(&store, &log_prefix).await?
                     .ok_or_else(|| anyhow::anyhow!(
                         "No commits found in Delta table {}", url_str

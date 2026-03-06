@@ -545,6 +545,7 @@ public class IcebergTableReader {
             Map<String, String> config,
             IcebergSnapshotInfo snapshotInfo,
             long fromSnapshotId) {
+        validateParams(catalogName, namespace, tableName, config);
         if (snapshotInfo == null) {
             throw new IllegalArgumentException("snapshotInfo must not be null");
         }
