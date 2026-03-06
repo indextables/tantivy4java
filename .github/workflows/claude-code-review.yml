@@ -1,0 +1,34 @@
+name: Claude Code Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  issue_comment:
+    types: [created]
+
+jobs:
+  claude-review:
+    if: |
+      (github.event_name == 'pull_request') ||
+      (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude'))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+    steps:
+      - name: Run Claude Code Review
+        uses: anthropics/claude-code-action@beta
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          model: "claude-sonnet-4-20250514"
+          direct_prompt: |
+            Review this PR for:
+            1. Correctness bugs (logic errors, off-by-one, null safety)
+            2. Security issues (injection, unsafe operations, credential handling)
+            3. Merge conflict markers or build-breaking issues
+            4. Missing error propagation (especially JNI error swallowing)
+            5. API consistency with existing patterns in the codebase
+
+            Be concise. Only comment on real issues, not style preferences.
+            Do not comment on pre-existing warnings or code not changed in this PR.
