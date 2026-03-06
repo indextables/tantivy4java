@@ -172,6 +172,19 @@ public class HistogramAggregation extends SplitAggregation {
         return this;
     }
 
+    /**
+     * Adds a named sub-aggregation to be computed within each histogram bucket.
+     * Consistent with TermsAggregation.addSubAggregation(String, SplitAggregation).
+     *
+     * @param name The name for the sub-aggregation in results
+     * @param subAgg The sub-aggregation to add
+     * @return this aggregation for method chaining
+     */
+    public HistogramAggregation addSubAggregation(String name, SplitAggregation subAgg) {
+        this.subAggregations.put(name, subAgg);
+        return this;
+    }
+
     @Override
     public String getFieldName() {
         return fieldName;

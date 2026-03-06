@@ -50,6 +50,9 @@ public class SplitSearcher implements AutoCloseable {
     private final String splitPath;
     // Configuration now comes from SplitCacheManager
     private final SplitCacheManager cacheManager;
+
+    /** Returns the native pointer for cross-object JNI calls (e.g. multi-split aggregation). */
+    long getNativePtr() { return nativePtr; }
     
     
     /**
@@ -439,6 +442,61 @@ public class SplitSearcher implements AutoCloseable {
      */
     public boolean supportsArrowFfi() {
         return hasParquetCompanion();
+    }
+
+    /**
+     * Get the Arrow schema for an aggregation result as JSON.
+     *
+     * <p>Returns a JSON string describing the columns and row count:
+     * {@code {"columns": [{"name": "key", "type": "Utf8"}, ...], "row_count": N}}</p>
+     *
+     * <p>Use this to determine the number of columns before calling
+     * {@link #aggregateArrowFfi} to pre-allocate FFI struct addresses.</p>
+     *
+     * @param queryAstJson  query in Quickwit QueryAst JSON format
+     * @param aggName       name of the aggregation to export
+     * @param aggJson       aggregation request JSON (e.g. {@code {"my_terms":{"terms":{"field":"status"}}}})
+     * @return JSON schema description
+     */
+    public String getAggregationArrowSchema(String queryAstJson, String aggName, String aggJson) {
+        if (nativePtr == 0) {
+            throw new IllegalStateException("SplitSearcher has been closed or not properly initialized");
+        }
+        return nativeAggregationArrowSchema(nativePtr, queryAstJson, aggName, aggJson);
+    }
+
+    /**
+     * Execute an aggregation query and export the result as Arrow columnar data via FFI.
+     *
+     * <p>This eliminates per-result JNI overhead by converting the aggregation result
+     * directly to an Arrow RecordBatch in Rust and exporting columns via the C Data Interface.</p>
+     *
+     * <p>The caller must pre-allocate ArrowArray and ArrowSchema C structs (one per column)
+     * and pass their memory addresses. Use {@link #getAggregationArrowSchema} first to
+     * determine the number of columns.</p>
+     *
+     * @param queryAstJson  query in Quickwit QueryAst JSON format
+     * @param aggName       name of the aggregation to export
+     * @param aggJson       aggregation request JSON
+     * @param arrayAddrs    pre-allocated ArrowArray memory addresses (one per column)
+     * @param schemaAddrs   pre-allocated ArrowSchema memory addresses (one per column)
+     * @return number of rows written
+     */
+    public int aggregateArrowFfi(String queryAstJson, String aggName, String aggJson,
+                                 long[] arrayAddrs, long[] schemaAddrs) {
+        if (nativePtr == 0) {
+            throw new IllegalStateException("SplitSearcher has been closed or not properly initialized");
+        }
+        if (arrayAddrs == null || schemaAddrs == null) {
+            throw new IllegalArgumentException("arrayAddrs and schemaAddrs must not be null");
+        }
+        if (arrayAddrs.length != schemaAddrs.length) {
+            throw new IllegalArgumentException(
+                "arrayAddrs and schemaAddrs must have the same length: " +
+                arrayAddrs.length + " != " + schemaAddrs.length);
+        }
+        return nativeAggregateArrowFfi(nativePtr, queryAstJson, aggName, aggJson,
+                arrayAddrs, schemaAddrs);
     }
 
     /**
@@ -1224,6 +1282,13 @@ public class SplitSearcher implements AutoCloseable {
     private static native Map<String, Long> getPerFieldComponentSizesNative(long nativePtr);
     private static native List<String> tokenizeNative(long nativePtr, String fieldName, String text);
     private static native void closeNative(long nativePtr);
+    // Aggregation Arrow FFI native methods
+    private static native int nativeAggregateArrowFfi(long nativePtr, String queryAstJson,
+                                                       String aggName, String aggJson,
+                                                       long[] arrayAddrs, long[] schemaAddrs);
+    private static native String nativeAggregationArrowSchema(long nativePtr, String queryAstJson,
+                                                               String aggName, String aggJson);
+
     // Parquet companion mode native methods
     private static native boolean nativeHasParquetManifest(long nativePtr);
     private static native byte[] nativeDocBatchProjected(long nativePtr, int[] segments, int[] docIds, String[] fields);

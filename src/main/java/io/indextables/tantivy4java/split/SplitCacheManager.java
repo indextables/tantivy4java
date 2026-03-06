@@ -1136,6 +1136,84 @@ public class SplitCacheManager implements AutoCloseable {
     }
     
     /**
+     * Execute an aggregation across multiple splits, merge intermediate results in Rust,
+     * and export the final result as Arrow columnar data via FFI.
+     *
+     * <p>This is the most efficient way to compute aggregations across many splits:
+     * each split's intermediate aggregation result is collected and merged entirely
+     * in native code, with the final result exported as a single Arrow RecordBatch.</p>
+     *
+     * @param searchers     list of SplitSearcher instances to aggregate across
+     * @param queryAstJson  query in Quickwit QueryAst JSON format
+     * @param aggName       name of the aggregation to export
+     * @param aggJson       aggregation request JSON
+     * @param arrayAddrs    pre-allocated ArrowArray memory addresses (one per column)
+     * @param schemaAddrs   pre-allocated ArrowSchema memory addresses (one per column)
+     * @return number of rows written
+     */
+    public int multiSplitAggregateArrowFfi(List<SplitSearcher> searchers,
+                                            String queryAstJson, String aggName, String aggJson,
+                                            long[] arrayAddrs, long[] schemaAddrs) {
+        if (nativePtr == 0) {
+            throw new IllegalStateException("CacheManager has been closed");
+        }
+        if (searchers == null || searchers.isEmpty()) {
+            throw new IllegalArgumentException("searchers must not be null or empty");
+        }
+        long[] searcherPtrs = new long[searchers.size()];
+        for (int i = 0; i < searchers.size(); i++) {
+            searcherPtrs[i] = searchers.get(i).getNativePtr();
+        }
+        return nativeMultiSplitAggregateArrowFfi(nativePtr, searcherPtrs,
+                queryAstJson, aggName, aggJson, arrayAddrs, schemaAddrs);
+    }
+
+    /**
+     * Multi-split, multi-aggregation single-pass: search each split once with all aggregations
+     * combined, merge intermediate results in native code, then export each named aggregation
+     * as a separate Arrow RecordBatch via FFI.
+     *
+     * This avoids redundant split searches when multiple aggregations are needed for the same query.
+     * For 3 aggregations across 100 splits: 100 searches instead of 300.
+     *
+     * @param searchers       list of split searchers to aggregate across
+     * @param queryAstJson    Quickwit QueryAst JSON
+     * @param aggNames        ordered list of aggregation names to export
+     * @param aggJson         combined aggregation JSON containing all named aggregations
+     * @param colCountsPerAgg number of Arrow columns per aggregation (same order as aggNames)
+     * @param arrayAddrs      pre-allocated ArrowArray addresses, laid out sequentially
+     *                        (first colCounts[0] for agg 0, then colCounts[1] for agg 1, etc.)
+     * @param schemaAddrs     pre-allocated ArrowSchema addresses, same layout
+     * @return JSON string with per-aggregation row counts, e.g. {"count_0":1,"sum_1":1}
+     */
+    public String multiSplitMultiAggregateArrowFfi(List<SplitSearcher> searchers,
+                                                    String queryAstJson, List<String> aggNames,
+                                                    String aggJson, int[] colCountsPerAgg,
+                                                    long[] arrayAddrs, long[] schemaAddrs) {
+        if (nativePtr == 0) {
+            throw new IllegalStateException("CacheManager has been closed");
+        }
+        if (searchers == null || searchers.isEmpty()) {
+            throw new IllegalArgumentException("searchers must not be null or empty");
+        }
+        long[] searcherPtrs = new long[searchers.size()];
+        for (int i = 0; i < searchers.size(); i++) {
+            searcherPtrs[i] = searchers.get(i).getNativePtr();
+        }
+        // Convert aggNames list to JSON array string
+        StringBuilder namesJson = new StringBuilder("[");
+        for (int i = 0; i < aggNames.size(); i++) {
+            if (i > 0) namesJson.append(",");
+            namesJson.append("\"").append(aggNames.get(i)).append("\"");
+        }
+        namesJson.append("]");
+
+        return nativeMultiSplitMultiAggregateArrowFfi(nativePtr, searcherPtrs,
+                queryAstJson, namesJson.toString(), aggJson, colCountsPerAgg,
+                arrayAddrs, schemaAddrs);
+    }
+
+    /**
      * Remove a split searcher from management
      */
     void removeSplitSearcher(String splitPath) {
@@ -1435,6 +1513,13 @@ public class SplitCacheManager implements AutoCloseable {
     private static native void forceEvictionNative(long ptr, long targetSizeBytes);
     private static native SearchResult searchAcrossAllSplitsNative(long ptr, long queryPtr, int totalLimit);
     private static native SearchResult searchAcrossSplitsNative(long ptr, List<String> splitPaths, long queryPtr, int totalLimit);
+    private static native int nativeMultiSplitAggregateArrowFfi(long ptr, long[] searcherPtrs,
+                                                                 String queryAstJson, String aggName, String aggJson,
+                                                                 long[] arrayAddrs, long[] schemaAddrs);
+    private static native String nativeMultiSplitMultiAggregateArrowFfi(long ptr, long[] searcherPtrs,
+                                                                         String queryAstJson, String aggNamesJson,
+                                                                         String aggJson, int[] colCountsPerAgg,
+                                                                         long[] arrayAddrs, long[] schemaAddrs);
 
     // Batch optimization metrics native methods
     static native long nativeGetBatchMetricsTotalOperations();

@@ -2,8 +2,10 @@ package io.indextables.tantivy4java.aggregation;
 
 import io.indextables.tantivy4java.split.SplitAggregation;
 
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.ArrayList;
+import java.util.Map;
 
 /**
  * Range aggregation that groups documents into buckets based on numeric or date ranges.
@@ -25,6 +27,7 @@ public class RangeAggregation extends SplitAggregation {
 
     private final String fieldName;
     private final List<RangeSpec> ranges;
+    private final Map<String, SplitAggregation> subAggregations = new LinkedHashMap<>();
 
     /**
      * Creates a range aggregation for the specified field.
@@ -79,6 +82,30 @@ public class RangeAggregation extends SplitAggregation {
         return addRange(null, from, to);
     }
 
+    /**
+     * Adds a sub-aggregation to be computed within each range bucket.
+     *
+     * @param subAgg The sub-aggregation to add (uses the aggregation's name as key)
+     * @return this aggregation for method chaining
+     */
+    public RangeAggregation addSubAggregation(SplitAggregation subAgg) {
+        this.subAggregations.put(subAgg.getName(), subAgg);
+        return this;
+    }
+
+    /**
+     * Adds a named sub-aggregation to be computed within each range bucket.
+     * Consistent with TermsAggregation.addSubAggregation(String, SplitAggregation).
+     *
+     * @param name The name for the sub-aggregation in results
+     * @param subAgg The sub-aggregation to add
+     * @return this aggregation for method chaining
+     */
+    public RangeAggregation addSubAggregation(String name, SplitAggregation subAgg) {
+        this.subAggregations.put(name, subAgg);
+        return this;
+    }
+
     @Override
     public String getFieldName() {
         return fieldName;
@@ -103,7 +130,22 @@ public class RangeAggregation extends SplitAggregation {
             json.append(ranges.get(i).toJson());
         }
 
-        json.append("]}}");
+        json.append("]}");
+
+        // Add sub-aggregations if any
+        if (!subAggregations.isEmpty()) {
+            json.append(", \"aggs\": {");
+            boolean first = true;
+            for (Map.Entry<String, SplitAggregation> entry : subAggregations.entrySet()) {
+                if (!first) json.append(", ");
+                json.append("\"").append(entry.getKey()).append("\": ");
+                json.append(entry.getValue().toAggregationJson());
+                first = false;
+            }
+            json.append("}");
+        }
+
+        json.append("}");
         return json.toString();
     }
 
