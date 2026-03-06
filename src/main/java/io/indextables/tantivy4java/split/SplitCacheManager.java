@@ -1200,11 +1200,12 @@ public class SplitCacheManager implements AutoCloseable {
         for (int i = 0; i < searchers.size(); i++) {
             searcherPtrs[i] = searchers.get(i).getNativePtr();
         }
-        // Convert aggNames list to JSON array string
+        // Convert aggNames list to JSON array string (escape quotes/backslashes in names)
         StringBuilder namesJson = new StringBuilder("[");
         for (int i = 0; i < aggNames.size(); i++) {
             if (i > 0) namesJson.append(",");
-            namesJson.append("\"").append(aggNames.get(i)).append("\"");
+            String escaped = aggNames.get(i).replace("\\", "\\\\").replace("\"", "\\\"");
+            namesJson.append("\"").append(escaped).append("\"");
         }
         namesJson.append("]");
 

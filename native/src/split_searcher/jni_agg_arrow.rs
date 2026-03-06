@@ -20,10 +20,12 @@ use crate::debug_println;
 use crate::perf_println;
 use crate::runtime_manager::block_on_operation;
 
+use std::collections::HashMap;
+
 use crate::searcher::aggregation::json_helpers::is_date_histogram_aggregation;
 use super::aggregation_arrow_ffi::{
     aggregation_result_arrow_schema_json, aggregation_result_to_record_batch,
-    export_record_batch_ffi,
+    apply_hash_resolution, export_record_batch_ffi,
 };
 use super::jni_search::perform_search_async_impl_leaf_response_with_aggregations;
 
@@ -102,8 +104,13 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_nati
             .map_err(|e| anyhow::anyhow!("Failed to parse aggregation JSON: {}", e))?;
 
         let limits = AggregationLimitsGuard::new(Some(50_000_000), Some(65_000));
-        let final_results: AggregationResults =
+        let mut final_results: AggregationResults =
             intermediate.into_final_result(aggregations, limits)?;
+
+        // Apply hash-to-string resolution for companion indexes with string hash fields
+        if let Some(ref resolution_map) = ctx.hash_resolution_map {
+            apply_hash_resolution(&mut final_results, resolution_map);
+        }
 
         // Find the requested aggregation
         let agg_result = final_results
@@ -222,24 +229,40 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_
         let query_json_owned = query_json.clone();
         let agg_json_owned = agg_json_str.clone();
 
-        // Search each split and collect intermediate aggregation bytes
-        let intermediate_bytes_vec: Vec<Vec<u8>> = block_on_operation(async move {
-            let mut results = Vec::with_capacity(ptrs_owned.len());
-            for &sptr in &ptrs_owned {
-                let ctx = perform_search_async_impl_leaf_response_with_aggregations(
-                    sptr,
-                    query_json_owned.clone(),
-                    0,
-                    Some(agg_json_owned.clone()),
-                )
-                .await?;
+        // Search each split and collect intermediate aggregation bytes + effective agg JSON + hash resolution
+        let (intermediate_bytes_vec, effective_agg_json, merged_hash_resolution): (Vec<Vec<u8>>, String, HashMap<u64, String>) =
+            block_on_operation(async move {
+                let mut results = Vec::with_capacity(ptrs_owned.len());
+                let mut eff_json: Option<String> = None;
+                let mut hash_res: HashMap<u64, String> = HashMap::new();
+                for &sptr in &ptrs_owned {
+                    let ctx = perform_search_async_impl_leaf_response_with_aggregations(
+                        sptr,
+                        query_json_owned.clone(),
+                        0,
+                        Some(agg_json_owned.clone()),
+                    )
+                    .await?;
 
-                if let Some(bytes) = ctx.leaf_response.intermediate_aggregation_result {
-                    results.push(bytes);
+                    // Capture effective_agg_json from first split that has one
+                    if eff_json.is_none() {
+                        if let Some(ref ej) = ctx.effective_agg_json {
+                            eff_json = Some(ej.clone());
+                        }
+                    }
+
+                    // Collect hash resolution maps from all splits
+                    if let Some(map) = ctx.hash_resolution_map {
+                        hash_res.extend(map);
+                    }
+
+                    if let Some(bytes) = ctx.leaf_response.intermediate_aggregation_result {
+                        results.push(bytes);
+                    }
                 }
-            }
-            Ok::<Vec<Vec<u8>>, anyhow::Error>(results)
-        })?;
+                let final_json = eff_json.unwrap_or(agg_json_owned);
+                Ok::<(Vec<Vec<u8>>, String, HashMap<u64, String>), anyhow::Error>((results, final_json, hash_res))
+            })?;
 
         if intermediate_bytes_vec.is_empty() {
             anyhow::bail!("No splits returned aggregation results");
@@ -273,13 +296,18 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_
             t_merge.elapsed().as_millis()
         );
 
-        // Finalize
-        let aggregations: Aggregations = serde_json::from_str(&agg_json_str)
+        // Finalize using effective agg JSON (may have been rewritten for hash fields)
+        let aggregations: Aggregations = serde_json::from_str(&effective_agg_json)
             .map_err(|e| anyhow::anyhow!("Failed to parse aggregation JSON: {}", e))?;
 
         let limits = AggregationLimitsGuard::new(Some(50_000_000), Some(65_000));
-        let final_results: AggregationResults =
+        let mut final_results: AggregationResults =
             merged.into_final_result(aggregations, limits)?;
+
+        // Apply hash-to-string resolution for companion indexes with string hash fields
+        if !merged_hash_resolution.is_empty() {
+            apply_hash_resolution(&mut final_results, &merged_hash_resolution);
+        }
 
         let agg_result = final_results
             .0
@@ -293,7 +321,7 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_
                 )
             })?;
 
-        let is_date_hist = is_date_histogram_aggregation(&agg_json_str, &agg_name_str);
+        let is_date_hist = is_date_histogram_aggregation(&effective_agg_json, &agg_name_str);
         let batch =
             aggregation_result_to_record_batch(&agg_name_str, agg_result, is_date_hist)?;
 
@@ -498,27 +526,43 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_
             std::slice::from_raw_parts(sch_addrs_elems.as_ptr(), sch_addrs_elems.len())
         };
 
-        // Search each split ONCE and collect intermediate bytes
+        // Search each split ONCE and collect intermediate bytes + effective agg JSON + hash resolution
         let ptrs_owned: Vec<jlong> = ptr_slice.to_vec();
         let query_json_owned = query_json.clone();
         let agg_json_owned = agg_json_str.clone();
 
-        let intermediate_bytes_vec: Vec<Vec<u8>> = block_on_operation(async move {
-            let mut results = Vec::with_capacity(ptrs_owned.len());
-            for &sptr in &ptrs_owned {
-                let ctx = perform_search_async_impl_leaf_response_with_aggregations(
-                    sptr,
-                    query_json_owned.clone(),
-                    0,
-                    Some(agg_json_owned.clone()),
-                )
-                .await?;
-                if let Some(bytes) = ctx.leaf_response.intermediate_aggregation_result {
-                    results.push(bytes);
+        let (intermediate_bytes_vec, effective_agg_json, merged_hash_resolution): (Vec<Vec<u8>>, String, HashMap<u64, String>) =
+            block_on_operation(async move {
+                let mut results = Vec::with_capacity(ptrs_owned.len());
+                let mut eff_json: Option<String> = None;
+                let mut hash_res: HashMap<u64, String> = HashMap::new();
+                for &sptr in &ptrs_owned {
+                    let ctx = perform_search_async_impl_leaf_response_with_aggregations(
+                        sptr,
+                        query_json_owned.clone(),
+                        0,
+                        Some(agg_json_owned.clone()),
+                    )
+                    .await?;
+
+                    if eff_json.is_none() {
+                        if let Some(ref ej) = ctx.effective_agg_json {
+                            eff_json = Some(ej.clone());
+                        }
+                    }
+
+                    // Collect hash resolution maps from all splits
+                    if let Some(map) = ctx.hash_resolution_map {
+                        hash_res.extend(map);
+                    }
+
+                    if let Some(bytes) = ctx.leaf_response.intermediate_aggregation_result {
+                        results.push(bytes);
+                    }
                 }
-            }
-            Ok::<Vec<Vec<u8>>, anyhow::Error>(results)
-        })?;
+                let final_json = eff_json.unwrap_or(agg_json_owned);
+                Ok::<(Vec<Vec<u8>>, String, HashMap<u64, String>), anyhow::Error>((results, final_json, hash_res))
+            })?;
 
         if intermediate_bytes_vec.is_empty() {
             anyhow::bail!("No splits returned aggregation results");
@@ -534,11 +578,16 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_
             })?;
         }
 
-        // Finalize
-        let aggregations: Aggregations = serde_json::from_str(&agg_json_str)?;
+        // Finalize using effective agg JSON (may have been rewritten for hash fields)
+        let aggregations: Aggregations = serde_json::from_str(&effective_agg_json)?;
         let limits = AggregationLimitsGuard::new(Some(50_000_000), Some(65_000));
-        let final_results: AggregationResults =
+        let mut final_results: AggregationResults =
             merged.into_final_result(aggregations, limits)?;
+
+        // Apply hash-to-string resolution for companion indexes with string hash fields
+        if !merged_hash_resolution.is_empty() {
+            apply_hash_resolution(&mut final_results, &merged_hash_resolution);
+        }
 
         // Export each named aggregation to its FFI address slice
         let mut offset = 0usize;
@@ -562,7 +611,7 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_
                     )
                 })?;
 
-            let is_date_hist = is_date_histogram_aggregation(&agg_json_str, agg_name);
+            let is_date_hist = is_date_histogram_aggregation(&effective_agg_json, agg_name);
             let batch = aggregation_result_to_record_batch(agg_name, agg_result, is_date_hist)?;
             let row_count = export_record_batch_ffi(&batch, arr_slice, sch_slice)?;
             row_counts.insert(agg_name.clone(), serde_json::json!(row_count));

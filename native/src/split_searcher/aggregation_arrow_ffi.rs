@@ -4,6 +4,7 @@
 // via the Arrow C Data Interface (FFI). It eliminates per-result JNI overhead by
 // converting tantivy's AggregationResults directly to Arrow RecordBatch format.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -424,6 +425,10 @@ fn extract_inner_buckets(bucket: &BucketResult) -> Vec<&BucketEntry> {
 /// Count the depth of nested bucket sub-aggregations (Terms chains).
 /// Returns the total number of key levels (including the leaf bucket level).
 fn count_nesting_depth(buckets: &[BucketEntry]) -> usize {
+    count_nesting_depth_ref(&buckets.iter().collect::<Vec<_>>())
+}
+
+fn count_nesting_depth_ref(buckets: &[&BucketEntry]) -> usize {
     let first = match buckets.first() {
         Some(b) => b,
         None => return 0,
@@ -431,9 +436,7 @@ fn count_nesting_depth(buckets: &[BucketEntry]) -> usize {
     match find_nested_bucket_sub_agg(Some(&first.sub_aggregation)) {
         Some((_, ref nested)) => {
             let inner = extract_inner_buckets(nested);
-            // Borrow the inner entries to get owned BucketEntry references
-            let inner_owned: Vec<BucketEntry> = inner.into_iter().cloned().collect();
-            1 + count_nesting_depth(&inner_owned)
+            1 + count_nesting_depth_ref(&inner)
         }
         None => 1, // Leaf level (has only metric sub-aggs or nothing)
     }
@@ -443,6 +446,27 @@ fn count_nesting_depth(buckets: &[BucketEntry]) -> usize {
 /// Each row has N key strings + doc_count + metric sub-agg values.
 fn collect_nested_rows(
     buckets: &[BucketEntry],
+    prefix_keys: &[String],
+    depth: usize,
+    metric_names: &[String],
+    key_columns: &mut Vec<Vec<String>>,
+    doc_count_values: &mut Vec<i64>,
+    metric_values: &mut Vec<Vec<Option<f64>>>,
+) {
+    let refs: Vec<&BucketEntry> = buckets.iter().collect();
+    collect_nested_rows_ref(
+        &refs,
+        prefix_keys,
+        depth,
+        metric_names,
+        key_columns,
+        doc_count_values,
+        metric_values,
+    );
+}
+
+fn collect_nested_rows_ref(
+    buckets: &[&BucketEntry],
     prefix_keys: &[String],
     depth: usize,
     metric_names: &[String],
@@ -475,9 +499,8 @@ fn collect_nested_rows(
                 })
                 .unwrap_or_default();
 
-            let inner_owned: Vec<BucketEntry> = inner_buckets.into_iter().cloned().collect();
-            collect_nested_rows(
-                &inner_owned,
+            collect_nested_rows_ref(
+                &inner_buckets,
                 &current_keys,
                 depth,
                 metric_names,
@@ -491,6 +514,10 @@ fn collect_nested_rows(
 
 /// Find the innermost (leaf) metric sub-aggregation names by walking the nesting chain.
 fn find_leaf_metric_names(buckets: &[BucketEntry]) -> Vec<String> {
+    find_leaf_metric_names_ref(&buckets.iter().collect::<Vec<_>>())
+}
+
+fn find_leaf_metric_names_ref(buckets: &[&BucketEntry]) -> Vec<String> {
     let first = match buckets.first() {
         Some(b) => b,
         None => return Vec::new(),
@@ -498,8 +525,7 @@ fn find_leaf_metric_names(buckets: &[BucketEntry]) -> Vec<String> {
     match find_nested_bucket_sub_agg(Some(&first.sub_aggregation)) {
         Some((_, ref nested)) => {
             let inner = extract_inner_buckets(nested);
-            let inner_owned: Vec<BucketEntry> = inner.into_iter().cloned().collect();
-            find_leaf_metric_names(&inner_owned)
+            find_leaf_metric_names_ref(&inner)
         }
         None => collect_metric_sub_agg_names(Some(&first.sub_aggregation)),
     }
@@ -565,13 +591,11 @@ fn flatten_nested_bucket_histogram(
     is_date_histogram: bool,
 ) -> Result<RecordBatch> {
     // Get the inner Terms buckets from first outer entry to determine nesting depth
-    let first_inner: Vec<BucketEntry> = outer_entries
+    let first_inner: Vec<&BucketEntry> = outer_entries
         .first()
         .and_then(|e| {
             e.sub_aggregation.0.values().find_map(|r| match r {
-                AggregationResult::BucketResult(b) => {
-                    Some(extract_inner_buckets(b).into_iter().cloned().collect::<Vec<_>>())
-                }
+                AggregationResult::BucketResult(b) => Some(extract_inner_buckets(b)),
                 _ => None,
             })
         })
@@ -581,13 +605,13 @@ fn flatten_nested_bucket_histogram(
     let inner_depth = if first_inner.is_empty() {
         1
     } else {
-        count_nesting_depth(&first_inner)
+        count_nesting_depth_ref(&first_inner)
     };
     let total_key_cols = 1 + inner_depth; // outer histogram key + inner Terms keys
     let metric_names = if first_inner.is_empty() {
         Vec::new()
     } else {
-        find_leaf_metric_names(&first_inner)
+        find_leaf_metric_names_ref(&first_inner)
     };
 
     // Build schema
@@ -615,14 +639,12 @@ fn flatten_nested_bucket_histogram(
         metric_names.iter().map(|_| Vec::new()).collect();
 
     for outer in outer_entries {
-        let inner_buckets: Vec<BucketEntry> = outer
+        let inner_buckets: Vec<&BucketEntry> = outer
             .sub_aggregation
             .0
             .values()
             .find_map(|r| match r {
-                AggregationResult::BucketResult(b) => {
-                    Some(extract_inner_buckets(b).into_iter().cloned().collect::<Vec<_>>())
-                }
+                AggregationResult::BucketResult(b) => Some(extract_inner_buckets(b)),
                 _ => None,
             })
             .unwrap_or_default();
@@ -633,7 +655,7 @@ fn flatten_nested_bucket_histogram(
         let mut inner_metrics: Vec<Vec<Option<f64>>> =
             metric_names.iter().map(|_| Vec::new()).collect();
 
-        collect_nested_rows(
+        collect_nested_rows_ref(
             &inner_buckets,
             &[],
             inner_depth,
@@ -689,13 +711,11 @@ fn flatten_nested_bucket_range(
     _nested_template: &BucketResult,
 ) -> Result<RecordBatch> {
     // Get inner Terms buckets from first entry to determine nesting depth
-    let first_inner: Vec<BucketEntry> = outer_entries
+    let first_inner: Vec<&BucketEntry> = outer_entries
         .first()
         .and_then(|e| {
             e.sub_aggregation.0.values().find_map(|r| match r {
-                AggregationResult::BucketResult(b) => {
-                    Some(extract_inner_buckets(b).into_iter().cloned().collect::<Vec<_>>())
-                }
+                AggregationResult::BucketResult(b) => Some(extract_inner_buckets(b)),
                 _ => None,
             })
         })
@@ -704,12 +724,12 @@ fn flatten_nested_bucket_range(
     let inner_depth = if first_inner.is_empty() {
         1
     } else {
-        count_nesting_depth(&first_inner)
+        count_nesting_depth_ref(&first_inner)
     };
     let metric_names = if first_inner.is_empty() {
         Vec::new()
     } else {
-        find_leaf_metric_names(&first_inner)
+        find_leaf_metric_names_ref(&first_inner)
     };
 
     // Build schema: key_0 (range key), from, to, key_1..key_N (nested terms), doc_count, metrics
@@ -737,14 +757,12 @@ fn flatten_nested_bucket_range(
         metric_names.iter().map(|_| Vec::new()).collect();
 
     for outer in outer_entries {
-        let inner_buckets: Vec<BucketEntry> = outer
+        let inner_buckets: Vec<&BucketEntry> = outer
             .sub_aggregation
             .0
             .values()
             .find_map(|r| match r {
-                AggregationResult::BucketResult(b) => {
-                    Some(extract_inner_buckets(b).into_iter().cloned().collect::<Vec<_>>())
-                }
+                AggregationResult::BucketResult(b) => Some(extract_inner_buckets(b)),
                 _ => None,
             })
             .unwrap_or_default();
@@ -754,7 +772,7 @@ fn flatten_nested_bucket_range(
         let mut inner_metrics: Vec<Vec<Option<f64>>> =
             metric_names.iter().map(|_| Vec::new()).collect();
 
-        collect_nested_rows(
+        collect_nested_rows_ref(
             &inner_buckets,
             &[],
             inner_depth,
@@ -794,6 +812,49 @@ fn flatten_nested_bucket_range(
 
     RecordBatch::try_new(schema, columns)
         .context("Failed to create flattened nested Range RecordBatch")
+}
+
+// ---- Hash Resolution ----
+
+/// Apply hash-to-string resolution to bucket keys in finalized aggregation results.
+///
+/// For companion indexes with string hash fields (`exact_only` / `withStringFingerprints`),
+/// tantivy stores U64 hash fingerprints as bucket keys. This function walks the results
+/// and replaces `Key::U64` entries with `Key::Str` using the resolution map built by
+/// `hash_touchup::build_hash_resolution_map`.
+pub fn apply_hash_resolution(
+    results: &mut tantivy::aggregation::agg_result::AggregationResults,
+    resolution_map: &HashMap<u64, String>,
+) {
+    if resolution_map.is_empty() {
+        return;
+    }
+    for result in results.0.values_mut() {
+        apply_hash_resolution_to_result(result, resolution_map);
+    }
+}
+
+fn apply_hash_resolution_to_result(
+    result: &mut AggregationResult,
+    resolution_map: &HashMap<u64, String>,
+) {
+    if let AggregationResult::BucketResult(bucket) = result {
+        match bucket {
+            BucketResult::Terms { buckets, .. } => {
+                for entry in buckets.iter_mut() {
+                    if let Key::U64(hash) = &entry.key {
+                        if let Some(resolved) = resolution_map.get(hash) {
+                            entry.key = Key::Str(resolved.clone());
+                        }
+                    }
+                    // Recurse into sub-aggregations for nested bucket aggs
+                    apply_hash_resolution(&mut entry.sub_aggregation, resolution_map);
+                }
+            }
+            // Other bucket types (Histogram, DateHistogram, Range) don't use string hash keys
+            _ => {}
+        }
+    }
 }
 
 // ---- Helpers ----
@@ -1284,5 +1345,141 @@ mod tests {
         let cols = parsed["columns"].as_array().unwrap();
         assert_eq!(cols.len(), 5);
         assert_eq!(cols[0]["name"], "count");
+    }
+
+    #[test]
+    fn test_apply_hash_resolution() {
+        // Create Terms result with U64 hash keys (simulating companion string hash fields)
+        let mut results = AggregationResults(
+            vec![(
+                "name_terms".to_string(),
+                AggregationResult::BucketResult(BucketResult::Terms {
+                    buckets: vec![
+                        BucketEntry {
+                            key: Key::U64(12345),
+                            doc_count: 3,
+                            key_as_string: None,
+                            sub_aggregation: AggregationResults::default(),
+                        },
+                        BucketEntry {
+                            key: Key::U64(67890),
+                            doc_count: 2,
+                            key_as_string: None,
+                            sub_aggregation: AggregationResults::default(),
+                        },
+                        BucketEntry {
+                            key: Key::U64(99999), // not in resolution map
+                            doc_count: 1,
+                            key_as_string: None,
+                            sub_aggregation: AggregationResults::default(),
+                        },
+                    ],
+                    sum_other_doc_count: 0,
+                    doc_count_error_upper_bound: None,
+                }),
+            )]
+            .into_iter()
+            .collect(),
+        );
+
+        let mut resolution_map = HashMap::new();
+        resolution_map.insert(12345u64, "alice".to_string());
+        resolution_map.insert(67890u64, "bob".to_string());
+
+        apply_hash_resolution(&mut results, &resolution_map);
+
+        // Verify resolved keys
+        if let AggregationResult::BucketResult(BucketResult::Terms { buckets, .. }) =
+            results.0.get("name_terms").unwrap()
+        {
+            assert!(matches!(&buckets[0].key, Key::Str(s) if s == "alice"));
+            assert!(matches!(&buckets[1].key, Key::Str(s) if s == "bob"));
+            // Unresolved key stays as U64
+            assert!(matches!(&buckets[2].key, Key::U64(99999)));
+        } else {
+            panic!("Expected Terms result");
+        }
+    }
+
+    #[test]
+    fn test_apply_hash_resolution_to_arrow() {
+        // Verify that after hash resolution, Arrow output has string keys (not numeric strings)
+        let mut results = AggregationResults(
+            vec![(
+                "dept_terms".to_string(),
+                AggregationResult::BucketResult(BucketResult::Terms {
+                    buckets: vec![
+                        BucketEntry {
+                            key: Key::U64(111),
+                            doc_count: 5,
+                            key_as_string: None,
+                            sub_aggregation: AggregationResults::default(),
+                        },
+                        BucketEntry {
+                            key: Key::U64(222),
+                            doc_count: 3,
+                            key_as_string: None,
+                            sub_aggregation: AggregationResults::default(),
+                        },
+                    ],
+                    sum_other_doc_count: 0,
+                    doc_count_error_upper_bound: None,
+                }),
+            )]
+            .into_iter()
+            .collect(),
+        );
+
+        let mut resolution_map = HashMap::new();
+        resolution_map.insert(111u64, "engineering".to_string());
+        resolution_map.insert(222u64, "sales".to_string());
+
+        apply_hash_resolution(&mut results, &resolution_map);
+
+        let batch = aggregation_result_to_record_batch(
+            "dept_terms",
+            results.0.get("dept_terms").unwrap(),
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(batch.num_rows(), 2);
+        let key_col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(key_col.value(0), "engineering");
+        assert_eq!(key_col.value(1), "sales");
+    }
+
+    #[test]
+    fn test_apply_hash_resolution_empty_map() {
+        // Empty resolution map should be a no-op
+        let mut results = AggregationResults(
+            vec![(
+                "t".to_string(),
+                AggregationResult::BucketResult(BucketResult::Terms {
+                    buckets: vec![BucketEntry {
+                        key: Key::Str("already_string".to_string()),
+                        doc_count: 1,
+                        key_as_string: None,
+                        sub_aggregation: AggregationResults::default(),
+                    }],
+                    sum_other_doc_count: 0,
+                    doc_count_error_upper_bound: None,
+                }),
+            )]
+            .into_iter()
+            .collect(),
+        );
+
+        apply_hash_resolution(&mut results, &HashMap::new());
+
+        if let AggregationResult::BucketResult(BucketResult::Terms { buckets, .. }) =
+            results.0.get("t").unwrap()
+        {
+            assert!(matches!(&buckets[0].key, Key::Str(s) if s == "already_string"));
+        }
     }
 }
