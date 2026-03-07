@@ -917,4 +917,136 @@ public class AggregationArrowFfiTest {
         List<?> values = getColumnValues(colMap, name);
         return ((Number) values.get(0)).doubleValue();
     }
+
+    // ---- Regression Tests: String Fingerprint Hash Resolution via Arrow FFI ----
+    //
+    // These tests verify that terms aggregations on companion splits with
+    // withStringHashOptimization(true) return the original string bucket keys
+    // (e.g. "item_0") via the Arrow FFI path, NOT raw U64 hash values.
+
+    /**
+     * Create a companion split with string hash optimization enabled.
+     * Returns [searcher, cacheManager] -- caller must close both.
+     */
+    private Object[] createCompanionSearcherWithHashOpt(Path dir, int numRows) throws Exception {
+        String tag = "hash_ffi_" + System.nanoTime();
+        Path parquetFile = dir.resolve(tag + ".parquet");
+        Path splitFile = dir.resolve(tag + ".split");
+
+        QuickwitSplit.nativeWriteTestParquet(parquetFile.toString(), numRows, 0);
+
+        ParquetCompanionConfig config = new ParquetCompanionConfig(dir.toString())
+                .withFastFieldMode(ParquetCompanionConfig.FastFieldMode.HYBRID)
+                .withStringHashOptimization(true);
+
+        QuickwitSplit.SplitMetadata metadata = QuickwitSplit.createFromParquet(
+                Collections.singletonList(parquetFile.toString()),
+                splitFile.toString(), config);
+
+        String cacheName = tag + "-cache";
+        SplitCacheManager.CacheConfig cacheConfig = new SplitCacheManager.CacheConfig(cacheName);
+        SplitCacheManager mgr = SplitCacheManager.getInstance(cacheConfig);
+
+        String splitUrl = "file://" + splitFile.toAbsolutePath();
+        SplitSearcher s = mgr.createSplitSearcher(splitUrl, metadata, dir.toString());
+        return new Object[] { s, mgr };
+    }
+
+    @Test
+    @DisplayName("Regression: Arrow FFI terms agg on companion split with hash opt returns string keys, not hashes")
+    public void testArrowFfiTermsAggHashResolution(@TempDir Path dir) throws Exception {
+        int numRows = 10;
+        Object[] pair = createCompanionSearcherWithHashOpt(dir, numRows);
+        SplitSearcher hashSearcher = (SplitSearcher) pair[0];
+        SplitCacheManager hashCacheMgr = (SplitCacheManager) pair[1];
+
+        try {
+            // Terms aggregation on "category" field (has _phash_category hash field)
+            // category values are "cat_0", "cat_1", "cat_2", "cat_3", "cat_4"
+            String queryAst = "{\"type\":\"match_all\"}";
+            String aggJson = "{\"cat_terms\":{\"terms\":{\"field\":\"category\",\"size\":100}}}";
+
+            int numCols = 2; // key + doc_count
+            long[] arrayAddrs = new long[numCols];
+            long[] schemaAddrs = new long[numCols];
+            allocateFfiBuffers(arrayAddrs, schemaAddrs, numCols);
+            try {
+                int rowCount = hashSearcher.aggregateArrowFfi(queryAst, "cat_terms", aggJson,
+                        arrayAddrs, schemaAddrs);
+                assertEquals(5, rowCount, "Should have 5 category buckets");
+
+                String json = nativeReadAggArrowColumnsAsJson(arrayAddrs, schemaAddrs, numCols, rowCount);
+                assertNotNull(json, "Read-back JSON should not be null");
+
+                Map<String, Object> result = parseJson(json);
+                List<Map<String, Object>> columns = getColumns(result);
+                assertEquals(2, columns.size());
+
+                // Key column: must be actual string values, NOT numeric hashes
+                List<?> keys = (List<?>) columns.get(0).get("values");
+                for (Object key : keys) {
+                    String keyStr = key.toString();
+                    assertTrue(keyStr.startsWith("cat_"),
+                            "Arrow FFI terms key should be original string (e.g. 'cat_0'), got: " + keyStr);
+                    // Verify it's NOT a numeric hash (would be a long decimal number)
+                    assertFalse(keyStr.matches("\\d{10,}"),
+                            "Arrow FFI terms key should NOT be a numeric hash, got: " + keyStr);
+                }
+                assertTrue(keys.contains("cat_0"), "Should contain 'cat_0'");
+                assertTrue(keys.contains("cat_4"), "Should contain 'cat_4'");
+            } finally {
+                freeFfiBuffers(arrayAddrs, schemaAddrs, numCols);
+            }
+        } finally {
+            hashSearcher.close();
+            hashCacheMgr.close();
+        }
+    }
+
+    @Test
+    @DisplayName("Regression: Arrow FFI terms+sub-agg on companion split with hash opt resolves keys")
+    public void testArrowFfiTermsSubAggHashResolution(@TempDir Path dir) throws Exception {
+        int numRows = 20;
+        Object[] pair = createCompanionSearcherWithHashOpt(dir, numRows);
+        SplitSearcher hashSearcher = (SplitSearcher) pair[0];
+        SplitCacheManager hashCacheMgr = (SplitCacheManager) pair[1];
+
+        try {
+            // Terms aggregation on "name" field with avg(score) sub-aggregation
+            // name values are "item_0" through "item_19" (all unique)
+            String queryAst = "{\"type\":\"match_all\"}";
+            String aggJson = "{\"name_terms\":{\"terms\":{\"field\":\"name\",\"size\":100}," +
+                    "\"aggs\":{\"avg_score\":{\"avg\":{\"field\":\"score\"}}}}}";
+
+            int numCols = 3; // key + doc_count + avg_score
+            long[] arrayAddrs = new long[numCols];
+            long[] schemaAddrs = new long[numCols];
+            allocateFfiBuffers(arrayAddrs, schemaAddrs, numCols);
+            try {
+                int rowCount = hashSearcher.aggregateArrowFfi(queryAst, "name_terms", aggJson,
+                        arrayAddrs, schemaAddrs);
+                assertEquals(numRows, rowCount, "Should have " + numRows + " name buckets");
+
+                String json = nativeReadAggArrowColumnsAsJson(arrayAddrs, schemaAddrs, numCols, rowCount);
+                assertNotNull(json);
+
+                Map<String, Object> result = parseJson(json);
+                List<Map<String, Object>> columns = getColumns(result);
+                assertEquals(3, columns.size());
+
+                // Verify keys are "item_X" strings, not hash numbers
+                List<?> keys = (List<?>) columns.get(0).get("values");
+                for (Object key : keys) {
+                    String keyStr = key.toString();
+                    assertTrue(keyStr.startsWith("item_"),
+                            "Arrow FFI terms key should be 'item_X', got: " + keyStr);
+                }
+            } finally {
+                freeFfiBuffers(arrayAddrs, schemaAddrs, numCols);
+            }
+        } finally {
+            hashSearcher.close();
+            hashCacheMgr.close();
+        }
+    }
 }
