@@ -15,6 +15,11 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 REQUIRED_JAVA_MAJOR=11
 
+# Protoc version to install from GitHub releases (Linux only).
+# Must support --experimental_allow_proto3_optional (used by quickwit proto build).
+# Flag added in 3.12, no-op in 22+. Distro packages are unreliable; pin a known-good version.
+PROTOC_VERSION="25.5"
+
 # Sibling repo configuration (required by Cargo path dependencies)
 QUICKWIT_REPO="https://github.com/indextables/quickwit.git"
 TANTIVY_REPO="https://github.com/indextables/tantivy.git"
@@ -142,9 +147,29 @@ check_rust() {
     command -v rustc &>/dev/null && command -v cargo &>/dev/null
 }
 
-# Check if protoc is available
+# Check if protoc is available and meets minimum version requirement.
 check_protoc() {
-    command -v protoc &>/dev/null
+    if ! command -v protoc &>/dev/null; then
+        return 1
+    fi
+    local version_str
+    version_str=$(protoc --version 2>/dev/null | sed 's/libprotoc //')
+    if [[ -z "$version_str" ]]; then
+        return 1
+    fi
+    local major minor
+    major=$(echo "$version_str" | cut -d. -f1)
+    minor=$(echo "$version_str" | cut -d. -f2)
+    # New versioning (22+): all versions support proto3 optional
+    if [[ "$major" -ge 22 ]]; then
+        return 0
+    fi
+    # Old versioning (3.x.y): require >= 3.15
+    if [[ "$major" -eq 3 ]] && [[ "$minor" -ge 15 ]]; then
+        return 0
+    fi
+    warn "protoc version $version_str is too old (need >= 3.15.0 or >= 22.0)"
+    return 1
 }
 
 # Check if OpenSSL dev headers and pkg-config are available
@@ -288,24 +313,39 @@ install_linux() {
         ok "Maven installed"
     fi
 
-    # --- Protobuf compiler ---
+    # --- Protobuf compiler (from GitHub releases for version reliability) ---
     if check_protoc; then
-        ok "Protobuf compiler (protoc) already installed"
+        ok "Protobuf compiler (protoc) already installed: $(protoc --version)"
     else
-        info "Installing protobuf compiler..."
-        case "$pkg_mgr" in
-            apt-get)
-                ensure_apt_updated
-                $sudo_cmd apt-get install -y protobuf-compiler
-                ;;
-            dnf)
-                $sudo_cmd dnf install -y protobuf-compiler
-                ;;
-            yum)
-                $sudo_cmd yum install -y protobuf-compiler
-                ;;
+        info "Installing protoc ${PROTOC_VERSION} from GitHub releases..."
+        local arch
+        arch="$(uname -m)"
+        local protoc_arch
+        case "$arch" in
+            x86_64)  protoc_arch="linux-x86_64" ;;
+            aarch64) protoc_arch="linux-aarch_64" ;;  # protoc release naming convention
+            *)       error "Unsupported architecture for protoc: $arch"; exit 1 ;;
         esac
-        ok "Protobuf compiler installed"
+        local protoc_url="https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-${protoc_arch}.zip"
+        local protoc_tmp
+        protoc_tmp=$(mktemp -d)
+        cleanup_protoc_tmp() { rm -rf "$protoc_tmp"; }
+        trap cleanup_protoc_tmp EXIT
+        # Ensure unzip is available
+        if ! command -v unzip &>/dev/null; then
+            case "$pkg_mgr" in
+                apt-get) ensure_apt_updated; $sudo_cmd apt-get install -y unzip ;;
+                dnf)     $sudo_cmd dnf install -y unzip ;;
+                yum)     $sudo_cmd yum install -y unzip ;;
+            esac
+        fi
+        curl -sL "$protoc_url" -o "$protoc_tmp/protoc.zip"
+        unzip -q "$protoc_tmp/protoc.zip" -d "$protoc_tmp/protoc"
+        $sudo_cmd install -m 755 "$protoc_tmp/protoc/bin/protoc" /usr/local/bin/protoc
+        $sudo_cmd cp -r "$protoc_tmp/protoc/include/"* /usr/local/include/ 2>/dev/null || true
+        rm -rf "$protoc_tmp"
+        trap - EXIT
+        ok "Protobuf compiler installed: $(protoc --version)"
     fi
 
     # --- OpenSSL dev headers + pkg-config (required by Rust openssl-sys crate) ---
