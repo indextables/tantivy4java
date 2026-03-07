@@ -13,9 +13,8 @@ MVN := mvn
 # ---------------------------------------------------------------------------
 # Targets
 # ---------------------------------------------------------------------------
-# Integration test patterns (cloud/Docker tests excluded from default run)
-INTEGRATION_EXCLUDES = **/Real*Test.java,**/AzureIntegrationTest.java,**/AzureOAuthTokenTest.java
-INTEGRATION_INCLUDES = **/Real*Test.java,**/AzureIntegrationTest.java,**/AzureOAuthTokenTest.java
+# Integration test class patterns for -Dtest (simple class name globs, not ANT paths)
+INTEGRATION_TESTS = Real*Test,AzureIntegrationTest,AzureOAuthTokenTest
 
 .PHONY: help setup compile test test-cloud test-all package clean
 
@@ -33,7 +32,7 @@ test: ## Run unit tests (excludes cloud/Docker integration tests)
 	$(MVN) test
 
 test-cloud: ## Run cloud/Docker integration tests only (requires credentials/Docker)
-	$(MVN) test -Dtest="$(INTEGRATION_INCLUDES)" -DfailIfNoTests=false
+	$(MVN) test -Dtest="$(INTEGRATION_TESTS)" -DfailIfNoTests=false
 
 test-all: ## Run all tests (unit + cloud/Docker integration)
 	$(MVN) test -Pintegration-tests
