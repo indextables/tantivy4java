@@ -4,6 +4,7 @@
 // via the Arrow C Data Interface (FFI). It eliminates per-result JNI overhead by
 // converting tantivy's AggregationResults directly to Arrow RecordBatch format.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -35,10 +36,26 @@ pub fn aggregation_result_to_record_batch(
     result: &AggregationResult,
     is_date_histogram: bool,
 ) -> Result<RecordBatch> {
+    aggregation_result_to_record_batch_with_hash_resolution(
+        _name,
+        result,
+        is_date_histogram,
+        None,
+    )
+}
+
+/// Convert a single named AggregationResult to an Arrow RecordBatch,
+/// resolving U64 hash bucket keys back to original strings using the provided map.
+pub fn aggregation_result_to_record_batch_with_hash_resolution(
+    _name: &str,
+    result: &AggregationResult,
+    is_date_histogram: bool,
+    hash_resolution_map: Option<&HashMap<u64, String>>,
+) -> Result<RecordBatch> {
     match result {
         AggregationResult::MetricResult(metric) => metric_to_record_batch(metric),
         AggregationResult::BucketResult(bucket) => {
-            bucket_to_record_batch(bucket, is_date_histogram)
+            bucket_to_record_batch(bucket, is_date_histogram, hash_resolution_map)
         }
     }
 }
@@ -184,9 +201,10 @@ fn metric_to_record_batch(metric: &MetricResult) -> Result<RecordBatch> {
 fn bucket_to_record_batch(
     bucket: &BucketResult,
     is_date_histogram: bool,
+    hash_resolution_map: Option<&HashMap<u64, String>>,
 ) -> Result<RecordBatch> {
     match bucket {
-        BucketResult::Terms { buckets, .. } => terms_to_record_batch(buckets),
+        BucketResult::Terms { buckets, .. } => terms_to_record_batch(buckets, hash_resolution_map),
         BucketResult::Histogram { buckets } => {
             if is_date_histogram {
                 date_histogram_to_record_batch(buckets)
@@ -198,10 +216,13 @@ fn bucket_to_record_batch(
     }
 }
 
-fn terms_to_record_batch(buckets: &[BucketEntry]) -> Result<RecordBatch> {
+fn terms_to_record_batch(
+    buckets: &[BucketEntry],
+    hash_resolution_map: Option<&HashMap<u64, String>>,
+) -> Result<RecordBatch> {
     // Check if there is a nested bucket sub-aggregation (FR-2: flattening)
     if let Some(nested) = find_nested_bucket_sub_agg(buckets.first().map(|b| &b.sub_aggregation)) {
-        return flatten_nested_bucket_terms(buckets, &nested.0, &nested.1);
+        return flatten_nested_bucket_terms(buckets, &nested.0, &nested.1, hash_resolution_map);
     }
 
     let sub_agg_names = collect_metric_sub_agg_names(
@@ -217,7 +238,7 @@ fn terms_to_record_batch(buckets: &[BucketEntry]) -> Result<RecordBatch> {
     }
     let schema = Arc::new(Schema::new(fields));
 
-    let keys: Vec<String> = buckets.iter().map(|b| key_to_string(&b.key)).collect();
+    let keys: Vec<String> = buckets.iter().map(|b| key_to_string_resolved(&b.key, hash_resolution_map)).collect();
     let doc_counts: Vec<i64> = buckets.iter().map(|b| b.doc_count as i64).collect();
 
     let mut columns: Vec<Arc<dyn arrow_array::Array>> = vec![
@@ -442,10 +463,11 @@ fn collect_nested_rows(
     key_columns: &mut Vec<Vec<String>>,
     doc_count_values: &mut Vec<i64>,
     metric_values: &mut Vec<Vec<Option<f64>>>,
+    hash_resolution_map: Option<&HashMap<u64, String>>,
 ) {
     for bucket in buckets {
         let mut current_keys = prefix_keys.to_vec();
-        current_keys.push(key_to_string(&bucket.key));
+        current_keys.push(key_to_string_resolved(&bucket.key, hash_resolution_map));
 
         if current_keys.len() == depth {
             // Leaf level: emit a row
@@ -477,6 +499,7 @@ fn collect_nested_rows(
                 key_columns,
                 doc_count_values,
                 metric_values,
+                hash_resolution_map,
             );
         }
     }
@@ -504,6 +527,7 @@ fn flatten_nested_bucket_terms(
     outer_buckets: &[BucketEntry],
     _nested_name: &str,
     _nested_template: &BucketResult,
+    hash_resolution_map: Option<&HashMap<u64, String>>,
 ) -> Result<RecordBatch> {
     // Determine total nesting depth (number of key columns)
     let depth = count_nesting_depth(outer_buckets);
@@ -533,6 +557,7 @@ fn flatten_nested_bucket_terms(
         &mut key_columns,
         &mut doc_count_values,
         &mut metric_values,
+        hash_resolution_map,
     );
 
     // Build Arrow columns
@@ -634,6 +659,7 @@ fn flatten_nested_bucket_histogram(
             &mut inner_keys,
             &mut inner_docs,
             &mut inner_metrics,
+            None, // histogram inner keys are not hash fields
         );
 
         let num_inner_rows = inner_docs.len();
@@ -681,6 +707,22 @@ fn key_to_string(key: &Key) -> String {
         Key::I64(v) => v.to_string(),
         Key::U64(v) => v.to_string(),
         Key::F64(v) => v.to_string(),
+    }
+}
+
+/// Like `key_to_string`, but resolves U64 hash keys back to original string values
+/// using the provided hash resolution map (from Phase 3 hash touchup).
+fn key_to_string_resolved(key: &Key, hash_resolution_map: Option<&HashMap<u64, String>>) -> String {
+    match key {
+        Key::U64(v) => {
+            if let Some(map) = hash_resolution_map {
+                if let Some(resolved) = map.get(v) {
+                    return resolved.clone();
+                }
+            }
+            v.to_string()
+        }
+        _ => key_to_string(key),
     }
 }
 
