@@ -13,11 +13,15 @@ MVN := mvn
 # ---------------------------------------------------------------------------
 # Targets
 # ---------------------------------------------------------------------------
-.PHONY: help setup compile test package clean
+# Integration test patterns (cloud/Docker tests excluded from default run)
+INTEGRATION_EXCLUDES = **/Real*Test.java,**/AzureIntegrationTest.java,**/AzureOAuthTokenTest.java
+INTEGRATION_INCLUDES = **/Real*Test.java,**/AzureIntegrationTest.java,**/AzureOAuthTokenTest.java
+
+.PHONY: help setup compile test test-cloud test-all package clean
 
 help: ## Show this help message
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
-		awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-15s\033[0m %s\n", $$1, $$2}'
+		awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2}'
 
 setup: ## Install/verify development dependencies (Java 11, Maven, Rust, protoc)
 	./scripts/setup.sh
@@ -25,8 +29,14 @@ setup: ## Install/verify development dependencies (Java 11, Maven, Rust, protoc)
 compile: ## Compile sources (Java + Rust native via cargo)
 	$(MVN) clean compile
 
-test: ## Run JUnit 5 tests
+test: ## Run unit tests (excludes cloud/Docker integration tests)
 	$(MVN) test
+
+test-cloud: ## Run cloud/Docker integration tests only (requires credentials/Docker)
+	$(MVN) test -Dtest="$(INTEGRATION_INCLUDES)" -DfailIfNoTests=false
+
+test-all: ## Run all tests (unit + cloud/Docker integration)
+	$(MVN) test -Pintegration-tests
 
 package: ## Build JAR, skip tests (mvn clean package -DskipTests)
 	$(MVN) clean package -DskipTests
