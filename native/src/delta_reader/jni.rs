@@ -15,7 +15,7 @@ use crate::debug_println;
 
 use super::scan::{list_delta_files, read_delta_schema};
 use super::serialization::{serialize_delta_entries, serialize_delta_schema, serialize_snapshot_info, serialize_log_changes};
-use super::distributed::{get_snapshot_info, read_checkpoint_part, read_post_checkpoint_changes, read_checkpoint_part_arrow_ffi, parse_column_mapping_json};
+use super::distributed::{get_snapshot_info, read_checkpoint_part, read_post_checkpoint_changes, read_checkpoint_part_arrow_ffi, parse_column_mapping_json, get_current_version, get_changes_between};
 
 // ─── Existing JNI entry points ──────────────────────────────────────────────
 
@@ -357,6 +357,99 @@ pub extern "system" fn Java_io_indextables_tantivy4java_delta_DeltaTableReader_n
         Err(e) => {
             to_java_exception(&mut env, &e);
             -1
+        }
+    }
+}
+
+// ── Streaming / incremental version JNI entry points ─────────────────────────
+
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_delta_DeltaTableReader_nativeGetCurrentVersion(
+    mut env: JNIEnv,
+    _class: JClass,
+    table_url: JString,
+    config_map: JObject,
+) -> jlong {
+    debug_println!("🔧 DELTA_JNI: nativeGetCurrentVersion called");
+
+    let url_str = match env.get_string(&table_url) {
+        Ok(s) => s.to_string_lossy().to_string(),
+        Err(e) => {
+            to_java_exception(&mut env, &anyhow::anyhow!("Failed to read table URL: {}", e));
+            return -1;
+        }
+    };
+
+    let config = build_storage_config(&mut env, &config_map);
+
+    debug_println!("🔧 DELTA_JNI: getCurrentVersion url={}", url_str);
+
+    match get_current_version(&url_str, &config) {
+        Ok(version) => {
+            debug_println!("🔧 DELTA_JNI: Current version={}", version);
+            version as jlong
+        }
+        Err(e) => {
+            to_java_exception(&mut env, &e);
+            -1
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_delta_DeltaTableReader_nativeGetChangesBetween(
+    mut env: JNIEnv,
+    _class: JClass,
+    table_url: JString,
+    config_map: JObject,
+    from_version: jlong,
+    to_version: jlong,
+    column_mapping_json: JString,
+) -> jbyteArray {
+    debug_println!(
+        "🔧 DELTA_JNI: nativeGetChangesBetween called (from={}, to={})",
+        from_version, to_version
+    );
+
+    let url_str = match env.get_string(&table_url) {
+        Ok(s) => s.to_string_lossy().to_string(),
+        Err(e) => {
+            to_java_exception(&mut env, &anyhow::anyhow!("Failed to read table URL: {}", e));
+            return std::ptr::null_mut();
+        }
+    };
+
+    if from_version < 0 || to_version < 0 {
+        to_java_exception(&mut env, &anyhow::anyhow!(
+            "fromVersion and toVersion must be non-negative (got from={}, to={})",
+            from_version, to_version
+        ));
+        return std::ptr::null_mut();
+    }
+
+    let cm_str = extract_optional_jstring(&mut env, &column_mapping_json);
+    let column_mapping = parse_column_mapping_json(cm_str.as_deref());
+
+    let config = build_storage_config(&mut env, &config_map);
+
+    match get_changes_between(
+        &url_str,
+        &config,
+        from_version as u64,
+        to_version as u64,
+        &column_mapping,
+    ) {
+        Ok(changes) => {
+            debug_println!(
+                "🔧 DELTA_JNI: getChangesBetween {} added, {} removed",
+                changes.added_files.len(), changes.removed_paths.len()
+            );
+            let buffer = serialize_log_changes(&changes);
+            buffer_to_jbytearray(&mut env, &buffer)
+        }
+        Err(e) => {
+            to_java_exception(&mut env, &e);
+            std::ptr::null_mut()
         }
     }
 }

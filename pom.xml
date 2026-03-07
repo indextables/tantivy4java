@@ -6,7 +6,7 @@
 
     <groupId>io.indextables</groupId>
     <artifactId>tantivy4java</artifactId>
-    <version>0.31.2</version>
+    <version>0.32.3</version>
     <packaging>jar</packaging>
 
     <name>Tantivy4Java Experimental</name>
@@ -49,6 +49,8 @@
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <junit.version>5.10.0</junit.version>
         <rust.target.dir>${project.build.directory}/rust</rust.target.dir>
+        <!-- Empty by default; the jdk17plus profile sets this for Java 17+ -->
+        <surefire.argLine></surefire.argLine>
     </properties>
 
     <dependencies>
@@ -207,8 +209,8 @@
                     <forkCount>1</forkCount>
                     <!-- Set test execution order to be predictable -->
                     <runOrder>filesystem</runOrder>
-                    <!-- Enable native access for JNI operations -->
-                    <argLine>--enable-native-access=ALL-UNNAMED</argLine>
+                    <!-- Enable native access for JNI operations (Java 17+ only; see jdk17plus profile) -->
+                    <argLine>${surefire.argLine}</argLine>
                 </configuration>
             </plugin>
 
@@ -558,6 +560,17 @@
                     </plugin>
                 </plugins>
             </build>
+        </profile>
+
+        <!-- Enable native access flag only on Java 17+ (flag does not exist on Java 11) -->
+        <profile>
+            <id>jdk17plus-native-access</id>
+            <activation>
+                <jdk>[17,)</jdk>
+            </activation>
+            <properties>
+                <surefire.argLine>--enable-native-access=ALL-UNNAMED</surefire.argLine>
+            </properties>
         </profile>
     </profiles>
 </project>
