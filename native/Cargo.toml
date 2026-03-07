@@ -1,6 +1,6 @@
 [package]
 name = "tantivy4java"
-version = "0.31.2"
+version = "0.32.4"
 edition = "2021"
 license = "MIT"
 authors = ["Tantivy4Java Contributors"]
