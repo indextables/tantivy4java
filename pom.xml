@@ -209,6 +209,13 @@
                     <forkCount>1</forkCount>
                     <!-- Set test execution order to be predictable -->
                     <runOrder>filesystem</runOrder>
+                    <!-- Exclude cloud/Docker integration tests by default.
+                         Run with: mvn test -Pintegration-tests -->
+                    <excludes>
+                        <exclude>**/Real*Test.java</exclude>
+                        <exclude>**/AzureIntegrationTest.java</exclude>
+                        <exclude>**/AzureOAuthTokenTest.java</exclude>
+                    </excludes>
                     <!-- Enable native access for JNI operations (Java 17+ only; see jdk17plus profile) -->
                     <argLine>${surefire.argLine}</argLine>
                 </configuration>
@@ -556,6 +563,23 @@
                         <configuration>
                             <publishingServerId>central</publishingServerId>
                             <tokenAuth>true</tokenAuth>
+                        </configuration>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+
+        <!-- Integration tests profile - includes cloud/Docker tests excluded by default.
+             Activate with: mvn test -Pintegration-tests -->
+        <profile>
+            <id>integration-tests</id>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-surefire-plugin</artifactId>
+                        <configuration>
+                            <excludes combine.self="override" />
                         </configuration>
                     </plugin>
                 </plugins>
