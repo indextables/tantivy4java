@@ -22,6 +22,7 @@ use tantivy::schema::{Schema as TantivySchema, Field};
 use uuid::Uuid;
 
 use crate::debug_println;
+use crate::memory_pool::{self, MemoryReservation};
 use super::indexing::{arrow_row_to_tantivy_doc, add_arrow_value_to_doc, add_string_value_to_doc, convert_arrow_to_owned_value, is_complex_arrow_type};
 use super::manifest::FastFieldMode;
 use super::name_mapping::NameMapping;
@@ -83,6 +84,8 @@ struct PartitionWriter {
     partition_values: HashMap<String, String>,
     /// Per-column statistics accumulators (populated when stats_columns is non-empty)
     accumulators: HashMap<String, StatisticsAccumulator>,
+    /// Memory reservation for the writer's heap — released on Drop/finalization.
+    _memory_reservation: MemoryReservation,
 }
 
 struct FieldMapping {
@@ -329,6 +332,20 @@ fn create_partition_writer(
     stats_columns: &std::collections::HashSet<String>,
     field_mapping: &[FieldMapping],
 ) -> Result<PartitionWriter> {
+    // Reserve memory from the global pool for this writer's heap.
+    // Fail-fast: if the pool denies, propagate the error to Java.
+    let reservation = MemoryReservation::try_new(
+        &memory_pool::global_pool(),
+        heap_size,
+        "index_writer",
+    ).map_err(|e| {
+        anyhow::anyhow!(
+            "Memory pool denied Arrow FFI writer allocation of {} MB: {}. \
+             Reduce heap size or increase pool capacity.",
+            heap_size / 1_000_000, e
+        )
+    })?;
+
     let index_dir = tempfile::tempdir()
         .context("Failed to create temp directory for partition writer")?;
 
@@ -375,6 +392,7 @@ fn create_partition_writer(
         doc_count: 0,
         partition_values,
         accumulators,
+        _memory_reservation: reservation,
     })
 }
 
