@@ -22,6 +22,7 @@ use jni::sys::jstring;
 use jni::JNIEnv;
 
 mod debug;  // Debug utilities and conditional logging
+pub mod memory_pool;  // Unified JVM-coordinated memory management
 mod runtime_manager;  // Global Quickwit runtime manager for async-first architecture
 mod schema;
 mod document;
@@ -68,6 +69,7 @@ pub extern "system" fn Java_io_indextables_tantivy4java_core_Tantivy_getVersion(
     _class: JClass,
 ) -> jstring {
     utils::install_panic_hook();
+    utils::set_jvm(&env);
     let version = env.new_string("0.24.0").unwrap();
     version.into_raw()
 }

@@ -26,6 +26,7 @@ use quickwit_directories::UnionDirectory;
 use quickwit_query::get_quickwit_fastfield_normalizer_manager;
 
 use crate::debug_println;
+use crate::memory_pool::{self, MemoryReservation};
 use crate::runtime_manager::QuickwitRuntimeManager;
 use super::QuickwitSplitMetadata;
 use super::merge_config::InternalMergeConfig;
@@ -624,6 +625,17 @@ pub async fn merge_split_directories_with_optimization(
                optimization.heap_size_bytes / 1_000_000,
                optimization.num_threads,
                if optimization.use_random_io { "Random" } else { "Sequential" });
+
+    // Reserve 3x heap from memory pool: writer heap + mmap copies + Vec temporaries
+    let merge_memory = optimization.heap_size_bytes as usize * 3;
+    let _merge_reservation = MemoryReservation::try_new(
+        &memory_pool::global_pool(),
+        merge_memory,
+        "merge",
+    ).map_err(|e| {
+        anyhow::anyhow!("Memory pool denied merge reservation of {}MB: {}. \
+            Reduce merge parallelism or increase pool capacity.", merge_memory / 1_000_000, e)
+    })?;
 
     // 1. Create output directory with controlled I/O
     std::fs::create_dir_all(output_path)?;

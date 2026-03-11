@@ -117,9 +117,16 @@ impl L2DiskCache {
 
                         // For size-based mode: drain bytes and notify waiting senders
                         if let Some((queued_bytes, backpressure)) = sb_state {
-                            queued_bytes.fetch_sub(data_len, Ordering::Release);
+                            let remaining = queued_bytes.fetch_sub(data_len, Ordering::Release) - data_len;
                             let (_lock, cvar) = &*backpressure;
                             cvar.notify_all();
+
+                            // When queue fully drains, release overflow memory back to pool
+                            if remaining == 0 {
+                                if let Some(budget) = &cache.memory_budget {
+                                    budget.on_queue_drained();
+                                }
+                            }
                         }
 
                         drop(permit); // Release permit when write completes

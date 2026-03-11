@@ -6,6 +6,7 @@ use std::sync::OnceLock;
 use quickwit_storage::ByteRangeCache;
 
 use crate::debug_println;
+use crate::memory_pool::{self, MemoryReservation};
 
 /// Global L1 ByteRangeCache shared across all SplitSearcher instances
 /// This provides memory-efficient caching - one bounded cache instead of per-split caches
@@ -18,6 +19,13 @@ static CONFIGURED_L1_CACHE_CAPACITY: OnceLock<std::sync::RwLock<Option<u64>>> = 
 /// Global flag to disable L1 ByteRangeCache for debugging
 /// When true, all storage requests bypass L1 memory cache and go to L2 disk cache / L3 storage
 static DISABLE_L1_CACHE: OnceLock<std::sync::RwLock<bool>> = OnceLock::new();
+
+/// Memory reservation for the L1 cache capacity. Released when cache is reset or process exits.
+static L1_CACHE_RESERVATION: OnceLock<std::sync::Mutex<Option<MemoryReservation>>> = OnceLock::new();
+
+fn get_l1_reservation_holder() -> &'static std::sync::Mutex<Option<MemoryReservation>> {
+    L1_CACHE_RESERVATION.get_or_init(|| std::sync::Mutex::new(None))
+}
 
 fn get_l1_cache_holder() -> &'static std::sync::RwLock<Option<ByteRangeCache>> {
     GLOBAL_L1_CACHE.get_or_init(|| std::sync::RwLock::new(None))
@@ -51,6 +59,11 @@ pub fn reset_global_l1_cache() {
         let holder = get_configured_capacity_holder();
         let mut guard = holder.write().unwrap();
         *guard = None;
+    }
+
+    // Release the memory reservation
+    {
+        *get_l1_reservation_holder().lock().unwrap() = None;
     }
 
     // Then clear the cache itself (will be recreated on next access)
@@ -93,6 +106,24 @@ pub fn get_or_create_global_l1_cache() -> Option<ByteRangeCache> {
 
     // Create bounded L1 cache with configurable capacity
     let capacity = get_l1_cache_capacity_bytes();
+
+    // Reserve memory from the global pool for L1 cache — fail-fast if denied
+    let reservation = match MemoryReservation::try_new(
+        &memory_pool::global_pool(),
+        capacity as usize,
+        "l1_cache",
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            debug_println!(
+                "❌ GLOBAL_L1_CACHE: Memory pool denied L1 reservation of {} MB: {}. L1 cache will not be created.",
+                capacity / 1024 / 1024, e
+            );
+            return None;
+        }
+    };
+    *get_l1_reservation_holder().lock().unwrap() = Some(reservation);
+
     let cache = ByteRangeCache::with_capacity(
         capacity,
         &quickwit_storage::STORAGE_METRICS.shortlived_cache,

@@ -519,6 +519,7 @@ public class SplitCacheManager implements AutoCloseable {
         private int writeQueueCapacity = 16;              // used ONLY when mode=FRAGMENT
         private long writeQueueMaxBytes = 2_147_483_648L; // used ONLY when mode=SIZE_BASED
         private boolean dropWritesWhenFull = false;        // query-path writes drop instead of block
+        private long maxWriteQueueBudget = 0;                // 0 = default (8x initial write queue size)
 
         /**
          * Set the disk cache directory path.
@@ -664,6 +665,28 @@ public class SplitCacheManager implements AutoCloseable {
         }
 
         /**
+         * Set the maximum memory budget for the write queue.
+         *
+         * <p>This caps how much memory the write queue can acquire from the JVM memory pool
+         * via staircase-up growth. When the queue needs more memory than its initial allocation,
+         * it grows in 500MB increments up to this cap. When the queue drains, overflow is released.
+         *
+         * <p>Default is 0, which means 8x the initial write queue size. For example, with a 2GB
+         * write queue, the default cap is 16GB. Set this lower to bound memory growth in
+         * memory-constrained environments.
+         *
+         * <p>Only effective when a JVM memory pool is configured via
+         * {@link io.indextables.tantivy4java.core.NativeMemoryManager}.
+         *
+         * @param bytes maximum budget in bytes (0 = default 8x initial)
+         * @return this TieredCacheConfig for method chaining
+         */
+        public TieredCacheConfig withMaxWriteQueueBudget(long bytes) {
+            this.maxWriteQueueBudget = bytes;
+            return this;
+        }
+
+        /**
          * Enable dropping query-path writes when the write queue is full.
          *
          * <p>When enabled, query-path cache writes (data fetched during searches) are
@@ -697,6 +720,8 @@ public class SplitCacheManager implements AutoCloseable {
         public long getWriteQueueMaxBytes() { return writeQueueMaxBytes; }
         /** @return whether query-path writes are dropped when the queue is full */
         public boolean isDropWritesWhenFull() { return dropWritesWhenFull; }
+        /** @return maximum write queue memory budget in bytes (0 = default 8x initial) */
+        public long getMaxWriteQueueBudget() { return maxWriteQueueBudget; }
 
         /**
          * Convert compression algorithm to ordinal for native layer.

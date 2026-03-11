@@ -833,6 +833,16 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_crea
                                 .map(|m| crate::parquet_companion::docid_mapping::build_file_hash_index(m))
                                 .unwrap_or_default();
 
+                            // Initialize global search arena reservation (max_concurrency × 16MB).
+                            // Fail-fast: if pool denies, searcher creation fails.
+                            if let Err(e) = crate::memory_pool::init_search_arena() {
+                                runtime.unregister_searcher();
+                                to_java_exception(&mut env, &anyhow::anyhow!(
+                                    "Memory pool denied search arena reservation: {}. \
+                                    Reduce max concurrency or increase pool capacity.", e));
+                                return 0;
+                            }
+
                             // Create clean struct-based context instead of complex tuple
                             let cached_context = CachedSearcherContext {
                                 standalone_searcher: std::sync::Arc::new(searcher),
@@ -867,6 +877,7 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_crea
                                 parquet_file_hash_index,
                                 has_merge_safe_tracking,
                                 pq_columns: std::sync::Arc::new(std::sync::RwLock::new(Vec::new())),
+                                search_arena_reservation: None, // Global arena covers all concurrent slots
                             };
 
                             let searcher_context = std::sync::Arc::new(cached_context);

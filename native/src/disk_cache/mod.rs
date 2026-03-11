@@ -52,6 +52,7 @@ use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::Duration;
 
 use crate::debug_println;
+use crate::memory_pool::{self, DiskCacheMemoryBudget};
 use tantivy::directory::OwnedBytes;
 
 use lru::SplitLruTable;
@@ -183,6 +184,8 @@ pub struct L2DiskCache {
     thread_handles: Mutex<Vec<std::thread::JoinHandle<()>>>,
     /// Dirty flag - set when manifest has uncommitted changes
     manifest_dirty: Arc<std::sync::atomic::AtomicBool>,
+    /// Memory budget for write queue (staircase-up/cliff-down pattern)
+    memory_budget: Option<DiskCacheMemoryBudget>,
 }
 
 #[allow(dead_code)]
@@ -240,6 +243,39 @@ impl L2DiskCache {
 
         let manifest_dirty = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
+        // Create memory budget for the write queue — only when a JVM pool is
+        // explicitly configured. With UnlimitedMemoryPool (default), the write
+        // queue operates with its static max size and no expand/contract behavior.
+        let memory_budget = if memory_pool::is_pool_configured() {
+            let max_budget = config.max_write_queue_budget as usize; // 0 = default (8x)
+            match &config.write_queue_mode {
+                WriteQueueMode::SizeBased { max_bytes } => {
+                    Some(DiskCacheMemoryBudget::with_config(
+                        &memory_pool::global_pool(),
+                        *max_bytes as usize,
+                        500 * 1024 * 1024, // 500MB grow increment
+                        max_budget,
+                    ))
+                }
+                WriteQueueMode::Fragment { capacity } => {
+                    // Estimate: each fragment slot can hold ~1MB of data
+                    let estimated_bytes = (*capacity as usize) * 1024 * 1024;
+                    if estimated_bytes > 0 {
+                        Some(DiskCacheMemoryBudget::with_config(
+                            &memory_pool::global_pool(),
+                            estimated_bytes,
+                            500 * 1024 * 1024,
+                            max_budget,
+                        ))
+                    } else {
+                        None
+                    }
+                }
+            }
+        } else {
+            None // UnlimitedMemoryPool — no budget tracking, static queue size
+        };
+
         let cache = Arc::new(Self {
             config: config.clone(),
             manifest: RwLock::new(manifest),
@@ -252,6 +288,7 @@ impl L2DiskCache {
             shutdown_flag: Arc::clone(&shutdown_flag),
             thread_handles: Mutex::new(Vec::new()),
             manifest_dirty: Arc::clone(&manifest_dirty),
+            memory_budget,
         });
 
         // Start background writer (uses Weak reference - doesn't prevent Drop)
@@ -411,9 +448,22 @@ impl L2DiskCache {
         )
     }
 
+    /// Try to expand the memory budget to accommodate new data.
+    /// Returns true if the budget has room (or was successfully expanded), false if denied.
+    fn try_expand_budget(&self, needed: usize) -> bool {
+        match &self.memory_budget {
+            Some(budget) => budget.ensure_capacity(needed),
+            None => true, // No budget configured — always allow
+        }
+    }
+
     /// Cache data (async write via background thread).
     /// Blocks if the write queue is full (backpressure).
     /// Use this for prewarm operations where data must be written.
+    ///
+    /// Tries to expand the memory budget first. If the pool denies expansion,
+    /// proceeds with a blocking write anyway — the background writer will drain
+    /// the queue naturally, and the user explicitly requested this data be cached.
     pub fn put(
         &self,
         storage_loc: &str,
@@ -431,7 +481,16 @@ impl L2DiskCache {
             self.trigger_eviction((self.max_bytes * 90) / 100);
         }
 
-        // Send to background writer with backpressure.
+        // Try to expand budget. If denied, proceed anyway — prewarm blocks on
+        // the channel send until the background writer drains and frees queue space.
+        if !self.try_expand_budget(data.len()) {
+            debug_println!(
+                "⚠️ L2DiskCache::put (prewarm): Memory budget denied expansion, \
+                 will block on queue backpressure until background writer drains"
+            );
+        }
+
+        // Send to background writer with backpressure (blocks if queue is full).
         let _ = self.write_tx.send(WriteRequest::Put {
             storage_loc: storage_loc.to_string(),
             split_id: split_id.to_string(),
@@ -444,6 +503,9 @@ impl L2DiskCache {
     /// Cache data if the write queue has capacity, otherwise drop silently.
     /// Returns `true` if the write was enqueued, `false` if dropped.
     /// Use this for query-path opportunistic caching where dropping is acceptable.
+    ///
+    /// Tries to expand the memory budget first. If the pool denies expansion,
+    /// drops the entry — a cache miss is preferable to over-allocating.
     pub fn put_if_ready(
         &self,
         storage_loc: &str,
@@ -457,6 +519,12 @@ impl L2DiskCache {
 
         if current + new_size > (self.max_bytes * 95) / 100 {
             self.trigger_eviction((self.max_bytes * 90) / 100);
+        }
+
+        // Try to expand budget. If denied, drop — query path should not over-allocate.
+        if !self.try_expand_budget(data.len()) {
+            debug_println!("⚠️ L2DiskCache::put_if_ready: Memory budget denied expansion, dropping cache entry");
+            return false;
         }
 
         self.write_tx.send_or_drop(WriteRequest::Put {
@@ -474,8 +542,8 @@ impl L2DiskCache {
     }
 
     /// Cache data for the query path — blocks or drops depending on config.
-    /// When `drop_writes_when_full` is enabled, silently drops writes if the queue is full.
-    /// When disabled, behaves identically to `put()` (blocks until enqueued).
+    /// Tries to expand the memory budget first. If the pool denies expansion,
+    /// drops the entry — a cache miss is preferable to over-allocating.
     pub fn put_query_path(
         &self,
         storage_loc: &str,
@@ -484,6 +552,12 @@ impl L2DiskCache {
         byte_range: Option<Range<u64>>,
         data: &[u8],
     ) {
+        // Try to expand budget. If denied, drop — query path should not over-allocate.
+        if !self.try_expand_budget(data.len()) {
+            debug_println!("⚠️ L2DiskCache::put_query_path: Memory budget denied expansion, dropping cache entry");
+            return;
+        }
+
         if self.config.drop_writes_when_full {
             self.put_if_ready(storage_loc, split_id, component, byte_range, data);
         } else {

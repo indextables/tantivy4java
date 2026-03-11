@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
-use arrow_array::{RecordBatch, UInt32Array};
+use arrow_array::{Array, RecordBatch, UInt32Array};
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use quickwit_storage::Storage;
 
@@ -162,7 +162,20 @@ pub async fn batch_parquet_to_arrow_ffi(
         t_rename.elapsed().as_millis()
     );
 
-    // Step 6: Export each column via Arrow FFI
+    // Step 6: Memory pool reservation for Arrow FFI data
+    let estimated_size: usize = renamed.columns().iter()
+        .map(|col| col.get_buffer_memory_size())
+        .sum();
+    let _ffi_reservation = crate::memory_pool::MemoryReservation::try_new(
+        &crate::memory_pool::global_pool(),
+        estimated_size,
+        "arrow_ffi",
+    )
+    .unwrap_or_else(|_| {
+        crate::memory_pool::MemoryReservation::empty(&crate::memory_pool::global_pool(), "arrow_ffi")
+    });
+
+    // Step 7: Export each column via Arrow FFI
     let num_cols = renamed.num_columns();
     if array_addrs.len() < num_cols || schema_addrs.len() < num_cols {
         anyhow::bail!(

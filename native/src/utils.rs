@@ -18,12 +18,29 @@
  */
 
 use jni::JNIEnv;
+use jni::JavaVM;
 use jni::sys::jlong;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::sync::atomic::{AtomicU64, Ordering};
 use once_cell::sync::Lazy;
 use crate::debug_println;
+
+/// Global JavaVM reference, captured on first JNI call.
+/// Required by JvmMemoryPool to attach threads and make JNI callbacks.
+static GLOBAL_JVM: OnceLock<JavaVM> = OnceLock::new();
+
+/// Store the JavaVM reference. Should be called once during initialization.
+pub fn set_jvm(env: &JNIEnv) {
+    GLOBAL_JVM.get_or_init(|| {
+        env.get_java_vm().expect("Failed to get JavaVM from JNIEnv")
+    });
+}
+
+/// Get the stored JavaVM reference.
+pub fn get_jvm() -> Option<&'static JavaVM> {
+    GLOBAL_JVM.get()
+}
 
 /// Handle errors by throwing Java exceptions
 pub fn handle_error(env: &mut JNIEnv, error: &str) {

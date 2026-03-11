@@ -377,6 +377,8 @@ pub extern "system" fn Java_io_indextables_tantivy4java_core_IndexWriter_nativeW
     ptr: jlong,
 ) {
     // wait_merging_threads consumes the IndexWriter, so we need to remove it from the Arc registry
+    // Also release the memory reservation
+    crate::index::WRITER_RESERVATIONS.lock().unwrap().remove(&ptr);
     let writer_arc = {
         let mut registry = crate::utils::ARC_REGISTRY.lock().unwrap();
         registry.remove(&ptr).and_then(|boxed| boxed.downcast::<Arc<Mutex<TantivyIndexWriter>>>().ok().map(|b| *b))
@@ -474,5 +476,7 @@ pub extern "system" fn Java_io_indextables_tantivy4java_core_IndexWriter_nativeC
     _class: JClass,
     ptr: jlong,
 ) {
+    // Release the memory reservation for this writer (if any)
+    crate::index::WRITER_RESERVATIONS.lock().unwrap().remove(&ptr);
     release_arc(ptr);
 }

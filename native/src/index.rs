@@ -27,7 +27,16 @@ use tantivy::directory::MmapDirectory;
 use tantivy::tokenizer::{SimpleTokenizer, WhitespaceTokenizer, LowerCaser, RemoveLongFilter, TextAnalyzer as TantivyAnalyzer};
 use crate::utils::{handle_error, with_arc_safe, arc_to_jlong, release_arc};
 use crate::text_analyzer::DEFAULT_MAX_TOKEN_LENGTH;
+use crate::memory_pool::{self, MemoryReservation};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+
+use once_cell::sync::Lazy;
+
+/// Tracks MemoryReservations for IndexWriter instances, keyed by their registry ID.
+/// When a writer is closed, its reservation is removed and dropped, releasing memory.
+pub(crate) static WRITER_RESERVATIONS: Lazy<Mutex<HashMap<jlong, MemoryReservation>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
 
 #[no_mangle]
 pub extern "system" fn Java_io_indextables_tantivy4java_core_Index_nativeNew(
@@ -172,21 +181,38 @@ pub extern "system" fn Java_io_indextables_tantivy4java_core_Index_nativeWriter(
     heap_size: jint,
     num_threads: jint,
 ) -> jlong {
+    let heap_size_bytes = if heap_size > 0 { heap_size as usize } else { 50_000_000 }; // 50MB default
+    let num_threads_val = if num_threads > 0 { num_threads as usize } else { 1 };
+
+    // Reserve memory from the global pool for this writer's heap
+    let reservation = match MemoryReservation::try_new(
+        &memory_pool::global_pool(),
+        heap_size_bytes,
+        "index_writer",
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            handle_error(&mut env, &format!("Memory pool denied IndexWriter allocation: {}", e));
+            return 0;
+        }
+    };
+
     let result = with_arc_safe::<Mutex<TantivyIndex>, Result<TantivyIndexWriter, String>>(ptr, |index_mutex| {
         let index = index_mutex.lock().unwrap();
-        let heap_size_bytes = if heap_size > 0 { heap_size as usize } else { 50_000_000 }; // 50MB default
-        let num_threads_val = if num_threads > 0 { num_threads as usize } else { 1 };
-        
         index.writer_with_num_threads(num_threads_val, heap_size_bytes)
             .map_err(|e| e.to_string())
     });
-    
+
     match result {
         Some(Ok(writer)) => {
             let writer_arc = Arc::new(Mutex::new(writer));
-            arc_to_jlong(writer_arc)
+            let writer_id = arc_to_jlong(writer_arc);
+            // Store reservation keyed by writer ID — released on nativeClose
+            WRITER_RESERVATIONS.lock().unwrap().insert(writer_id, reservation);
+            writer_id
         },
         Some(Err(err)) => {
+            // reservation is dropped here, releasing the memory
             handle_error(&mut env, &err);
             0
         },
