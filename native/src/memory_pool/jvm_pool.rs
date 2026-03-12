@@ -10,6 +10,7 @@ use jni::signature::ReturnType;
 use jni::JNIEnv;
 
 use super::pool::{MemoryError, MemoryPool};
+use crate::debug_println;
 
 /// Default high watermark: acquire more from JVM when usage exceeds 90% of grant.
 const DEFAULT_HIGH_WATERMARK: f64 = 0.90;
@@ -138,95 +139,92 @@ impl JvmMemoryPool {
         })
     }
 
-    /// Call Java acquireMemory(bytes) → returns actual bytes granted.
-    fn jni_acquire(&self, bytes: usize) -> Result<usize, MemoryError> {
+    /// Execute a closure with the JNI environment for the current thread.
+    ///
+    /// This keeps the `JNIEnv` borrow scoped to the closure, avoiding the need
+    /// for an unsafe lifetime transmute. The `jni_lock` is held for the duration,
+    /// serializing all JNI calls.
+    fn with_jni_env<R>(&self, f: impl FnOnce(&mut JNIEnv) -> R) -> Result<R, MemoryError> {
         let _lock = self.jni_lock.lock().unwrap();
 
-        // Get JNI env for current thread
-        let mut env = Self::get_env()?;
-
-        let result = unsafe {
-            env.call_method_unchecked(
-                &self.jvm_ref,
-                self.acquire_mid,
-                ReturnType::Primitive(jni::signature::Primitive::Long),
-                &[JValue::Long(bytes as i64).as_jni()],
-            )
-        };
-
-        match result {
-            Ok(val) => {
-                // Check for Java exceptions
-                if env.exception_check().unwrap_or(false) {
-                    env.exception_clear().ok();
-                    return Err(MemoryError::JniError(
-                        "Java exception during acquireMemory".to_string(),
-                    ));
-                }
-                let acquired = val.j().map_err(|e| {
-                    MemoryError::JniError(format!("Failed to extract long result: {}", e))
-                })?;
-                Ok(acquired as usize)
-            }
-            Err(e) => {
-                env.exception_clear().ok();
-                Err(MemoryError::JniError(format!(
-                    "JNI acquireMemory call failed: {}",
-                    e
-                )))
-            }
-        }
-    }
-
-    /// Call Java releaseMemory(bytes).
-    fn jni_release(&self, bytes: usize) -> Result<(), MemoryError> {
-        let _lock = self.jni_lock.lock().unwrap();
-
-        let mut env = Self::get_env()?;
-
-        let result = unsafe {
-            env.call_method_unchecked(
-                &self.jvm_ref,
-                self.release_mid,
-                ReturnType::Primitive(jni::signature::Primitive::Void),
-                &[JValue::Long(bytes as i64).as_jni()],
-            )
-        };
-
-        match result {
-            Ok(_) => {
-                if env.exception_check().unwrap_or(false) {
-                    env.exception_clear().ok();
-                    return Err(MemoryError::JniError(
-                        "Java exception during releaseMemory".to_string(),
-                    ));
-                }
-                Ok(())
-            }
-            Err(e) => {
-                env.exception_clear().ok();
-                Err(MemoryError::JniError(format!(
-                    "JNI releaseMemory call failed: {}",
-                    e
-                )))
-            }
-        }
-    }
-
-    /// Get JNI env for the current thread.
-    fn get_env() -> Result<JNIEnv<'static>, MemoryError> {
-        // Get the JavaVM from the JNI global
         let jvm = crate::utils::get_jvm().ok_or_else(|| {
             MemoryError::JniError("JavaVM not available".to_string())
         })?;
 
-        let env = jvm.attach_current_thread_permanently().map_err(|e| {
+        let mut env = jvm.attach_current_thread_permanently().map_err(|e| {
             MemoryError::JniError(format!("Failed to attach thread: {}", e))
         })?;
 
-        // Safety: we manage the lifetime carefully — the env is only used
-        // within jni_acquire/jni_release which hold jni_lock
-        Ok(unsafe { std::mem::transmute::<JNIEnv<'_>, JNIEnv<'static>>(env) })
+        Ok(f(&mut env))
+    }
+
+    /// Call Java acquireMemory(bytes) → returns actual bytes granted.
+    fn jni_acquire(&self, bytes: usize) -> Result<usize, MemoryError> {
+        self.with_jni_env(|env| {
+            let result = unsafe {
+                env.call_method_unchecked(
+                    &self.jvm_ref,
+                    self.acquire_mid,
+                    ReturnType::Primitive(jni::signature::Primitive::Long),
+                    &[JValue::Long(bytes as i64).as_jni()],
+                )
+            };
+
+            match result {
+                Ok(val) => {
+                    if env.exception_check().unwrap_or(false) {
+                        env.exception_clear().ok();
+                        return Err(MemoryError::JniError(
+                            "Java exception during acquireMemory".to_string(),
+                        ));
+                    }
+                    let acquired = val.j().map_err(|e| {
+                        MemoryError::JniError(format!("Failed to extract long result: {}", e))
+                    })?;
+                    Ok(acquired as usize)
+                }
+                Err(e) => {
+                    env.exception_clear().ok();
+                    Err(MemoryError::JniError(format!(
+                        "JNI acquireMemory call failed: {}",
+                        e
+                    )))
+                }
+            }
+        })?
+    }
+
+    /// Call Java releaseMemory(bytes).
+    fn jni_release(&self, bytes: usize) -> Result<(), MemoryError> {
+        self.with_jni_env(|env| {
+            let result = unsafe {
+                env.call_method_unchecked(
+                    &self.jvm_ref,
+                    self.release_mid,
+                    ReturnType::Primitive(jni::signature::Primitive::Void),
+                    &[JValue::Long(bytes as i64).as_jni()],
+                )
+            };
+
+            match result {
+                Ok(_) => {
+                    if env.exception_check().unwrap_or(false) {
+                        env.exception_clear().ok();
+                        return Err(MemoryError::JniError(
+                            "Java exception during releaseMemory".to_string(),
+                        ));
+                    }
+                    Ok(())
+                }
+                Err(e) => {
+                    env.exception_clear().ok();
+                    Err(MemoryError::JniError(format!(
+                        "JNI releaseMemory call failed: {}",
+                        e
+                    )))
+                }
+            }
+        })?
     }
 
     fn update_category(&self, category: &'static str, delta: isize) {
@@ -252,6 +250,8 @@ impl JvmMemoryPool {
     fn update_peak(&self) {
         let current = self.rust_used.load(Relaxed);
         let mut old_peak = self.peak.load(Relaxed);
+        // CAS loop converges quickly: each retry means another thread updated
+        // peak to a higher value, and once old_peak >= current the loop exits.
         while current > old_peak {
             match self.peak.compare_exchange_weak(old_peak, current, Relaxed, Relaxed) {
                 Ok(_) => break,
@@ -425,7 +425,12 @@ impl Drop for JvmMemoryPool {
         // Release all remaining grant back to JVM
         let granted = self.jvm_granted.swap(0, Relaxed);
         if granted > 0 {
-            let _ = self.jni_release(granted);
+            if let Err(e) = self.jni_release(granted) {
+                debug_println!(
+                    "MEMORY_POOL: Failed to release {} bytes back to JVM during drop: {}",
+                    granted, e
+                );
+            }
         }
     }
 }
