@@ -240,6 +240,17 @@ impl ParquetAugmentedDirectory {
         let num_docs: u32 = self.manifest.total_rows.try_into()
             .map_err(|_| anyhow::anyhow!("total_rows {} exceeds u32::MAX", self.manifest.total_rows))?;
 
+        // Estimate transcode output size: ~8 bytes per doc per column (columnar overhead)
+        let estimated_transcode_bytes = num_docs as usize * columns.len() * 8;
+        let _transcode_reservation = crate::memory_pool::MemoryReservation::try_new(
+            &crate::memory_pool::global_pool(),
+            estimated_transcode_bytes,
+            "parquet_transcode",
+        ).map_err(|e| {
+            anyhow::anyhow!("Memory pool denied parquet transcode reservation of {} bytes: {}",
+                estimated_transcode_bytes, e)
+        })?;
+
         // Transcode parquet columns to columnar bytes
         let parquet_columnar_bytes = transcode_columns_from_parquet(
             &columns,

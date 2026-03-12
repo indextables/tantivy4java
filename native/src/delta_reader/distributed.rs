@@ -1015,7 +1015,18 @@ pub fn read_checkpoint_part_arrow_ffi(
         }
     }
 
-    // 5. Build FFI structs in a temporary vec first, then write all at once.
+    // 5. Memory pool reservation for Arrow FFI data
+    let estimated_size: usize = arrays.iter().map(|(a, _)| a.get_buffer_memory_size()).sum();
+    let _reservation = crate::memory_pool::MemoryReservation::try_new(
+        &crate::memory_pool::global_pool(),
+        estimated_size,
+        "arrow_ffi",
+    )
+    .unwrap_or_else(|_| {
+        crate::memory_pool::MemoryReservation::empty(&crate::memory_pool::global_pool(), "arrow_ffi")
+    });
+
+    // 6. Build FFI structs in a temporary vec first, then write all at once.
     //    If any schema conversion fails, nothing is written.
     let mut ffi_pairs: Vec<(FFI_ArrowArray, FFI_ArrowSchema)> = Vec::with_capacity(NUM_COLS);
     for (i, (array, field)) in arrays.iter().enumerate() {
@@ -1026,7 +1037,7 @@ pub fn read_checkpoint_part_arrow_ffi(
         ffi_pairs.push((ffi_array, ffi_schema));
     }
 
-    // 6. All FFI structs built successfully — write them all out.
+    // 7. All FFI structs built successfully — write them all out.
     for (i, (ffi_array, ffi_schema)) in ffi_pairs.into_iter().enumerate() {
         let array_ptr = array_addrs[i] as *mut FFI_ArrowArray;
         let schema_ptr = schema_addrs[i] as *mut FFI_ArrowSchema;

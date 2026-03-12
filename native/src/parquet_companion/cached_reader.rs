@@ -20,6 +20,7 @@ use parquet::file::page_index::offset_index::{OffsetIndexMetaData, PageLocation}
 use quickwit_storage::Storage;
 
 use crate::debug_println;
+use crate::memory_pool::{self, MemoryReservation};
 use crate::perf_println;
 
 /// Cache key: (file_path, start_byte, end_byte)
@@ -72,18 +73,54 @@ impl CoalesceConfig {
     }
 }
 
-/// Shared byte-range cache across multiple CachedParquetReader instances.
+/// Byte-range cache that tracks its memory usage through the global memory pool.
+///
+/// Wraps an LRU cache of parquet byte ranges (dictionary pages, data pages) and
+/// grows/shrinks a `MemoryReservation` on every insert/eviction. Because the
+/// `JvmMemoryPool` uses high/low watermark batching, most grow/shrink calls are
+/// just an atomic add — JNI round-trips only happen at watermark crossings.
+pub struct TrackedByteRangeCache {
+    cache: lru::LruCache<ByteRangeCacheKey, Bytes>,
+    reservation: MemoryReservation,
+}
+
+impl TrackedByteRangeCache {
+    /// Look up a cached byte range. Returns a clone of the cached bytes.
+    pub fn get(&mut self, key: &ByteRangeCacheKey) -> Option<Bytes> {
+        self.cache.get(key).cloned()
+    }
+
+    /// Insert a byte range into the cache, tracking memory.
+    /// Uses `push()` to capture LRU evictions and shrink the reservation.
+    /// Growth is best-effort — if the pool denies, we still cache (bounded & transient).
+    pub fn put(&mut self, key: ByteRangeCacheKey, value: Bytes) {
+        let new_bytes = value.len();
+        if let Some((_evicted_key, evicted_value)) = self.cache.push(key, value) {
+            self.reservation.shrink(evicted_value.len());
+        }
+        let _ = self.reservation.grow(new_bytes); // best-effort
+    }
+}
+
+/// Shared tracked byte-range cache across multiple CachedParquetReader instances.
 /// Caches fetched byte ranges (e.g. dictionary pages, data pages) to avoid
 /// redundant S3/Azure downloads when retrieving multiple docs from the same file.
 /// Uses LRU eviction to bound memory — least-recently-used entries are evicted
 /// when the cache exceeds MAX_BYTE_CACHE_ENTRIES.
-pub type ByteRangeCache = Arc<Mutex<lru::LruCache<ByteRangeCacheKey, Bytes>>>;
+pub type ByteRangeCache = Arc<Mutex<TrackedByteRangeCache>>;
 
-/// Create a new empty byte-range cache.
+/// Create a new empty byte-range cache with memory pool tracking.
 pub fn new_byte_range_cache() -> ByteRangeCache {
-    Arc::new(Mutex::new(lru::LruCache::new(
-        std::num::NonZeroUsize::new(MAX_BYTE_CACHE_ENTRIES).unwrap(),
-    )))
+    let reservation = MemoryReservation::empty(
+        &memory_pool::global_pool(),
+        "parquet_byte_range_cache",
+    );
+    Arc::new(Mutex::new(TrackedByteRangeCache {
+        cache: lru::LruCache::new(
+            std::num::NonZeroUsize::new(MAX_BYTE_CACHE_ENTRIES).unwrap(),
+        ),
+        reservation,
+    }))
 }
 
 /// An AsyncFileReader that delegates to Quickwit's Storage trait.
@@ -172,7 +209,7 @@ impl CachedParquetReader {
     fn cache_get(&self, range: &Range<u64>) -> Option<Bytes> {
         let cache = self.byte_cache.as_ref()?;
         let key = (self.path.clone(), range.start, range.end);
-        cache.lock().ok()?.get(&key).cloned()
+        cache.lock().ok()?.get(&key)
     }
 
     /// Store bytes in the cache
@@ -237,7 +274,7 @@ impl AsyncFileReader for CachedParquetReader {
             // avoids the allocation+copy of .to_vec()
             let bytes = Bytes::from_owner(owned_bytes);
 
-            // Cache in L1 in-memory cache
+            // Cache in L1 in-memory cache (tracked by memory pool)
             if let Some(cache) = byte_cache {
                 let key = (path_for_cache, range.start, range.end);
                 if let Ok(mut guard) = cache.lock() {
@@ -316,7 +353,7 @@ impl AsyncFileReader for CachedParquetReader {
                 let bytes = fetched[fetch_idx].clone();
                 let range = &uncached_ranges[fetch_idx];
 
-                // Cache in L1 in-memory cache
+                // Cache in L1 in-memory cache (tracked by memory pool)
                 if let Some(ref cache) = byte_cache {
                     let key = (
                         path_for_cache.clone(),

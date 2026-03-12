@@ -73,6 +73,10 @@ pub struct DiskCacheConfig {
     /// When true, non-prewarm (query-path) writes are dropped if the write queue is full
     /// instead of blocking. Prewarm writes always block. Default: false (all writes block).
     pub drop_writes_when_full: bool,
+    /// Maximum memory budget for the write queue (bytes). Controls the hard cap for
+    /// staircase-up growth. 0 = default (8x the initial write queue size).
+    /// Only effective when a JVM memory pool is configured.
+    pub max_write_queue_budget: u64,
 }
 
 impl Default for DiskCacheConfig {
@@ -86,6 +90,7 @@ impl Default for DiskCacheConfig {
             mmap_cache_size: DEFAULT_MMAP_CACHE_SIZE,
             write_queue_mode: WriteQueueMode::default(),
             drop_writes_when_full: false,
+            max_write_queue_budget: 0, // Default: 8x initial
         }
     }
 }

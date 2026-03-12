@@ -18,6 +18,7 @@ use tantivy::TantivyDocument;
 
 use quickwit_storage::Storage;
 
+use crate::memory_pool::{self, MemoryReservation};
 use super::manifest::*;
 use super::page_index::compute_page_locations_from_column_chunk;
 use super::schema_derivation::{
@@ -376,6 +377,19 @@ pub async fn create_split_from_parquet(
 
     let index = tantivy::Index::create_in_dir(&index_dir, tantivy_schema.clone())
         .context("Failed to create tantivy index")?;
+
+    // Reserve memory from the global pool for this writer's heap.
+    let _writer_reservation = MemoryReservation::try_new(
+        &memory_pool::global_pool(),
+        parquet_config.writer_heap_size,
+        "index_writer",
+    ).map_err(|e| {
+        anyhow::anyhow!(
+            "Memory pool denied parquet companion writer allocation of {} MB: {}. \
+             Reduce writer_heap_size or increase pool capacity.",
+            parquet_config.writer_heap_size / 1_000_000, e
+        )
+    })?;
 
     // Single-threaded writer ensures docs within each segment are in insertion order.
     // Merges are allowed (default LogMergePolicy) — the __pq_file_hash and

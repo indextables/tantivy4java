@@ -22,9 +22,9 @@ use crate::runtime_manager::block_on_operation;
 
 use crate::searcher::aggregation::json_helpers::is_date_histogram_aggregation;
 use super::aggregation_arrow_ffi::{
-    aggregation_result_arrow_schema_json, aggregation_result_to_record_batch,
+    aggregation_result_arrow_schema_json,
     aggregation_result_to_record_batch_with_hash_resolution,
-    export_record_batch_ffi,
+    export_record_batch_ffi_tracked,
 };
 use super::jni_search::perform_search_async_impl_leaf_response_with_aggregations;
 
@@ -127,7 +127,7 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_nati
             ctx.hash_resolution_map.as_ref(),
         )?;
 
-        let row_count = export_record_batch_ffi(&batch, arr_slice, sch_slice)?;
+        let (row_count, _reservation) = export_record_batch_ffi_tracked(&batch, arr_slice, sch_slice)?;
 
         perf_println!(
             "⏱️ AGG_FFI: nativeAggregateArrowFfi DONE — {} rows, {} cols, {}ms",
@@ -321,7 +321,7 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_
             hash_resolution_map.as_ref(),
         )?;
 
-        let row_count = export_record_batch_ffi(&batch, arr_slice, sch_slice)?;
+        let (row_count, _reservation) = export_record_batch_ffi_tracked(&batch, arr_slice, sch_slice)?;
 
         perf_println!(
             "⏱️ AGG_FFI: nativeMultiSplitAggregateArrowFfi DONE — {} splits, {} rows, {}ms",
@@ -607,7 +607,7 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_
                 is_date_hist,
                 hash_resolution_map.as_ref(),
             )?;
-            let row_count = export_record_batch_ffi(&batch, arr_slice, sch_slice)?;
+            let (row_count, _reservation) = export_record_batch_ffi_tracked(&batch, arr_slice, sch_slice)?;
             row_counts.insert(agg_name.clone(), serde_json::json!(row_count));
         }
 

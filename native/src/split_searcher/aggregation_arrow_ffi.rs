@@ -10,9 +10,11 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
 use arrow_array::{
-    Float64Array, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray,
+    Array, Float64Array, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray,
 };
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
+
+use crate::memory_pool::{self, MemoryReservation};
 use tantivy::aggregation::agg_result::{
     AggregationResult, BucketEntries, BucketEntry, BucketResult, MetricResult,
     RangeBucketEntry,
@@ -112,6 +114,42 @@ pub fn export_record_batch_ffi(
     }
 
     Ok(batch.num_rows())
+}
+
+/// Estimate the memory footprint of a RecordBatch in bytes.
+///
+/// Sums the buffer sizes of all columns. This is a lower bound since it doesn't
+/// account for FFI struct overhead, but captures the bulk of the memory.
+fn estimate_record_batch_size(batch: &RecordBatch) -> usize {
+    batch
+        .columns()
+        .iter()
+        .map(|col| col.get_buffer_memory_size())
+        .sum()
+}
+
+/// Export a RecordBatch via FFI with memory pool tracking.
+///
+/// Creates a MemoryReservation for the estimated batch size before export,
+/// returning both the row count and the reservation. The caller must hold
+/// the reservation alive until the Java side has consumed the FFI data.
+pub fn export_record_batch_ffi_tracked(
+    batch: &RecordBatch,
+    array_addrs: &[i64],
+    schema_addrs: &[i64],
+) -> Result<(usize, MemoryReservation)> {
+    let estimated_size = estimate_record_batch_size(batch);
+
+    // Best-effort: if pool denies, proceed with empty reservation (data still exported)
+    let reservation = MemoryReservation::try_new(
+        &memory_pool::global_pool(),
+        estimated_size,
+        "arrow_ffi",
+    )
+    .unwrap_or_else(|_| MemoryReservation::empty(&memory_pool::global_pool(), "arrow_ffi"));
+
+    let row_count = export_record_batch_ffi(batch, array_addrs, schema_addrs)?;
+    Ok((row_count, reservation))
 }
 
 /// Return a JSON string describing the Arrow schema for the given aggregation result.

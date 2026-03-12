@@ -7,6 +7,7 @@ use std::ops::Range;
 use quickwit_storage::{Storage, ByteRangeCache};
 use crate::perf_println;
 use crate::debug_println;
+use crate::memory_pool::MemoryReservation;
 use crate::standalone_searcher::StandaloneSearcher;
 use crate::parquet_companion::manifest::ParquetManifest;
 
@@ -108,6 +109,9 @@ pub(crate) struct CachedSearcherContext {
     // When true, doc retrieval uses merge-safe fast-field resolution.
     // When false, falls back to legacy segment-based positional resolution.
     pub(crate) has_merge_safe_tracking: bool,
+    // Memory pool reservation for search result arena (16MB pre-acquired budget).
+    // Held for the lifetime of the SplitSearcher. Released on close via Drop.
+    pub(crate) search_arena_reservation: Option<MemoryReservation>,
     // Parquet companion mode: lazily-loaded __pq_file_hash and __pq_row_in_file Column handles.
     // Indexed as pq_columns[segment_ord] = Some((file_hash_col, row_in_file_col))
     // Column<u64> supports O(1) random access via values_for_doc(doc_id) — no need to

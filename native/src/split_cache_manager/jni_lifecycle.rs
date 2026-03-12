@@ -237,7 +237,15 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_
                         false
                     }
                 };
-            debug_println!("RUST DEBUG: write_queue_mode={:?}, drop_writes_when_full={}", write_queue_mode, drop_writes_when_full);
+            let max_write_queue_budget =
+                match env.call_method(&tiered_config_obj, "getMaxWriteQueueBudget", "()J", &[]) {
+                    Ok(result) => result.j().unwrap_or(0) as u64,
+                    Err(e) => {
+                        debug_println!("RUST DEBUG: Failed to get maxWriteQueueBudget: {:?}, defaulting to 0", e);
+                        0
+                    }
+                };
+            debug_println!("RUST DEBUG: write_queue_mode={:?}, drop_writes_when_full={}, max_write_queue_budget={}", write_queue_mode, drop_writes_when_full, max_write_queue_budget);
 
             // Create disk cache config if we have a path
             debug_println!("RUST DEBUG: disk_path is_some={}", disk_path.is_some());
@@ -260,6 +268,7 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_
                     mmap_cache_size: 0, // Use default (1024)
                     write_queue_mode,
                     drop_writes_when_full,
+                    max_write_queue_budget,
                 };
 
                 debug_println!("RUST DEBUG: Calling set_disk_cache with path: {}", path);
