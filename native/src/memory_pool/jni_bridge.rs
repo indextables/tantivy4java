@@ -195,3 +195,62 @@ pub extern "system" fn Java_io_indextables_tantivy4java_memory_NativeMemoryManag
 
     hashmap.into_raw()
 }
+
+/// Java_io_indextables_tantivy4java_memory_NativeMemoryManager_nativeGetCategoryPeakBreakdown
+///
+/// Returns a Java HashMap<String, Long> with per-category peak memory usage.
+/// Unlike getCategoryBreakdown() which only shows currently-held memory,
+/// this returns the maximum each category has ever held, even if now zero.
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_memory_NativeMemoryManager_nativeGetCategoryPeakBreakdown(
+    mut env: JNIEnv,
+    _class: JClass,
+) -> jobject {
+    let breakdown = global_pool().category_peak_breakdown();
+
+    let hashmap_class = match env.find_class("java/util/HashMap") {
+        Ok(c) => c,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    let hashmap = match env.new_object(&hashmap_class, "()V", &[]) {
+        Ok(m) => m,
+        Err(_) => return std::ptr::null_mut(),
+    };
+
+    for (category, bytes) in &breakdown {
+        let key = match env.new_string(category) {
+            Ok(k) => k,
+            Err(_) => continue,
+        };
+        let value = match env.new_object(
+            "java/lang/Long",
+            "(J)V",
+            &[jni::objects::JValue::Long(*bytes as i64)],
+        ) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let _ = env.call_method(
+            &hashmap,
+            "put",
+            "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+            &[(&key).into(), (&value).into()],
+        );
+    }
+
+    hashmap.into_raw()
+}
+
+/// Java_io_indextables_tantivy4java_memory_NativeMemoryManager_nativeShutdown
+///
+/// Signals that the JVM is shutting down. After this call, the pool will skip
+/// JNI release callbacks to avoid calling releaseMemory() outside of task context.
+/// Should be called before any shutdown hooks that trigger native resource cleanup.
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_memory_NativeMemoryManager_nativeShutdown(
+    _env: JNIEnv,
+    _class: JClass,
+) {
+    debug_println!("📊 MEMORY_POOL: Shutdown signaled — skipping future JNI release callbacks");
+    global_pool().shutdown();
+}

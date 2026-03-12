@@ -60,6 +60,31 @@ pub trait MemoryPool: Send + Sync + fmt::Debug {
 
     /// Per-category memory breakdown.
     fn category_breakdown(&self) -> HashMap<String, usize>;
+
+    /// Per-category peak memory breakdown. Returns the maximum bytes each category
+    /// has held since creation or last reset, even if currently zero.
+    fn category_peak_breakdown(&self) -> HashMap<String, usize>;
+
+    /// Signal that the JVM is shutting down. Subsequent release() calls skip
+    /// JNI callbacks to avoid calling releaseMemory() outside of task context.
+    /// Default implementation is a no-op (for non-JVM pools).
+    fn shutdown(&self) {}
+}
+
+/// Per-category tracking with current and peak usage.
+#[derive(Debug)]
+pub(super) struct CategoryTracker {
+    pub(super) current: AtomicUsize,
+    pub(super) peak: AtomicUsize,
+}
+
+impl CategoryTracker {
+    pub(super) fn new() -> Self {
+        Self {
+            current: AtomicUsize::new(0),
+            peak: AtomicUsize::new(0),
+        }
+    }
 }
 
 /// An unlimited memory pool that always grants requests.
@@ -69,7 +94,7 @@ pub trait MemoryPool: Send + Sync + fmt::Debug {
 pub struct UnlimitedMemoryPool {
     used: AtomicUsize,
     peak: AtomicUsize,
-    categories: Mutex<HashMap<&'static str, AtomicUsize>>,
+    categories: Mutex<HashMap<&'static str, CategoryTracker>>,
 }
 
 impl Default for UnlimitedMemoryPool {
@@ -85,13 +110,21 @@ impl Default for UnlimitedMemoryPool {
 impl UnlimitedMemoryPool {
     fn update_category(&self, category: &'static str, delta: isize) {
         let mut cats = self.categories.lock().unwrap();
-        let counter = cats
+        let tracker = cats
             .entry(category)
-            .or_insert_with(|| AtomicUsize::new(0));
+            .or_insert_with(CategoryTracker::new);
         if delta > 0 {
-            counter.fetch_add(delta as usize, Relaxed);
+            let new_val = tracker.current.fetch_add(delta as usize, Relaxed) + delta as usize;
+            // Update per-category peak
+            let mut old_peak = tracker.peak.load(Relaxed);
+            while new_val > old_peak {
+                match tracker.peak.compare_exchange_weak(old_peak, new_val, Relaxed, Relaxed) {
+                    Ok(_) => break,
+                    Err(actual) => old_peak = actual,
+                }
+            }
         } else {
-            counter.fetch_sub((-delta) as usize, Relaxed);
+            tracker.current.fetch_sub((-delta) as usize, Relaxed);
         }
     }
 
@@ -140,7 +173,15 @@ impl MemoryPool for UnlimitedMemoryPool {
     fn category_breakdown(&self) -> HashMap<String, usize> {
         let cats = self.categories.lock().unwrap();
         cats.iter()
-            .map(|(k, v)| (k.to_string(), v.load(Relaxed)))
+            .map(|(k, v)| (k.to_string(), v.current.load(Relaxed)))
+            .filter(|(_, v)| *v > 0)
+            .collect()
+    }
+
+    fn category_peak_breakdown(&self) -> HashMap<String, usize> {
+        let cats = self.categories.lock().unwrap();
+        cats.iter()
+            .map(|(k, v)| (k.to_string(), v.peak.load(Relaxed)))
             .filter(|(_, v)| *v > 0)
             .collect()
     }
@@ -154,7 +195,7 @@ pub struct LimitedMemoryPool {
     capacity: usize,
     used: AtomicUsize,
     peak: AtomicUsize,
-    categories: Mutex<HashMap<&'static str, AtomicUsize>>,
+    categories: Mutex<HashMap<&'static str, CategoryTracker>>,
 }
 
 #[cfg(test)]
@@ -170,11 +211,18 @@ impl LimitedMemoryPool {
 
     fn update_category(&self, category: &'static str, delta: isize) {
         let mut cats = self.categories.lock().unwrap();
-        let counter = cats.entry(category).or_insert_with(|| AtomicUsize::new(0));
+        let tracker = cats.entry(category).or_insert_with(CategoryTracker::new);
         if delta > 0 {
-            counter.fetch_add(delta as usize, Relaxed);
+            let new_val = tracker.current.fetch_add(delta as usize, Relaxed) + delta as usize;
+            let mut old_peak = tracker.peak.load(Relaxed);
+            while new_val > old_peak {
+                match tracker.peak.compare_exchange_weak(old_peak, new_val, Relaxed, Relaxed) {
+                    Ok(_) => break,
+                    Err(actual) => old_peak = actual,
+                }
+            }
         } else {
-            counter.fetch_sub((-delta) as usize, Relaxed);
+            tracker.current.fetch_sub((-delta) as usize, Relaxed);
         }
     }
 
@@ -225,7 +273,14 @@ impl MemoryPool for LimitedMemoryPool {
     fn category_breakdown(&self) -> HashMap<String, usize> {
         let cats = self.categories.lock().unwrap();
         cats.iter()
-            .map(|(k, v)| (k.to_string(), v.load(Relaxed)))
+            .map(|(k, v)| (k.to_string(), v.current.load(Relaxed)))
+            .filter(|(_, v)| *v > 0)
+            .collect()
+    }
+    fn category_peak_breakdown(&self) -> HashMap<String, usize> {
+        let cats = self.categories.lock().unwrap();
+        cats.iter()
+            .map(|(k, v)| (k.to_string(), v.peak.load(Relaxed)))
             .filter(|(_, v)| *v > 0)
             .collect()
     }
@@ -273,6 +328,17 @@ mod tests {
         pool.release(100, "index_writer");
         let breakdown = pool.category_breakdown();
         assert_eq!(*breakdown.get("index_writer").unwrap(), 50);
+
+        // Release everything — current breakdown should be empty
+        pool.release(50, "index_writer");
+        pool.release(200, "l1_cache");
+        let breakdown = pool.category_breakdown();
+        assert!(breakdown.is_empty(), "Current breakdown should be empty after full release");
+
+        // But peak breakdown should still show historical maximums
+        let peak_breakdown = pool.category_peak_breakdown();
+        assert_eq!(*peak_breakdown.get("index_writer").unwrap(), 150);
+        assert_eq!(*peak_breakdown.get("l1_cache").unwrap(), 200);
     }
 
     #[test]

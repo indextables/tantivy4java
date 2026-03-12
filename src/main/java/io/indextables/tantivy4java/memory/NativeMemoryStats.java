@@ -23,13 +23,22 @@ public class NativeMemoryStats {
     private final long peakBytes;
     private final long grantedBytes;
     private final Map<String, Long> categoryBreakdown;
+    private final Map<String, Long> categoryPeakBreakdown;
 
     NativeMemoryStats(long usedBytes, long peakBytes, long grantedBytes,
-                      Map<String, Long> categoryBreakdown) {
+                      Map<String, Long> categoryBreakdown,
+                      Map<String, Long> categoryPeakBreakdown) {
         this.usedBytes = usedBytes;
         this.peakBytes = peakBytes;
         this.grantedBytes = grantedBytes;
         this.categoryBreakdown = Collections.unmodifiableMap(categoryBreakdown);
+        this.categoryPeakBreakdown = Collections.unmodifiableMap(categoryPeakBreakdown);
+    }
+
+    // Backward-compatible constructor
+    NativeMemoryStats(long usedBytes, long peakBytes, long grantedBytes,
+                      Map<String, Long> categoryBreakdown) {
+        this(usedBytes, peakBytes, grantedBytes, categoryBreakdown, Collections.emptyMap());
     }
 
     /** Current total bytes reserved by native code. */
@@ -50,9 +59,20 @@ public class NativeMemoryStats {
         return grantedBytes;
     }
 
-    /** Per-category memory breakdown. */
+    /** Per-category current memory breakdown (only non-zero categories). */
     public Map<String, Long> getCategoryBreakdown() {
         return categoryBreakdown;
+    }
+
+    /**
+     * Per-category peak memory breakdown.
+     *
+     * <p>Returns the maximum bytes each category has ever held, even if
+     * currently zero. Useful for post-hoc analysis when all reservations
+     * have been released by the time this is called.
+     */
+    public Map<String, Long> getCategoryPeakBreakdown() {
+        return categoryPeakBreakdown;
     }
 
     @Override

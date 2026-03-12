@@ -10,8 +10,15 @@ package io.indextables.tantivy4java.config;
 public class RuntimeManager {
 
     static {
-        // Ensure native library is loaded
-        System.loadLibrary("tantivy4java");
+        try {
+            Class.forName("io.indextables.tantivy4java.core.Tantivy");
+        } catch (ClassNotFoundException e) {
+            try {
+                System.loadLibrary("tantivy4java");
+            } catch (UnsatisfiedLinkError ule) {
+                // Library may already be loaded
+            }
+        }
     }
 
     /**

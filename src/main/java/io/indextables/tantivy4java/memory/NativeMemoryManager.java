@@ -26,11 +26,18 @@ import java.util.Map;
 public class NativeMemoryManager {
 
     static {
-        // Ensure the native library is loaded
+        // Trigger Tantivy's static initializer which properly extracts and loads
+        // the native library from the jar. System.loadLibrary() alone doesn't work
+        // because the native library is jar-embedded, not on java.library.path.
         try {
-            System.loadLibrary("tantivy4java");
-        } catch (UnsatisfiedLinkError e) {
-            // Library may already be loaded by another class
+            Class.forName("io.indextables.tantivy4java.core.Tantivy");
+        } catch (ClassNotFoundException e) {
+            // Fallback for environments where Tantivy class is not available
+            try {
+                System.loadLibrary("tantivy4java");
+            } catch (UnsatisfiedLinkError ule) {
+                // Library may already be loaded by another class
+            }
         }
     }
 
@@ -104,7 +111,24 @@ public class NativeMemoryManager {
         if (breakdown == null) {
             breakdown = Collections.emptyMap();
         }
-        return new NativeMemoryStats(used, peak, granted, breakdown);
+        Map<String, Long> peakBreakdown = nativeGetCategoryPeakBreakdown();
+        if (peakBreakdown == null) {
+            peakBreakdown = Collections.emptyMap();
+        }
+        return new NativeMemoryStats(used, peak, granted, breakdown, peakBreakdown);
+    }
+
+    /**
+     * Signal that the JVM is shutting down.
+     *
+     * <p>After this call, the native pool skips JNI release callbacks to avoid
+     * calling {@code releaseMemory()} outside of a task context (e.g., on shutdown
+     * hook threads where Spark's TaskContext is unavailable).
+     *
+     * <p>Call this before any shutdown hooks that trigger native resource cleanup.
+     */
+    public static void shutdown() {
+        nativeShutdown();
     }
 
     // Native methods
@@ -118,4 +142,6 @@ public class NativeMemoryManager {
     private static native long nativeResetPeak();
     private static native boolean nativeIsConfigured();
     private static native Map<String, Long> nativeGetCategoryBreakdown();
+    private static native Map<String, Long> nativeGetCategoryPeakBreakdown();
+    private static native void nativeShutdown();
 }

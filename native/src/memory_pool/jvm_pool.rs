@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
 use std::sync::Mutex;
 
 use jni::objects::{GlobalRef, JMethodID, JValue};
@@ -63,14 +63,19 @@ pub struct JvmMemoryPool {
     /// Peak usage observed.
     peak: AtomicUsize,
 
-    // Per-category tracking
-    categories: Mutex<HashMap<&'static str, AtomicUsize>>,
+    // Per-category tracking (current + peak)
+    categories: Mutex<HashMap<&'static str, super::pool::CategoryTracker>>,
 
     // Watermark configuration
     config: JvmPoolConfig,
 
     // Mutex to serialize JNI calls (JNI method IDs are not Send in some impls)
     jni_lock: Mutex<()>,
+
+    /// When true, skip JNI release callbacks. Set during JVM shutdown to avoid
+    /// calling releaseMemory() outside of a task context (e.g., on shutdown hook
+    /// threads where Spark's TaskContext is unavailable).
+    shutting_down: AtomicBool,
 }
 
 // Safety: JMethodID is a pointer that is valid for the lifetime of the JVM.
@@ -129,6 +134,7 @@ impl JvmMemoryPool {
             categories: Mutex::new(HashMap::new()),
             config,
             jni_lock: Mutex::new(()),
+            shutting_down: AtomicBool::new(false),
         })
     }
 
@@ -225,13 +231,21 @@ impl JvmMemoryPool {
 
     fn update_category(&self, category: &'static str, delta: isize) {
         let mut cats = self.categories.lock().unwrap();
-        let counter = cats
+        let tracker = cats
             .entry(category)
-            .or_insert_with(|| AtomicUsize::new(0));
+            .or_insert_with(super::pool::CategoryTracker::new);
         if delta > 0 {
-            counter.fetch_add(delta as usize, Relaxed);
+            let new_val = tracker.current.fetch_add(delta as usize, Relaxed) + delta as usize;
+            // Update per-category peak
+            let mut old_peak = tracker.peak.load(Relaxed);
+            while new_val > old_peak {
+                match tracker.peak.compare_exchange_weak(old_peak, new_val, Relaxed, Relaxed) {
+                    Ok(_) => break,
+                    Err(actual) => old_peak = actual,
+                }
+            }
         } else {
-            counter.fetch_sub((-delta) as usize, Relaxed);
+            tracker.current.fetch_sub((-delta) as usize, Relaxed);
         }
     }
 
@@ -337,10 +351,27 @@ impl MemoryPool for JvmMemoryPool {
         self.rust_used.fetch_sub(size, Relaxed);
         self.update_category(category, -(size as isize));
 
-        // Check if we should release excess to JVM
+        // Check if we should release excess to JVM.
+        // Skip JNI release during shutdown — the JVM is exiting and the
+        // accountant's task context may no longer be available.
+        if self.shutting_down.load(Relaxed) {
+            return;
+        }
+
+        // Cap the release to `size` (the amount being freed by this call) to
+        // prevent releasing more to the JVM accountant than what the current
+        // thread's reservation held. The global pool batches acquisitions across
+        // threads, so the excess can be larger than any single thread's total.
+        // Without capping, a per-task accountant (e.g., Spark's ExecutionMemoryPool)
+        // would see releaseMemory(X) where X exceeds what that task acquired.
+        // Any remaining excess stays in jvm_granted and will be released by
+        // subsequent operations or on pool shutdown.
         if let Some(excess) = self.should_jvm_release() {
-            if let Ok(()) = self.jni_release(excess) {
-                self.jvm_granted.fetch_sub(excess, Relaxed);
+            let to_release = excess.min(size);
+            if to_release > 0 {
+                if let Ok(()) = self.jni_release(to_release) {
+                    self.jvm_granted.fetch_sub(to_release, Relaxed);
+                }
             }
             // If JNI release fails, we just keep the grant — no harm done
         }
@@ -366,14 +397,31 @@ impl MemoryPool for JvmMemoryPool {
     fn category_breakdown(&self) -> HashMap<String, usize> {
         let cats = self.categories.lock().unwrap();
         cats.iter()
-            .map(|(k, v)| (k.to_string(), v.load(Relaxed)))
+            .map(|(k, v)| (k.to_string(), v.current.load(Relaxed)))
             .filter(|(_, v)| *v > 0)
             .collect()
+    }
+
+    fn category_peak_breakdown(&self) -> HashMap<String, usize> {
+        let cats = self.categories.lock().unwrap();
+        cats.iter()
+            .map(|(k, v)| (k.to_string(), v.peak.load(Relaxed)))
+            .filter(|(_, v)| *v > 0)
+            .collect()
+    }
+
+    fn shutdown(&self) {
+        self.shutting_down.store(true, Relaxed);
     }
 }
 
 impl Drop for JvmMemoryPool {
     fn drop(&mut self) {
+        // Skip JNI release during shutdown — the JVM is exiting and the
+        // accountant's task context may no longer be available.
+        if self.shutting_down.load(Relaxed) {
+            return;
+        }
         // Release all remaining grant back to JVM
         let granted = self.jvm_granted.swap(0, Relaxed);
         if granted > 0 {

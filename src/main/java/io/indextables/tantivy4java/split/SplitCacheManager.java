@@ -75,6 +75,13 @@ public class SplitCacheManager implements AutoCloseable {
         Tantivy.initialize();
         // Add shutdown hook to gracefully cleanup all cache instances
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            // Signal the native memory pool to skip JNI release callbacks
+            // during shutdown — there's no Spark TaskContext on this thread.
+            try {
+                io.indextables.tantivy4java.memory.NativeMemoryManager.shutdown();
+            } catch (UnsatisfiedLinkError | NoClassDefFoundError e) {
+                // Memory pool may not be configured
+            }
             synchronized (instances) {
                 for (SplitCacheManager manager : instances.values()) {
                     try {
