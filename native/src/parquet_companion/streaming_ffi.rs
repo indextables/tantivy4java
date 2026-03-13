@@ -168,6 +168,12 @@ async fn produce_batches(
         let num_rows_in_file = rows.len();
 
         // Adaptive I/O strategy: select coalesce config based on per-file selectivity
+        if file_idx >= manifest.parquet_files.len() {
+            return Err(anyhow::anyhow!(
+                "Invalid file_idx {} >= {} parquet files in manifest",
+                file_idx, manifest.parquet_files.len()
+            ));
+        }
         let file_entry = &manifest.parquet_files[file_idx];
         let selectivity = compute_selectivity(num_rows_in_file, file_entry.num_rows as usize);
         let strategy = ReadStrategy::for_selectivity(selectivity);
@@ -213,8 +219,16 @@ async fn produce_batches(
                 let normalized = normalize_timestamps(renamed)?;
                 rows_emitted += normalized.num_rows();
                 if tx.send(Ok(normalized)).await.is_err() {
-                    perf_println!("⏱️ STREAMING: consumer dropped — stopping producer");
-                    return Ok(()); // Consumer dropped — stop producing
+                    if rows_emitted == 0 {
+                        return Err(anyhow::anyhow!(
+                            "Consumer dropped before any data was sent — possible consumer error"
+                        ));
+                    }
+                    perf_println!(
+                        "⏱️ STREAMING: consumer dropped after {} rows — stopping producer",
+                        rows_emitted
+                    );
+                    return Ok(());
                 }
             }
         }

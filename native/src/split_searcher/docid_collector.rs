@@ -47,7 +47,12 @@ impl Collector for DocIdCollector {
         &self,
         segment_fruits: Vec<Vec<(u32, u32)>>,
     ) -> tantivy::Result<Self::Fruit> {
-        let total: usize = segment_fruits.iter().map(|v| v.len()).sum();
+        let total: usize = segment_fruits.iter()
+            .map(|v| v.len())
+            .try_fold(0usize, |acc, len| acc.checked_add(len))
+            .ok_or_else(|| tantivy::TantivyError::InternalError(
+                "Result set too large: document count overflow".to_string()
+            ))?;
         let mut result = Vec::with_capacity(total);
         for fruit in segment_fruits {
             result.extend(fruit);
