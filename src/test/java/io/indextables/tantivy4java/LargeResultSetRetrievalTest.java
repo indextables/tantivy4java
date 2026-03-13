@@ -1,6 +1,7 @@
 package io.indextables.tantivy4java;
 
 import io.indextables.tantivy4java.core.*;
+import io.indextables.tantivy4java.core.JsonObjectOptions;
 import io.indextables.tantivy4java.result.SearchResult;
 import io.indextables.tantivy4java.split.*;
 import io.indextables.tantivy4java.split.merge.*;
@@ -2023,6 +2024,55 @@ public class LargeResultSetRetrievalTest {
     }
 
     /**
+     * Creates a split with an integer field "id" and a JSON field "scores"
+     * storing {"_values": [90, 85, 92]} — the exact pattern used by the Spark connector's
+     * SparkToTantivyConverter.wrapArrayInObject() for ArrayType fields.
+     */
+    private SplitSearcher createJsonIntArraySplit(Path dir, String tag) throws Exception {
+        try (SchemaBuilder builder = new SchemaBuilder()) {
+            builder.addIntegerField("id", true, true, false);
+            builder.addJsonField("scores", JsonObjectOptions.storedAndIndexed());
+            try (Schema schema = builder.build();
+                 Index index = new Index(schema, dir.resolve("jidx_" + tag).toString(), false);
+                 IndexWriter writer = index.writer(Index.Memory.DEFAULT_HEAP_SIZE, 1)) {
+                // Row 1: scores = [90, 85, 92]  (matches Scala test data)
+                try (Document doc = new Document()) {
+                    doc.addInteger("id", 1);
+                    Map<String, Object> wrapper1 = new HashMap<>();
+                    wrapper1.put("_values", Arrays.asList(90, 85, 92));
+                    doc.addJson("scores", wrapper1);
+                    writer.addDocument(doc);
+                }
+                // Row 2: scores = [78, 88, 95]
+                try (Document doc = new Document()) {
+                    doc.addInteger("id", 2);
+                    Map<String, Object> wrapper2 = new HashMap<>();
+                    wrapper2.put("_values", Arrays.asList(78, 88, 95));
+                    doc.addJson("scores", wrapper2);
+                    writer.addDocument(doc);
+                }
+                // Row 3: scores = [88, 90, 87]
+                try (Document doc = new Document()) {
+                    doc.addInteger("id", 3);
+                    Map<String, Object> wrapper3 = new HashMap<>();
+                    wrapper3.put("_values", Arrays.asList(88, 90, 87));
+                    doc.addJson("scores", wrapper3);
+                    writer.addDocument(doc);
+                }
+                writer.commit();
+            }
+        }
+        QuickwitSplit.SplitConfig splitConfig = new QuickwitSplit.SplitConfig(
+                "jsconarr-idx", "jsconarr-src", "jsconarr-node");
+        QuickwitSplit.SplitMetadata metadata = QuickwitSplit.convertIndexFromPath(
+                dir.resolve("jidx_" + tag).toString(),
+                dir.resolve("j" + tag + ".split").toString(), splitConfig);
+
+        String splitUrl = "file://" + dir.resolve("j" + tag + ".split").toAbsolutePath();
+        return cacheManager.createSplitSearcher(splitUrl, metadata);
+    }
+
+    /**
      * Creates a split with an integer field "id" and a stored text field "scores"
      * containing JSON-serialized integer arrays like "[90, 85, 92]".
      * This replicates how Spark's ArrayType(IntegerType) is stored via the connector.
@@ -2056,6 +2106,76 @@ public class LargeResultSetRetrievalTest {
 
         String splitUrl = "file://" + dir.resolve(tag + ".split").toAbsolutePath();
         return cacheManager.createSplitSearcher(splitUrl, metadata);
+    }
+
+    @Test
+    @Order(119)
+    @DisplayName("Regression: ArrayType(IntegerType) — JSON field with _values wrapper → List(Int32)")
+    void testIntArrayFromJsonFieldValuesWrapper(@TempDir Path dir) throws Exception {
+        // Replicates the exact Spark connector pattern from JsonFieldIntegrationTest.scala:109
+        // Schema: StructField("id", IntegerType), StructField("scores", ArrayType(IntegerType))
+        // Data: [90, 85, 92], [78, 88, 95], [88, 90, 87]
+        // Storage: JSON field with {"_values": [90, 85, 92]}
+        try (SplitSearcher searcher = createJsonIntArraySplit(dir, "jsonarr_hint")) {
+            String queryJson = new SplitMatchAllQuery().toQueryAstJson();
+
+            String[] typeHints = new String[] {
+                "id", "i32",
+                "scores", "{\"list\": \"i32\"}"
+            };
+
+            try (SplitSearcher.StreamingSession session = searcher.startStreamingRetrieval(
+                    queryJson, new String[]{"id", "scores"}, typeHints)) {
+                assertEquals(2, session.getColumnCount());
+
+                long[][] structs = allocateFfiStructs(2);
+                try {
+                    int rows = session.nextBatch(structs[0], structs[1]);
+                    assertEquals(3, rows, "Should retrieve all 3 rows");
+
+                    // Column 0: id (Int32) — format "i"
+                    String idFmt = readSchemaFormat(structs[1][0]);
+                    assertEquals("i", idFmt, "id column should be Int32 format 'i'");
+
+                    // Column 1: scores (List<Int32>) — format "+l"
+                    String scoresFmt = readSchemaFormat(structs[1][1]);
+                    assertEquals("+l", scoresFmt,
+                            "scores column should have Arrow list format (+l), got: " + scoresFmt);
+
+                    // Verify child array format is Int32 ("i")
+                    long schemaPtr = structs[1][1];
+                    long nChildren = unsafe.getLong(schemaPtr + 32);
+                    assertTrue(nChildren > 0, "List schema should have child");
+                    long childrenPtr = unsafe.getLong(schemaPtr + 40);
+                    long childSchemaPtr = unsafe.getLong(childrenPtr);
+                    String childFmt = readSchemaFormat(childSchemaPtr);
+                    assertEquals("i", childFmt,
+                            "List child should be Int32 format 'i', got: " + childFmt);
+
+                    // Verify the actual List data array has non-null Int32 values
+                    // ArrowArray: buffers at offset 48, children at offset 64
+                    long arrayPtr = structs[0][1]; // scores column ArrowArray
+                    long arrayLength = unsafe.getLong(arrayPtr);     // length
+                    long arrayNullCount = unsafe.getLong(arrayPtr + 8); // null_count
+                    assertTrue(arrayLength > 0, "List array should have rows");
+                    assertEquals(0, arrayNullCount, "List array should have no null rows");
+
+                    // The child array (Int32) should have 9 elements total (3 rows × 3 ints)
+                    long nArrayChildren = unsafe.getLong(arrayPtr + 24); // n_children
+                    assertTrue(nArrayChildren > 0, "List array should have child array");
+                    long arrayChildrenPtr = unsafe.getLong(arrayPtr + 64); // children pointer
+                    long childArrayPtr = unsafe.getLong(arrayChildrenPtr);
+                    long childLength = unsafe.getLong(childArrayPtr);     // child length
+                    long childNullCount = unsafe.getLong(childArrayPtr + 8); // child null_count
+                    assertEquals(9, childLength,
+                            "Child Int32 array should have 9 elements (3 rows × 3 ints)");
+                    assertEquals(0, childNullCount,
+                            "Child Int32 array should have zero null elements");
+                } finally {
+                    freeFfiStructs(structs[0], structs[1]);
+                }
+            }
+        }
     }
 
     @Test
