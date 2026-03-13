@@ -520,11 +520,34 @@ fn build_arrow_column(
             }
             Ok(Arc::new(builder.finish()))
         }
-        // Complex types: Struct, List, Map — extract OwnedValues and build recursively
-        DataType::Struct(_) | DataType::List(_) | DataType::LargeList(_) | DataType::Map(_, _) => {
+        // Complex types: Struct, Map — extract OwnedValues and build recursively
+        DataType::Struct(_) | DataType::Map(_, _) => {
             let values: Vec<Option<OwnedValue>> = docs
                 .iter()
                 .map(|doc| find_first_value(doc, field))
+                .collect();
+            owned_values_to_arrow(&values, arrow_type)
+        }
+        // List types: collect ALL values for the field into an Array.
+        // Tantivy multi-value fields store each value as a separate field entry,
+        // so find_first_value would only return the first element.
+        DataType::List(_) | DataType::LargeList(_) => {
+            let values: Vec<Option<OwnedValue>> = docs
+                .iter()
+                .map(|doc| {
+                    let all = find_all_values(doc, field);
+                    if all.is_empty() {
+                        None
+                    } else if all.len() == 1 {
+                        // Single value: if it's already an Array, use it directly
+                        match &all[0] {
+                            OwnedValue::Array(_) => Some(all.into_iter().next().unwrap()),
+                            _ => Some(OwnedValue::Array(all)),
+                        }
+                    } else {
+                        Some(OwnedValue::Array(all))
+                    }
+                })
                 .collect();
             owned_values_to_arrow(&values, arrow_type)
         }
@@ -553,6 +576,18 @@ fn find_first_value(
         }
     }
     None
+}
+
+/// Find ALL values for a given field in a TantivyDocument.
+/// Tantivy multi-value fields store each value as a separate field entry.
+fn find_all_values(
+    doc: &tantivy::TantivyDocument,
+    field: tantivy::schema::Field,
+) -> Vec<OwnedValue> {
+    doc.field_values()
+        .filter(|(f, _)| *f == field)
+        .map(|(_, val)| val.into())
+        .collect()
 }
 
 /// Convert an IPv6 address to its canonical display form.
@@ -826,6 +861,10 @@ fn build_scalar_from_owned_values(
                 match v {
                     Some(OwnedValue::I64(n)) => builder.append_value(*n),
                     Some(OwnedValue::U64(n)) => builder.append_value(*n as i64),
+                    Some(OwnedValue::Str(s)) => match s.parse::<i64>() {
+                        Ok(n) => builder.append_value(n),
+                        Err(_) => builder.append_null(),
+                    },
                     _ => builder.append_null(),
                 }
             }
@@ -837,6 +876,10 @@ fn build_scalar_from_owned_values(
                 match v {
                     Some(OwnedValue::I64(n)) => builder.append_value(*n as i32),
                     Some(OwnedValue::U64(n)) => builder.append_value(*n as i32),
+                    Some(OwnedValue::Str(s)) => match s.parse::<i32>() {
+                        Ok(n) => builder.append_value(n),
+                        Err(_) => builder.append_null(),
+                    },
                     _ => builder.append_null(),
                 }
             }
@@ -848,6 +891,10 @@ fn build_scalar_from_owned_values(
                 match v {
                     Some(OwnedValue::I64(n)) => builder.append_value(*n as i16),
                     Some(OwnedValue::U64(n)) => builder.append_value(*n as i16),
+                    Some(OwnedValue::Str(s)) => match s.parse::<i16>() {
+                        Ok(n) => builder.append_value(n),
+                        Err(_) => builder.append_null(),
+                    },
                     _ => builder.append_null(),
                 }
             }
@@ -859,6 +906,10 @@ fn build_scalar_from_owned_values(
                 match v {
                     Some(OwnedValue::I64(n)) => builder.append_value(*n as i8),
                     Some(OwnedValue::U64(n)) => builder.append_value(*n as i8),
+                    Some(OwnedValue::Str(s)) => match s.parse::<i8>() {
+                        Ok(n) => builder.append_value(n),
+                        Err(_) => builder.append_null(),
+                    },
                     _ => builder.append_null(),
                 }
             }
@@ -870,6 +921,10 @@ fn build_scalar_from_owned_values(
                 match v {
                     Some(OwnedValue::U64(n)) => builder.append_value(*n),
                     Some(OwnedValue::I64(n)) => builder.append_value(*n as u64),
+                    Some(OwnedValue::Str(s)) => match s.parse::<u64>() {
+                        Ok(n) => builder.append_value(n),
+                        Err(_) => builder.append_null(),
+                    },
                     _ => builder.append_null(),
                 }
             }
@@ -882,6 +937,10 @@ fn build_scalar_from_owned_values(
                     Some(OwnedValue::F64(n)) => builder.append_value(*n),
                     Some(OwnedValue::I64(n)) => builder.append_value(*n as f64),
                     Some(OwnedValue::U64(n)) => builder.append_value(*n as u64 as f64),
+                    Some(OwnedValue::Str(s)) => match s.parse::<f64>() {
+                        Ok(n) => builder.append_value(n),
+                        Err(_) => builder.append_null(),
+                    },
                     _ => builder.append_null(),
                 }
             }
@@ -893,6 +952,10 @@ fn build_scalar_from_owned_values(
                 match v {
                     Some(OwnedValue::F64(n)) => builder.append_value(*n as f32),
                     Some(OwnedValue::I64(n)) => builder.append_value(*n as f32),
+                    Some(OwnedValue::Str(s)) => match s.parse::<f32>() {
+                        Ok(n) => builder.append_value(n),
+                        Err(_) => builder.append_null(),
+                    },
                     _ => builder.append_null(),
                 }
             }
@@ -1430,5 +1493,90 @@ mod tests {
             .expect("should be Date32Array");
 
         assert!(date_col.is_null(0));
+    }
+
+    /// Regression: multi-value text field should produce a ListArray, not just
+    /// the first value. find_all_values collects all entries for the field.
+    #[test]
+    fn test_list_from_multi_value_field() {
+        let mut sb = SchemaBuilder::new();
+        let text_opts = tantivy::schema::TextOptions::default().set_stored();
+        let tags_field = sb.add_text_field("tags", text_opts.clone());
+        let schema = sb.build();
+
+        let mut hints = HashMap::new();
+        hints.insert(
+            "tags".to_string(),
+            DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+        );
+
+        let (arrow_schema, field_mapping) =
+            tantivy_schema_to_arrow(&schema, None, Some(&hints)).unwrap();
+
+        assert!(matches!(
+            arrow_schema.field(0).data_type(),
+            DataType::List(_)
+        ));
+
+        // Doc with multiple values for the same field (tantivy multi-value)
+        let mut doc = tantivy::TantivyDocument::default();
+        doc.add_text(tags_field, "alpha");
+        doc.add_text(tags_field, "beta");
+        doc.add_text(tags_field, "gamma");
+
+        let batch = docs_to_record_batch(&[doc], &arrow_schema, &field_mapping).unwrap();
+        let list_col = batch.column(0).as_any()
+            .downcast_ref::<ListArray>()
+            .expect("should be ListArray");
+
+        assert!(!list_col.is_null(0));
+        let row0 = list_col.value(0);
+        let strs = row0.as_any().downcast_ref::<arrow_array::StringArray>().unwrap();
+        assert_eq!(strs.len(), 3);
+        assert_eq!(strs.value(0), "alpha");
+        assert_eq!(strs.value(1), "beta");
+        assert_eq!(strs.value(2), "gamma");
+    }
+
+    /// Regression: map with integer keys. JSON/OwnedValue keys are always strings;
+    /// build_scalar_from_owned_values must parse them to the target key type.
+    #[test]
+    fn test_map_with_integer_keys() {
+        let key_type = DataType::Int32;
+        let val_type = DataType::Utf8;
+        let entries_field = Arc::new(Field::new(
+            "entries",
+            DataType::Struct(
+                vec![
+                    Arc::new(Field::new("key", key_type.clone(), false)),
+                    Arc::new(Field::new("value", val_type.clone(), true)),
+                ]
+                .into(),
+            ),
+            false,
+        ));
+        let map_type = DataType::Map(entries_field, false);
+
+        // OwnedValue::Object always has string keys
+        let values: Vec<Option<OwnedValue>> = vec![Some(OwnedValue::Object(vec![
+            ("10".to_string(), OwnedValue::Str("ten".to_string())),
+            ("20".to_string(), OwnedValue::Str("twenty".to_string())),
+        ]))];
+
+        let arr = owned_values_to_arrow(&values, &map_type).unwrap();
+        let map_arr = arr.as_any().downcast_ref::<MapArray>().unwrap();
+        assert_eq!(map_arr.len(), 1);
+
+        let entries = map_arr.value(0);
+        let struct_arr = entries.as_any().downcast_ref::<StructArray>().unwrap();
+        let keys = struct_arr.column(0).as_any()
+            .downcast_ref::<arrow_array::Int32Array>().unwrap();
+        let vals = struct_arr.column(1).as_any()
+            .downcast_ref::<arrow_array::StringArray>().unwrap();
+
+        assert_eq!(keys.value(0), 10);
+        assert_eq!(keys.value(1), 20);
+        assert_eq!(vals.value(0), "ten");
+        assert_eq!(vals.value(1), "twenty");
     }
 }
