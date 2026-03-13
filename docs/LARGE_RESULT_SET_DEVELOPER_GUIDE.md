@@ -208,6 +208,113 @@ Example: 10 files each contributing 20K rows → accumulator concatenates
 batches from ~7 files into one 128K-row output batch, then emits a second
 batch with the remaining ~72K rows.
 
+### Arrow Type Hints (Non-Companion Splits)
+
+When streaming from non-companion (regular tantivy) splits, the Arrow output
+types default to tantivy's internal storage types: all integers as `Int64`,
+all floats as `Float64`. This can cause problems when the caller expects
+narrower types (e.g., Spark's `IntegerType` → `Int32`, `FloatType` → `Float32`).
+
+The `startStreamingRetrieval()` overload with type hints lets the caller
+specify the desired Arrow output type per column. Values are narrowed during
+Arrow array construction — no extra cast pass needed.
+
+```java
+// Type hints: alternating [fieldName, arrowType, fieldName, arrowType, ...]
+String[] typeHints = new String[] {
+    "id",    "i32",    // tantivy stores as i64, output as Int32
+    "score", "f32",    // tantivy stores as f64, output as Float32
+    "rank",  "i16",    // tantivy stores as i64, output as Int16
+};
+
+try (SplitSearcher.StreamingSession session =
+        searcher.startStreamingRetrieval(queryJson,
+            new String[]{"id", "score", "rank", "name"},
+            typeHints)) {
+    // id column → Int32Array, score → Float32Array, rank → Int16Array, name → Utf8 (default)
+}
+```
+
+**Supported type hint strings:**
+
+| Hint String | Arrow DataType | Use Case |
+|-------------|---------------|----------|
+| `"i8"` / `"byte"` | `Int8` | Spark `ByteType` |
+| `"i16"` / `"short"` | `Int16` | Spark `ShortType` |
+| `"i32"` / `"int"` | `Int32` | Spark `IntegerType` |
+| `"i64"` / `"long"` | `Int64` | Default for tantivy integers |
+| `"u64"` | `UInt64` | Unsigned integers |
+| `"f32"` / `"float"` | `Float32` | Spark `FloatType` |
+| `"f64"` / `"double"` | `Float64` | Default for tantivy floats |
+| `"bool"` / `"boolean"` | `Boolean` | Boolean fields |
+| `"utf8"` / `"string"` | `Utf8` | String fields |
+| `"date"` / `"timestamp"` | `Timestamp(Microsecond)` | Date/timestamp fields |
+| `"binary"` / `"bytes"` | `Binary` | Binary fields |
+
+**Why companion splits don't need type hints:** Companion splits read from
+parquet files which preserve the original Arrow types from the write path.
+Type hints only affect the non-companion (tantivy doc store) streaming path.
+
+**Rust implementation:** `tantivy_schema_to_arrow()` in `streaming_doc_retrieval.rs`
+accepts an optional `HashMap<String, DataType>` which overrides the default
+tantivy→Arrow type mapping per field name. `build_arrow_column()` has dedicated
+builder branches for `Int32`, `Int16`, `Int8`, and `Float32` that narrow the
+internal `i64`/`f64` values during construction.
+
+### Document Limit (`maxDocs`)
+
+By default, `startStreamingRetrieval()` retrieves **all** matching documents.
+When the caller only needs a subset (e.g., Spark `LIMIT 100`), pass `maxDocs`
+to truncate the result set **before** any I/O work:
+
+```java
+// Without maxDocs: searches 10K matches → prefetches 10K store ranges → retrieves 10K docs
+try (var session = searcher.startStreamingRetrieval(queryJson, fields)) { ... }
+
+// With maxDocs=100: searches 10K matches → truncates to 100 → prefetches 100 ranges → retrieves 100 docs
+try (var session = searcher.startStreamingRetrieval(queryJson, fields, typeHints, 100)) { ... }
+```
+
+**Why this matters:** The bulk search (`DocIdCollector`) always finds all matches — it
+has no limit concept. Without `maxDocs`, the streaming pipeline prefetches store-file
+byte ranges and retrieves documents for the entire result set, even if the consumer
+stops reading after a few rows. For `LIMIT 100` on a 10K-row split, this wastes
+~99% of S3 requests.
+
+The truncation happens after `perform_bulk_search()` returns and before both:
+- `prefetch_store_ranges()` — range consolidation + S3 prefetch (non-companion)
+- `resolve_to_parquet_locations()` — fast-field resolution (companion)
+
+So both companion and non-companion paths benefit from the limit.
+
+**API overloads:**
+
+| Signature | maxDocs | typeHints |
+|-----------|---------|-----------|
+| `startStreamingRetrieval(query, fields...)` | unlimited | none |
+| `startStreamingRetrieval(query, fields, typeHints)` | unlimited | yes |
+| `startStreamingRetrieval(query, fields, typeHints, maxDocs)` | capped | yes |
+
+Pass `maxDocs = -1` for unlimited. Pass `typeHints = null` to use default Arrow types.
+
+### Store-File Range Prefetch (Non-Companion)
+
+Before the streaming producer starts retrieving documents, the pipeline runs the
+same range consolidation + prefetch that `docBatchProjected` uses. This prevents
+each `doc_async()` call from becoming a separate S3 request.
+
+```
+doc_ids → DocAddress[] → SimpleBatchOptimizer.consolidate_ranges()
+    → merge nearby .store byte ranges
+    → prefetch_ranges_with_cache() → bulk S3 GET → ByteRangeCache
+    → subsequent doc_async() calls hit cache
+```
+
+The prefetch runs synchronously before spawning the producer task (in
+`prefetch_store_ranges()`), so all cache entries are populated before
+any `doc_async()` call. This uses the same `SimpleBatchOptimizer` with
+`SimpleBatchConfig::default()` — the 50-doc optimization threshold applies.
+
 ### Java API — `StreamingSession` (AutoCloseable)
 
 `startStreamingRetrieval()` returns a `StreamingSession` wrapper that implements
@@ -251,6 +358,12 @@ try (SplitSearcher.StreamingSession session =
 // CompanionColumnarPartitionReader.scala
 class CompanionColumnarPartitionReader extends PartitionReader[ColumnarBatch] {
   private var session: SplitSearcher.StreamingSession = null
+
+  // Start session with type hints (for non-companion type narrowing) and limit
+  def open(searcher: SplitSearcher, queryJson: String,
+           fields: Array[String], typeHints: Array[String], limit: Int): Unit = {
+    session = searcher.startStreamingRetrieval(queryJson, fields, typeHints, limit)
+  }
 
   override def next(): Boolean = {
     val rows = session.nextBatch(arrayAddrs, schemaAddrs)
@@ -504,9 +617,10 @@ closed channel on its next `tx.send()` and stops gracefully.
 | Module | Tests | What's covered |
 |--------|-------|----------------|
 | `docid_collector` | 4 | Collector trait, batch collection, merge_fruits, scoring disabled |
+| `streaming_doc_retrieval` | 6 | Schema mapping, projection, type hints (Int32/Float32/Int16/Int8), batch conversion |
 | `streaming_ffi` | 6 | BatchAccumulator push/flush/empty, timestamp normalization, type mapping |
 | `read_strategy` | 7 | Selectivity thresholds, boundary values, coalesce scaling, flags |
-| **Rust Total** | **17** | All unit-testable logic |
+| **Rust Total** | **23** | All unit-testable logic |
 
 | Java Test Class | Tests | What's covered |
 |-----------------|-------|----------------|

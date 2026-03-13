@@ -215,9 +215,26 @@ async fn produce_batches(
         )
         .await?;
 
+        let file_duration_ms = t_file.elapsed().as_millis() as u64;
+
         perf_println!(
             "⏱️ STREAMING: file[{}] read {} rows in {} batches, took {}ms",
-            file_idx, num_rows_in_file, batches.len(), t_file.elapsed().as_millis()
+            file_idx, num_rows_in_file, batches.len(), file_duration_ms
+        );
+
+        // Record batch metrics per file for observability parity with docBatchProjected path
+        let file_stats = crate::batch_retrieval::simple::PrefetchStats {
+            ranges_fetched: batches.len().max(1),
+            bytes_fetched: 0, // TODO: plumb byte counts from parquet reader
+            duration_ms: file_duration_ms,
+            s3_requests: batches.len().max(1), // at least 1 request per file
+        };
+        crate::split_cache_manager::record_batch_metrics(
+            None,
+            num_rows_in_file,
+            &file_stats,
+            1, // one segment per parquet file
+            0,
         );
 
         // Feed batches through the accumulator → emit TARGET_BATCH_SIZE chunks
