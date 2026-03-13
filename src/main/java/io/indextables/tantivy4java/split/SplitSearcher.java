@@ -702,11 +702,54 @@ public class SplitSearcher implements AutoCloseable {
      * @throws IllegalStateException if searcher is closed or query is invalid
      */
     public StreamingSession startStreamingRetrieval(String queryAstJson, String... fields) {
+        return startStreamingRetrieval(queryAstJson, fields, null, -1);
+    }
+
+    /**
+     * Start a streaming retrieval session with explicit Arrow type hints.
+     *
+     * <p>Type hints allow the caller to specify narrower Arrow types for columns
+     * where tantivy's internal storage type (i64, f64) differs from the desired
+     * output type (e.g. Int32 for Spark IntegerType, Float32 for FloatType).
+     *
+     * <p>Type hints are passed as alternating pairs: [fieldName, arrowType, ...].
+     * Supported type strings: "i8", "i16", "i32", "i64", "u64", "f32", "f64",
+     * "bool", "utf8", "date", "binary".
+     *
+     * @param queryAstJson Quickwit query AST JSON string
+     * @param fields       field names to retrieve (null or empty for all fields)
+     * @param typeHints    alternating [fieldName, arrowType] pairs, or null for default types
+     * @return streaming session (implements AutoCloseable)
+     * @throws IllegalStateException if searcher is closed or query is invalid
+     */
+    public StreamingSession startStreamingRetrieval(String queryAstJson, String[] fields, String[] typeHints) {
+        return startStreamingRetrieval(queryAstJson, fields, typeHints, -1);
+    }
+
+    /**
+     * Start a streaming retrieval session with type hints and a document limit.
+     *
+     * <p>When {@code maxDocs > 0}, the native layer truncates the result set before
+     * prefetching store-file byte ranges and before the producer starts retrieving
+     * documents. This avoids unnecessary S3 requests when the caller only needs a
+     * subset of matching rows (e.g., Spark {@code LIMIT 100}).
+     *
+     * @param queryAstJson Quickwit query AST JSON string
+     * @param fields       field names to retrieve (null or empty for all fields)
+     * @param typeHints    alternating [fieldName, arrowType] pairs, or null for default types
+     * @param maxDocs      maximum documents to retrieve, or -1 for unlimited
+     * @return streaming session (implements AutoCloseable)
+     * @throws IllegalStateException if searcher is closed or query is invalid
+     */
+    public StreamingSession startStreamingRetrieval(String queryAstJson, String[] fields,
+                                                     String[] typeHints, int maxDocs) {
         if (nativePtr == 0) {
             throw new IllegalStateException("SplitSearcher has been closed or not properly initialized");
         }
         long session = nativeStartStreamingRetrieval(nativePtr, queryAstJson,
-                fields != null && fields.length > 0 ? fields : null);
+                fields != null && fields.length > 0 ? fields : null,
+                typeHints != null && typeHints.length > 0 ? typeHints : null,
+                maxDocs);
         if (session == 0) {
             throw new IllegalStateException(
                     "Failed to start streaming retrieval — query error or no stored fields");
@@ -1506,8 +1549,10 @@ public class SplitSearcher implements AutoCloseable {
     private static native int nativeDocBatchArrowFfi(long nativePtr, int[] segments, int[] docIds, String[] fields,
                                                      long[] arrayAddrs, long[] schemaAddrs);
 
-    // Streaming retrieval session (companion mode)
-    private static native long nativeStartStreamingRetrieval(long nativePtr, String queryAstJson, String[] fields);
+    // Streaming retrieval session
+    private static native long nativeStartStreamingRetrieval(long nativePtr, String queryAstJson,
+                                                              String[] fields, String[] typeHints,
+                                                              int maxDocs);
     private static native int nativeNextBatch(long sessionPtr, long[] arrayAddrs, long[] schemaAddrs);
     private static native void nativeCloseStreamingSession(long sessionPtr);
     private static native int nativeGetStreamingColumnCount(long sessionPtr);

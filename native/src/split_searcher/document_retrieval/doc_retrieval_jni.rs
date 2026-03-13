@@ -828,6 +828,77 @@ fn extract_jni_field_names(
     }
 }
 
+/// Parse type hint strings from a JNI String[] into a HashMap<String, DataType>.
+///
+/// Type hints are passed as alternating pairs: [fieldName, arrowType, fieldName, arrowType, ...].
+/// Supported type strings: "i8", "i16", "i32", "i64", "u64", "f32", "f64", "bool", "utf8",
+/// "date", "binary".
+///
+/// Returns None if the array is null or empty.
+fn parse_type_hints_from_env(
+    env: &mut JNIEnv,
+    type_hint_strs: jni::sys::jobjectArray,
+) -> anyhow::Result<Option<std::collections::HashMap<String, arrow_schema::DataType>>> {
+    if type_hint_strs.is_null() {
+        return Ok(None);
+    }
+    let hint_array = unsafe { jni::objects::JObjectArray::from_raw(type_hint_strs) };
+    let len = env.get_array_length(&hint_array)
+        .map_err(|e| anyhow::anyhow!("Failed to get type hints array length: {}", e))?;
+    if len == 0 || len % 2 != 0 {
+        return Ok(None);
+    }
+
+    let mut hints = std::collections::HashMap::new();
+    let mut i = 0;
+    while i < len {
+        let name_obj = env.get_object_array_element(&hint_array, i)
+            .map_err(|e| anyhow::anyhow!("Failed to get type hint name at {}: {}", i, e))?;
+        let type_obj = env.get_object_array_element(&hint_array, i + 1)
+            .map_err(|e| anyhow::anyhow!("Failed to get type hint type at {}: {}", i + 1, e))?;
+
+        if !name_obj.is_null() && !type_obj.is_null() {
+            let name: String = env.get_string((&name_obj).into())
+                .map_err(|e| anyhow::anyhow!("Failed to convert type hint name: {}", e))?
+                .into();
+            let type_str: String = env.get_string((&type_obj).into())
+                .map_err(|e| anyhow::anyhow!("Failed to convert type hint type: {}", e))?
+                .into();
+
+            if let Some(dt) = parse_arrow_type_string(&type_str) {
+                hints.insert(name, dt);
+            }
+        }
+        i += 2;
+    }
+
+    if hints.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(hints))
+    }
+}
+
+/// Parse an Arrow type string to a DataType.
+fn parse_arrow_type_string(s: &str) -> Option<arrow_schema::DataType> {
+    match s {
+        "i8" | "int8" | "byte" => Some(arrow_schema::DataType::Int8),
+        "i16" | "int16" | "short" => Some(arrow_schema::DataType::Int16),
+        "i32" | "int32" | "int" => Some(arrow_schema::DataType::Int32),
+        "i64" | "int64" | "long" => Some(arrow_schema::DataType::Int64),
+        "u64" | "uint64" => Some(arrow_schema::DataType::UInt64),
+        "f32" | "float32" | "float" => Some(arrow_schema::DataType::Float32),
+        "f64" | "float64" | "double" => Some(arrow_schema::DataType::Float64),
+        "bool" | "boolean" => Some(arrow_schema::DataType::Boolean),
+        "utf8" | "string" => Some(arrow_schema::DataType::Utf8),
+        "date" | "timestamp" => Some(arrow_schema::DataType::Timestamp(
+            arrow_schema::TimeUnit::Microsecond, None,
+        )),
+        "binary" | "bytes" => Some(arrow_schema::DataType::Binary),
+        _ => None,
+    }
+}
+
 /// Resolve doc addresses to parquet file groups via fast fields.
 ///
 /// This is the shared pipeline used by both nativeDocBatchProjected (TANT) and
@@ -1185,6 +1256,8 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_nati
     searcher_ptr: jlong,
     query_ast_json: jni::objects::JString,
     field_names: jni::sys::jobjectArray,
+    type_hint_strs: jni::sys::jobjectArray,
+    max_docs: jni::sys::jint,
 ) -> jlong {
     if searcher_ptr == 0 {
         to_java_exception(&mut env, &anyhow::anyhow!("Invalid searcher pointer"));
@@ -1208,6 +1281,9 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_nati
         // Extract field names
         let projected_fields = extract_jni_field_names(env, field_names);
 
+        // Parse type hints (alternating pairs: [fieldName, arrowType, ...])
+        let type_hints = parse_type_hints_from_env(env, type_hint_strs)?;
+
         let t_total = std::time::Instant::now();
         perf_println!(
             "⏱️ STREAMING_JNI: === nativeStartStreamingRetrieval START === companion={} fields={:?}",
@@ -1221,11 +1297,20 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_nati
             tokio::task::block_in_place(|| {
                 runtime.block_on(async {
                     // Phase 1: No-score search (works for both companion and regular splits)
-                    let doc_ids = crate::split_searcher::bulk_retrieval::perform_bulk_search(
+                    let mut doc_ids = crate::split_searcher::bulk_retrieval::perform_bulk_search(
                         ctx, &query_json,
                     ).await?;
 
                     perf_println!("⏱️ STREAMING_JNI: search found {} docs", doc_ids.len());
+
+                    // Apply maxDocs limit to avoid unnecessary S3 prefetch/retrieval
+                    if max_docs > 0 && (doc_ids.len() as i32) > max_docs {
+                        perf_println!(
+                            "⏱️ STREAMING_JNI: truncating {} docs to maxDocs={}",
+                            doc_ids.len(), max_docs
+                        );
+                        doc_ids.truncate(max_docs as usize);
+                    }
 
                     if has_manifest {
                         // === COMPANION PATH: parquet-based streaming ===
@@ -1272,8 +1357,8 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_nati
                     } else {
                         // === REGULAR PATH: tantivy doc store streaming ===
                         let session = crate::split_searcher::streaming_doc_retrieval::start_tantivy_streaming_retrieval(
-                            ctx, doc_ids, projected_fields,
-                        )?;
+                            ctx, doc_ids, projected_fields, type_hints,
+                        ).await?;
 
                         let handle = crate::utils::arc_to_jlong(std::sync::Arc::new(std::sync::Mutex::new(session)));
                         Ok(handle)

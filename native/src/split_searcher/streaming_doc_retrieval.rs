@@ -13,6 +13,7 @@
 //
 // Memory bound: same ~24MB peak as companion path (2 × batch in channel).
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -22,6 +23,7 @@ use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use tantivy::schema::{FieldEntry, FieldType, OwnedValue};
 use tokio::sync::mpsc;
 
+use crate::batch_retrieval::simple::{SimpleBatchConfig, SimpleBatchOptimizer};
 use crate::parquet_companion::streaming_ffi::StreamingRetrievalSession;
 use crate::perf_println;
 use super::types::CachedSearcherContext;
@@ -31,15 +33,21 @@ use super::types::CachedSearcherContext;
 const TANTIVY_BATCH_SIZE: usize = 4096;
 
 /// Max concurrent doc_async calls per batch.
-const DOC_ASYNC_CONCURRENCY: usize = 64;
+/// Matches BASE_CONCURRENT_REQUESTS used by docBatchProjected.
+const DOC_ASYNC_CONCURRENCY: usize = super::cache_config::BASE_CONCURRENT_REQUESTS;
 
 /// Build an Arrow schema from a Tantivy schema, optionally filtered by projected fields.
 ///
 /// Only includes stored fields (non-stored fields are not in the doc store).
 /// Returns the schema and a vec of (tantivy Field, arrow column index) for efficient lookup.
+///
+/// If `type_hints` is provided, it overrides the default tantivy→Arrow type mapping
+/// for specific fields. This is used when the caller knows the desired output types
+/// (e.g., Spark passes Int32 for IntegerType even though tantivy stores as i64).
 pub fn tantivy_schema_to_arrow(
     schema: &tantivy::schema::Schema,
     projected_fields: Option<&[String]>,
+    type_hints: Option<&HashMap<String, DataType>>,
 ) -> Result<(Arc<Schema>, Vec<(tantivy::schema::Field, String)>)> {
     let mut arrow_fields = Vec::new();
     let mut field_mapping = Vec::new();
@@ -59,7 +67,16 @@ pub fn tantivy_schema_to_arrow(
             continue;
         }
 
-        let arrow_type = tantivy_field_type_to_arrow(field_entry);
+        // Use type hint if available, otherwise derive from tantivy field type
+        let arrow_type = if let Some(hints) = type_hints {
+            if let Some(hint) = hints.get(&field_name) {
+                hint.clone()
+            } else {
+                tantivy_field_type_to_arrow(field_entry)
+            }
+        } else {
+            tantivy_field_type_to_arrow(field_entry)
+        };
         arrow_fields.push(Field::new(&field_name, arrow_type, true));
         field_mapping.push((field, field_name));
     }
@@ -92,14 +109,15 @@ fn tantivy_field_type_to_arrow(entry: &FieldEntry) -> DataType {
 /// Uses the same StreamingRetrievalSession infrastructure as companion mode.
 /// The producer retrieves documents from Tantivy's doc store in batches,
 /// converts them to Arrow RecordBatches, and streams through an mpsc channel.
-pub fn start_tantivy_streaming_retrieval(
+pub async fn start_tantivy_streaming_retrieval(
     ctx: &Arc<CachedSearcherContext>,
     doc_ids: Vec<(u32, u32)>,
     projected_fields: Option<Vec<String>>,
+    type_hints: Option<HashMap<String, DataType>>,
 ) -> Result<StreamingRetrievalSession> {
     let schema = ctx.cached_searcher.schema();
     let (arrow_schema, field_mapping) =
-        tantivy_schema_to_arrow(&schema, projected_fields.as_deref())?;
+        tantivy_schema_to_arrow(&schema, projected_fields.as_deref(), type_hints.as_ref())?;
 
     if doc_ids.is_empty() {
         // Empty session — same pattern as companion path
@@ -108,6 +126,13 @@ pub fn start_tantivy_streaming_retrieval(
     }
 
     let num_docs = doc_ids.len();
+
+    // ========================================================================
+    // Store-file range consolidation + prefetch (same as docBatchProjected)
+    // Done BEFORE spawning the producer so doc_async() hits the cache.
+    // ========================================================================
+    prefetch_store_ranges(ctx, &doc_ids).await;
+
     let (tx, rx) = mpsc::channel::<Result<RecordBatch>>(2);
 
     let searcher = ctx.cached_searcher.clone();
@@ -138,6 +163,80 @@ pub fn start_tantivy_streaming_retrieval(
     Ok(StreamingRetrievalSession::new(rx, arrow_schema, handle))
 }
 
+/// Prefetch consolidated byte ranges from the doc store file before streaming.
+///
+/// Same consolidation + prefetch logic as `docBatchProjected` in batch_doc_retrieval.rs.
+/// This ensures that subsequent `doc_async()` calls hit the ByteRangeCache instead of
+/// making individual S3 requests per document.
+async fn prefetch_store_ranges(
+    ctx: &CachedSearcherContext,
+    doc_ids: &[(u32, u32)],
+) {
+    let doc_addresses: Vec<tantivy::DocAddress> = doc_ids
+        .iter()
+        .map(|&(seg, doc)| tantivy::DocAddress::new(seg, doc))
+        .collect();
+
+    let optimizer = SimpleBatchOptimizer::new(SimpleBatchConfig::default());
+    if !optimizer.should_optimize(doc_addresses.len()) {
+        // Record baseline metric even when prefetch is skipped
+        let num_segments = ctx.cached_searcher.segment_readers().len();
+        let stats = crate::batch_retrieval::simple::PrefetchStats::empty();
+        crate::split_cache_manager::record_batch_metrics(None, doc_ids.len(), &stats, num_segments, 0);
+        return;
+    }
+
+    perf_println!(
+        "⏱️ TANTIVY_STREAMING: consolidating store ranges for {} docs",
+        doc_addresses.len()
+    );
+
+    let ranges = match optimizer.consolidate_ranges(&doc_addresses, &ctx.cached_searcher) {
+        Ok(r) => r,
+        Err(e) => {
+            perf_println!("⏱️ TANTIVY_STREAMING: range consolidation failed (continuing): {}", e);
+            return;
+        }
+    };
+
+    perf_println!(
+        "⏱️ TANTIVY_STREAMING: consolidated {} docs → {} ranges",
+        doc_addresses.len(),
+        ranges.len()
+    );
+
+    let prefetch_result = if let Some(cache) = ctx.byte_range_cache.as_ref() {
+        crate::batch_retrieval::simple::prefetch_ranges_with_cache(
+            ranges.clone(),
+            ctx.cached_storage.clone(),
+            &ctx.split_uri,
+            cache,
+            &ctx.bundle_file_offsets,
+        )
+        .await
+    } else {
+        optimizer
+            .prefetch_ranges(ranges.clone(), ctx.cached_storage.clone(), &ctx.split_uri)
+            .await
+    };
+
+    let num_segments = ctx.cached_searcher.segment_readers().len();
+    match prefetch_result {
+        Ok(stats) => {
+            perf_println!(
+                "⏱️ TANTIVY_STREAMING: prefetched {} ranges, {} bytes in {}ms",
+                stats.ranges_fetched, stats.bytes_fetched, stats.duration_ms
+            );
+            crate::split_cache_manager::record_batch_metrics(
+                None, doc_addresses.len(), &stats, num_segments, 0,
+            );
+        }
+        Err(e) => {
+            perf_println!("⏱️ TANTIVY_STREAMING: prefetch failed (continuing): {}", e);
+        }
+    }
+}
+
 /// Producer: retrieves Tantivy documents in batches, converts to RecordBatch,
 /// sends through channel.
 async fn produce_tantivy_batches(
@@ -162,7 +261,6 @@ async fn produce_tantivy_batches(
     let mut rows_emitted = 0usize;
     let mut batches_sent = 0usize;
 
-    // Process in chunks of TANTIVY_BATCH_SIZE
     for chunk in doc_ids.chunks(TANTIVY_BATCH_SIZE) {
         let t_batch = std::time::Instant::now();
 
@@ -225,7 +323,7 @@ async fn retrieve_docs_concurrent(
                 ));
             }
             let addr = tantivy::DocAddress::new(seg_ord, doc_id);
-            tokio::time::timeout(std::time::Duration::from_secs(10), s.doc_async(addr))
+            tokio::time::timeout(std::time::Duration::from_secs(5), s.doc_async(addr))
                 .await
                 .map_err(|_| anyhow::anyhow!("doc_async timed out for {:?}", addr))?
                 .map_err(|e| anyhow::anyhow!("doc_async failed for {:?}: {}", addr, e))
@@ -262,6 +360,9 @@ fn docs_to_record_batch(
 }
 
 /// Build a single Arrow column from the specified field across all documents.
+///
+/// When type hints specify a narrower type (e.g. Int32 instead of Int64),
+/// values are narrowed during construction — no extra cast pass needed.
 fn build_arrow_column(
     docs: &[tantivy::TantivyDocument],
     field: tantivy::schema::Field,
@@ -307,6 +408,39 @@ fn build_arrow_column(
             }
             Ok(Arc::new(builder.finish()))
         }
+        DataType::Int32 => {
+            let mut builder = Int32Builder::with_capacity(num_rows);
+            for doc in docs {
+                match find_first_value(doc, field) {
+                    Some(OwnedValue::I64(v)) => builder.append_value(v as i32),
+                    Some(OwnedValue::U64(v)) => builder.append_value(v as i32),
+                    _ => builder.append_null(),
+                }
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        DataType::Int16 => {
+            let mut builder = Int16Builder::with_capacity(num_rows);
+            for doc in docs {
+                match find_first_value(doc, field) {
+                    Some(OwnedValue::I64(v)) => builder.append_value(v as i16),
+                    Some(OwnedValue::U64(v)) => builder.append_value(v as i16),
+                    _ => builder.append_null(),
+                }
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        DataType::Int8 => {
+            let mut builder = Int8Builder::with_capacity(num_rows);
+            for doc in docs {
+                match find_first_value(doc, field) {
+                    Some(OwnedValue::I64(v)) => builder.append_value(v as i8),
+                    Some(OwnedValue::U64(v)) => builder.append_value(v as i8),
+                    _ => builder.append_null(),
+                }
+            }
+            Ok(Arc::new(builder.finish()))
+        }
         DataType::UInt64 => {
             let mut builder = UInt64Builder::with_capacity(num_rows);
             for doc in docs {
@@ -323,6 +457,16 @@ fn build_arrow_column(
             for doc in docs {
                 match find_first_value(doc, field) {
                     Some(OwnedValue::F64(v)) => builder.append_value(v),
+                    _ => builder.append_null(),
+                }
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        DataType::Float32 => {
+            let mut builder = Float32Builder::with_capacity(num_rows);
+            for doc in docs {
+                match find_first_value(doc, field) {
+                    Some(OwnedValue::F64(v)) => builder.append_value(v as f32),
                     _ => builder.append_null(),
                 }
             }
@@ -451,7 +595,7 @@ mod tests {
         sb.add_bool_field("active", STORED);
         let schema = sb.build();
 
-        let (arrow_schema, mapping) = tantivy_schema_to_arrow(&schema, None).unwrap();
+        let (arrow_schema, mapping) = tantivy_schema_to_arrow(&schema, None, None).unwrap();
         assert_eq!(arrow_schema.fields().len(), 4);
         assert_eq!(mapping.len(), 4);
 
@@ -478,7 +622,7 @@ mod tests {
 
         let fields = vec!["title".to_string(), "score".to_string()];
         let (arrow_schema, mapping) =
-            tantivy_schema_to_arrow(&schema, Some(&fields)).unwrap();
+            tantivy_schema_to_arrow(&schema, Some(&fields), None).unwrap();
         assert_eq!(arrow_schema.fields().len(), 2);
         assert_eq!(mapping.len(), 2);
         assert_eq!(arrow_schema.field(0).name(), "title");
@@ -492,7 +636,7 @@ mod tests {
         sb.add_text_field("body", TEXT);
         let schema = sb.build();
 
-        let result = tantivy_schema_to_arrow(&schema, None);
+        let result = tantivy_schema_to_arrow(&schema, None, None);
         assert!(result.is_err()); // No stored fields → error
     }
 
@@ -503,7 +647,7 @@ mod tests {
         let count_field = sb.add_i64_field("count", STORED | FAST);
         let schema = sb.build();
 
-        let (arrow_schema, field_mapping) = tantivy_schema_to_arrow(&schema, None).unwrap();
+        let (arrow_schema, field_mapping) = tantivy_schema_to_arrow(&schema, None, None).unwrap();
 
         let mut doc1 = tantivy::TantivyDocument::default();
         doc1.add_text(title_field, "hello");
@@ -534,5 +678,88 @@ mod tests {
             .unwrap();
         assert_eq!(count_col.value(0), 42);
         assert_eq!(count_col.value(1), 99);
+    }
+
+    #[test]
+    fn test_type_hints_narrow_int_and_float() {
+        let mut sb = SchemaBuilder::new();
+        let id_field = sb.add_i64_field("id", STORED | FAST);
+        let score_field = sb.add_f64_field("score", STORED);
+        let rank_field = sb.add_i64_field("rank", STORED);
+        let schema = sb.build();
+
+        // Request Int32 for "id", Float32 for "score", leave "rank" as default (Int64)
+        let mut hints = HashMap::new();
+        hints.insert("id".to_string(), DataType::Int32);
+        hints.insert("score".to_string(), DataType::Float32);
+
+        let (arrow_schema, field_mapping) =
+            tantivy_schema_to_arrow(&schema, None, Some(&hints)).unwrap();
+
+        assert_eq!(*arrow_schema.field(0).data_type(), DataType::Int32);   // narrowed
+        assert_eq!(*arrow_schema.field(1).data_type(), DataType::Float32); // narrowed
+        assert_eq!(*arrow_schema.field(2).data_type(), DataType::Int64);   // default
+
+        // Build docs and verify narrowed values
+        let mut doc1 = tantivy::TantivyDocument::default();
+        doc1.add_i64(id_field, 42);
+        doc1.add_f64(score_field, 3.14);
+        doc1.add_i64(rank_field, 100);
+
+        let docs = vec![doc1];
+        let batch = docs_to_record_batch(&docs, &arrow_schema, &field_mapping).unwrap();
+        assert_eq!(batch.num_rows(), 1);
+
+        // Verify Int32 column
+        let id_col = batch.column(0).as_any()
+            .downcast_ref::<arrow_array::Int32Array>()
+            .expect("id should be Int32Array");
+        assert_eq!(id_col.value(0), 42);
+
+        // Verify Float32 column
+        let score_col = batch.column(1).as_any()
+            .downcast_ref::<arrow_array::Float32Array>()
+            .expect("score should be Float32Array");
+        assert!((score_col.value(0) - 3.14f32).abs() < 0.001);
+
+        // Verify Int64 column (default, no hint)
+        let rank_col = batch.column(2).as_any()
+            .downcast_ref::<arrow_array::Int64Array>()
+            .expect("rank should be Int64Array");
+        assert_eq!(rank_col.value(0), 100);
+    }
+
+    #[test]
+    fn test_type_hints_int16_and_int8() {
+        let mut sb = SchemaBuilder::new();
+        let short_field = sb.add_i64_field("short_val", STORED);
+        let byte_field = sb.add_i64_field("byte_val", STORED);
+        let schema = sb.build();
+
+        let mut hints = HashMap::new();
+        hints.insert("short_val".to_string(), DataType::Int16);
+        hints.insert("byte_val".to_string(), DataType::Int8);
+
+        let (arrow_schema, field_mapping) =
+            tantivy_schema_to_arrow(&schema, None, Some(&hints)).unwrap();
+
+        assert_eq!(*arrow_schema.field(0).data_type(), DataType::Int16);
+        assert_eq!(*arrow_schema.field(1).data_type(), DataType::Int8);
+
+        let mut doc = tantivy::TantivyDocument::default();
+        doc.add_i64(short_field, 1000);
+        doc.add_i64(byte_field, 42);
+
+        let batch = docs_to_record_batch(&[doc], &arrow_schema, &field_mapping).unwrap();
+
+        let short_col = batch.column(0).as_any()
+            .downcast_ref::<arrow_array::Int16Array>()
+            .expect("should be Int16Array");
+        assert_eq!(short_col.value(0), 1000);
+
+        let byte_col = batch.column(1).as_any()
+            .downcast_ref::<arrow_array::Int8Array>()
+            .expect("should be Int8Array");
+        assert_eq!(byte_col.value(0), 42);
     }
 }
