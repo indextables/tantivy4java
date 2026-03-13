@@ -598,6 +598,36 @@ fn canonical_ip_string(ip: &std::net::Ipv6Addr) -> String {
     }
 }
 
+/// Convert serde_json::Value to OwnedValue (inverse of owned_value_to_json).
+fn json_value_to_owned(v: &serde_json::Value) -> OwnedValue {
+    match v {
+        serde_json::Value::Null => OwnedValue::Null,
+        serde_json::Value::Bool(b) => OwnedValue::Bool(*b),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                OwnedValue::I64(i)
+            } else if let Some(u) = n.as_u64() {
+                OwnedValue::U64(u)
+            } else if let Some(f) = n.as_f64() {
+                OwnedValue::F64(f)
+            } else {
+                OwnedValue::Null
+            }
+        }
+        serde_json::Value::String(s) => OwnedValue::Str(s.clone()),
+        serde_json::Value::Array(arr) => {
+            OwnedValue::Array(arr.iter().map(json_value_to_owned).collect())
+        }
+        serde_json::Value::Object(map) => {
+            OwnedValue::Object(
+                map.iter()
+                    .map(|(k, v)| (k.clone(), json_value_to_owned(v)))
+                    .collect(),
+            )
+        }
+    }
+}
+
 /// Convert OwnedValue to a JSON string for Object/Array types.
 fn owned_value_to_json_string(value: &OwnedValue) -> String {
     let json_value = owned_value_to_json(value);
@@ -728,6 +758,23 @@ fn build_list_from_owned_values(
                 for item in items {
                     all_elements.push(Some(item.clone()));
                 }
+                offsets.push(all_elements.len() as i32);
+                null_flags.push(true);
+            }
+            Some(OwnedValue::Str(s)) => {
+                // Try to parse as JSON array (e.g. "[90, 85, 92]")
+                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(s) {
+                    if let Some(arr) = parsed.as_array() {
+                        for elem in arr {
+                            all_elements.push(Some(json_value_to_owned(elem)));
+                        }
+                        offsets.push(all_elements.len() as i32);
+                        null_flags.push(true);
+                        continue;
+                    }
+                }
+                // Single scalar string — wrap as one-element list
+                all_elements.push(Some(OwnedValue::Str(s.clone())));
                 offsets.push(all_elements.len() as i32);
                 null_flags.push(true);
             }
@@ -1578,5 +1625,63 @@ mod tests {
         assert_eq!(keys.value(1), 20);
         assert_eq!(vals.value(0), "ten");
         assert_eq!(vals.value(1), "twenty");
+    }
+
+    /// Regression: string-serialized JSON integer array stored in a text field
+    /// should produce a valid Int32 ListArray with no nulls.
+    #[test]
+    fn test_list_from_json_string_int_array() {
+        let list_type = DataType::List(Arc::new(Field::new("item", DataType::Int32, true)));
+
+        // Simulate: text field value is a JSON-serialized integer array
+        let values: Vec<Option<OwnedValue>> = vec![
+            Some(OwnedValue::Str("[90, 85, 92]".to_string())),
+            Some(OwnedValue::Str("[78, 88, 95]".to_string())),
+        ];
+
+        let arr = owned_values_to_arrow(&values, &list_type).unwrap();
+        let list_arr = arr.as_any().downcast_ref::<ListArray>().unwrap();
+        assert_eq!(list_arr.len(), 2);
+        assert!(!list_arr.is_null(0));
+        assert!(!list_arr.is_null(1));
+
+        // First row: [90, 85, 92]
+        let row0 = list_arr.value(0);
+        let ints0 = row0.as_any().downcast_ref::<arrow_array::Int32Array>().unwrap();
+        assert_eq!(ints0.len(), 3);
+        assert!(!ints0.is_null(0));
+        assert!(!ints0.is_null(1));
+        assert!(!ints0.is_null(2));
+        assert_eq!(ints0.value(0), 90);
+        assert_eq!(ints0.value(1), 85);
+        assert_eq!(ints0.value(2), 92);
+
+        // Second row: [78, 88, 95]
+        let row1 = list_arr.value(1);
+        let ints1 = row1.as_any().downcast_ref::<arrow_array::Int32Array>().unwrap();
+        assert_eq!(ints1.len(), 3);
+        assert_eq!(ints1.value(0), 78);
+        assert_eq!(ints1.value(1), 88);
+        assert_eq!(ints1.value(2), 95);
+    }
+
+    /// Regression: JSON-serialized string array also parses correctly.
+    #[test]
+    fn test_list_from_json_string_str_array() {
+        let list_type = DataType::List(Arc::new(Field::new("item", DataType::Utf8, true)));
+
+        let values: Vec<Option<OwnedValue>> = vec![
+            Some(OwnedValue::Str(r#"["alpha", "beta"]"#.to_string())),
+        ];
+
+        let arr = owned_values_to_arrow(&values, &list_type).unwrap();
+        let list_arr = arr.as_any().downcast_ref::<ListArray>().unwrap();
+        assert_eq!(list_arr.len(), 1);
+
+        let row0 = list_arr.value(0);
+        let strs = row0.as_any().downcast_ref::<arrow_array::StringArray>().unwrap();
+        assert_eq!(strs.len(), 2);
+        assert_eq!(strs.value(0), "alpha");
+        assert_eq!(strs.value(1), "beta");
     }
 }
