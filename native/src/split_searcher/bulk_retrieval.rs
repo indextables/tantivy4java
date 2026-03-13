@@ -47,9 +47,19 @@ pub async fn perform_bulk_search(
 ) -> Result<Vec<(u32, u32)>> {
     let t0 = std::time::Instant::now();
 
-    // Parse QueryAst from JSON
-    let query_ast: QueryAst = serde_json::from_str(query_ast_json)
-        .with_context(|| format!("Failed to parse QueryAst JSON: {}", &query_ast_json[..query_ast_json.len().min(200)]))?;
+    // ========================================================================
+    // Query rewriting for companion splits (must happen before query building)
+    // ========================================================================
+    // The regular search() path rewrites queries for:
+    //   1. FieldPresence on hash-optimized fields → _phash_* fields
+    //   2. Term queries on exact_only fields → _phash_<field> hash lookups
+    // Without these rewrites, IS NOT NULL and exact_only EqualTo queries fail.
+    let effective_json = rewrite_companion_query(ctx, query_ast_json)?;
+    let effective_json_str = effective_json.as_deref().unwrap_or(query_ast_json);
+
+    // Parse QueryAst from (possibly rewritten) JSON
+    let query_ast: QueryAst = serde_json::from_str(effective_json_str)
+        .with_context(|| format!("Failed to parse QueryAst JSON: {}", &effective_json_str[..effective_json_str.len().min(200)]))?;
 
     // Get schema and tokenizer manager for query building
     let schema = ctx.cached_index.schema();
@@ -66,7 +76,9 @@ pub async fn perform_bulk_search(
         t0.elapsed().as_millis()
     );
 
-    // Warm up term dictionaries, posting lists, and fast fields for query fields.
+    // ========================================================================
+    // Warm up: term dictionaries, posting lists, fast fields
+    // ========================================================================
     // The HotDirectory only caches a subset of the split data; term, postings, and
     // fast files may not be in the hot cache. Tantivy's searcher.search() is synchronous
     // and will fail with "StorageDirectory only supports async reads" if it hits
@@ -74,8 +86,9 @@ pub async fn perform_bulk_search(
     // asynchronously, after which the synchronous search succeeds.
     let t_warmup = std::time::Instant::now();
 
-    // Extract only fields that need fast field access (range, field_presence/exists queries)
-    let fast_field_names = crate::parquet_companion::field_extraction::extract_range_query_fields(query_ast_json);
+    // Extract fields that need fast field access (range, field_presence/exists queries)
+    // from the REWRITTEN query (so _phash_* fields are included)
+    let fast_field_names = crate::parquet_companion::field_extraction::extract_range_query_fields(effective_json_str);
 
     let mut warmup_futures = Vec::new();
     for segment_reader in ctx.cached_searcher.segment_readers() {
@@ -102,13 +115,26 @@ pub async fn perform_bulk_search(
         );
     }
 
-    // Warm fast fields only for fields that need them (range, exists queries)
+    // Warm fast fields for fields that need them (range, exists, _phash_* queries)
     if !fast_field_names.is_empty() {
         let field_names: Vec<String> = fast_field_names.into_iter().collect();
         perf_println!("⏱️ BULK_SEARCH: warming fast fields for {:?}", field_names);
         let _ = ctx.warm_native_fast_fields_l1_for_fields(&field_names).await;
         perf_println!(
             "⏱️ BULK_SEARCH: warmup fast fields took {}ms",
+            t_warmup.elapsed().as_millis()
+        );
+    }
+
+    // For companion splits with an augmented directory, ensure parquet-sourced fast
+    // fields are transcoded and available. This mirrors what ensure_fast_fields_for_query()
+    // does in the regular search() path.
+    if ctx.augmented_directory.is_some() {
+        let _ = crate::split_searcher::async_impl::ensure_fast_fields_for_query(
+            ctx, effective_json_str, None,
+        ).await?;
+        perf_println!(
+            "⏱️ BULK_SEARCH: ensure_fast_fields took {}ms",
             t_warmup.elapsed().as_millis()
         );
     }
@@ -127,6 +153,53 @@ pub async fn perform_bulk_search(
     );
 
     Ok(doc_ids)
+}
+
+/// Apply companion-mode query rewrites (hash field presence + exact_only string indexing).
+///
+/// Returns `Ok(Some(rewritten))` if any rewrite was applied, `Ok(None)` if no changes needed.
+fn rewrite_companion_query(
+    ctx: &CachedSearcherContext,
+    query_json: &str,
+) -> Result<Option<String>> {
+    let manifest = match ctx.parquet_manifest.as_ref() {
+        Some(m) => m,
+        None => return Ok(None), // Not a companion split — no rewrites needed
+    };
+
+    let mut current = query_json.to_string();
+    let mut changed = false;
+
+    // Rewrite FieldPresence (exists/IS NOT NULL) queries on string hash fields
+    // to target _phash_* U64 fields instead of the original string field
+    if !manifest.string_hash_fields.is_empty() {
+        if let Some(rewritten) = crate::parquet_companion::hash_field_rewriter::rewrite_query_for_hash_fields(
+            &current,
+            &manifest.string_hash_fields,
+        ) {
+            perf_println!("⏱️ BULK_SEARCH: rewrote FieldPresence → hash field(s)");
+            current = rewritten;
+            changed = true;
+        }
+    }
+
+    // Rewrite term queries for exact_only / text_*_exactonly compact string indexing
+    // (converts field term queries to _phash_<field> hash lookups)
+    if !manifest.string_indexing_modes.is_empty() {
+        match crate::parquet_companion::hash_field_rewriter::rewrite_query_for_string_indexing(
+            &current,
+            &manifest.string_indexing_modes,
+        )? {
+            Some(rewritten) => {
+                perf_println!("⏱️ BULK_SEARCH: rewrote query for compact string indexing mode(s)");
+                current = rewritten;
+                changed = true;
+            }
+            None => {}
+        }
+    }
+
+    Ok(if changed { Some(current) } else { None })
 }
 
 /// Resolve doc addresses to parquet file groups entirely in Rust.

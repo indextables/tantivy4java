@@ -547,17 +547,12 @@ public class SplitSearcher implements AutoCloseable {
 
     /**
      * Fused companion-mode search + retrieval: executes a no-score search and returns
-     * matching rows as Arrow columnar data in a single JNI call.
+     * matching rows as Arrow columnar data.
      *
-     * <p>Optimized for companion splits where scores are not needed. Eliminates:
-     * <ul>
-     *   <li>BM25 scoring overhead (term frequencies not decompressed)</li>
-     *   <li>PartialHit protobuf allocation (no split_id strings, no sort values)</li>
-     *   <li>JNI round-trip of doc addresses (resolved entirely in native code)</li>
-     * </ul>
-     *
-     * <p>For small-to-medium result sets. For larger results (&gt; 50K rows),
-     * use the streaming retrieval API which bounds memory via batching.
+     * @deprecated Use {@link #startStreamingRetrieval(String, String...)} instead.
+     *             The streaming path has negligible overhead and is the single
+     *             companion retrieval path going forward. This method now delegates
+     *             to the streaming path internally.
      *
      * @param queryAstJson  Quickwit query AST JSON string
      * @param arrayAddrs    pre-allocated ArrowArray memory addresses (one per field)
@@ -565,15 +560,34 @@ public class SplitSearcher implements AutoCloseable {
      * @param fields        field names to retrieve (null or empty for all fields)
      * @return row count (&gt;0 = data, 0 = no matches, -1 = not a companion split)
      */
+    @Deprecated(forRemoval = true)
     public int searchAndRetrieveArrowFfi(String queryAstJson,
                                          long[] arrayAddrs, long[] schemaAddrs,
                                          String... fields) {
         if (nativePtr == 0) {
             throw new IllegalStateException("SplitSearcher has been closed or not properly initialized");
         }
-        return nativeSearchAndRetrieveArrowFfi(nativePtr, queryAstJson,
-                fields != null && fields.length > 0 ? fields : null,
-                arrayAddrs, schemaAddrs);
+
+        // Delegate to streaming path: start session → drain all batches → return total row count
+        StreamingSession session;
+        try {
+            session = startStreamingRetrieval(queryAstJson, fields);
+        } catch (IllegalStateException e) {
+            // Not a companion split or query error — return -1 for backward compatibility
+            return -1;
+        }
+
+        try {
+            int totalRows = 0;
+            while (true) {
+                int rows = session.nextBatch(arrayAddrs, schemaAddrs);
+                if (rows <= 0) break;
+                totalRows += rows;
+            }
+            return totalRows;
+        } finally {
+            session.close();
+        }
     }
 
     // =========================================================================
@@ -658,12 +672,14 @@ public class SplitSearcher implements AutoCloseable {
     }
 
     /**
-     * Start a streaming bulk retrieval session for companion mode.
+     * Start a streaming bulk retrieval session.
      *
-     * <p>Unlike {@link #searchAndRetrieveArrowFfi} which materializes all results
-     * in a single call, this starts a background producer that streams results in
-     * ~128K-row batches through a bounded channel. Memory usage is bounded to ~24MB
-     * regardless of total result size.
+     * <p>Works for both companion (parquet) and regular (tantivy doc store) splits.
+     * Companion splits stream from parquet files; regular splits stream from the
+     * tantivy document store.
+     *
+     * <p>Starts a background producer that streams results in batches through a
+     * bounded channel. Memory usage is bounded to ~24MB regardless of total result size.
      *
      * <p>Returns a {@link StreamingSession} that implements {@link AutoCloseable}
      * for safe resource management. Use with try-with-resources:
@@ -683,7 +699,7 @@ public class SplitSearcher implements AutoCloseable {
      * @param queryAstJson Quickwit query AST JSON string
      * @param fields       field names to retrieve (null or empty for all fields)
      * @return streaming session (implements AutoCloseable)
-     * @throws IllegalStateException if searcher is closed or not a companion split
+     * @throws IllegalStateException if searcher is closed or query is invalid
      */
     public StreamingSession startStreamingRetrieval(String queryAstJson, String... fields) {
         if (nativePtr == 0) {
@@ -693,7 +709,7 @@ public class SplitSearcher implements AutoCloseable {
                 fields != null && fields.length > 0 ? fields : null);
         if (session == 0) {
             throw new IllegalStateException(
-                    "Failed to start streaming retrieval — not a companion split or query error");
+                    "Failed to start streaming retrieval — query error or no stored fields");
         }
         return new StreamingSession(session);
     }
@@ -1490,11 +1506,7 @@ public class SplitSearcher implements AutoCloseable {
     private static native int nativeDocBatchArrowFfi(long nativePtr, int[] segments, int[] docIds, String[] fields,
                                                      long[] arrayAddrs, long[] schemaAddrs);
 
-    // Fused search + retrieve (companion mode optimization)
-    private static native int nativeSearchAndRetrieveArrowFfi(long nativePtr, String queryAstJson, String[] fields,
-                                                              long[] arrayAddrs, long[] schemaAddrs);
-
-    // Streaming retrieval session (companion mode, large result sets)
+    // Streaming retrieval session (companion mode)
     private static native long nativeStartStreamingRetrieval(long nativePtr, String queryAstJson, String[] fields);
     private static native int nativeNextBatch(long sessionPtr, long[] arrayAddrs, long[] schemaAddrs);
     private static native void nativeCloseStreamingSession(long sessionPtr);

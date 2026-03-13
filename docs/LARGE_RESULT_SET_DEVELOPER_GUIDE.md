@@ -1,20 +1,20 @@
 # Large Result Set Retrieval — Developer Guide
 
-Companion-mode bulk retrieval for returning thousands to millions of rows
-from parquet-backed Quickwit splits via Arrow FFI, with bounded memory.
+Bulk retrieval for returning thousands to millions of rows from Quickwit
+splits via Arrow FFI, with bounded memory.
 
 ## Overview
 
-Three retrieval tiers are available, selected by expected result size:
+Two retrieval tiers are available:
 
-| Tier | Result Size | API | Memory | Latency |
-|------|-------------|-----|--------|---------|
-| **Fused** | < 50K rows | `searchAndRetrieveArrowFfi()` | Proportional to results | Single call |
-| **Streaming** | > 50K rows | `startStreamingRetrieval()` / `nextBatch()` | ~24MB fixed | Pipelined |
+| Tier | Use Case | API | Memory | Latency |
+|------|----------|-----|--------|---------|
+| **Streaming** | Bulk unscored | `startStreamingRetrieval()` / `nextBatch()` | ~24MB fixed | Pipelined |
 | **Scored** | Top-K ranked | `search()` + `docBatchArrowFfi()` | Proportional to K | Two calls |
 
-All tiers are **companion-mode only** — they require a split with a parquet
-manifest. Non-companion splits return `-1` (fused) or throw (streaming).
+**Streaming works for all split types:**
+- **Companion splits** (with parquet manifest) stream from parquet files via columnar reads
+- **Regular splits** (tantivy doc store only) stream from the tantivy document store via `doc_async()`
 
 ---
 
@@ -23,21 +23,20 @@ manifest. Non-companion splits return `-1` (fused) or throw (streaming).
 ```
 Java caller
     │
-    ├─ Fused path ──────────────────────────────────────────────┐
-    │   searchAndRetrieveArrowFfi()                             │
-    │       → JNI: nativeSearchAndRetrieveArrowFfi              │
-    │           → search_and_retrieve_ffi()                     │
-    │               1. DocIdCollector search (no BM25)          │
-    │               2. Fast-field resolution (__pq columns)     │
-    │               3. batch_parquet_to_arrow_ffi()             │
-    │           ← row count via FFI addresses                   │
-    │                                                           │
-    ├─ Streaming path ──────────────────────────────────────────┤
+    ├─ Streaming path ──────────────────────────────────────────┐
     │   startStreamingRetrieval()                               │
     │       → JNI: nativeStartStreamingRetrieval                │
     │           1. DocIdCollector search (no BM25)              │
-    │           2. Fast-field resolution                        │
-    │           3. start_streaming_retrieval()                  │
+    │           ┌── companion split? ──────────────────────┐    │
+    │           │ YES: resolve → parquet streaming         │    │
+    │           │   2. Fast-field resolution to file+row   │    │
+    │           │   3. start_streaming_retrieval()         │    │
+    │           │      (columnar parquet reads)            │    │
+    │           ├──────────────────────────────────────────┤    │
+    │           │ NO:  tantivy doc store streaming         │    │
+    │           │   2. start_tantivy_streaming_retrieval() │    │
+    │           │      (row-oriented doc_async reads)      │    │
+    │           └──────────────────────────────────────────┘    │
     │               → spawns tokio producer task                │
     │               → returns session handle                   │
     │                                                           │
@@ -60,14 +59,14 @@ Java caller
 ```
 native/src/
 ├── split_searcher/
-│   ├── docid_collector.rs      # Stage 1: No-score tantivy Collector
-│   ├── bulk_retrieval.rs       # Stage 1: Search + fast-field resolution
-│   └── fused_retrieval.rs      # Stage 2: Single-call search+retrieve+FFI
+│   ├── docid_collector.rs          # Stage 1: No-score tantivy Collector
+│   ├── bulk_retrieval.rs           # Stage 1: Search + fast-field resolution
+│   └── streaming_doc_retrieval.rs  # Non-companion: tantivy doc store → Arrow
 │
 └── parquet_companion/
-    ├── streaming_ffi.rs        # Stage 3: Session-based streaming pipeline
-    ├── read_strategy.rs        # Stage 4: Adaptive I/O strategy
-    └── arrow_ffi_export.rs     # Shared: batch FFI export (pre-existing)
+    ├── streaming_ffi.rs            # Session type + companion streaming pipeline
+    ├── read_strategy.rs            # Adaptive I/O strategy (companion only)
+    └── arrow_ffi_export.rs         # Shared: batch FFI export (pre-existing)
 ```
 
 ---
@@ -106,7 +105,7 @@ decompresses term frequencies.
 
 ### Bulk Retrieval (`bulk_retrieval.rs`)
 
-Three public functions shared by both fused and streaming paths:
+Three public functions used by the streaming path:
 
 ```rust
 /// No-score search: QueryAst JSON → Vec<(segment_ord, doc_id)>
@@ -137,47 +136,7 @@ pub fn get_parquet_storage(
 
 ---
 
-## Stage 2: Fused Search + Retrieve
-
-### `fused_retrieval.rs`
-
-Single async function that combines all three phases:
-
-```rust
-pub async fn search_and_retrieve_ffi(
-    ctx: &Arc<CachedSearcherContext>,
-    query_ast_json: &str,
-    projected_fields: Option<&[String]>,
-    array_addrs: &[i64],        // Pre-allocated FFI_ArrowArray addresses
-    schema_addrs: &[i64],       // Pre-allocated FFI_ArrowSchema addresses
-) -> Result<usize>              // Returns row count
-```
-
-**Pipeline:**
-1. Guard: verify companion split (parquet manifest present)
-2. `perform_bulk_search()` → doc IDs
-3. `resolve_to_parquet_locations()` → file groups
-4. `batch_parquet_to_arrow_ffi()` → reads parquet, reorders rows, writes FFI
-
-**Eliminated overheads vs `search()` + `docBatchArrowFfi()`:**
-1. No BM25 scoring (term frequencies never decompressed)
-2. No PartialHit protobuf allocation (no split_id strings, no sort values)
-3. No JNI round-trip of doc addresses (resolved entirely in Rust)
-
-### Java API
-
-```java
-public int searchAndRetrieveArrowFfi(
-    String queryAstJson,
-    long[] arrayAddrs,
-    long[] schemaAddrs,
-    String... fields)
-// Returns: >0 = row count, 0 = no matches, -1 = not a companion split
-```
-
----
-
-## Stage 3: Streaming Pipeline
+## Stage 2: Streaming Pipeline
 
 ### Session Model (`streaming_ffi.rs`)
 
@@ -221,7 +180,7 @@ const TARGET_BATCH_SIZE: usize = 128 * 1024;  // 128K rows ≈ 12MB at ~100 byte
 
 1. Sort file groups by `file_idx` for deterministic output order
 2. For each file:
-   - Compute selectivity and select adaptive I/O strategy (see Stage 4)
+   - Compute selectivity and select adaptive I/O strategy (see Stage 3)
    - Read file's rows via `read_parquet_batches_for_file()`
    - Feed batches through `BatchAccumulator`
    - Rename columns (parquet → tantivy names)
@@ -291,21 +250,13 @@ try (SplitSearcher.StreamingSession session =
 ```scala
 // CompanionColumnarPartitionReader.scala
 class CompanionColumnarPartitionReader extends PartitionReader[ColumnarBatch] {
-  private val STREAMING_THRESHOLD = 50000
   private var session: SplitSearcher.StreamingSession = null
-  private var useStreaming: Boolean = false
 
   override def next(): Boolean = {
-    if (useStreaming) {
-      val rows = session.nextBatch(arrayAddrs, schemaAddrs)
-      if (rows == 0) return false
-      importBatchFromFfi(rows)
-      true
-    } else {
-      // Fused single-call path
-      val rows = searcher.searchAndRetrieveArrowFfi(query, arrayAddrs, schemaAddrs, fields: _*)
-      rows > 0
-    }
+    val rows = session.nextBatch(arrayAddrs, schemaAddrs)
+    if (rows == 0) return false
+    importBatchFromFfi(rows)
+    true
   }
 
   override def close(): Unit = {
@@ -316,7 +267,7 @@ class CompanionColumnarPartitionReader extends PartitionReader[ColumnarBatch] {
 
 ---
 
-## Stage 4: Adaptive I/O Strategy
+## Stage 3: Adaptive I/O Strategy
 
 ### ReadStrategy (`read_strategy.rs`)
 
@@ -431,7 +382,6 @@ the `TANTIVY4JAVA_DEBUG=1` environment variable:
 | Streaming channel | 2 × ~12MB | Duration of session |
 | Per-batch FFI export | ~12MB | Until Java imports batch |
 | **Peak (streaming)** | **~50MB** | **Regardless of total rows** |
-| **Peak (fused, 50K rows)** | **~20MB** | **Single call duration** |
 
 For comparison, materializing 2M rows × 100 bytes with the old path would
 require ~200MB of `PartialHit` protobufs plus ~200MB of document data.
@@ -530,7 +480,6 @@ nodes, returning only the field names that actually need fast field access.
 
 | Error | Cause | Recovery |
 |-------|-------|----------|
-| `searchAndRetrieveArrowFfi` returns `-1` | Not a companion split | Use standard search path |
 | `startStreamingRetrieval` throws `IllegalStateException` | Not companion, or query parse error | Check split type / query JSON |
 | `session.nextBatch()` returns `-1` | Parquet read failure, storage error | Check exception message, retry |
 | `session.nextBatch()` returns `0` | Normal end of stream | Stop polling |

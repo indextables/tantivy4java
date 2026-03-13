@@ -15,16 +15,14 @@ import java.util.*;
 import static org.junit.jupiter.api.Assertions.*;
 
 /**
- * Integration tests for the large result set retrieval APIs:
+ * Integration tests for the streaming companion-mode retrieval API:
+ * {@code startStreamingRetrieval()} / {@code nextBatch()} / {@code closeStreamingSession()}.
  *
- * <ul>
- *   <li><b>Fused path</b>: {@code searchAndRetrieveArrowFfi()} — single-call search + retrieval</li>
- *   <li><b>Streaming path</b>: {@code startStreamingRetrieval()} / {@code nextBatch()} /
- *       {@code closeStreamingSession()} — session-based streaming for large result sets</li>
- * </ul>
- *
- * These APIs bypass Quickwit's leaf_search, eliminate BM25 scoring, and resolve
+ * <p>These APIs bypass Quickwit's leaf_search, eliminate BM25 scoring, and resolve
  * doc-to-parquet locations entirely in Rust. Companion-mode only.
+ *
+ * <p>Some tests also exercise the deprecated {@code searchAndRetrieveArrowFfi()} wrapper
+ * which now delegates to the streaming path internally.
  */
 @TestMethodOrder(MethodOrderer.OrderAnnotation.class)
 public class LargeResultSetRetrievalTest {
@@ -192,199 +190,6 @@ public class LargeResultSetRetrievalTest {
                                         QuickwitSplit.SplitMetadata metadata) throws Exception {
         String splitUrl = "file://" + dir.resolve(splitName + ".split").toAbsolutePath();
         return cacheManager.createSplitSearcher(splitUrl, metadata, dir.toString());
-    }
-
-    // ====================================================================
-    // FUSED RETRIEVAL TESTS (searchAndRetrieveArrowFfi)
-    // ====================================================================
-
-    @Test
-    @Order(1)
-    @DisplayName("Fused: match-all query returns all rows")
-    void testFusedMatchAll(@TempDir Path dir) throws Exception {
-        int numRows = 50;
-        QuickwitSplit.SplitMetadata metadata = createSingleFileSplit(dir, "fused_all", numRows);
-
-        try (SplitSearcher searcher = openSearcher(dir, "fused_all", metadata)) {
-            String queryJson = new SplitMatchAllQuery().toQueryAstJson();
-            int numCols = ALL_COLS;
-            long[][] structs = allocateFfiStructs(numCols);
-            try {
-                int rowCount = searcher.searchAndRetrieveArrowFfi(
-                        queryJson, structs[0], structs[1]);
-                assertEquals(numRows, rowCount, "Should return all rows");
-
-                // Verify FFI structs are populated
-                for (int i = 0; i < numCols; i++) {
-                    assertEquals(numRows, readArrowArrayLength(structs[0][i]),
-                            "Column " + i + " should have " + numRows + " rows");
-                    assertNotEquals(0, readArrowArrayRelease(structs[0][i]),
-                            "Column " + i + " array should be initialized");
-                    assertNotEquals(0, readArrowSchemaRelease(structs[1][i]),
-                            "Column " + i + " schema should be initialized");
-                }
-            } finally {
-                freeFfiStructs(structs[0], structs[1]);
-            }
-        }
-    }
-
-    @Test
-    @Order(2)
-    @DisplayName("Fused: term query returns matching rows only")
-    void testFusedTermQuery(@TempDir Path dir) throws Exception {
-        int numRows = 50;
-        QuickwitSplit.SplitMetadata metadata = createSingleFileSplit(dir, "fused_term", numRows);
-
-        try (SplitSearcher searcher = openSearcher(dir, "fused_term", metadata)) {
-            // Query for a specific item by name
-            String queryJson = new SplitTermQuery("name", "item_10").toQueryAstJson();
-            int numCols = ALL_COLS;
-            long[][] structs = allocateFfiStructs(numCols);
-            try {
-                int rowCount = searcher.searchAndRetrieveArrowFfi(
-                        queryJson, structs[0], structs[1]);
-                assertEquals(1, rowCount, "Term query should match exactly 1 row");
-
-                // Verify the row data
-                Map<String, Integer> colMap = buildColumnMap(structs[1], numCols);
-                assertTrue(colMap.containsKey("id"), "Should have id column");
-                assertTrue(colMap.containsKey("name"), "Should have name column");
-
-                long idValue = readInt64(structs[0][colMap.get("id")], 0);
-                assertEquals(10L, idValue, "id should be 10");
-            } finally {
-                freeFfiStructs(structs[0], structs[1]);
-            }
-        }
-    }
-
-    @Test
-    @Order(3)
-    @DisplayName("Fused: projected fields returns subset of columns")
-    void testFusedProjectedFields(@TempDir Path dir) throws Exception {
-        int numRows = 30;
-        QuickwitSplit.SplitMetadata metadata = createSingleFileSplit(dir, "fused_proj", numRows);
-
-        try (SplitSearcher searcher = openSearcher(dir, "fused_proj", metadata)) {
-            String queryJson = new SplitMatchAllQuery().toQueryAstJson();
-            int numCols = 2; // only id and name
-            long[][] structs = allocateFfiStructs(numCols);
-            try {
-                int rowCount = searcher.searchAndRetrieveArrowFfi(
-                        queryJson, structs[0], structs[1], "id", "name");
-                assertEquals(numRows, rowCount);
-
-                Map<String, Integer> colMap = buildColumnMap(structs[1], numCols);
-                assertEquals(2, colMap.size(), "Should have exactly 2 projected columns");
-                assertTrue(colMap.containsKey("id"));
-                assertTrue(colMap.containsKey("name"));
-                assertFalse(colMap.containsKey("score"), "score should not be projected");
-                assertFalse(colMap.containsKey("active"), "active should not be projected");
-            } finally {
-                freeFfiStructs(structs[0], structs[1]);
-            }
-        }
-    }
-
-    @Test
-    @Order(4)
-    @DisplayName("Fused: no matches returns 0 rows")
-    void testFusedNoMatches(@TempDir Path dir) throws Exception {
-        QuickwitSplit.SplitMetadata metadata = createSingleFileSplit(dir, "fused_empty", 20);
-
-        try (SplitSearcher searcher = openSearcher(dir, "fused_empty", metadata)) {
-            String queryJson = new SplitTermQuery("name", "nonexistent_item_xyz").toQueryAstJson();
-            int numCols = ALL_COLS;
-            long[][] structs = allocateFfiStructs(numCols);
-            try {
-                int rowCount = searcher.searchAndRetrieveArrowFfi(
-                        queryJson, structs[0], structs[1]);
-                assertEquals(0, rowCount, "No matches should return 0");
-            } finally {
-                freeFfiStructs(structs[0], structs[1]);
-            }
-        }
-    }
-
-    @Test
-    @Order(5)
-    @DisplayName("Fused: multi-file split returns rows from all files")
-    void testFusedMultiFile(@TempDir Path dir) throws Exception {
-        int filesCount = 3;
-        int rowsPerFile = 20;
-        int totalRows = filesCount * rowsPerFile;
-        QuickwitSplit.SplitMetadata metadata = createMultiFileSplit(
-                dir, "fused_multi", filesCount, rowsPerFile);
-
-        try (SplitSearcher searcher = openSearcher(dir, "fused_multi", metadata)) {
-            String queryJson = new SplitMatchAllQuery().toQueryAstJson();
-            int numCols = ALL_COLS;
-            long[][] structs = allocateFfiStructs(numCols);
-            try {
-                int rowCount = searcher.searchAndRetrieveArrowFfi(
-                        queryJson, structs[0], structs[1]);
-                assertEquals(totalRows, rowCount, "Should return rows from all files");
-
-                // Verify column lengths
-                for (int i = 0; i < numCols; i++) {
-                    assertEquals(totalRows, readArrowArrayLength(structs[0][i]));
-                }
-            } finally {
-                freeFfiStructs(structs[0], structs[1]);
-            }
-        }
-    }
-
-    @Test
-    @Order(6)
-    @DisplayName("Fused: data values match docBatch retrieval")
-    void testFusedDataMatchesDocBatch(@TempDir Path dir) throws Exception {
-        int numRows = 25;
-        QuickwitSplit.SplitMetadata metadata = createSingleFileSplit(dir, "fused_compare", numRows);
-
-        try (SplitSearcher searcher = openSearcher(dir, "fused_compare", metadata)) {
-            // First: get results via existing search + docBatch path
-            SplitQuery query = searcher.parseQuery("*");
-            SearchResult results = searcher.search(query, numRows);
-            List<SearchResult.Hit> hits = results.getHits();
-
-            DocAddress[] docAddrs = new DocAddress[hits.size()];
-            for (int i = 0; i < hits.size(); i++) {
-                docAddrs[i] = hits.get(i).getDocAddress();
-            }
-            List<Document> batchDocs = searcher.docBatchProjected(docAddrs, "id", "name");
-
-            // Second: get same results via fused path
-            String queryJson = new SplitMatchAllQuery().toQueryAstJson();
-            int numCols = 2;
-            long[][] structs = allocateFfiStructs(numCols);
-            try {
-                int rowCount = searcher.searchAndRetrieveArrowFfi(
-                        queryJson, structs[0], structs[1], "id", "name");
-                assertEquals(batchDocs.size(), rowCount,
-                        "Fused row count should match docBatch count");
-
-                // Collect fused IDs
-                Map<String, Integer> colMap = buildColumnMap(structs[1], numCols);
-                int idCol = colMap.get("id");
-                Set<Long> fusedIds = new HashSet<>();
-                for (int r = 0; r < rowCount; r++) {
-                    fusedIds.add(readInt64(structs[0][idCol], r));
-                }
-
-                // Collect docBatch IDs
-                Set<Long> batchIds = new HashSet<>();
-                for (Document doc : batchDocs) {
-                    batchIds.add(((Number) doc.getFirst("id")).longValue());
-                }
-
-                assertEquals(batchIds, fusedIds,
-                        "Fused and docBatch should return the same document IDs");
-            } finally {
-                freeFfiStructs(structs[0], structs[1]);
-            }
-        }
     }
 
     // ====================================================================
@@ -583,34 +388,30 @@ public class LargeResultSetRetrievalTest {
 
     @Test
     @Order(15)
-    @DisplayName("Streaming: data matches fused retrieval")
-    void testStreamingMatchesFused(@TempDir Path dir) throws Exception {
+    @DisplayName("Streaming: data matches docBatch retrieval")
+    void testStreamingMatchesDocBatch(@TempDir Path dir) throws Exception {
         int numRows = 40;
-        QuickwitSplit.SplitMetadata metadata = createSingleFileSplit(dir, "stream_vs_fused", numRows);
+        QuickwitSplit.SplitMetadata metadata = createSingleFileSplit(dir, "stream_vs_batch", numRows);
 
-        try (SplitSearcher searcher = openSearcher(dir, "stream_vs_fused", metadata)) {
+        try (SplitSearcher searcher = openSearcher(dir, "stream_vs_batch", metadata)) {
             String queryJson = new SplitMatchAllQuery().toQueryAstJson();
-            String[] fields = {"id", "name"};
-            int numCols = fields.length;
 
-            // Fused path
-            long[][] fusedStructs = allocateFfiStructs(numCols);
-            Set<Long> fusedIds = new HashSet<>();
-            try {
-                int fusedRows = searcher.searchAndRetrieveArrowFfi(
-                        queryJson, fusedStructs[0], fusedStructs[1], fields);
-                Map<String, Integer> colMap = buildColumnMap(fusedStructs[1], numCols);
-                int idCol = colMap.get("id");
-                for (int r = 0; r < fusedRows; r++) {
-                    fusedIds.add(readInt64(fusedStructs[0][idCol], r));
-                }
-            } finally {
-                freeFfiStructs(fusedStructs[0], fusedStructs[1]);
+            // DocBatch path
+            SplitQuery query = searcher.parseQuery("*");
+            SearchResult results = searcher.search(query, numRows);
+            DocAddress[] docAddrs = new DocAddress[results.getHits().size()];
+            for (int i = 0; i < docAddrs.length; i++) {
+                docAddrs[i] = results.getHits().get(i).getDocAddress();
+            }
+            List<Document> batchDocs = searcher.docBatchProjected(docAddrs, "id");
+            Set<Long> batchIds = new HashSet<>();
+            for (Document doc : batchDocs) {
+                batchIds.add(((Number) doc.getFirst("id")).longValue());
             }
 
             // Streaming path
             Set<Long> streamIds = new HashSet<>();
-            SplitSearcher.StreamingSession session = searcher.startStreamingRetrieval(queryJson, fields);
+            SplitSearcher.StreamingSession session = searcher.startStreamingRetrieval(queryJson, "id");
             try {
                 int streamCols = session.getColumnCount();
                 while (true) {
@@ -618,10 +419,8 @@ public class LargeResultSetRetrievalTest {
                     try {
                         int rows = session.nextBatch(structs[0], structs[1]);
                         if (rows == 0) break;
-                        Map<String, Integer> colMap = buildColumnMap(structs[1], streamCols);
-                        int idCol = colMap.get("id");
                         for (int r = 0; r < rows; r++) {
-                            streamIds.add(readInt64(structs[0][idCol], r));
+                            streamIds.add(readInt64(structs[0][0], r));
                         }
                     } finally {
                         freeFfiStructs(structs[0], structs[1]);
@@ -631,8 +430,8 @@ public class LargeResultSetRetrievalTest {
                 session.close();
             }
 
-            assertEquals(fusedIds, streamIds,
-                    "Streaming and fused should return the same document IDs");
+            assertEquals(batchIds, streamIds,
+                    "Streaming and docBatch should return the same document IDs");
         }
     }
 
@@ -815,7 +614,7 @@ public class LargeResultSetRetrievalTest {
 
     @Test
     @Order(30)
-    @DisplayName("Cross-path: fused, streaming, and docBatch all return same data")
+    @DisplayName("Cross-path: streaming and docBatch return same data")
     void testAllPathsConsistent(@TempDir Path dir) throws Exception {
         int numRows = 35;
         QuickwitSplit.SplitMetadata metadata = createSingleFileSplit(dir, "cross_path", numRows);
@@ -836,20 +635,7 @@ public class LargeResultSetRetrievalTest {
                 docBatchIds.add(((Number) doc.getFirst("id")).longValue());
             }
 
-            // Path 2: fused
-            long[][] fusedStructs = allocateFfiStructs(1);
-            Set<Long> fusedIds = new HashSet<>();
-            try {
-                int fusedRows = searcher.searchAndRetrieveArrowFfi(
-                        queryJson, fusedStructs[0], fusedStructs[1], "id");
-                for (int r = 0; r < fusedRows; r++) {
-                    fusedIds.add(readInt64(fusedStructs[0][0], r));
-                }
-            } finally {
-                freeFfiStructs(fusedStructs[0], fusedStructs[1]);
-            }
-
-            // Path 3: streaming
+            // Path 2: streaming
             Set<Long> streamIds = new HashSet<>();
             SplitSearcher.StreamingSession session = searcher.startStreamingRetrieval(queryJson, "id");
             try {
@@ -870,39 +656,19 @@ public class LargeResultSetRetrievalTest {
                 session.close();
             }
 
-            // All three paths should return the same IDs
-            assertEquals(docBatchIds, fusedIds, "Fused IDs should match docBatch IDs");
             assertEquals(docBatchIds, streamIds, "Streaming IDs should match docBatch IDs");
         }
     }
 
     @Test
     @Order(31)
-    @DisplayName("Cross-path: partial query returns consistent results across all paths")
+    @DisplayName("Cross-path: partial query returns consistent results across streaming and docBatch")
     void testPartialQueryConsistency(@TempDir Path dir) throws Exception {
         int numRows = 50;
         QuickwitSplit.SplitMetadata metadata = createSingleFileSplit(dir, "cross_partial", numRows);
 
         try (SplitSearcher searcher = openSearcher(dir, "cross_partial", metadata)) {
-            // Query for items with id < 10 via parsed query
-            // nativeWriteTestParquet creates items with name "item_0", "item_1", etc.
-            // Use a term query for a specific item to ensure consistency
             String queryJson = new SplitTermQuery("name", "item_5").toQueryAstJson();
-
-            // Fused
-            long[][] fusedStructs = allocateFfiStructs(2);
-            long fusedId = -1;
-            String fusedName = null;
-            try {
-                int rows = searcher.searchAndRetrieveArrowFfi(
-                        queryJson, fusedStructs[0], fusedStructs[1], "id", "name");
-                assertEquals(1, rows);
-                Map<String, Integer> colMap = buildColumnMap(fusedStructs[1], 2);
-                fusedId = readInt64(fusedStructs[0][colMap.get("id")], 0);
-                fusedName = readUtf8(fusedStructs[0][colMap.get("name")], 0);
-            } finally {
-                freeFfiStructs(fusedStructs[0], fusedStructs[1]);
-            }
 
             // Streaming
             long streamId = -1;
@@ -924,10 +690,8 @@ public class LargeResultSetRetrievalTest {
                 session.close();
             }
 
-            assertEquals(fusedId, streamId, "Fused and streaming should return same id");
-            assertEquals(fusedName, streamName, "Fused and streaming should return same name");
-            assertEquals(5L, fusedId, "Should be id=5");
-            assertEquals("item_5", fusedName, "Should be item_5");
+            assertEquals(5L, streamId, "Should be id=5");
+            assertEquals("item_5", streamName, "Should be item_5");
         }
     }
 
@@ -1021,6 +785,7 @@ public class LargeResultSetRetrievalTest {
     @DisplayName("Error: fused with non-companion split returns -1")
     void testFusedNonCompanionSplit(@TempDir Path dir) throws Exception {
         // Create a regular (non-companion) Quickwit split from a Tantivy index
+        // Now that streaming works for non-companion splits, the deprecated wrapper should succeed
         try (SchemaBuilder builder = new SchemaBuilder()) {
             builder.addTextField("title", true, false, "default", "position");
             builder.addIntegerField("count", true, true, false);
@@ -1048,8 +813,8 @@ public class LargeResultSetRetrievalTest {
             try {
                 int rowCount = searcher.searchAndRetrieveArrowFfi(
                         queryJson, structs[0], structs[1], "title");
-                assertTrue(rowCount <= 0,
-                        "Non-companion split should return 0 or -1, got " + rowCount);
+                assertTrue(rowCount >= 1,
+                        "Non-companion split streaming should return rows, got " + rowCount);
             } finally {
                 freeFfiStructs(structs[0], structs[1]);
             }
@@ -1058,7 +823,7 @@ public class LargeResultSetRetrievalTest {
 
     @Test
     @Order(51)
-    @DisplayName("Error: streaming with non-companion split fails gracefully")
+    @DisplayName("Streaming with non-companion split works via tantivy doc store")
     void testStreamingNonCompanionSplit(@TempDir Path dir) throws Exception {
         try (SchemaBuilder builder = new SchemaBuilder()) {
             builder.addTextField("title", true, false, "default", "position");
@@ -1081,9 +846,17 @@ public class LargeResultSetRetrievalTest {
         String splitUrl = "file://" + dir.resolve("regular2.split").toAbsolutePath();
         try (SplitSearcher searcher = cacheManager.createSplitSearcher(splitUrl, metadata)) {
             String queryJson = new SplitMatchAllQuery().toQueryAstJson();
-            assertThrows(Exception.class, () -> {
-                searcher.startStreamingRetrieval(queryJson);
-            }, "Non-companion split should throw on streaming retrieval");
+            try (SplitSearcher.StreamingSession session = searcher.startStreamingRetrieval(queryJson)) {
+                int numCols = session.getColumnCount();
+                assertTrue(numCols >= 1, "Should have at least 1 column");
+                long[][] structs = allocateFfiStructs(numCols);
+                try {
+                    int rows = session.nextBatch(structs[0], structs[1]);
+                    assertTrue(rows >= 1, "Should retrieve at least 1 row from non-companion split");
+                } finally {
+                    freeFfiStructs(structs[0], structs[1]);
+                }
+            }
         }
     }
 
@@ -1659,7 +1432,7 @@ public class LargeResultSetRetrievalTest {
 
     @Test
     @Order(90)
-    @DisplayName("Cross-path: boolean and float values consistent across all paths")
+    @DisplayName("Cross-path: boolean and float values consistent via streaming")
     void testCrossPathAllTypes(@TempDir Path dir) throws Exception {
         int numRows = 20;
         QuickwitSplit.SplitMetadata metadata = createSingleFileSplit(dir, "cross_types", numRows);
@@ -1667,29 +1440,8 @@ public class LargeResultSetRetrievalTest {
         try (SplitSearcher searcher = openSearcher(dir, "cross_types", metadata)) {
             String queryJson = new SplitMatchAllQuery().toQueryAstJson();
             String[] fields = {"id", "score", "active"};
-            int numCols = fields.length;
 
-            // Fused path: collect all values
-            Map<Long, Double> fusedScores = new HashMap<>();
-            Map<Long, Boolean> fusedActive = new HashMap<>();
-            long[][] fusedStructs = allocateFfiStructs(numCols);
-            try {
-                int rowCount = searcher.searchAndRetrieveArrowFfi(
-                        queryJson, fusedStructs[0], fusedStructs[1], fields);
-                Map<String, Integer> colMap = buildColumnMap(fusedStructs[1], numCols);
-                int idCol = colMap.get("id");
-                int scoreCol = colMap.get("score");
-                int activeCol = colMap.get("active");
-                for (int r = 0; r < rowCount; r++) {
-                    long id = readInt64(fusedStructs[0][idCol], r);
-                    fusedScores.put(id, readFloat64(fusedStructs[0][scoreCol], r));
-                    fusedActive.put(id, readBoolean(fusedStructs[0][activeCol], r));
-                }
-            } finally {
-                freeFfiStructs(fusedStructs[0], fusedStructs[1]);
-            }
-
-            // Streaming path: collect same values
+            // Streaming path: collect all values
             Map<Long, Double> streamScores = new HashMap<>();
             Map<Long, Boolean> streamActive = new HashMap<>();
             SplitSearcher.StreamingSession session = searcher.startStreamingRetrieval(queryJson, fields);
@@ -1717,13 +1469,11 @@ public class LargeResultSetRetrievalTest {
                 session.close();
             }
 
-            // Compare
-            assertEquals(fusedScores.size(), streamScores.size());
-            for (Long id : fusedScores.keySet()) {
-                assertEquals(fusedScores.get(id), streamScores.get(id), 0.001,
-                        "Score mismatch for id=" + id);
-                assertEquals(fusedActive.get(id), streamActive.get(id),
-                        "Active mismatch for id=" + id);
+            // Verify we got all rows with valid values
+            assertEquals(numRows, streamScores.size(), "Should have all rows");
+            for (Long id : streamScores.keySet()) {
+                assertNotNull(streamScores.get(id), "Score should not be null for id=" + id);
+                assertNotNull(streamActive.get(id), "Active should not be null for id=" + id);
             }
         }
     }
@@ -1817,6 +1567,192 @@ public class LargeResultSetRetrievalTest {
                 assertEquals(totalRows, streamTotal);
             } finally {
                 session.close();
+            }
+        }
+    }
+
+    // ====================================================================
+    // STREAMING QUERY REWRITE REGRESSION TESTS
+    //
+    // These tests verify that perform_bulk_search() correctly rewrites
+    // queries for companion splits with string hash fields and exact_only
+    // string indexing modes. Without these rewrites, IS NOT NULL, IS NULL,
+    // and exact_only EqualTo queries return incorrect results.
+    //
+    // Bug: TANTIVY4JAVA_STREAMING_FAST_FIELD_BUG
+    // ====================================================================
+
+    /**
+     * Helper: create a companion split from the string-indexing test parquet,
+     * with the given tokenizer overrides and string hash optimization enabled.
+     */
+    private SplitSearcher createStringIndexingSplitSearcher(
+            Path dir, Map<String, String> tokenizerOverrides, String tag) throws Exception {
+        Path parquetFile = dir.resolve(tag + ".parquet");
+        Path splitFile = dir.resolve(tag + ".split");
+
+        QuickwitSplit.nativeWriteTestParquetForStringIndexing(
+                parquetFile.toString(), 15, 0);
+
+        ParquetCompanionConfig config = new ParquetCompanionConfig(dir.toString())
+                .withStringHashOptimization(true)
+                .withTokenizerOverrides(tokenizerOverrides);
+
+        QuickwitSplit.SplitMetadata metadata = QuickwitSplit.createFromParquet(
+                Collections.singletonList(parquetFile.toString()),
+                splitFile.toString(), config);
+
+        String splitUrl = "file://" + splitFile.toAbsolutePath();
+        return cacheManager.createSplitSearcher(splitUrl, metadata, dir.toString());
+    }
+
+    /** Drain a streaming session and return total row count. */
+    private int drainStreamingSession(SplitSearcher.StreamingSession session) {
+        int totalRows = 0;
+        int numCols = session.getColumnCount();
+        while (true) {
+            long[][] structs = allocateFfiStructs(numCols);
+            try {
+                int rows = session.nextBatch(structs[0], structs[1]);
+                if (rows <= 0) break;
+                totalRows += rows;
+            } finally {
+                freeFfiStructs(structs[0], structs[1]);
+            }
+        }
+        return totalRows;
+    }
+
+    @Test
+    @Order(100)
+    @DisplayName("Streaming: IS NOT NULL (FieldPresence) on companion split returns all rows")
+    void testStreamingFieldPresenceIsNotNull(@TempDir Path dir) throws Exception {
+        // Create companion split with string hash optimization (enables _phash_* fields)
+        Map<String, String> overrides = Collections.emptyMap();
+        try (SplitSearcher searcher = createStringIndexingSplitSearcher(dir, overrides, "fp_notnull")) {
+            // IS NOT NULL on trace_id — all 15 rows have this field
+            SplitExistsQuery existsQuery = new SplitExistsQuery("trace_id");
+            String queryJson = existsQuery.toQueryAstJson();
+
+            // Verify via regular search path (baseline)
+            SearchResult baseline = searcher.search(existsQuery, 100);
+            assertEquals(15, baseline.getHits().size(),
+                    "Baseline search should find all 15 rows for IS NOT NULL on trace_id");
+
+            // Verify via streaming path (the regression)
+            try (SplitSearcher.StreamingSession session = searcher.startStreamingRetrieval(queryJson)) {
+                int streamRows = drainStreamingSession(session);
+                assertEquals(15, streamRows,
+                        "Streaming IS NOT NULL should return 15 rows, same as baseline");
+            }
+        }
+    }
+
+    @Test
+    @Order(101)
+    @DisplayName("Streaming: IS NULL (negated FieldPresence) on companion split returns 0 rows")
+    void testStreamingFieldPresenceIsNull(@TempDir Path dir) throws Exception {
+        Map<String, String> overrides = Collections.emptyMap();
+        try (SplitSearcher searcher = createStringIndexingSplitSearcher(dir, overrides, "fp_null")) {
+            // IS NULL = match_all AND NOT exists(trace_id)
+            // When all rows have trace_id, IS NULL should return 0
+            SplitBooleanQuery isNullQuery = new SplitBooleanQuery()
+                    .addMust(new SplitMatchAllQuery())
+                    .addMustNot(new SplitExistsQuery("trace_id"));
+            String queryJson = isNullQuery.toQueryAstJson();
+
+            // Verify via regular search path (baseline)
+            SearchResult baseline = searcher.search(isNullQuery, 100);
+            assertEquals(0, baseline.getHits().size(),
+                    "Baseline IS NULL should return 0 rows when all docs have trace_id");
+
+            // Verify via streaming path (the regression)
+            try (SplitSearcher.StreamingSession session = searcher.startStreamingRetrieval(queryJson)) {
+                int streamRows = drainStreamingSession(session);
+                assertEquals(0, streamRows,
+                        "Streaming IS NULL should return 0 rows, same as baseline");
+            }
+        }
+    }
+
+    @Test
+    @Order(102)
+    @DisplayName("Streaming: exact_only term query finds matching document")
+    void testStreamingExactOnlyTermQuery(@TempDir Path dir) throws Exception {
+        Map<String, String> overrides = new HashMap<>();
+        overrides.put("trace_id", ParquetCompanionConfig.StringIndexingMode.EXACT_ONLY);
+
+        try (SplitSearcher searcher = createStringIndexingSplitSearcher(dir, overrides, "eo_stream")) {
+            // First, get a trace_id value from the data via regular search
+            SearchResult allDocs = searcher.search(new SplitMatchAllQuery(), 1);
+            assertEquals(1, allDocs.getHits().size());
+
+            String traceId;
+            try (Document doc = searcher.docProjected(allDocs.getHits().get(0).getDocAddress())) {
+                traceId = (String) doc.getFirst("trace_id");
+                assertNotNull(traceId, "trace_id should be retrievable from parquet");
+            }
+
+            // Build term query for this trace_id (will be rewritten to _phash_trace_id)
+            SplitTermQuery termQuery = new SplitTermQuery("trace_id", traceId);
+            String queryJson = termQuery.toQueryAstJson();
+
+            // Verify via regular search path (baseline)
+            SearchResult baseline = searcher.search(termQuery, 10);
+            assertEquals(1, baseline.getHits().size(),
+                    "Baseline exact_only term query should find exactly 1 doc");
+
+            // Verify via streaming path (the regression)
+            try (SplitSearcher.StreamingSession session = searcher.startStreamingRetrieval(queryJson)) {
+                int streamRows = drainStreamingSession(session);
+                assertEquals(1, streamRows,
+                        "Streaming exact_only term query should find 1 row, same as baseline");
+            }
+        }
+    }
+
+    @Test
+    @Order(103)
+    @DisplayName("Streaming: exact_only EqualTo for non-existent value returns 0")
+    void testStreamingExactOnlyNoMatch(@TempDir Path dir) throws Exception {
+        Map<String, String> overrides = new HashMap<>();
+        overrides.put("trace_id", ParquetCompanionConfig.StringIndexingMode.EXACT_ONLY);
+
+        try (SplitSearcher searcher = createStringIndexingSplitSearcher(dir, overrides, "eo_nomatch")) {
+            // Term query for a value that doesn't exist
+            SplitTermQuery termQuery = new SplitTermQuery("trace_id", "00000000-0000-0000-0000-000000000000");
+            String queryJson = termQuery.toQueryAstJson();
+
+            // Verify streaming returns 0
+            try (SplitSearcher.StreamingSession session = searcher.startStreamingRetrieval(queryJson)) {
+                int streamRows = drainStreamingSession(session);
+                assertEquals(0, streamRows,
+                        "Streaming exact_only term query for non-existent value should return 0");
+            }
+        }
+    }
+
+    @Test
+    @Order(104)
+    @DisplayName("Streaming vs search() consistency for IS NOT NULL on companion split")
+    void testStreamingVsSearchFieldPresenceConsistency(@TempDir Path dir) throws Exception {
+        // Test with a basic companion split (from createSingleFileSplit) to ensure
+        // field presence works on the standard test parquet columns too
+        QuickwitSplit.SplitMetadata metadata = createSingleFileSplit(dir, "fp_consist", 50);
+
+        try (SplitSearcher searcher = openSearcher(dir, "fp_consist", metadata)) {
+            // IS NOT NULL on "name" — all rows should have this column
+            SplitExistsQuery existsQuery = new SplitExistsQuery("name");
+            String queryJson = existsQuery.toQueryAstJson();
+
+            SearchResult baseline = searcher.search(existsQuery, 100);
+            int baselineCount = (int) baseline.getHits().size();
+            assertTrue(baselineCount > 0, "Baseline should find rows with name field");
+
+            try (SplitSearcher.StreamingSession session = searcher.startStreamingRetrieval(queryJson)) {
+                int streamRows = drainStreamingSession(session);
+                assertEquals(baselineCount, streamRows,
+                        "Streaming IS NOT NULL row count should match search() baseline");
             }
         }
     }

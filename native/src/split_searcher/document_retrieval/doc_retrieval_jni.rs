@@ -1167,111 +1167,6 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_nati
     }).unwrap_or(-1)
 }
 
-/// Fused companion-mode search + Arrow FFI retrieval in a single JNI call.
-///
-/// Combines DocIdCollector search (no BM25 scoring), fast-field resolution,
-/// parquet batch read, and Arrow FFI export into one operation. Eliminates:
-/// - BM25 term-frequency decompression
-/// - PartialHit protobuf allocation
-/// - JNI round-trip of doc addresses
-///
-/// Returns row count (>0 = data, 0 = no matches, -1 = not a companion split or error).
-#[no_mangle]
-pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_nativeSearchAndRetrieveArrowFfi(
-    mut env: JNIEnv,
-    _class: JClass,
-    searcher_ptr: jlong,
-    query_ast_json: jni::objects::JString,
-    field_names: jni::sys::jobjectArray,
-    array_addrs: jni::sys::jlongArray,
-    schema_addrs: jni::sys::jlongArray,
-) -> jint {
-    if searcher_ptr == 0 {
-        to_java_exception(&mut env, &anyhow::anyhow!("Invalid searcher pointer"));
-        return -1;
-    }
-
-    // Check if this split has a parquet manifest
-    let has_manifest = with_arc_safe(searcher_ptr, |ctx: &Arc<CachedSearcherContext>| {
-        ctx.parquet_manifest.is_some()
-    })
-    .unwrap_or(false);
-
-    if !has_manifest {
-        return -1;
-    }
-
-    use crate::utils::convert_throwable;
-    convert_throwable(&mut env, |env| {
-        // Extract query string from JNI
-        let query_json: String = env
-            .get_string(&query_ast_json)
-            .map_err(|e| anyhow::anyhow!("Failed to get query string: {}", e))?
-            .into();
-
-        // Extract field names
-        let projected_fields = extract_jni_field_names(env, field_names);
-
-        // Extract array_addrs and schema_addrs
-        let array_addrs_jni = unsafe { jni::objects::JLongArray::from_raw(array_addrs) };
-        let schema_addrs_jni = unsafe { jni::objects::JLongArray::from_raw(schema_addrs) };
-
-        let addrs_len = env.get_array_length(&array_addrs_jni)
-            .map_err(|e| anyhow::anyhow!("Failed to get array_addrs length: {}", e))? as usize;
-
-        let mut array_addrs_vec = vec![0i64; addrs_len];
-        env.get_long_array_region(&array_addrs_jni, 0, &mut array_addrs_vec)
-            .map_err(|e| anyhow::anyhow!("Failed to get array_addrs: {}", e))?;
-
-        let mut schema_addrs_vec = vec![0i64; addrs_len];
-        env.get_long_array_region(&schema_addrs_jni, 0, &mut schema_addrs_vec)
-            .map_err(|e| anyhow::anyhow!("Failed to get schema_addrs: {}", e))?;
-
-        let t_total = std::time::Instant::now();
-        perf_println!(
-            "⏱️ FUSED_JNI: === nativeSearchAndRetrieveArrowFfi START === {} columns, fields={:?}",
-            addrs_len, projected_fields
-        );
-
-        // Execute the fused pipeline (search + resolve + read + FFI export)
-        let result = with_arc_safe(searcher_ptr, |ctx: &Arc<CachedSearcherContext>| {
-            let runtime = crate::runtime_manager::QuickwitRuntimeManager::global().handle();
-            let _guard = runtime.enter();
-
-            tokio::task::block_in_place(|| {
-                runtime.block_on(async {
-                    crate::split_searcher::fused_retrieval::search_and_retrieve_ffi(
-                        ctx,
-                        &query_json,
-                        projected_fields.as_deref(),
-                        &array_addrs_vec,
-                        &schema_addrs_vec,
-                    )
-                    .await
-                })
-            })
-        });
-
-        match result {
-            Some(Ok(row_count)) => {
-                perf_println!(
-                    "⏱️ FUSED_JNI: === TOTAL took {}ms, {} rows ===",
-                    t_total.elapsed().as_millis(), row_count
-                );
-                Ok(row_count as jint)
-            }
-            Some(Err(e)) => {
-                perf_println!(
-                    "⏱️ FUSED_JNI: === FAILED after {}ms: {} ===",
-                    t_total.elapsed().as_millis(), e
-                );
-                Err(anyhow::anyhow!("Fused search+retrieve failed: {}", e))
-            }
-            None => Err(anyhow::anyhow!("Searcher context not found")),
-        }
-    }).unwrap_or(-1)
-}
-
 // =====================================================================
 // Streaming Retrieval Session JNI Methods
 // =====================================================================
@@ -1296,19 +1191,11 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_nati
         return 0;
     }
 
-    // Check if this split has a parquet manifest
+    // Check if this split has a parquet manifest (companion vs regular split)
     let has_manifest = with_arc_safe(searcher_ptr, |ctx: &Arc<CachedSearcherContext>| {
         ctx.parquet_manifest.is_some()
     })
     .unwrap_or(false);
-
-    if !has_manifest {
-        to_java_exception(
-            &mut env,
-            &anyhow::anyhow!("Streaming retrieval requires a companion split with parquet manifest"),
-        );
-        return 0;
-    }
 
     use crate::utils::convert_throwable;
     convert_throwable(&mut env, |env| {
@@ -1323,66 +1210,74 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_nati
 
         let t_total = std::time::Instant::now();
         perf_println!(
-            "⏱️ STREAMING_JNI: === nativeStartStreamingRetrieval START === fields={:?}",
-            projected_fields
+            "⏱️ STREAMING_JNI: === nativeStartStreamingRetrieval START === companion={} fields={:?}",
+            has_manifest, projected_fields
         );
 
-        // Phase 1: Bulk search → Phase 2: Resolve → Phase 3: Start streaming
         let result = with_arc_safe(searcher_ptr, |ctx: &Arc<CachedSearcherContext>| {
             let runtime = crate::runtime_manager::QuickwitRuntimeManager::global().handle();
             let _guard = runtime.enter();
 
             tokio::task::block_in_place(|| {
                 runtime.block_on(async {
-                    // Phase 1: No-score search
+                    // Phase 1: No-score search (works for both companion and regular splits)
                     let doc_ids = crate::split_searcher::bulk_retrieval::perform_bulk_search(
                         ctx, &query_json,
                     ).await?;
 
-                    if doc_ids.is_empty() {
-                        perf_println!("⏱️ STREAMING_JNI: no matches — returning empty session");
-                        // Return an empty session — next_batch will immediately return None
-                        let (_, rx) = tokio::sync::mpsc::channel::<anyhow::Result<arrow_array::RecordBatch>>(1);
-                        let manifest = ctx.parquet_manifest.as_ref().unwrap();
-                        let schema = crate::parquet_companion::streaming_ffi::build_tantivy_schema_pub(
-                            manifest, projected_fields.as_deref(),
-                        )?;
-                        let session = crate::parquet_companion::streaming_ffi::StreamingRetrievalSession::new_empty(
-                            rx, schema,
+                    perf_println!("⏱️ STREAMING_JNI: search found {} docs", doc_ids.len());
+
+                    if has_manifest {
+                        // === COMPANION PATH: parquet-based streaming ===
+                        if doc_ids.is_empty() {
+                            perf_println!("⏱️ STREAMING_JNI: no matches — returning empty session (companion)");
+                            let (_, rx) = tokio::sync::mpsc::channel::<anyhow::Result<arrow_array::RecordBatch>>(1);
+                            let manifest = ctx.parquet_manifest.as_ref().unwrap();
+                            let schema = crate::parquet_companion::streaming_ffi::build_tantivy_schema_pub(
+                                manifest, projected_fields.as_deref(),
+                            )?;
+                            let session = crate::parquet_companion::streaming_ffi::StreamingRetrievalSession::new_empty(
+                                rx, schema,
+                            );
+                            let handle = crate::utils::arc_to_jlong(std::sync::Arc::new(std::sync::Mutex::new(session)));
+                            return Ok::<jlong, anyhow::Error>(handle);
+                        }
+
+                        // Phase 2: Resolve to parquet locations
+                        let groups = crate::split_searcher::bulk_retrieval::resolve_to_parquet_locations(
+                            ctx, &doc_ids,
+                        ).await?;
+
+                        perf_println!(
+                            "⏱️ STREAMING_JNI: resolved to {} file groups (companion)",
+                            groups.len()
                         );
+
+                        // Phase 3: Start companion streaming producer
+                        let manifest = ctx.parquet_manifest.as_ref().unwrap().clone();
+                        let storage = crate::split_searcher::bulk_retrieval::get_parquet_storage(ctx)?;
+
+                        let session = crate::parquet_companion::streaming_ffi::start_streaming_retrieval(
+                            groups,
+                            projected_fields,
+                            manifest,
+                            storage,
+                            Some(ctx.parquet_metadata_cache.clone()),
+                            Some(ctx.parquet_byte_range_cache.clone()),
+                            ctx.parquet_coalesce_config,
+                        )?;
+
                         let handle = crate::utils::arc_to_jlong(std::sync::Arc::new(std::sync::Mutex::new(session)));
-                        return Ok::<jlong, anyhow::Error>(handle);
+                        Ok(handle)
+                    } else {
+                        // === REGULAR PATH: tantivy doc store streaming ===
+                        let session = crate::split_searcher::streaming_doc_retrieval::start_tantivy_streaming_retrieval(
+                            ctx, doc_ids, projected_fields,
+                        )?;
+
+                        let handle = crate::utils::arc_to_jlong(std::sync::Arc::new(std::sync::Mutex::new(session)));
+                        Ok(handle)
                     }
-
-                    let num_docs = doc_ids.len();
-                    perf_println!("⏱️ STREAMING_JNI: search found {} docs", num_docs);
-
-                    // Phase 2: Resolve to parquet locations
-                    let groups = crate::split_searcher::bulk_retrieval::resolve_to_parquet_locations(
-                        ctx, &doc_ids,
-                    ).await?;
-
-                    perf_println!(
-                        "⏱️ STREAMING_JNI: resolved to {} file groups",
-                        groups.len()
-                    );
-
-                    // Phase 3: Start streaming producer
-                    let manifest = ctx.parquet_manifest.as_ref().unwrap().clone();
-                    let storage = crate::split_searcher::bulk_retrieval::get_parquet_storage(ctx)?;
-
-                    let session = crate::parquet_companion::streaming_ffi::start_streaming_retrieval(
-                        groups,
-                        projected_fields,
-                        manifest,
-                        storage,
-                        Some(ctx.parquet_metadata_cache.clone()),
-                        Some(ctx.parquet_byte_range_cache.clone()),
-                        ctx.parquet_coalesce_config,
-                    )?;
-
-                    let handle = crate::utils::arc_to_jlong(std::sync::Arc::new(std::sync::Mutex::new(session)));
-                    Ok(handle)
                 })
             })
         });

@@ -10,7 +10,7 @@
 //
 // Memory bound: ~24MB peak (2 × 12MB batches in channel) regardless of total rows.
 //
-// For result sets < 50K rows, use the fused path (fused_retrieval.rs) instead.
+// This is the single companion retrieval path for all result sizes.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -44,6 +44,19 @@ pub struct StreamingRetrievalSession {
 }
 
 impl StreamingRetrievalSession {
+    /// Create a new streaming session with an active producer.
+    pub(crate) fn new(
+        receiver: mpsc::Receiver<Result<RecordBatch>>,
+        schema: Arc<Schema>,
+        producer_handle: tokio::task::JoinHandle<()>,
+    ) -> Self {
+        Self {
+            receiver,
+            schema,
+            _producer_handle: Some(producer_handle),
+        }
+    }
+
     /// Create an empty session for queries with no matches.
     /// The receiver channel is already closed (sender dropped), so blocking_next
     /// will immediately return None.
@@ -125,11 +138,7 @@ pub fn start_streaming_retrieval(
         }
     });
 
-    Ok(StreamingRetrievalSession {
-        receiver: rx,
-        schema: tantivy_schema,
-        _producer_handle: Some(handle),
-    })
+    Ok(StreamingRetrievalSession::new(rx, tantivy_schema, handle))
 }
 
 /// Producer: reads files sequentially, emits TARGET_BATCH_SIZE batches.

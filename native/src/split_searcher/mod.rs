@@ -19,7 +19,8 @@ pub mod async_impl;
 pub mod aggregation_arrow_ffi;
 pub mod docid_collector;
 pub mod bulk_retrieval;
-pub mod fused_retrieval;
+pub mod streaming_doc_retrieval;
+
 
 // Re-exports - items used by other modules in the crate
 pub(crate) use types::CachedSearcherContext;
