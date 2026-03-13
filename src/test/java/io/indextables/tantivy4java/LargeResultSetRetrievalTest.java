@@ -2021,4 +2021,88 @@ public class LargeResultSetRetrievalTest {
                     "Streaming with struct type hints should return same row count as search()");
         }
     }
+
+    /**
+     * Creates a split with an integer field "id" and a stored text field "scores"
+     * containing JSON-serialized integer arrays like "[90, 85, 92]".
+     * This replicates how Spark's ArrayType(IntegerType) is stored via the connector.
+     */
+    private SplitSearcher createIntArraySplit(Path dir, String tag, int numDocs) throws Exception {
+        try (SchemaBuilder builder = new SchemaBuilder()) {
+            builder.addIntegerField("id", true, true, false);
+            builder.addTextField("scores", true, false, "raw", "position");
+            try (Schema schema = builder.build();
+                 Index index = new Index(schema, dir.resolve("idx_" + tag).toString(), false);
+                 IndexWriter writer = index.writer(Index.Memory.DEFAULT_HEAP_SIZE, 1)) {
+                for (int i = 0; i < numDocs; i++) {
+                    try (Document doc = new Document()) {
+                        doc.addInteger("id", i);
+                        // Store integer array as JSON text, as the Spark connector does
+                        int a = 80 + (i * 3) % 20;
+                        int b = 85 + (i * 7) % 15;
+                        int c = 90 + (i * 11) % 10;
+                        doc.addText("scores", "[" + a + ", " + b + ", " + c + "]");
+                        writer.addDocument(doc);
+                    }
+                }
+                writer.commit();
+            }
+        }
+        QuickwitSplit.SplitConfig splitConfig = new QuickwitSplit.SplitConfig(
+                "intarr-idx", "intarr-src", "intarr-node");
+        QuickwitSplit.SplitMetadata metadata = QuickwitSplit.convertIndexFromPath(
+                dir.resolve("idx_" + tag).toString(),
+                dir.resolve(tag + ".split").toString(), splitConfig);
+
+        String splitUrl = "file://" + dir.resolve(tag + ".split").toAbsolutePath();
+        return cacheManager.createSplitSearcher(splitUrl, metadata);
+    }
+
+    @Test
+    @Order(120)
+    @DisplayName("Regression: ArrayType(IntegerType) — JSON int array in text field → List(Int32)")
+    void testIntArrayFromTextFieldListHint(@TempDir Path dir) throws Exception {
+        try (SplitSearcher searcher = createIntArraySplit(dir, "intarr_hint", 3)) {
+            String queryJson = new SplitMatchAllQuery().toQueryAstJson();
+
+            // Replicate the Spark connector type hint for ArrayType(IntegerType)
+            String[] typeHints = new String[] {
+                "id", "i32",
+                "scores", "{\"list\": \"i32\"}"
+            };
+
+            try (SplitSearcher.StreamingSession session = searcher.startStreamingRetrieval(
+                    queryJson, new String[]{"id", "scores"}, typeHints)) {
+                assertEquals(2, session.getColumnCount());
+
+                long[][] structs = allocateFfiStructs(2);
+                try {
+                    int rows = session.nextBatch(structs[0], structs[1]);
+                    assertEquals(3, rows, "Should retrieve all 3 rows");
+
+                    // Column 0: id (Int32) — format "i"
+                    String idFmt = readSchemaFormat(structs[1][0]);
+                    assertEquals("i", idFmt, "id column should be Int32 format 'i'");
+
+                    // Column 1: scores (List<Int32>) — format "+l"
+                    String scoresFmt = readSchemaFormat(structs[1][1]);
+                    assertEquals("+l", scoresFmt,
+                            "scores column should have Arrow list format (+l), got: " + scoresFmt);
+
+                    // Verify child array format is Int32 ("i")
+                    // ArrowSchema.children[0] is at offset 40 (n_children=32, children=40)
+                    long schemaPtr = structs[1][1];
+                    long nChildren = unsafe.getLong(schemaPtr + 32);
+                    assertTrue(nChildren > 0, "List schema should have child");
+                    long childrenPtr = unsafe.getLong(schemaPtr + 40);
+                    long childSchemaPtr = unsafe.getLong(childrenPtr);
+                    String childFmt = readSchemaFormat(childSchemaPtr);
+                    assertEquals("i", childFmt,
+                            "List child should be Int32 format 'i', got: " + childFmt);
+                } finally {
+                    freeFfiStructs(structs[0], structs[1]);
+                }
+            }
+        }
+    }
 }

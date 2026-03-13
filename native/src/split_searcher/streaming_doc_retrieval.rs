@@ -539,10 +539,25 @@ fn build_arrow_column(
                     if all.is_empty() {
                         None
                     } else if all.len() == 1 {
-                        // Single value: if it's already an Array, use it directly
-                        match &all[0] {
-                            OwnedValue::Array(_) => Some(all.into_iter().next().unwrap()),
-                            _ => Some(OwnedValue::Array(all)),
+                        // Single value: if it's already an Array, use it directly.
+                        // If it's a Str, try JSON parse — the connector may serialize
+                        // arrays as JSON text (e.g. "[90, 85, 92]").
+                        match all.into_iter().next().unwrap() {
+                            v @ OwnedValue::Array(_) => Some(v),
+                            OwnedValue::Str(s) => {
+                                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&s) {
+                                    if let Some(arr) = parsed.as_array() {
+                                        Some(OwnedValue::Array(
+                                            arr.iter().map(json_value_to_owned).collect(),
+                                        ))
+                                    } else {
+                                        Some(OwnedValue::Array(vec![OwnedValue::Str(s)]))
+                                    }
+                                } else {
+                                    Some(OwnedValue::Array(vec![OwnedValue::Str(s)]))
+                                }
+                            }
+                            other => Some(OwnedValue::Array(vec![other])),
                         }
                     } else {
                         Some(OwnedValue::Array(all))
@@ -1683,5 +1698,48 @@ mod tests {
         assert_eq!(strs.len(), 2);
         assert_eq!(strs.value(0), "alpha");
         assert_eq!(strs.value(1), "beta");
+    }
+
+    /// End-to-end regression: text field storing "[90, 85, 92]" with List(Int32)
+    /// type hint, going through the full docs_to_record_batch → build_arrow_column
+    /// → find_all_values → JSON parse path.
+    #[test]
+    fn test_e2e_text_field_json_int_array_to_list_i32() {
+        let mut sb = SchemaBuilder::new();
+        let text_opts = tantivy::schema::TextOptions::default().set_stored();
+        let scores_field = sb.add_text_field("scores", text_opts);
+        let schema = sb.build();
+
+        let mut hints = HashMap::new();
+        hints.insert(
+            "scores".to_string(),
+            DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+        );
+
+        let (arrow_schema, field_mapping) =
+            tantivy_schema_to_arrow(&schema, None, Some(&hints)).unwrap();
+
+        // Store a JSON-serialized integer array as a single text field value
+        let mut doc = tantivy::TantivyDocument::default();
+        doc.add_text(scores_field, "[90, 85, 92]");
+
+        let batch = docs_to_record_batch(&[doc], &arrow_schema, &field_mapping).unwrap();
+        let list_col = batch.column(0).as_any()
+            .downcast_ref::<ListArray>()
+            .expect("should be ListArray");
+
+        assert!(!list_col.is_null(0));
+        let row0 = list_col.value(0);
+        let ints = row0.as_any()
+            .downcast_ref::<arrow_array::Int32Array>()
+            .expect("child should be Int32Array");
+
+        assert_eq!(ints.len(), 3, "should have 3 elements from [90, 85, 92]");
+        assert!(!ints.is_null(0), "element 0 should not be null");
+        assert!(!ints.is_null(1), "element 1 should not be null");
+        assert!(!ints.is_null(2), "element 2 should not be null");
+        assert_eq!(ints.value(0), 90);
+        assert_eq!(ints.value(1), 85);
+        assert_eq!(ints.value(2), 92);
     }
 }
