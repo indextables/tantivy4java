@@ -1808,7 +1808,7 @@ public class LargeResultSetRetrievalTest {
 
             // Type hint: data field should be Arrow Struct with name (string) and age (i32)
             String[] typeHints = new String[] {
-                "data", "{\"struct\": {\"name\": \"string\", \"age\": \"i32\"}}"
+                "data", "{\"struct\": [[\"name\", \"string\"], [\"age\", \"i32\"]]}"
             };
 
             try (SplitSearcher.StreamingSession session = searcher.startStreamingRetrieval(
@@ -1911,7 +1911,7 @@ public class LargeResultSetRetrievalTest {
 
             // Type hint: struct with name (string) and tags (list of strings)
             String[] typeHints = new String[] {
-                "data", "{\"struct\": {\"name\": \"string\", \"tags\": {\"list\": \"string\"}}}"
+                "data", "{\"struct\": [[\"name\", \"string\"], [\"tags\", {\"list\": \"string\"}]]}"
             };
 
             try (SplitSearcher.StreamingSession session = searcher.startStreamingRetrieval(
@@ -1951,7 +1951,7 @@ public class LargeResultSetRetrievalTest {
             // Mixed: title as utf8 (scalar), data as struct (complex)
             String[] typeHints = new String[] {
                 "title", "utf8",
-                "data", "{\"struct\": {\"name\": \"string\", \"age\": \"i32\"}}"
+                "data", "{\"struct\": [[\"name\", \"string\"], [\"age\", \"i32\"]]}"
             };
 
             try (SplitSearcher.StreamingSession session = searcher.startStreamingRetrieval(
@@ -1995,7 +1995,7 @@ public class LargeResultSetRetrievalTest {
             String queryJson = new SplitMatchAllQuery().toQueryAstJson();
 
             String[] typeHints = new String[] {
-                "data", "{\"struct\": {\"name\": \"string\", \"age\": \"i32\"}}"
+                "data", "{\"struct\": [[\"name\", \"string\"], [\"age\", \"i32\"]]}"
             };
 
             // Count total rows from streaming with struct type hint

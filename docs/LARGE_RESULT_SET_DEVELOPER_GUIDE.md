@@ -261,9 +261,9 @@ a `StructType` column but receives a `Utf8` column.
 The JSON type hint format mirrors the structure of the desired Arrow type:
 
 ```java
-// Struct type hint — JSON object with field names → scalar types
+// Struct type hint — array-of-pairs preserves field ordering
 String[] typeHints = new String[] {
-    "metadata", "{\"struct\": {\"name\": \"string\", \"age\": \"i32\"}}",
+    "metadata", "{\"struct\": [[\"name\", \"string\"], [\"age\", \"i32\"]]}",
 };
 
 // List type hint — JSON object with element type
@@ -278,7 +278,7 @@ String[] typeHints = new String[] {
 
 // Nested complex types — struct containing a list
 String[] typeHints = new String[] {
-    "user", "{\"struct\": {\"name\": \"string\", \"scores\": {\"list\": \"i64\"}}}",
+    "user", "{\"struct\": [[\"name\", \"string\"], [\"scores\", {\"list\": \"i64\"}]]}",
 };
 ```
 
@@ -286,10 +286,15 @@ String[] typeHints = new String[] {
 
 | JSON Format | Arrow DataType | Example |
 |-------------|---------------|---------|
-| `{"struct": {"f1": "t1", ...}}` | `Struct([Field("f1", t1), ...])` | `{"struct": {"name": "string", "age": "i32"}}` |
+| `{"struct": [["f1", "t1"], ...]}` | `Struct([Field("f1", t1), ...])` | `{"struct": [["name", "string"], ["age", "i32"]]}` |
 | `{"list": "type"}` | `List(type)` | `{"list": "string"}` |
-| `{"list": {"struct": {...}}}` | `List(Struct(...))` | `{"list": {"struct": {"x": "f64"}}}` |
+| `{"list": {"struct": [...]}}` | `List(Struct(...))` | `{"list": {"struct": [["x", "f64"]]}}` |
 | `{"map": ["keyType", "valType"]}` | `Map(keyType, valType)` | `{"map": ["string", "i64"]}` |
+
+**Why array-of-pairs for struct?** JSON objects are unordered by spec.
+Spark reads struct children by ordinal position matching the `StructType`
+field order. Using `[["name", "type"], ...]` guarantees the field order
+matches what Spark expects.
 
 **How it works:** When `parse_arrow_type_string()` sees a type hint starting
 with `{`, it delegates to `parse_complex_type_json()` which recursively builds
@@ -316,7 +321,7 @@ val schema = StructType(Seq(
 // Type hints tell native layer to produce Arrow Struct instead of Utf8
 val typeHints = Array(
   "id", "i32",
-  "metadata", """{"struct": {"name": "string", "age": "i32"}}"""
+  "metadata", """{"struct": [["name", "string"], ["age", "i32"]]}"""
 )
 
 val session = searcher.startStreamingRetrieval(queryJson, fields, typeHints)

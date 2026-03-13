@@ -926,6 +926,19 @@ fn parse_arrow_type_string(s: &str) -> Option<arrow_schema::DataType> {
 ///
 /// Types can be nested arbitrarily:
 /// `{"struct": {"tags": {"list": "string"}, "coords": {"struct": {"x": "f64", "y": "f64"}}}}`
+/// Parse a JSON value into an Arrow DataType, supporting recursive complex types.
+///
+/// String values are parsed as scalar types. Object values describe complex types:
+/// - `{"struct": [["field1", <type>], ["field2", <type>], ...]}` → Struct (order-preserving)
+/// - `{"list": <element_type>}` → List
+/// - `{"map": [<key_type>, <value_type>]}` → Map
+///
+/// Struct fields use an array-of-pairs format to guarantee ordering. JSON objects
+/// are unordered by spec, and serde_json uses BTreeMap (alphabetical sort). Spark
+/// reads struct children by ordinal position, so ordering must be preserved.
+///
+/// Types can be nested arbitrarily:
+/// `{"struct": [["tags", {"list": "string"}], ["name", "string"]]}`
 fn parse_complex_type_json(v: &serde_json::Value) -> Option<arrow_schema::DataType> {
     use arrow_schema::{DataType, Field};
     use std::sync::Arc;
@@ -934,16 +947,22 @@ fn parse_complex_type_json(v: &serde_json::Value) -> Option<arrow_schema::DataTy
         serde_json::Value::String(s) => parse_arrow_type_string(s),
         serde_json::Value::Object(map) => {
             if let Some(fields_val) = map.get("struct") {
-                // Struct: {"struct": {"name": "string", "age": "i32"}}
-                let fields_obj = fields_val.as_object()?;
-                let mut fields = Vec::with_capacity(fields_obj.len());
-                for (name, type_val) in fields_obj {
-                    let dt = parse_complex_type_json(type_val)?;
+                // Struct: {"struct": [["name", "string"], ["age", "i32"]]}
+                // Array-of-pairs format guarantees field ordering.
+                let fields_arr = fields_val.as_array()?;
+                let mut fields = Vec::with_capacity(fields_arr.len());
+                for pair in fields_arr {
+                    let pair_arr = pair.as_array()?;
+                    if pair_arr.len() != 2 {
+                        return None;
+                    }
+                    let name = pair_arr[0].as_str()?;
+                    let dt = parse_complex_type_json(&pair_arr[1])?;
                     fields.push(Arc::new(Field::new(name, dt, true)));
                 }
                 Some(DataType::Struct(fields.into()))
             } else if let Some(elem_val) = map.get("list") {
-                // List: {"list": "string"} or {"list": {"struct": {...}}}
+                // List: {"list": "string"} or {"list": {"struct": [...]}}
                 let elem_type = parse_complex_type_json(elem_val)?;
                 Some(DataType::List(Arc::new(Field::new("item", elem_type, true))))
             } else if let Some(kv_val) = map.get("map") {
@@ -1597,16 +1616,15 @@ mod tests {
 
     #[test]
     fn test_parse_struct_type_hint() {
-        let json = r#"{"struct": {"name": "string", "age": "i64"}}"#;
+        let json = r#"{"struct": [["name", "string"], ["age", "i64"]]}"#;
         let dt = parse_arrow_type_string(json).unwrap();
         match &dt {
             DataType::Struct(fields) => {
                 assert_eq!(fields.len(), 2);
-                // Fields may be in any order since JSON object iteration order varies
-                let has_name = fields.iter().any(|f| f.name() == "name" && *f.data_type() == DataType::Utf8);
-                let has_age = fields.iter().any(|f| f.name() == "age" && *f.data_type() == DataType::Int64);
-                assert!(has_name, "should have name:string field");
-                assert!(has_age, "should have age:i64 field");
+                assert_eq!(fields[0].name(), "name");
+                assert_eq!(*fields[0].data_type(), DataType::Utf8);
+                assert_eq!(fields[1].name(), "age");
+                assert_eq!(*fields[1].data_type(), DataType::Int64);
             }
             _ => panic!("Expected Struct, got {:?}", dt),
         }
@@ -1646,18 +1664,80 @@ mod tests {
     #[test]
     fn test_parse_nested_complex_type() {
         // List of structs
-        let json = r#"{"list": {"struct": {"x": "f64", "y": "f64"}}}"#;
+        let json = r#"{"list": {"struct": [["x", "f64"], ["y", "f64"]]}}"#;
         let dt = parse_arrow_type_string(json).unwrap();
         match &dt {
             DataType::List(inner) => {
                 match inner.data_type() {
                     DataType::Struct(fields) => {
                         assert_eq!(fields.len(), 2);
+                        assert_eq!(fields[0].name(), "x");
+                        assert_eq!(fields[1].name(), "y");
                     }
                     _ => panic!("Expected Struct inside List"),
                 }
             }
             _ => panic!("Expected List, got {:?}", dt),
+        }
+    }
+
+    /// Struct field ordering matches the array-of-pairs order.
+    /// Spark reads struct children by ordinal position, so ordering is critical.
+    #[test]
+    fn test_struct_field_ordering_preserved() {
+        // "name" before "address" before "city" — would be wrong if sorted alphabetically
+        let json = r#"{"struct": [["name", "string"], ["address", "string"], ["city", "string"]]}"#;
+        let dt = parse_arrow_type_string(json).unwrap();
+        match &dt {
+            DataType::Struct(fields) => {
+                assert_eq!(fields.len(), 3);
+                assert_eq!(fields[0].name(), "name");
+                assert_eq!(fields[1].name(), "address");
+                assert_eq!(fields[2].name(), "city");
+            }
+            _ => panic!("Expected Struct, got {:?}", dt),
+        }
+    }
+
+    /// Alphabetically-first field appears last — confirms array order, not sort order.
+    #[test]
+    fn test_struct_field_ordering_alpha_last() {
+        let json = r#"{"struct": [["z_last", "i64"], ["a_first", "string"], ["m_middle", "f64"]]}"#;
+        let dt = parse_arrow_type_string(json).unwrap();
+        match &dt {
+            DataType::Struct(fields) => {
+                assert_eq!(fields.len(), 3);
+                assert_eq!(fields[0].name(), "z_last");
+                assert_eq!(*fields[0].data_type(), DataType::Int64);
+                assert_eq!(fields[1].name(), "a_first");
+                assert_eq!(*fields[1].data_type(), DataType::Utf8);
+                assert_eq!(fields[2].name(), "m_middle");
+                assert_eq!(*fields[2].data_type(), DataType::Float64);
+            }
+            _ => panic!("Expected Struct, got {:?}", dt),
+        }
+    }
+
+    /// Nested struct also preserves field ordering.
+    #[test]
+    fn test_nested_struct_field_ordering() {
+        let json = r#"{"struct": [["scores", {"list": "i64"}], ["name", "string"], ["address", {"struct": [["zip", "string"], ["city", "string"]]}]]}"#;
+        let dt = parse_arrow_type_string(json).unwrap();
+        match &dt {
+            DataType::Struct(fields) => {
+                assert_eq!(fields.len(), 3);
+                assert_eq!(fields[0].name(), "scores");
+                assert_eq!(fields[1].name(), "name");
+                assert_eq!(fields[2].name(), "address");
+                match fields[2].data_type() {
+                    DataType::Struct(inner) => {
+                        assert_eq!(inner[0].name(), "zip");
+                        assert_eq!(inner[1].name(), "city");
+                    }
+                    _ => panic!("Expected nested Struct"),
+                }
+            }
+            _ => panic!("Expected Struct, got {:?}", dt),
         }
     }
 }
