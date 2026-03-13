@@ -496,6 +496,20 @@ fn build_arrow_column(
             }
             Ok(Arc::new(builder.finish()))
         }
+        DataType::Date32 => {
+            let mut builder = Date32Builder::with_capacity(num_rows);
+            for doc in docs {
+                match find_first_value(doc, field) {
+                    Some(OwnedValue::Date(dt)) => {
+                        let micros = dt.into_timestamp_nanos() / 1_000;
+                        let days = (micros / 86_400_000_000) as i32;
+                        builder.append_value(days);
+                    }
+                    _ => builder.append_null(),
+                }
+            }
+            Ok(Arc::new(builder.finish()))
+        }
         DataType::Binary => {
             let mut builder = BinaryBuilder::with_capacity(num_rows, num_rows * 64);
             for doc in docs {
@@ -903,6 +917,25 @@ fn build_scalar_from_owned_values(
                         builder.append_value(micros);
                     }
                     Some(OwnedValue::I64(n)) => builder.append_value(*n),
+                    _ => builder.append_null(),
+                }
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        DataType::Date32 => {
+            let mut builder = Date32Builder::with_capacity(num_rows);
+            for v in values {
+                match v {
+                    Some(OwnedValue::Date(dt)) => {
+                        let micros = dt.into_timestamp_nanos() / 1_000;
+                        let days = (micros / 86_400_000_000) as i32;
+                        builder.append_value(days);
+                    }
+                    Some(OwnedValue::I64(n)) => {
+                        // Assume i64 is microseconds, convert to days
+                        let days = (*n / 86_400_000_000) as i32;
+                        builder.append_value(days);
+                    }
                     _ => builder.append_null(),
                 }
             }
@@ -1331,5 +1364,71 @@ mod tests {
         let y = struct_col.column(1).as_any()
             .downcast_ref::<arrow_array::Float64Array>().unwrap();
         assert_eq!(y.value(0), 2.5);
+    }
+
+    #[test]
+    fn test_date32_type_hint_converts_microseconds_to_days() {
+        // Date32 hint: tantivy DateTime (micros since epoch) → i32 days since epoch
+        let mut sb = SchemaBuilder::new();
+        let date_opts = tantivy::schema::DateOptions::default()
+            .set_stored()
+            .set_indexed()
+            .set_fast();
+        let date_field = sb.add_date_field("created", date_opts);
+        let schema = sb.build();
+
+        let mut hints = HashMap::new();
+        hints.insert("created".to_string(), DataType::Date32);
+
+        let (arrow_schema, field_mapping) =
+            tantivy_schema_to_arrow(&schema, None, Some(&hints)).unwrap();
+
+        assert_eq!(*arrow_schema.field(0).data_type(), DataType::Date32);
+
+        // 2024-01-15 = 19737 days since 1970-01-01
+        // In microseconds: 19737 * 86_400_000_000 = 1_705_276_800_000_000
+        let micros = 19737i64 * 86_400_000_000i64;
+        let dt = tantivy::DateTime::from_timestamp_micros(micros);
+
+        let mut doc = tantivy::TantivyDocument::default();
+        doc.add_date(date_field, dt);
+
+        let batch = docs_to_record_batch(&[doc], &arrow_schema, &field_mapping).unwrap();
+        let date_col = batch.column(0).as_any()
+            .downcast_ref::<arrow_array::Date32Array>()
+            .expect("should be Date32Array");
+
+        assert_eq!(date_col.value(0), 19737);
+    }
+
+    #[test]
+    fn test_date32_null_handling() {
+        // Date32 with missing values → null
+        let mut sb = SchemaBuilder::new();
+        let date_opts = tantivy::schema::DateOptions::default()
+            .set_stored()
+            .set_indexed();
+        sb.add_date_field("created", date_opts);
+        let text_opts = tantivy::schema::TextOptions::default()
+            .set_stored();
+        let title_field = sb.add_text_field("title", text_opts);
+        let schema = sb.build();
+
+        let mut hints = HashMap::new();
+        hints.insert("created".to_string(), DataType::Date32);
+
+        let (arrow_schema, field_mapping) =
+            tantivy_schema_to_arrow(&schema, None, Some(&hints)).unwrap();
+
+        // Doc without date field → null
+        let mut doc = tantivy::TantivyDocument::default();
+        doc.add_text(title_field, "no date");
+
+        let batch = docs_to_record_batch(&[doc], &arrow_schema, &field_mapping).unwrap();
+        let date_col = batch.column(0).as_any()
+            .downcast_ref::<arrow_array::Date32Array>()
+            .expect("should be Date32Array");
+
+        assert!(date_col.is_null(0));
     }
 }

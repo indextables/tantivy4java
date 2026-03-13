@@ -912,6 +912,7 @@ fn parse_arrow_type_string(s: &str) -> Option<arrow_schema::DataType> {
         "date" | "timestamp" => Some(arrow_schema::DataType::Timestamp(
             arrow_schema::TimeUnit::Microsecond, None,
         )),
+        "date32" => Some(arrow_schema::DataType::Date32),
         "binary" | "bytes" => Some(arrow_schema::DataType::Binary),
         _ => None,
     }
@@ -1611,6 +1612,7 @@ mod tests {
         assert_eq!(parse_arrow_type_string("string"), Some(DataType::Utf8));
         assert_eq!(parse_arrow_type_string("bool"), Some(DataType::Boolean));
         assert_eq!(parse_arrow_type_string("f64"), Some(DataType::Float64));
+        assert_eq!(parse_arrow_type_string("date32"), Some(DataType::Date32));
         assert_eq!(parse_arrow_type_string("unknown"), None);
     }
 

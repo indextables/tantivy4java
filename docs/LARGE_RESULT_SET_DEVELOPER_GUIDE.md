@@ -249,7 +249,22 @@ try (SplitSearcher.StreamingSession session =
 | `"bool"` / `"boolean"` | `Boolean` | Boolean fields |
 | `"utf8"` / `"string"` | `Utf8` | String fields |
 | `"date"` / `"timestamp"` | `Timestamp(Microsecond)` | Date/timestamp fields |
+| `"date32"` | `Date32` | Spark `DateType` (days since epoch) |
 | `"binary"` / `"bytes"` | `Binary` | Binary fields |
+
+**`date32` for Spark `DateType`:** The companion/parquet path produces `Date32`
+(Int32, days since epoch) for date columns. The non-companion streaming path
+defaults to `Timestamp(Microsecond)` which causes `UnsupportedOperationException`
+in Spark's `ArrowColumnVector.getInt()`. Use `"date32"` to match the companion
+path output:
+
+```java
+String[] typeHints = new String[] {
+    "created_date", "date32",   // DateTime → Date32 (days since epoch)
+    "score",        "i32",      // i64 → Int32
+};
+// Conversion: i64 microseconds → ÷ 86_400_000_000 → i32 days → Date32Array
+```
 
 #### Complex Type Hints (JSON Format)
 
