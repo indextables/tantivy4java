@@ -534,13 +534,16 @@ pub(crate) fn write_batch_to_ffi(
         };
 
         unsafe {
-            // Drop previous FFI contents to release Arrow buffers.
-            // A zeroed struct (release = null) is safe to read+drop (no-op).
-            let prev_array = std::ptr::read_unaligned(array_ptr);
-            drop(prev_array);
-            let prev_schema = std::ptr::read_unaligned(schema_ptr);
-            drop(prev_schema);
-
+            // Write new FFI data directly — do NOT read+drop previous contents.
+            //
+            // The old read+drop pattern caused SIGBUS crashes: if the memory at
+            // array_ptr was uninitialized (Unsafe.allocateMemory doesn't zero)
+            // or contained stale data, the FFI_ArrowArray.release field would be
+            // a garbage function pointer. Dropping it called that garbage pointer.
+            //
+            // Per the Arrow C Data Interface spec, the CONSUMER (Java/Spark) is
+            // responsible for calling the release callback after importing each
+            // batch. We just overwrite with new data.
             std::ptr::write_unaligned(array_ptr, FFI_ArrowArray::new(&data));
             std::ptr::write_unaligned(
                 schema_ptr,

@@ -251,6 +251,78 @@ try (SplitSearcher.StreamingSession session =
 | `"date"` / `"timestamp"` | `Timestamp(Microsecond)` | Date/timestamp fields |
 | `"binary"` / `"bytes"` | `Binary` | Binary fields |
 
+#### Complex Type Hints (JSON Format)
+
+For JSON fields stored in tantivy as serialized text, the caller can request
+proper Arrow Struct, List, or Map vectors by passing a JSON-formatted type
+hint. This avoids a `ClassCastException` in Spark when `ColumnarToRow` expects
+a `StructType` column but receives a `Utf8` column.
+
+The JSON type hint format mirrors the structure of the desired Arrow type:
+
+```java
+// Struct type hint — JSON object with field names → scalar types
+String[] typeHints = new String[] {
+    "metadata", "{\"struct\": {\"name\": \"string\", \"age\": \"i32\"}}",
+};
+
+// List type hint — JSON object with element type
+String[] typeHints = new String[] {
+    "tags", "{\"list\": \"string\"}",
+};
+
+// Map type hint — JSON array [keyType, valueType]
+String[] typeHints = new String[] {
+    "properties", "{\"map\": [\"string\", \"string\"]}",
+};
+
+// Nested complex types — struct containing a list
+String[] typeHints = new String[] {
+    "user", "{\"struct\": {\"name\": \"string\", \"scores\": {\"list\": \"i64\"}}}",
+};
+```
+
+**Supported complex type hint formats:**
+
+| JSON Format | Arrow DataType | Example |
+|-------------|---------------|---------|
+| `{"struct": {"f1": "t1", ...}}` | `Struct([Field("f1", t1), ...])` | `{"struct": {"name": "string", "age": "i32"}}` |
+| `{"list": "type"}` | `List(type)` | `{"list": "string"}` |
+| `{"list": {"struct": {...}}}` | `List(Struct(...))` | `{"list": {"struct": {"x": "f64"}}}` |
+| `{"map": ["keyType", "valType"]}` | `Map(keyType, valType)` | `{"map": ["string", "i64"]}` |
+
+**How it works:** When `parse_arrow_type_string()` sees a type hint starting
+with `{`, it delegates to `parse_complex_type_json()` which recursively builds
+the `arrow_schema::DataType`. During batch construction, `build_arrow_column()`
+detects `DataType::Struct | List | Map` and calls `owned_values_to_arrow()`,
+which recursively converts tantivy `OwnedValue` trees into proper Arrow arrays:
+
+- `OwnedValue::Object(Vec<(String, OwnedValue)>)` → `StructArray` or `MapArray`
+- `OwnedValue::Array(Vec<OwnedValue>)` → `ListArray`
+- Scalar values → leaf arrays (`StringArray`, `Int32Array`, etc.)
+
+**Spark integration example:**
+
+```scala
+// Spark declares a StructType column for a tantivy JSON field
+val schema = StructType(Seq(
+  StructField("id", IntegerType),
+  StructField("metadata", StructType(Seq(
+    StructField("name", StringType),
+    StructField("age", IntegerType)
+  )))
+))
+
+// Type hints tell native layer to produce Arrow Struct instead of Utf8
+val typeHints = Array(
+  "id", "i32",
+  "metadata", """{"struct": {"name": "string", "age": "i32"}}"""
+)
+
+val session = searcher.startStreamingRetrieval(queryJson, fields, typeHints)
+// metadata column → StructArray (not Utf8) → Spark ColumnarToRow works correctly
+```
+
 **Why companion splits don't need type hints:** Companion splits read from
 parquet files which preserve the original Arrow types from the write path.
 Type hints only affect the non-companion (tantivy doc store) streaming path.
@@ -259,7 +331,9 @@ Type hints only affect the non-companion (tantivy doc store) streaming path.
 accepts an optional `HashMap<String, DataType>` which overrides the default
 tantivy→Arrow type mapping per field name. `build_arrow_column()` has dedicated
 builder branches for `Int32`, `Int16`, `Int8`, and `Float32` that narrow the
-internal `i64`/`f64` values during construction.
+internal `i64`/`f64` values during construction. For complex types (`Struct`,
+`List`, `Map`), it extracts `OwnedValue` from each document and delegates to
+`owned_values_to_arrow()` for recursive Arrow array construction.
 
 ### Document Limit (`maxDocs`)
 
@@ -528,19 +602,16 @@ release_arc(handle);
 
 ### Arrow FFI Buffer Lifecycle
 
-`write_batch_to_ffi()` drops previous FFI contents before writing new ones,
-preventing Arrow buffer leaks when FFI addresses are reused across batches:
+`write_batch_to_ffi()` writes Arrow FFI structs to caller-provided memory
+addresses. The Java side is responsible for importing and releasing each batch
+before calling `nextBatch()` again. The FFI structs are written via safe
+`std::ptr::write` — no `read_unaligned` + `drop` of previous contents (that
+pattern caused SIGBUS crashes on aligned FFI struct addresses and was removed).
 
 ```rust
 unsafe {
-    // Drop previous FFI contents to release Arrow buffers
-    let prev_array = std::ptr::read_unaligned(array_ptr);
-    drop(prev_array);
-    let prev_schema = std::ptr::read_unaligned(schema_ptr);
-    drop(prev_schema);
-    // Write new contents
-    std::ptr::write_unaligned(array_ptr, FFI_ArrowArray::new(&data));
-    std::ptr::write_unaligned(schema_ptr, FFI_ArrowSchema::try_from(&field)?);
+    std::ptr::write(array_ptr, FFI_ArrowArray::new(&data));
+    std::ptr::write(schema_ptr, FFI_ArrowSchema::try_from(&field)?);
 }
 ```
 
@@ -554,38 +625,51 @@ The `StreamingSession` class wraps the raw native handle with:
 
 ---
 
-## Fast Field Warmup
+## Index Warmup
 
-### Selective Warmup in Bulk Search
+### Quickwit-Compatible Warmup in Bulk Search
 
-`perform_bulk_search()` warms fast fields **only for fields that need them** —
-specifically range queries and field_presence/exists queries. Term, phrase, and
-wildcard queries do NOT trigger fast field warmup.
+`perform_bulk_search()` uses `quickwit_search::warmup()` to pre-load all
+required index components into the `HotDirectory` cache before search. This
+prevents "StorageDirectory only supports async reads" errors from tantivy
+operations that do synchronous I/O (e.g., `.pos` file reads for phrase queries).
 
 ```rust
-// Extract only fields involved in range or field_presence queries
-let fast_field_names = extract_range_query_fields(query_ast_json);
+// Build warmup info from the tantivy Query + QueryAst
+let warmup_info = build_warmup_info(&*tantivy_query, &schema, query_ast_json);
 
-// Warm only those specific fields (not all fast fields)
-if !fast_field_names.is_empty() {
-    let field_names: Vec<String> = fast_field_names.into_iter().collect();
-    let _ = ctx.warm_native_fast_fields_l1_for_fields(&field_names).await;
-}
+// Run quickwit's 7-task parallel warmup
+quickwit_search::warmup(&ctx.cached_searcher, &warmup_info).await
+    .map_err(|e| anyhow!("Warmup failed: {}", e))?;
 ```
 
-**Why selective?** Fast field warmup triggers async reads from storage (S3/Azure)
-into the HotDirectory cache. Warming all fast fields is expensive and wastes
-bandwidth. The `extract_range_query_fields()` function (from `field_extraction.rs`)
-parses the query AST JSON for `"type": "range"` and `"type": "field_presence"`
-nodes, returning only the field names that actually need fast field access.
+`build_warmup_info()` mirrors Quickwit's internal `build_query()` (which is
+`pub(crate)` and inaccessible from our code) by combining two sources:
 
-| Query Type | Needs Fast Field Warmup? | Reason |
-|------------|--------------------------|--------|
-| Term | No | Uses term dictionary + postings |
-| Phrase | No | Uses term dictionary + positions |
-| Wildcard | No | Uses term dictionary FST |
-| Range | **Yes** | Reads fast field column data |
-| Exists/FieldPresence | **Yes** | Checks fast field presence |
+1. **`query.query_terms()`** — tantivy's method that reports per-term position
+   needs. Terms with positions require postings warmup; all terms require term
+   dictionary warmup.
+
+2. **`QueryAstVisitor`** — walks the Quickwit QueryAst to extract:
+   - Range query fields → fast field warmup
+   - FieldPresence/exists fields → fast field warmup
+   - TermSet fields → term dictionary warmup
+   - Wildcard/regex/prefix patterns → automaton warmup
+
+The resulting `WarmupInfo` drives `quickwit_search::warmup()`, which runs
+7 parallel tasks: terms, term_ranges, term_dicts, fast_fields, field_norms,
+postings (with positions), and automatons.
+
+| Query Type | What Gets Warmed | Mechanism |
+|------------|-----------------|-----------|
+| Term | Term dict + postings | `query.query_terms()` |
+| Phrase | Term dict + postings + positions (.pos files) | `query.query_terms()` with `has_positions=true` |
+| Wildcard | Term dict FST + automaton | `QueryAstVisitor` (PrefixAndAutomatonVisitor) |
+| Range | Fast field column data | `QueryAstVisitor` (RangeQueryFieldVisitor) |
+| Exists | Fast field column data | `QueryAstVisitor` (ExistsQueryFieldVisitor) |
+| Regex | Term dict FST + automaton | `QueryAstVisitor` (PrefixAndAutomatonVisitor) |
+| TermSet | Term dictionary | `QueryAstVisitor` (TermSetFieldVisitor) |
+| Boolean | Union of sub-query warmup needs | Recursive via all visitors |
 
 ---
 
@@ -617,10 +701,11 @@ closed channel on its next `tx.send()` and stops gracefully.
 | Module | Tests | What's covered |
 |--------|-------|----------------|
 | `docid_collector` | 4 | Collector trait, batch collection, merge_fruits, scoring disabled |
-| `streaming_doc_retrieval` | 6 | Schema mapping, projection, type hints (Int32/Float32/Int16/Int8), batch conversion |
+| `streaming_doc_retrieval` | 11 | Schema mapping, projection, scalar type hints, complex type conversion (Struct/List/Map/nested), end-to-end JSON field with struct type hint |
+| `doc_retrieval_jni` | 5 | Type hint parser: scalar strings, JSON struct/list/map, nested complex types |
 | `streaming_ffi` | 6 | BatchAccumulator push/flush/empty, timestamp normalization, type mapping |
 | `read_strategy` | 7 | Selectivity thresholds, boundary values, coalesce scaling, flags |
-| **Rust Total** | **23** | All unit-testable logic |
+| **Rust Total** | **33** | All unit-testable logic |
 
 | Java Test Class | Tests | What's covered |
 |-----------------|-------|----------------|

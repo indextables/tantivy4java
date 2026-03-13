@@ -11,12 +11,21 @@
 //    No JNI round-trip needed.
 
 use std::collections::{HashMap, HashSet};
+use std::convert::Infallible;
+use std::ops::Bound;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
 
-use quickwit_query::query_ast::QueryAst;
-use quickwit_query::create_default_quickwit_tokenizer_manager;
+use quickwit_doc_mapper::{Automaton, FastFieldWarmupInfo, TermRange, WarmupInfo};
+use quickwit_query::query_ast::{
+    FieldPresenceQuery, FullTextQuery, PhrasePrefixQuery, QueryAst, QueryAstVisitor,
+    RangeQuery, RegexQuery, TermSetQuery, WildcardQuery,
+};
+use quickwit_query::{create_default_quickwit_tokenizer_manager, find_field_or_hit_dynamic};
+use tantivy::query::Query;
+use tantivy::schema::{Field, Schema};
+use tantivy::Term;
 
 use crate::perf_println;
 use super::types::CachedSearcherContext;
@@ -77,58 +86,40 @@ pub async fn perform_bulk_search(
     );
 
     // ========================================================================
-    // Warm up: term dictionaries, posting lists, fast fields
+    // Warm up using Quickwit's warmup() — same mechanism as leaf_search_single_split
     // ========================================================================
-    // The HotDirectory only caches a subset of the split data; term, postings, and
-    // fast files may not be in the hot cache. Tantivy's searcher.search() is synchronous
-    // and will fail with "StorageDirectory only supports async reads" if it hits
-    // cold data. The warm_up calls load the data into the HotDirectory cache
-    // asynchronously, after which the synchronous search succeeds.
+    // The HotDirectory only caches a subset of the split data. Tantivy's
+    // searcher.search() is synchronous and will fail with "StorageDirectory
+    // only supports async reads" if it hits cold data. Quickwit's warmup()
+    // pre-loads exactly the right data (term dicts, postings, positions, fast
+    // fields, automatons) based on what the query actually needs.
     let t_warmup = std::time::Instant::now();
 
-    // Extract fields that need fast field access (range, field_presence/exists queries)
-    // from the REWRITTEN query (so _phash_* fields are included)
+    // Build WarmupInfo from the query, same way Quickwit's build_query() does:
+    // query.query_terms() tells us exactly which terms need warming and whether
+    // each needs position data (.pos files).
+    let warmup_info = build_warmup_info(&*tantivy_query, &schema, effective_json_str);
+
+    quickwit_search::warmup(&ctx.cached_searcher, &warmup_info).await
+        .map_err(|e| anyhow!("Warmup failed: {}", e))?;
+
+    perf_println!(
+        "⏱️ BULK_SEARCH: quickwit warmup took {}ms",
+        t_warmup.elapsed().as_millis()
+    );
+
+    // Warm native fast fields via L1 cache for range/exists queries
     let fast_field_names = crate::parquet_companion::field_extraction::extract_range_query_fields(effective_json_str);
-
-    let mut warmup_futures = Vec::new();
-    for segment_reader in ctx.cached_searcher.segment_readers() {
-        for (field, field_entry) in schema.fields() {
-            if !field_entry.is_indexed() {
-                continue;
-            }
-            if let Ok(inverted_index) = segment_reader.inverted_index(field) {
-                let inv = inverted_index.clone();
-                warmup_futures.push(async move {
-                    // Warm term dictionary (FST)
-                    let _ = inv.terms().warm_up_dictionary().await;
-                    // Warm posting lists
-                    let _ = inv.warm_postings_full(false).await;
-                });
-            }
-        }
-    }
-    if !warmup_futures.is_empty() {
-        futures::future::join_all(warmup_futures).await;
-        perf_println!(
-            "⏱️ BULK_SEARCH: warmup term+postings took {}ms",
-            t_warmup.elapsed().as_millis()
-        );
-    }
-
-    // Warm fast fields for fields that need them (range, exists, _phash_* queries)
     if !fast_field_names.is_empty() {
         let field_names: Vec<String> = fast_field_names.into_iter().collect();
-        perf_println!("⏱️ BULK_SEARCH: warming fast fields for {:?}", field_names);
         let _ = ctx.warm_native_fast_fields_l1_for_fields(&field_names).await;
         perf_println!(
-            "⏱️ BULK_SEARCH: warmup fast fields took {}ms",
+            "⏱️ BULK_SEARCH: warmup native fast fields took {}ms",
             t_warmup.elapsed().as_millis()
         );
     }
 
-    // For companion splits with an augmented directory, ensure parquet-sourced fast
-    // fields are transcoded and available. This mirrors what ensure_fast_fields_for_query()
-    // does in the regular search() path.
+    // For companion splits, ensure parquet-sourced fast fields are transcoded
     if ctx.augmented_directory.is_some() {
         let _ = crate::split_searcher::async_impl::ensure_fast_fields_for_query(
             ctx, effective_json_str, None,
@@ -153,6 +144,271 @@ pub async fn perform_bulk_search(
     );
 
     Ok(doc_ids)
+}
+
+/// Build a `WarmupInfo` from a built tantivy query and the original QueryAst.
+///
+/// This mirrors Quickwit's internal `build_query()` in `query_builder.rs` which is
+/// `pub(crate)` and not accessible to us. We reconstruct the same warmup information:
+///
+/// 1. `query.query_terms()` — extracts per-term position needs (critical for .pos files)
+/// 2. Range query visitor — extracts fast fields needed for range queries
+/// 3. Exists query visitor — extracts fast fields needed for field presence queries
+/// 4. TermSet visitor — extracts fields needing full term dictionary warmup
+/// 5. Prefix/wildcard/regex visitor — extracts term ranges and automatons
+fn build_warmup_info(
+    query: &dyn Query,
+    schema: &Schema,
+    query_ast_json: &str,
+) -> WarmupInfo {
+    // 1. Extract per-term warmup info from the built tantivy query.
+    // query_terms() tells us exactly which terms need warming and whether
+    // each needs position data (.pos files).
+    let mut terms_grouped_by_field: HashMap<Field, HashMap<Term, bool>> = HashMap::new();
+    query.query_terms(&mut |term, need_position| {
+        let field = term.field();
+        *terms_grouped_by_field
+            .entry(field)
+            .or_default()
+            .entry(term.clone())
+            .or_default() |= need_position;
+    });
+
+    // Parse the QueryAst for visitor-based extraction
+    let query_ast: std::result::Result<QueryAst, _> = serde_json::from_str(query_ast_json);
+    let query_ast = match query_ast {
+        Ok(ast) => ast,
+        Err(_) => {
+            // If we can't parse, return what we have from query_terms()
+            return WarmupInfo {
+                terms_grouped_by_field,
+                ..WarmupInfo::default()
+            };
+        }
+    };
+
+    // 2. Extract range query fields → fast field warmup
+    let mut range_visitor = RangeQueryFieldVisitor::default();
+    let _: std::result::Result<(), Infallible> = range_visitor.visit(&query_ast);
+    let mut fast_fields: HashSet<FastFieldWarmupInfo> = range_visitor
+        .field_names
+        .into_iter()
+        .map(|name| FastFieldWarmupInfo {
+            name,
+            with_subfields: false,
+        })
+        .collect();
+
+    // 3. Extract exists/FieldPresence query fields → fast field warmup
+    let mut exists_visitor = ExistsQueryFieldVisitor {
+        fields: HashSet::new(),
+        schema: schema.clone(),
+    };
+    let _: std::result::Result<(), Infallible> = exists_visitor.visit(&query_ast);
+    fast_fields.extend(exists_visitor.fields);
+
+    // 4. Extract term set query fields → full term dictionary warmup
+    let mut term_set_visitor = TermSetFieldVisitor {
+        fields: HashSet::new(),
+        schema,
+    };
+    let term_dict_fields = match term_set_visitor.visit(&query_ast) {
+        Ok(()) => term_set_visitor.fields,
+        Err(_) => HashSet::new(),
+    };
+
+    // 5. Extract prefix term ranges and automatons (wildcard/regex queries)
+    let tokenizer_manager = create_default_quickwit_tokenizer_manager();
+    let mut prefix_visitor = PrefixAndAutomatonVisitor::new(schema, &tokenizer_manager);
+    let _ = prefix_visitor.visit(&query_ast);
+
+    WarmupInfo {
+        term_dict_fields,
+        fast_fields,
+        field_norms: false, // DocIdCollector doesn't score
+        terms_grouped_by_field,
+        term_ranges_grouped_by_field: prefix_visitor.term_ranges,
+        automatons_grouped_by_field: prefix_visitor.automatons,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// QueryAst visitors — mirrors quickwit-doc-mapper/src/query_builder.rs
+// ---------------------------------------------------------------------------
+
+/// Visitor that extracts field names from Range queries for fast field warmup.
+#[derive(Default)]
+struct RangeQueryFieldVisitor {
+    field_names: HashSet<String>,
+}
+
+impl<'a> QueryAstVisitor<'a> for RangeQueryFieldVisitor {
+    type Err = Infallible;
+
+    fn visit_range(&mut self, range_query: &'a RangeQuery) -> std::result::Result<(), Infallible> {
+        self.field_names.insert(range_query.field.to_string());
+        Ok(())
+    }
+}
+
+/// Visitor that extracts fast fields from FieldPresence (exists/IS NOT NULL) queries.
+struct ExistsQueryFieldVisitor {
+    fields: HashSet<FastFieldWarmupInfo>,
+    schema: Schema,
+}
+
+impl<'a> QueryAstVisitor<'a> for ExistsQueryFieldVisitor {
+    type Err = Infallible;
+
+    fn visit_exists(&mut self, exists_query: &'a FieldPresenceQuery) -> std::result::Result<(), Infallible> {
+        let fields = exists_query.find_field_and_subfields(&self.schema);
+        for (_, field_entry, path) in fields {
+            if field_entry.is_fast() {
+                if field_entry.field_type().is_json() {
+                    let full_path = format!("{}.{}", field_entry.name(), path);
+                    self.fields.insert(FastFieldWarmupInfo {
+                        name: full_path,
+                        with_subfields: true,
+                    });
+                } else if path.is_empty() {
+                    self.fields.insert(FastFieldWarmupInfo {
+                        name: field_entry.name().to_string(),
+                        with_subfields: false,
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Visitor that extracts fields from TermSet queries for full dictionary warmup.
+struct TermSetFieldVisitor<'s> {
+    fields: HashSet<Field>,
+    schema: &'s Schema,
+}
+
+impl<'a, 's> QueryAstVisitor<'a> for TermSetFieldVisitor<'s> {
+    type Err = anyhow::Error;
+
+    fn visit_term_set(&mut self, term_set_query: &'a TermSetQuery) -> anyhow::Result<()> {
+        for field_name in term_set_query.terms_per_field.keys() {
+            if let Some((field, _field_entry, _path)) =
+                find_field_or_hit_dynamic(field_name, self.schema)
+            {
+                self.fields.insert(field);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Visitor that extracts prefix term ranges (from FullText/PhrasePrefix) and
+/// automatons (from Wildcard/Regex) for warmup.
+struct PrefixAndAutomatonVisitor<'a> {
+    schema: &'a Schema,
+    tokenizer_manager: &'a quickwit_query::tokenizers::TokenizerManager,
+    term_ranges: HashMap<Field, HashMap<TermRange, bool>>,
+    automatons: HashMap<Field, HashSet<Automaton>>,
+}
+
+impl<'a> PrefixAndAutomatonVisitor<'a> {
+    fn new(schema: &'a Schema, tokenizer_manager: &'a quickwit_query::tokenizers::TokenizerManager) -> Self {
+        Self {
+            schema,
+            tokenizer_manager,
+            term_ranges: HashMap::new(),
+            automatons: HashMap::new(),
+        }
+    }
+
+    fn add_prefix_term(&mut self, term: Term, max_expansions: u32, position_needed: bool) {
+        let field = term.field();
+        let (start, end) = prefix_term_to_range(term);
+        let term_range = TermRange {
+            start,
+            end,
+            limit: Some(max_expansions as u64),
+        };
+        *self
+            .term_ranges
+            .entry(field)
+            .or_default()
+            .entry(term_range)
+            .or_default() |= position_needed;
+    }
+}
+
+fn prefix_term_to_range(prefix: Term) -> (Bound<Term>, Bound<Term>) {
+    let mut end_bound = prefix.serialized_term().to_vec();
+    while !end_bound.is_empty() {
+        let last_byte = end_bound.last_mut().unwrap();
+        if *last_byte != u8::MAX {
+            *last_byte += 1;
+            return (
+                Bound::Included(prefix),
+                Bound::Excluded(Term::wrap(end_bound)),
+            );
+        }
+        end_bound.pop();
+    }
+    (Bound::Included(prefix), Bound::Unbounded)
+}
+
+impl<'a, 'b: 'a> QueryAstVisitor<'a> for PrefixAndAutomatonVisitor<'b> {
+    type Err = quickwit_query::InvalidQuery;
+
+    fn visit_full_text(&mut self, full_text_query: &'a FullTextQuery) -> std::result::Result<(), Self::Err> {
+        if let Some(prefix_term) =
+            full_text_query.get_prefix_term(self.schema, self.tokenizer_manager)
+        {
+            self.add_prefix_term(prefix_term, u32::MAX, false);
+        }
+        Ok(())
+    }
+
+    fn visit_phrase_prefix(
+        &mut self,
+        phrase_prefix: &'a PhrasePrefixQuery,
+    ) -> std::result::Result<(), Self::Err> {
+        let terms = match phrase_prefix.get_terms(self.schema, self.tokenizer_manager) {
+            Ok((_, terms)) => terms,
+            Err(quickwit_query::InvalidQuery::SchemaError(_))
+            | Err(quickwit_query::InvalidQuery::FieldDoesNotExist { .. }) => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        if let Some((_, term)) = terms.last() {
+            self.add_prefix_term(term.clone(), phrase_prefix.max_expansions, terms.len() > 1);
+        }
+        Ok(())
+    }
+
+    fn visit_wildcard(&mut self, wildcard_query: &'a WildcardQuery) -> std::result::Result<(), Self::Err> {
+        let (field, path, regex) =
+            match wildcard_query.to_regex(self.schema, self.tokenizer_manager) {
+                Ok(res) => res,
+                Err(quickwit_query::InvalidQuery::FieldDoesNotExist { .. }) => return Ok(()),
+                Err(e) => return Err(e),
+            };
+        self.automatons
+            .entry(field)
+            .or_default()
+            .insert(Automaton::Regex(path, regex));
+        Ok(())
+    }
+
+    fn visit_regex(&mut self, regex_query: &'a RegexQuery) -> std::result::Result<(), Self::Err> {
+        let (field, path, regex) = match regex_query.to_field_and_regex(self.schema) {
+            Ok(res) => res,
+            Err(quickwit_query::InvalidQuery::FieldDoesNotExist { .. }) => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        self.automatons
+            .entry(field)
+            .or_default()
+            .insert(Automaton::Regex(path, regex));
+        Ok(())
+    }
 }
 
 /// Apply companion-mode query rewrites (hash field presence + exact_only string indexing).

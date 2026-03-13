@@ -6851,6 +6851,7 @@ dependencies = [
  "anyhow",
  "arrow",
  "arrow-array",
+ "arrow-buffer",
  "arrow-schema",
  "async-trait",
  "aws-sdk-s3",

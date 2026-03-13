@@ -880,7 +880,25 @@ fn parse_type_hints_from_env(
 }
 
 /// Parse an Arrow type string to a DataType.
+///
+/// Supports scalar type names (e.g. "i32", "string") and JSON-formatted
+/// complex types for Struct, List, and Map:
+///
+/// ```json
+/// {"struct": {"name": "string", "age": "i32"}}
+/// {"list": "string"}
+/// {"list": {"struct": {"x": "f64", "y": "f64"}}}
+/// {"map": ["string", "i64"]}
+/// ```
 fn parse_arrow_type_string(s: &str) -> Option<arrow_schema::DataType> {
+    // Try JSON complex type first (starts with '{')
+    if s.starts_with('{') {
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(s) {
+            return parse_complex_type_json(&json);
+        }
+    }
+
+    // Scalar types
     match s {
         "i8" | "int8" | "byte" => Some(arrow_schema::DataType::Int8),
         "i16" | "int16" | "short" => Some(arrow_schema::DataType::Int16),
@@ -895,6 +913,63 @@ fn parse_arrow_type_string(s: &str) -> Option<arrow_schema::DataType> {
             arrow_schema::TimeUnit::Microsecond, None,
         )),
         "binary" | "bytes" => Some(arrow_schema::DataType::Binary),
+        _ => None,
+    }
+}
+
+/// Parse a JSON value into an Arrow DataType, supporting recursive complex types.
+///
+/// String values are parsed as scalar types. Object values describe complex types:
+/// - `{"struct": {"field1": <type>, "field2": <type>, ...}}` → Struct
+/// - `{"list": <element_type>}` → List
+/// - `{"map": [<key_type>, <value_type>]}` → Map
+///
+/// Types can be nested arbitrarily:
+/// `{"struct": {"tags": {"list": "string"}, "coords": {"struct": {"x": "f64", "y": "f64"}}}}`
+fn parse_complex_type_json(v: &serde_json::Value) -> Option<arrow_schema::DataType> {
+    use arrow_schema::{DataType, Field};
+    use std::sync::Arc;
+
+    match v {
+        serde_json::Value::String(s) => parse_arrow_type_string(s),
+        serde_json::Value::Object(map) => {
+            if let Some(fields_val) = map.get("struct") {
+                // Struct: {"struct": {"name": "string", "age": "i32"}}
+                let fields_obj = fields_val.as_object()?;
+                let mut fields = Vec::with_capacity(fields_obj.len());
+                for (name, type_val) in fields_obj {
+                    let dt = parse_complex_type_json(type_val)?;
+                    fields.push(Arc::new(Field::new(name, dt, true)));
+                }
+                Some(DataType::Struct(fields.into()))
+            } else if let Some(elem_val) = map.get("list") {
+                // List: {"list": "string"} or {"list": {"struct": {...}}}
+                let elem_type = parse_complex_type_json(elem_val)?;
+                Some(DataType::List(Arc::new(Field::new("item", elem_type, true))))
+            } else if let Some(kv_val) = map.get("map") {
+                // Map: {"map": ["string", "i64"]}
+                let kv_arr = kv_val.as_array()?;
+                if kv_arr.len() != 2 {
+                    return None;
+                }
+                let key_type = parse_complex_type_json(&kv_arr[0])?;
+                let val_type = parse_complex_type_json(&kv_arr[1])?;
+                let entries_field = Field::new(
+                    "entries",
+                    DataType::Struct(
+                        vec![
+                            Arc::new(Field::new("key", key_type, false)),
+                            Arc::new(Field::new("value", val_type, true)),
+                        ]
+                        .into(),
+                    ),
+                    false,
+                );
+                Some(DataType::Map(Arc::new(entries_field), false))
+            } else {
+                None
+            }
+        }
         _ => None,
     }
 }
@@ -1502,6 +1577,87 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_nati
         None => {
             to_java_exception(&mut env, &anyhow::anyhow!("Streaming session not found or already closed"));
             -1
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_schema::DataType;
+
+    #[test]
+    fn test_parse_scalar_types() {
+        assert_eq!(parse_arrow_type_string("i32"), Some(DataType::Int32));
+        assert_eq!(parse_arrow_type_string("string"), Some(DataType::Utf8));
+        assert_eq!(parse_arrow_type_string("bool"), Some(DataType::Boolean));
+        assert_eq!(parse_arrow_type_string("f64"), Some(DataType::Float64));
+        assert_eq!(parse_arrow_type_string("unknown"), None);
+    }
+
+    #[test]
+    fn test_parse_struct_type_hint() {
+        let json = r#"{"struct": {"name": "string", "age": "i64"}}"#;
+        let dt = parse_arrow_type_string(json).unwrap();
+        match &dt {
+            DataType::Struct(fields) => {
+                assert_eq!(fields.len(), 2);
+                // Fields may be in any order since JSON object iteration order varies
+                let has_name = fields.iter().any(|f| f.name() == "name" && *f.data_type() == DataType::Utf8);
+                let has_age = fields.iter().any(|f| f.name() == "age" && *f.data_type() == DataType::Int64);
+                assert!(has_name, "should have name:string field");
+                assert!(has_age, "should have age:i64 field");
+            }
+            _ => panic!("Expected Struct, got {:?}", dt),
+        }
+    }
+
+    #[test]
+    fn test_parse_list_type_hint() {
+        let json = r#"{"list": "string"}"#;
+        let dt = parse_arrow_type_string(json).unwrap();
+        match &dt {
+            DataType::List(inner) => {
+                assert_eq!(*inner.data_type(), DataType::Utf8);
+            }
+            _ => panic!("Expected List, got {:?}", dt),
+        }
+    }
+
+    #[test]
+    fn test_parse_map_type_hint() {
+        let json = r#"{"map": ["string", "i64"]}"#;
+        let dt = parse_arrow_type_string(json).unwrap();
+        match &dt {
+            DataType::Map(entries, sorted) => {
+                assert!(!sorted);
+                match entries.data_type() {
+                    DataType::Struct(fields) => {
+                        assert_eq!(*fields[0].data_type(), DataType::Utf8);
+                        assert_eq!(*fields[1].data_type(), DataType::Int64);
+                    }
+                    _ => panic!("Expected Struct entries"),
+                }
+            }
+            _ => panic!("Expected Map, got {:?}", dt),
+        }
+    }
+
+    #[test]
+    fn test_parse_nested_complex_type() {
+        // List of structs
+        let json = r#"{"list": {"struct": {"x": "f64", "y": "f64"}}}"#;
+        let dt = parse_arrow_type_string(json).unwrap();
+        match &dt {
+            DataType::List(inner) => {
+                match inner.data_type() {
+                    DataType::Struct(fields) => {
+                        assert_eq!(fields.len(), 2);
+                    }
+                    _ => panic!("Expected Struct inside List"),
+                }
+            }
+            _ => panic!("Expected List, got {:?}", dt),
         }
     }
 }
