@@ -539,11 +539,38 @@ fn build_arrow_column(
                     if all.is_empty() {
                         None
                     } else if all.len() == 1 {
-                        // Single value: if it's already an Array, use it directly.
-                        // If it's a Str, try JSON parse — the connector may serialize
-                        // arrays as JSON text (e.g. "[90, 85, 92]").
+                        // Single value — unwrap to the underlying Array.
+                        // Handles three storage patterns:
+                        //   1. OwnedValue::Array directly (multi-value or JSON array)
+                        //   2. OwnedValue::Object({"_values": [...]}) — Spark connector wrapping
+                        //   3. OwnedValue::Str("[90, 85, 92]") — JSON-serialized text
                         match all.into_iter().next().unwrap() {
                             v @ OwnedValue::Array(_) => Some(v),
+                            OwnedValue::Object(entries) => {
+                                // Spark connector wraps arrays as {"_values": [...]}
+                                let arr = entries.iter()
+                                    .find(|(k, _)| k == "_values")
+                                    .and_then(|(_, v)| match v {
+                                        OwnedValue::Array(_) => Some(v.clone()),
+                                        _ => None,
+                                    });
+                                if let Some(v) = arr {
+                                    Some(v)
+                                } else {
+                                    // No _values key — check for any single Array value
+                                    let arrays: Vec<_> = entries.iter()
+                                        .filter_map(|(_, v)| match v {
+                                            OwnedValue::Array(_) => Some(v.clone()),
+                                            _ => None,
+                                        })
+                                        .collect();
+                                    if arrays.len() == 1 {
+                                        Some(arrays.into_iter().next().unwrap())
+                                    } else {
+                                        Some(OwnedValue::Array(vec![OwnedValue::Object(entries)]))
+                                    }
+                                }
+                            }
                             OwnedValue::Str(s) => {
                                 if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&s) {
                                     if let Some(arr) = parsed.as_array() {
@@ -1729,6 +1756,56 @@ mod tests {
             .expect("should be ListArray");
 
         assert!(!list_col.is_null(0));
+        let row0 = list_col.value(0);
+        let ints = row0.as_any()
+            .downcast_ref::<arrow_array::Int32Array>()
+            .expect("child should be Int32Array");
+
+        assert_eq!(ints.len(), 3, "should have 3 elements from [90, 85, 92]");
+        assert!(!ints.is_null(0), "element 0 should not be null");
+        assert!(!ints.is_null(1), "element 1 should not be null");
+        assert!(!ints.is_null(2), "element 2 should not be null");
+        assert_eq!(ints.value(0), 90);
+        assert_eq!(ints.value(1), 85);
+        assert_eq!(ints.value(2), 92);
+    }
+
+    /// Regression: Spark connector wraps arrays as {"_values": [90, 85, 92]} in a JSON field.
+    /// The List dispatch must unwrap the "_values" key to get the actual array.
+    #[test]
+    fn test_e2e_json_field_values_wrapped_int_array_to_list_i32() {
+        let mut sb = SchemaBuilder::new();
+        let json_field = sb.add_json_field("scores", tantivy::schema::STORED);
+        let schema = sb.build();
+
+        let mut hints = HashMap::new();
+        hints.insert(
+            "scores".to_string(),
+            DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+        );
+
+        let (arrow_schema, field_mapping) =
+            tantivy_schema_to_arrow(&schema, None, Some(&hints)).unwrap();
+
+        // Replicate Spark connector: stores {"_values": [90, 85, 92]} in JSON field
+        let mut doc = tantivy::TantivyDocument::default();
+        let mut obj = std::collections::BTreeMap::new();
+        obj.insert(
+            "_values".to_string(),
+            OwnedValue::Array(vec![
+                OwnedValue::I64(90),
+                OwnedValue::I64(85),
+                OwnedValue::I64(92),
+            ]),
+        );
+        doc.add_object(json_field, obj);
+
+        let batch = docs_to_record_batch(&[doc], &arrow_schema, &field_mapping).unwrap();
+        let list_col = batch.column(0).as_any()
+            .downcast_ref::<ListArray>()
+            .expect("should be ListArray");
+
+        assert!(!list_col.is_null(0), "row 0 should not be null");
         let row0 = list_col.value(0);
         let ints = row0.as_any()
             .downcast_ref::<arrow_array::Int32Array>()
