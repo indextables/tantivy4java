@@ -1756,4 +1756,269 @@ public class LargeResultSetRetrievalTest {
             }
         }
     }
+
+    // ====================================================================
+    // COMPLEX ARROW TYPE HINT TESTS
+    //
+    // These tests verify that non-companion (tantivy doc store) streaming
+    // correctly converts JSON fields to complex Arrow types (Struct, List,
+    // Map) when the caller provides JSON-formatted type hints.
+    // ====================================================================
+
+    /**
+     * Helper: create a non-companion split with a JSON field containing struct data.
+     */
+    private SplitSearcher createJsonFieldSplit(Path dir, String tag, int numDocs) throws Exception {
+        try (SchemaBuilder builder = new SchemaBuilder()) {
+            builder.addTextField("title", true, false, "default", "position");
+            Field dataField = builder.addJsonField("data", JsonObjectOptions.storedAndIndexed());
+            try (Schema schema = builder.build();
+                 Index index = new Index(schema, dir.resolve("idx_" + tag).toString(), false);
+                 IndexWriter writer = index.writer(Index.Memory.DEFAULT_HEAP_SIZE, 1)) {
+                for (int i = 0; i < numDocs; i++) {
+                    try (Document doc = new Document()) {
+                        doc.addText("title", "doc" + i);
+                        Map<String, Object> data = new LinkedHashMap<>();
+                        data.put("name", "user" + i);
+                        data.put("age", i + 20);
+                        data.put("tags", Arrays.asList("tag" + (i % 3), "common"));
+                        doc.addJson(dataField, data);
+                        writer.addDocument(doc);
+                    }
+                }
+                writer.commit();
+            }
+        }
+        QuickwitSplit.SplitConfig splitConfig = new QuickwitSplit.SplitConfig(
+                "json-idx", "json-src", "json-node");
+        QuickwitSplit.SplitMetadata metadata = QuickwitSplit.convertIndexFromPath(
+                dir.resolve("idx_" + tag).toString(),
+                dir.resolve(tag + ".split").toString(), splitConfig);
+
+        String splitUrl = "file://" + dir.resolve(tag + ".split").toAbsolutePath();
+        return cacheManager.createSplitSearcher(splitUrl, metadata);
+    }
+
+    @Test
+    @Order(110)
+    @DisplayName("Complex type hints: struct type hint produces Arrow struct format")
+    void testStructTypeHint(@TempDir Path dir) throws Exception {
+        try (SplitSearcher searcher = createJsonFieldSplit(dir, "struct_hint", 5)) {
+            String queryJson = new SplitMatchAllQuery().toQueryAstJson();
+
+            // Type hint: data field should be Arrow Struct with name (string) and age (i32)
+            String[] typeHints = new String[] {
+                "data", "{\"struct\": {\"name\": \"string\", \"age\": \"i32\"}}"
+            };
+
+            try (SplitSearcher.StreamingSession session = searcher.startStreamingRetrieval(
+                    queryJson, new String[]{"data"}, typeHints)) {
+                int numCols = session.getColumnCount();
+                assertEquals(1, numCols, "Should have 1 projected column (data)");
+
+                long[][] structs = allocateFfiStructs(numCols);
+                try {
+                    int rows = session.nextBatch(structs[0], structs[1]);
+                    assertTrue(rows > 0, "Should retrieve at least 1 row");
+
+                    // Verify the schema format is "+s" (Arrow struct format string)
+                    String fmt = readSchemaFormat(structs[1][0]);
+                    assertEquals("+s", fmt,
+                            "data column should have Arrow struct format (+s), got: " + fmt);
+
+                    // Verify column name
+                    String name = readSchemaName(structs[1][0]);
+                    assertEquals("data", name, "Column name should be 'data'");
+                } finally {
+                    freeFfiStructs(structs[0], structs[1]);
+                }
+            }
+        }
+    }
+
+    @Test
+    @Order(111)
+    @DisplayName("Complex type hints: list type hint produces Arrow list format")
+    void testListTypeHint(@TempDir Path dir) throws Exception {
+        try (SplitSearcher searcher = createJsonFieldSplit(dir, "list_hint", 5)) {
+            String queryJson = new SplitMatchAllQuery().toQueryAstJson();
+
+            // Type hint: data field as list of strings
+            String[] typeHints = new String[] {
+                "data", "{\"list\": \"string\"}"
+            };
+
+            try (SplitSearcher.StreamingSession session = searcher.startStreamingRetrieval(
+                    queryJson, new String[]{"data"}, typeHints)) {
+                int numCols = session.getColumnCount();
+                assertEquals(1, numCols);
+
+                long[][] structs = allocateFfiStructs(numCols);
+                try {
+                    int rows = session.nextBatch(structs[0], structs[1]);
+                    assertTrue(rows > 0, "Should retrieve at least 1 row");
+
+                    // Arrow list format is "+l"
+                    String fmt = readSchemaFormat(structs[1][0]);
+                    assertEquals("+l", fmt,
+                            "data column should have Arrow list format (+l), got: " + fmt);
+                } finally {
+                    freeFfiStructs(structs[0], structs[1]);
+                }
+            }
+        }
+    }
+
+    @Test
+    @Order(112)
+    @DisplayName("Complex type hints: map type hint produces Arrow map format")
+    void testMapTypeHint(@TempDir Path dir) throws Exception {
+        try (SplitSearcher searcher = createJsonFieldSplit(dir, "map_hint", 5)) {
+            String queryJson = new SplitMatchAllQuery().toQueryAstJson();
+
+            // Type hint: data field as map<string, string>
+            String[] typeHints = new String[] {
+                "data", "{\"map\": [\"string\", \"string\"]}"
+            };
+
+            try (SplitSearcher.StreamingSession session = searcher.startStreamingRetrieval(
+                    queryJson, new String[]{"data"}, typeHints)) {
+                int numCols = session.getColumnCount();
+                assertEquals(1, numCols);
+
+                long[][] structs = allocateFfiStructs(numCols);
+                try {
+                    int rows = session.nextBatch(structs[0], structs[1]);
+                    assertTrue(rows > 0, "Should retrieve at least 1 row");
+
+                    // Arrow map format is "+m"
+                    String fmt = readSchemaFormat(structs[1][0]);
+                    assertEquals("+m", fmt,
+                            "data column should have Arrow map format (+m), got: " + fmt);
+                } finally {
+                    freeFfiStructs(structs[0], structs[1]);
+                }
+            }
+        }
+    }
+
+    @Test
+    @Order(113)
+    @DisplayName("Complex type hints: struct with nested list produces correct format")
+    void testNestedStructListTypeHint(@TempDir Path dir) throws Exception {
+        try (SplitSearcher searcher = createJsonFieldSplit(dir, "nested_hint", 5)) {
+            String queryJson = new SplitMatchAllQuery().toQueryAstJson();
+
+            // Type hint: struct with name (string) and tags (list of strings)
+            String[] typeHints = new String[] {
+                "data", "{\"struct\": {\"name\": \"string\", \"tags\": {\"list\": \"string\"}}}"
+            };
+
+            try (SplitSearcher.StreamingSession session = searcher.startStreamingRetrieval(
+                    queryJson, new String[]{"data"}, typeHints)) {
+                int numCols = session.getColumnCount();
+                assertEquals(1, numCols);
+
+                long[][] structs = allocateFfiStructs(numCols);
+                try {
+                    int rows = session.nextBatch(structs[0], structs[1]);
+                    assertTrue(rows > 0, "Should retrieve at least 1 row");
+
+                    // Top-level should be struct
+                    String fmt = readSchemaFormat(structs[1][0]);
+                    assertEquals("+s", fmt,
+                            "Nested struct should have Arrow struct format (+s), got: " + fmt);
+
+                    // Verify the number of child schemas (struct has 2 fields: name, tags)
+                    // ArrowSchema layout: format(0), name(8), metadata(16), flags(24), n_children(32)
+                    long nChildren = unsafe.getLong(structs[1][0] + 32);
+                    assertEquals(2, nChildren,
+                            "Struct should have 2 children (name, tags), got: " + nChildren);
+                } finally {
+                    freeFfiStructs(structs[0], structs[1]);
+                }
+            }
+        }
+    }
+
+    @Test
+    @Order(114)
+    @DisplayName("Complex type hints: mixed scalar and complex type hints in same session")
+    void testMixedScalarAndComplexTypeHints(@TempDir Path dir) throws Exception {
+        try (SplitSearcher searcher = createJsonFieldSplit(dir, "mixed_hint", 10)) {
+            String queryJson = new SplitMatchAllQuery().toQueryAstJson();
+
+            // Mixed: title as utf8 (scalar), data as struct (complex)
+            String[] typeHints = new String[] {
+                "title", "utf8",
+                "data", "{\"struct\": {\"name\": \"string\", \"age\": \"i32\"}}"
+            };
+
+            try (SplitSearcher.StreamingSession session = searcher.startStreamingRetrieval(
+                    queryJson, new String[]{"title", "data"}, typeHints)) {
+                int numCols = session.getColumnCount();
+                assertEquals(2, numCols, "Should have 2 projected columns");
+
+                long[][] structs = allocateFfiStructs(numCols);
+                try {
+                    int rows = session.nextBatch(structs[0], structs[1]);
+                    assertTrue(rows > 0, "Should retrieve rows");
+
+                    Map<String, Integer> colMap = buildColumnMap(structs[1], numCols);
+
+                    // title should be utf8
+                    if (colMap.containsKey("title")) {
+                        String titleFmt = readSchemaFormat(structs[1][colMap.get("title")]);
+                        assertTrue(titleFmt.equals("u") || titleFmt.equals("U"),
+                                "title should be utf8 (u/U), got: " + titleFmt);
+                    }
+
+                    // data should be struct
+                    if (colMap.containsKey("data")) {
+                        String dataFmt = readSchemaFormat(structs[1][colMap.get("data")]);
+                        assertEquals("+s", dataFmt,
+                                "data should be struct (+s), got: " + dataFmt);
+                    }
+                } finally {
+                    freeFfiStructs(structs[0], structs[1]);
+                }
+            }
+        }
+    }
+
+    @Test
+    @Order(115)
+    @DisplayName("Complex type hints: row count matches across batches")
+    void testComplexTypeHintMultipleBatches(@TempDir Path dir) throws Exception {
+        // Use enough docs that we might get multiple batches
+        try (SplitSearcher searcher = createJsonFieldSplit(dir, "multi_batch", 50)) {
+            String queryJson = new SplitMatchAllQuery().toQueryAstJson();
+
+            String[] typeHints = new String[] {
+                "data", "{\"struct\": {\"name\": \"string\", \"age\": \"i32\"}}"
+            };
+
+            // Count total rows from streaming with struct type hint
+            int streamTotal = 0;
+            try (SplitSearcher.StreamingSession session = searcher.startStreamingRetrieval(
+                    queryJson, new String[]{"data"}, typeHints)) {
+                int numCols = session.getColumnCount();
+                while (true) {
+                    long[][] structs = allocateFfiStructs(numCols);
+                    try {
+                        int rows = session.nextBatch(structs[0], structs[1]);
+                        if (rows <= 0) break;
+                        streamTotal += rows;
+                    } finally {
+                        freeFfiStructs(structs[0], structs[1]);
+                    }
+                }
+            }
+
+            // Compare with baseline search
+            SearchResult baseline = searcher.search(new SplitMatchAllQuery(), 1000);
+            assertEquals(baseline.getHits().size(), streamTotal,
+                    "Streaming with struct type hints should return same row count as search()");
+        }
+    }
 }

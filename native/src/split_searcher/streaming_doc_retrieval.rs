@@ -16,10 +16,11 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use arrow_array::builder::*;
-use arrow_array::RecordBatch;
-use arrow_schema::{DataType, Field, Schema, TimeUnit};
+use arrow_array::{ArrayRef, RecordBatch, StructArray, ListArray, MapArray};
+use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
+use arrow_schema::{DataType, Field, Fields, FieldRef, Schema, TimeUnit};
 use tantivy::schema::{FieldEntry, FieldType, OwnedValue};
 use tokio::sync::mpsc;
 
@@ -505,6 +506,14 @@ fn build_arrow_column(
             }
             Ok(Arc::new(builder.finish()))
         }
+        // Complex types: Struct, List, Map — extract OwnedValues and build recursively
+        DataType::Struct(_) | DataType::List(_) | DataType::LargeList(_) | DataType::Map(_, _) => {
+            let values: Vec<Option<OwnedValue>> = docs
+                .iter()
+                .map(|doc| find_first_value(doc, field))
+                .collect();
+            owned_values_to_arrow(&values, arrow_type)
+        }
         _ => {
             // Fallback: treat as Utf8
             let mut builder = StringBuilder::with_capacity(num_rows, num_rows * 32);
@@ -581,9 +590,352 @@ fn owned_value_to_json(value: &OwnedValue) -> serde_json::Value {
     }
 }
 
+// =============================================================================
+// OwnedValue → Arrow complex type conversion
+// =============================================================================
+//
+// Converts tantivy OwnedValue (Object, Array) to proper Arrow StructArray,
+// ListArray, MapArray based on a target DataType provided via type hints.
+//
+// This is the reverse of convert_arrow_to_owned_value() in indexing.rs (PR #114).
+// The write path does Arrow → OwnedValue; this does OwnedValue → Arrow.
+
+/// Convert a batch of OwnedValues to an Arrow array of the target DataType.
+///
+/// Handles complex types (Struct, List, Map) recursively, with scalar leaf types.
+/// Each element in `values` corresponds to one row; `None` means null.
+fn owned_values_to_arrow(
+    values: &[Option<OwnedValue>],
+    target_type: &DataType,
+) -> Result<ArrayRef> {
+    match target_type {
+        DataType::Struct(fields) => build_struct_from_owned_values(values, fields),
+        DataType::List(inner) => build_list_from_owned_values(values, inner),
+        DataType::LargeList(inner) => build_list_from_owned_values(values, inner),
+        DataType::Map(entries_field, sorted) => {
+            build_map_from_owned_values(values, entries_field, *sorted)
+        }
+        _ => build_scalar_from_owned_values(values, target_type),
+    }
+}
+
+/// Build a StructArray from OwnedValue::Object values.
+///
+/// For each struct field, extracts the matching entry from each OwnedValue::Object
+/// and recursively builds the child column. Missing fields become nulls.
+fn build_struct_from_owned_values(
+    values: &[Option<OwnedValue>],
+    fields: &Fields,
+) -> Result<ArrayRef> {
+    let mut columns: Vec<ArrayRef> = Vec::with_capacity(fields.len());
+
+    for field in fields.iter() {
+        // Extract this field's value from each row's OwnedValue::Object
+        let field_values: Vec<Option<OwnedValue>> = values
+            .iter()
+            .map(|opt| {
+                opt.as_ref().and_then(|v| match v {
+                    OwnedValue::Object(entries) => entries
+                        .iter()
+                        .find(|(k, _)| k == field.name())
+                        .map(|(_, v)| v.clone()),
+                    _ => None,
+                })
+            })
+            .collect();
+
+        let col = owned_values_to_arrow(&field_values, field.data_type())?;
+        columns.push(col);
+    }
+
+    // Build null buffer: null if the row's OwnedValue was None
+    let null_flags: Vec<bool> = values.iter().map(|v| v.is_some()).collect();
+    let null_buffer = NullBuffer::from(null_flags);
+
+    Ok(Arc::new(StructArray::new(
+        fields.clone(),
+        columns,
+        Some(null_buffer),
+    )))
+}
+
+/// Build a ListArray from OwnedValue::Array values.
+///
+/// Flattens all list elements into a single child array with an offsets buffer
+/// tracking where each row's list starts and ends.
+fn build_list_from_owned_values(
+    values: &[Option<OwnedValue>],
+    inner_field: &FieldRef,
+) -> Result<ArrayRef> {
+    let num_rows = values.len();
+    let mut offsets: Vec<i32> = Vec::with_capacity(num_rows + 1);
+    let mut all_elements: Vec<Option<OwnedValue>> = Vec::new();
+    let mut null_flags: Vec<bool> = Vec::with_capacity(num_rows);
+
+    offsets.push(0);
+    for v in values {
+        match v {
+            Some(OwnedValue::Array(items)) => {
+                for item in items {
+                    all_elements.push(Some(item.clone()));
+                }
+                offsets.push(all_elements.len() as i32);
+                null_flags.push(true);
+            }
+            None => {
+                offsets.push(all_elements.len() as i32);
+                null_flags.push(false);
+            }
+            Some(_) => {
+                // Non-array value in a list column — treat as null
+                offsets.push(all_elements.len() as i32);
+                null_flags.push(false);
+            }
+        }
+    }
+
+    let element_array = owned_values_to_arrow(&all_elements, inner_field.data_type())?;
+    let offsets_buffer = OffsetBuffer::new(ScalarBuffer::from(offsets));
+    let null_buffer = NullBuffer::from(null_flags);
+
+    Ok(Arc::new(ListArray::new(
+        inner_field.clone(),
+        offsets_buffer,
+        element_array,
+        Some(null_buffer),
+    )))
+}
+
+/// Build a MapArray from OwnedValue::Object values.
+///
+/// Each OwnedValue::Object's key-value pairs become entries in the map.
+/// Keys are always converted to the target key type; values are recursively converted.
+fn build_map_from_owned_values(
+    values: &[Option<OwnedValue>],
+    entries_field: &FieldRef,
+    sorted: bool,
+) -> Result<ArrayRef> {
+    let struct_fields = match entries_field.data_type() {
+        DataType::Struct(fields) => fields,
+        _ => return Err(anyhow!("Map entries field must be Struct, got {:?}", entries_field.data_type())),
+    };
+    if struct_fields.len() != 2 {
+        return Err(anyhow!("Map entries must have exactly 2 fields (key, value)"));
+    }
+    let key_field = &struct_fields[0];
+    let value_field = &struct_fields[1];
+
+    let num_rows = values.len();
+    let mut offsets: Vec<i32> = Vec::with_capacity(num_rows + 1);
+    let mut all_keys: Vec<Option<OwnedValue>> = Vec::new();
+    let mut all_values: Vec<Option<OwnedValue>> = Vec::new();
+    let mut null_flags: Vec<bool> = Vec::with_capacity(num_rows);
+
+    offsets.push(0);
+    for v in values {
+        match v {
+            Some(OwnedValue::Object(entries)) => {
+                for (k, val) in entries {
+                    all_keys.push(Some(OwnedValue::Str(k.clone())));
+                    all_values.push(Some(val.clone()));
+                }
+                offsets.push(all_keys.len() as i32);
+                null_flags.push(true);
+            }
+            None => {
+                offsets.push(all_keys.len() as i32);
+                null_flags.push(false);
+            }
+            Some(_) => {
+                offsets.push(all_keys.len() as i32);
+                null_flags.push(false);
+            }
+        }
+    }
+
+    let keys_array = owned_values_to_arrow(&all_keys, key_field.data_type())?;
+    let values_array = owned_values_to_arrow(&all_values, value_field.data_type())?;
+
+    // Build the inner struct (entries are not individually nullable in a Map)
+    let entries_struct = StructArray::new(
+        struct_fields.clone(),
+        vec![keys_array, values_array],
+        None,
+    );
+
+    let offsets_buffer = OffsetBuffer::new(ScalarBuffer::from(offsets));
+    let null_buffer = NullBuffer::from(null_flags);
+
+    Ok(Arc::new(MapArray::new(
+        entries_field.clone(),
+        offsets_buffer,
+        entries_struct,
+        Some(null_buffer),
+        sorted,
+    )))
+}
+
+/// Build a scalar Arrow array from OwnedValues.
+///
+/// Handles all tantivy scalar types (Str, I64, U64, F64, Bool, Date, etc.)
+/// with best-effort type coercion to match the target DataType.
+fn build_scalar_from_owned_values(
+    values: &[Option<OwnedValue>],
+    target_type: &DataType,
+) -> Result<ArrayRef> {
+    let num_rows = values.len();
+    match target_type {
+        DataType::Utf8 => {
+            let mut builder = StringBuilder::with_capacity(num_rows, num_rows * 32);
+            for v in values {
+                match v {
+                    Some(OwnedValue::Str(s)) => builder.append_value(s),
+                    Some(OwnedValue::IpAddr(ip)) => builder.append_value(canonical_ip_string(ip)),
+                    Some(OwnedValue::Facet(f)) => builder.append_value(f.to_path_string()),
+                    Some(OwnedValue::PreTokStr(pts)) => builder.append_value(&pts.text),
+                    Some(OwnedValue::Object(_)) | Some(OwnedValue::Array(_)) => {
+                        builder.append_value(owned_value_to_json_string(v.as_ref().unwrap()));
+                    }
+                    Some(OwnedValue::I64(n)) => builder.append_value(n.to_string()),
+                    Some(OwnedValue::U64(n)) => builder.append_value(n.to_string()),
+                    Some(OwnedValue::F64(n)) => builder.append_value(n.to_string()),
+                    Some(OwnedValue::Bool(b)) => builder.append_value(b.to_string()),
+                    Some(OwnedValue::Null) | None => builder.append_null(),
+                    Some(other) => builder.append_value(format!("{:?}", other)),
+                }
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        DataType::Int64 => {
+            let mut builder = Int64Builder::with_capacity(num_rows);
+            for v in values {
+                match v {
+                    Some(OwnedValue::I64(n)) => builder.append_value(*n),
+                    Some(OwnedValue::U64(n)) => builder.append_value(*n as i64),
+                    _ => builder.append_null(),
+                }
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        DataType::Int32 => {
+            let mut builder = Int32Builder::with_capacity(num_rows);
+            for v in values {
+                match v {
+                    Some(OwnedValue::I64(n)) => builder.append_value(*n as i32),
+                    Some(OwnedValue::U64(n)) => builder.append_value(*n as i32),
+                    _ => builder.append_null(),
+                }
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        DataType::Int16 => {
+            let mut builder = Int16Builder::with_capacity(num_rows);
+            for v in values {
+                match v {
+                    Some(OwnedValue::I64(n)) => builder.append_value(*n as i16),
+                    Some(OwnedValue::U64(n)) => builder.append_value(*n as i16),
+                    _ => builder.append_null(),
+                }
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        DataType::Int8 => {
+            let mut builder = Int8Builder::with_capacity(num_rows);
+            for v in values {
+                match v {
+                    Some(OwnedValue::I64(n)) => builder.append_value(*n as i8),
+                    Some(OwnedValue::U64(n)) => builder.append_value(*n as i8),
+                    _ => builder.append_null(),
+                }
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        DataType::UInt64 => {
+            let mut builder = UInt64Builder::with_capacity(num_rows);
+            for v in values {
+                match v {
+                    Some(OwnedValue::U64(n)) => builder.append_value(*n),
+                    Some(OwnedValue::I64(n)) => builder.append_value(*n as u64),
+                    _ => builder.append_null(),
+                }
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        DataType::Float64 => {
+            let mut builder = Float64Builder::with_capacity(num_rows);
+            for v in values {
+                match v {
+                    Some(OwnedValue::F64(n)) => builder.append_value(*n),
+                    Some(OwnedValue::I64(n)) => builder.append_value(*n as f64),
+                    Some(OwnedValue::U64(n)) => builder.append_value(*n as u64 as f64),
+                    _ => builder.append_null(),
+                }
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        DataType::Float32 => {
+            let mut builder = Float32Builder::with_capacity(num_rows);
+            for v in values {
+                match v {
+                    Some(OwnedValue::F64(n)) => builder.append_value(*n as f32),
+                    Some(OwnedValue::I64(n)) => builder.append_value(*n as f32),
+                    _ => builder.append_null(),
+                }
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        DataType::Boolean => {
+            let mut builder = BooleanBuilder::with_capacity(num_rows);
+            for v in values {
+                match v {
+                    Some(OwnedValue::Bool(b)) => builder.append_value(*b),
+                    _ => builder.append_null(),
+                }
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        DataType::Timestamp(TimeUnit::Microsecond, _) => {
+            let mut builder = TimestampMicrosecondBuilder::with_capacity(num_rows);
+            for v in values {
+                match v {
+                    Some(OwnedValue::Date(dt)) => {
+                        let micros = dt.into_timestamp_nanos() / 1_000;
+                        builder.append_value(micros);
+                    }
+                    Some(OwnedValue::I64(n)) => builder.append_value(*n),
+                    _ => builder.append_null(),
+                }
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        DataType::Binary => {
+            let mut builder = BinaryBuilder::with_capacity(num_rows, num_rows * 64);
+            for v in values {
+                match v {
+                    Some(OwnedValue::Bytes(b)) => builder.append_value(b),
+                    _ => builder.append_null(),
+                }
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        _ => {
+            // Fallback: stringify everything
+            let mut builder = StringBuilder::with_capacity(num_rows, num_rows * 32);
+            for v in values {
+                match v {
+                    Some(val) => builder.append_value(format!("{:?}", val)),
+                    None => builder.append_null(),
+                }
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow_array::Array;
     use tantivy::schema::{SchemaBuilder, STORED, TEXT, FAST};
 
     #[test]
@@ -761,5 +1113,223 @@ mod tests {
             .downcast_ref::<arrow_array::Int8Array>()
             .expect("should be Int8Array");
         assert_eq!(byte_col.value(0), 42);
+    }
+
+    #[test]
+    fn test_owned_values_to_struct_array() {
+        let values = vec![
+            Some(OwnedValue::Object(vec![
+                ("name".to_string(), OwnedValue::Str("Alice".to_string())),
+                ("age".to_string(), OwnedValue::I64(30)),
+            ])),
+            Some(OwnedValue::Object(vec![
+                ("name".to_string(), OwnedValue::Str("Bob".to_string())),
+                ("age".to_string(), OwnedValue::I64(25)),
+            ])),
+            None, // null row
+        ];
+
+        let target = DataType::Struct(
+            vec![
+                Arc::new(Field::new("name", DataType::Utf8, true)),
+                Arc::new(Field::new("age", DataType::Int64, true)),
+            ]
+            .into(),
+        );
+
+        let array = owned_values_to_arrow(&values, &target).unwrap();
+        let struct_arr = array.as_any().downcast_ref::<StructArray>().unwrap();
+        assert_eq!(struct_arr.len(), 3);
+
+        // Check name column
+        let names = struct_arr.column(0).as_any()
+            .downcast_ref::<arrow_array::StringArray>().unwrap();
+        assert_eq!(names.value(0), "Alice");
+        assert_eq!(names.value(1), "Bob");
+        assert!(struct_arr.is_null(2)); // whole struct is null
+
+        // Check age column
+        let ages = struct_arr.column(1).as_any()
+            .downcast_ref::<arrow_array::Int64Array>().unwrap();
+        assert_eq!(ages.value(0), 30);
+        assert_eq!(ages.value(1), 25);
+    }
+
+    #[test]
+    fn test_owned_values_to_list_array() {
+        let values = vec![
+            Some(OwnedValue::Array(vec![
+                OwnedValue::Str("a".to_string()),
+                OwnedValue::Str("b".to_string()),
+                OwnedValue::Str("c".to_string()),
+            ])),
+            Some(OwnedValue::Array(vec![
+                OwnedValue::Str("x".to_string()),
+            ])),
+            None, // null list
+            Some(OwnedValue::Array(vec![])), // empty list
+        ];
+
+        let target = DataType::List(Arc::new(Field::new("item", DataType::Utf8, true)));
+
+        let array = owned_values_to_arrow(&values, &target).unwrap();
+        let list_arr = array.as_any().downcast_ref::<ListArray>().unwrap();
+        assert_eq!(list_arr.len(), 4);
+
+        // Row 0: ["a", "b", "c"]
+        let row0 = list_arr.value(0);
+        let strs = row0.as_any().downcast_ref::<arrow_array::StringArray>().unwrap();
+        assert_eq!(strs.len(), 3);
+        assert_eq!(strs.value(0), "a");
+        assert_eq!(strs.value(1), "b");
+        assert_eq!(strs.value(2), "c");
+
+        // Row 1: ["x"]
+        let row1 = list_arr.value(1);
+        assert_eq!(row1.len(), 1);
+
+        // Row 2: null
+        assert!(list_arr.is_null(2));
+
+        // Row 3: empty list
+        assert!(!list_arr.is_null(3));
+        assert_eq!(list_arr.value(3).len(), 0);
+    }
+
+    #[test]
+    fn test_owned_values_to_map_array() {
+        let values = vec![
+            Some(OwnedValue::Object(vec![
+                ("key1".to_string(), OwnedValue::I64(100)),
+                ("key2".to_string(), OwnedValue::I64(200)),
+            ])),
+            None, // null map
+        ];
+
+        let entries_field = Field::new(
+            "entries",
+            DataType::Struct(
+                vec![
+                    Arc::new(Field::new("key", DataType::Utf8, false)),
+                    Arc::new(Field::new("value", DataType::Int64, true)),
+                ]
+                .into(),
+            ),
+            false,
+        );
+        let target = DataType::Map(Arc::new(entries_field), false);
+
+        let array = owned_values_to_arrow(&values, &target).unwrap();
+        let map_arr = array.as_any().downcast_ref::<MapArray>().unwrap();
+        assert_eq!(map_arr.len(), 2);
+
+        // Row 0: {"key1": 100, "key2": 200}
+        let entry0 = map_arr.value(0);
+        let keys_struct = entry0.as_any().downcast_ref::<StructArray>().unwrap();
+        let keys = keys_struct.column(0).as_any()
+            .downcast_ref::<arrow_array::StringArray>().unwrap();
+        assert_eq!(keys.value(0), "key1");
+        assert_eq!(keys.value(1), "key2");
+
+        let vals = keys_struct.column(1).as_any()
+            .downcast_ref::<arrow_array::Int64Array>().unwrap();
+        assert_eq!(vals.value(0), 100);
+        assert_eq!(vals.value(1), 200);
+
+        // Row 1: null
+        assert!(map_arr.is_null(1));
+    }
+
+    #[test]
+    fn test_owned_values_nested_struct_with_list() {
+        // Struct containing a List field
+        let values = vec![
+            Some(OwnedValue::Object(vec![
+                ("id".to_string(), OwnedValue::I64(1)),
+                ("tags".to_string(), OwnedValue::Array(vec![
+                    OwnedValue::Str("rust".to_string()),
+                    OwnedValue::Str("arrow".to_string()),
+                ])),
+            ])),
+        ];
+
+        let target = DataType::Struct(
+            vec![
+                Arc::new(Field::new("id", DataType::Int64, true)),
+                Arc::new(Field::new(
+                    "tags",
+                    DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+                    true,
+                )),
+            ]
+            .into(),
+        );
+
+        let array = owned_values_to_arrow(&values, &target).unwrap();
+        let struct_arr = array.as_any().downcast_ref::<StructArray>().unwrap();
+        assert_eq!(struct_arr.len(), 1);
+
+        // Check id
+        let ids = struct_arr.column(0).as_any()
+            .downcast_ref::<arrow_array::Int64Array>().unwrap();
+        assert_eq!(ids.value(0), 1);
+
+        // Check tags list
+        let tags = struct_arr.column(1).as_any()
+            .downcast_ref::<ListArray>().unwrap();
+        let tag_vals = tags.value(0);
+        let strs = tag_vals.as_any().downcast_ref::<arrow_array::StringArray>().unwrap();
+        assert_eq!(strs.len(), 2);
+        assert_eq!(strs.value(0), "rust");
+        assert_eq!(strs.value(1), "arrow");
+    }
+
+    #[test]
+    fn test_build_arrow_column_struct_via_type_hint() {
+        // End-to-end: tantivy doc with JSON field → struct column via type hint
+        let mut sb = SchemaBuilder::new();
+        let json_field = sb.add_json_field("data", tantivy::schema::STORED);
+        let schema = sb.build();
+
+        let mut hints = HashMap::new();
+        hints.insert(
+            "data".to_string(),
+            DataType::Struct(
+                vec![
+                    Arc::new(Field::new("x", DataType::Float64, true)),
+                    Arc::new(Field::new("y", DataType::Float64, true)),
+                ]
+                .into(),
+            ),
+        );
+
+        let (arrow_schema, field_mapping) =
+            tantivy_schema_to_arrow(&schema, None, Some(&hints)).unwrap();
+
+        // Verify schema has Struct type, not Utf8
+        assert!(matches!(
+            arrow_schema.field(0).data_type(),
+            DataType::Struct(_)
+        ));
+
+        // Build a doc with JSON object
+        let mut doc = tantivy::TantivyDocument::default();
+        let mut obj = std::collections::BTreeMap::new();
+        obj.insert("x".to_string(), OwnedValue::F64(1.5));
+        obj.insert("y".to_string(), OwnedValue::F64(2.5));
+        doc.add_object(json_field, obj);
+
+        let batch = docs_to_record_batch(&[doc], &arrow_schema, &field_mapping).unwrap();
+        let struct_col = batch.column(0).as_any()
+            .downcast_ref::<StructArray>()
+            .expect("should be StructArray, not StringArray");
+
+        let x = struct_col.column(0).as_any()
+            .downcast_ref::<arrow_array::Float64Array>().unwrap();
+        assert_eq!(x.value(0), 1.5);
+
+        let y = struct_col.column(1).as_any()
+            .downcast_ref::<arrow_array::Float64Array>().unwrap();
+        assert_eq!(y.value(0), 2.5);
     }
 }
