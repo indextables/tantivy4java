@@ -546,6 +546,201 @@ public class SplitSearcher implements AutoCloseable {
     }
 
     /**
+     * Fused companion-mode search + retrieval: executes a no-score search and returns
+     * matching rows as Arrow columnar data in a single JNI call.
+     *
+     * <p>Optimized for companion splits where scores are not needed. Eliminates:
+     * <ul>
+     *   <li>BM25 scoring overhead (term frequencies not decompressed)</li>
+     *   <li>PartialHit protobuf allocation (no split_id strings, no sort values)</li>
+     *   <li>JNI round-trip of doc addresses (resolved entirely in native code)</li>
+     * </ul>
+     *
+     * <p>For small-to-medium result sets. For larger results (&gt; 50K rows),
+     * use the streaming retrieval API which bounds memory via batching.
+     *
+     * @param queryAstJson  Quickwit query AST JSON string
+     * @param arrayAddrs    pre-allocated ArrowArray memory addresses (one per field)
+     * @param schemaAddrs   pre-allocated ArrowSchema memory addresses (one per field)
+     * @param fields        field names to retrieve (null or empty for all fields)
+     * @return row count (&gt;0 = data, 0 = no matches, -1 = not a companion split)
+     */
+    public int searchAndRetrieveArrowFfi(String queryAstJson,
+                                         long[] arrayAddrs, long[] schemaAddrs,
+                                         String... fields) {
+        if (nativePtr == 0) {
+            throw new IllegalStateException("SplitSearcher has been closed or not properly initialized");
+        }
+        return nativeSearchAndRetrieveArrowFfi(nativePtr, queryAstJson,
+                fields != null && fields.length > 0 ? fields : null,
+                arrayAddrs, schemaAddrs);
+    }
+
+    // =========================================================================
+    // Streaming Retrieval API (companion mode, large result sets > 50K rows)
+    // =========================================================================
+
+    /**
+     * A streaming retrieval session that implements AutoCloseable for safe resource management.
+     *
+     * <p>Wraps a native session handle with double-close protection and lifecycle tracking.
+     * Use with try-with-resources for automatic cleanup:
+     *
+     * <pre>{@code
+     * try (StreamingSession session = searcher.startStreamingRetrieval(queryJson, "field1")) {
+     *     int numCols = session.getColumnCount();
+     *     long[] arrayAddrs = new long[numCols];
+     *     long[] schemaAddrs = new long[numCols];
+     *     int rows;
+     *     while ((rows = session.nextBatch(arrayAddrs, schemaAddrs)) > 0) {
+     *         // process batch...
+     *     }
+     * }
+     * }</pre>
+     */
+    public static class StreamingSession implements AutoCloseable {
+        private long handle;
+        private volatile boolean closed = false;
+
+        StreamingSession(long handle) {
+            this.handle = handle;
+        }
+
+        /**
+         * Poll the next batch from the streaming session.
+         *
+         * @param arrayAddrs  pre-allocated ArrowArray memory addresses (one per column)
+         * @param schemaAddrs pre-allocated ArrowSchema memory addresses (one per column)
+         * @return row count (&gt;0 = data, 0 = end of stream)
+         * @throws IllegalStateException if session is closed
+         */
+        public synchronized int nextBatch(long[] arrayAddrs, long[] schemaAddrs) {
+            if (closed) {
+                throw new IllegalStateException("Streaming session has been closed");
+            }
+            return nativeNextBatch(handle, arrayAddrs, schemaAddrs);
+        }
+
+        /**
+         * Get the number of columns in the output schema.
+         *
+         * @return number of columns
+         * @throws IllegalStateException if session is closed
+         */
+        public synchronized int getColumnCount() {
+            if (closed) {
+                throw new IllegalStateException("Streaming session has been closed");
+            }
+            return nativeGetStreamingColumnCount(handle);
+        }
+
+        /**
+         * Get the native handle. For use by legacy code that needs the raw handle.
+         *
+         * @return native session handle, or 0 if closed
+         */
+        public long getHandle() {
+            return closed ? 0 : handle;
+        }
+
+        /**
+         * Close the session and free native resources.
+         * Safe to call multiple times — subsequent calls are no-ops.
+         */
+        @Override
+        public synchronized void close() {
+            if (!closed && handle != 0) {
+                nativeCloseStreamingSession(handle);
+                handle = 0;
+                closed = true;
+            }
+        }
+    }
+
+    /**
+     * Start a streaming bulk retrieval session for companion mode.
+     *
+     * <p>Unlike {@link #searchAndRetrieveArrowFfi} which materializes all results
+     * in a single call, this starts a background producer that streams results in
+     * ~128K-row batches through a bounded channel. Memory usage is bounded to ~24MB
+     * regardless of total result size.
+     *
+     * <p>Returns a {@link StreamingSession} that implements {@link AutoCloseable}
+     * for safe resource management. Use with try-with-resources:
+     *
+     * <pre>{@code
+     * try (StreamingSession session = searcher.startStreamingRetrieval(queryJson, "field1")) {
+     *     int numCols = session.getColumnCount();
+     *     long[] arrayAddrs = new long[numCols];
+     *     long[] schemaAddrs = new long[numCols];
+     *     int rows;
+     *     while ((rows = session.nextBatch(arrayAddrs, schemaAddrs)) > 0) {
+     *         // process batch...
+     *     }
+     * }
+     * }</pre>
+     *
+     * @param queryAstJson Quickwit query AST JSON string
+     * @param fields       field names to retrieve (null or empty for all fields)
+     * @return streaming session (implements AutoCloseable)
+     * @throws IllegalStateException if searcher is closed or not a companion split
+     */
+    public StreamingSession startStreamingRetrieval(String queryAstJson, String... fields) {
+        if (nativePtr == 0) {
+            throw new IllegalStateException("SplitSearcher has been closed or not properly initialized");
+        }
+        long session = nativeStartStreamingRetrieval(nativePtr, queryAstJson,
+                fields != null && fields.length > 0 ? fields : null);
+        if (session == 0) {
+            throw new IllegalStateException(
+                    "Failed to start streaming retrieval — not a companion split or query error");
+        }
+        return new StreamingSession(session);
+    }
+
+    /**
+     * Poll the next batch from a streaming retrieval session.
+     *
+     * @deprecated Use {@link StreamingSession#nextBatch} instead for type-safe lifecycle management.
+     * @param sessionHandle handle from startStreamingRetrieval
+     * @param arrayAddrs    pre-allocated ArrowArray memory addresses
+     * @param schemaAddrs   pre-allocated ArrowSchema memory addresses
+     * @return row count (&gt;0 = data, 0 = end of stream, -1 = error)
+     */
+    @Deprecated
+    public int nextBatch(long sessionHandle, long[] arrayAddrs, long[] schemaAddrs) {
+        return nativeNextBatch(sessionHandle, arrayAddrs, schemaAddrs);
+    }
+
+    /**
+     * Close a streaming retrieval session and free native resources.
+     *
+     * <p>Safe to call multiple times — the native layer uses a registry pattern
+     * so duplicate close calls are no-ops.
+     *
+     * @deprecated Use {@link StreamingSession#close} instead for type-safe lifecycle management.
+     * @param sessionHandle handle from startStreamingRetrieval
+     */
+    @Deprecated
+    public void closeStreamingSession(long sessionHandle) {
+        if (sessionHandle != 0) {
+            nativeCloseStreamingSession(sessionHandle);
+        }
+    }
+
+    /**
+     * Get the number of columns in a streaming session's output schema.
+     *
+     * @deprecated Use {@link StreamingSession#getColumnCount} instead.
+     * @param sessionHandle handle from startStreamingRetrieval
+     * @return number of columns, or -1 on error
+     */
+    @Deprecated
+    public int getStreamingColumnCount(long sessionHandle) {
+        return nativeGetStreamingColumnCount(sessionHandle);
+    }
+
+    /**
      * Retrieve multiple documents by their addresses in a single batch operation.
      * This is significantly more efficient than calling doc() multiple times,
      * especially for large numbers of documents.
@@ -1294,6 +1489,16 @@ public class SplitSearcher implements AutoCloseable {
     private static native byte[] nativeDocBatchProjected(long nativePtr, int[] segments, int[] docIds, String[] fields);
     private static native int nativeDocBatchArrowFfi(long nativePtr, int[] segments, int[] docIds, String[] fields,
                                                      long[] arrayAddrs, long[] schemaAddrs);
+
+    // Fused search + retrieve (companion mode optimization)
+    private static native int nativeSearchAndRetrieveArrowFfi(long nativePtr, String queryAstJson, String[] fields,
+                                                              long[] arrayAddrs, long[] schemaAddrs);
+
+    // Streaming retrieval session (companion mode, large result sets)
+    private static native long nativeStartStreamingRetrieval(long nativePtr, String queryAstJson, String[] fields);
+    private static native int nativeNextBatch(long sessionPtr, long[] arrayAddrs, long[] schemaAddrs);
+    private static native void nativeCloseStreamingSession(long sessionPtr);
+    private static native int nativeGetStreamingColumnCount(long sessionPtr);
 
     // Smart Wildcard Optimization Statistics (for testing/monitoring)
     private static native void resetSmartWildcardStats();

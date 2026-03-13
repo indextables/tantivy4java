@@ -27,6 +27,8 @@ pub mod hash_field_rewriter;
 pub mod hash_touchup;
 pub mod string_indexing;
 pub(crate) mod page_index;
+pub mod streaming_ffi;
+pub mod read_strategy;
 
 pub use manifest::{
     ParquetManifest, FastFieldMode, SegmentRowRange, ParquetFileEntry,
