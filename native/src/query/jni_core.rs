@@ -55,7 +55,53 @@ pub extern "system" fn Java_io_indextables_tantivy4java_query_Query_nativeTermQu
             // SAFETY: We've validated field_value is not null above
             JObject::from_raw(field_value)
         };
-        
+
+        // IP CIDR/wildcard expansion: for IpAddr fields, transparently expand CIDR or wildcard
+        // patterns to a RangeQuery before falling through to the normal TermQuery path.
+        // Fast path: try_expand_ip_range returns None with zero allocation for regular IPs.
+        if let tantivy::schema::FieldType::IpAddr(_) = field_type {
+            let ip_string_result: Result<String, String> =
+                env.call_method(&field_value_obj, "toString", "()Ljava/lang/String;", &[])
+                    .and_then(|r| r.l())
+                    .and_then(|s| env.get_string(&JString::from(s)).map(|js| js.into()))
+                    .map_err(|e| format!("Failed to get IP string for expansion check: {}", e));
+
+            if let Ok(ip_string) = ip_string_result {
+                if let Some((lower_str, upper_str)) = crate::ip_expansion::try_expand_ip_range(&ip_string) {
+                    // Match-all case: *.*.*.*  or  /0
+                    if crate::ip_expansion::is_match_all_range(&lower_str, &upper_str) {
+                        return Ok(Box::new(AllQuery) as Box<dyn TantivyQuery>);
+                    }
+
+                    let lower_ip: std::net::IpAddr = lower_str.parse()
+                        .map_err(|_| format!("Invalid lower IP in CIDR/wildcard expansion: {}", lower_str))?;
+                    let upper_ip: std::net::IpAddr = upper_str.parse()
+                        .map_err(|_| format!("Invalid upper IP in CIDR/wildcard expansion: {}", upper_str))?;
+
+                    // Tantivy stores all IPs as IPv4-mapped IPv6 internally
+                    let lower_ipv6 = match lower_ip {
+                        std::net::IpAddr::V4(v4) => v4.to_ipv6_mapped(),
+                        std::net::IpAddr::V6(v6) => v6,
+                    };
+                    let upper_ipv6 = match upper_ip {
+                        std::net::IpAddr::V4(v4) => v4.to_ipv6_mapped(),
+                        std::net::IpAddr::V6(v6) => v6,
+                    };
+
+                    let lower_term = Term::from_field_ip_addr(field, lower_ipv6);
+                    let upper_term = Term::from_field_ip_addr(field, upper_ipv6);
+
+                    use std::ops::Bound;
+                    use tantivy::query::RangeQuery as TantivyRangeQuery;
+                    let range_query = TantivyRangeQuery::new(
+                        Bound::Included(lower_term),
+                        Bound::Included(upper_term),
+                    );
+                    return Ok(Box::new(range_query) as Box<dyn TantivyQuery>);
+                }
+            }
+        }
+
         // Create term based on field type and value type
         let term = match field_type {
             tantivy::schema::FieldType::Str(text_options) => {

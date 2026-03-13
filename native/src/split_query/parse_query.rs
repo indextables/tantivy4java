@@ -57,6 +57,37 @@ pub fn parse_query_string(
         default_fields_vec
     );
 
+    // Pre-process the query string: expand IP CIDR/wildcard patterns into explicit range syntax.
+    //
+    // Step A — when a single default field is set, prefix any bare CIDR/wildcard/quoted-IPv6
+    //   tokens with the field name so that Step B can expand them uniformly.
+    //   This handles the Spark `indexquery` operator which passes field name separately:
+    //     parseQuery("192.168.1.0/24", "ip")   → prefix → "ip:192.168.1.0/24"
+    //     parseQuery("192.168.1.0/24 OR 10.0.0.0/8", "ip")
+    //                                          → prefix → "ip:192.168.1.0/24 OR ip:10.0.0.0/8"
+    //     parseQuery("\"2001:db8::/32\"", "ip") → prefix → "ip:\"2001:db8::/32\""
+    //
+    // Step B — rewrite all field:CIDR and field:"quoted-CIDR" tokens to range syntax:
+    //     "ip:192.168.1.0/24"       → "ip:[192.168.1.0 TO 192.168.1.255]"
+    //     "ip:\"2001:db8::/32\""    → "ip:[2001:db8:: TO 2001:db8:ffff:...]"
+    // Outer fast-path: skip both preprocessing steps when no IP patterns are possible.
+    // This avoids two separate string clones in the common case (pure text queries).
+    // Both inner functions carry their own guards as a safety net for direct callers.
+    let query_str = if query_str.contains('/') || query_str.contains('*') {
+        let after_prefix = if default_fields_vec.len() == 1 {
+            prefix_bare_ip_tokens(&query_str, &default_fields_vec[0])
+        } else {
+            query_str
+        };
+        preprocess_ip_query_string(&after_prefix)
+    } else {
+        query_str
+    };
+    debug_println!(
+        "RUST DEBUG: After IP preprocessing, query_str: '{}'",
+        query_str
+    );
+
     // 🚀 PROPER QUICKWIT PARSING: Use Quickwit's proven two-step process
     // Step 1: Create UserInputQuery AST with proper default fields
     // Use None if default fields is empty to let Quickwit handle field-less queries properly
@@ -93,6 +124,11 @@ pub fn parse_query_string(
             return Err(anyhow!("Failed to parse query '{}': {}. This query requires explicit field names (e.g., 'field:term') or valid default search fields in the schema.", query_str, e));
         }
     };
+
+    // Post-process the parsed AST to transparently expand IP CIDR/wildcard patterns.
+    // This handles cases like "ip:192.168.1.0/24" where the parser may emit a
+    // TermQuery with a literal slash that needs to become a RangeQuery.
+    let parsed_ast = rewrite_ip_terms(parsed_ast);
 
     debug_println!("RUST DEBUG: 🎯 Final parsed QueryAst: {:?}", parsed_ast);
 
@@ -383,6 +419,260 @@ fn collect_fields_recursive(query_ast: &QueryAst, fields: &mut std::collections:
         QueryAst::MatchAll | QueryAst::MatchNone => {
             // No fields for match_all/match_none
         }
+    }
+}
+
+/// When a single default field is set, scan the query string for bare CIDR/wildcard tokens
+/// (those without an explicit `field:` qualifier) and prefix them with the default field name.
+///
+/// Also handles double-quoted IPv6 CIDR patterns: `"2001:db8::/32"` → `ip:"2001:db8::/32"`.
+///
+/// After this step, `preprocess_ip_query_string` can expand all `field:CIDR` patterns uniformly.
+///
+/// Performance design:
+///   - Fast-path early return when query contains neither '/' nor '*' (zero allocation).
+///   - Byte-level scanner: no Vec<char> allocation; query strings are always ASCII.
+///   - `try_expand_ip_range` guards every prefix decision with O(1) fast-path checks.
+fn prefix_bare_ip_tokens(query: &str, default_field: &str) -> String {
+    // Fast path: CIDR requires '/' and wildcards require '*'.
+    // If neither is present there are no expandable patterns.
+    if !query.contains('/') && !query.contains('*') {
+        return query.to_string();
+    }
+
+    // Byte-level scanner — query strings are ASCII, so byte indices == char indices.
+    let bytes = query.as_bytes();
+    let n = bytes.len();
+    let mut result = String::with_capacity(query.len() + 32);
+    let mut i = 0;
+
+    while i < n {
+        let b = bytes[i];
+
+        // Whitespace — pass through
+        if b.is_ascii_whitespace() {
+            result.push(b as char);
+            i += 1;
+            continue;
+        }
+
+        // Structural characters — pass through individually
+        if matches!(b, b'(' | b')' | b'[' | b']' | b'{' | b'}') {
+            result.push(b as char);
+            i += 1;
+            continue;
+        }
+
+        // Double-quoted token: `"2001:db8::/32"` — quoted because IPv6 colons
+        if b == b'"' {
+            let quote_start = i;
+            i += 1;
+            while i < n && bytes[i] != b'"' {
+                i += 1;
+            }
+            if i < n {
+                i += 1; // consume closing quote
+            }
+            // Byte slice is safe: all chars in range are ASCII
+            let quoted_token = &query[quote_start..i];
+            let inner = if quoted_token.len() >= 2 {
+                &quoted_token[1..quoted_token.len() - 1]
+            } else {
+                quoted_token
+            };
+            if crate::ip_expansion::try_expand_ip_range(inner).is_some() {
+                debug_println!(
+                    "RUST DEBUG: prefix_bare_ip_tokens: quoted '{}' → '{}:{}'",
+                    quoted_token, default_field, quoted_token
+                );
+                result.push_str(default_field);
+                result.push(':');
+            }
+            result.push_str(quoted_token);
+            continue;
+        }
+
+        // Collect a word token (stop at whitespace, parens, quotes)
+        let token_start = i;
+        while i < n
+            && !bytes[i].is_ascii_whitespace()
+            && !matches!(bytes[i], b'(' | b')' | b'[' | b']' | b'{' | b'}' | b'"')
+        {
+            i += 1;
+        }
+        let token = &query[token_start..i];
+
+        if token.is_empty() {
+            continue;
+        }
+
+        // Check if already has an explicit `field:` prefix.
+        // Rule: the substring before the first ':' consists entirely of word chars AND
+        // contains at least one letter — this distinguishes field names from IPv6 hex groups.
+        let has_field_prefix = token.find(':').map_or(false, |colon_pos| {
+            let before = &token[..colon_pos];
+            !before.is_empty()
+                && before.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_')
+                && before.bytes().any(|c| c.is_ascii_alphabetic())
+        });
+
+        if has_field_prefix {
+            result.push_str(token);
+            continue;
+        }
+
+        // Prefix with the default field only for expandable IP patterns (CIDR / wildcard).
+        // Boolean keywords (AND, OR, NOT) and plain IPs are left as-is for Quickwit.
+        if crate::ip_expansion::try_expand_ip_range(token).is_some() {
+            debug_println!(
+                "RUST DEBUG: prefix_bare_ip_tokens: '{}' → '{}:{}'",
+                token, default_field, token
+            );
+            result.push_str(default_field);
+            result.push(':');
+        }
+        result.push_str(token);
+    }
+
+    result
+}
+
+/// Pre-process a Quickwit user-text query string, rewriting any IP CIDR or wildcard patterns
+/// into explicit Quickwit range syntax so that the Quickwit parser never sees the '/' character
+/// in IP field values.
+///
+/// Handles both unquoted (`ip:192.168.1.0/24`) and quoted (`ip:"2001:db8::/32"`) forms.
+///
+/// Examples:
+///   `ip_addr:192.168.1.0/24`       →  `ip_addr:[192.168.1.0 TO 192.168.1.255]`
+///   `ip_addr:192.168.1.*`          →  `ip_addr:[192.168.1.0 TO 192.168.1.255]`
+///   `ip_addr:"2001:db8::/32"`      →  `ip_addr:[2001:db8:: TO 2001:db8:ffff:...]`
+///
+/// Performance design:
+///   - Fast-path early return when query contains neither '/' nor '*' (zero allocation).
+///   - Single regex pass handles both quoted and unquoted forms via alternation.
+///   - Regex compiled once via `once_cell::sync::Lazy`.
+///   - `try_expand_ip_range` O(1) fast-path for non-IP tokens (checks contains('/') / contains('*')).
+///
+/// Must be called BEFORE `query_ast_from_user_text`.
+fn preprocess_ip_query_string(query: &str) -> String {
+    use once_cell::sync::Lazy;
+    use regex::Regex;
+
+    // Fast path 1: no CIDR or wildcard patterns possible without '/' or '*'.
+    if !query.contains('/') && !query.contains('*') {
+        return query.to_string();
+    }
+
+    // Fast path 2: a field:CIDR or field:wildcard token always has a digit or opening
+    // quote immediately after the ':' (e.g. `ip:192...` or `ip:"2001...`).
+    // Queries like `url:http://example.com/path` have '/' present but are followed by
+    // '/' not a digit, so we can skip the regex entirely and avoid the Cow::Borrowed
+    // → into_owned() clone that would otherwise occur with no matches.
+    let has_ip_like_colon = query
+        .as_bytes()
+        .windows(2)
+        .any(|w| w[0] == b':' && (w[1].is_ascii_digit() || w[1] == b'"'));
+    if !has_ip_like_colon {
+        return query.to_string();
+    }
+
+    // Single pass: alternation matches both quoted and unquoted field:value forms.
+    // Group layout: 1 = field name (both arms), 2 = quoted value, 3 = unquoted value.
+    // The quoted arm is listed first so it takes priority when both could match.
+    static IP_TOKEN: Lazy<Regex> = Lazy::new(|| {
+        Regex::new(r#"(\b\w+):(?:"([\d.:/a-fA-F*]+)"|([\d.:/a-fA-F*]+))"#).unwrap()
+    });
+
+    IP_TOKEN
+        .replace_all(query, |caps: &regex::Captures| {
+            let field = &caps[1];
+            // Exactly one of caps[2] (quoted) or caps[3] (unquoted) is non-empty per match.
+            let (value, was_quoted) = match (caps.get(2), caps.get(3)) {
+                (Some(m), _) => (m.as_str(), true),
+                (_, Some(m)) => (m.as_str(), false),
+                _ => return String::new(),
+            };
+            if let Some((lower, upper)) = crate::ip_expansion::try_expand_ip_range(value) {
+                debug_println!(
+                    "RUST DEBUG: preprocess_ip_query_string: '{}:{}' → '{}:[{} TO {}]'",
+                    field, value, field, lower, upper
+                );
+                format!("{}:[{} TO {}]", field, lower, upper)
+            } else if was_quoted {
+                format!("{}:\"{}\"", field, value)
+            } else {
+                format!("{}:{}", field, value)
+            }
+        })
+        .into_owned()
+}
+
+/// Recursively rewrite a QueryAst, expanding IP CIDR and wildcard patterns in TermQuery and
+/// WildcardQuery nodes.
+///
+/// The Quickwit parser may emit either a `QueryAst::Term` (for CIDR patterns containing '/') or a
+/// `QueryAst::Wildcard` (for patterns containing '*' like `ip:192.168.1.*`) when the query string
+/// contains IP range shorthands. This function walks the AST and replaces such nodes with the
+/// correct `QueryAst::Range` or `QueryAst::MatchAll`.
+fn rewrite_ip_terms(ast: QueryAst) -> QueryAst {
+    // Helper: attempt expansion given a field name and value string, returning a rewritten node
+    // if the value is an IP CIDR or wildcard pattern.
+    let try_rewrite = |field: &str, value: &str| -> Option<QueryAst> {
+        let (lower, upper) = crate::ip_expansion::try_expand_ip_range(value)?;
+        if crate::ip_expansion::is_match_all_range(&lower, &upper) {
+            debug_println!(
+                "RUST DEBUG: rewrite_ip_terms: '{}:{}' → MatchAll",
+                field, value
+            );
+            return Some(QueryAst::MatchAll);
+        }
+        debug_println!(
+            "RUST DEBUG: rewrite_ip_terms: '{}:{}' → Range [{} TO {}]",
+            field, value, lower, upper
+        );
+        use quickwit_query::query_ast::RangeQuery;
+        use quickwit_query::JsonLiteral;
+        use std::ops::Bound;
+        Some(QueryAst::Range(RangeQuery {
+            field: field.to_string(),
+            lower_bound: Bound::Included(JsonLiteral::String(lower)),
+            upper_bound: Bound::Included(JsonLiteral::String(upper)),
+        }))
+    };
+
+    // QueryAst::Term — CIDR patterns (e.g. ip:192.168.1.0/24) parse here
+    if let QueryAst::Term(ref t) = ast {
+        if let Some(rewritten) = try_rewrite(&t.field, &t.value) {
+            return rewritten;
+        }
+    }
+
+    // QueryAst::Wildcard — wildcard patterns (e.g. ip:192.168.1.*) parse here
+    if let QueryAst::Wildcard(ref w) = ast {
+        if let Some(rewritten) = try_rewrite(&w.field, &w.value) {
+            return rewritten;
+        }
+    }
+
+    // Recursively rewrite compound subqueries; pass all other variants through unchanged
+    match ast {
+        QueryAst::Bool(b) => {
+            use quickwit_query::query_ast::BoolQuery;
+            let rewritten = BoolQuery {
+                must: b.must.into_iter().map(rewrite_ip_terms).collect(),
+                should: b.should.into_iter().map(rewrite_ip_terms).collect(),
+                must_not: b.must_not.into_iter().map(rewrite_ip_terms).collect(),
+                filter: b.filter.into_iter().map(rewrite_ip_terms).collect(),
+                minimum_should_match: b.minimum_should_match,
+            };
+            QueryAst::Bool(rewritten)
+        }
+        QueryAst::Boost { underlying, boost } => QueryAst::Boost {
+            underlying: Box::new(rewrite_ip_terms(*underlying)),
+            boost,
+        },
+        other => other,
     }
 }
 

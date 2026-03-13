@@ -61,6 +61,31 @@ pub fn convert_term_query_to_query_ast(env: &mut JNIEnv, obj: &JObject) -> Resul
         value
     );
 
+    // IP CIDR/wildcard expansion: transparently rewrite to RangeQuery or MatchAll.
+    // Fast path: try_expand_ip_range returns None in O(n) with zero allocation for regular IPs.
+    if let Some((lower, upper)) = crate::ip_expansion::try_expand_ip_range(&value) {
+        debug_println!(
+            "RUST DEBUG: Expanding IP pattern '{}' to range [{} TO {}]",
+            value, lower, upper
+        );
+        // Match-all case: *.*.*.*  or  /0 — emit MatchAll for maximum performance
+        if crate::ip_expansion::is_match_all_range(&lower, &upper) {
+            debug_println!(
+                "RUST DEBUG: IP pattern '{}' covers all IPs, returning MatchAll",
+                value
+            );
+            return Ok(QueryAst::MatchAll);
+        }
+        use quickwit_query::query_ast::RangeQuery;
+        use std::ops::Bound;
+        let range_query = RangeQuery {
+            field,
+            lower_bound: Bound::Included(JsonLiteral::String(lower)),
+            upper_bound: Bound::Included(JsonLiteral::String(upper)),
+        };
+        return Ok(QueryAst::Range(range_query));
+    }
+
     // Create proper Quickwit QueryAst using official structures
     use quickwit_query::query_ast::TermQuery;
 
