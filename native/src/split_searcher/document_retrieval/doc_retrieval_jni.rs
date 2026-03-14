@@ -1166,3 +1166,257 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_nati
         }
     }).unwrap_or(-1)
 }
+
+// =====================================================================
+// Streaming Retrieval Session JNI Methods
+// =====================================================================
+
+/// Start a streaming bulk retrieval session for companion mode.
+///
+/// Performs the search + resolve phases synchronously, then starts a background
+/// producer task that streams batches through a bounded channel.
+///
+/// Returns a session handle (jlong) that Java uses to poll batches via
+/// nativeNextBatch. Returns 0 on error (exception thrown) or if not a companion split.
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_nativeStartStreamingRetrieval(
+    mut env: JNIEnv,
+    _class: JClass,
+    searcher_ptr: jlong,
+    query_ast_json: jni::objects::JString,
+    field_names: jni::sys::jobjectArray,
+) -> jlong {
+    if searcher_ptr == 0 {
+        to_java_exception(&mut env, &anyhow::anyhow!("Invalid searcher pointer"));
+        return 0;
+    }
+
+    // Check if this split has a parquet manifest (companion vs regular split)
+    let has_manifest = with_arc_safe(searcher_ptr, |ctx: &Arc<CachedSearcherContext>| {
+        ctx.parquet_manifest.is_some()
+    })
+    .unwrap_or(false);
+
+    use crate::utils::convert_throwable;
+    convert_throwable(&mut env, |env| {
+        // Extract query string
+        let query_json: String = env
+            .get_string(&query_ast_json)
+            .map_err(|e| anyhow::anyhow!("Failed to get query string: {}", e))?
+            .into();
+
+        // Extract field names
+        let projected_fields = extract_jni_field_names(env, field_names);
+
+        let t_total = std::time::Instant::now();
+        perf_println!(
+            "⏱️ STREAMING_JNI: === nativeStartStreamingRetrieval START === companion={} fields={:?}",
+            has_manifest, projected_fields
+        );
+
+        let result = with_arc_safe(searcher_ptr, |ctx: &Arc<CachedSearcherContext>| {
+            let runtime = crate::runtime_manager::QuickwitRuntimeManager::global().handle();
+            let _guard = runtime.enter();
+
+            tokio::task::block_in_place(|| {
+                runtime.block_on(async {
+                    // Phase 1: No-score search (works for both companion and regular splits)
+                    let doc_ids = crate::split_searcher::bulk_retrieval::perform_bulk_search(
+                        ctx, &query_json,
+                    ).await?;
+
+                    perf_println!("⏱️ STREAMING_JNI: search found {} docs", doc_ids.len());
+
+                    if has_manifest {
+                        // === COMPANION PATH: parquet-based streaming ===
+                        if doc_ids.is_empty() {
+                            perf_println!("⏱️ STREAMING_JNI: no matches — returning empty session (companion)");
+                            let (_, rx) = tokio::sync::mpsc::channel::<anyhow::Result<arrow_array::RecordBatch>>(1);
+                            let manifest = ctx.parquet_manifest.as_ref().unwrap();
+                            let schema = crate::parquet_companion::streaming_ffi::build_tantivy_schema_pub(
+                                manifest, projected_fields.as_deref(),
+                            )?;
+                            let session = crate::parquet_companion::streaming_ffi::StreamingRetrievalSession::new_empty(
+                                rx, schema,
+                            );
+                            let handle = crate::utils::arc_to_jlong(std::sync::Arc::new(std::sync::Mutex::new(session)));
+                            return Ok::<jlong, anyhow::Error>(handle);
+                        }
+
+                        // Phase 2: Resolve to parquet locations
+                        let groups = crate::split_searcher::bulk_retrieval::resolve_to_parquet_locations(
+                            ctx, &doc_ids,
+                        ).await?;
+
+                        perf_println!(
+                            "⏱️ STREAMING_JNI: resolved to {} file groups (companion)",
+                            groups.len()
+                        );
+
+                        // Phase 3: Start companion streaming producer
+                        let manifest = ctx.parquet_manifest.as_ref().unwrap().clone();
+                        let storage = crate::split_searcher::bulk_retrieval::get_parquet_storage(ctx)?;
+
+                        let session = crate::parquet_companion::streaming_ffi::start_streaming_retrieval(
+                            groups,
+                            projected_fields,
+                            manifest,
+                            storage,
+                            Some(ctx.parquet_metadata_cache.clone()),
+                            Some(ctx.parquet_byte_range_cache.clone()),
+                            ctx.parquet_coalesce_config,
+                        )?;
+
+                        let handle = crate::utils::arc_to_jlong(std::sync::Arc::new(std::sync::Mutex::new(session)));
+                        Ok(handle)
+                    } else {
+                        // === REGULAR PATH: tantivy doc store streaming ===
+                        let session = crate::split_searcher::streaming_doc_retrieval::start_tantivy_streaming_retrieval(
+                            ctx, doc_ids, projected_fields,
+                        )?;
+
+                        let handle = crate::utils::arc_to_jlong(std::sync::Arc::new(std::sync::Mutex::new(session)));
+                        Ok(handle)
+                    }
+                })
+            })
+        });
+
+        match result {
+            Some(Ok(handle)) => {
+                perf_println!(
+                    "⏱️ STREAMING_JNI: === session started, took {}ms ===",
+                    t_total.elapsed().as_millis()
+                );
+                Ok(handle)
+            }
+            Some(Err(e)) => {
+                perf_println!(
+                    "⏱️ STREAMING_JNI: === FAILED after {}ms: {} ===",
+                    t_total.elapsed().as_millis(), e
+                );
+                Err(anyhow::anyhow!("Failed to start streaming retrieval: {}", e))
+            }
+            None => Err(anyhow::anyhow!("Searcher context not found")),
+        }
+    })
+    .unwrap_or(0)
+}
+
+/// Poll the next batch from a streaming session.
+///
+/// Writes Arrow FFI data to the provided addresses.
+/// Returns: >0 = row count, 0 = end of stream, -1 = error.
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_nativeNextBatch(
+    mut env: JNIEnv,
+    _class: JClass,
+    session_ptr: jlong,
+    array_addrs: jni::sys::jlongArray,
+    schema_addrs: jni::sys::jlongArray,
+) -> jint {
+    if session_ptr == 0 {
+        to_java_exception(&mut env, &anyhow::anyhow!("Invalid session pointer"));
+        return -1;
+    }
+
+    use crate::utils::convert_throwable;
+    convert_throwable(&mut env, |env| {
+        // Look up session in registry (safe — no raw pointer dereference)
+        let session_arc = crate::utils::jlong_to_arc::<std::sync::Mutex<
+            crate::parquet_companion::streaming_ffi::StreamingRetrievalSession,
+        >>(session_ptr)
+        .ok_or_else(|| anyhow::anyhow!("Streaming session not found or already closed (handle={})", session_ptr))?;
+
+        // Extract FFI addresses
+        let array_addrs_jni = unsafe { jni::objects::JLongArray::from_raw(array_addrs) };
+        let schema_addrs_jni = unsafe { jni::objects::JLongArray::from_raw(schema_addrs) };
+
+        let addrs_len = env
+            .get_array_length(&array_addrs_jni)
+            .map_err(|e| anyhow::anyhow!("Failed to get array_addrs length: {}", e))?
+            as usize;
+
+        let mut array_addrs_vec = vec![0i64; addrs_len];
+        env.get_long_array_region(&array_addrs_jni, 0, &mut array_addrs_vec)
+            .map_err(|e| anyhow::anyhow!("Failed to get array_addrs: {}", e))?;
+
+        let mut schema_addrs_vec = vec![0i64; addrs_len];
+        env.get_long_array_region(&schema_addrs_jni, 0, &mut schema_addrs_vec)
+            .map_err(|e| anyhow::anyhow!("Failed to get schema_addrs: {}", e))?;
+
+        // Poll next batch from channel (blocking)
+        let mut session = session_arc.lock()
+            .map_err(|e| anyhow::anyhow!("Failed to lock streaming session: {}", e))?;
+        match session.blocking_next() {
+            Some(Ok(batch)) => {
+                let row_count = crate::parquet_companion::streaming_ffi::write_batch_to_ffi(
+                    &batch,
+                    &array_addrs_vec,
+                    &schema_addrs_vec,
+                )?;
+                perf_println!("⏱️ STREAMING_JNI: nextBatch returned {} rows", row_count);
+                Ok(row_count as jint)
+            }
+            Some(Err(e)) => {
+                perf_println!("⏱️ STREAMING_JNI: nextBatch error: {}", e);
+                Err(anyhow::anyhow!("Streaming batch read failed: {}", e))
+            }
+            None => {
+                perf_println!("⏱️ STREAMING_JNI: end of stream");
+                Ok(0) // End of stream
+            }
+        }
+    })
+    .unwrap_or(-1)
+}
+
+/// Close and free a streaming session.
+///
+/// Safe to call multiple times — second call is a no-op (registry entry already removed).
+/// Must be called to release native resources and stop the producer task.
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_nativeCloseStreamingSession(
+    _env: JNIEnv,
+    _class: JClass,
+    session_ptr: jlong,
+) {
+    if session_ptr != 0 {
+        perf_println!("⏱️ STREAMING_JNI: closing session (handle={})", session_ptr);
+        crate::utils::release_arc(session_ptr);
+    }
+}
+
+/// Get the number of columns in a streaming session's output schema.
+/// Used by Java to allocate the correct number of FFI address arrays.
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_nativeGetStreamingColumnCount(
+    mut env: JNIEnv,
+    _class: JClass,
+    session_ptr: jlong,
+) -> jint {
+    if session_ptr == 0 {
+        to_java_exception(&mut env, &anyhow::anyhow!("Invalid session pointer"));
+        return -1;
+    }
+
+    let session_arc = crate::utils::jlong_to_arc::<std::sync::Mutex<
+        crate::parquet_companion::streaming_ffi::StreamingRetrievalSession,
+    >>(session_ptr);
+
+    match session_arc {
+        Some(arc) => {
+            match arc.lock() {
+                Ok(session) => session.num_columns() as jint,
+                Err(_) => {
+                    to_java_exception(&mut env, &anyhow::anyhow!("Failed to lock streaming session"));
+                    -1
+                }
+            }
+        }
+        None => {
+            to_java_exception(&mut env, &anyhow::anyhow!("Streaming session not found or already closed"));
+            -1
+        }
+    }
+}

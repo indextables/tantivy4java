@@ -266,7 +266,7 @@ fn is_identity_permutation(perm: &[usize]) -> bool {
 ///
 /// This is a zero-copy operation — only the schema metadata changes, the data
 /// buffers are shared via Arc.
-fn rename_columns_to_tantivy(
+pub(crate) fn rename_columns_to_tantivy(
     batch: &RecordBatch,
     column_mapping: &[ColumnMapping],
 ) -> Result<RecordBatch> {
