@@ -22,6 +22,7 @@ use jni::sys::jstring;
 use jni::JNIEnv;
 
 mod debug;  // Debug utilities and conditional logging
+pub mod ip_expansion;  // CIDR and wildcard IP pattern expansion for transparent query rewriting
 pub mod memory_pool;  // Unified JVM-coordinated memory management
 mod runtime_manager;  // Global Quickwit runtime manager for async-first architecture
 mod schema;
