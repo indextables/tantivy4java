@@ -828,6 +828,172 @@ fn extract_jni_field_names(
     }
 }
 
+/// Parse type hint strings from a JNI String[] into a HashMap<String, DataType>.
+///
+/// Type hints are passed as alternating pairs: [fieldName, arrowType, fieldName, arrowType, ...].
+/// Supported type strings: "i8", "i16", "i32", "i64", "u64", "f32", "f64", "bool", "utf8",
+/// "date", "binary".
+///
+/// Returns None if the array is null or empty.
+fn parse_type_hints_from_env(
+    env: &mut JNIEnv,
+    type_hint_strs: jni::sys::jobjectArray,
+) -> anyhow::Result<Option<std::collections::HashMap<String, arrow_schema::DataType>>> {
+    if type_hint_strs.is_null() {
+        return Ok(None);
+    }
+    let hint_array = unsafe { jni::objects::JObjectArray::from_raw(type_hint_strs) };
+    let len = env.get_array_length(&hint_array)
+        .map_err(|e| anyhow::anyhow!("Failed to get type hints array length: {}", e))?;
+    if len == 0 || len % 2 != 0 {
+        return Ok(None);
+    }
+
+    let mut hints = std::collections::HashMap::new();
+    let mut i = 0;
+    while i < len {
+        let name_obj = env.get_object_array_element(&hint_array, i)
+            .map_err(|e| anyhow::anyhow!("Failed to get type hint name at {}: {}", i, e))?;
+        let type_obj = env.get_object_array_element(&hint_array, i + 1)
+            .map_err(|e| anyhow::anyhow!("Failed to get type hint type at {}: {}", i + 1, e))?;
+
+        if !name_obj.is_null() && !type_obj.is_null() {
+            let name: String = env.get_string((&name_obj).into())
+                .map_err(|e| anyhow::anyhow!("Failed to convert type hint name: {}", e))?
+                .into();
+            let type_str: String = env.get_string((&type_obj).into())
+                .map_err(|e| anyhow::anyhow!("Failed to convert type hint type: {}", e))?
+                .into();
+
+            if let Some(dt) = parse_arrow_type_string(&type_str) {
+                hints.insert(name, dt);
+            }
+        }
+        i += 2;
+    }
+
+    if hints.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(hints))
+    }
+}
+
+/// Parse an Arrow type string to a DataType.
+///
+/// Supports scalar type names (e.g. "i32", "string") and JSON-formatted
+/// complex types for Struct, List, and Map:
+///
+/// ```json
+/// {"struct": {"name": "string", "age": "i32"}}
+/// {"list": "string"}
+/// {"list": {"struct": {"x": "f64", "y": "f64"}}}
+/// {"map": ["string", "i64"]}
+/// ```
+fn parse_arrow_type_string(s: &str) -> Option<arrow_schema::DataType> {
+    // Try JSON complex type first (starts with '{')
+    if s.starts_with('{') {
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(s) {
+            return parse_complex_type_json(&json);
+        }
+    }
+
+    // Scalar types
+    match s {
+        "i8" | "int8" | "byte" => Some(arrow_schema::DataType::Int8),
+        "i16" | "int16" | "short" => Some(arrow_schema::DataType::Int16),
+        "i32" | "int32" | "int" => Some(arrow_schema::DataType::Int32),
+        "i64" | "int64" | "long" => Some(arrow_schema::DataType::Int64),
+        "u64" | "uint64" => Some(arrow_schema::DataType::UInt64),
+        "f32" | "float32" | "float" => Some(arrow_schema::DataType::Float32),
+        "f64" | "float64" | "double" => Some(arrow_schema::DataType::Float64),
+        "bool" | "boolean" => Some(arrow_schema::DataType::Boolean),
+        "utf8" | "string" => Some(arrow_schema::DataType::Utf8),
+        "date" | "timestamp" => Some(arrow_schema::DataType::Timestamp(
+            arrow_schema::TimeUnit::Microsecond, None,
+        )),
+        "date32" => Some(arrow_schema::DataType::Date32),
+        "binary" | "bytes" => Some(arrow_schema::DataType::Binary),
+        _ => None,
+    }
+}
+
+/// Parse a JSON value into an Arrow DataType, supporting recursive complex types.
+///
+/// String values are parsed as scalar types. Object values describe complex types:
+/// - `{"struct": {"field1": <type>, "field2": <type>, ...}}` → Struct
+/// - `{"list": <element_type>}` → List
+/// - `{"map": [<key_type>, <value_type>]}` → Map
+///
+/// Types can be nested arbitrarily:
+/// `{"struct": {"tags": {"list": "string"}, "coords": {"struct": {"x": "f64", "y": "f64"}}}}`
+/// Parse a JSON value into an Arrow DataType, supporting recursive complex types.
+///
+/// String values are parsed as scalar types. Object values describe complex types:
+/// - `{"struct": [["field1", <type>], ["field2", <type>], ...]}` → Struct (order-preserving)
+/// - `{"list": <element_type>}` → List
+/// - `{"map": [<key_type>, <value_type>]}` → Map
+///
+/// Struct fields use an array-of-pairs format to guarantee ordering. JSON objects
+/// are unordered by spec, and serde_json uses BTreeMap (alphabetical sort). Spark
+/// reads struct children by ordinal position, so ordering must be preserved.
+///
+/// Types can be nested arbitrarily:
+/// `{"struct": [["tags", {"list": "string"}], ["name", "string"]]}`
+fn parse_complex_type_json(v: &serde_json::Value) -> Option<arrow_schema::DataType> {
+    use arrow_schema::{DataType, Field};
+    use std::sync::Arc;
+
+    match v {
+        serde_json::Value::String(s) => parse_arrow_type_string(s),
+        serde_json::Value::Object(map) => {
+            if let Some(fields_val) = map.get("struct") {
+                // Struct: {"struct": [["name", "string"], ["age", "i32"]]}
+                // Array-of-pairs format guarantees field ordering.
+                let fields_arr = fields_val.as_array()?;
+                let mut fields = Vec::with_capacity(fields_arr.len());
+                for pair in fields_arr {
+                    let pair_arr = pair.as_array()?;
+                    if pair_arr.len() != 2 {
+                        return None;
+                    }
+                    let name = pair_arr[0].as_str()?;
+                    let dt = parse_complex_type_json(&pair_arr[1])?;
+                    fields.push(Arc::new(Field::new(name, dt, true)));
+                }
+                Some(DataType::Struct(fields.into()))
+            } else if let Some(elem_val) = map.get("list") {
+                // List: {"list": "string"} or {"list": {"struct": [...]}}
+                let elem_type = parse_complex_type_json(elem_val)?;
+                Some(DataType::List(Arc::new(Field::new("item", elem_type, true))))
+            } else if let Some(kv_val) = map.get("map") {
+                // Map: {"map": ["string", "i64"]}
+                let kv_arr = kv_val.as_array()?;
+                if kv_arr.len() != 2 {
+                    return None;
+                }
+                let key_type = parse_complex_type_json(&kv_arr[0])?;
+                let val_type = parse_complex_type_json(&kv_arr[1])?;
+                let entries_field = Field::new(
+                    "entries",
+                    DataType::Struct(
+                        vec![
+                            Arc::new(Field::new("key", key_type, false)),
+                            Arc::new(Field::new("value", val_type, true)),
+                        ]
+                        .into(),
+                    ),
+                    false,
+                );
+                Some(DataType::Map(Arc::new(entries_field), false))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
 /// Resolve doc addresses to parquet file groups via fast fields.
 ///
 /// This is the shared pipeline used by both nativeDocBatchProjected (TANT) and
@@ -1185,6 +1351,8 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_nati
     searcher_ptr: jlong,
     query_ast_json: jni::objects::JString,
     field_names: jni::sys::jobjectArray,
+    type_hint_strs: jni::sys::jobjectArray,
+    max_docs: jni::sys::jint,
 ) -> jlong {
     if searcher_ptr == 0 {
         to_java_exception(&mut env, &anyhow::anyhow!("Invalid searcher pointer"));
@@ -1208,6 +1376,9 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_nati
         // Extract field names
         let projected_fields = extract_jni_field_names(env, field_names);
 
+        // Parse type hints (alternating pairs: [fieldName, arrowType, ...])
+        let type_hints = parse_type_hints_from_env(env, type_hint_strs)?;
+
         let t_total = std::time::Instant::now();
         perf_println!(
             "⏱️ STREAMING_JNI: === nativeStartStreamingRetrieval START === companion={} fields={:?}",
@@ -1221,11 +1392,20 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_nati
             tokio::task::block_in_place(|| {
                 runtime.block_on(async {
                     // Phase 1: No-score search (works for both companion and regular splits)
-                    let doc_ids = crate::split_searcher::bulk_retrieval::perform_bulk_search(
+                    let mut doc_ids = crate::split_searcher::bulk_retrieval::perform_bulk_search(
                         ctx, &query_json,
                     ).await?;
 
                     perf_println!("⏱️ STREAMING_JNI: search found {} docs", doc_ids.len());
+
+                    // Apply maxDocs limit to avoid unnecessary S3 prefetch/retrieval
+                    if max_docs > 0 && (doc_ids.len() as i32) > max_docs {
+                        perf_println!(
+                            "⏱️ STREAMING_JNI: truncating {} docs to maxDocs={}",
+                            doc_ids.len(), max_docs
+                        );
+                        doc_ids.truncate(max_docs as usize);
+                    }
 
                     if has_manifest {
                         // === COMPANION PATH: parquet-based streaming ===
@@ -1272,8 +1452,8 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_nati
                     } else {
                         // === REGULAR PATH: tantivy doc store streaming ===
                         let session = crate::split_searcher::streaming_doc_retrieval::start_tantivy_streaming_retrieval(
-                            ctx, doc_ids, projected_fields,
-                        )?;
+                            ctx, doc_ids, projected_fields, type_hints,
+                        ).await?;
 
                         let handle = crate::utils::arc_to_jlong(std::sync::Arc::new(std::sync::Mutex::new(session)));
                         Ok(handle)
@@ -1417,6 +1597,149 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_nati
         None => {
             to_java_exception(&mut env, &anyhow::anyhow!("Streaming session not found or already closed"));
             -1
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_schema::DataType;
+
+    #[test]
+    fn test_parse_scalar_types() {
+        assert_eq!(parse_arrow_type_string("i32"), Some(DataType::Int32));
+        assert_eq!(parse_arrow_type_string("string"), Some(DataType::Utf8));
+        assert_eq!(parse_arrow_type_string("bool"), Some(DataType::Boolean));
+        assert_eq!(parse_arrow_type_string("f64"), Some(DataType::Float64));
+        assert_eq!(parse_arrow_type_string("date32"), Some(DataType::Date32));
+        assert_eq!(parse_arrow_type_string("unknown"), None);
+    }
+
+    #[test]
+    fn test_parse_struct_type_hint() {
+        let json = r#"{"struct": [["name", "string"], ["age", "i64"]]}"#;
+        let dt = parse_arrow_type_string(json).unwrap();
+        match &dt {
+            DataType::Struct(fields) => {
+                assert_eq!(fields.len(), 2);
+                assert_eq!(fields[0].name(), "name");
+                assert_eq!(*fields[0].data_type(), DataType::Utf8);
+                assert_eq!(fields[1].name(), "age");
+                assert_eq!(*fields[1].data_type(), DataType::Int64);
+            }
+            _ => panic!("Expected Struct, got {:?}", dt),
+        }
+    }
+
+    #[test]
+    fn test_parse_list_type_hint() {
+        let json = r#"{"list": "string"}"#;
+        let dt = parse_arrow_type_string(json).unwrap();
+        match &dt {
+            DataType::List(inner) => {
+                assert_eq!(*inner.data_type(), DataType::Utf8);
+            }
+            _ => panic!("Expected List, got {:?}", dt),
+        }
+    }
+
+    #[test]
+    fn test_parse_map_type_hint() {
+        let json = r#"{"map": ["string", "i64"]}"#;
+        let dt = parse_arrow_type_string(json).unwrap();
+        match &dt {
+            DataType::Map(entries, sorted) => {
+                assert!(!sorted);
+                match entries.data_type() {
+                    DataType::Struct(fields) => {
+                        assert_eq!(*fields[0].data_type(), DataType::Utf8);
+                        assert_eq!(*fields[1].data_type(), DataType::Int64);
+                    }
+                    _ => panic!("Expected Struct entries"),
+                }
+            }
+            _ => panic!("Expected Map, got {:?}", dt),
+        }
+    }
+
+    #[test]
+    fn test_parse_nested_complex_type() {
+        // List of structs
+        let json = r#"{"list": {"struct": [["x", "f64"], ["y", "f64"]]}}"#;
+        let dt = parse_arrow_type_string(json).unwrap();
+        match &dt {
+            DataType::List(inner) => {
+                match inner.data_type() {
+                    DataType::Struct(fields) => {
+                        assert_eq!(fields.len(), 2);
+                        assert_eq!(fields[0].name(), "x");
+                        assert_eq!(fields[1].name(), "y");
+                    }
+                    _ => panic!("Expected Struct inside List"),
+                }
+            }
+            _ => panic!("Expected List, got {:?}", dt),
+        }
+    }
+
+    /// Struct field ordering matches the array-of-pairs order.
+    /// Spark reads struct children by ordinal position, so ordering is critical.
+    #[test]
+    fn test_struct_field_ordering_preserved() {
+        // "name" before "address" before "city" — would be wrong if sorted alphabetically
+        let json = r#"{"struct": [["name", "string"], ["address", "string"], ["city", "string"]]}"#;
+        let dt = parse_arrow_type_string(json).unwrap();
+        match &dt {
+            DataType::Struct(fields) => {
+                assert_eq!(fields.len(), 3);
+                assert_eq!(fields[0].name(), "name");
+                assert_eq!(fields[1].name(), "address");
+                assert_eq!(fields[2].name(), "city");
+            }
+            _ => panic!("Expected Struct, got {:?}", dt),
+        }
+    }
+
+    /// Alphabetically-first field appears last — confirms array order, not sort order.
+    #[test]
+    fn test_struct_field_ordering_alpha_last() {
+        let json = r#"{"struct": [["z_last", "i64"], ["a_first", "string"], ["m_middle", "f64"]]}"#;
+        let dt = parse_arrow_type_string(json).unwrap();
+        match &dt {
+            DataType::Struct(fields) => {
+                assert_eq!(fields.len(), 3);
+                assert_eq!(fields[0].name(), "z_last");
+                assert_eq!(*fields[0].data_type(), DataType::Int64);
+                assert_eq!(fields[1].name(), "a_first");
+                assert_eq!(*fields[1].data_type(), DataType::Utf8);
+                assert_eq!(fields[2].name(), "m_middle");
+                assert_eq!(*fields[2].data_type(), DataType::Float64);
+            }
+            _ => panic!("Expected Struct, got {:?}", dt),
+        }
+    }
+
+    /// Nested struct also preserves field ordering.
+    #[test]
+    fn test_nested_struct_field_ordering() {
+        let json = r#"{"struct": [["scores", {"list": "i64"}], ["name", "string"], ["address", {"struct": [["zip", "string"], ["city", "string"]]}]]}"#;
+        let dt = parse_arrow_type_string(json).unwrap();
+        match &dt {
+            DataType::Struct(fields) => {
+                assert_eq!(fields.len(), 3);
+                assert_eq!(fields[0].name(), "scores");
+                assert_eq!(fields[1].name(), "name");
+                assert_eq!(fields[2].name(), "address");
+                match fields[2].data_type() {
+                    DataType::Struct(inner) => {
+                        assert_eq!(inner[0].name(), "zip");
+                        assert_eq!(inner[1].name(), "city");
+                    }
+                    _ => panic!("Expected nested Struct"),
+                }
+            }
+            _ => panic!("Expected Struct, got {:?}", dt),
         }
     }
 }

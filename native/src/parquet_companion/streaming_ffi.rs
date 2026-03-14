@@ -215,9 +215,26 @@ async fn produce_batches(
         )
         .await?;
 
+        let file_duration_ms = t_file.elapsed().as_millis() as u64;
+
         perf_println!(
             "⏱️ STREAMING: file[{}] read {} rows in {} batches, took {}ms",
-            file_idx, num_rows_in_file, batches.len(), t_file.elapsed().as_millis()
+            file_idx, num_rows_in_file, batches.len(), file_duration_ms
+        );
+
+        // Record batch metrics per file for observability parity with docBatchProjected path
+        let file_stats = crate::batch_retrieval::simple::PrefetchStats {
+            ranges_fetched: batches.len().max(1),
+            bytes_fetched: 0, // TODO: plumb byte counts from parquet reader
+            duration_ms: file_duration_ms,
+            s3_requests: batches.len().max(1), // at least 1 request per file
+        };
+        crate::split_cache_manager::record_batch_metrics(
+            None,
+            num_rows_in_file,
+            &file_stats,
+            1, // one segment per parquet file
+            0,
         );
 
         // Feed batches through the accumulator → emit TARGET_BATCH_SIZE chunks
@@ -507,6 +524,15 @@ pub(crate) fn write_batch_to_ffi(
         let array_ptr = array_addrs[i] as *mut FFI_ArrowArray;
         let schema_ptr = schema_addrs[i] as *mut FFI_ArrowSchema;
 
+        if array_ptr.is_null() || schema_ptr.is_null() {
+            return Err(anyhow::anyhow!(
+                "Null FFI pointer for column {}: array_ptr={}, schema_ptr={}",
+                i,
+                array_ptr.is_null(),
+                schema_ptr.is_null()
+            ));
+        }
+
         let orig_field = schema.field(i);
         let export_field: Field = match orig_field.data_type() {
             DataType::Timestamp(unit, tz) if *unit != TimeUnit::Microsecond => orig_field
@@ -517,13 +543,18 @@ pub(crate) fn write_batch_to_ffi(
         };
 
         unsafe {
-            // Drop previous FFI contents to release Arrow buffers.
-            // A zeroed struct (release = null) is safe to read+drop (no-op).
-            let prev_array = std::ptr::read_unaligned(array_ptr);
-            drop(prev_array);
-            let prev_schema = std::ptr::read_unaligned(schema_ptr);
-            drop(prev_schema);
-
+            // Write new FFI data directly — do NOT read+drop previous contents.
+            //
+            // The old read+drop pattern caused SIGBUS crashes: if the memory at
+            // array_ptr was uninitialized (Unsafe.allocateMemory doesn't zero)
+            // or contained stale data, the FFI_ArrowArray.release field would be
+            // a garbage function pointer. Dropping it called that garbage pointer.
+            //
+            // Per the Arrow C Data Interface spec, the CONSUMER (Java/Spark) is
+            // responsible for calling the release callback after importing each
+            // batch. We just overwrite with new data. The consumer must have
+            // already released any previous batch before calling back into this
+            // function — failing to do so will leak the previous Arrow arrays.
             std::ptr::write_unaligned(array_ptr, FFI_ArrowArray::new(&data));
             std::ptr::write_unaligned(
                 schema_ptr,
