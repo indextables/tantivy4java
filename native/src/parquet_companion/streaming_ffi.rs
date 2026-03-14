@@ -524,6 +524,15 @@ pub(crate) fn write_batch_to_ffi(
         let array_ptr = array_addrs[i] as *mut FFI_ArrowArray;
         let schema_ptr = schema_addrs[i] as *mut FFI_ArrowSchema;
 
+        if array_ptr.is_null() || schema_ptr.is_null() {
+            return Err(anyhow::anyhow!(
+                "Null FFI pointer for column {}: array_ptr={}, schema_ptr={}",
+                i,
+                array_ptr.is_null(),
+                schema_ptr.is_null()
+            ));
+        }
+
         let orig_field = schema.field(i);
         let export_field: Field = match orig_field.data_type() {
             DataType::Timestamp(unit, tz) if *unit != TimeUnit::Microsecond => orig_field
@@ -543,7 +552,9 @@ pub(crate) fn write_batch_to_ffi(
             //
             // Per the Arrow C Data Interface spec, the CONSUMER (Java/Spark) is
             // responsible for calling the release callback after importing each
-            // batch. We just overwrite with new data.
+            // batch. We just overwrite with new data. The consumer must have
+            // already released any previous batch before calling back into this
+            // function — failing to do so will leak the previous Arrow arrays.
             std::ptr::write_unaligned(array_ptr, FFI_ArrowArray::new(&data));
             std::ptr::write_unaligned(
                 schema_ptr,

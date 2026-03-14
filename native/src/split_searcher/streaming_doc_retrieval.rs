@@ -413,8 +413,14 @@ fn build_arrow_column(
             let mut builder = Int32Builder::with_capacity(num_rows);
             for doc in docs {
                 match find_first_value(doc, field) {
-                    Some(OwnedValue::I64(v)) => builder.append_value(v as i32),
-                    Some(OwnedValue::U64(v)) => builder.append_value(v as i32),
+                    Some(OwnedValue::I64(v)) => match i32::try_from(v) {
+                        Ok(v32) => builder.append_value(v32),
+                        Err(_) => builder.append_null(),
+                    },
+                    Some(OwnedValue::U64(v)) => match i32::try_from(v) {
+                        Ok(v32) => builder.append_value(v32),
+                        Err(_) => builder.append_null(),
+                    },
                     _ => builder.append_null(),
                 }
             }
@@ -424,8 +430,14 @@ fn build_arrow_column(
             let mut builder = Int16Builder::with_capacity(num_rows);
             for doc in docs {
                 match find_first_value(doc, field) {
-                    Some(OwnedValue::I64(v)) => builder.append_value(v as i16),
-                    Some(OwnedValue::U64(v)) => builder.append_value(v as i16),
+                    Some(OwnedValue::I64(v)) => match i16::try_from(v) {
+                        Ok(v16) => builder.append_value(v16),
+                        Err(_) => builder.append_null(),
+                    },
+                    Some(OwnedValue::U64(v)) => match i16::try_from(v) {
+                        Ok(v16) => builder.append_value(v16),
+                        Err(_) => builder.append_null(),
+                    },
                     _ => builder.append_null(),
                 }
             }
@@ -435,8 +447,14 @@ fn build_arrow_column(
             let mut builder = Int8Builder::with_capacity(num_rows);
             for doc in docs {
                 match find_first_value(doc, field) {
-                    Some(OwnedValue::I64(v)) => builder.append_value(v as i8),
-                    Some(OwnedValue::U64(v)) => builder.append_value(v as i8),
+                    Some(OwnedValue::I64(v)) => match i8::try_from(v) {
+                        Ok(v8) => builder.append_value(v8),
+                        Err(_) => builder.append_null(),
+                    },
+                    Some(OwnedValue::U64(v)) => match i8::try_from(v) {
+                        Ok(v8) => builder.append_value(v8),
+                        Err(_) => builder.append_null(),
+                    },
                     _ => builder.append_null(),
                 }
             }
@@ -447,7 +465,10 @@ fn build_arrow_column(
             for doc in docs {
                 match find_first_value(doc, field) {
                     Some(OwnedValue::U64(v)) => builder.append_value(v),
-                    Some(OwnedValue::I64(v)) => builder.append_value(v as u64),
+                    Some(OwnedValue::I64(v)) => match u64::try_from(v) {
+                        Ok(v64) => builder.append_value(v64),
+                        Err(_) => builder.append_null(),
+                    },
                     _ => builder.append_null(),
                 }
             }
@@ -572,15 +593,23 @@ fn build_arrow_column(
                                 }
                             }
                             OwnedValue::Str(s) => {
-                                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&s) {
-                                    if let Some(arr) = parsed.as_array() {
-                                        Some(OwnedValue::Array(
-                                            arr.iter().map(json_value_to_owned).collect(),
-                                        ))
+                                // Guard against very large JSON strings to prevent memory exhaustion.
+                                // 10MB is generous for any reasonable array field value.
+                                const MAX_JSON_PARSE_LEN: usize = 10 * 1024 * 1024;
+                                if s.len() <= MAX_JSON_PARSE_LEN {
+                                    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&s) {
+                                        if let Some(arr) = parsed.as_array() {
+                                            Some(OwnedValue::Array(
+                                                arr.iter().map(json_value_to_owned).collect(),
+                                            ))
+                                        } else {
+                                            Some(OwnedValue::Array(vec![OwnedValue::Str(s)]))
+                                        }
                                     } else {
                                         Some(OwnedValue::Array(vec![OwnedValue::Str(s)]))
                                     }
                                 } else {
+                                    // Too large to parse safely — wrap as-is
                                     Some(OwnedValue::Array(vec![OwnedValue::Str(s)]))
                                 }
                             }
