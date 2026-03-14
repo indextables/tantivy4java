@@ -17,6 +17,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
+use crate::debug_println;
 use arrow_array::builder::*;
 use arrow_array::{ArrayRef, RecordBatch, StructArray, ListArray, MapArray};
 use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
@@ -415,11 +416,17 @@ fn build_arrow_column(
                 match find_first_value(doc, field) {
                     Some(OwnedValue::I64(v)) => match i32::try_from(v) {
                         Ok(v32) => builder.append_value(v32),
-                        Err(_) => builder.append_null(),
+                        Err(_) => {
+                            debug_println!("RUST DEBUG: Int32 overflow for field '{:?}': i64 value {} out of range, emitting null", field, v);
+                            builder.append_null();
+                        }
                     },
                     Some(OwnedValue::U64(v)) => match i32::try_from(v) {
                         Ok(v32) => builder.append_value(v32),
-                        Err(_) => builder.append_null(),
+                        Err(_) => {
+                            debug_println!("RUST DEBUG: Int32 overflow for field '{:?}': u64 value {} out of range, emitting null", field, v);
+                            builder.append_null();
+                        }
                     },
                     _ => builder.append_null(),
                 }
@@ -432,11 +439,17 @@ fn build_arrow_column(
                 match find_first_value(doc, field) {
                     Some(OwnedValue::I64(v)) => match i16::try_from(v) {
                         Ok(v16) => builder.append_value(v16),
-                        Err(_) => builder.append_null(),
+                        Err(_) => {
+                            debug_println!("RUST DEBUG: Int16 overflow for field '{:?}': i64 value {} out of range, emitting null", field, v);
+                            builder.append_null();
+                        }
                     },
                     Some(OwnedValue::U64(v)) => match i16::try_from(v) {
                         Ok(v16) => builder.append_value(v16),
-                        Err(_) => builder.append_null(),
+                        Err(_) => {
+                            debug_println!("RUST DEBUG: Int16 overflow for field '{:?}': u64 value {} out of range, emitting null", field, v);
+                            builder.append_null();
+                        }
                     },
                     _ => builder.append_null(),
                 }
@@ -449,11 +462,17 @@ fn build_arrow_column(
                 match find_first_value(doc, field) {
                     Some(OwnedValue::I64(v)) => match i8::try_from(v) {
                         Ok(v8) => builder.append_value(v8),
-                        Err(_) => builder.append_null(),
+                        Err(_) => {
+                            debug_println!("RUST DEBUG: Int8 overflow for field '{:?}': i64 value {} out of range, emitting null", field, v);
+                            builder.append_null();
+                        }
                     },
                     Some(OwnedValue::U64(v)) => match i8::try_from(v) {
                         Ok(v8) => builder.append_value(v8),
-                        Err(_) => builder.append_null(),
+                        Err(_) => {
+                            debug_println!("RUST DEBUG: Int8 overflow for field '{:?}': u64 value {} out of range, emitting null", field, v);
+                            builder.append_null();
+                        }
                     },
                     _ => builder.append_null(),
                 }
@@ -467,7 +486,10 @@ fn build_arrow_column(
                     Some(OwnedValue::U64(v)) => builder.append_value(v),
                     Some(OwnedValue::I64(v)) => match u64::try_from(v) {
                         Ok(v64) => builder.append_value(v64),
-                        Err(_) => builder.append_null(),
+                        Err(_) => {
+                            debug_println!("RUST DEBUG: UInt64 overflow for field '{:?}': negative i64 value {} cannot be unsigned, emitting null", field, v);
+                            builder.append_null();
+                        }
                     },
                     _ => builder.append_null(),
                 }
