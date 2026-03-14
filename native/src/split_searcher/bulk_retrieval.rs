@@ -68,7 +68,7 @@ pub async fn perform_bulk_search(
 
     // Parse QueryAst from (possibly rewritten) JSON
     let query_ast: QueryAst = serde_json::from_str(effective_json_str)
-        .with_context(|| format!("Failed to parse QueryAst JSON: {}", &effective_json_str[..effective_json_str.len().min(200)]))?;
+        .with_context(|| format!("Failed to parse QueryAst JSON: {}", &effective_json_str[..effective_json_str.len().min(1000)]))?;
 
     // Get schema and tokenizer manager for query building
     let schema = ctx.cached_index.schema();
