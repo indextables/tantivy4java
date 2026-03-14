@@ -70,16 +70,26 @@ pub fn parse_query_string(
     // Step B — rewrite all field:CIDR and field:"quoted-CIDR" tokens to range syntax:
     //     "ip:192.168.1.0/24"       → "ip:[192.168.1.0 TO 192.168.1.255]"
     //     "ip:\"2001:db8::/32\""    → "ip:[2001:db8:: TO 2001:db8:ffff:...]"
+    //
+    // Both preprocessors now receive the set of IP-typed field names so that expansion
+    // is only attempted for fields whose schema type is actually IpAddr. This prevents
+    // accidental expansion for fields like `url` whose values may contain '/' or '*'.
+    //
     // Outer fast-path: skip both preprocessing steps when no IP patterns are possible.
-    // This avoids two separate string clones in the common case (pure text queries).
-    // Both inner functions carry their own guards as a safety net for direct callers.
+    // This avoids both string clones and schema inspection in the common case (pure text queries).
+    let original_query_str = query_str.clone();
     let query_str = if query_str.contains('/') || query_str.contains('*') {
-        let after_prefix = if default_fields_vec.len() == 1 {
-            prefix_bare_ip_tokens(&query_str, &default_fields_vec[0])
+        let ip_fields = extract_ip_fields_from_schema_ptr(schema_ptr);
+        if !ip_fields.is_empty() {
+            let after_prefix = if default_fields_vec.len() == 1 {
+                prefix_bare_ip_tokens(&query_str, &default_fields_vec[0], &ip_fields)
+            } else {
+                query_str
+            };
+            preprocess_ip_query_string(&after_prefix, &ip_fields)
         } else {
             query_str
-        };
-        preprocess_ip_query_string(&after_prefix)
+        }
     } else {
         query_str
     };
@@ -128,7 +138,13 @@ pub fn parse_query_string(
     // Post-process the parsed AST to transparently expand IP CIDR/wildcard patterns.
     // This handles cases like "ip:192.168.1.0/24" where the parser may emit a
     // TermQuery with a literal slash that needs to become a RangeQuery.
-    let parsed_ast = rewrite_ip_terms(parsed_ast);
+    // Guard: skip the tree walk entirely when the original query string contained no
+    // IP-like patterns — zero cost for the 99% of queries that have no '/' or '*'.
+    let parsed_ast = if original_query_str.contains('/') || original_query_str.contains('*') {
+        rewrite_ip_terms(parsed_ast)
+    } else {
+        parsed_ast
+    };
 
     debug_println!("RUST DEBUG: 🎯 Final parsed QueryAst: {:?}", parsed_ast);
 
@@ -423,7 +439,8 @@ fn collect_fields_recursive(query_ast: &QueryAst, fields: &mut std::collections:
 }
 
 /// When a single default field is set, scan the query string for bare CIDR/wildcard tokens
-/// (those without an explicit `field:` qualifier) and prefix them with the default field name.
+/// (those without an explicit `field:` qualifier) and prefix them with the default field name,
+/// but only when that default field is in `ip_fields`.
 ///
 /// Also handles double-quoted IPv6 CIDR patterns: `"2001:db8::/32"` → `ip:"2001:db8::/32"`.
 ///
@@ -431,12 +448,27 @@ fn collect_fields_recursive(query_ast: &QueryAst, fields: &mut std::collections:
 ///
 /// Performance design:
 ///   - Fast-path early return when query contains neither '/' nor '*' (zero allocation).
+///   - Short-circuits immediately when `default_field` is not an IP field.
 ///   - Byte-level scanner: no Vec<char> allocation; query strings are always ASCII.
-///   - `try_expand_ip_range` guards every prefix decision with O(1) fast-path checks.
-fn prefix_bare_ip_tokens(query: &str, default_field: &str) -> String {
+///   - `try_expand_ip_range` guards every prefix decision with zero allocation for plain IPs.
+///
+/// NOTE: Unquoted IPv6 CIDRs (e.g., fe80::1/10) are NOT supported here.
+/// The has_field_prefix heuristic detects letters before ':' to distinguish field names
+/// from pure-hex IPv6 groups (2001:db8), but link-local prefixes like fe80 contain
+/// letters and would be misidentified as field names. Users must quote IPv6 CIDRs.
+fn prefix_bare_ip_tokens(
+    query: &str,
+    default_field: &str,
+    ip_fields: &std::collections::HashSet<String>,
+) -> String {
     // Fast path: CIDR requires '/' and wildcards require '*'.
     // If neither is present there are no expandable patterns.
     if !query.contains('/') && !query.contains('*') {
+        return query.to_string();
+    }
+
+    // Fast path: if the default field is not an IP field, there is nothing to prefix.
+    if !ip_fields.contains(default_field) {
         return query.to_string();
     }
 
@@ -541,6 +573,9 @@ fn prefix_bare_ip_tokens(query: &str, default_field: &str) -> String {
 /// into explicit Quickwit range syntax so that the Quickwit parser never sees the '/' character
 /// in IP field values.
 ///
+/// Only tokens whose field name is in `ip_fields` are candidates for expansion; all other
+/// `field:value` tokens (e.g. `url:http://example.com/path`) are passed through unchanged.
+///
 /// Handles both unquoted (`ip:192.168.1.0/24`) and quoted (`ip:"2001:db8::/32"`) forms.
 ///
 /// Examples:
@@ -552,10 +587,13 @@ fn prefix_bare_ip_tokens(query: &str, default_field: &str) -> String {
 ///   - Fast-path early return when query contains neither '/' nor '*' (zero allocation).
 ///   - Single regex pass handles both quoted and unquoted forms via alternation.
 ///   - Regex compiled once via `once_cell::sync::Lazy`.
-///   - `try_expand_ip_range` O(1) fast-path for non-IP tokens (checks contains('/') / contains('*')).
+///   - `ip_fields.contains(field)` short-circuits before `try_expand_ip_range` for non-IP tokens.
 ///
 /// Must be called BEFORE `query_ast_from_user_text`.
-fn preprocess_ip_query_string(query: &str) -> String {
+fn preprocess_ip_query_string(
+    query: &str,
+    ip_fields: &std::collections::HashSet<String>,
+) -> String {
     use once_cell::sync::Lazy;
     use regex::Regex;
 
@@ -587,6 +625,11 @@ fn preprocess_ip_query_string(query: &str) -> String {
     IP_TOKEN
         .replace_all(query, |caps: &regex::Captures| {
             let field = &caps[1];
+            // Only expand tokens for fields that are actually IP-typed in the schema.
+            if !ip_fields.contains(field) {
+                // Reconstruct original token unchanged (avoids allocation for the common case).
+                return caps[0].to_string();
+            }
             // Exactly one of caps[2] (quoted) or caps[3] (unquoted) is non-empty per match.
             let (value, was_quoted) = match (caps.get(2), caps.get(3)) {
                 (Some(m), _) => (m.as_str(), true),
@@ -606,6 +649,40 @@ fn preprocess_ip_query_string(query: &str) -> String {
             }
         })
         .into_owned()
+}
+
+/// Extract the names of all IpAddr-typed fields from the schema referenced by `schema_ptr`.
+/// Returns an empty set when the pointer is invalid or refers to no IP fields, so callers
+/// can safely skip IP preprocessing without schema context.
+fn extract_ip_fields_from_schema_ptr(schema_ptr: jni::sys::jlong) -> std::collections::HashSet<String> {
+    if let Some(schema) = crate::utils::jlong_to_arc::<tantivy::schema::Schema>(schema_ptr) {
+        schema
+            .fields()
+            .filter_map(|(_, entry)| {
+                if matches!(entry.field_type(), tantivy::schema::FieldType::IpAddr(_)) {
+                    Some(entry.name().to_string())
+                } else {
+                    None
+                }
+            })
+            .collect()
+    } else {
+        // Also try the split schema cache as a fallback (same pattern as extract_text_fields_from_schema)
+        let cache = SPLIT_SCHEMA_CACHE.lock().unwrap();
+        for (_, cached_schema) in cache.iter() {
+            return cached_schema
+                .fields()
+                .filter_map(|(_, entry)| {
+                    if matches!(entry.field_type(), tantivy::schema::FieldType::IpAddr(_)) {
+                        Some(entry.name().to_string())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+        }
+        std::collections::HashSet::new()
+    }
 }
 
 /// Recursively rewrite a QueryAst, expanding IP CIDR and wildcard patterns in TermQuery and

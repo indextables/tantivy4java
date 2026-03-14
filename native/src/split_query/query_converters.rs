@@ -61,29 +61,45 @@ pub fn convert_term_query_to_query_ast(env: &mut JNIEnv, obj: &JObject) -> Resul
         value
     );
 
-    // IP CIDR/wildcard expansion: transparently rewrite to RangeQuery or MatchAll.
-    // Fast path: try_expand_ip_range returns None in O(n) with zero allocation for regular IPs.
-    if let Some((lower, upper)) = crate::ip_expansion::try_expand_ip_range(&value) {
-        debug_println!(
-            "RUST DEBUG: Expanding IP pattern '{}' to range [{} TO {}]",
-            value, lower, upper
-        );
-        // Match-all case: *.*.*.*  or  /0 — emit MatchAll for maximum performance
-        if crate::ip_expansion::is_match_all_range(&lower, &upper) {
+    // IP CIDR/wildcard expansion: only expand when the caller signals this is an IP field
+    // via the nullable `fieldType` field. Expanding unconditionally would rewrite any field
+    // whose value happens to contain '/' or '*' (e.g., url:http://example.com/path).
+    // Zero allocation for regular IPs (no '/' or '*' in value).
+    let field_type_obj = env
+        .get_field(obj, "fieldType", "Ljava/lang/String;")
+        .map_err(|e| anyhow!("Failed to get fieldType: {}", e))?;
+    let field_type_jobj = field_type_obj.l()?;
+    let is_ip_field = if field_type_jobj.is_null() {
+        false
+    } else {
+        let ft_jstring: JString = field_type_jobj.into();
+        let ft: String = env.get_string(&ft_jstring)?.into();
+        matches!(ft.as_str(), "ipaddr" | "ip_addr" | "ip")
+    };
+
+    if is_ip_field {
+        if let Some((lower, upper)) = crate::ip_expansion::try_expand_ip_range(&value) {
             debug_println!(
-                "RUST DEBUG: IP pattern '{}' covers all IPs, returning MatchAll",
-                value
+                "RUST DEBUG: Expanding IP pattern '{}' to range [{} TO {}]",
+                value, lower, upper
             );
-            return Ok(QueryAst::MatchAll);
+            // Match-all case: *.*.*.*  or  /0 — emit MatchAll for maximum performance
+            if crate::ip_expansion::is_match_all_range(&lower, &upper) {
+                debug_println!(
+                    "RUST DEBUG: IP pattern '{}' covers all IPs, returning MatchAll",
+                    value
+                );
+                return Ok(QueryAst::MatchAll);
+            }
+            use quickwit_query::query_ast::RangeQuery;
+            use std::ops::Bound;
+            let range_query = RangeQuery {
+                field,
+                lower_bound: Bound::Included(JsonLiteral::String(lower)),
+                upper_bound: Bound::Included(JsonLiteral::String(upper)),
+            };
+            return Ok(QueryAst::Range(range_query));
         }
-        use quickwit_query::query_ast::RangeQuery;
-        use std::ops::Bound;
-        let range_query = RangeQuery {
-            field,
-            lower_bound: Bound::Included(JsonLiteral::String(lower)),
-            upper_bound: Bound::Included(JsonLiteral::String(upper)),
-        };
-        return Ok(QueryAst::Range(range_query));
     }
 
     // Create proper Quickwit QueryAst using official structures
