@@ -9,7 +9,6 @@ use quickwit_query::query_ast::{query_ast_from_user_text, QueryAst};
 
 use crate::debug_println;
 
-use super::schema_cache::SPLIT_SCHEMA_CACHE;
 
 /// Parse a query string into a SplitQuery
 pub fn parse_query_string(
@@ -77,7 +76,6 @@ pub fn parse_query_string(
     //
     // Outer fast-path: skip both preprocessing steps when no IP patterns are possible.
     // This avoids both string clones and schema inspection in the common case (pure text queries).
-    let original_query_str = query_str.clone();
     let query_str = if query_str.contains('/') || query_str.contains('*') {
         let ip_fields = extract_ip_fields_from_schema_ptr(schema_ptr);
         if !ip_fields.is_empty() {
@@ -133,17 +131,6 @@ pub fn parse_query_string(
             // 🚨 THROW ERROR instead of falling back to match_all
             return Err(anyhow!("Failed to parse query '{}': {}. This query requires explicit field names (e.g., 'field:term') or valid default search fields in the schema.", query_str, e));
         }
-    };
-
-    // Post-process the parsed AST to transparently expand IP CIDR/wildcard patterns.
-    // This handles cases like "ip:192.168.1.0/24" where the parser may emit a
-    // TermQuery with a literal slash that needs to become a RangeQuery.
-    // Guard: skip the tree walk entirely when the original query string contained no
-    // IP-like patterns — zero cost for the 99% of queries that have no '/' or '*'.
-    let parsed_ast = if original_query_str.contains('/') || original_query_str.contains('*') {
-        rewrite_ip_terms(parsed_ast)
-    } else {
-        parsed_ast
     };
 
     debug_println!("RUST DEBUG: 🎯 Final parsed QueryAst: {:?}", parsed_ast);
@@ -326,28 +313,14 @@ pub fn extract_text_fields_from_schema(
         "RUST DEBUG: This suggests either the pointer is invalid or the schema is not in the registry"
     );
 
-    // NEW APPROACH: Try to get any cached schema from the split schema cache
-    // Since we don't have the split URI in this context, iterate through all cached schemas
-    debug_println!("RUST DEBUG: Attempting to retrieve schema from split schema cache...");
-    let cache = SPLIT_SCHEMA_CACHE.lock().unwrap();
-    for (split_uri, cached_schema) in cache.iter() {
-        debug_println!("RUST DEBUG: Found cached schema for split URI: {}", split_uri);
-        let text_fields = extract_fields_from_schema(cached_schema)?;
-        debug_println!(
-            "RUST DEBUG: ✅ Using cached schema from split: {} with text fields: {:?}",
-            split_uri,
-            text_fields
-        );
-        return Ok(text_fields);
-    }
-    drop(cache);
-
-    debug_println!("RUST DEBUG: ❌ No cached schemas found in split schema cache");
-
-    Err(anyhow!(
-        "Schema registry lookup failed for pointer: {} and no cached schemas found - this indicates a schema pointer lifecycle issue",
+    // schema_ptr is invalid or stale — return empty rather than guessing from a random
+    // cached schema that may belong to a different split.
+    debug_println!(
+        "RUST DEBUG: extract_text_fields_from_schema: schema_ptr {} not in registry, returning empty",
         schema_ptr
-    ))
+    );
+
+    Ok(Vec::new())
 }
 
 /// Helper function to extract text fields from a schema
@@ -667,91 +640,16 @@ fn extract_ip_fields_from_schema_ptr(schema_ptr: jni::sys::jlong) -> std::collec
             })
             .collect()
     } else {
-        // Also try the split schema cache as a fallback (same pattern as extract_text_fields_from_schema)
-        let cache = SPLIT_SCHEMA_CACHE.lock().unwrap();
-        for (_, cached_schema) in cache.iter() {
-            return cached_schema
-                .fields()
-                .filter_map(|(_, entry)| {
-                    if matches!(entry.field_type(), tantivy::schema::FieldType::IpAddr(_)) {
-                        Some(entry.name().to_string())
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-        }
+        // schema_ptr is invalid or stale — return empty rather than guessing from a random
+        // cached schema that may belong to a different split.
+        debug_println!(
+            "RUST DEBUG: extract_ip_fields_from_schema_ptr: schema_ptr {} not in registry, returning empty",
+            schema_ptr
+        );
         std::collections::HashSet::new()
     }
 }
 
-/// Recursively rewrite a QueryAst, expanding IP CIDR and wildcard patterns in TermQuery and
-/// WildcardQuery nodes.
-///
-/// The Quickwit parser may emit either a `QueryAst::Term` (for CIDR patterns containing '/') or a
-/// `QueryAst::Wildcard` (for patterns containing '*' like `ip:192.168.1.*`) when the query string
-/// contains IP range shorthands. This function walks the AST and replaces such nodes with the
-/// correct `QueryAst::Range` or `QueryAst::MatchAll`.
-fn rewrite_ip_terms(ast: QueryAst) -> QueryAst {
-    // Helper: attempt expansion given a field name and value string, returning a rewritten node
-    // if the value is an IP CIDR or wildcard pattern.
-    let try_rewrite = |field: &str, value: &str| -> Option<QueryAst> {
-        let (lower, upper) = crate::ip_expansion::try_expand_ip_range(value)?;
-        if crate::ip_expansion::is_match_all_range(&lower, &upper) {
-            debug_println!(
-                "RUST DEBUG: rewrite_ip_terms: '{}:{}' → MatchAll",
-                field, value
-            );
-            return Some(QueryAst::MatchAll);
-        }
-        debug_println!(
-            "RUST DEBUG: rewrite_ip_terms: '{}:{}' → Range [{} TO {}]",
-            field, value, lower, upper
-        );
-        use quickwit_query::query_ast::RangeQuery;
-        use quickwit_query::JsonLiteral;
-        use std::ops::Bound;
-        Some(QueryAst::Range(RangeQuery {
-            field: field.to_string(),
-            lower_bound: Bound::Included(JsonLiteral::String(lower)),
-            upper_bound: Bound::Included(JsonLiteral::String(upper)),
-        }))
-    };
-
-    // QueryAst::Term — CIDR patterns (e.g. ip:192.168.1.0/24) parse here
-    if let QueryAst::Term(ref t) = ast {
-        if let Some(rewritten) = try_rewrite(&t.field, &t.value) {
-            return rewritten;
-        }
-    }
-
-    // QueryAst::Wildcard — wildcard patterns (e.g. ip:192.168.1.*) parse here
-    if let QueryAst::Wildcard(ref w) = ast {
-        if let Some(rewritten) = try_rewrite(&w.field, &w.value) {
-            return rewritten;
-        }
-    }
-
-    // Recursively rewrite compound subqueries; pass all other variants through unchanged
-    match ast {
-        QueryAst::Bool(b) => {
-            use quickwit_query::query_ast::BoolQuery;
-            let rewritten = BoolQuery {
-                must: b.must.into_iter().map(rewrite_ip_terms).collect(),
-                should: b.should.into_iter().map(rewrite_ip_terms).collect(),
-                must_not: b.must_not.into_iter().map(rewrite_ip_terms).collect(),
-                filter: b.filter.into_iter().map(rewrite_ip_terms).collect(),
-                minimum_should_match: b.minimum_should_match,
-            };
-            QueryAst::Bool(rewritten)
-        }
-        QueryAst::Boost { underlying, boost } => QueryAst::Boost {
-            underlying: Box::new(rewrite_ip_terms(*underlying)),
-            boost,
-        },
-        other => other,
-    }
-}
 
 /// Count the number of unique fields in a parsed query
 pub fn count_query_fields(

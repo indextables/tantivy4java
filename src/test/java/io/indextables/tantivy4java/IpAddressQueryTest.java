@@ -965,9 +965,9 @@ public class IpAddressQueryTest {
     }
 
     @Test
-    @DisplayName("IPv4 wildcard mixed positions 10.*.1.* matches correct IPs")
+    @DisplayName("IPv4 non-contiguous wildcard 10.*.1.* is rejected (not silently over-matched)")
     public void testIpv4WildcardMixedPositions() {
-        System.out.println("=== IPv4 Wildcard Mixed Positions Test ===");
+        System.out.println("=== IPv4 Non-Contiguous Wildcard Rejection Test ===");
 
         try (SchemaBuilder builder = new SchemaBuilder()) {
             builder.addTextField("title", true, false, "default", "position")
@@ -975,36 +975,17 @@ public class IpAddressQueryTest {
                    .addIntegerField("id", true, true, true);
 
             try (Schema schema = builder.build()) {
-                try (Index index = new Index(schema, "", true)) {
-                    try (IndexWriter writer = index.writer(Index.Memory.DEFAULT_HEAP_SIZE, 1)) {
-                        // 10.*.1.* expands to the single contiguous range [10.0.1.0, 10.255.1.255].
-                        // Range semantics: any IP between the lower and upper bound is matched,
-                        // even if the third octet is not 1 (e.g., 10.0.2.5 is inside the range).
-                        addDocumentWithIp(writer, "In range exact",   "10.0.1.5",    1);
-                        addDocumentWithIp(writer, "In range exact",   "10.255.1.100", 2);
-                        addDocumentWithIp(writer, "In range approx",  "10.0.2.5",    3);  // inside [10.0.1.0, 10.255.1.255]
-                        addDocumentWithIp(writer, "Out of range",     "11.0.1.5",    4);  // first octet not 10 — outside range
-                        writer.commit();
-                    }
-                    index.reload();
-
-                    try (Searcher searcher = index.searcher()) {
-                        try (Query query = Query.termQuery(schema, "ip_addr", "10.*.1.*")) {
-                            try (SearchResult result = searcher.search(query, 20)) {
-                                // Range [10.0.1.0, 10.255.1.255] matches 3 IPs: the two exact-pattern
-                                // matches plus 10.0.2.5 which lies inside the contiguous range.
-                                // Non-trailing wildcards produce an over-approximating single range.
-                                assertEquals(3, result.getHits().size(),
-                                    "10.*.1.* range [10.0.1.0, 10.255.1.255] matches all IPs within bounds");
-                                System.out.println("10.*.1.* matched " + result.getHits().size() + " docs (range semantics)");
-                            }
-                        }
-                    }
-                }
+                // Non-contiguous wildcard "10.*.1.*" cannot be expressed as a single IP range
+                // without producing false positives (e.g. 10.0.2.5 would incorrectly match).
+                // The expansion is intentionally rejected so the caller receives an explicit
+                // error rather than silently wrong results.
+                assertThrows(RuntimeException.class,
+                    () -> Query.termQuery(schema, "ip_addr", "10.*.1.*"),
+                    "Non-contiguous wildcard 10.*.1.* must be rejected, not silently over-matched");
             }
         }
 
-        System.out.println("IPv4 wildcard mixed positions test PASSED\n");
+        System.out.println("IPv4 non-contiguous wildcard rejection test PASSED\n");
     }
 
     @Test

@@ -78,6 +78,21 @@ pub fn try_expand_ipv4_wildcard(value: &str) -> Option<(String, String)> {
         return None;
     }
 
+    // Reject non-contiguous wildcard patterns like "10.*.1.*" where a fixed octet
+    // follows a wildcard octet.  A single range [10.0.1.0 TO 10.255.1.255] would
+    // include addresses with wrong third octets (false positives).  Return None so
+    // the caller treats the value as a literal term and the user gets an explicit error
+    // rather than silently incorrect results.
+    let mut seen_wildcard = false;
+    for part in &parts {
+        if *part == "*" {
+            seen_wildcard = true;
+        } else if seen_wildcard {
+            // Fixed octet after a wildcard — non-contiguous, cannot represent as a single range.
+            return None;
+        }
+    }
+
     let mut lower_parts = [0u8; 4];
     let mut upper_parts = [0u8; 4];
 
@@ -237,8 +252,11 @@ mod tests {
 
     #[test]
     fn test_wildcard_mixed_positions() {
+        // Non-contiguous wildcard: a fixed octet (1) follows a wildcard octet (*).
+        // A single range would produce false positives (e.g. 10.5.2.100 would match).
+        // We reject these patterns so callers get an explicit error instead of wrong results.
         let result = try_expand_ipv4_wildcard("10.*.1.*");
-        assert_eq!(result, Some(("10.0.1.0".to_string(), "10.255.1.255".to_string())));
+        assert_eq!(result, None);
     }
 
     #[test]

@@ -116,7 +116,7 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_sear
 
     // Extract all JNI data at entry point - no JNI types should go into core functions
     debug_println!("🔥 NATIVE DEBUG: Converting SplitQuery to JSON");
-    let query_json_str = match convert_split_query_to_json(&mut env, &split_query_obj) {
+    let query_json_str = match convert_split_query_to_json(&mut env, &split_query_obj, searcher_ptr) {
         Ok(json_str) => {
             debug_println!("🔥 NATIVE DEBUG: Successfully converted SplitQuery to JSON: {}", json_str);
             json_str
@@ -216,7 +216,7 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_sear
     debug_println!("RUST DEBUG: searcher_ptr validation passed: {}", searcher_ptr);
 
     // Convert SplitQuery to QueryAst JSON (using existing infrastructure)
-    let query_json_result = convert_split_query_to_json(&mut env, &split_query);
+    let query_json_result = convert_split_query_to_json(&mut env, &split_query, searcher_ptr);
     let query_json = match query_json_result {
         Ok(json) => {
             debug_println!("RUST DEBUG: Query conversion successful");
