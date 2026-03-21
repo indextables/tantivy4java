@@ -50,6 +50,7 @@ pub mod delta_reader;  // Delta Lake table file listing via delta-kernel-rs
 pub mod iceberg_reader;  // Iceberg table reading via apache/iceberg-rust
 pub mod parquet_schema_reader;  // Read schema from standalone parquet files
 pub mod parquet_reader;  // Hive-style partitioned parquet directory reading
+pub mod txlog;  // Indextables transaction log (Avro state format, v4)
 
 pub use schema::*;
 pub use document::*;

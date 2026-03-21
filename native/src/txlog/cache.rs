@@ -1,0 +1,392 @@
+// txlog/cache.rs - Unified cache with read/invalidate/refresh semantics
+//
+// Replaces Scala's 5+ separate caches with a single structure providing
+// TTL-based expiration, LRU eviction, and a global manifest cache.
+
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
+use lru::LruCache;
+use parking_lot::RwLock;
+use std::num::NonZeroUsize;
+
+use super::actions::*;
+
+// ============================================================================
+// Cache configuration
+// ============================================================================
+
+#[derive(Clone, Debug)]
+pub struct CacheConfig {
+    pub version_capacity: usize,
+    pub version_ttl: Duration,
+    pub snapshot_capacity: usize,
+    pub snapshot_ttl: Duration,
+    pub file_list_capacity: usize,
+    pub file_list_ttl: Duration,
+    pub metadata_ttl: Duration,
+    pub enabled: bool,
+}
+
+impl Default for CacheConfig {
+    fn default() -> Self {
+        Self {
+            version_capacity: 1000,
+            version_ttl: Duration::from_secs(300),
+            snapshot_capacity: 100,
+            snapshot_ttl: Duration::from_secs(600),
+            file_list_capacity: 50,
+            file_list_ttl: Duration::from_secs(120),
+            metadata_ttl: Duration::from_secs(1800),
+            enabled: true,
+        }
+    }
+}
+
+// ============================================================================
+// Cache statistics
+// ============================================================================
+
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct CacheStatsSnapshot {
+    pub hits: u64,
+    pub misses: u64,
+    pub evictions: u64,
+}
+
+impl CacheStatsSnapshot {
+    pub fn hit_rate(&self) -> f64 {
+        let total = self.hits + self.misses;
+        if total == 0 { 0.0 } else { self.hits as f64 / total as f64 * 100.0 }
+    }
+}
+
+// ============================================================================
+// Time-bounded LRU cache
+// ============================================================================
+
+struct Timed<T> {
+    value: T,
+    inserted_at: Instant,
+}
+
+struct TimedLruCache<K: Hash + Eq, V> {
+    inner: LruCache<K, Timed<V>>,
+    ttl: Duration,
+    hits: u64,
+    misses: u64,
+    evictions: u64,
+}
+
+impl<K: Hash + Eq, V: Clone> TimedLruCache<K, V> {
+    fn new(capacity: usize, ttl: Duration) -> Self {
+        Self {
+            inner: LruCache::new(NonZeroUsize::new(capacity.max(1)).unwrap()),
+            ttl,
+            hits: 0,
+            misses: 0,
+            evictions: 0,
+        }
+    }
+
+    fn get(&mut self, key: &K) -> Option<V> {
+        // First check if the key exists and is not expired (peek doesn't promote)
+        if let Some(entry) = self.inner.peek(key) {
+            if entry.inserted_at.elapsed() < self.ttl {
+                // Not expired - promote via get and return
+                let entry = self.inner.get(key).unwrap();
+                self.hits += 1;
+                return Some(entry.value.clone());
+            }
+            // Expired - remove it
+            self.inner.pop(key);
+            self.evictions += 1;
+        }
+        self.misses += 1;
+        None
+    }
+
+    fn put(&mut self, key: K, value: V) {
+        if self.inner.len() >= self.inner.cap().get() {
+            self.evictions += 1;
+        }
+        self.inner.put(key, Timed { value, inserted_at: Instant::now() });
+    }
+
+    fn invalidate_all(&mut self) {
+        self.inner.clear();
+    }
+
+    fn stats(&self) -> CacheStatsSnapshot {
+        CacheStatsSnapshot {
+            hits: self.hits,
+            misses: self.misses,
+            evictions: self.evictions,
+        }
+    }
+
+    fn reset_stats(&mut self) {
+        self.hits = 0;
+        self.misses = 0;
+        self.evictions = 0;
+    }
+}
+
+// ============================================================================
+// FileListKey: cache key for filtered file lists
+// ============================================================================
+
+#[derive(Eq, PartialEq)]
+struct FileListKey {
+    version: i64,
+    filter_hash: u64,
+}
+
+impl Hash for FileListKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.version.hash(state);
+        self.filter_hash.hash(state);
+    }
+}
+
+// ============================================================================
+// Main cache structure
+// ============================================================================
+
+pub struct TxLogCache {
+    inner: RwLock<CacheInner>,
+    config: CacheConfig,
+}
+
+struct CacheInner {
+    versions: TimedLruCache<i64, Vec<super::actions::Action>>,
+    snapshots: TimedLruCache<i64, Arc<Vec<FileEntry>>>,
+    file_lists: TimedLruCache<FileListKey, Arc<Vec<FileEntry>>>,
+    metadata: Option<Timed<Arc<(ProtocolAction, MetadataAction)>>>,
+    last_checkpoint: Option<Timed<LastCheckpointInfo>>,
+    metadata_ttl: Duration,
+}
+
+impl TxLogCache {
+    pub fn new(config: CacheConfig) -> Self {
+        let inner = CacheInner {
+            versions: TimedLruCache::new(config.version_capacity, config.version_ttl),
+            snapshots: TimedLruCache::new(config.snapshot_capacity, config.snapshot_ttl),
+            file_lists: TimedLruCache::new(config.file_list_capacity, config.file_list_ttl),
+            metadata: None,
+            last_checkpoint: None,
+            metadata_ttl: config.metadata_ttl,
+        };
+        Self {
+            inner: RwLock::new(inner),
+            config,
+        }
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        self.config.enabled
+    }
+
+    // -- Read --
+
+    // Note: get_version/get_snapshot/get_file_list take a write lock because
+    // LRU::get() updates internal access order for eviction tracking.
+    // This serializes all cache reads. Acceptable for txlog workload (infrequent reads).
+
+    pub fn get_version(&self, version: i64) -> Option<Vec<super::actions::Action>> {
+        if !self.config.enabled { return None; }
+        self.inner.write().versions.get(&version)
+    }
+
+    pub fn get_snapshot(&self, version: i64) -> Option<Arc<Vec<FileEntry>>> {
+        if !self.config.enabled { return None; }
+        self.inner.write().snapshots.get(&version)
+    }
+
+    pub fn get_file_list(&self, version: i64, filter_hash: u64) -> Option<Arc<Vec<FileEntry>>> {
+        if !self.config.enabled { return None; }
+        let key = FileListKey { version, filter_hash };
+        self.inner.write().file_lists.get(&key)
+    }
+
+    pub fn get_metadata(&self) -> Option<Arc<(ProtocolAction, MetadataAction)>> {
+        if !self.config.enabled { return None; }
+        let inner = self.inner.read();
+        if let Some(ref entry) = inner.metadata {
+            if entry.inserted_at.elapsed() < inner.metadata_ttl {
+                return Some(entry.value.clone());
+            }
+        }
+        None
+    }
+
+    pub fn get_last_checkpoint(&self) -> Option<LastCheckpointInfo> {
+        if !self.config.enabled { return None; }
+        let inner = self.inner.read();
+        if let Some(ref entry) = inner.last_checkpoint {
+            if entry.inserted_at.elapsed() < inner.metadata_ttl {
+                return Some(entry.value.clone());
+            }
+        }
+        None
+    }
+
+    // -- Write / Cache --
+
+    pub fn put_version(&self, version: i64, actions: Vec<super::actions::Action>) {
+        if !self.config.enabled { return; }
+        self.inner.write().versions.put(version, actions);
+    }
+
+    pub fn put_snapshot(&self, version: i64, entries: Arc<Vec<FileEntry>>) {
+        if !self.config.enabled { return; }
+        self.inner.write().snapshots.put(version, entries);
+    }
+
+    pub fn put_file_list(&self, version: i64, filter_hash: u64, entries: Arc<Vec<FileEntry>>) {
+        if !self.config.enabled { return; }
+        let key = FileListKey { version, filter_hash };
+        self.inner.write().file_lists.put(key, entries);
+    }
+
+    pub fn put_metadata(&self, protocol: ProtocolAction, metadata: MetadataAction) {
+        if !self.config.enabled { return; }
+        self.inner.write().metadata = Some(Timed {
+            value: Arc::new((protocol, metadata)),
+            inserted_at: Instant::now(),
+        });
+    }
+
+    pub fn put_last_checkpoint(&self, info: LastCheckpointInfo) {
+        if !self.config.enabled { return; }
+        self.inner.write().last_checkpoint = Some(Timed {
+            value: info,
+            inserted_at: Instant::now(),
+        });
+    }
+
+    // -- Invalidate --
+
+    pub fn invalidate_all(&self) {
+        let mut inner = self.inner.write();
+        inner.versions.invalidate_all();
+        inner.snapshots.invalidate_all();
+        inner.file_lists.invalidate_all();
+        inner.metadata = None;
+        inner.last_checkpoint = None;
+    }
+
+    pub fn invalidate_mutable(&self) {
+        let mut inner = self.inner.write();
+        inner.versions.invalidate_all();
+        inner.snapshots.invalidate_all();
+        inner.file_lists.invalidate_all();
+    }
+
+    // -- Stats --
+
+    pub fn stats(&self) -> CacheStatsSnapshot {
+        let inner = self.inner.read();
+        let v = inner.versions.stats();
+        let s = inner.snapshots.stats();
+        let f = inner.file_lists.stats();
+        CacheStatsSnapshot {
+            hits: v.hits + s.hits + f.hits,
+            misses: v.misses + s.misses + f.misses,
+            evictions: v.evictions + s.evictions + f.evictions,
+        }
+    }
+
+    pub fn reset_stats(&self) {
+        let mut inner = self.inner.write();
+        inner.versions.reset_stats();
+        inner.snapshots.reset_stats();
+        inner.file_lists.reset_stats();
+    }
+}
+
+// ============================================================================
+// Global manifest cache (immutable data, no TTL)
+// ============================================================================
+
+static GLOBAL_MANIFEST_CACHE: OnceLock<RwLock<LruCache<String, Arc<Vec<FileEntry>>>>> = OnceLock::new();
+
+fn global_manifest_cache() -> &'static RwLock<LruCache<String, Arc<Vec<FileEntry>>>> {
+    GLOBAL_MANIFEST_CACHE.get_or_init(|| {
+        RwLock::new(LruCache::new(NonZeroUsize::new(500).unwrap()))
+    })
+}
+
+/// Note: takes write lock because LRU::get() updates internal access order.
+pub fn get_cached_manifest(path: &str) -> Option<Arc<Vec<FileEntry>>> {
+    global_manifest_cache().write().get(&path.to_string()).cloned()
+}
+
+pub fn put_cached_manifest(path: &str, entries: Arc<Vec<FileEntry>>) {
+    global_manifest_cache().write().put(path.to_string(), entries);
+}
+
+pub fn invalidate_manifest_cache() {
+    global_manifest_cache().write().clear();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_cache_disabled() {
+        let config = CacheConfig { enabled: false, ..Default::default() };
+        let cache = TxLogCache::new(config);
+        cache.put_version(1, vec![]);
+        assert!(cache.get_version(1).is_none());
+    }
+
+    #[test]
+    fn test_cache_hit_miss() {
+        let cache = TxLogCache::new(CacheConfig::default());
+        assert!(cache.get_version(1).is_none()); // miss
+        cache.put_version(1, vec![]);
+        assert!(cache.get_version(1).is_some()); // hit
+    }
+
+    #[test]
+    fn test_cache_invalidate() {
+        let cache = TxLogCache::new(CacheConfig::default());
+        cache.put_version(1, vec![]);
+        cache.invalidate_all();
+        assert!(cache.get_version(1).is_none());
+    }
+
+    #[test]
+    fn test_cache_ttl_expiry() {
+        let config = CacheConfig {
+            version_ttl: Duration::from_millis(1),
+            ..Default::default()
+        };
+        let cache = TxLogCache::new(config);
+        cache.put_version(1, vec![]);
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(cache.get_version(1).is_none()); // expired
+    }
+
+    #[test]
+    fn test_global_manifest_cache() {
+        let entries = Arc::new(vec![]);
+        put_cached_manifest("test-manifest.avro", entries.clone());
+        let cached = get_cached_manifest("test-manifest.avro");
+        assert!(cached.is_some());
+    }
+
+    #[test]
+    fn test_stats() {
+        let cache = TxLogCache::new(CacheConfig::default());
+        cache.get_version(1); // miss
+        cache.put_version(1, vec![]);
+        cache.get_version(1); // hit
+        let stats = cache.stats();
+        assert_eq!(stats.misses, 1);
+        assert_eq!(stats.hits, 1);
+    }
+}
