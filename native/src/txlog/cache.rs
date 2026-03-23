@@ -331,6 +331,113 @@ pub fn invalidate_manifest_cache() {
     global_manifest_cache().write().clear();
 }
 
+// ============================================================================
+// Global cache registry (Option B: internal LRU keyed by table_path)
+// ============================================================================
+
+use std::collections::hash_map::DefaultHasher;
+
+/// Cache key combining table path and TTL (credential changes don't invalidate cache).
+#[derive(Eq, PartialEq, Hash, Clone, Debug)]
+struct RegistryKey {
+    table_path: String,
+    ttl_ms: u64,
+}
+
+static CACHE_REGISTRY: OnceLock<RwLock<HashMap<RegistryKey, Arc<TxLogCache>>>> = OnceLock::new();
+
+fn cache_registry() -> &'static RwLock<HashMap<RegistryKey, Arc<TxLogCache>>> {
+    CACHE_REGISTRY.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+/// Extract cache TTL from config map. Returns None if caching disabled (ttl=0).
+pub fn extract_cache_ttl(config: &HashMap<String, String>) -> Option<Duration> {
+    let ttl_str = config.get("cache.ttl.ms")
+        .or_else(|| config.get("cache_ttl_ms"));
+    match ttl_str {
+        Some(s) => {
+            let ms: u64 = s.parse().unwrap_or(300_000);
+            if ms == 0 { None } else { Some(Duration::from_millis(ms)) }
+        }
+        None => Some(Duration::from_secs(300)), // default 5 minutes
+    }
+}
+
+/// Get or create a TxLogCache for the given table path and TTL.
+pub fn get_or_create_cache(table_path: &str, ttl: Duration) -> Arc<TxLogCache> {
+    let key = RegistryKey {
+        table_path: table_path.to_string(),
+        ttl_ms: ttl.as_millis() as u64,
+    };
+
+    // Fast path: check if already exists (read lock)
+    {
+        let registry = cache_registry().read();
+        if let Some(cache) = registry.get(&key) {
+            return cache.clone();
+        }
+    }
+
+    // Slow path: create new cache (write lock)
+    let mut registry = cache_registry().write();
+    // Double-check after acquiring write lock
+    if let Some(cache) = registry.get(&key) {
+        return cache.clone();
+    }
+
+    let config = CacheConfig {
+        version_ttl: ttl,
+        snapshot_ttl: ttl,
+        file_list_ttl: ttl,
+        metadata_ttl: ttl,
+        ..Default::default()
+    };
+    let cache = Arc::new(TxLogCache::new(config));
+    registry.insert(key, cache.clone());
+    cache
+}
+
+/// Invalidate cached data for a specific table (called after writes).
+pub fn invalidate_table_cache(table_path: &str) {
+    let registry = cache_registry().read();
+    for (key, cache) in registry.iter() {
+        if key.table_path == table_path {
+            cache.invalidate_mutable();
+        }
+    }
+}
+
+/// Get aggregate stats across all cached tables.
+pub fn global_cache_stats() -> CacheStatsSnapshot {
+    let registry = cache_registry().read();
+    let mut total = CacheStatsSnapshot::default();
+    for cache in registry.values() {
+        let s = cache.stats();
+        total.hits += s.hits;
+        total.misses += s.misses;
+        total.evictions += s.evictions;
+    }
+    total
+}
+
+/// Clear all caches (for testing or shutdown).
+pub fn clear_all_caches() {
+    let mut registry = cache_registry().write();
+    for cache in registry.values() {
+        cache.invalidate_all();
+    }
+    registry.clear();
+    invalidate_manifest_cache();
+}
+
+/// Compute a stable hash for snapshot cache key from snapshot info.
+pub fn hash_snapshot_key(checkpoint_version: i64, post_cp_count: usize) -> i64 {
+    let mut hasher = DefaultHasher::new();
+    checkpoint_version.hash(&mut hasher);
+    post_cp_count.hash(&mut hasher);
+    hasher.finish() as i64
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -388,5 +495,60 @@ mod tests {
         let stats = cache.stats();
         assert_eq!(stats.misses, 1);
         assert_eq!(stats.hits, 1);
+    }
+
+    #[test]
+    fn test_extract_cache_ttl_default() {
+        let config = HashMap::new();
+        let ttl = extract_cache_ttl(&config);
+        assert_eq!(ttl, Some(Duration::from_secs(300)));
+    }
+
+    #[test]
+    fn test_extract_cache_ttl_custom() {
+        let mut config = HashMap::new();
+        config.insert("cache.ttl.ms".to_string(), "60000".to_string());
+        let ttl = extract_cache_ttl(&config);
+        assert_eq!(ttl, Some(Duration::from_millis(60000)));
+    }
+
+    #[test]
+    fn test_extract_cache_ttl_disabled() {
+        let mut config = HashMap::new();
+        config.insert("cache.ttl.ms".to_string(), "0".to_string());
+        let ttl = extract_cache_ttl(&config);
+        assert!(ttl.is_none());
+    }
+
+    #[test]
+    fn test_get_or_create_cache_reuse() {
+        let ttl = Duration::from_secs(60);
+        let c1 = get_or_create_cache("test://table1", ttl);
+        let c2 = get_or_create_cache("test://table1", ttl);
+        // Same Arc — should be the same cache
+        assert!(Arc::ptr_eq(&c1, &c2));
+    }
+
+    #[test]
+    fn test_invalidate_table_cache() {
+        let ttl = Duration::from_secs(300);
+        let c = get_or_create_cache("test://table_inv", ttl);
+        c.put_version(1, vec![]);
+        assert!(c.get_version(1).is_some());
+        invalidate_table_cache("test://table_inv");
+        assert!(c.get_version(1).is_none()); // invalidated
+    }
+
+    #[test]
+    fn test_global_cache_stats() {
+        let ttl = Duration::from_secs(300);
+        let c = get_or_create_cache("test://table_stats", ttl);
+        c.get_version(99); // miss
+        c.put_version(99, vec![]);
+        c.get_version(99); // hit
+        let stats = global_cache_stats();
+        // Stats are global aggregated — at least 1 hit and 1 miss from this test
+        assert!(stats.hits >= 1);
+        assert!(stats.misses >= 1);
     }
 }

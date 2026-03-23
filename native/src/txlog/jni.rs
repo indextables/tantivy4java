@@ -7,12 +7,23 @@ use jni::objects::{JClass, JObject, JString};
 use jni::sys::{jbyteArray, jint, jlong};
 use jni::JNIEnv;
 
-use crate::common::{buffer_to_jbytearray, build_storage_config, extract_optional_jstring, to_java_exception};
+use crate::common::{buffer_to_jbytearray, build_storage_config, extract_optional_jstring, extract_string, to_java_exception};
 use crate::runtime_manager::block_on_operation;
-use crate::debug_println;
 
 use super::distributed;
 use super::serialization;
+
+/// Extract cache-related config from the Java Map into a Rust HashMap.
+fn extract_cache_config(env: &mut JNIEnv, config_map: &JObject) -> std::collections::HashMap<String, String> {
+    let mut map = std::collections::HashMap::new();
+    if let Some(ttl) = extract_string(env, config_map, "cache.ttl.ms") {
+        map.insert("cache.ttl.ms".to_string(), ttl);
+    }
+    if let Some(ttl) = extract_string(env, config_map, "cache_ttl_ms") {
+        map.insert("cache_ttl_ms".to_string(), ttl);
+    }
+    map
+}
 
 // ============================================================================
 // DISTRIBUTABLE PRIMITIVES (stateless)
@@ -34,9 +45,10 @@ pub extern "system" fn Java_io_indextables_jni_txlog_TransactionLogReader_native
         }
     };
     let config = build_storage_config(&mut env, &config_map);
+    let cache_config = extract_cache_config(&mut env, &config_map);
 
     match block_on_operation(async move {
-        distributed::get_txlog_snapshot_info(&path, &config).await
+        distributed::get_txlog_snapshot_info_with_cache(&path, &config, &cache_config).await
     }) {
         Ok(info) => {
             let buf = serialization::serialize_snapshot_info(&info);

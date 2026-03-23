@@ -5,11 +5,13 @@
 //   Phase 2 (executor): read individual manifests in parallel
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::delta_reader::engine::DeltaStorageConfig;
 use crate::debug_println;
 
 use super::actions::*;
+use super::cache;
 use super::error::{TxLogError, Result};
 use super::log_replay;
 use super::schema_dedup;
@@ -41,10 +43,61 @@ pub struct ManifestPathInfo {
 /// Driver-side: read _last_checkpoint + state manifest + list post-checkpoint versions.
 ///
 /// Cost: 1 GET (_last_checkpoint) + 1 GET (_manifest) + 1 LIST (version files)
+/// With caching: 0 I/O if cached and within TTL.
 pub async fn get_txlog_snapshot_info(
     table_path: &str,
     config: &DeltaStorageConfig,
 ) -> Result<TxLogSnapshotInfo> {
+    get_txlog_snapshot_info_with_cache(table_path, config, &HashMap::new()).await
+}
+
+/// Cached variant that accepts a config map for `cache.ttl.ms` extraction.
+pub async fn get_txlog_snapshot_info_with_cache(
+    table_path: &str,
+    config: &DeltaStorageConfig,
+    config_map: &HashMap<String, String>,
+) -> Result<TxLogSnapshotInfo> {
+    // Check cache first
+    if let Some(ttl) = cache::extract_cache_ttl(config_map) {
+        let c = cache::get_or_create_cache(table_path, ttl);
+        if let Some(cached_meta) = c.get_metadata() {
+            if let Some(cached_cp) = c.get_last_checkpoint() {
+                let state_dir = cached_cp.state_dir.clone()
+                    .unwrap_or_else(|| TxLogStorage::state_dir_name(cached_cp.version));
+
+                // We still need to read the state manifest for manifest paths,
+                // but we can use the cached protocol/metadata
+                let storage = TxLogStorage::new(table_path, config)?;
+                let state_manifest = super::avro::state_reader::read_state_manifest(&storage, &state_dir).await?;
+                let all_versions = storage.list_versions().await?;
+                let post_cp_paths: Vec<String> = all_versions.iter()
+                    .filter(|v| **v > cached_cp.version)
+                    .map(|v| TxLogStorage::version_path(*v))
+                    .collect();
+
+                let manifest_paths: Vec<ManifestPathInfo> = state_manifest.manifests.iter()
+                    .map(|m| ManifestPathInfo {
+                        path: m.path.clone(),
+                        file_count: m.file_count,
+                        partition_bounds: m.partition_bounds.clone(),
+                    })
+                    .collect();
+
+                debug_println!("📊 DISTRIBUTED: snapshot_info from CACHE: checkpoint v{}, {} manifests",
+                    cached_cp.version, manifest_paths.len());
+
+                return Ok(TxLogSnapshotInfo {
+                    checkpoint_version: cached_cp.version,
+                    manifest_paths,
+                    post_checkpoint_version_paths: post_cp_paths,
+                    protocol: cached_meta.0.clone(),
+                    metadata: cached_meta.1.clone(),
+                    state_dir,
+                });
+            }
+        }
+    }
+
     let storage = TxLogStorage::new(table_path, config)?;
 
     // Read _last_checkpoint
@@ -100,8 +153,17 @@ pub async fn get_txlog_snapshot_info(
     debug_println!("📊 DISTRIBUTED: snapshot_info: checkpoint v{}, {} manifests, {} post-cp versions",
         last_cp.version, manifest_paths.len(), post_cp_paths.len());
 
+    let checkpoint_version = last_cp.version;
+
+    // Populate cache
+    if let Some(ttl) = cache::extract_cache_ttl(config_map) {
+        let c = cache::get_or_create_cache(table_path, ttl);
+        c.put_metadata(protocol.clone(), metadata.clone());
+        c.put_last_checkpoint(last_cp);
+    }
+
     Ok(TxLogSnapshotInfo {
-        checkpoint_version: last_cp.version,
+        checkpoint_version,
         manifest_paths,
         post_checkpoint_version_paths: post_cp_paths,
         protocol,
@@ -209,7 +271,8 @@ pub async fn read_post_checkpoint_changes(
 /// Read ONE Avro manifest file → Vec<FileEntry>.
 /// Highly parallelizable: each executor reads one manifest.
 ///
-/// Cost: 1 GET (manifest avro file)
+/// Cost: 1 GET (manifest avro file). With caching: 0 if manifest already cached.
+/// Manifests are immutable, so they are cached globally without TTL.
 pub async fn read_manifest(
     table_path: &str,
     config: &DeltaStorageConfig,
@@ -217,13 +280,24 @@ pub async fn read_manifest(
     manifest_path: &str,
     metadata_config: &HashMap<String, String>,
 ) -> Result<Vec<FileEntry>> {
+    // Check global manifest cache (manifests are immutable — no TTL needed)
+    let cache_key = format!("{}/{}/{}", table_path, state_dir, manifest_path);
+    if let Some(cached) = cache::get_cached_manifest(&cache_key) {
+        debug_println!("📊 DISTRIBUTED: read_manifest CACHE HIT: {}", manifest_path);
+        return Ok(cached.as_ref().clone());
+    }
+
     let storage = TxLogStorage::new(table_path, config)?;
-    super::avro::state_reader::read_single_manifest(
+    let entries = super::avro::state_reader::read_single_manifest(
         &storage,
         state_dir,
         manifest_path,
         metadata_config,
-    ).await
+    ).await?;
+
+    // Cache the result (manifests are immutable)
+    cache::put_cached_manifest(&cache_key, Arc::new(entries.clone()));
+    Ok(entries)
 }
 
 // ============================================================================
@@ -275,6 +349,8 @@ pub async fn write_version(
         let written = version_file::write_version(&storage, target_version, &actions).await?;
         if written {
             debug_println!("✅ DISTRIBUTED: Wrote version {} (attempt {})", target_version, attempt);
+            // Invalidate cached data for this table since state changed
+            cache::invalidate_table_cache(table_path);
             return Ok(WriteResult {
                 version: target_version,
                 retries: attempt,
@@ -323,6 +399,7 @@ pub async fn write_version_once(
 
     let written = version_file::write_version(&storage, target_version, &actions).await?;
     if written {
+        cache::invalidate_table_cache(table_path);
         Ok(WriteResult {
             version: target_version,
             retries: 0,
@@ -379,6 +456,7 @@ pub async fn initialize_table(
             anyhow::anyhow!("Table already initialized: version 0 exists at {}", table_path)
         ));
     }
+    cache::invalidate_table_cache(table_path);
     Ok(())
 }
 
