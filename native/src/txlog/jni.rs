@@ -13,14 +13,13 @@ use crate::runtime_manager::block_on_operation;
 use super::distributed;
 use super::serialization;
 
-/// Extract cache-related config from the Java Map into a Rust HashMap.
-fn extract_cache_config(env: &mut JNIEnv, config_map: &JObject) -> std::collections::HashMap<String, String> {
+/// Extract cache and checkpoint config from the Java Map into a Rust HashMap.
+fn extract_extended_config(env: &mut JNIEnv, config_map: &JObject) -> std::collections::HashMap<String, String> {
     let mut map = std::collections::HashMap::new();
-    if let Some(ttl) = extract_string(env, config_map, "cache.ttl.ms") {
-        map.insert("cache.ttl.ms".to_string(), ttl);
-    }
-    if let Some(ttl) = extract_string(env, config_map, "cache_ttl_ms") {
-        map.insert("cache_ttl_ms".to_string(), ttl);
+    for key in &["cache.ttl.ms", "cache_ttl_ms", "checkpoint_interval", "checkpoint.interval"] {
+        if let Some(val) = extract_string(env, config_map, key) {
+            map.insert(key.to_string(), val);
+        }
     }
     map
 }
@@ -45,7 +44,7 @@ pub extern "system" fn Java_io_indextables_jni_txlog_TransactionLogReader_native
         }
     };
     let config = build_storage_config(&mut env, &config_map);
-    let cache_config = extract_cache_config(&mut env, &config_map);
+    let cache_config = extract_extended_config(&mut env, &config_map);
 
     match block_on_operation(async move {
         distributed::get_txlog_snapshot_info_with_cache(&path, &config, &cache_config).await
@@ -289,8 +288,17 @@ pub extern "system" fn Java_io_indextables_jni_txlog_TransactionLogWriter_native
         }
     }
 
+    let ext_config = extract_extended_config(&mut env, &config_map);
+    let path2 = path.clone();
+    let config2 = config.clone();
+    let ext_config2 = ext_config.clone();
+
     match block_on_operation(async move {
-        distributed::write_version(&path, &config, actions, distributed::RetryConfig::default()).await
+        let result = distributed::write_version(&path, &config, actions, distributed::RetryConfig::default()).await?;
+        if result.version >= 0 {
+            distributed::maybe_auto_checkpoint(&path2, &config2, &ext_config2, result.version).await;
+        }
+        Ok::<_, super::error::TxLogError>(result)
     }) {
         Ok(result) => {
             let buf = serialization::serialize_write_result(&result);
@@ -338,8 +346,17 @@ pub extern "system" fn Java_io_indextables_jni_txlog_TransactionLogWriter_native
         }
     }
 
+    let ext_config = extract_extended_config(&mut env, &config_map);
+    let path2 = path.clone();
+    let config2 = config.clone();
+    let ext_config2 = ext_config.clone();
+
     match block_on_operation(async move {
-        distributed::write_version_once(&path, &config, actions).await
+        let result = distributed::write_version_once(&path, &config, actions).await?;
+        if result.version >= 0 {
+            distributed::maybe_auto_checkpoint(&path2, &config2, &ext_config2, result.version).await;
+        }
+        Ok::<_, super::error::TxLogError>(result)
     }) {
         Ok(result) => {
             let buf = serialization::serialize_write_result(&result);
@@ -424,8 +441,17 @@ pub extern "system" fn Java_io_indextables_jni_txlog_TransactionLogWriter_native
         .map(super::actions::Action::Add)
         .collect();
 
+    let ext_config = extract_extended_config(&mut env, &config_map);
+    let path2 = path.clone();
+    let config2 = config.clone();
+    let ext_config2 = ext_config.clone();
+
     match block_on_operation(async move {
-        distributed::write_version(&path, &config, actions, distributed::RetryConfig::default()).await
+        let result = distributed::write_version(&path, &config, actions, distributed::RetryConfig::default()).await?;
+        if result.version >= 0 {
+            distributed::maybe_auto_checkpoint(&path2, &config2, &ext_config2, result.version).await;
+        }
+        Ok::<_, super::error::TxLogError>(result)
     }) {
         Ok(result) => {
             let buf = serialization::serialize_write_result(&result);
@@ -470,8 +496,17 @@ pub extern "system" fn Java_io_indextables_jni_txlog_TransactionLogWriter_native
         size: None,
     })];
 
+    let ext_config = extract_extended_config(&mut env, &config_map);
+    let path2 = path.clone();
+    let config2 = config.clone();
+    let ext_config2 = ext_config.clone();
+
     match block_on_operation(async move {
-        distributed::write_version(&path, &config, actions, distributed::RetryConfig::default()).await
+        let result = distributed::write_version(&path, &config, actions, distributed::RetryConfig::default()).await?;
+        if result.version >= 0 {
+            distributed::maybe_auto_checkpoint(&path2, &config2, &ext_config2, result.version).await;
+        }
+        Ok::<_, super::error::TxLogError>(result)
     }) {
         Ok(result) => result.version,
         Err(e) => {
@@ -511,8 +546,17 @@ pub extern "system" fn Java_io_indextables_jni_txlog_TransactionLogWriter_native
 
     let actions = vec![super::actions::Action::MergeSkip(skip)];
 
+    let ext_config = extract_extended_config(&mut env, &config_map);
+    let path2 = path.clone();
+    let config2 = config.clone();
+    let ext_config2 = ext_config.clone();
+
     match block_on_operation(async move {
-        distributed::write_version(&path, &config, actions, distributed::RetryConfig::default()).await
+        let result = distributed::write_version(&path, &config, actions, distributed::RetryConfig::default()).await?;
+        if result.version >= 0 {
+            distributed::maybe_auto_checkpoint(&path2, &config2, &ext_config2, result.version).await;
+        }
+        Ok::<_, super::error::TxLogError>(result)
     }) {
         Ok(result) => result.version,
         Err(e) => {

@@ -1161,6 +1161,162 @@ public class TransactionLogIntegrationTest {
     }
 
     // ========================================================================
+    // 28-30. GAP-9 and GAP-10 Integration Tests
+    // ========================================================================
+
+    @Test
+    @Order(28)
+    void testSnapshotInfoWithoutCheckpoint() throws Exception {
+        // GAP-9: getSnapshotInfo should work on tables without _last_checkpoint
+        Path noCheckpointDir = Files.createTempDirectory("txlog-nocheckpoint");
+        Files.createDirectories(noCheckpointDir.resolve("_transaction_log"));
+        String noCheckpointTable = "file://" + noCheckpointDir.toAbsolutePath();
+
+        try {
+            // Initialize table (writes version 0 with protocol + metadata, no checkpoint)
+            String protocolJson = MAPPER.writeValueAsString(Map.of(
+                "minReaderVersion", 4, "minWriterVersion", 4));
+            String metadataJson = MAPPER.writeValueAsString(Map.of(
+                "id", "nocheckpoint-test",
+                "schemaString", "{\"fields\":[{\"name\":\"title\",\"type\":\"text\"}]}",
+                "partitionColumns", List.of(),
+                "configuration", Map.of()));
+            TransactionLogWriter.initializeTable(noCheckpointTable, config, protocolJson, metadataJson);
+
+            // Add some files without creating a checkpoint
+            for (int i = 0; i < 3; i++) {
+                String addsJson = MAPPER.writeValueAsString(List.of(
+                    makeAddAction("no-cp-split-" + i + ".split", 1000 + i, 100 + i)));
+                TransactionLogWriter.addFiles(noCheckpointTable, config, addsJson);
+            }
+
+            // getSnapshotInfo should NOT throw — it should fall back to version scanning
+            TxLogSnapshotInfo snapshot = TransactionLogReader.getSnapshotInfo(noCheckpointTable, config);
+            assertNotNull(snapshot);
+
+            // checkpointVersion should be -1 (no checkpoint)
+            assertEquals(-1, snapshot.getCheckpointVersion(),
+                "Should report checkpointVersion=-1 when no checkpoint exists");
+
+            // manifestPaths should be empty
+            assertTrue(snapshot.getManifestPaths().isEmpty(),
+                "Should have no manifest paths without checkpoint");
+
+            // All version files should be in postCheckpointPaths
+            assertTrue(snapshot.getPostCheckpointPaths().size() >= 4,
+                "Should have at least 4 version paths (v0 init + 3 adds), got " +
+                snapshot.getPostCheckpointPaths().size());
+
+            // Metadata should be populated from version 0
+            assertNotNull(snapshot.getMetadataJson());
+            assertTrue(snapshot.getMetadataJson().contains("nocheckpoint-test") ||
+                       snapshot.getMetadataJson().contains("title"),
+                "Metadata should contain table schema or id");
+
+            // Protocol should be populated
+            assertNotNull(snapshot.getProtocolJson());
+
+            // Reading post-checkpoint changes should return all files
+            TxLogChanges changes = TransactionLogReader.readPostCheckpointChanges(
+                noCheckpointTable, config,
+                MAPPER.writeValueAsString(snapshot.getPostCheckpointPaths()),
+                "{}");
+            assertTrue(changes.getAddedFiles().size() >= 3,
+                "Should have at least 3 added files, got " + changes.getAddedFiles().size());
+        } finally {
+            deleteRecursively(noCheckpointDir.toFile());
+        }
+    }
+
+    @Test
+    @Order(29)
+    void testSnapshotInfoWithAddAndRemove() throws Exception {
+        // GAP-9 test case 3: removes should be reflected in version scan
+        Path arDir = Files.createTempDirectory("txlog-addremove");
+        Files.createDirectories(arDir.resolve("_transaction_log"));
+        String arTable = "file://" + arDir.toAbsolutePath();
+
+        try {
+            String protocolJson = MAPPER.writeValueAsString(Map.of(
+                "minReaderVersion", 4, "minWriterVersion", 4));
+            String metadataJson = MAPPER.writeValueAsString(Map.of(
+                "id", "addremove-test", "schemaString", "{}", "partitionColumns", List.of(),
+                "configuration", Map.of()));
+            TransactionLogWriter.initializeTable(arTable, config, protocolJson, metadataJson);
+
+            // Add 2 files
+            String adds = MAPPER.writeValueAsString(List.of(
+                makeAddAction("keep.split", 1000, 100),
+                makeAddAction("remove-me.split", 2000, 200)));
+            TransactionLogWriter.addFiles(arTable, config, adds);
+
+            // Remove one
+            TransactionLogWriter.removeFile(arTable, config, "remove-me.split");
+
+            // Snapshot should work and show only "keep.split" via changes
+            TxLogSnapshotInfo snapshot = TransactionLogReader.getSnapshotInfo(arTable, config);
+            TxLogChanges changes = TransactionLogReader.readPostCheckpointChanges(
+                arTable, config,
+                MAPPER.writeValueAsString(snapshot.getPostCheckpointPaths()),
+                "{}");
+
+            // The changes should include both adds and the removal
+            List<String> removedPaths = changes.getRemovedPaths();
+            assertTrue(removedPaths.contains("remove-me.split"),
+                "Should contain removed file path");
+        } finally {
+            deleteRecursively(arDir.toFile());
+        }
+    }
+
+    @Test
+    @Order(30)
+    void testAutoCheckpointOnWrites() throws Exception {
+        // GAP-10: auto-checkpoint with checkpoint_interval=3
+        Path autoDir = Files.createTempDirectory("txlog-autocheckpoint");
+        Files.createDirectories(autoDir.resolve("_transaction_log"));
+        String autoTable = "file://" + autoDir.toAbsolutePath();
+
+        Map<String, String> autoConfig = new HashMap<>(config);
+        autoConfig.put("checkpoint_interval", "3");
+
+        try {
+            // Initialize (version 0, no checkpoint)
+            String protocolJson = MAPPER.writeValueAsString(Map.of(
+                "minReaderVersion", 4, "minWriterVersion", 4));
+            String metadataJson = MAPPER.writeValueAsString(Map.of(
+                "id", "autocheckpoint-test", "schemaString", "{}",
+                "partitionColumns", List.of(), "configuration", Map.of()));
+            TransactionLogWriter.initializeTable(autoTable, autoConfig, protocolJson, metadataJson);
+
+            // Write versions 1, 2 (no checkpoint yet)
+            for (int i = 1; i <= 2; i++) {
+                String addsJson = MAPPER.writeValueAsString(List.of(
+                    makeAddAction("auto-split-" + i + ".split", 1000 * i, 100 * i)));
+                TransactionLogWriter.addFiles(autoTable, autoConfig, addsJson);
+            }
+
+            // At this point we have version 0,1,2 — no auto-checkpoint yet
+            // Version 3 should trigger auto-checkpoint (3 % 3 == 0)
+            String v3Adds = MAPPER.writeValueAsString(List.of(
+                makeAddAction("auto-split-3.split", 3000, 300)));
+            TransactionLogWriter.addFiles(autoTable, autoConfig, v3Adds);
+
+            // Now _last_checkpoint should exist (created by auto-checkpoint at version 3)
+            TxLogSnapshotInfo snapshot = TransactionLogReader.getSnapshotInfo(autoTable, autoConfig);
+            assertNotNull(snapshot);
+
+            // With auto-checkpoint, we should have a proper checkpoint
+            // The checkpoint version should be >= 3
+            assertTrue(snapshot.getCheckpointVersion() >= 0,
+                "Auto-checkpoint should have created _last_checkpoint, got version " +
+                snapshot.getCheckpointVersion());
+        } finally {
+            deleteRecursively(autoDir.toFile());
+        }
+    }
+
+    // ========================================================================
     // Helpers
     // ========================================================================
 

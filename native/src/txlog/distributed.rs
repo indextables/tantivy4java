@@ -100,15 +100,35 @@ pub async fn get_txlog_snapshot_info_with_cache(
 
     let storage = TxLogStorage::new(table_path, config)?;
 
-    // Read _last_checkpoint
-    let checkpoint_data = storage.get("_last_checkpoint").await?;
-    let last_cp: LastCheckpointInfo = serde_json::from_slice(&checkpoint_data)?;
+    // Try to read _last_checkpoint — if it doesn't exist, fall back to version scanning
+    let checkpoint_result = storage.get("_last_checkpoint").await;
 
+    match checkpoint_result {
+        Ok(checkpoint_data) => {
+            // Normal path: checkpoint exists
+            let last_cp: LastCheckpointInfo = serde_json::from_slice(&checkpoint_data)?;
+            snapshot_from_checkpoint(&storage, table_path, config_map, last_cp).await
+        }
+        Err(_) => {
+            // Fallback path: no checkpoint — scan all version files
+            debug_println!("📊 DISTRIBUTED: No _last_checkpoint found, falling back to version scan");
+            snapshot_from_version_scan(&storage, table_path, config_map).await
+        }
+    }
+}
+
+/// Build snapshot info from an existing checkpoint.
+async fn snapshot_from_checkpoint(
+    storage: &TxLogStorage,
+    table_path: &str,
+    config_map: &HashMap<String, String>,
+    last_cp: LastCheckpointInfo,
+) -> Result<TxLogSnapshotInfo> {
     let state_dir = last_cp.state_dir.clone()
         .unwrap_or_else(|| TxLogStorage::state_dir_name(last_cp.version));
 
     // Read state manifest
-    let state_manifest = super::avro::state_reader::read_state_manifest(&storage, &state_dir).await?;
+    let state_manifest = super::avro::state_reader::read_state_manifest(storage, &state_dir).await?;
 
     // List post-checkpoint version files
     let all_versions = storage.list_versions().await?;
@@ -120,27 +140,19 @@ pub async fn get_txlog_snapshot_info_with_cache(
     // Read post-checkpoint versions for potential protocol/metadata updates
     let mut all_version_actions: Vec<(i64, Vec<Action>)> = Vec::new();
     for v in all_versions.iter().filter(|v| **v > last_cp.version) {
-        if let Ok(actions) = version_file::read_version(&storage, *v).await {
+        if let Ok(actions) = version_file::read_version(storage, *v).await {
             all_version_actions.push((*v, actions));
         }
     }
 
-    // Try to extract protocol/metadata from post-checkpoint versions first,
-    // then fall back to version 0 as a last resort
-    let v0_actions = match version_file::read_version(&storage, 0).await {
+    // Extract protocol/metadata from post-checkpoint versions, fall back to v0
+    let v0_actions = match version_file::read_version(storage, 0).await {
         Ok(actions) => actions,
-        Err(_) => vec![], // May not exist if table was created differently
+        Err(_) => vec![],
     };
     let (protocol, metadata) = log_replay::extract_metadata(&v0_actions, &all_version_actions);
     let protocol = protocol.unwrap_or_else(ProtocolAction::v4);
-    let metadata = metadata.unwrap_or_else(|| MetadataAction {
-        id: String::new(),
-        schema_string: String::new(),
-        partition_columns: vec![],
-        format: FormatSpec::default(),
-        configuration: HashMap::new(),
-        created_time: None,
-    });
+    let metadata = metadata.unwrap_or_else(MetadataAction::empty);
 
     let manifest_paths: Vec<ManifestPathInfo> = state_manifest.manifests.iter()
         .map(|m| ManifestPathInfo {
@@ -169,6 +181,65 @@ pub async fn get_txlog_snapshot_info_with_cache(
         protocol,
         metadata,
         state_dir,
+    })
+}
+
+/// Build snapshot info by scanning all version files (no checkpoint exists).
+async fn snapshot_from_version_scan(
+    storage: &TxLogStorage,
+    table_path: &str,
+    config_map: &HashMap<String, String>,
+) -> Result<TxLogSnapshotInfo> {
+    let all_versions = storage.list_versions().await?;
+
+    if all_versions.is_empty() {
+        return Err(TxLogError::NotInitialized {
+            path: table_path.to_string(),
+        });
+    }
+
+    // Read ALL version files to extract protocol/metadata
+    let mut all_version_actions: Vec<(i64, Vec<Action>)> = Vec::new();
+    for v in &all_versions {
+        if let Ok(actions) = version_file::read_version(storage, *v).await {
+            all_version_actions.push((*v, actions));
+        }
+    }
+
+    // Extract protocol/metadata from all versions
+    let v0_actions = all_version_actions.iter()
+        .find(|(v, _)| *v == 0)
+        .map(|(_, a)| a.clone())
+        .unwrap_or_default();
+    let non_v0_actions: Vec<(i64, Vec<Action>)> = all_version_actions.iter()
+        .filter(|(v, _)| *v > 0)
+        .cloned()
+        .collect();
+    let (protocol, metadata) = log_replay::extract_metadata(&v0_actions, &non_v0_actions);
+    let protocol = protocol.unwrap_or_else(ProtocolAction::v4);
+    let metadata = metadata.unwrap_or_else(MetadataAction::empty);
+
+    // All version files are "post-checkpoint" since there is no checkpoint
+    let post_cp_paths: Vec<String> = all_versions.iter()
+        .map(|v| TxLogStorage::version_path(*v))
+        .collect();
+
+    debug_println!("📊 DISTRIBUTED: snapshot_info from version scan: {} versions, no checkpoint",
+        all_versions.len());
+
+    // Populate cache
+    if let Some(ttl) = cache::extract_cache_ttl(config_map) {
+        let c = cache::get_or_create_cache(table_path, ttl);
+        c.put_metadata(protocol.clone(), metadata.clone());
+    }
+
+    Ok(TxLogSnapshotInfo {
+        checkpoint_version: -1,
+        manifest_paths: vec![],
+        post_checkpoint_version_paths: post_cp_paths,
+        protocol,
+        metadata,
+        state_dir: String::new(),
     })
 }
 
@@ -458,6 +529,98 @@ pub async fn initialize_table(
     }
     cache::invalidate_table_cache(table_path);
     Ok(())
+}
+
+// ============================================================================
+// Auto-checkpoint support (GAP-10)
+// ============================================================================
+
+/// Extract checkpoint interval from config. Returns None if disabled (0) or not set.
+fn extract_checkpoint_interval(config_map: &HashMap<String, String>) -> Option<i64> {
+    let val_str = config_map.get("checkpoint_interval")
+        .or_else(|| config_map.get("checkpoint.interval"));
+    match val_str {
+        Some(s) => {
+            let interval: i64 = s.parse().unwrap_or(10);
+            if interval <= 0 { None } else { Some(interval) }
+        }
+        None => Some(10), // default: checkpoint every 10 versions
+    }
+}
+
+/// Maybe create a checkpoint after a successful write, if the version is a multiple
+/// of the configured checkpoint_interval. Failures are logged but do not propagate.
+pub async fn maybe_auto_checkpoint(
+    table_path: &str,
+    config: &DeltaStorageConfig,
+    config_map: &HashMap<String, String>,
+    written_version: i64,
+) {
+    let interval = match extract_checkpoint_interval(config_map) {
+        Some(i) => i,
+        None => return, // disabled
+    };
+
+    if written_version <= 0 || written_version % interval != 0 {
+        return;
+    }
+
+    debug_println!("📊 DISTRIBUTED: auto-checkpoint triggered at version {} (interval={})",
+        written_version, interval);
+
+    // Get current table state by reading all version files
+    let storage = match TxLogStorage::new(table_path, config) {
+        Ok(s) => s,
+        Err(e) => {
+            debug_println!("⚠️ DISTRIBUTED: auto-checkpoint storage init failed: {}", e);
+            return;
+        }
+    };
+
+    // Replay all versions to compute current state
+    let all_versions = match storage.list_versions().await {
+        Ok(v) => v,
+        Err(e) => {
+            debug_println!("⚠️ DISTRIBUTED: auto-checkpoint list_versions failed: {}", e);
+            return;
+        }
+    };
+
+    let mut versioned_actions: Vec<(i64, Vec<Action>)> = Vec::new();
+    for v in &all_versions {
+        if *v > written_version { break; }
+        if let Ok(actions) = version_file::read_version(&storage, *v).await {
+            versioned_actions.push((*v, actions));
+        }
+    }
+
+    // Replay to get current file entries (no prior checkpoint — start empty)
+    let replay_result = log_replay::replay(vec![], versioned_actions.clone());
+
+    // Extract protocol/metadata
+    let v0_actions = versioned_actions.iter()
+        .find(|(v, _)| *v == 0)
+        .map(|(_, a)| a.clone())
+        .unwrap_or_default();
+    let non_v0: Vec<(i64, Vec<Action>)> = versioned_actions.iter()
+        .filter(|(v, _)| *v > 0)
+        .cloned()
+        .collect();
+    let (protocol, metadata) = log_replay::extract_metadata(&v0_actions, &non_v0);
+    let protocol = protocol.unwrap_or_else(ProtocolAction::v4);
+    let metadata = metadata.unwrap_or_else(MetadataAction::empty);
+
+    // Write checkpoint
+    match write_checkpoint(table_path, config, replay_result.files, metadata, protocol).await {
+        Ok(cp_info) => {
+            debug_println!("✅ DISTRIBUTED: auto-checkpoint created at v{}, {:?} files",
+                cp_info.version, cp_info.num_files);
+        }
+        Err(e) => {
+            // Log but do NOT fail — the write already succeeded
+            debug_println!("⚠️ DISTRIBUTED: auto-checkpoint failed (non-fatal): {}", e);
+        }
+    }
 }
 
 /// Create an Avro state checkpoint at the given version.

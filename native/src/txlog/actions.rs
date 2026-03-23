@@ -142,6 +142,20 @@ pub struct MetadataAction {
     pub created_time: Option<i64>,
 }
 
+impl MetadataAction {
+    /// Create an empty MetadataAction (used when no metadata is found in version files).
+    pub fn empty() -> Self {
+        MetadataAction {
+            id: String::new(),
+            schema_string: String::new(),
+            partition_columns: vec![],
+            format: FormatSpec::default(),
+            configuration: HashMap::new(),
+            created_time: None,
+        }
+    }
+}
+
 // ============================================================================
 // Add action — file addition with extensive metadata
 // ============================================================================
