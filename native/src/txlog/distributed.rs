@@ -310,6 +310,78 @@ pub async fn write_version(
     })
 }
 
+/// Write a new version file with a single attempt (no retry).
+/// Returns WriteResult with version=-1 if version already exists.
+pub async fn write_version_once(
+    table_path: &str,
+    config: &DeltaStorageConfig,
+    actions: Vec<Action>,
+) -> Result<WriteResult> {
+    let storage = TxLogStorage::new(table_path, config)?;
+    let current_versions = storage.list_versions().await?;
+    let target_version = current_versions.last().map(|v| v + 1).unwrap_or(0);
+
+    let written = version_file::write_version(&storage, target_version, &actions).await?;
+    if written {
+        Ok(WriteResult {
+            version: target_version,
+            retries: 0,
+            conflicted_versions: vec![],
+        })
+    } else {
+        Ok(WriteResult {
+            version: -1,
+            retries: 0,
+            conflicted_versions: vec![target_version],
+        })
+    }
+}
+
+/// List all version numbers in the transaction log.
+pub async fn list_versions(
+    table_path: &str,
+    config: &DeltaStorageConfig,
+) -> Result<Vec<i64>> {
+    let storage = TxLogStorage::new(table_path, config)?;
+    storage.list_versions().await
+}
+
+/// Read raw JSON-lines content from a specific version file.
+pub async fn read_version_raw(
+    table_path: &str,
+    config: &DeltaStorageConfig,
+    version: i64,
+) -> Result<String> {
+    let storage = TxLogStorage::new(table_path, config)?;
+    let path = TxLogStorage::version_path(version);
+    let data = storage.get(&path).await?;
+    let text_bytes = super::compression::maybe_decompress(&data)?;
+    String::from_utf8(text_bytes)
+        .map_err(|e| super::error::TxLogError::Storage(anyhow::anyhow!("Invalid UTF-8: {}", e)))
+}
+
+/// Initialize a new table: write version 0 with Protocol + Metadata.
+/// Fails if version 0 already exists.
+pub async fn initialize_table(
+    table_path: &str,
+    config: &DeltaStorageConfig,
+    protocol: ProtocolAction,
+    metadata: MetadataAction,
+) -> Result<()> {
+    let storage = TxLogStorage::new(table_path, config)?;
+    let actions = vec![
+        Action::Protocol(protocol),
+        Action::MetaData(metadata),
+    ];
+    let written = version_file::write_version(&storage, 0, &actions).await?;
+    if !written {
+        return Err(super::error::TxLogError::Storage(
+            anyhow::anyhow!("Table already initialized: version 0 exists at {}", table_path)
+        ));
+    }
+    Ok(())
+}
+
 /// Create an Avro state checkpoint at the given version.
 pub async fn write_checkpoint(
     table_path: &str,

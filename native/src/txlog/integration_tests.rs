@@ -41,7 +41,7 @@ fn make_add_action(path: &str, size: i64, num_records: Option<i64>) -> AddAction
         num_records,
         footer_start_offset: None,
         footer_end_offset: None,
-        has_footer_offsets: None,
+        has_footer_offsets: None, delete_opstamp: None,
         split_tags: None,
         num_merge_ops: None,
         doc_mapping_json: None,
@@ -62,7 +62,7 @@ fn make_add_action_full(
     partition_values: HashMap<String, String>,
     doc_mapping_json: Option<String>,
     time_range: Option<(i64, i64)>,
-    split_tags: Option<HashMap<String, String>>,
+    split_tags: Option<Vec<String>>,
 ) -> AddAction {
     AddAction {
         path: path.to_string(),
@@ -76,7 +76,7 @@ fn make_add_action_full(
         num_records,
         footer_start_offset: None,
         footer_end_offset: None,
-        has_footer_offsets: None,
+        has_footer_offsets: None, delete_opstamp: None,
         split_tags,
         num_merge_ops: None,
         doc_mapping_json,
@@ -104,7 +104,7 @@ fn make_file_entry_full(
     partition_values: HashMap<String, String>,
     doc_mapping_json: Option<String>,
     time_range: Option<(i64, i64)>,
-    split_tags: Option<HashMap<String, String>>,
+    split_tags: Option<Vec<String>>,
     num_records: Option<i64>,
 ) -> FileEntry {
     FileEntry {
@@ -408,9 +408,7 @@ async fn test_checkpoint_manifest_roundtrip() {
     assert!(version_file::write_version(&storage, 0, &v0_actions).await.unwrap());
 
     // Create entries with rich metadata
-    let mut tags = HashMap::new();
-    tags.insert("env".to_string(), "prod".to_string());
-    tags.insert("region".to_string(), "us-east-1".to_string());
+    let tags = vec!["env:prod".to_string(), "region:us-east-1".to_string()];
 
     let entries = vec![
         make_file_entry_full(
@@ -450,8 +448,8 @@ async fn test_checkpoint_manifest_roundtrip() {
     assert_eq!(entry.add.uncompressed_size_bytes, Some(2000)); // size * 2
     assert!(entry.add.split_tags.is_some());
     let tags = entry.add.split_tags.as_ref().unwrap();
-    assert_eq!(tags.get("env"), Some(&"prod".to_string()));
-    assert_eq!(tags.get("region"), Some(&"us-east-1".to_string()));
+    assert!(tags.contains(&"env:prod".to_string()));
+    assert!(tags.contains(&"region:us-east-1".to_string()));
     // doc_mapping_json should survive the roundtrip
     assert_eq!(
         entry.add.doc_mapping_json,

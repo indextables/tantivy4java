@@ -188,10 +188,96 @@ public class TransactionLogWriter {
         return LastCheckpointInfo.fromMap(maps.get(0));
     }
 
+    /**
+     * Write a version file with arbitrary mixed actions and automatic retry.
+     *
+     * <p>The actionsJson is standard Delta-compatible JSON-lines format:
+     * <pre>
+     * {"protocol":{"minReaderVersion":4,"minWriterVersion":4}}
+     * {"metaData":{"id":"abc","schemaString":"{...}","partitionColumns":[],"configuration":{}}}
+     * {"add":{"path":"file.split","size":1000,"partitionValues":{},"modificationTime":0,"dataChange":true}}
+     * </pre>
+     *
+     * @param tablePath   table location
+     * @param config      credential and storage configuration
+     * @param actionsJson JSON-lines with one action per line
+     * @return WriteResult with version, retries, and conflicted versions
+     */
+    public static WriteResult writeVersion(String tablePath, Map<String, String> config,
+                                            String actionsJson) {
+        if (tablePath == null || tablePath.isEmpty()) {
+            throw new IllegalArgumentException("tablePath must not be null or empty");
+        }
+        byte[] bytes = nativeWriteVersion(tablePath,
+                config != null ? config : Collections.emptyMap(), actionsJson);
+        if (bytes == null) {
+            throw new RuntimeException("Native writeVersion returned null (check preceding exception)");
+        }
+        ByteBuffer buffer = ByteBuffer.wrap(bytes);
+        buffer.order(ByteOrder.nativeOrder());
+        BatchDocumentReader reader = new BatchDocumentReader();
+        List<Map<String, Object>> maps = reader.parseToMaps(buffer);
+        if (maps.isEmpty()) {
+            throw new RuntimeException("Empty writeVersion response");
+        }
+        return WriteResult.fromMap(maps.get(0));
+    }
+
+    /**
+     * Write a version file with a single attempt (no retry).
+     * Returns WriteResult with version=-1 on conflict.
+     *
+     * @param tablePath   table location
+     * @param config      credential and storage configuration
+     * @param actionsJson JSON-lines with one action per line
+     * @return WriteResult (version=-1 if conflict)
+     */
+    public static WriteResult writeVersionOnce(String tablePath, Map<String, String> config,
+                                                String actionsJson) {
+        if (tablePath == null || tablePath.isEmpty()) {
+            throw new IllegalArgumentException("tablePath must not be null or empty");
+        }
+        byte[] bytes = nativeWriteVersionOnce(tablePath,
+                config != null ? config : Collections.emptyMap(), actionsJson);
+        if (bytes == null) {
+            throw new RuntimeException("Native writeVersionOnce returned null (check preceding exception)");
+        }
+        ByteBuffer buffer = ByteBuffer.wrap(bytes);
+        buffer.order(ByteOrder.nativeOrder());
+        BatchDocumentReader reader = new BatchDocumentReader();
+        List<Map<String, Object>> maps = reader.parseToMaps(buffer);
+        if (maps.isEmpty()) {
+            throw new RuntimeException("Empty writeVersionOnce response");
+        }
+        return WriteResult.fromMap(maps.get(0));
+    }
+
+    /**
+     * Initialize a new table by writing version 0 with Protocol + Metadata.
+     * Fails if version 0 already exists.
+     *
+     * @param tablePath    table location
+     * @param config       credential and storage configuration
+     * @param protocolJson JSON representation of ProtocolAction
+     * @param metadataJson JSON representation of MetadataAction
+     */
+    public static void initializeTable(String tablePath, Map<String, String> config,
+                                        String protocolJson, String metadataJson) {
+        if (tablePath == null || tablePath.isEmpty()) {
+            throw new IllegalArgumentException("tablePath must not be null or empty");
+        }
+        nativeInitializeTable(tablePath,
+                config != null ? config : Collections.emptyMap(),
+                protocolJson, metadataJson);
+    }
+
     // --- Native methods ---
 
     private static native byte[] nativeAddFiles(String tablePath, Map<String, String> config, String addsJson);
     private static native long nativeRemoveFile(String tablePath, Map<String, String> config, String path);
     private static native long nativeSkipFile(String tablePath, Map<String, String> config, String skipJson);
     private static native byte[] nativeCreateCheckpoint(String tablePath, Map<String, String> config, String entriesJson, String metadataJson, String protocolJson);
+    private static native byte[] nativeWriteVersion(String tablePath, Map<String, String> config, String actionsJson);
+    private static native byte[] nativeWriteVersionOnce(String tablePath, Map<String, String> config, String actionsJson);
+    private static native void nativeInitializeTable(String tablePath, Map<String, String> config, String protocolJson, String metadataJson);
 }

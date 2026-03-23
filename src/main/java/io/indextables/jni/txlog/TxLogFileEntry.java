@@ -39,9 +39,11 @@ public class TxLogFileEntry implements Serializable {
     private final long footerStartOffset;
     private final long footerEndOffset;
     private final boolean hasFooterOffsets;
-    private final Map<String, String> splitTags;
+    private final long deleteOpstamp;
+    private final List<String> splitTags;
     private final int numMergeOps;
     private final String docMappingJson;
+    private final String docMappingRef;
     private final long uncompressedSizeBytes;
     private final long timeRangeStart;
     private final long timeRangeEnd;
@@ -58,8 +60,8 @@ public class TxLogFileEntry implements Serializable {
             Map<String, String> partitionValues, String stats,
             Map<String, String> minValues, Map<String, String> maxValues,
             long footerStartOffset, long footerEndOffset, boolean hasFooterOffsets,
-            Map<String, String> splitTags, int numMergeOps,
-            String docMappingJson, long uncompressedSizeBytes,
+            long deleteOpstamp, List<String> splitTags, int numMergeOps,
+            String docMappingJson, String docMappingRef, long uncompressedSizeBytes,
             long timeRangeStart, long timeRangeEnd,
             List<String> companionSourceFiles, long companionDeltaVersion,
             String companionFastFieldMode,
@@ -82,11 +84,13 @@ public class TxLogFileEntry implements Serializable {
         this.footerStartOffset = footerStartOffset;
         this.footerEndOffset = footerEndOffset;
         this.hasFooterOffsets = hasFooterOffsets;
+        this.deleteOpstamp = deleteOpstamp;
         this.splitTags = splitTags != null
-                ? Collections.unmodifiableMap(splitTags)
-                : Collections.emptyMap();
+                ? Collections.unmodifiableList(splitTags)
+                : Collections.emptyList();
         this.numMergeOps = numMergeOps;
         this.docMappingJson = docMappingJson;
+        this.docMappingRef = docMappingRef;
         this.uncompressedSizeBytes = uncompressedSizeBytes;
         this.timeRangeStart = timeRangeStart;
         this.timeRangeEnd = timeRangeEnd;
@@ -135,14 +139,23 @@ public class TxLogFileEntry implements Serializable {
     /** @return true if footer offsets are present */
     public boolean getHasFooterOffsets() { return hasFooterOffsets; }
 
+    /** @return delete opstamp, or -1 if not set */
+    public long getDeleteOpstamp() { return deleteOpstamp; }
+
+    /** @return true if delete opstamp is set */
+    public boolean hasDeleteOpstamp() { return deleteOpstamp >= 0; }
+
     /** @return split tags (empty if not present) */
-    public Map<String, String> getSplitTags() { return splitTags; }
+    public List<String> getSplitTags() { return splitTags; }
 
     /** @return number of merge operations, or 0 if not present */
     public int getNumMergeOps() { return numMergeOps; }
 
     /** @return doc mapping JSON string, or null if not present */
     public String getDocMappingJson() { return docMappingJson; }
+
+    /** @return doc mapping reference (schema dedup hash), or null if not present */
+    public String getDocMappingRef() { return docMappingRef; }
 
     /** @return uncompressed size in bytes, or -1 if not present */
     public long getUncompressedSizeBytes() { return uncompressedSizeBytes; }
@@ -198,9 +211,11 @@ public class TxLogFileEntry implements Serializable {
         long footerStartOffset = toLong(map.get("footer_start_offset"));
         long footerEndOffset = toLong(map.get("footer_end_offset"));
         boolean hasFooterOffsets = toBoolean(map.get("has_footer_offsets"));
-        Map<String, String> splitTags = parseJsonMap(map.get("split_tags"));
+        long deleteOpstamp = toLong(map.get("delete_opstamp"));
+        List<String> splitTags = parseJsonList(map.get("split_tags"));
         int numMergeOps = toInt(map.get("num_merge_ops"));
         String docMappingJson = (String) map.get("doc_mapping_json");
+        String docMappingRef = (String) map.get("doc_mapping_ref");
         long uncompressedSizeBytes = toLong(map.get("uncompressed_size_bytes"));
         long timeRangeStart = toLong(map.get("time_range_start"));
         long timeRangeEnd = toLong(map.get("time_range_end"));
@@ -214,7 +229,8 @@ public class TxLogFileEntry implements Serializable {
                 path, size, modificationTime, dataChange, numRecords,
                 partitionValues, stats, minValues, maxValues,
                 footerStartOffset, footerEndOffset, hasFooterOffsets,
-                splitTags, numMergeOps, docMappingJson, uncompressedSizeBytes,
+                deleteOpstamp, splitTags, numMergeOps,
+                docMappingJson, docMappingRef, uncompressedSizeBytes,
                 timeRangeStart, timeRangeEnd,
                 companionSourceFiles, companionDeltaVersion, companionFastFieldMode,
                 addedAtVersion, addedAtTimestamp);

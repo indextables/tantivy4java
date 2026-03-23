@@ -192,7 +192,7 @@ mod tests {
                 partition_values: pv,
                 size: 100, modification_time: 0, data_change: true,
                 stats: None, min_values: None, max_values: None, num_records: None,
-                footer_start_offset: None, footer_end_offset: None, has_footer_offsets: None,
+                footer_start_offset: None, footer_end_offset: None, has_footer_offsets: None, delete_opstamp: None,
                 split_tags: None, num_merge_ops: None,
                 doc_mapping_json: None, doc_mapping_ref: None,
                 uncompressed_size_bytes: None,

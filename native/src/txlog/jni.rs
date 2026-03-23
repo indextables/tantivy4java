@@ -174,9 +174,213 @@ pub extern "system" fn Java_io_indextables_jni_txlog_TransactionLogReader_native
     }
 }
 
+/// List all version numbers. Returns JSON array.
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_jni_txlog_TransactionLogReader_nativeListVersions(
+    mut env: JNIEnv,
+    _class: JClass,
+    table_path: JString,
+    config_map: JObject,
+) -> jbyteArray {
+    let path = match env.get_string(&table_path) {
+        Ok(s) => s.to_string_lossy().to_string(),
+        Err(e) => { to_java_exception(&mut env, &anyhow::anyhow!("{}", e)); return std::ptr::null_mut(); }
+    };
+    let config = build_storage_config(&mut env, &config_map);
+
+    match block_on_operation(async move {
+        distributed::list_versions(&path, &config).await
+    }) {
+        Ok(versions) => {
+            let json = serde_json::to_string(&versions).unwrap_or_else(|_| "[]".to_string());
+            let jstr = match env.new_string(&json) {
+                Ok(s) => s,
+                Err(e) => { to_java_exception(&mut env, &anyhow::anyhow!("{}", e)); return std::ptr::null_mut(); }
+            };
+            jstr.into_raw() as jbyteArray // Return as jstring (compatible pointer type)
+        }
+        Err(e) => {
+            to_java_exception(&mut env, &anyhow::anyhow!("{}", e));
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Read raw JSON-lines from a specific version file.
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_jni_txlog_TransactionLogReader_nativeReadVersion(
+    mut env: JNIEnv,
+    _class: JClass,
+    table_path: JString,
+    config_map: JObject,
+    version: jlong,
+) -> jbyteArray {
+    let path = match env.get_string(&table_path) {
+        Ok(s) => s.to_string_lossy().to_string(),
+        Err(e) => { to_java_exception(&mut env, &anyhow::anyhow!("{}", e)); return std::ptr::null_mut(); }
+    };
+    let config = build_storage_config(&mut env, &config_map);
+
+    match block_on_operation(async move {
+        distributed::read_version_raw(&path, &config, version).await
+    }) {
+        Ok(content) => {
+            let jstr = match env.new_string(&content) {
+                Ok(s) => s,
+                Err(e) => { to_java_exception(&mut env, &anyhow::anyhow!("{}", e)); return std::ptr::null_mut(); }
+            };
+            jstr.into_raw() as jbyteArray
+        }
+        Err(e) => {
+            to_java_exception(&mut env, &anyhow::anyhow!("{}", e));
+            std::ptr::null_mut()
+        }
+    }
+}
+
 // ============================================================================
 // WRITE OPERATIONS
 // ============================================================================
+
+/// Write a version file with arbitrary mixed actions and automatic retry.
+/// actionsJson is JSON-lines format (one action per line).
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_jni_txlog_TransactionLogWriter_nativeWriteVersion(
+    mut env: JNIEnv,
+    _class: JClass,
+    table_path: JString,
+    config_map: JObject,
+    actions_json: JString,
+) -> jbyteArray {
+    let path = match env.get_string(&table_path) {
+        Ok(s) => s.to_string_lossy().to_string(),
+        Err(e) => { to_java_exception(&mut env, &anyhow::anyhow!("{}", e)); return std::ptr::null_mut(); }
+    };
+    let config = build_storage_config(&mut env, &config_map);
+    let actions_str = match env.get_string(&actions_json) {
+        Ok(s) => s.to_string_lossy().to_string(),
+        Err(e) => { to_java_exception(&mut env, &anyhow::anyhow!("{}", e)); return std::ptr::null_mut(); }
+    };
+
+    // Parse JSON-lines: one ActionEnvelope per line
+    let mut actions = Vec::new();
+    for line in actions_str.lines() {
+        let line = line.trim();
+        if line.is_empty() { continue; }
+        let envelope: super::actions::ActionEnvelope = match serde_json::from_str(line) {
+            Ok(e) => e,
+            Err(e) => {
+                to_java_exception(&mut env, &anyhow::anyhow!("Parse action line: {}", e));
+                return std::ptr::null_mut();
+            }
+        };
+        if let Some(action) = envelope.into_action() {
+            actions.push(action);
+        }
+    }
+
+    match block_on_operation(async move {
+        distributed::write_version(&path, &config, actions, distributed::RetryConfig::default()).await
+    }) {
+        Ok(result) => {
+            let buf = serialization::serialize_write_result(&result);
+            buffer_to_jbytearray(&mut env, &buf)
+        }
+        Err(e) => {
+            to_java_exception(&mut env, &anyhow::anyhow!("{}", e));
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Write a version file with a single attempt (no retry).
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_jni_txlog_TransactionLogWriter_nativeWriteVersionOnce(
+    mut env: JNIEnv,
+    _class: JClass,
+    table_path: JString,
+    config_map: JObject,
+    actions_json: JString,
+) -> jbyteArray {
+    let path = match env.get_string(&table_path) {
+        Ok(s) => s.to_string_lossy().to_string(),
+        Err(e) => { to_java_exception(&mut env, &anyhow::anyhow!("{}", e)); return std::ptr::null_mut(); }
+    };
+    let config = build_storage_config(&mut env, &config_map);
+    let actions_str = match env.get_string(&actions_json) {
+        Ok(s) => s.to_string_lossy().to_string(),
+        Err(e) => { to_java_exception(&mut env, &anyhow::anyhow!("{}", e)); return std::ptr::null_mut(); }
+    };
+
+    let mut actions = Vec::new();
+    for line in actions_str.lines() {
+        let line = line.trim();
+        if line.is_empty() { continue; }
+        let envelope: super::actions::ActionEnvelope = match serde_json::from_str(line) {
+            Ok(e) => e,
+            Err(e) => {
+                to_java_exception(&mut env, &anyhow::anyhow!("Parse action line: {}", e));
+                return std::ptr::null_mut();
+            }
+        };
+        if let Some(action) = envelope.into_action() {
+            actions.push(action);
+        }
+    }
+
+    match block_on_operation(async move {
+        distributed::write_version_once(&path, &config, actions).await
+    }) {
+        Ok(result) => {
+            let buf = serialization::serialize_write_result(&result);
+            buffer_to_jbytearray(&mut env, &buf)
+        }
+        Err(e) => {
+            to_java_exception(&mut env, &anyhow::anyhow!("{}", e));
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Initialize a new table (write version 0 with Protocol + Metadata).
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_jni_txlog_TransactionLogWriter_nativeInitializeTable(
+    mut env: JNIEnv,
+    _class: JClass,
+    table_path: JString,
+    config_map: JObject,
+    protocol_json: JString,
+    metadata_json: JString,
+) -> () {
+    let path = match env.get_string(&table_path) {
+        Ok(s) => s.to_string_lossy().to_string(),
+        Err(e) => { to_java_exception(&mut env, &anyhow::anyhow!("{}", e)); return; }
+    };
+    let config = build_storage_config(&mut env, &config_map);
+    let proto_str = match env.get_string(&protocol_json) {
+        Ok(s) => s.to_string_lossy().to_string(),
+        Err(e) => { to_java_exception(&mut env, &anyhow::anyhow!("{}", e)); return; }
+    };
+    let meta_str = match env.get_string(&metadata_json) {
+        Ok(s) => s.to_string_lossy().to_string(),
+        Err(e) => { to_java_exception(&mut env, &anyhow::anyhow!("{}", e)); return; }
+    };
+
+    let protocol: super::actions::ProtocolAction = match serde_json::from_str(&proto_str) {
+        Ok(p) => p,
+        Err(e) => { to_java_exception(&mut env, &anyhow::anyhow!("Parse protocol: {}", e)); return; }
+    };
+    let metadata: super::actions::MetadataAction = match serde_json::from_str(&meta_str) {
+        Ok(m) => m,
+        Err(e) => { to_java_exception(&mut env, &anyhow::anyhow!("Parse metadata: {}", e)); return; }
+    };
+
+    if let Err(e) = block_on_operation(async move {
+        distributed::initialize_table(&path, &config, protocol, metadata).await
+    }) {
+        to_java_exception(&mut env, &anyhow::anyhow!("{}", e));
+    }
+}
 
 /// Add files. Returns TANT buffer with WriteResult.
 #[no_mangle]

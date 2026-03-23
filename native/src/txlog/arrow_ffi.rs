@@ -33,9 +33,11 @@ pub fn file_entry_arrow_schema() -> Schema {
         Field::new("footer_start_offset", DataType::Int64, true),
         Field::new("footer_end_offset", DataType::Int64, true),
         Field::new("has_footer_offsets", DataType::Boolean, true),
+        Field::new("delete_opstamp", DataType::Int64, true),
         Field::new("split_tags", DataType::Utf8, true),
         Field::new("num_merge_ops", DataType::Int32, true),
         Field::new("doc_mapping_json", DataType::Utf8, true),
+        Field::new("doc_mapping_ref", DataType::Utf8, true),
         Field::new("uncompressed_size_bytes", DataType::Int64, true),
         Field::new("time_range_start", DataType::Int64, true),
         Field::new("time_range_end", DataType::Int64, true),
@@ -85,6 +87,7 @@ pub fn file_entries_to_record_batch(entries: &[FileEntry]) -> Result<RecordBatch
     let mut time_start_builder = Int64Builder::with_capacity(len);
     let mut time_end_builder = Int64Builder::with_capacity(len);
     let mut comp_delta_ver_builder = Int64Builder::with_capacity(len);
+    let mut delete_opstamp_builder = Int64Builder::with_capacity(len);
 
     // Nullable Utf8 columns
     let mut partition_vals_builder = StringBuilder::with_capacity(len, len * 32);
@@ -93,6 +96,7 @@ pub fn file_entries_to_record_batch(entries: &[FileEntry]) -> Result<RecordBatch
     let mut max_vals_builder = StringBuilder::with_capacity(len, len * 32);
     let mut split_tags_builder = StringBuilder::with_capacity(len, len * 32);
     let mut doc_mapping_builder = StringBuilder::with_capacity(len, len * 128);
+    let mut doc_mapping_ref_builder = StringBuilder::with_capacity(len, len * 32);
     let mut comp_src_files_builder = StringBuilder::with_capacity(len, len * 64);
     let mut comp_ff_mode_builder = StringBuilder::with_capacity(len, len * 16);
 
@@ -122,6 +126,7 @@ pub fn file_entries_to_record_batch(entries: &[FileEntry]) -> Result<RecordBatch
         time_end_builder.append_option(add.time_range_end);
         comp_delta_ver_builder.append_option(add.companion_delta_version);
         has_footer_offsets_builder.append_option(add.has_footer_offsets);
+        delete_opstamp_builder.append_option(add.delete_opstamp);
 
         // Nullable Utf8 (JSON-encoded maps)
         match hashmap_required_to_json(&add.partition_values) {
@@ -140,13 +145,21 @@ pub fn file_entries_to_record_batch(entries: &[FileEntry]) -> Result<RecordBatch
             Some(s) => max_vals_builder.append_value(&s),
             None => max_vals_builder.append_null(),
         }
-        match hashmap_to_json(&add.split_tags) {
-            Some(s) => split_tags_builder.append_value(&s),
+        match &add.split_tags {
+            Some(tags) => {
+                let json = serde_json::to_string(tags)
+                    .map_err(|e| TxLogError::Serde(e.to_string()))?;
+                split_tags_builder.append_value(&json);
+            }
             None => split_tags_builder.append_null(),
         }
         match &add.doc_mapping_json {
             Some(s) => doc_mapping_builder.append_value(s),
             None => doc_mapping_builder.append_null(),
+        }
+        match &add.doc_mapping_ref {
+            Some(s) => doc_mapping_ref_builder.append_value(s),
+            None => doc_mapping_ref_builder.append_null(),
         }
         match &add.companion_source_files {
             Some(files) => {
@@ -178,9 +191,11 @@ pub fn file_entries_to_record_batch(entries: &[FileEntry]) -> Result<RecordBatch
         Arc::new(footer_start_builder.finish()),
         Arc::new(footer_end_builder.finish()),
         Arc::new(has_footer_offsets_builder.finish()),
+        Arc::new(delete_opstamp_builder.finish()),
         Arc::new(split_tags_builder.finish()),
         Arc::new(num_merge_ops_builder.finish()),
         Arc::new(doc_mapping_builder.finish()),
+        Arc::new(doc_mapping_ref_builder.finish()),
         Arc::new(uncomp_size_builder.finish()),
         Arc::new(time_start_builder.finish()),
         Arc::new(time_end_builder.finish()),
@@ -292,7 +307,7 @@ mod tests {
                 num_records: Some(100),
                 footer_start_offset: None,
                 footer_end_offset: None,
-                has_footer_offsets: None,
+                has_footer_offsets: None, delete_opstamp: None,
                 split_tags: None,
                 num_merge_ops: None,
                 doc_mapping_json: None,
@@ -312,7 +327,7 @@ mod tests {
     #[test]
     fn test_schema_field_count() {
         let schema = file_entry_arrow_schema();
-        assert_eq!(schema.fields().len(), 23);
+        assert_eq!(schema.fields().len(), 25);
         // Verify a few key field names and types
         assert_eq!(schema.field(0).name(), "path");
         assert_eq!(schema.field(0).data_type(), &DataType::Utf8);
@@ -324,18 +339,18 @@ mod tests {
         assert_eq!(schema.field(11).name(), "has_footer_offsets");
         assert!(schema.field(11).is_nullable());
 
-        assert_eq!(schema.field(21).name(), "added_at_version");
-        assert!(!schema.field(21).is_nullable());
+        assert_eq!(schema.field(23).name(), "added_at_version");
+        assert!(!schema.field(23).is_nullable());
 
-        assert_eq!(schema.field(22).name(), "added_at_timestamp");
-        assert!(!schema.field(22).is_nullable());
+        assert_eq!(schema.field(24).name(), "added_at_timestamp");
+        assert!(!schema.field(24).is_nullable());
     }
 
     #[test]
     fn test_empty_entries_to_batch() {
         let batch = file_entries_to_record_batch(&[]).unwrap();
         assert_eq!(batch.num_rows(), 0);
-        assert_eq!(batch.num_columns(), 23);
+        assert_eq!(batch.num_columns(), 25);
     }
 
     #[test]
@@ -347,7 +362,7 @@ mod tests {
         let batch = file_entries_to_record_batch(&entries).unwrap();
 
         assert_eq!(batch.num_rows(), 2);
-        assert_eq!(batch.num_columns(), 23);
+        assert_eq!(batch.num_columns(), 25);
 
         // Verify path column
         let path_col = batch
@@ -385,18 +400,18 @@ mod tests {
         assert!(!nr_col.is_null(0));
         assert_eq!(nr_col.value(0), 100);
 
-        // Verify added_at_version
+        // Verify added_at_version (col 23)
         let ver_col = batch
-            .column(21)
+            .column(23)
             .as_any()
             .downcast_ref::<Int64Array>()
             .unwrap();
         assert_eq!(ver_col.value(0), 1);
         assert_eq!(ver_col.value(1), 2);
 
-        // Verify added_at_timestamp
+        // Verify added_at_timestamp (col 24)
         let ts_col = batch
-            .column(22)
+            .column(24)
             .as_any()
             .downcast_ref::<Int64Array>()
             .unwrap();
@@ -408,9 +423,7 @@ mod tests {
     fn test_entries_with_optional_fields() {
         let mut entry = make_test_entry("split-opt.split", 999, 5);
         // Set some optional fields
-        let mut tags = HashMap::new();
-        tags.insert("region".to_string(), "us-east-1".to_string());
-        entry.add.split_tags = Some(tags);
+        entry.add.split_tags = Some(vec!["region:us-east-1".to_string()]);
         entry.add.num_merge_ops = Some(3);
         entry.add.doc_mapping_json = Some("{\"field\":\"value\"}".to_string());
         entry.add.companion_source_files = Some(vec!["file1.parquet".to_string(), "file2.parquet".to_string()]);
@@ -436,37 +449,37 @@ mod tests {
         let batch = file_entries_to_record_batch(&[entry, entry_none]).unwrap();
         assert_eq!(batch.num_rows(), 2);
 
-        // split_tags: row 0 populated, row 1 null (col 12 after has_footer_offsets at 11)
-        let tags_col = batch.column(12).as_any().downcast_ref::<StringArray>().unwrap();
+        // split_tags: row 0 populated, row 1 null (col 13)
+        let tags_col = batch.column(13).as_any().downcast_ref::<StringArray>().unwrap();
         assert!(!tags_col.is_null(0));
-        let tags_json: HashMap<String, String> = serde_json::from_str(tags_col.value(0)).unwrap();
-        assert_eq!(tags_json.get("region").unwrap(), "us-east-1");
+        let tags_arr: Vec<String> = serde_json::from_str(tags_col.value(0)).unwrap();
+        assert_eq!(tags_arr, vec!["region:us-east-1"]);
         assert!(tags_col.is_null(1));
 
-        // num_merge_ops: row 0 = 3, row 1 = null
-        let merge_col = batch.column(13).as_any().downcast_ref::<Int32Array>().unwrap();
+        // num_merge_ops: row 0 = 3, row 1 = null (col 14)
+        let merge_col = batch.column(14).as_any().downcast_ref::<Int32Array>().unwrap();
         assert_eq!(merge_col.value(0), 3);
         assert!(merge_col.is_null(1));
 
-        // doc_mapping_json: row 0 populated, row 1 null
-        let dm_col = batch.column(14).as_any().downcast_ref::<StringArray>().unwrap();
+        // doc_mapping_json: row 0 populated, row 1 null (col 15)
+        let dm_col = batch.column(15).as_any().downcast_ref::<StringArray>().unwrap();
         assert_eq!(dm_col.value(0), "{\"field\":\"value\"}");
         assert!(dm_col.is_null(1));
 
-        // companion_source_files: row 0 = JSON array, row 1 = null
-        let csf_col = batch.column(18).as_any().downcast_ref::<StringArray>().unwrap();
+        // companion_source_files: row 0 = JSON array, row 1 = null (col 20)
+        let csf_col = batch.column(20).as_any().downcast_ref::<StringArray>().unwrap();
         assert!(!csf_col.is_null(0));
         let files: Vec<String> = serde_json::from_str(csf_col.value(0)).unwrap();
         assert_eq!(files, vec!["file1.parquet", "file2.parquet"]);
         assert!(csf_col.is_null(1));
 
-        // companion_delta_version: row 0 = 42, row 1 = null
-        let cdv_col = batch.column(19).as_any().downcast_ref::<Int64Array>().unwrap();
+        // companion_delta_version: row 0 = 42, row 1 = null (col 21)
+        let cdv_col = batch.column(21).as_any().downcast_ref::<Int64Array>().unwrap();
         assert_eq!(cdv_col.value(0), 42);
         assert!(cdv_col.is_null(1));
 
-        // companion_fast_field_mode: row 0 = "hybrid", row 1 = null
-        let cff_col = batch.column(20).as_any().downcast_ref::<StringArray>().unwrap();
+        // companion_fast_field_mode: row 0 = "hybrid", row 1 = null (col 22)
+        let cff_col = batch.column(22).as_any().downcast_ref::<StringArray>().unwrap();
         assert_eq!(cff_col.value(0), "hybrid");
         assert!(cff_col.is_null(1));
 

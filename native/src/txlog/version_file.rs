@@ -100,7 +100,7 @@ mod tests {
                 num_records: Some(42),
                 footer_start_offset: None,
                 footer_end_offset: None,
-                has_footer_offsets: None,
+                has_footer_offsets: None, delete_opstamp: None,
                 split_tags: None,
                 num_merge_ops: None,
                 doc_mapping_json: None,

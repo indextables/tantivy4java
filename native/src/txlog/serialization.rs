@@ -44,9 +44,11 @@ fn serialize_file_entry(buf: &mut Vec<u8>, entry: &FileEntry) {
     if a.footer_start_offset.is_some() { field_count += 1; }
     if a.footer_end_offset.is_some() { field_count += 1; }
     if a.has_footer_offsets.is_some() { field_count += 1; }
+    if a.delete_opstamp.is_some() { field_count += 1; }
     if a.split_tags.is_some() { field_count += 1; }
     if a.num_merge_ops.is_some() { field_count += 1; }
     if a.doc_mapping_json.is_some() { field_count += 1; }
+    if a.doc_mapping_ref.is_some() { field_count += 1; }
     if a.uncompressed_size_bytes.is_some() { field_count += 1; }
     if a.time_range_start.is_some() { field_count += 1; }
     if a.time_range_end.is_some() { field_count += 1; }
@@ -110,9 +112,13 @@ fn serialize_file_entry(buf: &mut Vec<u8>, entry: &FileEntry) {
         write_field_header(buf, "has_footer_offsets", FIELD_TYPE_BOOLEAN, 1);
         buf.push(if v { 1 } else { 0 });
     }
-    if let Some(ref m) = a.split_tags {
+    if let Some(v) = a.delete_opstamp {
+        write_field_header(buf, "delete_opstamp", FIELD_TYPE_INTEGER, 1);
+        buf.extend_from_slice(&v.to_ne_bytes());
+    }
+    if let Some(ref tags) = a.split_tags {
         write_field_header(buf, "split_tags", FIELD_TYPE_JSON, 1);
-        let json = serde_json::to_string(m).unwrap_or_else(|_| "{}".to_string());
+        let json = serde_json::to_string(tags).unwrap_or_else(|_| "[]".to_string());
         write_string(buf, &json);
     }
     if let Some(v) = a.num_merge_ops {
@@ -121,6 +127,10 @@ fn serialize_file_entry(buf: &mut Vec<u8>, entry: &FileEntry) {
     }
     if let Some(ref s) = a.doc_mapping_json {
         write_field_header(buf, "doc_mapping_json", FIELD_TYPE_TEXT, 1);
+        write_string(buf, s);
+    }
+    if let Some(ref s) = a.doc_mapping_ref {
+        write_field_header(buf, "doc_mapping_ref", FIELD_TYPE_TEXT, 1);
         write_string(buf, s);
     }
     if let Some(v) = a.uncompressed_size_bytes {
@@ -234,17 +244,40 @@ pub fn serialize_changes(changes: &TxLogChanges) -> Vec<u8> {
         write_string(&mut buf, path);
     }
 
-    // Skip actions
+    // Skip actions (expanded fields for GAP-6)
     for skip in &changes.skip_actions {
         offsets.push(buf.len() as u32);
-        let fc: u16 = 3;
+        let mut fc: u16 = 4; // path, reason, skip_count, skip_timestamp
+        if skip.operation.is_some() { fc += 1; }
+        if skip.partition_values.is_some() { fc += 1; }
+        if skip.size.is_some() { fc += 1; }
+        if skip.retry_after.is_some() { fc += 1; }
         buf.extend_from_slice(&fc.to_ne_bytes());
         write_field_header(&mut buf, "path", FIELD_TYPE_TEXT, 1);
         write_string(&mut buf, &skip.path);
+        write_field_header(&mut buf, "skip_timestamp", FIELD_TYPE_INTEGER, 1);
+        buf.extend_from_slice(&skip.skip_timestamp.to_ne_bytes());
         write_field_header(&mut buf, "reason", FIELD_TYPE_TEXT, 1);
         write_string(&mut buf, &skip.reason);
         write_field_header(&mut buf, "skip_count", FIELD_TYPE_INTEGER, 1);
         buf.extend_from_slice(&(skip.skip_count.unwrap_or(0) as i64).to_ne_bytes());
+        if let Some(ref op) = skip.operation {
+            write_field_header(&mut buf, "operation", FIELD_TYPE_TEXT, 1);
+            write_string(&mut buf, op);
+        }
+        if let Some(ref pv) = skip.partition_values {
+            write_field_header(&mut buf, "partition_values", FIELD_TYPE_JSON, 1);
+            let json = serde_json::to_string(pv).unwrap_or_else(|_| "{}".to_string());
+            write_string(&mut buf, &json);
+        }
+        if let Some(v) = skip.size {
+            write_field_header(&mut buf, "size", FIELD_TYPE_INTEGER, 1);
+            buf.extend_from_slice(&v.to_ne_bytes());
+        }
+        if let Some(v) = skip.retry_after {
+            write_field_header(&mut buf, "retry_after", FIELD_TYPE_INTEGER, 1);
+            buf.extend_from_slice(&v.to_ne_bytes());
+        }
     }
 
     write_footer(&mut buf, &offsets);

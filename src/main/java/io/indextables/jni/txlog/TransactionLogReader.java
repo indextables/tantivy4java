@@ -187,10 +187,57 @@ public class TransactionLogReader {
         return version;
     }
 
+    /**
+     * List all version numbers present in the transaction log.
+     *
+     * @param tablePath table location
+     * @param config    credential and storage configuration
+     * @return sorted array of version numbers
+     */
+    public static long[] listVersions(String tablePath, Map<String, String> config) {
+        if (tablePath == null || tablePath.isEmpty()) {
+            throw new IllegalArgumentException("tablePath must not be null or empty");
+        }
+        String json = nativeListVersions(tablePath,
+                config != null ? config : Collections.emptyMap());
+        if (json == null) {
+            throw new RuntimeException("Native listVersions returned null (check preceding exception)");
+        }
+        try {
+            com.fasterxml.jackson.databind.ObjectMapper mapper = new com.fasterxml.jackson.databind.ObjectMapper();
+            long[] versions = mapper.readValue(json, long[].class);
+            return versions;
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to parse listVersions response: " + e.getMessage(), e);
+        }
+    }
+
+    /**
+     * Read the raw JSON-lines content from a specific version file.
+     *
+     * @param tablePath table location
+     * @param config    credential and storage configuration
+     * @param version   version number to read
+     * @return raw JSON-lines content of the version file
+     */
+    public static String readVersion(String tablePath, Map<String, String> config, long version) {
+        if (tablePath == null || tablePath.isEmpty()) {
+            throw new IllegalArgumentException("tablePath must not be null or empty");
+        }
+        String content = nativeReadVersion(tablePath,
+                config != null ? config : Collections.emptyMap(), version);
+        if (content == null) {
+            throw new RuntimeException("Native readVersion returned null (check preceding exception)");
+        }
+        return content;
+    }
+
     // --- Native methods ---
 
     private static native byte[] nativeGetSnapshotInfo(String tablePath, Map<String, String> config);
     private static native byte[] nativeReadManifest(String tablePath, Map<String, String> config, String stateDir, String manifestPath, String metadataConfigJson);
     private static native byte[] nativeReadPostCheckpointChanges(String tablePath, Map<String, String> config, String versionPathsJson, String metadataConfigJson);
     private static native long nativeGetCurrentVersion(String tablePath, Map<String, String> config);
+    private static native String nativeListVersions(String tablePath, Map<String, String> config);
+    private static native String nativeReadVersion(String tablePath, Map<String, String> config, long version);
 }

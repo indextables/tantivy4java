@@ -175,9 +175,13 @@ pub struct AddAction {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub has_footer_offsets: Option<bool>,
 
+    // Delete tracking
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delete_opstamp: Option<i64>,
+
     // Split metadata
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub split_tags: Option<HashMap<String, String>>,
+    pub split_tags: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub num_merge_ops: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -328,6 +332,7 @@ mod tests {
             footer_start_offset: None,
             footer_end_offset: None,
             has_footer_offsets: None,
+            delete_opstamp: None,
             split_tags: None,
             num_merge_ops: None,
             doc_mapping_json: None,

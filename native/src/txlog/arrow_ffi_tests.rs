@@ -32,7 +32,7 @@ fn make_test_entry(path: &str, size: i64, num_records: Option<i64>) -> FileEntry
             num_records,
             footer_start_offset: None,
             footer_end_offset: None,
-            has_footer_offsets: None,
+            has_footer_offsets: None, delete_opstamp: None,
             split_tags: None,
             num_merge_ops: None,
             doc_mapping_json: None,
@@ -54,8 +54,7 @@ fn make_full_entry(path: &str) -> FileEntry {
     pv.insert("year".to_string(), "2024".to_string());
     pv.insert("month".to_string(), "01".to_string());
 
-    let mut tags = HashMap::new();
-    tags.insert("source".to_string(), "indexer-1".to_string());
+    let tags = vec!["source:indexer-1".to_string()];
 
     let mut min_vals = HashMap::new();
     min_vals.insert("timestamp".to_string(), "1000".to_string());
@@ -75,7 +74,7 @@ fn make_full_entry(path: &str) -> FileEntry {
             num_records: Some(100),
             footer_start_offset: Some(49000),
             footer_end_offset: Some(50000),
-            has_footer_offsets: Some(true),
+            has_footer_offsets: Some(true), delete_opstamp: None,
             split_tags: Some(tags),
             num_merge_ops: Some(2),
             doc_mapping_json: Some(
@@ -121,9 +120,11 @@ fn test_ffi_batch_column_types() {
         ("footer_start_offset", DataType::Int64),
         ("footer_end_offset", DataType::Int64),
         ("has_footer_offsets", DataType::Boolean),
+        ("delete_opstamp", DataType::Int64),
         ("split_tags", DataType::Utf8),
         ("num_merge_ops", DataType::Int32),
         ("doc_mapping_json", DataType::Utf8),
+        ("doc_mapping_ref", DataType::Utf8),
         ("uncompressed_size_bytes", DataType::Int64),
         ("time_range_start", DataType::Int64),
         ("time_range_end", DataType::Int64),
@@ -159,8 +160,8 @@ fn test_ffi_batch_required_columns_not_null() {
         ("size", 1),
         ("modification_time", 2),
         ("data_change", 3),
-        ("added_at_version", 21),
-        ("added_at_timestamp", 22),
+        ("added_at_version", 23),
+        ("added_at_timestamp", 24),
     ];
 
     for (name, idx) in &required_columns {
@@ -201,15 +202,17 @@ fn test_ffi_batch_nullable_columns() {
         ("footer_start_offset", 9),
         ("footer_end_offset", 10),
         ("has_footer_offsets", 11),
-        ("split_tags", 12),
-        ("num_merge_ops", 13),
-        ("doc_mapping_json", 14),
-        ("uncompressed_size_bytes", 15),
-        ("time_range_start", 16),
-        ("time_range_end", 17),
-        ("companion_source_files", 18),
-        ("companion_delta_version", 19),
-        ("companion_fast_field_mode", 20),
+        ("delete_opstamp", 12),
+        ("split_tags", 13),
+        ("num_merge_ops", 14),
+        ("doc_mapping_json", 15),
+        ("doc_mapping_ref", 16),
+        ("uncompressed_size_bytes", 17),
+        ("time_range_start", 18),
+        ("time_range_end", 19),
+        ("companion_source_files", 20),
+        ("companion_delta_version", 21),
+        ("companion_fast_field_mode", 22),
     ];
 
     for (name, idx) in &nullable_columns {
@@ -291,55 +294,55 @@ fn test_ffi_batch_all_fields_populated() {
     let feo_col = batch.column(10).as_any().downcast_ref::<Int64Array>().unwrap();
     assert_eq!(feo_col.value(0), 50000);
 
-    // split_tags (JSON)
-    let tags_col = batch.column(12).as_any().downcast_ref::<StringArray>().unwrap();
+    // split_tags (JSON array, col 13)
+    let tags_col = batch.column(13).as_any().downcast_ref::<StringArray>().unwrap();
     assert!(!tags_col.is_null(0));
-    let tags: HashMap<String, String> = serde_json::from_str(tags_col.value(0)).unwrap();
-    assert_eq!(tags.get("source").unwrap(), "indexer-1");
+    let tags: Vec<String> = serde_json::from_str(tags_col.value(0)).unwrap();
+    assert_eq!(tags, vec!["source:indexer-1"]);
 
-    // num_merge_ops
-    let nmo_col = batch.column(13).as_any().downcast_ref::<Int32Array>().unwrap();
+    // num_merge_ops (col 14)
+    let nmo_col = batch.column(14).as_any().downcast_ref::<Int32Array>().unwrap();
     assert_eq!(nmo_col.value(0), 2);
 
-    // doc_mapping_json
-    let dm_col = batch.column(14).as_any().downcast_ref::<StringArray>().unwrap();
+    // doc_mapping_json (col 15)
+    let dm_col = batch.column(15).as_any().downcast_ref::<StringArray>().unwrap();
     assert_eq!(
         dm_col.value(0),
         r#"{"fields":[{"name":"title","type":"text"}]}"#
     );
 
-    // uncompressed_size_bytes
-    let usb_col = batch.column(15).as_any().downcast_ref::<Int64Array>().unwrap();
+    // uncompressed_size_bytes (col 17)
+    let usb_col = batch.column(17).as_any().downcast_ref::<Int64Array>().unwrap();
     assert_eq!(usb_col.value(0), 100000);
 
-    // time_range_start
-    let trs_col = batch.column(16).as_any().downcast_ref::<Int64Array>().unwrap();
+    // time_range_start (col 18)
+    let trs_col = batch.column(18).as_any().downcast_ref::<Int64Array>().unwrap();
     assert_eq!(trs_col.value(0), 1000);
 
-    // time_range_end
-    let tre_col = batch.column(17).as_any().downcast_ref::<Int64Array>().unwrap();
+    // time_range_end (col 19)
+    let tre_col = batch.column(19).as_any().downcast_ref::<Int64Array>().unwrap();
     assert_eq!(tre_col.value(0), 2000);
 
-    // companion_source_files (JSON array)
-    let csf_col = batch.column(18).as_any().downcast_ref::<StringArray>().unwrap();
+    // companion_source_files (JSON array, col 20)
+    let csf_col = batch.column(20).as_any().downcast_ref::<StringArray>().unwrap();
     assert!(!csf_col.is_null(0));
     let files: Vec<String> = serde_json::from_str(csf_col.value(0)).unwrap();
     assert_eq!(files, vec!["file1.parquet", "file2.parquet"]);
 
-    // companion_delta_version
-    let cdv_col = batch.column(19).as_any().downcast_ref::<Int64Array>().unwrap();
+    // companion_delta_version (col 21)
+    let cdv_col = batch.column(21).as_any().downcast_ref::<Int64Array>().unwrap();
     assert_eq!(cdv_col.value(0), 42);
 
-    // companion_fast_field_mode
-    let cfm_col = batch.column(20).as_any().downcast_ref::<StringArray>().unwrap();
+    // companion_fast_field_mode (col 22)
+    let cfm_col = batch.column(22).as_any().downcast_ref::<StringArray>().unwrap();
     assert_eq!(cfm_col.value(0), "HYBRID");
 
-    // added_at_version
-    let aav_col = batch.column(21).as_any().downcast_ref::<Int64Array>().unwrap();
+    // added_at_version (col 23)
+    let aav_col = batch.column(23).as_any().downcast_ref::<Int64Array>().unwrap();
     assert_eq!(aav_col.value(0), 5);
 
-    // added_at_timestamp
-    let aat_col = batch.column(22).as_any().downcast_ref::<Int64Array>().unwrap();
+    // added_at_timestamp (col 24)
+    let aat_col = batch.column(24).as_any().downcast_ref::<Int64Array>().unwrap();
     assert_eq!(aat_col.value(0), 1700000050000);
 }
 
@@ -365,7 +368,7 @@ fn test_ffi_batch_multiple_entries() {
 
     let batch = file_entries_to_record_batch(&entries).unwrap();
     assert_eq!(batch.num_rows(), 100);
-    assert_eq!(batch.num_columns(), 23);
+    assert_eq!(batch.num_columns(), 25);
 
     // Spot-check: first entry
     let path_col = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
@@ -394,7 +397,7 @@ fn test_ffi_batch_multiple_entries() {
     assert!(!stats_col.is_null(5)); // i=5: 5%5==0
 
     // Spot-check: added_at_version
-    let ver_col = batch.column(21).as_any().downcast_ref::<Int64Array>().unwrap();
+    let ver_col = batch.column(23).as_any().downcast_ref::<Int64Array>().unwrap();
     assert_eq!(ver_col.value(0), 0);
     assert_eq!(ver_col.value(42), 42);
     assert_eq!(ver_col.value(99), 99);
@@ -535,9 +538,9 @@ fn test_ffi_export_reimport() {
     let size_col = size_array.as_any().downcast_ref::<Int64Array>().unwrap();
     assert_eq!(size_col.value(0), 50000);
 
-    // Reimport added_at_version column (index 21) and verify
-    let ffi_a = std::mem::replace(&mut ffi_arrays2[21], FFI_ArrowArray::empty());
-    let ffi_s = std::mem::replace(&mut ffi_schemas2[21], FFI_ArrowSchema::empty());
+    // Reimport added_at_version column (index 23) and verify
+    let ffi_a = std::mem::replace(&mut ffi_arrays2[23], FFI_ArrowArray::empty());
+    let ffi_s = std::mem::replace(&mut ffi_schemas2[23], FFI_ArrowSchema::empty());
     let data = unsafe { from_ffi(ffi_a, &ffi_s) }.unwrap();
     let ver_array = make_array(data);
     let ver_col = ver_array.as_any().downcast_ref::<Int64Array>().unwrap();
@@ -602,7 +605,7 @@ async fn test_e2e_write_checkpoint_export_ffi() {
             num_records: Some((i + 1) * 100),
             footer_start_offset: None,
             footer_end_offset: None,
-            has_footer_offsets: None,
+            has_footer_offsets: None, delete_opstamp: None,
             split_tags: None,
             num_merge_ops: if i > 0 { Some(i as i32) } else { None },
             doc_mapping_json: if i == 0 {
@@ -650,7 +653,7 @@ async fn test_e2e_write_checkpoint_export_ffi() {
     // Step 4: Convert the read-back entries to Arrow RecordBatch
     let batch = file_entries_to_record_batch(&read_back).unwrap();
     assert_eq!(batch.num_rows(), 5);
-    assert_eq!(batch.num_columns(), 23);
+    assert_eq!(batch.num_columns(), 25);
 
     // Step 5: Verify all fields match the original add_actions
     let path_col = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
@@ -695,24 +698,24 @@ async fn test_e2e_write_checkpoint_export_ffi() {
         );
     }
 
-    // Verify num_merge_ops: row 0 = None (null), rows 1-4 = Some(i)
-    let nmo_col = batch.column(13).as_any().downcast_ref::<Int32Array>().unwrap();
+    // Verify num_merge_ops (col 14): row 0 = None (null), rows 1-4 = Some(i)
+    let nmo_col = batch.column(14).as_any().downcast_ref::<Int32Array>().unwrap();
     assert!(nmo_col.is_null(0));
     for i in 1..5 {
         assert!(!nmo_col.is_null(i));
         assert_eq!(nmo_col.value(i), i as i32);
     }
 
-    // Verify doc_mapping_json: only row 0 has it
-    let dm_col = batch.column(14).as_any().downcast_ref::<StringArray>().unwrap();
+    // Verify doc_mapping_json (col 15): only row 0 has it
+    let dm_col = batch.column(15).as_any().downcast_ref::<StringArray>().unwrap();
     assert!(!dm_col.is_null(0));
     assert!(dm_col.value(0).contains("body"));
     for i in 1..5 {
         assert!(dm_col.is_null(i));
     }
 
-    // Verify companion fields: only row 2 has them
-    let csf_col = batch.column(18).as_any().downcast_ref::<StringArray>().unwrap();
+    // Verify companion fields: only row 2 has them (col 20/21/22)
+    let csf_col = batch.column(20).as_any().downcast_ref::<StringArray>().unwrap();
     assert!(csf_col.is_null(0));
     assert!(csf_col.is_null(1));
     assert!(!csf_col.is_null(2));
@@ -721,12 +724,12 @@ async fn test_e2e_write_checkpoint_export_ffi() {
     assert!(csf_col.is_null(3));
     assert!(csf_col.is_null(4));
 
-    let cdv_col = batch.column(19).as_any().downcast_ref::<Int64Array>().unwrap();
+    let cdv_col = batch.column(21).as_any().downcast_ref::<Int64Array>().unwrap();
     assert!(cdv_col.is_null(0));
     assert!(!cdv_col.is_null(2));
     assert_eq!(cdv_col.value(2), 7);
 
-    let cfm_col = batch.column(20).as_any().downcast_ref::<StringArray>().unwrap();
+    let cfm_col = batch.column(22).as_any().downcast_ref::<StringArray>().unwrap();
     assert!(cfm_col.is_null(0));
     assert!(!cfm_col.is_null(2));
     assert_eq!(cfm_col.value(2), "HYBRID");
