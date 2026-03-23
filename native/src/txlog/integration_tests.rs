@@ -810,7 +810,7 @@ fn test_serialize_snapshot_info() {
             "00000000000000000043.json".to_string(),
             "00000000000000000044.json".to_string(),
         ],
-        protocol: make_protocol(),
+        protocol: Some(make_protocol()),
         metadata: make_metadata("snapshot-test"),
         state_dir: "state-v42".to_string(),
     };

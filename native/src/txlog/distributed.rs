@@ -28,7 +28,7 @@ pub struct TxLogSnapshotInfo {
     pub checkpoint_version: i64,
     pub manifest_paths: Vec<ManifestPathInfo>,
     pub post_checkpoint_version_paths: Vec<String>,
-    pub protocol: ProtocolAction,
+    pub protocol: Option<ProtocolAction>,
     pub metadata: MetadataAction,
     pub state_dir: String,
 }
@@ -90,7 +90,7 @@ pub async fn get_txlog_snapshot_info_with_cache(
                     checkpoint_version: cached_cp.version,
                     manifest_paths,
                     post_checkpoint_version_paths: post_cp_paths,
-                    protocol: cached_meta.0.clone(),
+                    protocol: Some(cached_meta.0.clone()),
                     metadata: cached_meta.1.clone(),
                     state_dir,
                 });
@@ -150,8 +150,7 @@ async fn snapshot_from_checkpoint(
         Ok(actions) => actions,
         Err(_) => vec![],
     };
-    let (protocol, metadata) = log_replay::extract_metadata(&v0_actions, &all_version_actions);
-    let protocol = protocol.unwrap_or_else(ProtocolAction::v4);
+    let (protocol_opt, metadata) = log_replay::extract_metadata(&v0_actions, &all_version_actions);
     let metadata = metadata.unwrap_or_else(MetadataAction::empty);
 
     let manifest_paths: Vec<ManifestPathInfo> = state_manifest.manifests.iter()
@@ -167,10 +166,11 @@ async fn snapshot_from_checkpoint(
 
     let checkpoint_version = last_cp.version;
 
-    // Populate cache
+    // Populate cache (use v4 default for cache since it needs a concrete value)
     if let Some(ttl) = cache::extract_cache_ttl(config_map) {
         let c = cache::get_or_create_cache(table_path, ttl);
-        c.put_metadata(protocol.clone(), metadata.clone());
+        let cache_protocol = protocol_opt.clone().unwrap_or_else(ProtocolAction::v4);
+        c.put_metadata(cache_protocol, metadata.clone());
         c.put_last_checkpoint(last_cp);
     }
 
@@ -178,7 +178,7 @@ async fn snapshot_from_checkpoint(
         checkpoint_version,
         manifest_paths,
         post_checkpoint_version_paths: post_cp_paths,
-        protocol,
+        protocol: protocol_opt,
         metadata,
         state_dir,
     })
@@ -215,8 +215,7 @@ async fn snapshot_from_version_scan(
         .filter(|(v, _)| *v > 0)
         .cloned()
         .collect();
-    let (protocol, metadata) = log_replay::extract_metadata(&v0_actions, &non_v0_actions);
-    let protocol = protocol.unwrap_or_else(ProtocolAction::v4);
+    let (protocol_opt, metadata) = log_replay::extract_metadata(&v0_actions, &non_v0_actions);
     let metadata = metadata.unwrap_or_else(MetadataAction::empty);
 
     // All version files are "post-checkpoint" since there is no checkpoint
@@ -227,17 +226,18 @@ async fn snapshot_from_version_scan(
     debug_println!("📊 DISTRIBUTED: snapshot_info from version scan: {} versions, no checkpoint",
         all_versions.len());
 
-    // Populate cache
+    // Populate cache (use v4 default for cache since it needs a concrete value)
     if let Some(ttl) = cache::extract_cache_ttl(config_map) {
         let c = cache::get_or_create_cache(table_path, ttl);
-        c.put_metadata(protocol.clone(), metadata.clone());
+        let cache_protocol = protocol_opt.clone().unwrap_or_else(ProtocolAction::v4);
+        c.put_metadata(cache_protocol, metadata.clone());
     }
 
     Ok(TxLogSnapshotInfo {
         checkpoint_version: -1,
         manifest_paths: vec![],
         post_checkpoint_version_paths: post_cp_paths,
-        protocol,
+        protocol: protocol_opt,
         metadata,
         state_dir: String::new(),
     })

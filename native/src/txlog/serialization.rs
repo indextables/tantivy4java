@@ -191,7 +191,10 @@ pub fn serialize_snapshot_info(info: &TxLogSnapshotInfo) -> Vec<u8> {
     write_string(&mut buf, &pcp_json);
 
     write_field_header(&mut buf, "protocol_json", FIELD_TYPE_JSON, 1);
-    let proto_json = serde_json::to_string(&info.protocol).unwrap_or_else(|_| "{}".to_string());
+    let proto_json = match &info.protocol {
+        Some(p) => serde_json::to_string(p).unwrap_or_else(|_| "{}".to_string()),
+        None => String::new(), // Empty string signals "no protocol found"
+    };
     write_string(&mut buf, &proto_json);
 
     write_field_header(&mut buf, "metadata_json", FIELD_TYPE_JSON, 1);
