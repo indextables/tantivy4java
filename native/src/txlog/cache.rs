@@ -397,12 +397,14 @@ pub fn get_or_create_cache(table_path: &str, ttl: Duration) -> Arc<TxLogCache> {
     cache
 }
 
-/// Invalidate cached data for a specific table (called after writes).
+/// Invalidate all cached data for a specific table (called after writes).
+/// Clears everything including metadata and last_checkpoint, since any write
+/// (version file or checkpoint) can change the table state.
 pub fn invalidate_table_cache(table_path: &str) {
     let registry = cache_registry().read();
     for (key, cache) in registry.iter() {
         if key.table_path == table_path {
-            cache.invalidate_mutable();
+            cache.invalidate_all();
         }
     }
 }
