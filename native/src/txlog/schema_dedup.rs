@@ -169,7 +169,7 @@ mod tests {
                 assert!(a.doc_mapping_json.is_none());
                 assert!(a.doc_mapping_ref.is_some());
             }
-            _ => panic!("expected Add"),
+            other => panic!("expected Add, got {:?}", other),
         }
     }
 
@@ -188,11 +188,11 @@ mod tests {
         // Both should have same ref
         let ref1 = match &actions[0] {
             Action::Add(a) => a.doc_mapping_ref.clone().unwrap(),
-            _ => panic!(""),
+            other => panic!("unexpected action: {:?}", other),
         };
         let ref2 = match &actions[1] {
             Action::Add(a) => a.doc_mapping_ref.clone().unwrap(),
-            _ => panic!(""),
+            other => panic!("unexpected action: {:?}", other),
         };
         assert_eq!(ref1, ref2);
     }

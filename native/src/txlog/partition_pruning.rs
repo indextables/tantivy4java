@@ -620,7 +620,7 @@ mod tests {
                 assert_eq!(column, "year");
                 assert_eq!(value, "2024");
             }
-            _ => panic!("expected Eq"),
+            other => panic!("expected Eq, got {:?}", other),
         }
     }
 
@@ -630,7 +630,7 @@ mod tests {
         let f: PartitionFilter = serde_json::from_str(json).unwrap();
         match f {
             PartitionFilter::And { filters } => assert_eq!(filters.len(), 2),
-            _ => panic!("expected And"),
+            other => panic!("expected And, got {:?}", other),
         }
     }
 
@@ -640,7 +640,7 @@ mod tests {
         let f: PartitionFilter = serde_json::from_str(json).unwrap();
         match f {
             PartitionFilter::Not { .. } => {}
-            _ => panic!("expected Not"),
+            other => panic!("expected Not, got {:?}", other),
         }
     }
 }

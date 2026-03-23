@@ -353,7 +353,7 @@ mod tests {
         let action = parsed.into_action().unwrap();
         match action {
             Action::Add(a) => assert_eq!(a.path, "split-001.split"),
-            _ => panic!("expected Add"),
+            other => panic!("expected Add, got {:?}", other),
         }
     }
 
@@ -380,7 +380,7 @@ mod tests {
                 assert_eq!(s.reason, "merge");
                 assert_eq!(s.skip_count, Some(3));
             }
-            _ => panic!("expected MergeSkip"),
+            other => panic!("expected MergeSkip, got {:?}", other),
         }
     }
 

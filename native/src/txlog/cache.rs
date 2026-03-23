@@ -91,15 +91,14 @@ impl<K: Hash + Eq, V: Clone> TimedLruCache<K, V> {
     }
 
     fn get(&mut self, key: &K) -> Option<V> {
-        // First check if the key exists and is not expired (peek doesn't promote)
-        if let Some(entry) = self.inner.peek(key) {
+        // Use get() directly which both checks existence and promotes in LRU order.
+        // Then check TTL — if expired, remove and count as miss.
+        if let Some(entry) = self.inner.get(key) {
             if entry.inserted_at.elapsed() < self.ttl {
-                // Not expired - promote via get and return
-                let entry = self.inner.get(key).unwrap();
                 self.hits += 1;
                 return Some(entry.value.clone());
             }
-            // Expired - remove it
+            // Expired — remove it
             self.inner.pop(key);
             self.evictions += 1;
         }

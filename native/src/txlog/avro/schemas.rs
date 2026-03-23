@@ -62,7 +62,7 @@ mod tests {
                 assert_eq!(r.name.fullname(None), "io.indextables.txlog.FileEntry");
                 assert_eq!(r.fields.len(), 25);
             }
-            _ => panic!("Expected Record schema"),
+            other => panic!("expected Record schema, got {:?}", other),
         }
     }
 }

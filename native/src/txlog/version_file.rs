@@ -76,11 +76,11 @@ mod tests {
         assert_eq!(actions.len(), 2);
         match &actions[0] {
             Action::Add(a) => assert_eq!(a.path, "f.split"),
-            _ => panic!("expected Add"),
+            other => panic!("expected Add, got {:?}", other),
         }
         match &actions[1] {
             Action::Remove(r) => assert_eq!(r.path, "old.split"),
-            _ => panic!("expected Remove"),
+            other => panic!("expected Remove, got {:?}", other),
         }
     }
 
@@ -121,14 +121,14 @@ mod tests {
         assert_eq!(parsed.len(), 2);
         match &parsed[0] {
             Action::Protocol(p) => assert_eq!(p.min_reader_version, 4),
-            _ => panic!("expected Protocol"),
+            other => panic!("expected Protocol, got {:?}", other),
         }
         match &parsed[1] {
             Action::Add(a) => {
                 assert_eq!(a.path, "test.split");
                 assert_eq!(a.num_records, Some(42));
             }
-            _ => panic!("expected Add"),
+            other => panic!("expected Add, got {:?}", other),
         }
     }
 
@@ -143,7 +143,7 @@ mod tests {
                 assert_eq!(s.reason, "merge");
                 assert_eq!(s.skip_count, Some(2));
             }
-            _ => panic!("expected MergeSkip"),
+            other => panic!("expected MergeSkip, got {:?}", other),
         }
     }
 }

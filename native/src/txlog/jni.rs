@@ -87,17 +87,16 @@ pub extern "system" fn Java_io_indextables_jni_txlog_TransactionLogReader_native
     let config = build_storage_config(&mut env, &config_map);
 
     let mc_str = extract_optional_jstring(&mut env, &metadata_config_json);
-    let metadata_config: std::collections::HashMap<String, String> = mc_str
-        .and_then(|s| {
-            match serde_json::from_str(&s) {
-                Ok(map) => Some(map),
-                Err(e) => {
-                    crate::debug_println!("⚠️ TXLOG_JNI: Failed to parse metadata_config_json: {}", e);
-                    None
-                }
+    let metadata_config: std::collections::HashMap<String, String> = match mc_str {
+        Some(s) if !s.is_empty() => match serde_json::from_str(&s) {
+            Ok(map) => map,
+            Err(e) => {
+                to_java_exception(&mut env, &anyhow::anyhow!("Invalid metadata_config_json: {}", e));
+                return std::ptr::null_mut();
             }
-        })
-        .unwrap_or_default();
+        },
+        _ => std::collections::HashMap::new(),
+    };
 
     match block_on_operation(async move {
         distributed::read_manifest(&path, &config, &sd, &mp, &metadata_config).await
@@ -135,17 +134,16 @@ pub extern "system" fn Java_io_indextables_jni_txlog_TransactionLogReader_native
         .unwrap_or_default();
 
     let mc_str = extract_optional_jstring(&mut env, &metadata_config_json);
-    let metadata_config: std::collections::HashMap<String, String> = mc_str
-        .and_then(|s| {
-            match serde_json::from_str(&s) {
-                Ok(map) => Some(map),
-                Err(e) => {
-                    crate::debug_println!("⚠️ TXLOG_JNI: Failed to parse metadata_config_json: {}", e);
-                    None
-                }
+    let metadata_config: std::collections::HashMap<String, String> = match mc_str {
+        Some(s) if !s.is_empty() => match serde_json::from_str(&s) {
+            Ok(map) => map,
+            Err(e) => {
+                to_java_exception(&mut env, &anyhow::anyhow!("Invalid metadata_config_json: {}", e));
+                return std::ptr::null_mut();
             }
-        })
-        .unwrap_or_default();
+        },
+        _ => std::collections::HashMap::new(),
+    };
 
     match block_on_operation(async move {
         distributed::read_post_checkpoint_changes(&path, &config, &version_paths, &metadata_config).await
