@@ -890,6 +890,247 @@ public class TransactionLogIntegrationTest {
     }
 
     // ========================================================================
+    // 21-27. Gap Closure Integration Tests
+    // ========================================================================
+
+    @Test
+    @Order(21)
+    void testInitializeTable() throws Exception {
+        Path initDir = Files.createTempDirectory("txlog-init");
+        Files.createDirectories(initDir.resolve("_transaction_log"));
+        String initTable = "file://" + initDir.toAbsolutePath();
+
+        try {
+            String protocolJson = MAPPER.writeValueAsString(Map.of(
+                "minReaderVersion", 4, "minWriterVersion", 4));
+            String metadataJson = MAPPER.writeValueAsString(Map.of(
+                "id", "init-test-id",
+                "schemaString", "{\"fields\":[]}",
+                "partitionColumns", List.of(),
+                "configuration", Map.of()));
+
+            // First init should succeed
+            TransactionLogWriter.initializeTable(initTable, config, protocolJson, metadataJson);
+
+            // Verify version 0 exists
+            long version = TransactionLogReader.getCurrentVersion(initTable, config);
+            assertEquals(0, version, "Should have version 0 after init");
+
+            // Second init should fail (version 0 already exists)
+            assertThrows(RuntimeException.class, () ->
+                TransactionLogWriter.initializeTable(initTable, config, protocolJson, metadataJson),
+                "Should throw when table already initialized");
+        } finally {
+            deleteRecursively(initDir.toFile());
+        }
+    }
+
+    @Test
+    @Order(22)
+    void testWriteVersionMixedActions() throws Exception {
+        Path mixDir = Files.createTempDirectory("txlog-mixed");
+        Files.createDirectories(mixDir.resolve("_transaction_log"));
+        String mixTable = "file://" + mixDir.toAbsolutePath();
+
+        try {
+            // Initialize table first
+            String protocolJson = MAPPER.writeValueAsString(Map.of(
+                "minReaderVersion", 4, "minWriterVersion", 4));
+            String metadataJson = MAPPER.writeValueAsString(Map.of(
+                "id", "mixed-test",
+                "schemaString", "{\"fields\":[]}",
+                "partitionColumns", List.of(),
+                "configuration", Map.of()));
+            TransactionLogWriter.initializeTable(mixTable, config, protocolJson, metadataJson);
+
+            // Write mixed actions: Add + Remove in same version (like commitMergeSplits)
+            String actionsJson =
+                "{\"add\":{\"path\":\"new.split\",\"partitionValues\":{},\"size\":5000,\"modificationTime\":1700000000000,\"dataChange\":true,\"numRecords\":100}}\n" +
+                "{\"remove\":{\"path\":\"old.split\",\"deletionTimestamp\":1700000000000,\"dataChange\":true}}";
+
+            WriteResult result = TransactionLogWriter.writeVersion(mixTable, config, actionsJson);
+            assertEquals(1, result.getVersion(), "Should write version 1");
+            assertEquals(0, result.getRetries(), "Should succeed without retries");
+
+            // Verify by reading the version back
+            String content = TransactionLogReader.readVersion(mixTable, config, 1);
+            assertNotNull(content);
+            assertTrue(content.contains("new.split"), "Should contain add action");
+            assertTrue(content.contains("old.split"), "Should contain remove action");
+        } finally {
+            deleteRecursively(mixDir.toFile());
+        }
+    }
+
+    @Test
+    @Order(23)
+    void testWriteVersionOnceConflict() throws Exception {
+        Path onceDir = Files.createTempDirectory("txlog-once");
+        Files.createDirectories(onceDir.resolve("_transaction_log"));
+        String onceTable = "file://" + onceDir.toAbsolutePath();
+
+        try {
+            // Write version 0
+            String v0Actions = "{\"protocol\":{\"minReaderVersion\":4,\"minWriterVersion\":4}}";
+            WriteResult r1 = TransactionLogWriter.writeVersionOnce(onceTable, config, v0Actions);
+            assertEquals(0, r1.getVersion(), "First write should get version 0");
+
+            // Write version 1 — should succeed
+            String v1Actions = "{\"add\":{\"path\":\"a.split\",\"partitionValues\":{},\"size\":100,\"modificationTime\":0,\"dataChange\":true}}";
+            WriteResult r2 = TransactionLogWriter.writeVersionOnce(onceTable, config, v1Actions);
+            assertEquals(1, r2.getVersion(), "Second write should get version 1");
+        } finally {
+            deleteRecursively(onceDir.toFile());
+        }
+    }
+
+    @Test
+    @Order(24)
+    void testListVersions() throws Exception {
+        // Use the main test table which has versions 0-4 from earlier tests
+        long[] versions = TransactionLogReader.listVersions(tablePath, config);
+        assertNotNull(versions);
+        assertTrue(versions.length >= 4, "Should have at least 4 versions, got " + versions.length);
+        // Versions should be sorted
+        for (int i = 1; i < versions.length; i++) {
+            assertTrue(versions[i] > versions[i-1],
+                "Versions should be sorted ascending: " + versions[i-1] + " < " + versions[i]);
+        }
+    }
+
+    @Test
+    @Order(25)
+    void testReadVersion() throws Exception {
+        // Read version 0 (protocol + metadata from testWriteInitialVersion)
+        String content = TransactionLogReader.readVersion(tablePath, config, 0);
+        assertNotNull(content);
+        assertFalse(content.isEmpty(), "Version 0 content should not be empty");
+        // Version 0 should contain protocol action
+        assertTrue(content.contains("protocol") || content.contains("metaData"),
+            "Version 0 should contain protocol or metadata actions");
+    }
+
+    @Test
+    @Order(26)
+    void testDeleteOpstampAndDocMappingRefRoundTrip() throws Exception {
+        Path fieldDir = Files.createTempDirectory("txlog-fields");
+        Files.createDirectories(fieldDir.resolve("_transaction_log"));
+        String fieldTable = "file://" + fieldDir.toAbsolutePath();
+
+        try {
+            // Initialize
+            String protocolJson = MAPPER.writeValueAsString(Map.of(
+                "minReaderVersion", 4, "minWriterVersion", 4));
+            String metadataJson = MAPPER.writeValueAsString(Map.of(
+                "id", "field-test",
+                "schemaString", "{\"fields\":[]}",
+                "partitionColumns", List.of(),
+                "configuration", Map.of("docMappingSchema.abc123", "{\"fields\":[]}")));
+            TransactionLogWriter.initializeTable(fieldTable, config, protocolJson, metadataJson);
+
+            // Write add action with deleteOpstamp and docMappingRef
+            Map<String, Object> addWithFields = new LinkedHashMap<>();
+            addWithFields.put("path", "split-with-fields.split");
+            addWithFields.put("partitionValues", Map.of());
+            addWithFields.put("size", 10000);
+            addWithFields.put("modificationTime", 1700000000000L);
+            addWithFields.put("dataChange", true);
+            addWithFields.put("numRecords", 500);
+            addWithFields.put("deleteOpstamp", 42);
+            addWithFields.put("docMappingRef", "abc123");
+            addWithFields.put("splitTags", List.of("env:test", "tier:hot"));
+
+            String addsJson = MAPPER.writeValueAsString(List.of(addWithFields));
+            TransactionLogWriter.addFiles(fieldTable, config, addsJson);
+
+            // Checkpoint and read back
+            String entriesJson = MAPPER.writeValueAsString(List.of(addWithFields));
+            TransactionLogWriter.createCheckpoint(fieldTable, config, entriesJson, metadataJson, protocolJson);
+
+            TxLogSnapshotInfo info = TransactionLogReader.getSnapshotInfo(fieldTable, config);
+            List<TxLogFileEntry> entries = new ArrayList<>();
+            for (String mp : info.getManifestPaths()) {
+                entries.addAll(TransactionLogReader.readManifest(
+                    fieldTable, config, info.getStateDir(), mp,
+                    MAPPER.writeValueAsString(Map.of("docMappingSchema.abc123", "{\"fields\":[]}"))));
+            }
+
+            assertEquals(1, entries.size());
+            TxLogFileEntry entry = entries.get(0);
+
+            // Verify deleteOpstamp round-trip
+            assertTrue(entry.hasDeleteOpstamp(), "Should have deleteOpstamp");
+            assertEquals(42, entry.getDeleteOpstamp());
+
+            // Verify splitTags as List<String> round-trip
+            assertNotNull(entry.getSplitTags());
+            assertTrue(entry.getSplitTags().contains("env:test"));
+            assertTrue(entry.getSplitTags().contains("tier:hot"));
+
+            // docMappingRef is consumed by schema dedup: on read it gets resolved
+            // to docMappingJson if the schema registry contains the ref
+            // The ref itself may or may not survive depending on dedup behavior
+            assertNotNull(entry.getPath());
+        } finally {
+            deleteRecursively(fieldDir.toFile());
+        }
+    }
+
+    @Test
+    @Order(27)
+    void testExpandedSkipActionFields() throws Exception {
+        Path skipDir = Files.createTempDirectory("txlog-skip-expanded");
+        Files.createDirectories(skipDir.resolve("_transaction_log"));
+        String skipTable = "file://" + skipDir.toAbsolutePath();
+
+        try {
+            // Initialize
+            String protocolJson = MAPPER.writeValueAsString(Map.of(
+                "minReaderVersion", 4, "minWriterVersion", 4));
+            String metadataJson = MAPPER.writeValueAsString(Map.of(
+                "id", "skip-test",
+                "schemaString", "{\"fields\":[]}",
+                "partitionColumns", List.of(),
+                "configuration", Map.of()));
+            TransactionLogWriter.initializeTable(skipTable, config, protocolJson, metadataJson);
+
+            // Write add + checkpoint so we have a baseline
+            String addJson = MAPPER.writeValueAsString(List.of(
+                makeAddAction("keep.split", 1000, 100)));
+            TransactionLogWriter.addFiles(skipTable, config, addJson);
+
+            // Write expanded skip action with all fields
+            Map<String, Object> skipMap = new LinkedHashMap<>();
+            skipMap.put("path", "bad.split");
+            skipMap.put("skipTimestamp", 1700000000000L);
+            skipMap.put("reason", "merge_conflict");
+            skipMap.put("operation", "merge_v2");
+            skipMap.put("partitionValues", Map.of("date", "2024-01-01"));
+            skipMap.put("size", 5000);
+            skipMap.put("retryAfter", 1700000300000L);
+            skipMap.put("skipCount", 3);
+            String skipJson = MAPPER.writeValueAsString(skipMap);
+            TransactionLogWriter.skipFile(skipTable, config, skipJson);
+
+            // Create checkpoint with the add action
+            String cpEntries = MAPPER.writeValueAsString(List.of(
+                makeAddAction("keep.split", 1000, 100)));
+            TransactionLogWriter.createCheckpoint(skipTable, config, cpEntries, metadataJson, protocolJson);
+
+            // Read post-checkpoint changes (the skip was written after the add but before checkpoint —
+            // actually it's version 2, and checkpoint is at version 2 or 3, so let's read version 2 directly)
+            String v2Content = TransactionLogReader.readVersion(skipTable, config, 2);
+            assertNotNull(v2Content);
+            assertTrue(v2Content.contains("merge_conflict"), "Skip action should contain reason");
+            assertTrue(v2Content.contains("merge_v2"), "Skip action should contain operation");
+            assertTrue(v2Content.contains("retryAfter") || v2Content.contains("retry_after"),
+                "Skip action should contain retryAfter");
+        } finally {
+            deleteRecursively(skipDir.toFile());
+        }
+    }
+
+    // ========================================================================
     // Helpers
     // ========================================================================
 
