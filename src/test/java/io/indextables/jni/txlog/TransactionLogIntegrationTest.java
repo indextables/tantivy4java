@@ -407,7 +407,7 @@ public class TransactionLogIntegrationTest {
             richAdd.put("numRecords", 100);
             richAdd.put("footerStartOffset", 49000);
             richAdd.put("footerEndOffset", 50000);
-            richAdd.put("splitTags", Map.of("source", "indexer-1"));
+            richAdd.put("splitTags", List.of("source:indexer-1"));
             richAdd.put("numMergeOps", 2);
             richAdd.put("docMappingJson", "{\"fields\":[{\"name\":\"title\",\"type\":\"text\"}]}");
             richAdd.put("uncompressedSizeBytes", 100000);
@@ -448,7 +448,7 @@ public class TransactionLogIntegrationTest {
             assertEquals("{\"numRecords\":100}", entry.getStats());
             assertEquals(49000, entry.getFooterStartOffset());
             assertEquals(50000, entry.getFooterEndOffset());
-            assertEquals("indexer-1", entry.getSplitTags().get("source"));
+            assertTrue(entry.getSplitTags().contains("source:indexer-1"));
             assertEquals(2, entry.getNumMergeOps());
             assertNotNull(entry.getDocMappingJson());
             assertTrue(entry.getDocMappingJson().contains("title"));
