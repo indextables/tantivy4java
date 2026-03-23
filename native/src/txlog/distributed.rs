@@ -472,11 +472,15 @@ pub async fn write_checkpoint(
     let version = storage.list_versions().await?
         .last().copied().unwrap_or(0);
 
-    super::avro::state_writer::write_state_checkpoint(
+    let result = super::avro::state_writer::write_state_checkpoint(
         &storage,
         version,
         &entries,
         &protocol,
         &metadata,
-    ).await
+    ).await?;
+
+    // Invalidate cache after checkpoint write
+    cache::invalidate_table_cache(table_path);
+    Ok(result)
 }

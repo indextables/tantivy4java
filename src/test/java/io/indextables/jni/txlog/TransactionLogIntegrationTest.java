@@ -1001,13 +1001,43 @@ public class TransactionLogIntegrationTest {
     @Test
     @Order(25)
     void testReadVersion() throws Exception {
-        // Read version 0 (protocol + metadata from testWriteInitialVersion)
-        String content = TransactionLogReader.readVersion(tablePath, config, 0);
-        assertNotNull(content);
-        assertFalse(content.isEmpty(), "Version 0 content should not be empty");
-        // Version 0 should contain protocol action
-        assertTrue(content.contains("protocol") || content.contains("metaData"),
-            "Version 0 should contain protocol or metadata actions");
+        // Use a dedicated table with proper initialization (version 0 = protocol + metadata)
+        Path rvDir = Files.createTempDirectory("txlog-readver");
+        Files.createDirectories(rvDir.resolve("_transaction_log"));
+        String rvTable = "file://" + rvDir.toAbsolutePath();
+
+        try {
+            String protocolJson = MAPPER.writeValueAsString(Map.of(
+                "minReaderVersion", 4, "minWriterVersion", 4));
+            String metadataJson = MAPPER.writeValueAsString(Map.of(
+                "id", "readver-test",
+                "schemaString", "{\"fields\":[]}",
+                "partitionColumns", List.of(),
+                "configuration", Map.of()));
+
+            TransactionLogWriter.initializeTable(rvTable, config, protocolJson, metadataJson);
+
+            // Read version 0 — should contain protocol + metadata
+            String content = TransactionLogReader.readVersion(rvTable, config, 0);
+            assertNotNull(content);
+            assertFalse(content.isEmpty(), "Version 0 content should not be empty");
+            assertTrue(content.contains("protocol"),
+                "Version 0 should contain protocol action");
+            assertTrue(content.contains("metaData") || content.contains("metaData"),
+                "Version 0 should contain metadata action");
+
+            // Write version 1 with an add action
+            String addActions = "{\"add\":{\"path\":\"test.split\",\"partitionValues\":{},\"size\":100,\"modificationTime\":0,\"dataChange\":true}}";
+            TransactionLogWriter.writeVersionOnce(rvTable, config, addActions);
+
+            // Read version 1
+            String v1Content = TransactionLogReader.readVersion(rvTable, config, 1);
+            assertNotNull(v1Content);
+            assertTrue(v1Content.contains("test.split"),
+                "Version 1 should contain the add action");
+        } finally {
+            deleteRecursively(rvDir.toFile());
+        }
     }
 
     @Test
