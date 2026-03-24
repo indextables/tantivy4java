@@ -24,8 +24,30 @@ pub async fn write_state_checkpoint(
     protocol: &ProtocolAction,
     metadata: &MetadataAction,
 ) -> Result<LastCheckpointInfo> {
+    let last_checkpoint = write_state_directory(storage, version, entries, protocol, metadata).await?;
+
+    // Write _last_checkpoint pointer
+    let checkpoint_json = serde_json::to_vec(&last_checkpoint)
+        .map_err(|e| crate::txlog::error::TxLogError::Storage(anyhow::anyhow!("Serialize checkpoint: {}", e)))?;
+    storage.put("_last_checkpoint", Bytes::from(checkpoint_json)).await?;
+
+    debug_println!("✅ STATE_WRITER: _last_checkpoint updated to version {}", version);
+    Ok(last_checkpoint)
+}
+
+/// Write the state directory (manifests + _manifest) WITHOUT updating _last_checkpoint.
+///
+/// Called after every write to create a recoverable state snapshot.
+/// `_last_checkpoint` is only updated at interval boundaries by the caller.
+pub async fn write_state_directory(
+    storage: &TxLogStorage,
+    version: i64,
+    entries: &[FileEntry],
+    protocol: &ProtocolAction,
+    metadata: &MetadataAction,
+) -> Result<LastCheckpointInfo> {
     let state_dir = TxLogStorage::state_dir_name(version);
-    debug_println!("📝 STATE_WRITER: Writing checkpoint at {} with {} entries", state_dir, entries.len());
+    debug_println!("📝 STATE_WRITER: Writing state dir {} with {} entries", state_dir, entries.len());
 
     // Group entries by partition key for manifest splitting
     let groups = group_entries_by_partition(entries, &metadata.partition_columns);
@@ -88,7 +110,6 @@ pub async fn write_state_checkpoint(
     let manifest_path = format!("{}/_manifest", state_dir);
     storage.put(&manifest_path, Bytes::from(manifest_json)).await?;
 
-    // Write _last_checkpoint
     let last_checkpoint = LastCheckpointInfo {
         version,
         size: entries.len() as i64,
@@ -98,11 +119,8 @@ pub async fn write_state_checkpoint(
         state_dir: Some(state_dir),
         created_time: Some(now),
     };
-    let checkpoint_json = serde_json::to_vec(&last_checkpoint)
-        .map_err(|e| crate::txlog::error::TxLogError::Storage(anyhow::anyhow!("Serialize checkpoint: {}", e)))?;
-    storage.put("_last_checkpoint", Bytes::from(checkpoint_json)).await?;
 
-    debug_println!("✅ STATE_WRITER: Checkpoint written at version {} ({} manifests, {} entries)",
+    debug_println!("✅ STATE_WRITER: State dir written at version {} ({} manifests, {} entries)",
         version, manifest_idx, entries.len());
 
     Ok(last_checkpoint)

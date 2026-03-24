@@ -674,6 +674,10 @@ public class TransactionLogIntegrationTest {
     @Order(18)
     @DisplayName("Skip actions survive write → checkpoint → post-checkpoint read pipeline")
     void testSkipActionsThroughPipeline() throws Exception {
+        // Disable auto-checkpoint so skip/add versions remain as post-checkpoint changes
+        Map<String, String> noCpConfig = new HashMap<>(config);
+        noCpConfig.put("checkpoint_interval", "0");
+
         Path skipDir = Files.createTempDirectory("txlog-skip-pipeline");
         Files.createDirectories(skipDir.resolve("_transaction_log"));
         String skipTable = "file://" + skipDir.toAbsolutePath();
@@ -684,7 +688,7 @@ public class TransactionLogIntegrationTest {
                 makeAddAction("file-a.split", 1000, 10),
                 makeAddAction("file-b.split", 2000, 20));
             String addsJson = MAPPER.writeValueAsString(initialAdds);
-            TransactionLogWriter.addFiles(skipTable, config, addsJson);
+            TransactionLogWriter.addFiles(skipTable, noCpConfig, addsJson);
 
             // Create checkpoint
             String metadataJson = MAPPER.writeValueAsString(Map.of(
@@ -695,7 +699,7 @@ public class TransactionLogIntegrationTest {
             String protocolJson = MAPPER.writeValueAsString(Map.of(
                 "minReaderVersion", 4, "minWriterVersion", 4));
 
-            TransactionLogWriter.createCheckpoint(skipTable, config, addsJson, metadataJson, protocolJson);
+            TransactionLogWriter.createCheckpoint(skipTable, noCpConfig, addsJson, metadataJson, protocolJson);
 
             // Version 1: skip action for "bad-file.split"
             String skipJson = MAPPER.writeValueAsString(Map.of(
@@ -703,23 +707,23 @@ public class TransactionLogIntegrationTest {
                 "skipTimestamp", 1700000000000L,
                 "reason", "merge",
                 "skipCount", 3));
-            long skipVersion = TransactionLogWriter.skipFile(skipTable, config, skipJson);
+            long skipVersion = TransactionLogWriter.skipFile(skipTable, noCpConfig, skipJson);
             assertTrue(skipVersion > 0, "Skip version should be > 0 (post-checkpoint)");
 
             // Version 2: add another file
             String addMoreJson = MAPPER.writeValueAsString(List.of(
                 makeAddAction("file-c.split", 3000, 30)));
-            TransactionLogWriter.addFiles(skipTable, config, addMoreJson);
+            TransactionLogWriter.addFiles(skipTable, noCpConfig, addMoreJson);
 
             // Read back via getSnapshotInfo + readPostCheckpointChanges
-            TxLogSnapshotInfo info = TransactionLogReader.getSnapshotInfo(skipTable, config);
+            TxLogSnapshotInfo info = TransactionLogReader.getSnapshotInfo(skipTable, noCpConfig);
 
             assertFalse(info.getPostCheckpointPaths().isEmpty(),
                 "Should have post-checkpoint version paths");
 
             String versionPathsJson = MAPPER.writeValueAsString(info.getPostCheckpointPaths());
             TxLogChanges changes = TransactionLogReader.readPostCheckpointChanges(
-                skipTable, config, versionPathsJson, null);
+                skipTable, noCpConfig, versionPathsJson, null);
 
             assertNotNull(changes);
             assertEquals(1, changes.getAddedFiles().size(),
@@ -1168,6 +1172,10 @@ public class TransactionLogIntegrationTest {
     @Order(28)
     void testSnapshotInfoWithoutCheckpoint() throws Exception {
         // GAP-9: getSnapshotInfo should work on tables without _last_checkpoint
+        // Disable auto-checkpoint so we can test the no-checkpoint fallback
+        Map<String, String> noCpConfig = new HashMap<>(config);
+        noCpConfig.put("checkpoint_interval", "0");
+
         Path noCheckpointDir = Files.createTempDirectory("txlog-nocheckpoint");
         Files.createDirectories(noCheckpointDir.resolve("_transaction_log"));
         String noCheckpointTable = "file://" + noCheckpointDir.toAbsolutePath();
@@ -1181,17 +1189,17 @@ public class TransactionLogIntegrationTest {
                 "schemaString", "{\"fields\":[{\"name\":\"title\",\"type\":\"text\"}]}",
                 "partitionColumns", List.of(),
                 "configuration", Map.of()));
-            TransactionLogWriter.initializeTable(noCheckpointTable, config, protocolJson, metadataJson);
+            TransactionLogWriter.initializeTable(noCheckpointTable, noCpConfig, protocolJson, metadataJson);
 
-            // Add some files without creating a checkpoint
+            // Add some files without creating a checkpoint (auto-checkpoint disabled)
             for (int i = 0; i < 3; i++) {
                 String addsJson = MAPPER.writeValueAsString(List.of(
                     makeAddAction("no-cp-split-" + i + ".split", 1000 + i, 100 + i)));
-                TransactionLogWriter.addFiles(noCheckpointTable, config, addsJson);
+                TransactionLogWriter.addFiles(noCheckpointTable, noCpConfig, addsJson);
             }
 
             // getSnapshotInfo should NOT throw — it should fall back to version scanning
-            TxLogSnapshotInfo snapshot = TransactionLogReader.getSnapshotInfo(noCheckpointTable, config);
+            TxLogSnapshotInfo snapshot = TransactionLogReader.getSnapshotInfo(noCheckpointTable, noCpConfig);
             assertNotNull(snapshot);
 
             // checkpointVersion should be -1 (no checkpoint)
@@ -1218,7 +1226,7 @@ public class TransactionLogIntegrationTest {
 
             // Reading post-checkpoint changes should return all files
             TxLogChanges changes = TransactionLogReader.readPostCheckpointChanges(
-                noCheckpointTable, config,
+                noCheckpointTable, noCpConfig,
                 MAPPER.writeValueAsString(snapshot.getPostCheckpointPaths()),
                 "{}");
             assertTrue(changes.getAddedFiles().size() >= 3,
@@ -1232,6 +1240,10 @@ public class TransactionLogIntegrationTest {
     @Order(29)
     void testSnapshotInfoWithAddAndRemove() throws Exception {
         // GAP-9 test case 3: removes should be reflected in version scan
+        // Disable auto-checkpoint so removes appear in post-checkpoint changes
+        Map<String, String> noCpConfig = new HashMap<>(config);
+        noCpConfig.put("checkpoint_interval", "0");
+
         Path arDir = Files.createTempDirectory("txlog-addremove");
         Files.createDirectories(arDir.resolve("_transaction_log"));
         String arTable = "file://" + arDir.toAbsolutePath();
@@ -1242,21 +1254,21 @@ public class TransactionLogIntegrationTest {
             String metadataJson = MAPPER.writeValueAsString(Map.of(
                 "id", "addremove-test", "schemaString", "{}", "partitionColumns", List.of(),
                 "configuration", Map.of()));
-            TransactionLogWriter.initializeTable(arTable, config, protocolJson, metadataJson);
+            TransactionLogWriter.initializeTable(arTable, noCpConfig, protocolJson, metadataJson);
 
             // Add 2 files
             String adds = MAPPER.writeValueAsString(List.of(
                 makeAddAction("keep.split", 1000, 100),
                 makeAddAction("remove-me.split", 2000, 200)));
-            TransactionLogWriter.addFiles(arTable, config, adds);
+            TransactionLogWriter.addFiles(arTable, noCpConfig, adds);
 
             // Remove one
-            TransactionLogWriter.removeFile(arTable, config, "remove-me.split");
+            TransactionLogWriter.removeFile(arTable, noCpConfig, "remove-me.split");
 
             // Snapshot should work and show only "keep.split" via changes
-            TxLogSnapshotInfo snapshot = TransactionLogReader.getSnapshotInfo(arTable, config);
+            TxLogSnapshotInfo snapshot = TransactionLogReader.getSnapshotInfo(arTable, noCpConfig);
             TxLogChanges changes = TransactionLogReader.readPostCheckpointChanges(
-                arTable, config,
+                arTable, noCpConfig,
                 MAPPER.writeValueAsString(snapshot.getPostCheckpointPaths()),
                 "{}");
 

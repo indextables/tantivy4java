@@ -556,40 +556,37 @@ pub async fn initialize_table(
 // Auto-checkpoint support (GAP-10)
 // ============================================================================
 
-/// Extract checkpoint interval from config. Returns None if disabled (0) or not set.
-fn extract_checkpoint_interval(config_map: &HashMap<String, String>) -> Option<i64> {
+/// Check if auto-checkpoint is enabled. Disabled when checkpoint_interval=0.
+fn is_auto_checkpoint_enabled(config_map: &HashMap<String, String>) -> bool {
     let val_str = config_map.get("checkpoint_interval")
         .or_else(|| config_map.get("checkpoint.interval"));
     match val_str {
         Some(s) => {
-            let interval: i64 = s.parse().unwrap_or(10);
-            if interval <= 0 { None } else { Some(interval) }
+            let interval: i64 = s.parse().unwrap_or(1);
+            interval > 0
         }
-        None => Some(10), // default: checkpoint every 10 versions
+        None => true, // enabled by default
     }
 }
 
-/// Maybe create a checkpoint after a successful write, if the version is a multiple
-/// of the configured checkpoint_interval. Failures are logged but do not propagate.
+/// Create a full checkpoint (state directory + _last_checkpoint) after every write.
+///
+/// Matches Scala behavior: every successful write creates a state-v<N>/ directory
+/// and updates _last_checkpoint. Set checkpoint_interval=0 to disable entirely.
+/// Failures are logged but never fail the write operation.
 pub async fn maybe_auto_checkpoint(
     table_path: &str,
     config: &DeltaStorageConfig,
     config_map: &HashMap<String, String>,
     written_version: i64,
 ) {
-    let interval = match extract_checkpoint_interval(config_map) {
-        Some(i) => i,
-        None => return, // disabled
-    };
-
-    if written_version <= 0 || written_version % interval != 0 {
+    if written_version < 0 || !is_auto_checkpoint_enabled(config_map) {
         return;
     }
 
-    debug_println!("📊 DISTRIBUTED: auto-checkpoint triggered at version {} (interval={})",
-        written_version, interval);
+    debug_println!("📊 DISTRIBUTED: auto-checkpoint at version {}", written_version);
 
-    // Get current table state by reading all version files
+    // Replay all versions to compute current state
     let storage = match TxLogStorage::new(table_path, config) {
         Ok(s) => s,
         Err(e) => {
@@ -598,7 +595,6 @@ pub async fn maybe_auto_checkpoint(
         }
     };
 
-    // Replay all versions to compute current state
     let all_versions = match storage.list_versions().await {
         Ok(v) => v,
         Err(e) => {
@@ -615,7 +611,7 @@ pub async fn maybe_auto_checkpoint(
         }
     }
 
-    // Replay to get current file entries (no prior checkpoint — start empty)
+    // Replay to get current file entries
     let replay_result = log_replay::replay(vec![], versioned_actions.clone());
 
     // Extract protocol/metadata
@@ -631,15 +627,14 @@ pub async fn maybe_auto_checkpoint(
     let protocol = protocol.unwrap_or_else(ProtocolAction::v4);
     let metadata = metadata.unwrap_or_else(MetadataAction::empty);
 
-    // Write checkpoint
+    // Full checkpoint: state dir + _last_checkpoint (every write)
     match write_checkpoint(table_path, config, replay_result.files, metadata, protocol).await {
         Ok(cp_info) => {
-            debug_println!("✅ DISTRIBUTED: auto-checkpoint created at v{}, {:?} files",
+            debug_println!("✅ DISTRIBUTED: checkpoint at v{}, {:?} files",
                 cp_info.version, cp_info.num_files);
         }
         Err(e) => {
-            // Log but do NOT fail — the write already succeeded
-            debug_println!("⚠️ DISTRIBUTED: auto-checkpoint failed (non-fatal): {}", e);
+            debug_println!("⚠️ DISTRIBUTED: checkpoint failed (non-fatal): {}", e);
         }
     }
 }
