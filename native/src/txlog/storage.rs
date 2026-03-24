@@ -129,9 +129,10 @@ impl TxLogStorage {
         format!("{:020}.json", version)
     }
 
-    /// State directory name: "state-v42/"
+    /// State directory name: "state-v00000000000000000042"
+    /// Uses 20-digit zero-padded format matching Scala's StateManifestIO.formatStateDir().
     pub fn state_dir_name(version: i64) -> String {
-        format!("state-v{}", version)
+        format!("state-v{:020}", version)
     }
 
     /// Get table path.
@@ -173,6 +174,7 @@ mod tests {
 
     #[test]
     fn test_state_dir_name() {
-        assert_eq!(TxLogStorage::state_dir_name(42), "state-v42");
+        assert_eq!(TxLogStorage::state_dir_name(42), "state-v00000000000000000042");
+        assert_eq!(TxLogStorage::state_dir_name(0), "state-v00000000000000000000");
     }
 }
