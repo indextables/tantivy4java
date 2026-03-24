@@ -145,13 +145,20 @@ async fn snapshot_from_checkpoint(
         }
     }
 
-    // Extract protocol/metadata from post-checkpoint versions.
+    // Source protocol/metadata from the checkpoint's cached JSON first,
+    // then override with any updates from post-checkpoint version files.
     // Do NOT read version 0 — it may have been deleted by TRUNCATE TIME TRAVEL.
-    // When a checkpoint exists, any protocol/metadata updates after the checkpoint
-    // are in the post-checkpoint version files. If none exist, return None and let
-    // the caller use defaults or read from the checkpoint's cached metadata.
-    let (protocol_opt, metadata) = log_replay::extract_metadata(&[], &all_version_actions);
-    let metadata = metadata.unwrap_or_else(MetadataAction::empty);
+    let cp_protocol: Option<ProtocolAction> = state_manifest.protocol_json.as_ref()
+        .and_then(|s| serde_json::from_str(s).ok());
+    let cp_metadata: Option<MetadataAction> = state_manifest.metadata.as_ref()
+        .and_then(|s| serde_json::from_str(s).ok());
+
+    // Check post-checkpoint versions for overrides
+    let (post_protocol, post_metadata) = log_replay::extract_metadata(&[], &all_version_actions);
+
+    // Post-checkpoint overrides checkpoint
+    let protocol_opt = post_protocol.or(cp_protocol);
+    let metadata = post_metadata.or(cp_metadata).unwrap_or_else(MetadataAction::empty);
 
     let manifest_paths: Vec<ManifestPathInfo> = state_manifest.manifests.iter()
         .map(|m| ManifestPathInfo {

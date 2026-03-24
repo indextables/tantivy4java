@@ -305,6 +305,15 @@ pub struct StateManifest {
     pub created_time: i64,
     pub total_file_count: i64,
     pub format: String,
+    /// Cached protocol action JSON (so checkpoint is self-contained after TRUNCATE)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub protocol_json: Option<String>,
+    /// Cached metadata action JSON — matches Scala StateManifest.metadata field
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<String>,
+    /// Schema registry for doc mapping deduplication — matches Scala StateManifest.schemaRegistry
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub schema_registry: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

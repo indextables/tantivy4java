@@ -21,7 +21,7 @@ pub async fn write_state_checkpoint(
     storage: &TxLogStorage,
     version: i64,
     entries: &[FileEntry],
-    _protocol: &ProtocolAction,
+    protocol: &ProtocolAction,
     metadata: &MetadataAction,
 ) -> Result<LastCheckpointInfo> {
     let state_dir = TxLogStorage::state_dir_name(version);
@@ -59,6 +59,17 @@ pub async fn write_state_checkpoint(
     let global_bounds = compute_partition_bounds(entries, &metadata.partition_columns);
 
     let now = current_timestamp_ms();
+    // Cache protocol and metadata JSON in the manifest so the checkpoint is
+    // self-contained after TRUNCATE TIME TRAVEL deletes version files.
+    let protocol_json = serde_json::to_string(protocol).ok();
+    let metadata_json_cached = serde_json::to_string(metadata).ok();
+
+    // Build schema registry from entries' docMappingRef values
+    let schema_registry: std::collections::HashMap<String, String> = metadata.configuration.iter()
+        .filter(|(k, _)| k.starts_with("docMappingSchema."))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+
     let state_manifest = StateManifest {
         version,
         manifests: manifest_infos,
@@ -66,6 +77,9 @@ pub async fn write_state_checkpoint(
         created_time: now,
         total_file_count: entries.len() as i64,
         format: "avro-state".to_string(),
+        protocol_json,
+        metadata: metadata_json_cached,
+        schema_registry,
     };
 
     // Write _manifest
