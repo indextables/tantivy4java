@@ -232,6 +232,87 @@ public class TransactionLogReader {
         return content;
     }
 
+    // ========================================================================
+    // Purge Primitives
+    // ========================================================================
+
+    /**
+     * List versions within the retention window (non-expired).
+     *
+     * @param tablePath    table location
+     * @param config       credential and storage configuration
+     * @param retentionMs  retention duration in milliseconds (0 = only keep latest checkpoint)
+     * @return sorted array of retained version numbers
+     */
+    public static long[] listRetainedVersions(String tablePath, Map<String, String> config,
+                                               long retentionMs) {
+        if (tablePath == null || tablePath.isEmpty()) {
+            throw new IllegalArgumentException("tablePath must not be null or empty");
+        }
+        String json = nativeListRetainedVersions(tablePath,
+                config != null ? config : Collections.emptyMap(), retentionMs);
+        if (json == null) {
+            throw new RuntimeException("Native listRetainedVersions returned null");
+        }
+        try {
+            return new com.fasterxml.jackson.databind.ObjectMapper().readValue(json, long[].class);
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to parse listRetainedVersions: " + e.getMessage(), e);
+        }
+    }
+
+    /**
+     * Open a cursor over all file paths referenced by non-expired versions.
+     * Results are streamed as TANT byte buffer batches via {@link #readNextRetainedFilesBatch}.
+     *
+     * @param tablePath    table location
+     * @param config       credential and storage configuration
+     * @param retentionMs  retention duration in milliseconds
+     * @return cursor handle for streaming reads
+     */
+    public static long openRetainedFilesCursor(String tablePath, Map<String, String> config,
+                                                long retentionMs) {
+        if (tablePath == null || tablePath.isEmpty()) {
+            throw new IllegalArgumentException("tablePath must not be null or empty");
+        }
+        long handle = nativeOpenRetainedFilesCursor(tablePath,
+                config != null ? config : Collections.emptyMap(), retentionMs);
+        if (handle < 0) {
+            throw new RuntimeException("Failed to open retained files cursor");
+        }
+        return handle;
+    }
+
+    /**
+     * Read the next batch of retained files from the cursor.
+     * Each entry has fields: path (String), size (long), version (long).
+     *
+     * @param cursorHandle handle from {@link #openRetainedFilesCursor}
+     * @param batchSize    max rows per batch
+     * @return list of maps with path/size/version, or null when exhausted
+     */
+    public static List<Map<String, Object>> readNextRetainedFilesBatch(long cursorHandle,
+                                                                        int batchSize) {
+        byte[] bytes = nativeReadNextRetainedFilesBatch(cursorHandle, batchSize);
+        if (bytes == null) {
+            return null; // Cursor exhausted
+        }
+        java.nio.ByteBuffer buffer = java.nio.ByteBuffer.wrap(bytes);
+        buffer.order(java.nio.ByteOrder.nativeOrder());
+        io.indextables.tantivy4java.batch.BatchDocumentReader reader =
+                new io.indextables.tantivy4java.batch.BatchDocumentReader();
+        return reader.parseToMaps(buffer);
+    }
+
+    /**
+     * Close a retained files cursor and release resources.
+     *
+     * @param cursorHandle handle from {@link #openRetainedFilesCursor}
+     */
+    public static void closeRetainedFilesCursor(long cursorHandle) {
+        nativeCloseRetainedFilesCursor(cursorHandle);
+    }
+
     // --- Native methods ---
 
     private static native byte[] nativeGetSnapshotInfo(String tablePath, Map<String, String> config);
@@ -240,4 +321,8 @@ public class TransactionLogReader {
     private static native long nativeGetCurrentVersion(String tablePath, Map<String, String> config);
     private static native String nativeListVersions(String tablePath, Map<String, String> config);
     private static native String nativeReadVersion(String tablePath, Map<String, String> config, long version);
+    private static native String nativeListRetainedVersions(String tablePath, Map<String, String> config, long retentionMs);
+    private static native long nativeOpenRetainedFilesCursor(String tablePath, Map<String, String> config, long retentionMs);
+    private static native byte[] nativeReadNextRetainedFilesBatch(long cursorHandle, int batchSize);
+    private static native void nativeCloseRetainedFilesCursor(long cursorHandle);
 }

@@ -271,6 +271,58 @@ public class TransactionLogWriter {
                 protocolJson, metadataJson);
     }
 
+    // ========================================================================
+    // Purge Primitives
+    // ========================================================================
+
+    /**
+     * Delete Avro state directories older than the retention period.
+     * Always preserves the latest state directory.
+     *
+     * @param tablePath    table location
+     * @param config       credential and storage configuration
+     * @param retentionMs  retention duration in milliseconds (0 = delete all expired)
+     * @param dryRun       if true, count but don't delete
+     * @return JSON string: { "found": N, "deleted": N }
+     */
+    public static String deleteExpiredStates(String tablePath, Map<String, String> config,
+                                              long retentionMs, boolean dryRun) {
+        if (tablePath == null || tablePath.isEmpty()) {
+            throw new IllegalArgumentException("tablePath must not be null or empty");
+        }
+        String result = nativeDeleteExpiredStates(tablePath,
+                config != null ? config : Collections.emptyMap(),
+                retentionMs, dryRun ? 1 : 0);
+        if (result == null) {
+            throw new RuntimeException("Native deleteExpiredStates returned null");
+        }
+        return result;
+    }
+
+    /**
+     * Delete version files older than the retention period that are
+     * fully captured in a checkpoint (safe to remove).
+     *
+     * @param tablePath    table location
+     * @param config       credential and storage configuration
+     * @param retentionMs  retention duration in milliseconds (0 = delete all pre-checkpoint)
+     * @param dryRun       if true, count but don't delete
+     * @return JSON string: { "found": N, "deleted": N }
+     */
+    public static String deleteExpiredVersions(String tablePath, Map<String, String> config,
+                                                long retentionMs, boolean dryRun) {
+        if (tablePath == null || tablePath.isEmpty()) {
+            throw new IllegalArgumentException("tablePath must not be null or empty");
+        }
+        String result = nativeDeleteExpiredVersions(tablePath,
+                config != null ? config : Collections.emptyMap(),
+                retentionMs, dryRun ? 1 : 0);
+        if (result == null) {
+            throw new RuntimeException("Native deleteExpiredVersions returned null");
+        }
+        return result;
+    }
+
     // --- Native methods ---
 
     private static native byte[] nativeAddFiles(String tablePath, Map<String, String> config, String addsJson);
@@ -280,4 +332,6 @@ public class TransactionLogWriter {
     private static native byte[] nativeWriteVersion(String tablePath, Map<String, String> config, String actionsJson);
     private static native byte[] nativeWriteVersionOnce(String tablePath, Map<String, String> config, String actionsJson);
     private static native void nativeInitializeTable(String tablePath, Map<String, String> config, String protocolJson, String metadataJson);
+    private static native String nativeDeleteExpiredStates(String tablePath, Map<String, String> config, long retentionMs, int dryRun);
+    private static native String nativeDeleteExpiredVersions(String tablePath, Map<String, String> config, long retentionMs, int dryRun);
 }

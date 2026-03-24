@@ -644,6 +644,221 @@ pub extern "system" fn Java_io_indextables_jni_txlog_TransactionLogWriter_native
 }
 
 // ============================================================================
+// PURGE PRIMITIVES
+// ============================================================================
+
+/// List retained (non-expired) version numbers. Returns JSON array.
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_jni_txlog_TransactionLogReader_nativeListRetainedVersions(
+    mut env: JNIEnv,
+    _class: JClass,
+    table_path: JString,
+    config_map: JObject,
+    retention_ms: jlong,
+) -> jbyteArray {
+    let path = match env.get_string(&table_path) {
+        Ok(s) => s.to_string_lossy().to_string(),
+        Err(e) => { to_java_exception(&mut env, &anyhow::anyhow!("{}", e)); return std::ptr::null_mut(); }
+    };
+    let config = build_storage_config(&mut env, &config_map);
+
+    match block_on_operation(async move {
+        super::purge::list_retained_versions(&path, &config, retention_ms).await
+    }) {
+        Ok(versions) => {
+            let json = serde_json::to_string(&versions).unwrap_or_else(|_| "[]".to_string());
+            let jstr = match env.new_string(&json) {
+                Ok(s) => s,
+                Err(e) => { to_java_exception(&mut env, &anyhow::anyhow!("{}", e)); return std::ptr::null_mut(); }
+            };
+            jstr.into_raw() as jbyteArray
+        }
+        Err(e) => {
+            to_java_exception(&mut env, &anyhow::anyhow!("{}", e));
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Open a cursor over retained file paths (Arrow FFI streaming).
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_jni_txlog_TransactionLogReader_nativeOpenRetainedFilesCursor(
+    mut env: JNIEnv,
+    _class: JClass,
+    table_path: JString,
+    config_map: JObject,
+    retention_ms: jlong,
+) -> jlong {
+    let path = match env.get_string(&table_path) {
+        Ok(s) => s.to_string_lossy().to_string(),
+        Err(e) => { to_java_exception(&mut env, &anyhow::anyhow!("{}", e)); return -1; }
+    };
+    let config = build_storage_config(&mut env, &config_map);
+
+    match block_on_operation(async move {
+        super::purge::open_retained_files_cursor(&path, &config, retention_ms).await
+    }) {
+        Ok(cursor_id) => cursor_id,
+        Err(e) => {
+            to_java_exception(&mut env, &anyhow::anyhow!("{}", e));
+            -1
+        }
+    }
+}
+
+/// Read next batch of retained files from cursor. Returns TANT buffer with path/size/version,
+/// or null when exhausted.
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_jni_txlog_TransactionLogReader_nativeReadNextRetainedFilesBatch(
+    mut env: JNIEnv,
+    _class: JClass,
+    cursor_handle: jlong,
+    batch_size: jint,
+) -> jbyteArray {
+    let bs = if batch_size <= 0 { 10_000 } else { batch_size as usize };
+
+    match super::purge::read_next_retained_files_batch(cursor_handle, bs) {
+        Ok(Some(batch)) => {
+            // Serialize as TANT buffer: each row is a document with path, size, version fields
+            let num_rows = batch.num_rows();
+            let path_col = batch.column(0).as_any().downcast_ref::<arrow::array::StringArray>().unwrap();
+            let size_col = batch.column(1).as_any().downcast_ref::<arrow::array::Int64Array>().unwrap();
+            let ver_col = batch.column(2).as_any().downcast_ref::<arrow::array::Int64Array>().unwrap();
+
+            let magic: u32 = 0x54414E54;
+            let mut buf = Vec::with_capacity(4 + num_rows * 100 + 12);
+            buf.extend_from_slice(&magic.to_ne_bytes());
+
+            let mut offsets = Vec::with_capacity(num_rows);
+            for i in 0..num_rows {
+                offsets.push(buf.len() as u32);
+                let fc: u16 = 3;
+                buf.extend_from_slice(&fc.to_ne_bytes());
+                // path
+                let name = b"path";
+                buf.extend_from_slice(&(name.len() as u16).to_ne_bytes());
+                buf.extend_from_slice(name);
+                buf.push(0u8); // TEXT
+                buf.extend_from_slice(&1u16.to_ne_bytes());
+                let pv = path_col.value(i).as_bytes();
+                buf.extend_from_slice(&(pv.len() as u32).to_ne_bytes());
+                buf.extend_from_slice(pv);
+                // size
+                let name = b"size";
+                buf.extend_from_slice(&(name.len() as u16).to_ne_bytes());
+                buf.extend_from_slice(name);
+                buf.push(1u8); // INTEGER
+                buf.extend_from_slice(&1u16.to_ne_bytes());
+                buf.extend_from_slice(&size_col.value(i).to_ne_bytes());
+                // version
+                let name = b"version";
+                buf.extend_from_slice(&(name.len() as u16).to_ne_bytes());
+                buf.extend_from_slice(name);
+                buf.push(1u8); // INTEGER
+                buf.extend_from_slice(&1u16.to_ne_bytes());
+                buf.extend_from_slice(&ver_col.value(i).to_ne_bytes());
+            }
+
+            // Footer
+            let offset_table_start = buf.len() as u32;
+            for off in &offsets {
+                buf.extend_from_slice(&off.to_ne_bytes());
+            }
+            buf.extend_from_slice(&offset_table_start.to_ne_bytes());
+            buf.extend_from_slice(&(offsets.len() as u32).to_ne_bytes());
+            buf.extend_from_slice(&magic.to_ne_bytes());
+
+            buffer_to_jbytearray(&mut env, &buf)
+        }
+        Ok(None) => std::ptr::null_mut(), // Exhausted
+        Err(e) => {
+            to_java_exception(&mut env, &anyhow::anyhow!("{}", e));
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Close a retained files cursor.
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_jni_txlog_TransactionLogReader_nativeCloseRetainedFilesCursor(
+    _env: JNIEnv,
+    _class: JClass,
+    cursor_handle: jlong,
+) {
+    super::purge::close_retained_files_cursor(cursor_handle);
+}
+
+/// Delete expired state directories. Returns JSON: { "found": N, "deleted": N }.
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_jni_txlog_TransactionLogWriter_nativeDeleteExpiredStates(
+    mut env: JNIEnv,
+    _class: JClass,
+    table_path: JString,
+    config_map: JObject,
+    retention_ms: jlong,
+    dry_run: jint,
+) -> jbyteArray {
+    let path = match env.get_string(&table_path) {
+        Ok(s) => s.to_string_lossy().to_string(),
+        Err(e) => { to_java_exception(&mut env, &anyhow::anyhow!("{}", e)); return std::ptr::null_mut(); }
+    };
+    let config = build_storage_config(&mut env, &config_map);
+    let is_dry_run = dry_run != 0;
+
+    match block_on_operation(async move {
+        super::purge::delete_expired_states(&path, &config, retention_ms, is_dry_run).await
+    }) {
+        Ok(result) => {
+            let json = serde_json::to_string(&result).unwrap_or_else(|_| r#"{"found":0,"deleted":0}"#.to_string());
+            let jstr = match env.new_string(&json) {
+                Ok(s) => s,
+                Err(e) => { to_java_exception(&mut env, &anyhow::anyhow!("{}", e)); return std::ptr::null_mut(); }
+            };
+            jstr.into_raw() as jbyteArray
+        }
+        Err(e) => {
+            to_java_exception(&mut env, &anyhow::anyhow!("{}", e));
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Delete expired version files. Returns JSON: { "found": N, "deleted": N }.
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_jni_txlog_TransactionLogWriter_nativeDeleteExpiredVersions(
+    mut env: JNIEnv,
+    _class: JClass,
+    table_path: JString,
+    config_map: JObject,
+    retention_ms: jlong,
+    dry_run: jint,
+) -> jbyteArray {
+    let path = match env.get_string(&table_path) {
+        Ok(s) => s.to_string_lossy().to_string(),
+        Err(e) => { to_java_exception(&mut env, &anyhow::anyhow!("{}", e)); return std::ptr::null_mut(); }
+    };
+    let config = build_storage_config(&mut env, &config_map);
+    let is_dry_run = dry_run != 0;
+
+    match block_on_operation(async move {
+        super::purge::delete_expired_versions(&path, &config, retention_ms, is_dry_run).await
+    }) {
+        Ok(result) => {
+            let json = serde_json::to_string(&result).unwrap_or_else(|_| r#"{"found":0,"deleted":0}"#.to_string());
+            let jstr = match env.new_string(&json) {
+                Ok(s) => s,
+                Err(e) => { to_java_exception(&mut env, &anyhow::anyhow!("{}", e)); return std::ptr::null_mut(); }
+            };
+            jstr.into_raw() as jbyteArray
+        }
+        Err(e) => {
+            to_java_exception(&mut env, &anyhow::anyhow!("{}", e));
+            std::ptr::null_mut()
+        }
+    }
+}
+
+// ============================================================================
 // STATEFUL READ OPERATIONS (with cache)
 // ============================================================================
 

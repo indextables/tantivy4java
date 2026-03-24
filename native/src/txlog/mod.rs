@@ -18,6 +18,7 @@ pub mod jni;
 pub mod log_replay;
 pub mod metrics;
 pub mod partition_pruning;
+pub mod purge;
 pub mod schema_dedup;
 pub mod serialization;
 pub mod storage;
