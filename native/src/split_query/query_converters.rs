@@ -79,11 +79,20 @@ pub fn convert_term_query_to_query_ast(env: &mut JNIEnv, obj: &JObject, searcher
         value
     );
 
-    // IP CIDR/wildcard expansion: look up the field type in the schema associated with
-    // this searcher. Expanding unconditionally would rewrite any field whose value
-    // happens to contain '/' or '*' (e.g., url:http://example.com/path).
+    // IP CIDR/wildcard expansion: determine if this is an IP field via two sources:
+    //   1. Explicit fieldTypeValue from the Java constructor (FieldType.IP_ADDR.getValue() == 10).
+    //      This is the preferred path when the caller (e.g. Spark FiltersToQueryConverter) already
+    //      knows the field type from its own schema — no schema registry lookup needed.
+    //   2. Schema-based detection via the searcher's cached schema (fallback for callers that
+    //      use the two-arg SplitTermQuery constructor without an explicit type hint).
     // Zero allocation for regular fields (no '/' or '*' in value).
-    let is_ip_field = is_ip_field_by_schema(&field, searcher_ptr);
+    const FIELD_TYPE_IP_ADDR: i32 = 10; // FieldType.IP_ADDR.getValue() in tantivy4java
+    let field_type_value = env
+        .get_field(obj, "fieldTypeValue", "I")
+        .and_then(|v| v.i())
+        .unwrap_or(0);
+    let is_ip_field = field_type_value == FIELD_TYPE_IP_ADDR
+        || is_ip_field_by_schema(&field, searcher_ptr);
 
     if is_ip_field {
         if let Some((lower, upper)) = crate::ip_expansion::try_expand_ip_range(&value) {
