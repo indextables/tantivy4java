@@ -145,12 +145,12 @@ async fn snapshot_from_checkpoint(
         }
     }
 
-    // Extract protocol/metadata from post-checkpoint versions, fall back to v0
-    let v0_actions = match version_file::read_version(storage, 0).await {
-        Ok(actions) => actions,
-        Err(_) => vec![],
-    };
-    let (protocol_opt, metadata) = log_replay::extract_metadata(&v0_actions, &all_version_actions);
+    // Extract protocol/metadata from post-checkpoint versions.
+    // Do NOT read version 0 — it may have been deleted by TRUNCATE TIME TRAVEL.
+    // When a checkpoint exists, any protocol/metadata updates after the checkpoint
+    // are in the post-checkpoint version files. If none exist, return None and let
+    // the caller use defaults or read from the checkpoint's cached metadata.
+    let (protocol_opt, metadata) = log_replay::extract_metadata(&[], &all_version_actions);
     let metadata = metadata.unwrap_or_else(MetadataAction::empty);
 
     let manifest_paths: Vec<ManifestPathInfo> = state_manifest.manifests.iter()
