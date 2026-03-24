@@ -82,7 +82,7 @@ struct TimedLruCache<K: Hash + Eq, V> {
 impl<K: Hash + Eq, V: Clone> TimedLruCache<K, V> {
     fn new(capacity: usize, ttl: Duration) -> Self {
         Self {
-            inner: LruCache::new(NonZeroUsize::new(capacity.max(1)).unwrap()),
+            inner: LruCache::new(NonZeroUsize::new(capacity.max(1)).expect("capacity.max(1) is always >= 1")),
             ttl,
             hits: 0,
             misses: 0,
@@ -313,7 +313,7 @@ static GLOBAL_MANIFEST_CACHE: OnceLock<RwLock<LruCache<String, Arc<Vec<FileEntry
 
 fn global_manifest_cache() -> &'static RwLock<LruCache<String, Arc<Vec<FileEntry>>>> {
     GLOBAL_MANIFEST_CACHE.get_or_init(|| {
-        RwLock::new(LruCache::new(NonZeroUsize::new(500).unwrap()))
+        RwLock::new(LruCache::new(NonZeroUsize::new(500).expect("500 is non-zero")))
     })
 }
 
