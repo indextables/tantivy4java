@@ -302,7 +302,21 @@ pub async fn read_post_checkpoint_changes(
             max_version = version;
         }
 
-        let data = storage.get(path).await?;
+        let data = match storage.get(path).await {
+            Ok(d) => d,
+            Err(e) => {
+                // Tolerate missing version files — they may have been deleted by
+                // TRUNCATE TIME TRAVEL or PURGE between getSnapshotInfo and this call.
+                let err_str = format!("{}", e);
+                if err_str.contains("not found") || err_str.contains("NotFound")
+                    || err_str.contains("No such file") || err_str.contains("404")
+                {
+                    debug_println!("⚠️ DISTRIBUTED: Version file {} not found, skipping (may have been deleted by TRUNCATE/PURGE)", path);
+                    continue;
+                }
+                return Err(e); // Real errors still propagate
+            }
+        };
         let actions = version_file::parse_version_file(&data)?;
 
         for action in actions {
