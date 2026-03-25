@@ -15,6 +15,7 @@ use crate::delta_reader::engine::DeltaStorageConfig;
 use crate::debug_println;
 
 use super::actions::*;
+use super::cache;
 use super::error::{TxLogError, Result};
 use super::log_replay;
 use super::storage::TxLogStorage;
@@ -289,16 +290,22 @@ pub async fn delete_expired_states(
             continue; // Always preserve latest
         }
 
-        // Check age using filesystem last_modified time (reflects mtime changes by tests/TRUNCATE)
-        let manifest_path = format!("{}/_manifest", state_dir);
+        // Check age using filesystem last_modified of files within the state dir.
+        // We use list() which returns ObjectMeta with last_modified for each file,
+        // then take the newest file's mtime as the state dir's effective age.
+        // This works on local filesystem where tests age directories via setTimes().
+        let dir_file_metas = storage.list_with_meta(state_dir).await.unwrap_or_default();
         let is_expired = if retention_ms <= 0 {
             true // Immediate cleanup of all non-latest
         } else {
-            match storage.last_modified_ms(&manifest_path).await {
-                Ok(last_modified) if last_modified > 0 => {
-                    (now_ms - last_modified) >= retention_ms
-                }
-                _ => false, // Can't determine age → keep (safe default)
+            let newest_modified = dir_file_metas.iter()
+                .map(|(_, modified_ms)| *modified_ms)
+                .max()
+                .unwrap_or(0);
+            if newest_modified > 0 {
+                (now_ms - newest_modified) >= retention_ms
+            } else {
+                false // Can't determine age → keep
             }
         };
 
@@ -308,12 +315,17 @@ pub async fn delete_expired_states(
 
         found += 1;
         if !dry_run {
-            let dir_entries = storage.list(state_dir).await.unwrap_or_default();
-            for entry in &dir_entries {
+            for (entry, _) in &dir_file_metas {
                 let _ = storage.delete(entry).await;
             }
             deleted += 1;
         }
+    }
+
+    // Invalidate cache after deletion so stale snapshots referencing
+    // deleted state dirs are not served
+    if deleted > 0 {
+        cache::invalidate_table_cache(table_path);
     }
 
     Ok(DeleteResult { found, deleted })
@@ -377,6 +389,12 @@ pub async fn delete_expired_versions(
                 Err(_) => {} // Best effort
             }
         }
+    }
+
+    // Invalidate cache after deletion so stale snapshots referencing
+    // deleted version files are not served
+    if deleted > 0 {
+        cache::invalidate_table_cache(table_path);
     }
 
     Ok(DeleteResult { found, deleted })

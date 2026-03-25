@@ -114,6 +114,28 @@ impl TxLogStorage {
         Ok(meta.last_modified.timestamp_millis())
     }
 
+    /// List entries under a prefix with metadata (path, last_modified_ms).
+    pub async fn list_with_meta(&self, prefix: &str) -> Result<Vec<(String, i64)>> {
+        let full_prefix = format!("{}/{}", self.txlog_prefix, prefix);
+        let path = ObjectPath::from(full_prefix.as_str());
+
+        let mut entries = Vec::new();
+        let result = self.store.list(Some(&path));
+        use futures::TryStreamExt;
+        let items: Vec<_> = result.try_collect().await
+            .map_err(|e| TxLogError::Storage(anyhow::anyhow!("LIST {}: {}", path, e)))?;
+        let normalized_prefix = self.txlog_prefix.trim_start_matches('/');
+        for meta in items {
+            let full = meta.location.to_string();
+            let relative = full.strip_prefix(&self.txlog_prefix)
+                .or_else(|| full.strip_prefix(normalized_prefix))
+                .map(|r| r.trim_start_matches('/').to_string())
+                .unwrap_or(full);
+            entries.push((relative, meta.last_modified.timestamp_millis()));
+        }
+        Ok(entries)
+    }
+
     /// Check existence of a path relative to txlog root.
     pub async fn exists(&self, relative_path: &str) -> Result<bool> {
         let path = self.full_path(relative_path);
