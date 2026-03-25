@@ -26,7 +26,13 @@ use super::version_file;
 // ============================================================================
 
 /// List versions within the retention window (non-expired).
-/// The latest checkpoint version and all post-checkpoint versions are always retained.
+///
+/// Safety invariants — always holds:
+/// - The latest version is always retained
+/// - All versions at or after the checkpoint are always retained
+/// - When no checkpoint exists, all versions are retained (they are the
+///   sole source of truth)
+/// - When a version's age cannot be determined, it is retained
 pub async fn list_retained_versions(
     table_path: &str,
     config: &DeltaStorageConfig,
@@ -39,38 +45,38 @@ pub async fn list_retained_versions(
         return Ok(vec![]);
     }
 
-    // Find checkpoint version
+    let max_version = all_versions.iter().copied().max().unwrap(); // safe: non-empty
+
+    // Find checkpoint version.  If there is no checkpoint, every version is
+    // needed for replay — retain them all.
     let checkpoint_version = match storage.get("_last_checkpoint").await {
         Ok(data) => {
             let cp: LastCheckpointInfo = serde_json::from_slice(&data)?;
             cp.version
         }
-        Err(_) => -1, // No checkpoint
+        Err(_) => return Ok(all_versions), // No checkpoint → keep everything
     };
 
+    // retain_floor: everything at or above this version is unconditionally kept.
+    let retain_floor = std::cmp::min(checkpoint_version, max_version);
+
     if retention_ms <= 0 {
-        // Keep only post-checkpoint versions + checkpoint version itself
         return Ok(all_versions.into_iter()
-            .filter(|v| *v >= checkpoint_version)
+            .filter(|v| *v >= retain_floor)
             .collect());
     }
 
     let now_ms = current_timestamp_ms();
 
-    // For retention > 0, keep versions newer than (now - retention) or post-checkpoint
     let mut retained = Vec::new();
     for v in &all_versions {
-        if *v >= checkpoint_version {
-            // Post-checkpoint: always retain
+        if *v >= retain_floor {
             retained.push(*v);
         } else {
             // Pre-checkpoint: check age by reading version file modification time
-            // Approximate: use version number ordering + checkpoint created_time
-            // Versions close to checkpoint are likely recent enough
             let path = TxLogStorage::version_path(*v);
             if let Ok(data) = storage.get(&path).await {
                 if let Ok(actions) = version_file::parse_version_file(&data) {
-                    // Use the first add's modification_time as the version timestamp
                     let version_ts = actions.iter().find_map(|a| match a {
                         Action::Add(add) => Some(add.modification_time),
                         _ => None,
@@ -78,7 +84,13 @@ pub async fn list_retained_versions(
                     if now_ms - version_ts < retention_ms {
                         retained.push(*v);
                     }
+                } else {
+                    // Can't parse → keep (safe default)
+                    retained.push(*v);
                 }
+            } else {
+                // Can't read → keep (safe default)
+                retained.push(*v);
             }
         }
     }
@@ -248,7 +260,13 @@ pub struct DeleteResult {
 }
 
 /// Delete Avro state directories older than the retention period.
-/// Always preserves the latest state directory.
+///
+/// Safety invariants — never violated regardless of inputs:
+/// - The state directory referenced by `_last_checkpoint` is never deleted
+/// - The lexicographically latest state directory is never deleted (fallback
+///   protection when `_last_checkpoint` is missing or unreadable)
+/// - If we cannot positively identify which state dirs are safe to delete,
+///   we delete nothing
 pub async fn delete_expired_states(
     table_path: &str,
     config: &DeltaStorageConfig,
@@ -258,18 +276,9 @@ pub async fn delete_expired_states(
     let storage = TxLogStorage::new(table_path, config)?;
     let now_ms = current_timestamp_ms();
 
-    // Find latest checkpoint state dir
-    let latest_state_dir = match storage.get("_last_checkpoint").await {
-        Ok(data) => {
-            let cp: LastCheckpointInfo = serde_json::from_slice(&data)?;
-            cp.state_dir.unwrap_or_else(|| TxLogStorage::state_dir_name(cp.version))
-        }
-        Err(_) => String::new(),
-    };
-
     // List all state directories
     let all_entries = storage.list("").await?;
-    let state_dirs: Vec<String> = all_entries.iter()
+    let mut state_dirs: Vec<String> = all_entries.iter()
         .filter_map(|entry| {
             let entry = entry.trim_start_matches('/');
             if entry.starts_with("state-v") {
@@ -282,12 +291,42 @@ pub async fn delete_expired_states(
         .into_iter()
         .collect();
 
+    if state_dirs.is_empty() {
+        return Ok(DeleteResult { found: 0, deleted: 0 });
+    }
+
+    // Sort so we can identify the lexicographically latest (highest version)
+    state_dirs.sort();
+    let latest_by_name = state_dirs.last().unwrap().clone();
+
+    // Find checkpoint state dir — if we can't read it, the latest-by-name
+    // guard still protects us, but we also refuse to delete anything when
+    // there's only one state dir (nothing is safe to remove).
+    let checkpoint_state_dir = match storage.get("_last_checkpoint").await {
+        Ok(data) => {
+            match serde_json::from_slice::<LastCheckpointInfo>(&data) {
+                Ok(cp) => Some(
+                    cp.state_dir.unwrap_or_else(|| TxLogStorage::state_dir_name(cp.version))
+                ),
+                Err(_) => None, // Corrupt _last_checkpoint — can't trust it
+            }
+        }
+        Err(_) => None, // No checkpoint file
+    };
+
+    // Build the set of protected state dirs
+    let mut protected = std::collections::HashSet::new();
+    protected.insert(latest_by_name.clone());
+    if let Some(ref cp_dir) = checkpoint_state_dir {
+        protected.insert(cp_dir.clone());
+    }
+
     let mut found = 0i32;
     let mut deleted = 0i32;
 
     for state_dir in &state_dirs {
-        if *state_dir == latest_state_dir {
-            continue; // Always preserve latest
+        if protected.contains(state_dir) {
+            continue;
         }
 
         // Check age using the _manifest file's last_modified timestamp.
@@ -295,7 +334,7 @@ pub async fn delete_expired_states(
         // Fallback: newest file mtime from list_with_meta().
         let manifest_path = format!("{}/_manifest", state_dir);
         let is_expired = if retention_ms <= 0 {
-            true // Immediate cleanup of all non-latest
+            true // Immediate cleanup of all non-protected
         } else {
             // Try _manifest head first
             let mtime = match storage.last_modified_ms(&manifest_path).await {
@@ -342,6 +381,15 @@ pub async fn delete_expired_states(
 
 /// Delete version files older than the retention period that are
 /// fully captured in a checkpoint (safe to remove).
+///
+/// Safety invariants — never violated regardless of inputs:
+/// - The latest version file (highest version number) is never deleted
+/// - All version files at or after the checkpoint version are never deleted
+/// - If no checkpoint exists, nothing is deleted (versions are the only
+///   source of truth)
+/// - If a version's age cannot be determined, it is kept
+/// - Only versions that are strictly BOTH pre-checkpoint AND pre-max-version
+///   AND expired are candidates for deletion
 pub async fn delete_expired_versions(
     table_path: &str,
     config: &DeltaStorageConfig,
@@ -350,30 +398,45 @@ pub async fn delete_expired_versions(
 ) -> Result<DeleteResult> {
     let storage = TxLogStorage::new(table_path, config)?;
 
-    // Find checkpoint version
+    // Without a checkpoint, version files are the sole source of truth.
+    // Deleting any of them risks data loss. Bail out entirely.
     let checkpoint_version = match storage.get("_last_checkpoint").await {
         Ok(data) => {
             let cp: LastCheckpointInfo = serde_json::from_slice(&data)?;
             cp.version
         }
-        Err(_) => return Ok(DeleteResult { found: 0, deleted: 0 }), // No checkpoint, nothing to clean
+        Err(_) => return Ok(DeleteResult { found: 0, deleted: 0 }),
     };
 
-    let now_ms = current_timestamp_ms();
     let all_versions = storage.list_versions().await?;
+    if all_versions.is_empty() {
+        return Ok(DeleteResult { found: 0, deleted: 0 });
+    }
+
+    let now_ms = current_timestamp_ms();
+    let max_version = all_versions.iter().copied().max().unwrap(); // safe: non-empty
+
+    // Compute the minimum version we must keep.  Everything at or above this
+    // is unconditionally retained.  We take the lower of checkpoint_version
+    // and max_version so that even if the checkpoint was written at a version
+    // beyond all existing version files (race with auto-checkpoint), we still
+    // protect everything from the checkpoint onward.
+    let retain_floor = std::cmp::min(checkpoint_version, max_version);
 
     let mut found = 0i32;
     let mut deleted = 0i32;
 
     for version in &all_versions {
-        if *version >= checkpoint_version {
-            continue; // Post-checkpoint, keep
+        // Unconditionally retain: latest version, and anything at/above the
+        // checkpoint (needed for replay on top of the checkpoint snapshot).
+        if *version >= retain_floor {
+            continue;
         }
 
-        // Check age using filesystem last_modified time (reflects mtime changes by tests/TRUNCATE)
+        // Check age using filesystem last_modified time
         let path = TxLogStorage::version_path(*version);
         let is_expired = if retention_ms <= 0 {
-            true // Immediate cleanup of all pre-checkpoint
+            true // Immediate cleanup of all pre-floor versions
         } else {
             match storage.last_modified_ms(&path).await {
                 Ok(last_modified) if last_modified > 0 => {
