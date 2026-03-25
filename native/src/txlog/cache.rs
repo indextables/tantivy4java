@@ -330,6 +330,23 @@ pub fn invalidate_manifest_cache() {
     global_manifest_cache().write().clear();
 }
 
+/// Invalidate manifest cache entries for a specific table path.
+/// Manifest cache keys are formatted as "table_path/state_dir/manifest_path".
+pub fn invalidate_manifest_cache_for_table(table_path: &str) {
+    let normalized = normalize_table_path(table_path);
+    let mut cache = global_manifest_cache().write();
+    let keys_to_remove: Vec<String> = cache.iter()
+        .filter(|(k, _)| {
+            let norm_key = normalize_table_path(k);
+            norm_key.starts_with(&normalized)
+        })
+        .map(|(k, _)| k.clone())
+        .collect();
+    for key in keys_to_remove {
+        cache.pop(&key);
+    }
+}
+
 // ============================================================================
 // Global cache registry (Option B: internal LRU keyed by table_path)
 // ============================================================================

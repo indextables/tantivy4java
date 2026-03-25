@@ -345,6 +345,25 @@ public class TransactionLogReader {
         return result;
     }
 
+    // ========================================================================
+    // Cache Management
+    // ========================================================================
+
+    /**
+     * Explicitly invalidate all cached data for a table path.
+     * Call this after purge/truncate operations to ensure subsequent reads
+     * get fresh data from storage.
+     *
+     * <p>Handles path normalization internally (file:// vs file:///).
+     *
+     * @param tablePath table location
+     */
+    public static void invalidateCache(String tablePath) {
+        if (tablePath != null && !tablePath.isEmpty()) {
+            nativeInvalidateCache(tablePath);
+        }
+    }
+
     // --- Native methods ---
 
     private static native byte[] nativeGetSnapshotInfo(String tablePath, Map<String, String> config);
@@ -358,4 +377,5 @@ public class TransactionLogReader {
     private static native byte[] nativeReadNextRetainedFilesBatch(long cursorHandle, int batchSize);
     private static native void nativeCloseRetainedFilesCursor(long cursorHandle);
     private static native byte[] nativeListSkipActions(String tablePath, Map<String, String> config, long maxAgeMs);
+    private static native void nativeInvalidateCache(String tablePath);
 }

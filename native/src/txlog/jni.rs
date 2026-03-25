@@ -888,6 +888,28 @@ pub extern "system" fn Java_io_indextables_jni_txlog_TransactionLogWriter_native
 }
 
 // ============================================================================
+// CACHE MANAGEMENT
+// ============================================================================
+
+/// Explicitly invalidate all cached data for a table path.
+/// The Scala layer should call this after purge/truncate operations to ensure
+/// subsequent reads get fresh data. Handles path normalization internally.
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_jni_txlog_TransactionLogReader_nativeInvalidateCache(
+    mut env: JNIEnv,
+    _class: JClass,
+    table_path: JString,
+) {
+    let path = match env.get_string(&table_path) {
+        Ok(s) => s.to_string_lossy().to_string(),
+        Err(_) => return,
+    };
+    super::cache::invalidate_table_cache(&path);
+    // Also clear the global manifest cache for this table
+    super::cache::invalidate_manifest_cache_for_table(&path);
+}
+
+// ============================================================================
 // STATEFUL READ OPERATIONS (with cache)
 // ============================================================================
 
