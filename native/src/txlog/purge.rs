@@ -290,22 +290,26 @@ pub async fn delete_expired_states(
             continue; // Always preserve latest
         }
 
-        // Check age using filesystem last_modified of files within the state dir.
-        // We use list() which returns ObjectMeta with last_modified for each file,
-        // then take the newest file's mtime as the state dir's effective age.
-        // This works on local filesystem where tests age directories via setTimes().
-        let dir_file_metas = storage.list_with_meta(state_dir).await.unwrap_or_default();
+        // Check age using the _manifest file's last_modified timestamp.
+        // Primary: head() on _manifest (works on local FS and cloud).
+        // Fallback: newest file mtime from list_with_meta().
+        let manifest_path = format!("{}/_manifest", state_dir);
         let is_expired = if retention_ms <= 0 {
             true // Immediate cleanup of all non-latest
         } else {
-            let newest_modified = dir_file_metas.iter()
-                .map(|(_, modified_ms)| *modified_ms)
-                .max()
-                .unwrap_or(0);
-            if newest_modified > 0 {
-                (now_ms - newest_modified) >= retention_ms
-            } else {
-                false // Can't determine age → keep
+            // Try _manifest head first
+            let mtime = match storage.last_modified_ms(&manifest_path).await {
+                Ok(ms) if ms > 0 => Some(ms),
+                _ => {
+                    // Fallback: check newest file in dir
+                    storage.list_with_meta(state_dir).await.ok()
+                        .and_then(|metas| metas.iter().map(|(_, ms)| *ms).max())
+                        .filter(|ms| *ms > 0)
+                }
+            };
+            match mtime {
+                Some(ms) => (now_ms - ms) >= retention_ms,
+                None => false, // Can't determine age → keep
             }
         };
 
@@ -315,7 +319,8 @@ pub async fn delete_expired_states(
 
         found += 1;
         if !dry_run {
-            for (entry, _) in &dir_file_metas {
+            let dir_entries = storage.list(state_dir).await.unwrap_or_default();
+            for entry in &dir_entries {
                 let _ = storage.delete(entry).await;
             }
             deleted += 1;

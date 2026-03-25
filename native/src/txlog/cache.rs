@@ -365,7 +365,7 @@ pub fn extract_cache_ttl(config: &HashMap<String, String>) -> Option<Duration> {
 /// Get or create a TxLogCache for the given table path and TTL.
 pub fn get_or_create_cache(table_path: &str, ttl: Duration) -> Arc<TxLogCache> {
     let key = RegistryKey {
-        table_path: table_path.to_string(),
+        table_path: normalize_table_path(table_path),
         ttl_ms: ttl.as_millis() as u64,
     };
 
@@ -396,13 +396,27 @@ pub fn get_or_create_cache(table_path: &str, ttl: Duration) -> Arc<TxLogCache> {
     cache
 }
 
+/// Normalize a table path for consistent cache key matching.
+/// Handles file:// vs file:/// and trailing slash differences.
+fn normalize_table_path(path: &str) -> String {
+    let p = path.trim_end_matches('/');
+    // Normalize file:/// to file:// (both are valid for local paths)
+    if p.starts_with("file:///") {
+        format!("file://{}", &p[7..])
+    } else {
+        p.to_string()
+    }
+}
+
 /// Invalidate all cached data for a specific table (called after writes).
 /// Clears everything including metadata and last_checkpoint, since any write
 /// (version file or checkpoint) can change the table state.
+/// Uses normalized path matching to handle file:// vs file:/// differences.
 pub fn invalidate_table_cache(table_path: &str) {
+    let normalized = normalize_table_path(table_path);
     let registry = cache_registry().read();
     for (key, cache) in registry.iter() {
-        if key.table_path == table_path {
+        if normalize_table_path(&key.table_path) == normalized {
             cache.invalidate_all();
         }
     }
