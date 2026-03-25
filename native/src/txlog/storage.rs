@@ -105,6 +105,15 @@ impl TxLogStorage {
         Ok(entries)
     }
 
+    /// Get file metadata (last_modified, size) for a path relative to txlog root.
+    /// Returns last_modified as epoch milliseconds.
+    pub async fn last_modified_ms(&self, relative_path: &str) -> Result<i64> {
+        let path = self.full_path(relative_path);
+        let meta = self.store.head(&path).await
+            .map_err(|e| TxLogError::Storage(anyhow::anyhow!("HEAD {}: {}", path, e)))?;
+        Ok(meta.last_modified.timestamp_millis())
+    }
+
     /// Check existence of a path relative to txlog root.
     pub async fn exists(&self, relative_path: &str) -> Result<bool> {
         let path = self.full_path(relative_path);

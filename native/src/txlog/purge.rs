@@ -289,21 +289,16 @@ pub async fn delete_expired_states(
             continue; // Always preserve latest
         }
 
-        // Check age — only count as "found" if actually expired
+        // Check age using filesystem last_modified time (reflects mtime changes by tests/TRUNCATE)
         let manifest_path = format!("{}/_manifest", state_dir);
         let is_expired = if retention_ms <= 0 {
             true // Immediate cleanup of all non-latest
         } else {
-            match storage.get(&manifest_path).await {
-                Ok(data) => {
-                    match serde_json::from_slice::<StateManifest>(&data) {
-                        Ok(manifest) if manifest.created_time > 0 => {
-                            (now_ms - manifest.created_time) >= retention_ms
-                        }
-                        _ => false, // Can't determine age → keep (safe default)
-                    }
+            match storage.last_modified_ms(&manifest_path).await {
+                Ok(last_modified) if last_modified > 0 => {
+                    (now_ms - last_modified) >= retention_ms
                 }
-                Err(_) => false, // Can't read manifest → keep (safe default)
+                _ => false, // Can't determine age → keep (safe default)
             }
         };
 
@@ -358,29 +353,17 @@ pub async fn delete_expired_versions(
             continue; // Post-checkpoint, keep
         }
 
-        // Check age — only count as "found" if actually expired
+        // Check age using filesystem last_modified time (reflects mtime changes by tests/TRUNCATE)
         let path = TxLogStorage::version_path(*version);
         let is_expired = if retention_ms <= 0 {
             true // Immediate cleanup of all pre-checkpoint
-        } else if let Ok(data) = storage.get(&path).await {
-            if let Ok(actions) = version_file::parse_version_file(&data) {
-                // Find the best timestamp from any action in the version file
-                let version_ts = actions.iter().find_map(|a| match a {
-                    Action::Add(add) if add.modification_time > 0 => Some(add.modification_time),
-                    Action::MetaData(m) => m.created_time.filter(|t| *t > 0),
-                    Action::Remove(r) => r.deletion_timestamp.filter(|t| *t > 0),
-                    Action::MergeSkip(s) if s.skip_timestamp > 0 => Some(s.skip_timestamp),
-                    _ => None,
-                });
-                match version_ts {
-                    Some(ts) => (now_ms - ts) >= retention_ms,
-                    None => false, // No timestamp found → can't determine age → keep
-                }
-            } else {
-                false // Can't parse → keep (safe default)
-            }
         } else {
-            continue; // Can't read, skip
+            match storage.last_modified_ms(&path).await {
+                Ok(last_modified) if last_modified > 0 => {
+                    (now_ms - last_modified) >= retention_ms
+                }
+                _ => false, // Can't determine age → keep (safe default)
+            }
         };
 
         if !is_expired {
