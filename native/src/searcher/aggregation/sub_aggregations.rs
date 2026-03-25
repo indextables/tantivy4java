@@ -211,7 +211,7 @@ pub(crate) fn create_java_aggregation_from_final_result(
                 }
                 BucketResult::Range { buckets } => {
                     debug_println!("RUST DEBUG: Creating RangeResult");
-                    create_range_result_object(env, aggregation_name, buckets)
+                    create_range_result_object(env, aggregation_name, buckets, resolution_map, redirected_names)
                 }
                 BucketResult::Histogram { buckets } => {
                     // Use the hint from the aggregation request JSON if available
@@ -238,10 +238,10 @@ pub(crate) fn create_java_aggregation_from_final_result(
                             is_date_histogram_hint,
                             !is_date_histogram_hint
                         );
-                        create_date_histogram_result_object(env, aggregation_name, buckets)
+                        create_date_histogram_result_object(env, aggregation_name, buckets, resolution_map, redirected_names)
                     } else {
                         debug_println!("RUST DEBUG: Creating HistogramResult (numeric field)");
-                        create_histogram_result_object(env, aggregation_name, buckets)
+                        create_histogram_result_object(env, aggregation_name, buckets, resolution_map, redirected_names)
                     }
                 }
             }

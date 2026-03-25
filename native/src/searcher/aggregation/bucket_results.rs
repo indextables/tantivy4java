@@ -164,6 +164,8 @@ pub(crate) fn create_histogram_result_object(
     env: &mut JNIEnv,
     aggregation_name: &str,
     buckets: &BucketEntries<BucketEntry>,
+    resolution_map: Option<&std::collections::HashMap<u64, String>>,
+    redirected_names: Option<&std::collections::HashSet<String>>,
 ) -> anyhow::Result<jobject> {
     debug_println!(
         "RUST DEBUG: Creating HistogramResult for '{}'",
@@ -212,7 +214,7 @@ pub(crate) fn create_histogram_result_object(
                 "RUST DEBUG: Processing {} sub-aggregations in histogram bucket",
                 bucket.sub_aggregation.0.len()
             );
-            create_sub_aggregations_map(env, &bucket.sub_aggregation, None, None)?
+            create_sub_aggregations_map(env, &bucket.sub_aggregation, resolution_map, redirected_names)?
         } else {
             // Create empty HashMap
             let hashmap_class = env.find_class("java/util/HashMap")?;
@@ -259,6 +261,8 @@ pub(crate) fn create_date_histogram_result_object(
     env: &mut JNIEnv,
     aggregation_name: &str,
     buckets: &BucketEntries<BucketEntry>,
+    resolution_map: Option<&std::collections::HashMap<u64, String>>,
+    redirected_names: Option<&std::collections::HashSet<String>>,
 ) -> anyhow::Result<jobject> {
     debug_println!(
         "RUST DEBUG: Creating DateHistogramResult for '{}'",
@@ -324,7 +328,7 @@ pub(crate) fn create_date_histogram_result_object(
                 "RUST DEBUG: Processing {} sub-aggregations in date histogram bucket",
                 bucket.sub_aggregation.0.len()
             );
-            create_sub_aggregations_map(env, &bucket.sub_aggregation, None, None)?
+            create_sub_aggregations_map(env, &bucket.sub_aggregation, resolution_map, redirected_names)?
         } else {
             // Create empty HashMap
             let hashmap_class = env.find_class("java/util/HashMap")?;
@@ -375,6 +379,8 @@ pub(crate) fn create_range_result_object(
     env: &mut JNIEnv,
     aggregation_name: &str,
     buckets: &BucketEntries<RangeBucketEntry>,
+    resolution_map: Option<&std::collections::HashMap<u64, String>>,
+    redirected_names: Option<&std::collections::HashSet<String>>,
 ) -> anyhow::Result<jobject> {
     debug_println!(
         "RUST DEBUG: Creating RangeResult for '{}'",
@@ -439,7 +445,7 @@ pub(crate) fn create_range_result_object(
                 "RUST DEBUG: Processing {} sub-aggregations in range bucket",
                 bucket.sub_aggregation.0.len()
             );
-            create_sub_aggregations_map(env, &bucket.sub_aggregation, None, None)?
+            create_sub_aggregations_map(env, &bucket.sub_aggregation, resolution_map, redirected_names)?
         } else {
             // Create empty HashMap
             let hashmap_class = env.find_class("java/util/HashMap")?;
