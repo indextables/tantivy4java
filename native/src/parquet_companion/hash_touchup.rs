@@ -80,21 +80,22 @@ pub async fn build_hash_resolution_map(
         .into_final_result(aggregations, limits)
         .map_err(|e| anyhow::anyhow!("Failed to finalize agg results for touchup: {}", e))?;
 
-    // Step 2: Collect unique hash values per hash field name
+    // Step 2: Collect unique hash values per hash field name.
     // Multiple touchup infos may share the same hash field, so we deduplicate.
-    // Use recursive lookup because nested terms aggs (e.g. Terms inside a
+    // Use recursive collection because nested terms aggs (e.g. Terms inside a
     // DateHistogram) are not in the top-level results map — they're buried
-    // inside bucket sub-aggregations.
+    // inside bucket sub-aggregations. Each parent bucket has its own independent
+    // copy of the nested Terms with potentially different hash keys, so we must
+    // traverse ALL buckets to collect the full set.
     let mut hashes_per_field: HashMap<String, HashSet<u64>> = HashMap::new();
     for touchup in touchup_infos {
-        if let Some(agg_result) = find_agg_result_recursive(&final_results, &touchup.agg_name) {
-            let hashes = collect_u64_bucket_keys(agg_result);
-            if !hashes.is_empty() {
-                hashes_per_field
-                    .entry(touchup.hash_field_name.clone())
-                    .or_default()
-                    .extend(hashes);
-            }
+        let mut hashes = HashSet::new();
+        collect_all_hashes_recursive(&final_results, &touchup.agg_name, &mut hashes);
+        if !hashes.is_empty() {
+            hashes_per_field
+                .entry(touchup.hash_field_name.clone())
+                .or_default()
+                .extend(hashes);
         }
     }
 
@@ -349,65 +350,61 @@ pub async fn build_hash_resolution_map(
     Ok(all_resolutions)
 }
 
-/// Recursively search for an aggregation result by name through the entire
-/// result tree, including sub-aggregations nested inside bucket aggregations.
+/// Recursively collect all U64 bucket keys from every instance of the named
+/// aggregation across the entire result tree.
 ///
-/// Top-level terms aggregations appear directly in `results.0`, but when a
-/// terms aggregation is nested inside a bucket aggregation (e.g. DateHistogram
-/// → Terms), it only appears inside each bucket's `sub_aggregation`. This
-/// function traverses the full tree to find it.
-fn find_agg_result_recursive<'a>(
-    results: &'a AggregationResults,
+/// A bucket aggregation (e.g. DateHistogram) with N parent buckets produces N
+/// independent copies of each nested sub-aggregation, each potentially containing
+/// different hash keys. This function traverses ALL buckets to accumulate the
+/// complete set of hashes into `out`.
+fn collect_all_hashes_recursive(
+    results: &AggregationResults,
     target_name: &str,
-) -> Option<&'a AggregationResult> {
-    // Direct lookup first
+    out: &mut HashSet<u64>,
+) {
+    // Direct lookup at this level
     if let Some(result) = results.0.get(target_name) {
-        return Some(result);
+        out.extend(collect_u64_bucket_keys(result));
     }
-    // Recurse into bucket sub-aggregations
+    // Recurse into every bucket's sub-aggregations
     for (_name, agg_result) in &results.0 {
         if let AggregationResult::BucketResult(bucket) = agg_result {
             match bucket {
                 BucketResult::Terms { buckets, .. } => {
                     for b in buckets {
-                        if let Some(r) = find_agg_result_recursive(&b.sub_aggregation, target_name) {
-                            return Some(r);
-                        }
+                        collect_all_hashes_recursive(&b.sub_aggregation, target_name, out);
                     }
                 }
                 BucketResult::Histogram { buckets } => {
-                    for b in iter_bucket_entries(buckets) {
-                        if let Some(r) = find_agg_result_recursive(&b.sub_aggregation, target_name) {
-                            return Some(r);
+                    match buckets {
+                        BucketEntries::Vec(vec) => {
+                            for b in vec {
+                                collect_all_hashes_recursive(&b.sub_aggregation, target_name, out);
+                            }
+                        }
+                        BucketEntries::HashMap(map) => {
+                            for b in map.values() {
+                                collect_all_hashes_recursive(&b.sub_aggregation, target_name, out);
+                            }
                         }
                     }
                 }
                 BucketResult::Range { buckets } => {
-                    for b in iter_range_bucket_entries(buckets) {
-                        if let Some(r) = find_agg_result_recursive(&b.sub_aggregation, target_name) {
-                            return Some(r);
+                    match buckets {
+                        BucketEntries::Vec(vec) => {
+                            for b in vec {
+                                collect_all_hashes_recursive(&b.sub_aggregation, target_name, out);
+                            }
+                        }
+                        BucketEntries::HashMap(map) => {
+                            for b in map.values() {
+                                collect_all_hashes_recursive(&b.sub_aggregation, target_name, out);
+                            }
                         }
                     }
                 }
             }
         }
-    }
-    None
-}
-
-/// Helper to iterate over BucketEntries<BucketEntry> regardless of variant.
-fn iter_bucket_entries(entries: &BucketEntries<BucketEntry>) -> Vec<&BucketEntry> {
-    match entries {
-        BucketEntries::Vec(vec) => vec.iter().collect(),
-        BucketEntries::HashMap(map) => map.values().collect(),
-    }
-}
-
-/// Helper to iterate over BucketEntries<RangeBucketEntry> regardless of variant.
-fn iter_range_bucket_entries(entries: &BucketEntries<RangeBucketEntry>) -> Vec<&RangeBucketEntry> {
-    match entries {
-        BucketEntries::Vec(vec) => vec.iter().collect(),
-        BucketEntries::HashMap(map) => map.values().collect(),
     }
 }
 
@@ -441,8 +438,8 @@ mod tests {
     }
 
     #[test]
-    fn test_find_agg_result_recursive_top_level() {
-        // Terms at top level — should be found by direct lookup
+    fn test_collect_all_hashes_recursive_top_level() {
+        // Terms at top level — direct lookup collects hashes
         let results = make_agg_results(vec![
             ("my_terms", AggregationResult::BucketResult(BucketResult::Terms {
                 buckets: vec![BucketEntry {
@@ -455,12 +452,18 @@ mod tests {
                 doc_count_error_upper_bound: None,
             })),
         ]);
-        assert!(find_agg_result_recursive(&results, "my_terms").is_some());
-        assert!(find_agg_result_recursive(&results, "nonexistent").is_none());
+        let mut hashes = HashSet::new();
+        collect_all_hashes_recursive(&results, "my_terms", &mut hashes);
+        assert_eq!(hashes.len(), 1);
+        assert!(hashes.contains(&111));
+
+        let mut empty = HashSet::new();
+        collect_all_hashes_recursive(&results, "nonexistent", &mut empty);
+        assert!(empty.is_empty());
     }
 
     #[test]
-    fn test_find_agg_result_recursive_nested_in_histogram() {
+    fn test_collect_all_hashes_recursive_nested_in_histogram() {
         // Terms nested inside a Histogram bucket — must recurse to find it
         let nested_terms = AggregationResult::BucketResult(BucketResult::Terms {
             buckets: vec![BucketEntry {
@@ -486,14 +489,60 @@ mod tests {
 
         let results = make_agg_results(vec![("bucket_agg", histogram)]);
 
-        // "nested_terms" is NOT in top level, but should be found recursively
-        assert!(results.0.get("nested_terms").is_none());
-        let found = find_agg_result_recursive(&results, "nested_terms");
-        assert!(found.is_some());
-
-        // Verify we found the right one — collect its U64 keys
-        let hashes = collect_u64_bucket_keys(found.unwrap());
+        let mut hashes = HashSet::new();
+        collect_all_hashes_recursive(&results, "nested_terms", &mut hashes);
+        assert_eq!(hashes.len(), 1);
         assert!(hashes.contains(&42));
+    }
+
+    #[test]
+    fn test_collect_all_hashes_recursive_multi_bucket() {
+        // DateHistogram with 2 buckets, each containing nested Terms with
+        // different hash keys. Bucket 1 has {hash_A, hash_B}, bucket 2 has
+        // {hash_B, hash_C}. All 3 unique hashes must be collected.
+        let make_nested_terms = |keys: Vec<u64>| -> AggregationResult {
+            AggregationResult::BucketResult(BucketResult::Terms {
+                buckets: keys.into_iter().map(|k| BucketEntry {
+                    key: Key::U64(k),
+                    doc_count: 1,
+                    key_as_string: None,
+                    sub_aggregation: AggregationResults(Default::default()),
+                }).collect(),
+                sum_other_doc_count: 0,
+                doc_count_error_upper_bound: None,
+            })
+        };
+
+        let sub_aggs_1 = make_agg_results(vec![("nested_terms", make_nested_terms(vec![100, 200]))]);
+        let sub_aggs_2 = make_agg_results(vec![("nested_terms", make_nested_terms(vec![200, 300]))]);
+
+        let histogram = AggregationResult::BucketResult(BucketResult::Histogram {
+            buckets: BucketEntries::Vec(vec![
+                BucketEntry {
+                    key: Key::F64(1000.0),
+                    doc_count: 5,
+                    key_as_string: Some("2026-01-01T00:00:00Z".to_string()),
+                    sub_aggregation: sub_aggs_1,
+                },
+                BucketEntry {
+                    key: Key::F64(2000.0),
+                    doc_count: 3,
+                    key_as_string: Some("2026-02-01T00:00:00Z".to_string()),
+                    sub_aggregation: sub_aggs_2,
+                },
+            ]),
+        });
+
+        let results = make_agg_results(vec![("bucket_agg", histogram)]);
+
+        let mut hashes = HashSet::new();
+        collect_all_hashes_recursive(&results, "nested_terms", &mut hashes);
+
+        // Must collect all 3 unique hashes across both parent buckets
+        assert_eq!(hashes.len(), 3, "expected 3 unique hashes, got {:?}", hashes);
+        assert!(hashes.contains(&100), "hash_A (100) missing");
+        assert!(hashes.contains(&200), "hash_B (200) missing");
+        assert!(hashes.contains(&300), "hash_C (300) missing");
     }
 
     #[test]

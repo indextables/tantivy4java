@@ -245,12 +245,12 @@ fn bucket_to_record_batch(
         BucketResult::Terms { buckets, .. } => terms_to_record_batch(buckets, hash_resolution_map),
         BucketResult::Histogram { buckets } => {
             if is_date_histogram {
-                date_histogram_to_record_batch(buckets)
+                date_histogram_to_record_batch(buckets, hash_resolution_map)
             } else {
-                histogram_to_record_batch(buckets)
+                histogram_to_record_batch(buckets, hash_resolution_map)
             }
         }
-        BucketResult::Range { buckets } => range_to_record_batch(buckets),
+        BucketResult::Range { buckets } => range_to_record_batch(buckets, hash_resolution_map),
     }
 }
 
@@ -295,7 +295,10 @@ fn terms_to_record_batch(
     RecordBatch::try_new(schema, columns).context("Failed to create Terms RecordBatch")
 }
 
-fn histogram_to_record_batch(buckets: &BucketEntries<BucketEntry>) -> Result<RecordBatch> {
+fn histogram_to_record_batch(
+    buckets: &BucketEntries<BucketEntry>,
+    hash_resolution_map: Option<&HashMap<u64, String>>,
+) -> Result<RecordBatch> {
     let entries: Vec<&BucketEntry> = match buckets {
         BucketEntries::Vec(v) => v.iter().collect(),
         BucketEntries::HashMap(m) => m.values().collect(),
@@ -303,7 +306,7 @@ fn histogram_to_record_batch(buckets: &BucketEntries<BucketEntry>) -> Result<Rec
 
     // Check for nested bucket sub-aggregation (FR-2: flattening)
     if let Some(nested) = find_nested_bucket_sub_agg(entries.first().map(|b| &b.sub_aggregation)) {
-        return flatten_nested_bucket_histogram(&entries, &nested.0, &nested.1, false);
+        return flatten_nested_bucket_histogram(&entries, &nested.0, &nested.1, false, hash_resolution_map);
     }
 
     let sub_agg_names = collect_metric_sub_agg_names(
@@ -341,6 +344,7 @@ fn histogram_to_record_batch(buckets: &BucketEntries<BucketEntry>) -> Result<Rec
 
 fn date_histogram_to_record_batch(
     buckets: &BucketEntries<BucketEntry>,
+    hash_resolution_map: Option<&HashMap<u64, String>>,
 ) -> Result<RecordBatch> {
     let entries: Vec<&BucketEntry> = match buckets {
         BucketEntries::Vec(v) => v.iter().collect(),
@@ -349,7 +353,7 @@ fn date_histogram_to_record_batch(
 
     // Check for nested bucket sub-aggregation (FR-2: flattening)
     if let Some(nested) = find_nested_bucket_sub_agg(entries.first().map(|b| &b.sub_aggregation)) {
-        return flatten_nested_bucket_histogram(&entries, &nested.0, &nested.1, true);
+        return flatten_nested_bucket_histogram(&entries, &nested.0, &nested.1, true, hash_resolution_map);
     }
 
     let sub_agg_names = collect_metric_sub_agg_names(
@@ -398,6 +402,7 @@ fn date_histogram_to_record_batch(
 
 fn range_to_record_batch(
     buckets: &BucketEntries<RangeBucketEntry>,
+    _hash_resolution_map: Option<&HashMap<u64, String>>,
 ) -> Result<RecordBatch> {
     let entries: Vec<&RangeBucketEntry> = match buckets {
         BucketEntries::Vec(v) => v.iter().collect(),
@@ -619,6 +624,7 @@ fn flatten_nested_bucket_histogram(
     _nested_name: &str,
     _nested_template: &BucketResult,
     is_date_histogram: bool,
+    hash_resolution_map: Option<&HashMap<u64, String>>,
 ) -> Result<RecordBatch> {
     // Get the inner Terms buckets from first outer entry to determine nesting depth
     let first_inner: Vec<BucketEntry> = outer_entries
@@ -697,7 +703,7 @@ fn flatten_nested_bucket_histogram(
             &mut inner_keys,
             &mut inner_docs,
             &mut inner_metrics,
-            None, // histogram inner keys are not hash fields
+            hash_resolution_map,
         );
 
         let num_inner_rows = inner_docs.len();
