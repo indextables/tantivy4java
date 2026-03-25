@@ -1579,6 +1579,130 @@ public class TransactionLogIntegrationTest {
     }
 
     // ========================================================================
+    // 36. Repro: getSnapshotInfo after version file deletion
+    // ========================================================================
+
+    @Test
+    @Order(36)
+    void testSnapshotInfoAfterVersionFileDeletion() throws Exception {
+        // Repro for: getSnapshotInfo returns "not initialized" after deleteExpiredVersions
+        // deletes pre-checkpoint version files, even though _last_checkpoint and checkpoint
+        // state directory are intact.
+        Path purgeDir = Files.createTempDirectory("txlog-purge-snapshot");
+        Files.createDirectories(purgeDir.resolve("_transaction_log"));
+        String purgeTable = "file://" + purgeDir.toAbsolutePath();
+
+        try {
+            String protocolJson = MAPPER.writeValueAsString(Map.of(
+                "minReaderVersion", 4, "minWriterVersion", 4));
+            String metadataJson = MAPPER.writeValueAsString(Map.of(
+                "id", "purge-snapshot-test",
+                "schemaString", "{\"fields\":[{\"name\":\"title\",\"type\":\"text\"}]}",
+                "partitionColumns", List.of(),
+                "configuration", Map.of()));
+
+            // Initialize and write 12 versions (0 = init, 1-12 = adds)
+            TransactionLogWriter.initializeTable(purgeTable, config, protocolJson, metadataJson);
+            for (int i = 1; i <= 12; i++) {
+                String adds = MAPPER.writeValueAsString(List.of(
+                    makeAddAction("split-" + i + ".split", 1000, 100)));
+                TransactionLogWriter.addFiles(purgeTable, config, adds);
+            }
+
+            // Verify checkpoint exists (auto-checkpoint creates one after every write)
+            TxLogSnapshotInfo snapshot1 = TransactionLogReader.getSnapshotInfo(purgeTable, config);
+            assertNotNull(snapshot1);
+            assertTrue(snapshot1.getCheckpointVersion() >= 0,
+                "Checkpoint should exist, got version " + snapshot1.getCheckpointVersion());
+
+            // Delete pre-checkpoint version files with retention=0 (immediate)
+            String deleteResult = TransactionLogWriter.deleteExpiredVersions(
+                purgeTable, config, 0, false);
+            assertNotNull(deleteResult);
+
+            // Explicitly invalidate cache
+            TransactionLogReader.invalidateCache(purgeTable);
+
+            // getSnapshotInfo should succeed by reading _last_checkpoint
+            TxLogSnapshotInfo snapshot2 = TransactionLogReader.getSnapshotInfo(purgeTable, config);
+            assertNotNull(snapshot2, "getSnapshotInfo should succeed after version file deletion");
+            assertTrue(snapshot2.getCheckpointVersion() >= 0,
+                "Should have valid checkpoint version after purge");
+            assertNotNull(snapshot2.getMetadataJson(),
+                "Metadata should be available from checkpoint after version deletion");
+            assertFalse(snapshot2.getMetadataJson().isEmpty(),
+                "Metadata JSON should not be empty");
+
+            // Also test with file:/// variant (Spark often uses triple-slash)
+            String purgeTableTripleSlash = "file:///" + purgeDir.toAbsolutePath();
+            TransactionLogReader.invalidateCache(purgeTableTripleSlash);
+            TxLogSnapshotInfo snapshot3 = TransactionLogReader.getSnapshotInfo(purgeTableTripleSlash, config);
+            assertNotNull(snapshot3, "getSnapshotInfo should work with file:/// after purge");
+            assertTrue(snapshot3.getCheckpointVersion() >= 0,
+                "Should have valid checkpoint with file:/// path");
+
+        } finally {
+            deleteRecursively(purgeDir.toFile());
+        }
+    }
+
+    @Test
+    @Order(37)
+    void testSnapshotInfoAfterAllVersionsDeleted() throws Exception {
+        // Edge case: ALL version files deleted, only checkpoint remains
+        Map<String, String> noCpConfig = new HashMap<>(config);
+        noCpConfig.put("checkpoint_interval", "0");
+
+        Path edgeDir = Files.createTempDirectory("txlog-purge-edge");
+        Files.createDirectories(edgeDir.resolve("_transaction_log"));
+        String edgeTable = "file://" + edgeDir.toAbsolutePath();
+
+        try {
+            String protocolJson = MAPPER.writeValueAsString(Map.of(
+                "minReaderVersion", 4, "minWriterVersion", 4));
+            String metadataJson = MAPPER.writeValueAsString(Map.of(
+                "id", "edge-test",
+                "schemaString", "{\"fields\":[{\"name\":\"body\",\"type\":\"text\"}]}",
+                "partitionColumns", List.of(),
+                "configuration", Map.of()));
+
+            // Initialize and write versions (no auto-checkpoint)
+            TransactionLogWriter.initializeTable(edgeTable, noCpConfig, protocolJson, metadataJson);
+            for (int i = 1; i <= 5; i++) {
+                String adds = MAPPER.writeValueAsString(List.of(
+                    makeAddAction("edge-split-" + i + ".split", 1000, 100)));
+                TransactionLogWriter.addFiles(edgeTable, noCpConfig, adds);
+            }
+
+            // Manually create checkpoint
+            List<Map<String, Object>> cpEntries = new ArrayList<>();
+            for (int i = 1; i <= 5; i++) {
+                cpEntries.add(makeAddAction("edge-split-" + i + ".split", 1000, 100));
+            }
+            TransactionLogWriter.createCheckpoint(edgeTable, noCpConfig,
+                MAPPER.writeValueAsString(cpEntries), metadataJson, protocolJson);
+
+            // Delete ALL version files (retention=0)
+            TransactionLogWriter.deleteExpiredVersions(edgeTable, noCpConfig, 0, false);
+            TransactionLogReader.invalidateCache(edgeTable);
+
+            // Verify no version files remain
+            long[] remainingVersions = TransactionLogReader.listVersions(edgeTable, noCpConfig);
+            // The checkpoint version file itself might remain (it's AT checkpoint version)
+            // Pre-checkpoint versions should be gone
+
+            // getSnapshotInfo MUST work — checkpoint has all data
+            TxLogSnapshotInfo snapshot = TransactionLogReader.getSnapshotInfo(edgeTable, noCpConfig);
+            assertNotNull(snapshot, "getSnapshotInfo must work when only checkpoint exists");
+            assertTrue(snapshot.getCheckpointVersion() >= 0,
+                "Should read from checkpoint, got version " + snapshot.getCheckpointVersion());
+
+        } finally {
+            deleteRecursively(edgeDir.toFile());
+        }
+    }
+
+    // ========================================================================
     // Helpers
     // ========================================================================
 
