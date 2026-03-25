@@ -611,12 +611,16 @@ pub async fn maybe_auto_checkpoint(
         }
     }
 
-    // Read previous checkpoint's metadata/protocol as baseline.
-    // After purge, version 0 (containing MetadataAction) may be deleted.
-    // The previous checkpoint's StateManifest has cached protocol_json and metadata fields.
+    // Read previous checkpoint as baseline for both metadata AND file entries.
+    // After purge, old version files (including version 0 with MetadataAction and
+    // early versions with AddActions) may be deleted. The previous checkpoint's
+    // StateManifest + manifests contain the full consolidated state.
     let (mut cp_protocol, mut cp_metadata): (Option<ProtocolAction>, Option<MetadataAction>) = (None, None);
+    let mut cp_file_entries: Vec<FileEntry> = Vec::new();
+    let mut cp_version: i64 = -1;
     if let Ok(cp_data) = storage.get("_last_checkpoint").await {
         if let Ok(cp) = serde_json::from_slice::<LastCheckpointInfo>(&cp_data) {
+            cp_version = cp.version;
             let state_dir = cp.state_dir.unwrap_or_else(|| TxLogStorage::state_dir_name(cp.version));
             let manifest_path = format!("{}/_manifest", state_dir);
             if let Ok(manifest_data) = storage.get(&manifest_path).await {
@@ -625,25 +629,30 @@ pub async fn maybe_auto_checkpoint(
                         .and_then(|s| serde_json::from_str(s).ok());
                     cp_metadata = manifest.metadata.as_ref()
                         .and_then(|s| serde_json::from_str(s).ok());
+
+                    // Read file entries from checkpoint manifests
+                    let metadata_config = manifest.schema_registry.clone();
+                    for mi in &manifest.manifests {
+                        if let Ok(entries) = super::avro::state_reader::read_single_manifest(
+                            &storage, &state_dir, &mi.path, &metadata_config,
+                        ).await {
+                            cp_file_entries.extend(entries);
+                        }
+                    }
                 }
             }
         }
     }
 
-    // Replay version files to get current file entries
-    let replay_result = log_replay::replay(vec![], versioned_actions.clone());
-
-    // Extract protocol/metadata from version files, falling back to previous checkpoint
-    let v0_actions = versioned_actions.iter()
-        .find(|(v, _)| *v == 0)
-        .map(|(_, a)| a.clone())
-        .unwrap_or_default();
-    let non_v0: Vec<(i64, Vec<Action>)> = versioned_actions.iter()
-        .filter(|(v, _)| *v > 0)
+    // Replay: use checkpoint entries as baseline, apply only POST-checkpoint version changes
+    let post_cp_actions: Vec<(i64, Vec<Action>)> = versioned_actions.iter()
+        .filter(|(v, _)| *v > cp_version)
         .cloned()
         .collect();
-    let (version_protocol, version_metadata) = log_replay::extract_metadata(&v0_actions, &non_v0);
-    // Version files override checkpoint, checkpoint overrides defaults
+    let replay_result = log_replay::replay(cp_file_entries, post_cp_actions.clone());
+
+    // Extract protocol/metadata: post-checkpoint versions override checkpoint baseline
+    let (version_protocol, version_metadata) = log_replay::extract_metadata(&[], &post_cp_actions);
     let protocol = version_protocol.or(cp_protocol).unwrap_or_else(ProtocolAction::v4);
     let metadata = version_metadata.or(cp_metadata).unwrap_or_else(MetadataAction::empty);
 

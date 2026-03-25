@@ -1713,6 +1713,17 @@ public class TransactionLogIntegrationTest {
             assertFalse(metaId.isEmpty(),
                 "Auto-checkpoint must preserve table id from previous checkpoint, got empty");
 
+            // Step 6c: Verify file entries are PRESERVED (not just from surviving versions)
+            List<TxLogFileEntry> allFiles = new ArrayList<>();
+            for (String mp : snap3.getManifestPaths()) {
+                allFiles.addAll(TransactionLogReader.readManifest(
+                    purgeTable, config, snap3.getStateDir(), mp, "{}"));
+            }
+            System.out.println("Step 6 file count: " + allFiles.size() + " (expected 13: 12 existing + 1 appended)");
+            assertEquals(13, allFiles.size(),
+                "Auto-checkpoint must carry forward file entries from previous checkpoint. " +
+                "Got " + allFiles.size() + " but expected 13 (12 from checkpoint 12 + 1 new from version 13)");
+
         } finally {
             deleteRecursively(purgeDir.toFile());
         }
