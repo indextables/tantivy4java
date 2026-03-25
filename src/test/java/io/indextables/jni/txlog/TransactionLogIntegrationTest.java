@@ -1329,6 +1329,256 @@ public class TransactionLogIntegrationTest {
     }
 
     // ========================================================================
+    // 31-35. Purge Primitive Integration Tests
+    // ========================================================================
+
+    @Test
+    @Order(31)
+    void testDeleteExpiredStatesRetentionHonored() throws Exception {
+        // Verify that retentionMs is properly honored (regression test for GAP)
+        Path purgeDir = Files.createTempDirectory("txlog-purge-retention");
+        Files.createDirectories(purgeDir.resolve("_transaction_log"));
+        String purgeTable = "file://" + purgeDir.toAbsolutePath();
+
+        try {
+            // Initialize and write several versions (auto-checkpoint creates state dirs)
+            String protocolJson = MAPPER.writeValueAsString(Map.of(
+                "minReaderVersion", 4, "minWriterVersion", 4));
+            String metadataJson = MAPPER.writeValueAsString(Map.of(
+                "id", "purge-retention-test", "schemaString", "{}",
+                "partitionColumns", List.of(), "configuration", Map.of()));
+            TransactionLogWriter.initializeTable(purgeTable, config, protocolJson, metadataJson);
+
+            for (int i = 0; i < 5; i++) {
+                String adds = MAPPER.writeValueAsString(List.of(
+                    makeAddAction("retention-split-" + i + ".split", 1000, 100)));
+                TransactionLogWriter.addFiles(purgeTable, config, adds);
+            }
+
+            // All state dirs are < 1 second old. With 24-hour retention, nothing should expire
+            String result24h = TransactionLogWriter.deleteExpiredStates(
+                purgeTable, config, 24 * 3600 * 1000L, true);
+            assertNotNull(result24h);
+            assertTrue(result24h.contains("\"found\":0"),
+                "24h retention: no states should be expired, got: " + result24h);
+
+            // With 0 retention, all non-latest should expire
+            String result0 = TransactionLogWriter.deleteExpiredStates(
+                purgeTable, config, 0, true);
+            assertNotNull(result0);
+            // found > 0 but deleted = 0 (dry run)
+            assertTrue(result0.contains("\"deleted\":0"),
+                "Dry run: deleted should be 0, got: " + result0);
+        } finally {
+            deleteRecursively(purgeDir.toFile());
+        }
+    }
+
+    @Test
+    @Order(32)
+    void testDeleteExpiredVersionsRetentionHonored() throws Exception {
+        // Disable auto-checkpoint so we have pre-checkpoint version files
+        Map<String, String> noCpConfig = new HashMap<>(config);
+        noCpConfig.put("checkpoint_interval", "0");
+
+        Path verDir = Files.createTempDirectory("txlog-purge-versions");
+        Files.createDirectories(verDir.resolve("_transaction_log"));
+        String verTable = "file://" + verDir.toAbsolutePath();
+
+        try {
+            String protocolJson = MAPPER.writeValueAsString(Map.of(
+                "minReaderVersion", 4, "minWriterVersion", 4));
+            String metadataJson = MAPPER.writeValueAsString(Map.of(
+                "id", "purge-ver-test", "schemaString", "{}",
+                "partitionColumns", List.of(), "configuration", Map.of()));
+            TransactionLogWriter.initializeTable(verTable, noCpConfig, protocolJson, metadataJson);
+
+            // Write 5 versions with RECENT modification times
+            long recentTs = System.currentTimeMillis();
+            for (int i = 0; i < 5; i++) {
+                Map<String, Object> add = new LinkedHashMap<>();
+                add.put("path", "ver-split-" + i + ".split");
+                add.put("partitionValues", Map.of());
+                add.put("size", 1000);
+                add.put("modificationTime", recentTs);
+                add.put("dataChange", true);
+                add.put("numRecords", 100);
+                String adds = MAPPER.writeValueAsString(List.of(add));
+                TransactionLogWriter.addFiles(verTable, noCpConfig, adds);
+            }
+
+            // Create checkpoint at latest version
+            Map<String, Object> cpAdd = new LinkedHashMap<>();
+            cpAdd.put("path", "ver-split-4.split");
+            cpAdd.put("partitionValues", Map.of());
+            cpAdd.put("size", 1000);
+            cpAdd.put("modificationTime", recentTs);
+            cpAdd.put("dataChange", true);
+            cpAdd.put("numRecords", 100);
+            TransactionLogWriter.createCheckpoint(verTable, noCpConfig,
+                MAPPER.writeValueAsString(List.of(cpAdd)), metadataJson, protocolJson);
+
+            // With 24h retention, no versions should be expired (all < 1 second old)
+            String result24h = TransactionLogWriter.deleteExpiredVersions(
+                verTable, noCpConfig, 24 * 3600 * 1000L, true);
+            assertNotNull(result24h);
+            assertTrue(result24h.contains("\"found\":0"),
+                "24h retention: no versions should be expired, got: " + result24h);
+
+            // With 0 retention, pre-checkpoint versions should be found
+            String result0 = TransactionLogWriter.deleteExpiredVersions(
+                verTable, noCpConfig, 0, true);
+            assertNotNull(result0);
+            // found > 0 since we have pre-checkpoint versions
+            assertFalse(result0.contains("\"found\":0"),
+                "0 retention: should find pre-checkpoint versions, got: " + result0);
+            // Dry run: deleted should be 0
+            assertTrue(result0.contains("\"deleted\":0"),
+                "Dry run: deleted should be 0, got: " + result0);
+        } finally {
+            deleteRecursively(verDir.toFile());
+        }
+    }
+
+    @Test
+    @Order(33)
+    void testDryRunNeverDeletes() throws Exception {
+        Map<String, String> noCpConfig = new HashMap<>(config);
+        noCpConfig.put("checkpoint_interval", "0");
+
+        Path dryDir = Files.createTempDirectory("txlog-purge-dryrun");
+        Files.createDirectories(dryDir.resolve("_transaction_log"));
+        String dryTable = "file://" + dryDir.toAbsolutePath();
+
+        try {
+            String protocolJson = MAPPER.writeValueAsString(Map.of(
+                "minReaderVersion", 4, "minWriterVersion", 4));
+            String metadataJson = MAPPER.writeValueAsString(Map.of(
+                "id", "dryrun-test", "schemaString", "{}",
+                "partitionColumns", List.of(), "configuration", Map.of()));
+            TransactionLogWriter.initializeTable(dryTable, noCpConfig, protocolJson, metadataJson);
+
+            for (int i = 0; i < 3; i++) {
+                String adds = MAPPER.writeValueAsString(List.of(
+                    makeAddAction("dry-split-" + i + ".split", 1000, 100)));
+                TransactionLogWriter.addFiles(dryTable, noCpConfig, adds);
+            }
+
+            TransactionLogWriter.createCheckpoint(dryTable, noCpConfig,
+                MAPPER.writeValueAsString(List.of(makeAddAction("dry-split-2.split", 1000, 100))),
+                metadataJson, protocolJson);
+
+            // Dry run with retention=0 should find but not delete
+            String resultVersions = TransactionLogWriter.deleteExpiredVersions(
+                dryTable, noCpConfig, 0, true);
+            assertTrue(resultVersions.contains("\"deleted\":0"),
+                "Dry run versions: deleted must be 0, got: " + resultVersions);
+
+            // Verify versions still exist after dry run
+            long[] versions = TransactionLogReader.listVersions(dryTable, noCpConfig);
+            assertTrue(versions.length >= 3,
+                "Versions should still exist after dry run, found: " + versions.length);
+        } finally {
+            deleteRecursively(dryDir.toFile());
+        }
+    }
+
+    @Test
+    @Order(34)
+    void testRetainedFilesCursorStreaming() throws Exception {
+        Path curDir = Files.createTempDirectory("txlog-retained-cursor");
+        Files.createDirectories(curDir.resolve("_transaction_log"));
+        String curTable = "file://" + curDir.toAbsolutePath();
+
+        try {
+            String protocolJson = MAPPER.writeValueAsString(Map.of(
+                "minReaderVersion", 4, "minWriterVersion", 4));
+            String metadataJson = MAPPER.writeValueAsString(Map.of(
+                "id", "cursor-test", "schemaString", "{}",
+                "partitionColumns", List.of(), "configuration", Map.of()));
+            TransactionLogWriter.initializeTable(curTable, config, protocolJson, metadataJson);
+
+            // Add 3 files
+            for (int i = 0; i < 3; i++) {
+                String adds = MAPPER.writeValueAsString(List.of(
+                    makeAddAction("cursor-split-" + i + ".split", 1000 * (i + 1), 100)));
+                TransactionLogWriter.addFiles(curTable, config, adds);
+            }
+
+            // Open cursor with large retention (keep everything)
+            long cursor = TransactionLogReader.openRetainedFilesCursor(
+                curTable, config, 24 * 3600 * 1000L);
+            assertTrue(cursor > 0, "Cursor handle should be positive");
+
+            // Read batch
+            List<Map<String, Object>> batch = TransactionLogReader.readNextRetainedFilesBatch(
+                cursor, 100);
+            assertNotNull(batch, "First batch should not be null");
+            assertTrue(batch.size() >= 3,
+                "Should have at least 3 retained files, got: " + batch.size());
+
+            // Verify each entry has path, size, version
+            for (Map<String, Object> entry : batch) {
+                assertNotNull(entry.get("path"), "Each entry should have path");
+                assertNotNull(entry.get("size"), "Each entry should have size");
+                assertNotNull(entry.get("version"), "Each entry should have version");
+            }
+
+            // Second read should be exhausted
+            List<Map<String, Object>> batch2 = TransactionLogReader.readNextRetainedFilesBatch(
+                cursor, 100);
+            assertNull(batch2, "Second batch should be null (exhausted)");
+
+            // Close cursor
+            TransactionLogReader.closeRetainedFilesCursor(cursor);
+        } finally {
+            deleteRecursively(curDir.toFile());
+        }
+    }
+
+    @Test
+    @Order(35)
+    void testListRetainedVersions() throws Exception {
+        Map<String, String> noCpConfig = new HashMap<>(config);
+        noCpConfig.put("checkpoint_interval", "0");
+
+        Path retDir = Files.createTempDirectory("txlog-retained-versions");
+        Files.createDirectories(retDir.resolve("_transaction_log"));
+        String retTable = "file://" + retDir.toAbsolutePath();
+
+        try {
+            String protocolJson = MAPPER.writeValueAsString(Map.of(
+                "minReaderVersion", 4, "minWriterVersion", 4));
+            String metadataJson = MAPPER.writeValueAsString(Map.of(
+                "id", "retained-test", "schemaString", "{}",
+                "partitionColumns", List.of(), "configuration", Map.of()));
+            TransactionLogWriter.initializeTable(retTable, noCpConfig, protocolJson, metadataJson);
+
+            for (int i = 0; i < 5; i++) {
+                String adds = MAPPER.writeValueAsString(List.of(
+                    makeAddAction("ret-split-" + i + ".split", 1000, 100)));
+                TransactionLogWriter.addFiles(retTable, noCpConfig, adds);
+            }
+
+            // All versions with large retention
+            long[] retained = TransactionLogReader.listRetainedVersions(
+                retTable, noCpConfig, 24 * 3600 * 1000L);
+            assertNotNull(retained);
+            assertTrue(retained.length >= 5,
+                "Should retain all versions with 24h retention, got: " + retained.length);
+
+            // With retention=0 and no checkpoint, all versions retained
+            long[] retained0 = TransactionLogReader.listRetainedVersions(
+                retTable, noCpConfig, 0);
+            assertNotNull(retained0);
+            assertTrue(retained0.length >= 5,
+                "No checkpoint: all versions retained even with 0 retention, got: " + retained0.length);
+        } finally {
+            deleteRecursively(retDir.toFile());
+        }
+    }
+
+    // ========================================================================
     // Helpers
     // ========================================================================
 

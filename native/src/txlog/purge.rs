@@ -17,7 +17,6 @@ use crate::debug_println;
 use super::actions::*;
 use super::error::{TxLogError, Result};
 use super::log_replay;
-use super::schema_dedup;
 use super::storage::TxLogStorage;
 use super::version_file;
 
@@ -289,28 +288,36 @@ pub async fn delete_expired_states(
         if *state_dir == latest_state_dir {
             continue; // Always preserve latest
         }
-        found += 1;
 
-        // Check age
+        // Check age — only count as "found" if actually expired
         let manifest_path = format!("{}/_manifest", state_dir);
-        let is_expired = match storage.get(&manifest_path).await {
-            Ok(data) => {
-                match serde_json::from_slice::<StateManifest>(&data) {
-                    Ok(manifest) => (now_ms - manifest.created_time) >= retention_ms,
-                    Err(_) => true, // Corrupted
+        let is_expired = if retention_ms <= 0 {
+            true // Immediate cleanup of all non-latest
+        } else {
+            match storage.get(&manifest_path).await {
+                Ok(data) => {
+                    match serde_json::from_slice::<StateManifest>(&data) {
+                        Ok(manifest) if manifest.created_time > 0 => {
+                            (now_ms - manifest.created_time) >= retention_ms
+                        }
+                        _ => false, // Can't determine age → keep (safe default)
+                    }
                 }
+                Err(_) => false, // Can't read manifest → keep (safe default)
             }
-            Err(_) => true, // Missing manifest
         };
 
-        if is_expired && !dry_run {
+        if !is_expired {
+            continue;
+        }
+
+        found += 1;
+        if !dry_run {
             let dir_entries = storage.list(state_dir).await.unwrap_or_default();
             for entry in &dir_entries {
                 let _ = storage.delete(entry).await;
             }
             deleted += 1;
-        } else if is_expired {
-            deleted += 1; // Count for dry run
         }
     }
 
@@ -350,34 +357,42 @@ pub async fn delete_expired_versions(
         if *version >= checkpoint_version {
             continue; // Post-checkpoint, keep
         }
-        found += 1;
 
-        // Check age: read version file to get timestamp
+        // Check age — only count as "found" if actually expired
         let path = TxLogStorage::version_path(*version);
         let is_expired = if retention_ms <= 0 {
-            true // Immediate cleanup
+            true // Immediate cleanup of all pre-checkpoint
         } else if let Ok(data) = storage.get(&path).await {
             if let Ok(actions) = version_file::parse_version_file(&data) {
+                // Find the best timestamp from any action in the version file
                 let version_ts = actions.iter().find_map(|a| match a {
-                    Action::Add(add) => Some(add.modification_time),
-                    Action::MetaData(m) => m.created_time,
+                    Action::Add(add) if add.modification_time > 0 => Some(add.modification_time),
+                    Action::MetaData(m) => m.created_time.filter(|t| *t > 0),
+                    Action::Remove(r) => r.deletion_timestamp.filter(|t| *t > 0),
+                    Action::MergeSkip(s) if s.skip_timestamp > 0 => Some(s.skip_timestamp),
                     _ => None,
-                }).unwrap_or(0);
-                (now_ms - version_ts) >= retention_ms
+                });
+                match version_ts {
+                    Some(ts) => (now_ms - ts) >= retention_ms,
+                    None => false, // No timestamp found → can't determine age → keep
+                }
             } else {
-                true // Corrupted
+                false // Can't parse → keep (safe default)
             }
         } else {
             continue; // Can't read, skip
         };
 
-        if is_expired && !dry_run {
+        if !is_expired {
+            continue;
+        }
+
+        found += 1;
+        if !dry_run {
             match storage.delete(&path).await {
                 Ok(()) => deleted += 1,
                 Err(_) => {} // Best effort
             }
-        } else if is_expired {
-            deleted += 1; // Count for dry run
         }
     }
 
