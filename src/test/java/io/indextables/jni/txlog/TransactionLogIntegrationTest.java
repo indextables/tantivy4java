@@ -1694,8 +1694,24 @@ public class TransactionLogIntegrationTest {
             assertTrue(snap3.getCheckpointVersion() >= 0,
                 "Step 6: Should have valid checkpoint, got " + snap3.getCheckpointVersion());
 
-            System.out.println("Step 6 SUCCESS: getSnapshotInfo works after post-purge write. " +
-                "checkpointVersion=" + snap3.getCheckpointVersion());
+            System.out.println("Step 6: checkpointVersion=" + snap3.getCheckpointVersion());
+
+            // Step 6b: Verify metadata is PRESERVED (not empty) — this is the actual bug
+            String metaJson = snap3.getMetadataJson();
+            System.out.println("Step 6 metadataJson: " + metaJson);
+            assertNotNull(metaJson, "Metadata should not be null after post-purge write");
+            assertFalse(metaJson.isEmpty(), "Metadata should not be empty after post-purge write");
+
+            com.fasterxml.jackson.databind.JsonNode metaNode = MAPPER.readTree(metaJson);
+            String schemaString = metaNode.path("schemaString").asText("");
+            String metaId = metaNode.path("id").asText("");
+            System.out.println("Step 6 schemaString: " + schemaString);
+            System.out.println("Step 6 id: " + metaId);
+
+            assertFalse(schemaString.isEmpty(),
+                "Auto-checkpoint must preserve schemaString from previous checkpoint, got empty");
+            assertFalse(metaId.isEmpty(),
+                "Auto-checkpoint must preserve table id from previous checkpoint, got empty");
 
         } finally {
             deleteRecursively(purgeDir.toFile());

@@ -611,10 +611,29 @@ pub async fn maybe_auto_checkpoint(
         }
     }
 
-    // Replay to get current file entries
+    // Read previous checkpoint's metadata/protocol as baseline.
+    // After purge, version 0 (containing MetadataAction) may be deleted.
+    // The previous checkpoint's StateManifest has cached protocol_json and metadata fields.
+    let (mut cp_protocol, mut cp_metadata): (Option<ProtocolAction>, Option<MetadataAction>) = (None, None);
+    if let Ok(cp_data) = storage.get("_last_checkpoint").await {
+        if let Ok(cp) = serde_json::from_slice::<LastCheckpointInfo>(&cp_data) {
+            let state_dir = cp.state_dir.unwrap_or_else(|| TxLogStorage::state_dir_name(cp.version));
+            let manifest_path = format!("{}/_manifest", state_dir);
+            if let Ok(manifest_data) = storage.get(&manifest_path).await {
+                if let Ok(manifest) = serde_json::from_slice::<StateManifest>(&manifest_data) {
+                    cp_protocol = manifest.protocol_json.as_ref()
+                        .and_then(|s| serde_json::from_str(s).ok());
+                    cp_metadata = manifest.metadata.as_ref()
+                        .and_then(|s| serde_json::from_str(s).ok());
+                }
+            }
+        }
+    }
+
+    // Replay version files to get current file entries
     let replay_result = log_replay::replay(vec![], versioned_actions.clone());
 
-    // Extract protocol/metadata
+    // Extract protocol/metadata from version files, falling back to previous checkpoint
     let v0_actions = versioned_actions.iter()
         .find(|(v, _)| *v == 0)
         .map(|(_, a)| a.clone())
@@ -623,9 +642,10 @@ pub async fn maybe_auto_checkpoint(
         .filter(|(v, _)| *v > 0)
         .cloned()
         .collect();
-    let (protocol, metadata) = log_replay::extract_metadata(&v0_actions, &non_v0);
-    let protocol = protocol.unwrap_or_else(ProtocolAction::v4);
-    let metadata = metadata.unwrap_or_else(MetadataAction::empty);
+    let (version_protocol, version_metadata) = log_replay::extract_metadata(&v0_actions, &non_v0);
+    // Version files override checkpoint, checkpoint overrides defaults
+    let protocol = version_protocol.or(cp_protocol).unwrap_or_else(ProtocolAction::v4);
+    let metadata = version_metadata.or(cp_metadata).unwrap_or_else(MetadataAction::empty);
 
     // Full checkpoint: state dir + _last_checkpoint (every write)
     match write_checkpoint(table_path, config, replay_result.files, metadata, protocol).await {
