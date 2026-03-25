@@ -313,6 +313,38 @@ public class TransactionLogReader {
         nativeCloseRetainedFilesCursor(cursorHandle);
     }
 
+    /**
+     * List skip actions from recent version files within a time window.
+     * Scans version files backward from latest, stopping when actions are
+     * older than maxAgeMs.
+     *
+     * @param tablePath  table location
+     * @param config     credential and storage configuration
+     * @param maxAgeMs   maximum age in milliseconds (0 = all skip actions)
+     * @return list of TxLogSkipAction
+     */
+    public static List<TxLogSkipAction> listSkipActions(String tablePath, Map<String, String> config,
+                                                         long maxAgeMs) {
+        if (tablePath == null || tablePath.isEmpty()) {
+            throw new IllegalArgumentException("tablePath must not be null or empty");
+        }
+        byte[] bytes = nativeListSkipActions(tablePath,
+                config != null ? config : Collections.emptyMap(), maxAgeMs);
+        if (bytes == null) {
+            return Collections.emptyList();
+        }
+        java.nio.ByteBuffer buffer = java.nio.ByteBuffer.wrap(bytes);
+        buffer.order(java.nio.ByteOrder.nativeOrder());
+        io.indextables.tantivy4java.batch.BatchDocumentReader reader =
+                new io.indextables.tantivy4java.batch.BatchDocumentReader();
+        List<Map<String, Object>> maps = reader.parseToMaps(buffer);
+        List<TxLogSkipAction> result = new ArrayList<>();
+        for (Map<String, Object> map : maps) {
+            result.add(TxLogSkipAction.fromMap(map));
+        }
+        return result;
+    }
+
     // --- Native methods ---
 
     private static native byte[] nativeGetSnapshotInfo(String tablePath, Map<String, String> config);
@@ -325,4 +357,5 @@ public class TransactionLogReader {
     private static native long nativeOpenRetainedFilesCursor(String tablePath, Map<String, String> config, long retentionMs);
     private static native byte[] nativeReadNextRetainedFilesBatch(long cursorHandle, int batchSize);
     private static native void nativeCloseRetainedFilesCursor(long cursorHandle);
+    private static native byte[] nativeListSkipActions(String tablePath, Map<String, String> config, long maxAgeMs);
 }

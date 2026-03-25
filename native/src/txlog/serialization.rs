@@ -346,6 +346,54 @@ pub fn serialize_last_checkpoint(info: &LastCheckpointInfo) -> Vec<u8> {
 }
 
 // ============================================================================
+// SkipAction serialization (for listSkipActions)
+// ============================================================================
+
+pub fn serialize_skip_actions(skips: &[super::actions::SkipAction]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(4 + skips.len() * 200 + 12);
+    buf.extend_from_slice(&MAGIC_NUMBER.to_ne_bytes());
+
+    let mut offsets = Vec::with_capacity(skips.len());
+    for skip in skips {
+        offsets.push(buf.len() as u32);
+        let mut fc: u16 = 4; // path, skip_timestamp, reason, skip_count
+        if skip.operation.is_some() { fc += 1; }
+        if skip.partition_values.is_some() { fc += 1; }
+        if skip.size.is_some() { fc += 1; }
+        if skip.retry_after.is_some() { fc += 1; }
+        buf.extend_from_slice(&fc.to_ne_bytes());
+        write_field_header(&mut buf, "path", FIELD_TYPE_TEXT, 1);
+        write_string(&mut buf, &skip.path);
+        write_field_header(&mut buf, "skip_timestamp", FIELD_TYPE_INTEGER, 1);
+        buf.extend_from_slice(&skip.skip_timestamp.to_ne_bytes());
+        write_field_header(&mut buf, "reason", FIELD_TYPE_TEXT, 1);
+        write_string(&mut buf, &skip.reason);
+        write_field_header(&mut buf, "skip_count", FIELD_TYPE_INTEGER, 1);
+        buf.extend_from_slice(&(skip.skip_count.unwrap_or(0) as i64).to_ne_bytes());
+        if let Some(ref op) = skip.operation {
+            write_field_header(&mut buf, "operation", FIELD_TYPE_TEXT, 1);
+            write_string(&mut buf, op);
+        }
+        if let Some(ref pv) = skip.partition_values {
+            write_field_header(&mut buf, "partition_values", FIELD_TYPE_JSON, 1);
+            let json = serde_json::to_string(pv).unwrap_or_else(|_| "{}".to_string());
+            write_string(&mut buf, &json);
+        }
+        if let Some(v) = skip.size {
+            write_field_header(&mut buf, "size", FIELD_TYPE_INTEGER, 1);
+            buf.extend_from_slice(&v.to_ne_bytes());
+        }
+        if let Some(v) = skip.retry_after {
+            write_field_header(&mut buf, "retry_after", FIELD_TYPE_INTEGER, 1);
+            buf.extend_from_slice(&v.to_ne_bytes());
+        }
+    }
+
+    write_footer(&mut buf, &offsets);
+    buf
+}
+
+// ============================================================================
 // Helpers (same as delta_reader/serialization.rs)
 // ============================================================================
 

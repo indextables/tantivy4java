@@ -788,6 +788,35 @@ pub extern "system" fn Java_io_indextables_jni_txlog_TransactionLogReader_native
     super::purge::close_retained_files_cursor(cursor_handle);
 }
 
+/// List skip actions from recent version files. Returns TANT buffer of skip actions.
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_jni_txlog_TransactionLogReader_nativeListSkipActions(
+    mut env: JNIEnv,
+    _class: JClass,
+    table_path: JString,
+    config_map: JObject,
+    max_age_ms: jlong,
+) -> jbyteArray {
+    let path = match env.get_string(&table_path) {
+        Ok(s) => s.to_string_lossy().to_string(),
+        Err(e) => { to_java_exception(&mut env, &anyhow::anyhow!("{}", e)); return std::ptr::null_mut(); }
+    };
+    let config = build_storage_config(&mut env, &config_map);
+
+    match block_on_operation(async move {
+        super::purge::list_skip_actions(&path, &config, max_age_ms).await
+    }) {
+        Ok(skips) => {
+            let buf = serialization::serialize_skip_actions(&skips);
+            buffer_to_jbytearray(&mut env, &buf)
+        }
+        Err(e) => {
+            to_java_exception(&mut env, &anyhow::anyhow!("{}", e));
+            std::ptr::null_mut()
+        }
+    }
+}
+
 /// Delete expired state directories. Returns JSON: { "found": N, "deleted": N }.
 #[no_mangle]
 pub extern "system" fn Java_io_indextables_jni_txlog_TransactionLogWriter_nativeDeleteExpiredStates(

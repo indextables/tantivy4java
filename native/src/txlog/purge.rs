@@ -399,6 +399,60 @@ pub async fn delete_expired_versions(
     Ok(DeleteResult { found, deleted })
 }
 
+// ============================================================================
+// listSkipActions — scan recent version files for skip actions
+// ============================================================================
+
+/// List skip actions from version files within the given time window.
+/// Scans version files backward from the latest, stopping when actions
+/// are older than maxAgeMs. Returns all SkipActions found.
+pub async fn list_skip_actions(
+    table_path: &str,
+    config: &DeltaStorageConfig,
+    max_age_ms: i64,
+) -> Result<Vec<SkipAction>> {
+    let storage = TxLogStorage::new(table_path, config)?;
+    let all_versions = storage.list_versions().await?;
+
+    if all_versions.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let now_ms = current_timestamp_ms();
+    let cutoff_ms = if max_age_ms > 0 { now_ms - max_age_ms } else { 0 };
+    let mut skip_actions = Vec::new();
+
+    // Scan versions in reverse order (newest first) for efficiency
+    for version in all_versions.iter().rev() {
+        if let Ok(actions) = version_file::read_version(&storage, *version).await {
+            let mut version_has_recent = false;
+            for action in actions {
+                match action {
+                    Action::MergeSkip(skip) => {
+                        if skip.skip_timestamp >= cutoff_ms {
+                            version_has_recent = true;
+                            skip_actions.push(skip);
+                        }
+                    }
+                    Action::Add(ref add) => {
+                        if add.modification_time >= cutoff_ms {
+                            version_has_recent = true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            // If this version has no recent actions, older versions won't either
+            if !version_has_recent && max_age_ms > 0 {
+                break;
+            }
+        }
+    }
+
+    debug_println!("📊 PURGE: Found {} skip actions within {}ms window", skip_actions.len(), max_age_ms);
+    Ok(skip_actions)
+}
+
 fn current_timestamp_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
