@@ -1672,10 +1672,30 @@ public class TransactionLogIntegrationTest {
             assertNotNull(snap2.getMetadataJson(), "Metadata should come from checkpoint");
             assertFalse(snap2.getMetadataJson().isEmpty(), "Metadata should not be empty");
 
-            System.out.println("SUCCESS: getSnapshotInfo works after purge. " +
+            System.out.println("Step 4 SUCCESS: getSnapshotInfo works after purge. " +
                 "checkpointVersion=" + snap2.getCheckpointVersion() +
                 ", manifestPaths=" + snap2.getManifestPaths().size() +
                 ", postCheckpointPaths=" + snap2.getPostCheckpointPaths().size());
+
+            // Step 5: Write (append) AFTER purge — this is what triggers the bug
+            // Use the exact config from the Scala test: checkpoint_interval=10, cache.ttl.ms=300000
+            Map<String, String> writeConfig = new HashMap<>(config);
+            writeConfig.put("checkpoint_interval", "10");
+            writeConfig.put("cache.ttl.ms", "300000");
+            String appendAdds = MAPPER.writeValueAsString(List.of(
+                makeAddAction("split-13.split", 1000, 1)));
+            WriteResult appendResult = TransactionLogWriter.addFiles(purgeTable, writeConfig, appendAdds);
+            System.out.println("Step 5: Wrote version " + appendResult.getVersion());
+
+            // Step 6: Read AFTER the post-purge write — THIS IS WHERE THE SCALA TEST FAILS
+            // The write auto-invalidated the cache. The cache rebuild must succeed from _last_checkpoint.
+            TxLogSnapshotInfo snap3 = TransactionLogReader.getSnapshotInfo(purgeTable, config);
+            assertNotNull(snap3, "Step 6: getSnapshotInfo MUST succeed after post-purge write");
+            assertTrue(snap3.getCheckpointVersion() >= 0,
+                "Step 6: Should have valid checkpoint, got " + snap3.getCheckpointVersion());
+
+            System.out.println("Step 6 SUCCESS: getSnapshotInfo works after post-purge write. " +
+                "checkpointVersion=" + snap3.getCheckpointVersion());
 
         } finally {
             deleteRecursively(purgeDir.toFile());
