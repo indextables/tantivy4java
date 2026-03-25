@@ -29,3 +29,5 @@ pub mod version_file;
 mod arrow_ffi_tests;
 #[cfg(test)]
 mod integration_tests;
+#[cfg(test)]
+mod purge_tests;
