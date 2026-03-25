@@ -1584,6 +1584,107 @@ public class TransactionLogIntegrationTest {
 
     @Test
     @Order(36)
+    void testPurgeWithAgingReproduction() throws Exception {
+        // Exact reproduction of PurgeIndexTableTransactionLogCleanupTest:
+        // "should allow reads and writes even when old transaction logs are missing"
+        //
+        // 1. Write 13 versions (0=init, 1-12=adds) with auto-checkpoint
+        // 2. Age version files 0-8 to 25 hours ago via setLastModified
+        // 3. deleteExpiredVersions with 24h retention → should delete 0-8
+        // 4. invalidateCache
+        // 5. getSnapshotInfo → MUST succeed from _last_checkpoint
+
+        Path purgeDir = Files.createTempDirectory("txlog-purge-repro");
+        Files.createDirectories(purgeDir.resolve("_transaction_log"));
+        String purgeTable = "file://" + purgeDir.toAbsolutePath();
+
+        try {
+            String protocolJson = MAPPER.writeValueAsString(Map.of(
+                "minReaderVersion", 4, "minWriterVersion", 4));
+            String metadataJson = MAPPER.writeValueAsString(Map.of(
+                "id", "purge-repro-test",
+                "schemaString", "{\"fields\":[{\"name\":\"id\",\"type\":\"i64\"},{\"name\":\"value\",\"type\":\"text\"}]}",
+                "partitionColumns", List.of(),
+                "configuration", Map.of()));
+
+            // Step 1: Initialize + 12 writes (like the Scala test's 12 spark.write calls)
+            TransactionLogWriter.initializeTable(purgeTable, config, protocolJson, metadataJson);
+            for (int i = 1; i <= 12; i++) {
+                String adds = MAPPER.writeValueAsString(List.of(
+                    makeAddAction("split-" + i + ".split", 1000, 1)));
+                TransactionLogWriter.addFiles(purgeTable, config, adds);
+            }
+
+            // Verify checkpoint exists
+            TxLogSnapshotInfo snap1 = TransactionLogReader.getSnapshotInfo(purgeTable, config);
+            assertTrue(snap1.getCheckpointVersion() >= 0, "Should have checkpoint");
+
+            // Verify all 13 version files exist (0-12)
+            long[] allVersions = TransactionLogReader.listVersions(purgeTable, config);
+            assertTrue(allVersions.length >= 13, "Should have 13 versions, got " + allVersions.length);
+
+            // Step 2: Age version files 0-8 to 25 hours ago (matching fs.setTimes in Scala test)
+            long oldTimestamp = System.currentTimeMillis() - (25L * 60 * 60 * 1000);
+            java.io.File txLogDir = purgeDir.resolve("_transaction_log").toFile();
+            for (int v = 0; v <= 8; v++) {
+                String fileName = String.format("%020d.json", v);
+                java.io.File versionFile = new java.io.File(txLogDir, fileName);
+                if (versionFile.exists()) {
+                    boolean set = versionFile.setLastModified(oldTimestamp);
+                    assertTrue(set, "Should be able to set mtime on " + fileName);
+                }
+            }
+
+            // Step 3: Delete expired versions with 24h retention (like PURGE OLDER THAN 24 HOURS)
+            long retentionMs = 24L * 60 * 60 * 1000;
+            String deleteResult = TransactionLogWriter.deleteExpiredVersions(
+                purgeTable, config, retentionMs, false);
+            assertNotNull(deleteResult);
+            System.out.println("deleteExpiredVersions result: " + deleteResult);
+
+            // Verify versions 0-8 are gone, 9-12 remain
+            long[] remainingVersions = TransactionLogReader.listVersions(purgeTable, config);
+            System.out.println("Remaining versions: " + java.util.Arrays.toString(remainingVersions));
+            for (int v = 0; v <= 8; v++) {
+                final int ver = v;
+                assertFalse(java.util.Arrays.stream(remainingVersions).anyMatch(x -> x == ver),
+                    "Version " + v + " should be deleted (aged)");
+            }
+            for (int v = 9; v <= 12; v++) {
+                final int ver = v;
+                assertTrue(java.util.Arrays.stream(remainingVersions).anyMatch(x -> x == ver),
+                    "Version " + v + " should still exist (fresh)");
+            }
+
+            // Verify _last_checkpoint still exists
+            assertTrue(new java.io.File(txLogDir, "_last_checkpoint").exists(),
+                "_last_checkpoint should still exist after purge");
+
+            // Step 4: Invalidate cache (matching Scala purge executor behavior)
+            TransactionLogReader.invalidateCache(purgeTable);
+
+            // Step 5: getSnapshotInfo MUST succeed from _last_checkpoint
+            // This is where the Scala test fails with "not initialized"
+            TxLogSnapshotInfo snap2 = TransactionLogReader.getSnapshotInfo(purgeTable, config);
+            assertNotNull(snap2, "getSnapshotInfo MUST succeed after version deletion + cache invalidation");
+            assertTrue(snap2.getCheckpointVersion() >= 0,
+                "Should have valid checkpoint, got version " + snap2.getCheckpointVersion());
+            assertNotNull(snap2.getMetadataJson(), "Metadata should come from checkpoint");
+            assertFalse(snap2.getMetadataJson().isEmpty(), "Metadata should not be empty");
+
+            System.out.println("SUCCESS: getSnapshotInfo works after purge. " +
+                "checkpointVersion=" + snap2.getCheckpointVersion() +
+                ", manifestPaths=" + snap2.getManifestPaths().size() +
+                ", postCheckpointPaths=" + snap2.getPostCheckpointPaths().size());
+
+        } finally {
+            deleteRecursively(purgeDir.toFile());
+        }
+    }
+
+    @Test
+    @Order(37)
+    @DisplayName("getSnapshotInfo works after version file deletion with consistent paths")
     void testSnapshotInfoAfterVersionFileDeletion() throws Exception {
         // Repro for: getSnapshotInfo returns "not initialized" after deleteExpiredVersions
         // deletes pre-checkpoint version files, even though _last_checkpoint and checkpoint
