@@ -1248,4 +1248,81 @@ mod tests {
         assert_eq!(cols.len(), 5);
         assert_eq!(cols[0]["name"], "count");
     }
+
+    #[test]
+    fn test_date_histogram_nested_terms_hash_resolution() {
+        // DateHistogram with 2 time buckets, each containing nested Terms with U64 hash keys.
+        // A hash_resolution_map resolves hashes back to strings in the flattened output.
+        let make_inner_terms = |keys: Vec<(u64, u64)>| -> AggregationResults {
+            let inner_buckets: Vec<BucketEntry> = keys
+                .into_iter()
+                .map(|(hash, count)| BucketEntry {
+                    key: Key::U64(hash),
+                    doc_count: count,
+                    key_as_string: None,
+                    sub_aggregation: AggregationResults::default(),
+                })
+                .collect();
+            let inner_result = BucketResult::Terms {
+                buckets: inner_buckets,
+                sum_other_doc_count: 0,
+                doc_count_error_upper_bound: None,
+            };
+            let map = vec![(
+                "category_terms".to_string(),
+                AggregationResult::BucketResult(inner_result),
+            )]
+            .into_iter()
+            .collect();
+            AggregationResults(map)
+        };
+
+        let outer_buckets = vec![
+            BucketEntry {
+                key: Key::F64(1704067200000.0), // 2024-01-01 in ms
+                doc_count: 30,
+                key_as_string: Some("2024-01-01T00:00:00Z".to_string()),
+                sub_aggregation: make_inner_terms(vec![(111, 20), (222, 10)]),
+            },
+            BucketEntry {
+                key: Key::F64(1706745600000.0), // 2024-02-01 in ms
+                doc_count: 15,
+                key_as_string: Some("2024-02-01T00:00:00Z".to_string()),
+                sub_aggregation: make_inner_terms(vec![(222, 8), (333, 7)]),
+            },
+        ];
+
+        let result = AggregationResult::BucketResult(BucketResult::Histogram {
+            buckets: BucketEntries::Vec(outer_buckets),
+        });
+
+        // Build resolution map: hash → original string
+        let mut resolution_map = HashMap::new();
+        resolution_map.insert(111, "electronics".to_string());
+        resolution_map.insert(222, "books".to_string());
+        resolution_map.insert(333, "clothing".to_string());
+
+        let batch = aggregation_result_to_record_batch_with_hash_resolution(
+            "date_hist",
+            &result,
+            true, // is_date_histogram
+            Some(&resolution_map),
+        )
+        .unwrap();
+
+        // Flattened: 4 rows (2 outer x 2 inner each)
+        assert_eq!(batch.num_rows(), 4);
+        // Columns: key_0 (timestamp), key_1 (resolved string), doc_count
+        assert_eq!(batch.num_columns(), 3);
+        assert_eq!(batch.schema().field(0).name(), "key_0");
+        assert_eq!(batch.schema().field(1).name(), "key_1");
+        assert_eq!(batch.schema().field(2).name(), "doc_count");
+
+        // key_1 should be resolved strings, not numeric hashes
+        let key1 = batch.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(key1.value(0), "electronics");
+        assert_eq!(key1.value(1), "books");
+        assert_eq!(key1.value(2), "books");
+        assert_eq!(key1.value(3), "clothing");
+    }
 }

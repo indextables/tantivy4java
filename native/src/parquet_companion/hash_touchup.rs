@@ -87,15 +87,24 @@ pub async fn build_hash_resolution_map(
     // inside bucket sub-aggregations. Each parent bucket has its own independent
     // copy of the nested Terms with potentially different hash keys, so we must
     // traverse ALL buckets to collect the full set.
+    // Deduplicate by agg_name so we traverse the tree at most once per unique name.
+    let mut hashes_by_agg_name: HashMap<&str, HashSet<u64>> = HashMap::new();
+    for name in touchup_infos.iter().map(|t| t.agg_name.as_str()) {
+        hashes_by_agg_name.entry(name).or_insert_with(|| {
+            let mut hashes = HashSet::new();
+            collect_all_hashes_recursive(&final_results, name, &mut hashes);
+            hashes
+        });
+    }
     let mut hashes_per_field: HashMap<String, HashSet<u64>> = HashMap::new();
     for touchup in touchup_infos {
-        let mut hashes = HashSet::new();
-        collect_all_hashes_recursive(&final_results, &touchup.agg_name, &mut hashes);
-        if !hashes.is_empty() {
-            hashes_per_field
-                .entry(touchup.hash_field_name.clone())
-                .or_default()
-                .extend(hashes);
+        if let Some(hashes) = hashes_by_agg_name.get(touchup.agg_name.as_str()) {
+            if !hashes.is_empty() {
+                hashes_per_field
+                    .entry(touchup.hash_field_name.clone())
+                    .or_default()
+                    .extend(hashes);
+            }
         }
     }
 
@@ -376,33 +385,32 @@ fn collect_all_hashes_recursive(
                     }
                 }
                 BucketResult::Histogram { buckets } => {
-                    match buckets {
-                        BucketEntries::Vec(vec) => {
-                            for b in vec {
-                                collect_all_hashes_recursive(&b.sub_aggregation, target_name, out);
-                            }
-                        }
-                        BucketEntries::HashMap(map) => {
-                            for b in map.values() {
-                                collect_all_hashes_recursive(&b.sub_aggregation, target_name, out);
-                            }
-                        }
-                    }
+                    recurse_bucket_entries(buckets, |b| &b.sub_aggregation, target_name, out);
                 }
                 BucketResult::Range { buckets } => {
-                    match buckets {
-                        BucketEntries::Vec(vec) => {
-                            for b in vec {
-                                collect_all_hashes_recursive(&b.sub_aggregation, target_name, out);
-                            }
-                        }
-                        BucketEntries::HashMap(map) => {
-                            for b in map.values() {
-                                collect_all_hashes_recursive(&b.sub_aggregation, target_name, out);
-                            }
-                        }
-                    }
+                    recurse_bucket_entries(buckets, |b| &b.sub_aggregation, target_name, out);
                 }
+            }
+        }
+    }
+}
+
+/// Recurse into sub-aggregations of each entry in a `BucketEntries` (Vec or HashMap).
+fn recurse_bucket_entries<T>(
+    entries: &BucketEntries<T>,
+    get_sub: impl Fn(&T) -> &AggregationResults,
+    target_name: &str,
+    out: &mut HashSet<u64>,
+) {
+    match entries {
+        BucketEntries::Vec(vec) => {
+            for b in vec {
+                collect_all_hashes_recursive(get_sub(b), target_name, out);
+            }
+        }
+        BucketEntries::HashMap(map) => {
+            for b in map.values() {
+                collect_all_hashes_recursive(get_sub(b), target_name, out);
             }
         }
     }
@@ -426,7 +434,7 @@ fn collect_u64_bucket_keys(result: &AggregationResult) -> HashSet<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tantivy::aggregation::agg_result::{AggregationResults, BucketEntries, BucketEntry};
+    use tantivy::aggregation::agg_result::{AggregationResults, BucketEntries, BucketEntry, RangeBucketEntry};
 
     /// Helper to build an AggregationResults with entries (avoids needing FxHashMap directly).
     fn make_agg_results(entries: Vec<(&str, AggregationResult)>) -> AggregationResults {
@@ -543,6 +551,198 @@ mod tests {
         assert!(hashes.contains(&100), "hash_A (100) missing");
         assert!(hashes.contains(&200), "hash_B (200) missing");
         assert!(hashes.contains(&300), "hash_C (300) missing");
+    }
+
+    #[test]
+    fn test_collect_all_hashes_recursive_nested_in_range() {
+        // Terms nested inside Range buckets — exercises the Range arm of recurse_bucket_entries
+        let make_nested_terms = |keys: Vec<u64>| -> AggregationResult {
+            AggregationResult::BucketResult(BucketResult::Terms {
+                buckets: keys.into_iter().map(|k| BucketEntry {
+                    key: Key::U64(k),
+                    doc_count: 1,
+                    key_as_string: None,
+                    sub_aggregation: AggregationResults(Default::default()),
+                }).collect(),
+                sum_other_doc_count: 0,
+                doc_count_error_upper_bound: None,
+            })
+        };
+
+        let sub_aggs_1 = make_agg_results(vec![("nested_terms", make_nested_terms(vec![500, 600]))]);
+        let sub_aggs_2 = make_agg_results(vec![("nested_terms", make_nested_terms(vec![600, 700]))]);
+
+        let range = AggregationResult::BucketResult(BucketResult::Range {
+            buckets: BucketEntries::Vec(vec![
+                RangeBucketEntry {
+                    key: Key::Str("*-100".to_string()),
+                    doc_count: 5,
+                    sub_aggregation: sub_aggs_1,
+                    from: None,
+                    to: Some(100.0),
+                    from_as_string: None,
+                    to_as_string: None,
+                },
+                RangeBucketEntry {
+                    key: Key::Str("100-*".to_string()),
+                    doc_count: 3,
+                    sub_aggregation: sub_aggs_2,
+                    from: Some(100.0),
+                    to: None,
+                    from_as_string: None,
+                    to_as_string: None,
+                },
+            ]),
+        });
+
+        let results = make_agg_results(vec![("range_agg", range)]);
+
+        let mut hashes = HashSet::new();
+        collect_all_hashes_recursive(&results, "nested_terms", &mut hashes);
+
+        assert_eq!(hashes.len(), 3, "expected 3 unique hashes from range buckets, got {:?}", hashes);
+        assert!(hashes.contains(&500));
+        assert!(hashes.contains(&600));
+        assert!(hashes.contains(&700));
+    }
+
+    #[test]
+    fn test_collect_all_hashes_recursive_hashmap_variant() {
+        // Histogram with BucketEntries::HashMap — exercises the HashMap path in recurse_bucket_entries
+        let nested_terms = AggregationResult::BucketResult(BucketResult::Terms {
+            buckets: vec![BucketEntry {
+                key: Key::U64(999),
+                doc_count: 1,
+                key_as_string: None,
+                sub_aggregation: AggregationResults(Default::default()),
+            }],
+            sum_other_doc_count: 0,
+            doc_count_error_upper_bound: None,
+        });
+
+        let sub_aggs = make_agg_results(vec![("nested_terms", nested_terms)]);
+
+        let histogram = AggregationResult::BucketResult(BucketResult::Histogram {
+            buckets: BucketEntries::HashMap(
+                vec![("1000".to_string(), BucketEntry {
+                    key: Key::F64(1000.0),
+                    doc_count: 10,
+                    key_as_string: None,
+                    sub_aggregation: sub_aggs,
+                })].into_iter().collect()
+            ),
+        });
+
+        let results = make_agg_results(vec![("hist", histogram)]);
+
+        let mut hashes = HashSet::new();
+        collect_all_hashes_recursive(&results, "nested_terms", &mut hashes);
+
+        assert_eq!(hashes.len(), 1);
+        assert!(hashes.contains(&999), "hash from HashMap variant bucket missing");
+    }
+
+    #[test]
+    fn test_collect_all_hashes_recursive_nested_in_terms() {
+        // Inner Terms nested inside outer Terms — exercises direct Vec iteration (not recurse_bucket_entries)
+        let inner_terms = AggregationResult::BucketResult(BucketResult::Terms {
+            buckets: vec![BucketEntry {
+                key: Key::U64(777),
+                doc_count: 2,
+                key_as_string: None,
+                sub_aggregation: AggregationResults(Default::default()),
+            }],
+            sum_other_doc_count: 0,
+            doc_count_error_upper_bound: None,
+        });
+
+        let sub_aggs = make_agg_results(vec![("inner_terms", inner_terms)]);
+
+        let outer_terms = AggregationResult::BucketResult(BucketResult::Terms {
+            buckets: vec![BucketEntry {
+                key: Key::Str("parent_bucket".to_string()),
+                doc_count: 10,
+                key_as_string: None,
+                sub_aggregation: sub_aggs,
+            }],
+            sum_other_doc_count: 0,
+            doc_count_error_upper_bound: None,
+        });
+
+        let results = make_agg_results(vec![("outer_terms", outer_terms)]);
+
+        let mut hashes = HashSet::new();
+        collect_all_hashes_recursive(&results, "inner_terms", &mut hashes);
+
+        assert_eq!(hashes.len(), 1);
+        assert!(hashes.contains(&777), "hash from Terms-in-Terms nesting missing");
+    }
+
+    #[test]
+    fn test_collect_all_hashes_recursive_deep_nesting() {
+        // 3-level: Histogram → Range → Terms. Exercises all three bucket type arms.
+        let leaf_terms = AggregationResult::BucketResult(BucketResult::Terms {
+            buckets: vec![
+                BucketEntry { key: Key::U64(11), doc_count: 1, key_as_string: None, sub_aggregation: AggregationResults(Default::default()) },
+                BucketEntry { key: Key::U64(22), doc_count: 1, key_as_string: None, sub_aggregation: AggregationResults(Default::default()) },
+            ],
+            sum_other_doc_count: 0,
+            doc_count_error_upper_bound: None,
+        });
+
+        let range_sub = make_agg_results(vec![("leaf_terms", leaf_terms)]);
+
+        let range = AggregationResult::BucketResult(BucketResult::Range {
+            buckets: BucketEntries::Vec(vec![RangeBucketEntry {
+                key: Key::Str("0-50".to_string()),
+                doc_count: 10,
+                sub_aggregation: range_sub,
+                from: Some(0.0),
+                to: Some(50.0),
+                from_as_string: None,
+                to_as_string: None,
+            }]),
+        });
+
+        let hist_sub = make_agg_results(vec![("range_agg", range)]);
+
+        let histogram = AggregationResult::BucketResult(BucketResult::Histogram {
+            buckets: BucketEntries::Vec(vec![BucketEntry {
+                key: Key::F64(1000.0),
+                doc_count: 10,
+                key_as_string: Some("2026-01-01".to_string()),
+                sub_aggregation: hist_sub,
+            }]),
+        });
+
+        let results = make_agg_results(vec![("histogram_agg", histogram)]);
+
+        let mut hashes = HashSet::new();
+        collect_all_hashes_recursive(&results, "leaf_terms", &mut hashes);
+
+        assert_eq!(hashes.len(), 2, "expected 2 hashes from 3-level nesting, got {:?}", hashes);
+        assert!(hashes.contains(&11));
+        assert!(hashes.contains(&22));
+    }
+
+    #[test]
+    fn test_collect_all_hashes_recursive_empty_buckets() {
+        // Empty bucket lists should produce no hashes and not panic
+        let empty_hist = AggregationResult::BucketResult(BucketResult::Histogram {
+            buckets: BucketEntries::Vec(vec![]),
+        });
+        let empty_range = AggregationResult::BucketResult(BucketResult::Range {
+            buckets: BucketEntries::Vec(vec![]),
+        });
+
+        let results = make_agg_results(vec![
+            ("hist", empty_hist),
+            ("range", empty_range),
+        ]);
+
+        let mut hashes = HashSet::new();
+        collect_all_hashes_recursive(&results, "anything", &mut hashes);
+        assert!(hashes.is_empty(), "empty buckets should yield no hashes");
     }
 
     #[test]
