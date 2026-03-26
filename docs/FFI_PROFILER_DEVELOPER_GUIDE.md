@@ -5,7 +5,7 @@
 The FFI profiler is a near-zero-overhead instrumentation system for the native Rust read path. It tracks invocation count, total time, min time, and max time for 54 code sections across all FFI read operations, plus hit/miss counters for 5 cache layers.
 
 **Design goals:**
-- **~1ns overhead when disabled** (single `Relaxed` atomic load per section)
+- **~1ns overhead when disabled** (single `Acquire` atomic load per section — identical cost to `Relaxed` on x86, ~1ns on ARM)
 - **~60-64ns overhead when enabled** (2x `Instant::now()` + atomic updates)
 - **Zero heap allocation** on the hot path
 - **Global read/reset** via flat `long[]` JNI transfer
@@ -340,7 +340,8 @@ Cache:    [counter0, counter1, ...]
 ```
 
 **Macros** (`#[macro_export]` at crate root):
-- `profile_section!(Section::Xxx, { block })` — sync code
-- `profile_section_async!(Section::Xxx, { block })` — async code (measures wall time including `.await`)
+- `profile_section!(Section::Xxx, { block })` — works for both sync and async code (measures wall time including `.await`)
+
+Note: `return` statements inside the macro block will exit the enclosing function and skip recording. This means error paths are not profiled. This is by design — profiling only captures successful executions.
 
 Both check `is_enabled()` first and skip all timing when disabled.

@@ -125,6 +125,7 @@ pub fn retrieve_documents_batch_from_split_optimized(
                                 }
 
                                 // 🚀 BATCH OPTIMIZATION FIX: Use prefetch_ranges_with_cache to populate the correct cache
+                                // underscore prefix suppresses warning; variable IS used in profiler guard below
                                 let _t_prefetch = std::time::Instant::now();
                                 let prefetch_result = if let Some(cache) = byte_range_cache {
                                     debug_println!(

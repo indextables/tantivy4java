@@ -8,8 +8,6 @@ use jni::JNIEnv;
 
 use crate::debug_println;
 use crate::perf_println;
-use crate::profile_section;
-use crate::profile_section_async;
 use crate::ffi_profiler::Section;
 use super::types::CachedSearcherContext;
 use super::searcher_cache::extract_split_id_from_uri;
@@ -224,6 +222,7 @@ pub async fn perform_search_async_impl_leaf_response(
     // creation, before any intersection happens. Moving clauses to filter only affects
     // scoring, not execution order.
 
+    let _t_wildcard = std::time::Instant::now();
     let effective_query_json = if let Ok(analysis) = crate::split_query::analyze_query_ast_json(&query_json) {
         // Track that we analyzed this query
         crate::split_query::increment_queries_analyzed();
@@ -295,9 +294,13 @@ pub async fn perform_search_async_impl_leaf_response(
     // ========================================================================
     // End of Smart Wildcard Optimization
     // ========================================================================
+    if crate::ffi_profiler::is_enabled() {
+        crate::ffi_profiler::record(crate::ffi_profiler::Section::WildcardAnalysis, _t_wildcard.elapsed().as_nanos() as u64);
+    }
 
     // Rewrite FieldPresence (exists) queries on string hash fields to use the native
     // _phash_* U64 field, avoiding string column transcoding.
+    let _t_rewrite_start = std::time::Instant::now();
     let effective_query_json = if let Some(ref manifest) = context.parquet_manifest {
         if !manifest.string_hash_fields.is_empty() {
             if let Some(rewritten) = crate::parquet_companion::hash_field_rewriter::rewrite_query_for_hash_fields(
@@ -318,6 +321,7 @@ pub async fn perform_search_async_impl_leaf_response(
 
     // Rewrite term queries for compact string indexing modes (exact_only, text_*_exactonly).
     // Also blocks unsupported query types (wildcard, phrase, regex) on exact_only fields.
+    let _t_string_idx = std::time::Instant::now();
     let effective_query_json = if let Some(ref manifest) = context.parquet_manifest {
         if !manifest.string_indexing_modes.is_empty() {
             match crate::parquet_companion::hash_field_rewriter::rewrite_query_for_string_indexing(
@@ -336,12 +340,14 @@ pub async fn perform_search_async_impl_leaf_response(
     } else {
         effective_query_json
     };
+    if crate::ffi_profiler::is_enabled() {
+        crate::ffi_profiler::record(crate::ffi_profiler::Section::QueryRewriteStringIdx, _t_string_idx.elapsed().as_nanos() as u64);
+    }
 
     // Lazy transcoding: ensure fast fields needed by range queries are transcoded
     let t_rewrite = t_total.elapsed();
-    // Record query rewriting time (covers WildcardAnalysis + QueryRewriteHash + QueryRewriteStringIdx)
     if crate::ffi_profiler::is_enabled() {
-        crate::ffi_profiler::record(Section::QueryRewriteHash, t_rewrite.as_nanos() as u64);
+        crate::ffi_profiler::record(Section::QueryRewriteHash, _t_rewrite_start.elapsed().as_nanos() as u64);
     }
     perf_println!("⏱️ PROJ_DIAG: perform_search_leaf_response query rewriting took {}ms", t_rewrite.as_millis());
     let t_transcode = std::time::Instant::now();
@@ -353,11 +359,12 @@ pub async fn perform_search_async_impl_leaf_response(
             fast_field_data: o.fast_field_data.clone(),
         })
     };
+    let transcode_elapsed = t_transcode.elapsed();
     if crate::ffi_profiler::is_enabled() {
-        crate::ffi_profiler::record(Section::EnsureFastFields, t_transcode.elapsed().as_nanos() as u64);
+        crate::ffi_profiler::record(Section::EnsureFastFields, transcode_elapsed.as_nanos() as u64);
     }
     perf_println!("⏱️ PROJ_DIAG: perform_search_leaf_response ensure_fast_fields took {}ms",
-        t_transcode.elapsed().as_millis());
+        transcode_elapsed.as_millis());
 
     // Use Quickwit's real search functionality with cached searcher following their patterns
     let t_leaf = std::time::Instant::now();

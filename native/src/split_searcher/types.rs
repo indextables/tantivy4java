@@ -155,8 +155,10 @@ impl CachedSearcherContext {
             if cache.get(seg_ord as usize).and_then(|o| o.as_ref()).is_some() {
                 perf_println!("⏱️ PROJ_DIAG: ensure_pq_segment_loaded seg={} CACHE HIT (cache has {} segments, self={:p}) took {}ms",
                     seg_ord, cache_len, self, t0.elapsed().as_millis());
+                crate::ffi_profiler::cache_inc(crate::ffi_profiler::CacheCounter::PqColumnHit);
                 return Ok(());
             }
+            crate::ffi_profiler::cache_inc(crate::ffi_profiler::CacheCounter::PqColumnMiss);
             perf_println!("⏱️ PROJ_DIAG: ensure_pq_segment_loaded seg={} CACHE MISS (cache has {} segments, self={:p}) — loading via searcher fast fields",
                 seg_ord, cache_len, self);
         }

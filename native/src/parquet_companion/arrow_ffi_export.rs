@@ -184,6 +184,7 @@ pub async fn batch_parquet_to_arrow_ffi(
         );
     }
 
+    let _t_ffi_export = std::time::Instant::now();
     let t_ffi = std::time::Instant::now();
     let renamed_schema = renamed.schema();
     for (i, col) in renamed.columns().iter().enumerate() {
@@ -241,6 +242,9 @@ pub async fn batch_parquet_to_arrow_ffi(
                     .map_err(|e| anyhow::anyhow!("FFI_ArrowSchema conversion failed for column {}: {}", i, e))?,
             );
         }
+    }
+    if crate::ffi_profiler::is_enabled() {
+        crate::ffi_profiler::record(crate::ffi_profiler::Section::ArrowFfiExport, _t_ffi_export.elapsed().as_nanos() as u64);
     }
     perf_println!(
         "⏱️ FFI_DIAG: FFI export of {} columns took {}ms",

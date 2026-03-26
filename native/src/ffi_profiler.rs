@@ -2,7 +2,7 @@
 //
 // Design:
 //   - Static arrays of AtomicU64 for count, total_nanos, min_nanos, max_nanos per section.
-//   - Global AtomicBool enable flag checked with Relaxed ordering (~1ns when disabled).
+//   - Global AtomicBool enable flag checked with Ordering::Relaxed ordering (~1ns when disabled).
 //   - When enabled: 2× Instant::now() + atomic updates per section (~60ns).
 //   - Separate cache hit/miss counters (single fetch_add each).
 //   - All counters readable and resettable from Java via JNI.
@@ -11,7 +11,7 @@
 // Instrument at batch/file level, NEVER per-row. Per-row instrumentation at 1M rows
 // would add ~64ms overhead — unacceptable. Batch-level keeps it under 3µs total.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 // ═══════════════════════════════════════════════════════════════════════
 // Section enum — one entry per instrumented code section
@@ -232,6 +232,15 @@ impl CacheCounter {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
+// Compile-time safety: ensure ALL array and enum stay in sync
+// ═══════════════════════════════════════════════════════════════════════
+
+const _: () = assert!(Section::ArrowFfiExport as usize == NUM_SECTIONS - 1,
+    "Section enum last variant must equal NUM_SECTIONS - 1");
+const _: () = assert!(CacheCounter::PqColumnMiss as usize == NUM_CACHE_COUNTERS - 1,
+    "CacheCounter enum last variant must equal NUM_CACHE_COUNTERS - 1");
+
+// ═══════════════════════════════════════════════════════════════════════
 // Static storage — all zero-initialized, no heap allocation
 // ═══════════════════════════════════════════════════════════════════════
 
@@ -253,21 +262,24 @@ static CACHE_COUNTERS: [AtomicU64; NUM_CACHE_COUNTERS] = [INIT_ZERO; NUM_CACHE_C
 // Public API
 // ═══════════════════════════════════════════════════════════════════════
 
-/// Check if profiling is enabled. Relaxed load ≈ 1ns.
+/// Check if profiling is enabled.
+/// Uses Acquire ordering so that when enabled==true, all reset stores are visible.
+/// Cost: ~1ns on x86 (identical to Ordering::Relaxed), ~1ns on ARM (load-acquire).
 #[inline(always)]
 pub fn is_enabled() -> bool {
-    ENABLED.load(Relaxed)
+    ENABLED.load(Ordering::Acquire)
 }
 
 /// Enable profiling and reset all counters to start fresh.
+/// Uses Release ordering so other threads see zeroed counters when they observe enabled==true.
 pub fn enable() {
     reset_all_internal();
-    ENABLED.store(true, Relaxed);
+    ENABLED.store(true, Ordering::Release);
 }
 
 /// Disable profiling.
 pub fn disable() {
-    ENABLED.store(false, Relaxed);
+    ENABLED.store(false, Ordering::Release);
 }
 
 /// Record one invocation of `section` that took `nanos` nanoseconds.
@@ -275,22 +287,22 @@ pub fn disable() {
 #[inline(always)]
 pub fn record(section: Section, nanos: u64) {
     let idx = section as usize;
-    COUNTS[idx].fetch_add(1, Relaxed);
-    NANOS[idx].fetch_add(nanos, Relaxed);
+    COUNTS[idx].fetch_add(1, Ordering::Relaxed);
+    NANOS[idx].fetch_add(nanos, Ordering::Relaxed);
 
     // Update min — CAS loop (typically 1 iteration)
-    let mut current_min = MINS[idx].load(Relaxed);
+    let mut current_min = MINS[idx].load(Ordering::Relaxed);
     while nanos < current_min {
-        match MINS[idx].compare_exchange_weak(current_min, nanos, Relaxed, Relaxed) {
+        match MINS[idx].compare_exchange_weak(current_min, nanos, Ordering::Relaxed, Ordering::Relaxed) {
             Ok(_) => break,
             Err(actual) => current_min = actual,
         }
     }
 
     // Update max — CAS loop (typically 1 iteration)
-    let mut current_max = MAXS[idx].load(Relaxed);
+    let mut current_max = MAXS[idx].load(Ordering::Relaxed);
     while nanos > current_max {
-        match MAXS[idx].compare_exchange_weak(current_max, nanos, Relaxed, Relaxed) {
+        match MAXS[idx].compare_exchange_weak(current_max, nanos, Ordering::Relaxed, Ordering::Relaxed) {
             Ok(_) => break,
             Err(actual) => current_max = actual,
         }
@@ -301,21 +313,25 @@ pub fn record(section: Section, nanos: u64) {
 #[inline(always)]
 pub fn cache_inc(counter: CacheCounter) {
     if is_enabled() {
-        CACHE_COUNTERS[counter as usize].fetch_add(1, Relaxed);
+        CACHE_COUNTERS[counter as usize].fetch_add(1, Ordering::Relaxed);
     }
 }
 
 /// Snapshot section data as a flat array: [count0, nanos0, min0, max0, count1, nanos1, ...].
-/// 4 values per section × NUM_SECTIONS = 216 entries.
+/// 4 values per section × NUM_SECTIONS entries.
 /// min is reported as 0 if count is 0 (sentinel replaced).
+///
+/// **Consistency note:** Snapshots use Relaxed loads per-field, so values are approximate
+/// under concurrent recording. A section's count and nanos may reflect different numbers
+/// of recordings. This is acceptable for profiling — values converge over many samples.
 pub fn snapshot_flat() -> Vec<i64> {
     let mut flat = Vec::with_capacity(NUM_SECTIONS * 4);
     for &s in Section::ALL.iter() {
         let idx = s as usize;
-        let count = COUNTS[idx].load(Relaxed);
-        let nanos = NANOS[idx].load(Relaxed);
-        let min = MINS[idx].load(Relaxed);
-        let max = MAXS[idx].load(Relaxed);
+        let count = COUNTS[idx].load(Ordering::Relaxed);
+        let nanos = NANOS[idx].load(Ordering::Relaxed);
+        let min = MINS[idx].load(Ordering::Relaxed);
+        let max = MAXS[idx].load(Ordering::Relaxed);
         flat.push(count as i64);
         flat.push(nanos as i64);
         flat.push(if count == 0 { 0 } else { min as i64 });
@@ -329,10 +345,10 @@ pub fn reset_sections_flat() -> Vec<i64> {
     let mut flat = Vec::with_capacity(NUM_SECTIONS * 4);
     for &s in Section::ALL.iter() {
         let idx = s as usize;
-        let count = COUNTS[idx].swap(0, Relaxed);
-        let nanos = NANOS[idx].swap(0, Relaxed);
-        let min = MINS[idx].swap(u64::MAX, Relaxed);
-        let max = MAXS[idx].swap(0, Relaxed);
+        let count = COUNTS[idx].swap(0, Ordering::Relaxed);
+        let nanos = NANOS[idx].swap(0, Ordering::Relaxed);
+        let min = MINS[idx].swap(u64::MAX, Ordering::Relaxed);
+        let max = MAXS[idx].swap(0, Ordering::Relaxed);
         flat.push(count as i64);
         flat.push(nanos as i64);
         flat.push(if count == 0 { 0 } else { min as i64 });
@@ -343,24 +359,24 @@ pub fn reset_sections_flat() -> Vec<i64> {
 
 /// Snapshot cache counters as flat array: [counter0, counter1, ...].
 pub fn cache_snapshot_flat() -> Vec<i64> {
-    CacheCounter::ALL.iter().map(|c| CACHE_COUNTERS[*c as usize].load(Relaxed) as i64).collect()
+    CacheCounter::ALL.iter().map(|c| CACHE_COUNTERS[*c as usize].load(Ordering::Relaxed) as i64).collect()
 }
 
 /// Reset cache counters and return pre-reset flat array.
 pub fn cache_reset_flat() -> Vec<i64> {
-    CacheCounter::ALL.iter().map(|c| CACHE_COUNTERS[*c as usize].swap(0, Relaxed) as i64).collect()
+    CacheCounter::ALL.iter().map(|c| CACHE_COUNTERS[*c as usize].swap(0, Ordering::Relaxed) as i64).collect()
 }
 
 /// Internal: zero everything.
 fn reset_all_internal() {
     for i in 0..NUM_SECTIONS {
-        COUNTS[i].store(0, Relaxed);
-        NANOS[i].store(0, Relaxed);
-        MINS[i].store(u64::MAX, Relaxed);
-        MAXS[i].store(0, Relaxed);
+        COUNTS[i].store(0, Ordering::Relaxed);
+        NANOS[i].store(0, Ordering::Relaxed);
+        MINS[i].store(u64::MAX, Ordering::Relaxed);
+        MAXS[i].store(0, Ordering::Relaxed);
     }
     for i in 0..NUM_CACHE_COUNTERS {
-        CACHE_COUNTERS[i].store(0, Relaxed);
+        CACHE_COUNTERS[i].store(0, Ordering::Relaxed);
     }
 }
 
@@ -390,28 +406,8 @@ macro_rules! profile_section {
     }};
 }
 
-/// Profile an async code block. Same overhead as profile_section!.
-/// Note: measures wall-clock time including .await suspension.
-///
-/// Usage:
-/// ```ignore
-/// let result = profile_section_async!(Section::LeafSearch, {
-///     do_expensive_work().await
-/// });
-/// ```
-#[macro_export]
-macro_rules! profile_section_async {
-    ($section:expr, $block:expr) => {{
-        if $crate::ffi_profiler::is_enabled() {
-            let __pf_t0 = std::time::Instant::now();
-            let __pf_result = { $block };
-            $crate::ffi_profiler::record($section, __pf_t0.elapsed().as_nanos() as u64);
-            __pf_result
-        } else {
-            $block
-        }
-    }};
-}
+// NOTE: profile_section! works for both sync and async code. When the block contains
+// .await, wall-clock time including suspension is measured. No separate async macro needed.
 
 #[cfg(test)]
 mod tests {

@@ -84,7 +84,12 @@ impl StreamingRetrievalSession {
     /// Receive the next batch from the producer.
     /// Returns None when the stream is complete.
     pub fn blocking_next(&mut self) -> Option<Result<RecordBatch>> {
-        self.receiver.blocking_recv()
+        let _t_next = std::time::Instant::now();
+        let result = self.receiver.blocking_recv();
+        if crate::ffi_profiler::is_enabled() {
+            crate::ffi_profiler::record(crate::ffi_profiler::Section::StreamBatchNext, _t_next.elapsed().as_nanos() as u64);
+        }
+        result
     }
 }
 
@@ -111,6 +116,8 @@ pub fn start_streaming_retrieval(
     byte_cache: Option<ByteRangeCache>,
     coalesce_config: Option<CoalesceConfig>,
 ) -> Result<StreamingRetrievalSession> {
+    let _t_setup = std::time::Instant::now();
+
     // Determine output schema from manifest column mapping
     let tantivy_schema = build_tantivy_schema(&manifest, projected_fields.as_deref())?;
 
@@ -138,7 +145,13 @@ pub fn start_streaming_retrieval(
         }
     });
 
-    Ok(StreamingRetrievalSession::new(rx, tantivy_schema, handle))
+    let session = StreamingRetrievalSession::new(rx, tantivy_schema, handle);
+
+    if crate::ffi_profiler::is_enabled() {
+        crate::ffi_profiler::record(crate::ffi_profiler::Section::StreamSetup, _t_setup.elapsed().as_nanos() as u64);
+    }
+
+    Ok(session)
 }
 
 /// Producer: reads files sequentially, emits TARGET_BATCH_SIZE batches.
@@ -203,6 +216,7 @@ async fn produce_batches(
         );
 
         // Read this file's rows as RecordBatches
+        let _t_batch_read = std::time::Instant::now();
         let batches = read_parquet_batches_for_file(
             file_idx,
             &rows,
@@ -214,6 +228,9 @@ async fn produce_batches(
             effective_coalesce,
         )
         .await?;
+        if crate::ffi_profiler::is_enabled() {
+            crate::ffi_profiler::record(crate::ffi_profiler::Section::StreamBatchRead, _t_batch_read.elapsed().as_nanos() as u64);
+        }
 
         let file_duration_ms = t_file.elapsed().as_millis() as u64;
 

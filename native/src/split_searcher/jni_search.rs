@@ -346,6 +346,7 @@ pub async fn perform_search_async_impl_leaf_response_with_aggregations(
 
     // Phase 2a: Rewrite query JSON to redirect FieldPresence (exists) queries on string
     // hash fields to the native _phash_* U64 field, avoiding string column transcoding.
+    let _t_rewrite_start = std::time::Instant::now();
     let effective_query_json = if let Some(ref manifest) = context.parquet_manifest {
         if !manifest.string_hash_fields.is_empty() {
             if let Some(rewritten) = crate::parquet_companion::hash_field_rewriter::rewrite_query_for_hash_fields(
@@ -427,7 +428,7 @@ pub async fn perform_search_async_impl_leaf_response_with_aggregations(
     // Use the rewritten query/agg JSON so that hash fields (already native) are not transcoded from parquet.
     let t_rewrite = t_total.elapsed();
     if crate::ffi_profiler::is_enabled() {
-        crate::ffi_profiler::record(Section::AggRewriteHash, t_rewrite.as_nanos() as u64);
+        crate::ffi_profiler::record(Section::AggRewriteHash, _t_rewrite_start.elapsed().as_nanos() as u64);
     }
     perf_println!("⏱️ PROJ_DIAG: perform_search_with_aggregations query/agg rewriting took {}ms", t_rewrite.as_millis());
     let t_transcode = std::time::Instant::now();
@@ -444,7 +445,8 @@ pub async fn perform_search_async_impl_leaf_response_with_aggregations(
         })
     };
     if crate::ffi_profiler::is_enabled() {
-        crate::ffi_profiler::record(Section::AggEnsureFastFields, t_transcode.elapsed().as_nanos() as u64);
+        let transcode_elapsed = t_transcode.elapsed();
+        crate::ffi_profiler::record(Section::AggEnsureFastFields, transcode_elapsed.as_nanos() as u64);
     }
     perf_println!("⏱️ PROJ_DIAG: perform_search_with_aggregations ensure_fast_fields took {}ms",
         t_transcode.elapsed().as_millis());

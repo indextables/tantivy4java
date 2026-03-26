@@ -36,6 +36,7 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_docB
         return std::ptr::null_mut();
     }
 
+    let _t_jni_extract = std::time::Instant::now();
     // Convert JNI arrays to proper JArray types
     let segments_array = unsafe { jni::objects::JIntArray::from_raw(segments) };
     let doc_ids_array = unsafe { jni::objects::JIntArray::from_raw(doc_ids) };
@@ -87,9 +88,16 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_docB
         .enumerate()
         .map(|(idx, (&seg, &doc))| (idx, tantivy::DocAddress::new(seg, doc)))
         .collect();
+    if crate::ffi_profiler::is_enabled() {
+        crate::ffi_profiler::record(crate::ffi_profiler::Section::DocBatchJniExtract, _t_jni_extract.elapsed().as_nanos() as u64);
+    }
 
     // Sort by document address for cache locality (following Quickwit pattern)
+    let _t_sort = std::time::Instant::now();
     indexed_addresses.sort_by_key(|(_, addr)| *addr);
+    if crate::ffi_profiler::is_enabled() {
+        crate::ffi_profiler::record(crate::ffi_profiler::Section::DocBatchSort, _t_sort.elapsed().as_nanos() as u64);
+    }
 
     // Extract sorted addresses for batch retrieval
     let sorted_addresses: Vec<tantivy::DocAddress> = indexed_addresses
@@ -104,14 +112,19 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_docB
     match retrieval_result {
         Ok(sorted_docs) => {
             // Reorder documents back to original input order
+            let _t_reorder = std::time::Instant::now();
             let mut ordered_doc_ptrs = vec![std::ptr::null_mut(); indexed_addresses.len()];
             for (i, (original_idx, _)) in indexed_addresses.iter().enumerate() {
                 if i < sorted_docs.len() {
                     ordered_doc_ptrs[*original_idx] = sorted_docs[i];
                 }
             }
+            if crate::ffi_profiler::is_enabled() {
+                crate::ffi_profiler::record(crate::ffi_profiler::Section::DocBatchReorder, _t_reorder.elapsed().as_nanos() as u64);
+            }
 
             // Create a Java Document array
+            let _t_java_objects = std::time::Instant::now();
             let document_class =
                 match env.find_class("io/indextables/tantivy4java/core/Document") {
                     Ok(class) => class,
@@ -167,6 +180,9 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_docB
                         &anyhow::anyhow!("Failed to set array element: {}", e),
                     );
                 }
+            }
+            if crate::ffi_profiler::is_enabled() {
+                crate::ffi_profiler::record(crate::ffi_profiler::Section::DocBatchCreateJavaObjects, _t_java_objects.elapsed().as_nanos() as u64);
             }
 
             doc_array.into_raw()
@@ -1122,11 +1138,15 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_nati
     use crate::utils::convert_throwable;
     convert_throwable(&mut env, |env| {
         // Extract JNI arrays
+        let _t_pq_jni_extract = std::time::Instant::now();
         let (segments_vec, doc_ids_vec) = extract_jni_int_arrays(env, segments, doc_ids)
             .map_err(|msg| anyhow::anyhow!("{}", msg))?;
 
         // Extract field names
         let projected_fields = extract_jni_field_names(env, field_names);
+        if crate::ffi_profiler::is_enabled() {
+            crate::ffi_profiler::record(crate::ffi_profiler::Section::PqDocJniExtract, _t_pq_jni_extract.elapsed().as_nanos() as u64);
+        }
 
         let t_jni_total = std::time::Instant::now();
         perf_println!(
@@ -1307,9 +1327,13 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_nati
 
             tokio::task::block_in_place(|| {
                 runtime.block_on(async {
+                    let _t_resolve = std::time::Instant::now();
                     let groups = resolve_doc_addresses_to_groups(ctx, &addresses).await?;
+                    if crate::ffi_profiler::is_enabled() {
+                        crate::ffi_profiler::record(crate::ffi_profiler::Section::ArrowFfiResolve, _t_resolve.elapsed().as_nanos() as u64);
+                    }
 
-                    let t_ffi = std::time::Instant::now();
+                    let _t_batch_read = std::time::Instant::now();
                     let row_count =
                         crate::parquet_companion::arrow_ffi_export::batch_parquet_to_arrow_ffi(
                             groups,
@@ -1324,9 +1348,12 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_nati
                             &schema_addrs_vec,
                         )
                         .await?;
+                    if crate::ffi_profiler::is_enabled() {
+                        crate::ffi_profiler::record(crate::ffi_profiler::Section::ArrowFfiBatchRead, _t_batch_read.elapsed().as_nanos() as u64);
+                    }
                     perf_println!(
                         "⏱️ FFI_DIAG: batch_parquet_to_arrow_ffi returned {} rows, took {}ms",
-                        row_count, t_ffi.elapsed().as_millis()
+                        row_count, _t_batch_read.elapsed().as_millis()
                     );
                     Ok::<usize, anyhow::Error>(row_count)
                 })
