@@ -1016,11 +1016,15 @@ async fn resolve_doc_addresses_to_groups(
             .await
             .map_err(|e| anyhow::anyhow!("Failed to load __pq fields for seg {}: {}", seg, e))?;
     }
+    let pq_load_elapsed = t_pq_load.elapsed();
     perf_println!(
         "⏱️ PROJ_DIAG: ensure_pq_segment_loaded({} segments) took {}ms",
         unique_segments.len(),
-        t_pq_load.elapsed().as_millis()
+        pq_load_elapsed.as_millis()
     );
+    if crate::ffi_profiler::is_enabled() {
+        crate::ffi_profiler::record(crate::ffi_profiler::Section::PqDocEnsurePqFields, pq_load_elapsed.as_nanos() as u64);
+    }
 
     // Resolve all addresses via pre-loaded __pq data
     let t_resolve = std::time::Instant::now();
@@ -1029,11 +1033,15 @@ async fn resolve_doc_addresses_to_groups(
         let (file_hash, row_in_file) = ctx.get_pq_location(seg_ord, doc_id)?;
         resolved_locations.push((idx, file_hash, row_in_file));
     }
+    let resolve_elapsed = t_resolve.elapsed();
     perf_println!(
         "⏱️ PROJ_DIAG: get_pq_location({} docs) took {}ms",
         addresses.len(),
-        t_resolve.elapsed().as_millis()
+        resolve_elapsed.as_millis()
     );
+    if crate::ffi_profiler::is_enabled() {
+        crate::ffi_profiler::record(crate::ffi_profiler::Section::PqDocResolveLocations, resolve_elapsed.as_nanos() as u64);
+    }
 
     let t_group = std::time::Instant::now();
     let groups = crate::parquet_companion::docid_mapping::group_resolved_locations_by_file(
@@ -1041,11 +1049,15 @@ async fn resolve_doc_addresses_to_groups(
         &ctx.parquet_file_hash_index,
     )
     .map_err(|e| anyhow::anyhow!("{}", e))?;
+    let group_elapsed = t_group.elapsed();
     perf_println!(
         "⏱️ PROJ_DIAG: group_resolved_locations_by_file → {} file groups, took {}ms",
         groups.len(),
-        t_group.elapsed().as_millis()
+        group_elapsed.as_millis()
     );
+    if crate::ffi_profiler::is_enabled() {
+        crate::ffi_profiler::record(crate::ffi_profiler::Section::PqDocGroupByFile, group_elapsed.as_nanos() as u64);
+    }
 
     Ok(groups)
 }
@@ -1155,10 +1167,14 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_nati
                         ctx.parquet_coalesce_config,
                     )
                     .await;
+                    let parquet_elapsed = t_parquet.elapsed();
                     perf_println!(
                         "⏱️ PROJ_DIAG: batch_parquet_to_tant_buffer_by_groups took {}ms",
-                        t_parquet.elapsed().as_millis()
+                        parquet_elapsed.as_millis()
                     );
+                    if crate::ffi_profiler::is_enabled() {
+                        crate::ffi_profiler::record(crate::ffi_profiler::Section::PqDocParquetRead, parquet_elapsed.as_nanos() as u64);
+                    }
                     result
                 })
             })
@@ -1178,10 +1194,14 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_nati
                 };
                 env.set_byte_array_region(&byte_array, 0, byte_slice)
                     .map_err(|e| anyhow::anyhow!("Failed to set byte array data: {}", e))?;
+                let jni_copy_elapsed = t_jni_copy.elapsed();
                 perf_println!(
                     "⏱️ PROJ_DIAG: JNI byte array copy took {}ms",
-                    t_jni_copy.elapsed().as_millis()
+                    jni_copy_elapsed.as_millis()
                 );
+                if crate::ffi_profiler::is_enabled() {
+                    crate::ffi_profiler::record(crate::ffi_profiler::Section::PqDocJniCopy, jni_copy_elapsed.as_nanos() as u64);
+                }
                 perf_println!(
                     "⏱️ PROJ_DIAG: === nativeDocBatchProjected TOTAL took {}ms ===",
                     t_jni_total.elapsed().as_millis()

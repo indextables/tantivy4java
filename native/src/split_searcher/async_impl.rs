@@ -8,6 +8,9 @@ use jni::JNIEnv;
 
 use crate::debug_println;
 use crate::perf_println;
+use crate::profile_section;
+use crate::profile_section_async;
+use crate::ffi_profiler::Section;
 use super::types::CachedSearcherContext;
 use super::searcher_cache::extract_split_id_from_uri;
 use quickwit_storage::Storage;
@@ -336,6 +339,10 @@ pub async fn perform_search_async_impl_leaf_response(
 
     // Lazy transcoding: ensure fast fields needed by range queries are transcoded
     let t_rewrite = t_total.elapsed();
+    // Record query rewriting time (covers WildcardAnalysis + QueryRewriteHash + QueryRewriteStringIdx)
+    if crate::ffi_profiler::is_enabled() {
+        crate::ffi_profiler::record(Section::QueryRewriteHash, t_rewrite.as_nanos() as u64);
+    }
     perf_println!("⏱️ PROJ_DIAG: perform_search_leaf_response query rewriting took {}ms", t_rewrite.as_millis());
     let t_transcode = std::time::Instant::now();
     let overrides = if context.augmented_directory.is_some() {
@@ -346,6 +353,9 @@ pub async fn perform_search_async_impl_leaf_response(
             fast_field_data: o.fast_field_data.clone(),
         })
     };
+    if crate::ffi_profiler::is_enabled() {
+        crate::ffi_profiler::record(Section::EnsureFastFields, t_transcode.elapsed().as_nanos() as u64);
+    }
     perf_println!("⏱️ PROJ_DIAG: perform_search_leaf_response ensure_fast_fields took {}ms",
         t_transcode.elapsed().as_millis());
 
@@ -364,6 +374,9 @@ pub async fn perform_search_async_impl_leaf_response(
         limit as usize,
         overrides,
     ).await?;
+    if crate::ffi_profiler::is_enabled() {
+        crate::ffi_profiler::record(Section::LeafSearch, t_leaf.elapsed().as_nanos() as u64);
+    }
 
     perf_println!("⏱️ PROJ_DIAG: perform_search_leaf_response TOTAL {}ms (rewrite={}ms, transcode={}ms, leaf={}ms) — {} hits",
         t_total.elapsed().as_millis(), t_rewrite.as_millis(), t_transcode.elapsed().as_millis(),
@@ -661,6 +674,9 @@ async fn perform_real_quickwit_search(
     };
 
     let t_docmapper = t0.elapsed();
+    if crate::ffi_profiler::is_enabled() {
+        crate::ffi_profiler::record(Section::DocMapperCreate, t_docmapper.as_nanos() as u64);
+    }
     perf_println!("⏱️ PROJ_DIAG: perform_real_quickwit_search DocMapper creation took {}ms", t_docmapper.as_millis());
 
     // Create SearchRequest following Quickwit patterns
@@ -736,6 +752,9 @@ async fn perform_real_quickwit_search(
     debug_println!("🔍 PERMIT_FIX: Acquiring permit from dedicated provider - should be immediate");
     let t_permit = std::time::Instant::now();
     let mut search_permit = permit_future.await;
+    if crate::ffi_profiler::is_enabled() {
+        crate::ffi_profiler::record(Section::PermitAcquire, t_permit.elapsed().as_nanos() as u64);
+    }
     perf_println!("⏱️ PROJ_DIAG: perform_real_quickwit_search permit acquisition took {}ms", t_permit.elapsed().as_millis());
     debug_println!("✅ PERMIT_FIX: Successfully acquired search permit from dedicated provider - no timeout needed!");
 

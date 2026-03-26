@@ -54,15 +54,21 @@ pub fn retrieve_document_from_split_optimized(
     // Track cache statistics
     if cached_searcher.is_some() {
         SEARCHER_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
+        crate::ffi_profiler::cache_inc(crate::ffi_profiler::CacheCounter::SearcherHit);
     } else {
         SEARCHER_CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
+        crate::ffi_profiler::cache_inc(crate::ffi_profiler::CacheCounter::SearcherMiss);
     }
 
+    let cache_check_elapsed = cache_check_start.elapsed();
     debug_println!(
         "RUST DEBUG: ⏱️ Cache lookup completed [TIMING: {}ms] - cache_hit: {}",
-        cache_check_start.elapsed().as_millis(),
+        cache_check_elapsed.as_millis(),
         cached_searcher.is_some()
     );
+    if crate::ffi_profiler::is_enabled() {
+        crate::ffi_profiler::record(crate::ffi_profiler::Section::SingleDocCacheLookup, cache_check_elapsed.as_nanos() as u64);
+    }
 
     if let Some(searcher) = cached_searcher {
         // Use cached searcher - very fast path (cache hit)
@@ -114,11 +120,15 @@ pub fn retrieve_document_from_split_optimized(
 
         match doc_and_schema {
             Ok((doc, schema)) => {
+                let cache_hit_elapsed = cache_hit_start.elapsed();
                 debug_println!(
                     "RUST DEBUG: ⏱️ ✅ CACHE HIT document retrieval completed [TIMING: {}ms] [TOTAL: {}ms]",
-                    cache_hit_start.elapsed().as_millis(),
+                    cache_hit_elapsed.as_millis(),
                     function_start.elapsed().as_millis()
                 );
+                if crate::ffi_profiler::is_enabled() {
+                    crate::ffi_profiler::record(crate::ffi_profiler::Section::SingleDocFetch, cache_hit_elapsed.as_nanos() as u64);
+                }
                 return Ok((doc, schema));
             }
             Err(e) => {
@@ -304,10 +314,14 @@ pub fn retrieve_document_from_split_optimized(
                         "RUST DEBUG: ⏱️ 📖 Searcher caching completed [TIMING: {}ms]",
                         caching_start.elapsed().as_millis()
                     );
+                    let index_opening_elapsed = index_opening_start.elapsed();
                     debug_println!(
                         "RUST DEBUG: ⏱️ 📖 TOTAL INDEX OPENING completed [TIMING: {}ms]",
-                        index_opening_start.elapsed().as_millis()
+                        index_opening_elapsed.as_millis()
                     );
+                    if crate::ffi_profiler::is_enabled() {
+                        crate::ffi_profiler::record(crate::ffi_profiler::Section::SingleDocCacheMissOpen, index_opening_elapsed.as_nanos() as u64);
+                    }
 
                     // Validate segment ordinal to prevent index-out-of-bounds panic
                     let num_segments = searcher.segment_readers().len();
