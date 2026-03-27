@@ -83,19 +83,7 @@ pub fn convert_term_query_to_query_ast(env: &mut JNIEnv, obj: &JObject, searcher
     // require '*'. Skip the schema lookup entirely for the 99%+ of term queries that are
     // plain values, making the schema scan zero-cost in the common case.
     if value.contains('/') || value.contains('*') {
-        // Determine if this is an IP field via two sources:
-        //   1. Explicit fieldTypeValue from the Java constructor (FieldType.IP_ADDR.getValue() == 10).
-        //      Preferred path when the caller already knows the field type (e.g. Spark
-        //      FiltersToQueryConverter) — no schema registry lookup needed.
-        //   2. Schema-based detection via the searcher's cached schema (fallback for callers
-        //      using the two-arg SplitTermQuery constructor without an explicit type hint).
-        const FIELD_TYPE_IP_ADDR: i32 = 10; // FieldType.IP_ADDR.getValue() in tantivy4java
-        let field_type_value = env
-            .get_field(obj, "fieldTypeValue", "I")
-            .and_then(|v| v.i())
-            .unwrap_or(0);
-        let is_ip_field = field_type_value == FIELD_TYPE_IP_ADDR
-            || is_ip_field_by_schema(&field, searcher_ptr);
+        let is_ip_field = is_ip_field_by_schema(&field, searcher_ptr);
 
         if is_ip_field {
             if let Some((lower, upper)) = crate::ip_expansion::try_expand_ip_range(&value) {
