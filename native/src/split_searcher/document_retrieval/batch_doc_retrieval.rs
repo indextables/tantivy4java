@@ -98,6 +98,7 @@ pub fn retrieve_documents_batch_from_split_optimized(
                         );
                         debug_println!("🔍 TRACE: Should optimize = true");
 
+                        let _t_consolidate = std::time::Instant::now();
                         match optimizer.consolidate_ranges(&doc_addresses, &cached_searcher) {
                             Ok(ranges) => {
                                 let num_segments = ranges
@@ -199,6 +200,9 @@ pub fn retrieve_documents_batch_from_split_optimized(
                                 );
                                 // Non-fatal: continue with normal doc_async
                             }
+                        }
+                        if crate::ffi_profiler::is_enabled() {
+                            crate::ffi_profiler::record(crate::ffi_profiler::Section::DocBatchRangeConsolidate, _t_consolidate.elapsed().as_nanos() as u64);
                         }
                     } else {
                         debug_println!(

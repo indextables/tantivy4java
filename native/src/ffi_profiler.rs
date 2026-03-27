@@ -2,7 +2,7 @@
 //
 // Design:
 //   - Static arrays of AtomicU64 for count, total_nanos, min_nanos, max_nanos per section.
-//   - Global AtomicBool enable flag checked with Ordering::Relaxed ordering (~1ns when disabled).
+//   - Global AtomicBool enable flag: Acquire load (~1ns), Release store on enable/disable.
 //   - When enabled: 2× Instant::now() + atomic updates per section (~60ns).
 //   - Separate cache hit/miss counters (single fetch_add each).
 //   - All counters readable and resettable from Java via JNI.

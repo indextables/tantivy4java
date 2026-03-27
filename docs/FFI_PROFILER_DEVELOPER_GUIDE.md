@@ -165,10 +165,10 @@ The map returned by `snapshot()` and `reset()` uses `LinkedHashMap` and preserve
 
 | Section | Location | What it measures |
 |---------|----------|-----------------|
-| `pc_doc_create_reader` | doc_retrieval.rs | CachedParquetReader setup |
-| `pc_doc_row_group_filter` | doc_retrieval.rs | Determine which row groups contain target rows |
-| `pc_doc_row_selection` | doc_retrieval.rs | Build row selection within row groups |
-| `pc_doc_stream_batches` | doc_retrieval.rs | Parquet page decode + decompression |
+| `pc_doc_create_reader` | arrow_to_tant.rs | CachedParquetReader setup |
+| `pc_doc_row_group_filter` | arrow_to_tant.rs | Determine which row groups contain target rows |
+| `pc_doc_row_selection` | arrow_to_tant.rs | Build row selection within row groups |
+| `pc_doc_stream_batches` | arrow_to_tant.rs | Parquet page decode + decompression |
 | `pc_doc_serialize_tant` | arrow_to_tant.rs | Arrow rows → TANT binary format |
 
 ### Streaming Retrieval (3 sections)
@@ -185,7 +185,7 @@ The map returned by `snapshot()` and `reset()` uses `LinkedHashMap` and preserve
 |---------|----------|-----------------|
 | `arrow_ffi_resolve` | doc_retrieval_jni.rs | resolve_doc_addresses_to_groups |
 | `arrow_ffi_batch_read` | doc_retrieval_jni.rs | Parquet batch read for Arrow export |
-| `arrow_ffi_export` | doc_retrieval_jni.rs | Write to FFI_ArrowArray/Schema structs |
+| `arrow_ffi_export` | arrow_ffi_export.rs | Write to FFI_ArrowArray/Schema structs |
 
 ## Cache Counters
 
@@ -203,7 +203,7 @@ The map returned by `snapshot()` and `reset()` uses `LinkedHashMap` and preserve
 
 | State | Cost per section | Components |
 |-------|-----------------|------------|
-| **Disabled** | ~1ns | 1x `AtomicBool::load(Relaxed)` |
+| **Disabled** | ~1ns | 1x `AtomicBool::load(Acquire)` (same cost as Relaxed on x86) |
 | **Enabled** | ~64ns | 2x `Instant::now()` (~22ns each) + `fetch_add` count + `fetch_add` nanos + CAS min + CAS max |
 
 ### For a Typical Workload (1M doc retrieval, 3 parquet files)
@@ -298,12 +298,21 @@ crate::ffi_profiler::cache_inc(crate::ffi_profiler::CacheCounter::MyNewMiss);
 
 Sections measured across `.await` points include Tokio scheduling time. Under concurrent load, a section's time may include time spent running *other* tasks on the same Tokio worker. For single-query benchmarks this is accurate; under load, interpret as "wall-clock time from the caller's perspective."
 
-### Relaxed Ordering
+### Atomic Ordering
 
-All atomics use `Relaxed` ordering. This means:
+The enable flag uses `Acquire`/`Release` ordering — when a thread sees `enabled==true`, all reset-to-zero stores are guaranteed visible. Counter reads and writes use `Relaxed` ordering for maximum performance. This means:
 - Counters may be slightly stale across CPU cores (acceptable for profiling)
 - Snapshot across sections is non-atomic (section A and section B may be from different moments)
 - Count and nanos for the *same* section may be slightly inconsistent during concurrent updates
+
+### Hierarchical Sections
+
+Some sections are intentionally nested/overlapping:
+- `LeafSearch` includes `DocMapperCreate` + `PermitAcquire` + the actual `leaf_search_single_split` call
+- `QueryRewriteHash` includes `QueryRewriteStringIdx` time (total rewrite vs sub-phase)
+- `ArrowFfiBatchRead` includes `ArrowFfiExport` time
+
+To get the "pure" inner time, subtract the sub-section from the parent. For example: actual leaf search time = `LeafSearch` - `DocMapperCreate` - `PermitAcquire`.
 
 ### Test Isolation
 
