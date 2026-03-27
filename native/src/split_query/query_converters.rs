@@ -11,6 +11,24 @@ use quickwit_query::JsonLiteral;
 
 use crate::debug_println;
 
+/// Return true if `field` is an IP address field according to the schema associated with
+/// `searcher_ptr`.  Returns false (never expands) when `searcher_ptr` is 0 or the schema
+/// cannot be resolved — this is the correct behaviour for test-only JNI paths.
+fn is_ip_field_by_schema(field: &str, searcher_ptr: jni::sys::jlong) -> bool {
+    let schema_ptr = match crate::split_query::get_searcher_schema(searcher_ptr) {
+        Some(ptr) => ptr,
+        None => return false,
+    };
+    if let Some(schema) = crate::utils::jlong_to_arc::<tantivy::schema::Schema>(schema_ptr) {
+        schema.fields().any(|(_, entry)| {
+            entry.name() == field
+                && matches!(entry.field_type(), tantivy::schema::FieldType::IpAddr(_))
+        })
+    } else {
+        false
+    }
+}
+
 /// Convert a QueryAst to JSON string using Quickwit's proven serialization
 pub fn convert_query_ast_to_json_string(query: QueryAst) -> Result<String> {
     // Use Quickwit's proven serde serialization - this automatically handles
@@ -20,12 +38,12 @@ pub fn convert_query_ast_to_json_string(query: QueryAst) -> Result<String> {
 }
 
 // Wrapper function for JNI layer - converts to JSON string
-pub fn convert_term_query_to_ast(env: &mut JNIEnv, obj: &JObject) -> Result<String> {
-    let query_ast = convert_term_query_to_query_ast(env, obj)?;
+pub fn convert_term_query_to_ast(env: &mut JNIEnv, obj: &JObject, searcher_ptr: jni::sys::jlong) -> Result<String> {
+    let query_ast = convert_term_query_to_query_ast(env, obj, searcher_ptr)?;
     convert_query_ast_to_json_string(query_ast)
 }
 
-pub fn convert_term_query_to_query_ast(env: &mut JNIEnv, obj: &JObject) -> Result<QueryAst> {
+pub fn convert_term_query_to_query_ast(env: &mut JNIEnv, obj: &JObject, searcher_ptr: jni::sys::jlong) -> Result<QueryAst> {
     // Extract field and value from Java SplitTermQuery object
     let field_obj = env
         .get_field(obj, "field", "Ljava/lang/String;")
@@ -61,6 +79,37 @@ pub fn convert_term_query_to_query_ast(env: &mut JNIEnv, obj: &JObject) -> Resul
         value
     );
 
+    // IP CIDR/wildcard expansion: fast-path guard first — CIDR requires '/' and wildcards
+    // require '*'. Skip the schema lookup entirely for the 99%+ of term queries that are
+    // plain values, making the schema scan zero-cost in the common case.
+    if value.contains('/') || value.contains('*') {
+        let is_ip_field = is_ip_field_by_schema(&field, searcher_ptr);
+
+        if is_ip_field {
+            if let Some((lower, upper)) = crate::ip_expansion::try_expand_ip_range(&value) {
+                debug_println!(
+                    "RUST DEBUG: Expanding IP pattern '{}' to range [{} TO {}]",
+                    value, lower, upper
+                );
+                // Match-all case: *.*.*.*  or  /0 — emit MatchAll for maximum performance
+                if crate::ip_expansion::is_match_all_range(&lower, &upper) {
+                    debug_println!(
+                        "RUST DEBUG: IP pattern '{}' covers all IPs, returning MatchAll",
+                        value
+                    );
+                    return Ok(QueryAst::MatchAll);
+                }
+                use quickwit_query::query_ast::RangeQuery;
+                let range_query = RangeQuery {
+                    field,
+                    lower_bound: Bound::Included(JsonLiteral::String(lower)),
+                    upper_bound: Bound::Included(JsonLiteral::String(upper)),
+                };
+                return Ok(QueryAst::Range(range_query));
+            }
+        }
+    } // end value.contains('/') || value.contains('*')
+
     // Create proper Quickwit QueryAst using official structures
     use quickwit_query::query_ast::TermQuery;
 
@@ -73,12 +122,12 @@ pub fn convert_term_query_to_query_ast(env: &mut JNIEnv, obj: &JObject) -> Resul
 }
 
 // Wrapper function for JNI layer - converts to JSON string
-pub fn convert_boolean_query_to_ast(env: &mut JNIEnv, obj: &JObject) -> Result<String> {
-    let query_ast = convert_boolean_query_to_query_ast(env, obj)?;
+pub fn convert_boolean_query_to_ast(env: &mut JNIEnv, obj: &JObject, searcher_ptr: jni::sys::jlong) -> Result<String> {
+    let query_ast = convert_boolean_query_to_query_ast(env, obj, searcher_ptr)?;
     convert_query_ast_to_json_string(query_ast)
 }
 
-pub fn convert_boolean_query_to_query_ast(env: &mut JNIEnv, obj: &JObject) -> Result<QueryAst> {
+pub fn convert_boolean_query_to_query_ast(env: &mut JNIEnv, obj: &JObject, searcher_ptr: jni::sys::jlong) -> Result<QueryAst> {
     // Extract clauses from Java SplitBooleanQuery object
     let must_list_obj = env
         .get_field(obj, "mustQueries", "Ljava/util/List;")
@@ -94,9 +143,9 @@ pub fn convert_boolean_query_to_query_ast(env: &mut JNIEnv, obj: &JObject) -> Re
         .map_err(|e| anyhow!("Failed to get minimumShouldMatch: {}", e))?;
 
     // Convert Java lists to Rust QueryAst clauses
-    let must_clauses = convert_query_list(env, must_list_obj.l()?)?;
-    let should_clauses = convert_query_list(env, should_list_obj.l()?)?;
-    let must_not_clauses = convert_query_list(env, must_not_list_obj.l()?)?;
+    let must_clauses = convert_query_list(env, must_list_obj.l()?, searcher_ptr)?;
+    let should_clauses = convert_query_list(env, should_list_obj.l()?, searcher_ptr)?;
+    let must_not_clauses = convert_query_list(env, must_not_list_obj.l()?, searcher_ptr)?;
 
     // Handle minimum should match
     let min_should_match_jobj = min_should_match_obj.l()?;
@@ -338,7 +387,7 @@ fn convert_range_bound(
     }
 }
 
-pub fn convert_query_list(env: &mut JNIEnv, list_obj: JObject) -> Result<Vec<QueryAst>> {
+pub fn convert_query_list(env: &mut JNIEnv, list_obj: JObject, searcher_ptr: jni::sys::jlong) -> Result<Vec<QueryAst>> {
     if list_obj.is_null() {
         return Ok(Vec::new());
     }
@@ -360,14 +409,14 @@ pub fn convert_query_list(env: &mut JNIEnv, list_obj: JObject) -> Result<Vec<Que
         let query_obj = get_result.l()?;
 
         // Convert based on the actual type
-        let query_ast = convert_split_query_to_ast(env, &query_obj)?;
+        let query_ast = convert_split_query_to_ast(env, &query_obj, searcher_ptr)?;
         queries.push(query_ast);
     }
 
     Ok(queries)
 }
 
-pub fn convert_split_query_to_ast(env: &mut JNIEnv, query_obj: &JObject) -> Result<QueryAst> {
+pub fn convert_split_query_to_ast(env: &mut JNIEnv, query_obj: &JObject, searcher_ptr: jni::sys::jlong) -> Result<QueryAst> {
     // Determine the actual type of the SplitQuery object
     let class = env.get_object_class(query_obj)?;
     let class_name_obj = env.call_method(class, "getName", "()Ljava/lang/String;", &[])?;
@@ -377,11 +426,11 @@ pub fn convert_split_query_to_ast(env: &mut JNIEnv, query_obj: &JObject) -> Resu
     match class_name.as_str() {
         "io.indextables.tantivy4java.split.SplitTermQuery" => {
             // Create QueryAst directly using native Quickwit structures
-            convert_term_query_to_query_ast(env, query_obj)
+            convert_term_query_to_query_ast(env, query_obj, searcher_ptr)
         }
         "io.indextables.tantivy4java.split.SplitBooleanQuery" => {
             // Create QueryAst directly using native Quickwit structures
-            convert_boolean_query_to_query_ast(env, query_obj)
+            convert_boolean_query_to_query_ast(env, query_obj, searcher_ptr)
         }
         "io.indextables.tantivy4java.split.SplitRangeQuery" => {
             // Create QueryAst directly using native Quickwit structures
@@ -433,11 +482,11 @@ pub fn convert_parsed_query_to_query_ast(env: &mut JNIEnv, obj: &JObject) -> Res
 }
 
 // Convert SplitQuery to JSON string for async operations
-pub fn convert_split_query_to_json(env: &mut JNIEnv, query_obj: &JObject) -> Result<String, String> {
+pub fn convert_split_query_to_json(env: &mut JNIEnv, query_obj: &JObject, searcher_ptr: jni::sys::jlong) -> Result<String, String> {
     debug_println!("🔄 CONVERT: Converting SplitQuery to JSON");
 
     // First convert to QueryAst
-    let query_ast = convert_split_query_to_ast(env, query_obj)
+    let query_ast = convert_split_query_to_ast(env, query_obj, searcher_ptr)
         .map_err(|e| format!("Failed to convert SplitQuery to QueryAst: {}", e))?;
 
     // Then serialize QueryAst to JSON
