@@ -55,7 +55,7 @@ pub extern "system" fn Java_io_indextables_tantivy4java_query_Query_nativeTermQu
             // SAFETY: We've validated field_value is not null above
             JObject::from_raw(field_value)
         };
-
+        
         // Create term based on field type and value type
         let term = match field_type {
             tantivy::schema::FieldType::Str(text_options) => {
@@ -203,7 +203,7 @@ pub extern "system" fn Java_io_indextables_tantivy4java_query_Query_nativeTermQu
                     return Err("Field value cannot be null for IP address field".to_string());
                 }
 
-                // Single toString() call — used for both CIDR/wildcard expansion and exact-IP parse.
+                // Get string representation of IP address by calling toString()
                 let ip_string: String = match env.call_method(&field_value_obj, "toString", "()Ljava/lang/String;", &[]) {
                     Ok(result) => {
                         let string_obj = result.l().map_err(|e| format!("Failed to get string object: {}", e))?;
@@ -214,35 +214,7 @@ pub extern "system" fn Java_io_indextables_tantivy4java_query_Query_nativeTermQu
                     Err(e) => return Err(format!("Failed to get IP address string: {}", e)),
                 };
 
-                // CIDR/wildcard expansion: transparently rewrite to RangeQuery or MatchAll.
-                // Zero allocation for regular IPs (no '/' or '*' in value).
-                if let Some((lower_str, upper_str)) = crate::ip_expansion::try_expand_ip_range(&ip_string) {
-                    if crate::ip_expansion::is_match_all_range(&lower_str, &upper_str) {
-                        return Ok(Box::new(AllQuery) as Box<dyn TantivyQuery>);
-                    }
-                    let lower_ip: std::net::IpAddr = lower_str.parse()
-                        .map_err(|_| format!("Invalid lower IP in CIDR/wildcard expansion: {}", lower_str))?;
-                    let upper_ip: std::net::IpAddr = upper_str.parse()
-                        .map_err(|_| format!("Invalid upper IP in CIDR/wildcard expansion: {}", upper_str))?;
-                    let lower_ipv6 = match lower_ip {
-                        std::net::IpAddr::V4(v4) => v4.to_ipv6_mapped(),
-                        std::net::IpAddr::V6(v6) => v6,
-                    };
-                    let upper_ipv6 = match upper_ip {
-                        std::net::IpAddr::V4(v4) => v4.to_ipv6_mapped(),
-                        std::net::IpAddr::V6(v6) => v6,
-                    };
-                    let lower_term = Term::from_field_ip_addr(field, lower_ipv6);
-                    let upper_term = Term::from_field_ip_addr(field, upper_ipv6);
-                    use std::ops::Bound;
-                    use tantivy::query::RangeQuery as TantivyRangeQuery;
-                    return Ok(Box::new(TantivyRangeQuery::new(
-                        Bound::Included(lower_term),
-                        Bound::Included(upper_term),
-                    )) as Box<dyn TantivyQuery>);
-                }
-
-                // Exact IP: parse the address (handles both IPv4 and IPv6)
+                // Parse IP address (handles both IPv4 and IPv6)
                 let ip_addr: std::net::IpAddr = ip_string.parse()
                     .map_err(|_| format!("Invalid IP address format: {}", ip_string))?;
 

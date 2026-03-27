@@ -59,7 +59,7 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitTermQuery_toQ
     mut env: JNIEnv,
     obj: JObject,
 ) -> jstring {
-    let result = convert_term_query_to_ast(&mut env, &obj, 0_i64);
+    let result = convert_term_query_to_ast(&mut env, &obj);
     match result {
         Ok(json) => match env.new_string(json) {
             Ok(jstring) => jstring.into_raw(),
@@ -92,7 +92,7 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitBooleanQuery_
     mut env: JNIEnv,
     obj: JObject,
 ) -> jstring {
-    let result = convert_boolean_query_to_ast(&mut env, &obj, 0_i64);
+    let result = convert_boolean_query_to_ast(&mut env, &obj);
     match result {
         Ok(json) => match env.new_string(json) {
             Ok(jstring) => jstring.into_raw(),
