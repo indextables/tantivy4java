@@ -10,6 +10,8 @@ use jni::JNIEnv;
 
 use crate::debug_println;
 use crate::perf_println;
+use crate::profile_section;
+use crate::ffi_profiler::Section;
 use crate::common::to_java_exception;
 use crate::runtime_manager::block_on_operation;
 use crate::split_query::convert_split_query_to_json;
@@ -47,13 +49,15 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_sear
     debug_println!("🚀 ASYNC_JNI: searchWithQueryAst called with async-first architecture");
 
     // Extract query JSON first (JNI types can't be sent across threads)
-    let query_json: String = match env.get_string(&query_ast_json) {
-        Ok(java_str) => java_str.into(),
-        Err(e) => {
-            debug_println!("❌ ASYNC_JNI: Failed to extract query JSON: {}", e);
-            return std::ptr::null_mut();
+    let query_json: String = profile_section!(Section::JniStringExtract, {
+        match env.get_string(&query_ast_json) {
+            Ok(java_str) => java_str.into(),
+            Err(e) => {
+                debug_println!("❌ ASYNC_JNI: Failed to extract query JSON: {}", e);
+                return std::ptr::null_mut();
+            }
         }
-    };
+    });
 
     // Use async pattern that returns LeafSearchResponse directly (avoid unnecessary JSON marshalling)
     debug_println!("🔍 ASYNC_JNI: About to call perform_search_async_impl_leaf_response");
@@ -68,7 +72,9 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_sear
             debug_println!("✅ ASYNC_JNI: Got LeafSearchResponse, creating SearchResult object");
             let t_result = std::time::Instant::now();
             // Create proper SearchResult object directly from LeafSearchResponse (no JSON marshalling)
-            match perform_unified_search_result_creation(leaf_search_response, &mut env, None, None, None, None) {
+            match profile_section!(Section::ResultCreation, {
+                perform_unified_search_result_creation(leaf_search_response, &mut env, None, None, None, None)
+            }) {
                 Ok(search_result_obj) => {
                     perf_println!("⏱️ PROJ_DIAG: === searchWithQueryAst TOTAL {}ms (search={}ms, result_creation={}ms) ===",
                         t_total.elapsed().as_millis(), t_search.as_millis(), t_result.elapsed().as_millis());
@@ -116,18 +122,20 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_sear
 
     // Extract all JNI data at entry point - no JNI types should go into core functions
     debug_println!("🔥 NATIVE DEBUG: Converting SplitQuery to JSON");
-    let query_json_str = match convert_split_query_to_json(&mut env, &split_query_obj, searcher_ptr) {
-        Ok(json_str) => {
-            debug_println!("🔥 NATIVE DEBUG: Successfully converted SplitQuery to JSON: {}", json_str);
-            json_str
-        },
-        Err(e) => {
-            debug_println!("🔥 NATIVE DEBUG: Failed to convert SplitQuery to JSON: {}", e);
-            debug_println!("❌ ASYNC_JNI: Failed to convert SplitQuery to JSON: {}", e);
-            to_java_exception(&mut env, &anyhow::anyhow!("Failed to convert SplitQuery to JSON: {}", e));
-            return std::ptr::null_mut();
+    let query_json_str = profile_section!(Section::QueryConvert, {
+        match convert_split_query_to_json(&mut env, &split_query_obj, searcher_ptr) {
+            Ok(json_str) => {
+                debug_println!("🔥 NATIVE DEBUG: Successfully converted SplitQuery to JSON: {}", json_str);
+                json_str
+            },
+            Err(e) => {
+                debug_println!("🔥 NATIVE DEBUG: Failed to convert SplitQuery to JSON: {}", e);
+                debug_println!("❌ ASYNC_JNI: Failed to convert SplitQuery to JSON: {}", e);
+                to_java_exception(&mut env, &anyhow::anyhow!("Failed to convert SplitQuery to JSON: {}", e));
+                return std::ptr::null_mut();
+            }
         }
-    };
+    });
 
     // Use async pattern that returns LeafSearchResponse directly (avoid unnecessary JSON marshalling)
     // No JNI types passed to core functions - all data extracted at entry point
@@ -161,7 +169,9 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_sear
             debug_println!("✅ ASYNC_JNI: Got LeafSearchResponse from SplitQuery, creating SearchResult object");
             let t_result = std::time::Instant::now();
             // Create proper SearchResult object directly from LeafSearchResponse (no JSON marshalling)
-            match perform_unified_search_result_creation(leaf_search_response, &mut env, None, None, None, None) {
+            match profile_section!(Section::ResultCreation, {
+                perform_unified_search_result_creation(leaf_search_response, &mut env, None, None, None, None)
+            }) {
                 Ok(search_result_obj) => {
                     perf_println!("⏱️ PROJ_DIAG: === searchWithSplitQuery TOTAL {}ms (query_convert={}ms, search={}ms, result_creation={}ms) ===",
                         t_total.elapsed().as_millis(), t_query_convert.as_millis(), t_search.as_millis() - t_query_convert.as_millis(), t_result.elapsed().as_millis());
@@ -216,32 +226,35 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_sear
     debug_println!("RUST DEBUG: searcher_ptr validation passed: {}", searcher_ptr);
 
     // Convert SplitQuery to QueryAst JSON (using existing infrastructure)
-    let query_json_result = convert_split_query_to_json(&mut env, &split_query, searcher_ptr);
-    let query_json = match query_json_result {
-        Ok(json) => {
-            debug_println!("RUST DEBUG: Query conversion successful");
-            json
-        },
-        Err(e) => {
-            debug_println!("RUST DEBUG: ⏱️ searchWithAggregations ERROR: Failed to convert SplitQuery [TIMING: {}ms]", method_start_time.elapsed().as_millis());
-            to_java_exception(&mut env, &anyhow::anyhow!("Failed to convert SplitQuery to JSON: {}", e));
-            return std::ptr::null_mut();
+    let query_json = profile_section!(Section::QueryConvert, {
+        match convert_split_query_to_json(&mut env, &split_query, searcher_ptr) {
+            Ok(json) => {
+                debug_println!("RUST DEBUG: Query conversion successful");
+                json
+            },
+            Err(e) => {
+                debug_println!("RUST DEBUG: ⏱️ searchWithAggregations ERROR: Failed to convert SplitQuery [TIMING: {}ms]", method_start_time.elapsed().as_millis());
+                to_java_exception(&mut env, &anyhow::anyhow!("Failed to convert SplitQuery to JSON: {}", e));
+                return std::ptr::null_mut();
+            }
         }
-    };
+    });
 
     // Convert Java aggregations map to JSON
     debug_println!("RUST DEBUG: Starting aggregation conversion");
-    let aggregation_request_json = match convert_java_aggregations_to_json(&mut env, &aggregations_map) {
-        Ok(agg_json) => {
-            debug_println!("RUST DEBUG: Aggregation conversion successful");
-            agg_json
-        },
-        Err(e) => {
-            debug_println!("RUST DEBUG: ⏱️ searchWithAggregations ERROR: Failed to convert aggregations to JSON [TIMING: {}ms]", method_start_time.elapsed().as_millis());
-            to_java_exception(&mut env, &anyhow::anyhow!("Failed to convert aggregations to JSON: {}", e));
-            return std::ptr::null_mut();
+    let aggregation_request_json = profile_section!(Section::AggJavaToJson, {
+        match convert_java_aggregations_to_json(&mut env, &aggregations_map) {
+            Ok(agg_json) => {
+                debug_println!("RUST DEBUG: Aggregation conversion successful");
+                agg_json
+            },
+            Err(e) => {
+                debug_println!("RUST DEBUG: ⏱️ searchWithAggregations ERROR: Failed to convert aggregations to JSON [TIMING: {}ms]", method_start_time.elapsed().as_millis());
+                to_java_exception(&mut env, &anyhow::anyhow!("Failed to convert aggregations to JSON: {}", e));
+                return std::ptr::null_mut();
+            }
         }
-    };
+    });
 
     debug_println!("RUST DEBUG: Query JSON: {}", query_json);
     if let Some(ref agg_json) = aggregation_request_json {
@@ -270,14 +283,16 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_sear
                          ctx.leaf_response.intermediate_aggregation_result.is_some());
 
             let t_result = std::time::Instant::now();
-            match perform_unified_search_result_creation(
-                ctx.leaf_response,
-                &mut env,
-                ctx.effective_agg_json,
-                ctx.redirected_hash_agg_names,
-                ctx.hash_resolution_map,
-                ctx.touchup_infos,
-            ) {
+            match profile_section!(Section::AggResultCreation, {
+                perform_unified_search_result_creation(
+                    ctx.leaf_response,
+                    &mut env,
+                    ctx.effective_agg_json,
+                    ctx.redirected_hash_agg_names,
+                    ctx.hash_resolution_map,
+                    ctx.touchup_infos,
+                )
+            }) {
                 Ok(search_result_obj) => {
                     perf_println!("⏱️ PROJ_DIAG: === searchWithAggregations TOTAL {}ms (jni_prep={}ms, search={}ms, result_creation={}ms) ===",
                         method_start_time.elapsed().as_millis(), t_jni_prep.as_millis(),
@@ -331,6 +346,7 @@ pub async fn perform_search_async_impl_leaf_response_with_aggregations(
 
     // Phase 2a: Rewrite query JSON to redirect FieldPresence (exists) queries on string
     // hash fields to the native _phash_* U64 field, avoiding string column transcoding.
+    let _t_rewrite_start = std::time::Instant::now();
     let effective_query_json = if let Some(ref manifest) = context.parquet_manifest {
         if !manifest.string_hash_fields.is_empty() {
             if let Some(rewritten) = crate::parquet_companion::hash_field_rewriter::rewrite_query_for_hash_fields(
@@ -411,6 +427,9 @@ pub async fn perform_search_async_impl_leaf_response_with_aggregations(
     // Lazy transcoding: ensure fast fields needed by aggregation + range queries are transcoded.
     // Use the rewritten query/agg JSON so that hash fields (already native) are not transcoded from parquet.
     let t_rewrite = t_total.elapsed();
+    if crate::ffi_profiler::is_enabled() {
+        crate::ffi_profiler::record(Section::AggRewriteHash, _t_rewrite_start.elapsed().as_nanos() as u64);
+    }
     perf_println!("⏱️ PROJ_DIAG: perform_search_with_aggregations query/agg rewriting took {}ms", t_rewrite.as_millis());
     let t_transcode = std::time::Instant::now();
     let overrides = if context.augmented_directory.is_some() {
@@ -425,6 +444,10 @@ pub async fn perform_search_async_impl_leaf_response_with_aggregations(
             fast_field_data: o.fast_field_data.clone(),
         })
     };
+    if crate::ffi_profiler::is_enabled() {
+        let transcode_elapsed = t_transcode.elapsed();
+        crate::ffi_profiler::record(Section::AggEnsureFastFields, transcode_elapsed.as_nanos() as u64);
+    }
     perf_println!("⏱️ PROJ_DIAG: perform_search_with_aggregations ensure_fast_fields took {}ms",
         t_transcode.elapsed().as_millis());
 
@@ -444,6 +467,9 @@ pub async fn perform_search_async_impl_leaf_response_with_aggregations(
         effective_agg_json.clone(),
         overrides,
     ).await?;
+    if crate::ffi_profiler::is_enabled() {
+        crate::ffi_profiler::record(Section::AggLeafSearch, t_leaf.elapsed().as_nanos() as u64);
+    }
     perf_println!("⏱️ PROJ_DIAG: perform_search_with_aggregations leaf_search took {}ms, {} hits",
         t_leaf.elapsed().as_millis(), leaf_response.num_hits);
 
@@ -503,6 +529,9 @@ pub async fn perform_search_async_impl_leaf_response_with_aggregations(
             (None, None)
         };
 
+    if crate::ffi_profiler::is_enabled() {
+        crate::ffi_profiler::record(Section::AggHashTouchup, t_phase3.elapsed().as_nanos() as u64);
+    }
     perf_println!("⏱️ PROJ_DIAG: perform_search_with_aggregations phase3 hash_resolution took {}ms",
         t_phase3.elapsed().as_millis());
 

@@ -546,6 +546,260 @@ public class SplitSearcher implements AutoCloseable {
     }
 
     /**
+     * Fused companion-mode search + retrieval: executes a no-score search and returns
+     * matching rows as Arrow columnar data.
+     *
+     * @deprecated Use {@link #startStreamingRetrieval(String, String...)} instead.
+     *             The streaming path has negligible overhead and is the single
+     *             companion retrieval path going forward. This method now delegates
+     *             to the streaming path internally.
+     *
+     * @param queryAstJson  Quickwit query AST JSON string
+     * @param arrayAddrs    pre-allocated ArrowArray memory addresses (one per field)
+     * @param schemaAddrs   pre-allocated ArrowSchema memory addresses (one per field)
+     * @param fields        field names to retrieve (null or empty for all fields)
+     * @return row count (&gt;0 = data, 0 = no matches, -1 = not a companion split)
+     */
+    @Deprecated(forRemoval = true)
+    public int searchAndRetrieveArrowFfi(String queryAstJson,
+                                         long[] arrayAddrs, long[] schemaAddrs,
+                                         String... fields) {
+        if (nativePtr == 0) {
+            throw new IllegalStateException("SplitSearcher has been closed or not properly initialized");
+        }
+
+        // Delegate to streaming path: start session → drain all batches → return total row count
+        StreamingSession session;
+        try {
+            session = startStreamingRetrieval(queryAstJson, fields);
+        } catch (IllegalStateException e) {
+            // Not a companion split or query error — return -1 for backward compatibility
+            return -1;
+        }
+
+        try {
+            int totalRows = 0;
+            while (true) {
+                int rows = session.nextBatch(arrayAddrs, schemaAddrs);
+                if (rows <= 0) break;
+                totalRows += rows;
+            }
+            return totalRows;
+        } finally {
+            session.close();
+        }
+    }
+
+    // =========================================================================
+    // Streaming Retrieval API (companion mode, large result sets > 50K rows)
+    // =========================================================================
+
+    /**
+     * A streaming retrieval session that implements AutoCloseable for safe resource management.
+     *
+     * <p>Wraps a native session handle with double-close protection and lifecycle tracking.
+     * Use with try-with-resources for automatic cleanup:
+     *
+     * <pre>{@code
+     * try (StreamingSession session = searcher.startStreamingRetrieval(queryJson, "field1")) {
+     *     int numCols = session.getColumnCount();
+     *     long[] arrayAddrs = new long[numCols];
+     *     long[] schemaAddrs = new long[numCols];
+     *     int rows;
+     *     while ((rows = session.nextBatch(arrayAddrs, schemaAddrs)) > 0) {
+     *         // process batch...
+     *     }
+     * }
+     * }</pre>
+     */
+    public static class StreamingSession implements AutoCloseable {
+        private long handle;
+        private volatile boolean closed = false;
+
+        StreamingSession(long handle) {
+            this.handle = handle;
+        }
+
+        /**
+         * Poll the next batch from the streaming session.
+         *
+         * @param arrayAddrs  pre-allocated ArrowArray memory addresses (one per column)
+         * @param schemaAddrs pre-allocated ArrowSchema memory addresses (one per column)
+         * @return row count (&gt;0 = data, 0 = end of stream)
+         * @throws IllegalStateException if session is closed
+         */
+        public synchronized int nextBatch(long[] arrayAddrs, long[] schemaAddrs) {
+            if (closed) {
+                throw new IllegalStateException("Streaming session has been closed");
+            }
+            return nativeNextBatch(handle, arrayAddrs, schemaAddrs);
+        }
+
+        /**
+         * Get the number of columns in the output schema.
+         *
+         * @return number of columns
+         * @throws IllegalStateException if session is closed
+         */
+        public synchronized int getColumnCount() {
+            if (closed) {
+                throw new IllegalStateException("Streaming session has been closed");
+            }
+            return nativeGetStreamingColumnCount(handle);
+        }
+
+        /**
+         * Get the native handle. For use by legacy code that needs the raw handle.
+         *
+         * @return native session handle, or 0 if closed
+         */
+        public long getHandle() {
+            return closed ? 0 : handle;
+        }
+
+        /**
+         * Close the session and free native resources.
+         * Safe to call multiple times — subsequent calls are no-ops.
+         */
+        @Override
+        public synchronized void close() {
+            if (!closed && handle != 0) {
+                nativeCloseStreamingSession(handle);
+                handle = 0;
+                closed = true;
+            }
+        }
+    }
+
+    /**
+     * Start a streaming bulk retrieval session.
+     *
+     * <p>Works for both companion (parquet) and regular (tantivy doc store) splits.
+     * Companion splits stream from parquet files; regular splits stream from the
+     * tantivy document store.
+     *
+     * <p>Starts a background producer that streams results in batches through a
+     * bounded channel. Memory usage is bounded to ~24MB regardless of total result size.
+     *
+     * <p>Returns a {@link StreamingSession} that implements {@link AutoCloseable}
+     * for safe resource management. Use with try-with-resources:
+     *
+     * <pre>{@code
+     * try (StreamingSession session = searcher.startStreamingRetrieval(queryJson, "field1")) {
+     *     int numCols = session.getColumnCount();
+     *     long[] arrayAddrs = new long[numCols];
+     *     long[] schemaAddrs = new long[numCols];
+     *     int rows;
+     *     while ((rows = session.nextBatch(arrayAddrs, schemaAddrs)) > 0) {
+     *         // process batch...
+     *     }
+     * }
+     * }</pre>
+     *
+     * @param queryAstJson Quickwit query AST JSON string
+     * @param fields       field names to retrieve (null or empty for all fields)
+     * @return streaming session (implements AutoCloseable)
+     * @throws IllegalStateException if searcher is closed or query is invalid
+     */
+    public StreamingSession startStreamingRetrieval(String queryAstJson, String... fields) {
+        return startStreamingRetrieval(queryAstJson, fields, null, -1);
+    }
+
+    /**
+     * Start a streaming retrieval session with explicit Arrow type hints.
+     *
+     * <p>Type hints allow the caller to specify narrower Arrow types for columns
+     * where tantivy's internal storage type (i64, f64) differs from the desired
+     * output type (e.g. Int32 for Spark IntegerType, Float32 for FloatType).
+     *
+     * <p>Type hints are passed as alternating pairs: [fieldName, arrowType, ...].
+     * Supported type strings: "i8", "i16", "i32", "i64", "u64", "f32", "f64",
+     * "bool", "utf8", "date", "binary".
+     *
+     * @param queryAstJson Quickwit query AST JSON string
+     * @param fields       field names to retrieve (null or empty for all fields)
+     * @param typeHints    alternating [fieldName, arrowType] pairs, or null for default types
+     * @return streaming session (implements AutoCloseable)
+     * @throws IllegalStateException if searcher is closed or query is invalid
+     */
+    public StreamingSession startStreamingRetrieval(String queryAstJson, String[] fields, String[] typeHints) {
+        return startStreamingRetrieval(queryAstJson, fields, typeHints, -1);
+    }
+
+    /**
+     * Start a streaming retrieval session with type hints and a document limit.
+     *
+     * <p>When {@code maxDocs > 0}, the native layer truncates the result set before
+     * prefetching store-file byte ranges and before the producer starts retrieving
+     * documents. This avoids unnecessary S3 requests when the caller only needs a
+     * subset of matching rows (e.g., Spark {@code LIMIT 100}).
+     *
+     * @param queryAstJson Quickwit query AST JSON string
+     * @param fields       field names to retrieve (null or empty for all fields)
+     * @param typeHints    alternating [fieldName, arrowType] pairs, or null for default types
+     * @param maxDocs      maximum documents to retrieve, or -1 for unlimited
+     * @return streaming session (implements AutoCloseable)
+     * @throws IllegalStateException if searcher is closed or query is invalid
+     */
+    public StreamingSession startStreamingRetrieval(String queryAstJson, String[] fields,
+                                                     String[] typeHints, int maxDocs) {
+        if (nativePtr == 0) {
+            throw new IllegalStateException("SplitSearcher has been closed or not properly initialized");
+        }
+        long session = nativeStartStreamingRetrieval(nativePtr, queryAstJson,
+                fields != null && fields.length > 0 ? fields : null,
+                typeHints != null && typeHints.length > 0 ? typeHints : null,
+                maxDocs);
+        if (session == 0) {
+            throw new IllegalStateException(
+                    "Failed to start streaming retrieval — query error or no stored fields");
+        }
+        return new StreamingSession(session);
+    }
+
+    /**
+     * Poll the next batch from a streaming retrieval session.
+     *
+     * @deprecated Use {@link StreamingSession#nextBatch} instead for type-safe lifecycle management.
+     * @param sessionHandle handle from startStreamingRetrieval
+     * @param arrayAddrs    pre-allocated ArrowArray memory addresses
+     * @param schemaAddrs   pre-allocated ArrowSchema memory addresses
+     * @return row count (&gt;0 = data, 0 = end of stream, -1 = error)
+     */
+    @Deprecated
+    public int nextBatch(long sessionHandle, long[] arrayAddrs, long[] schemaAddrs) {
+        return nativeNextBatch(sessionHandle, arrayAddrs, schemaAddrs);
+    }
+
+    /**
+     * Close a streaming retrieval session and free native resources.
+     *
+     * <p>Safe to call multiple times — the native layer uses a registry pattern
+     * so duplicate close calls are no-ops.
+     *
+     * @deprecated Use {@link StreamingSession#close} instead for type-safe lifecycle management.
+     * @param sessionHandle handle from startStreamingRetrieval
+     */
+    @Deprecated
+    public void closeStreamingSession(long sessionHandle) {
+        if (sessionHandle != 0) {
+            nativeCloseStreamingSession(sessionHandle);
+        }
+    }
+
+    /**
+     * Get the number of columns in a streaming session's output schema.
+     *
+     * @deprecated Use {@link StreamingSession#getColumnCount} instead.
+     * @param sessionHandle handle from startStreamingRetrieval
+     * @return number of columns, or -1 on error
+     */
+    @Deprecated
+    public int getStreamingColumnCount(long sessionHandle) {
+        return nativeGetStreamingColumnCount(sessionHandle);
+    }
+
+    /**
      * Retrieve multiple documents by their addresses in a single batch operation.
      * This is significantly more efficient than calling doc() multiple times,
      * especially for large numbers of documents.
@@ -1294,6 +1548,14 @@ public class SplitSearcher implements AutoCloseable {
     private static native byte[] nativeDocBatchProjected(long nativePtr, int[] segments, int[] docIds, String[] fields);
     private static native int nativeDocBatchArrowFfi(long nativePtr, int[] segments, int[] docIds, String[] fields,
                                                      long[] arrayAddrs, long[] schemaAddrs);
+
+    // Streaming retrieval session
+    private static native long nativeStartStreamingRetrieval(long nativePtr, String queryAstJson,
+                                                              String[] fields, String[] typeHints,
+                                                              int maxDocs);
+    private static native int nativeNextBatch(long sessionPtr, long[] arrayAddrs, long[] schemaAddrs);
+    private static native void nativeCloseStreamingSession(long sessionPtr);
+    private static native int nativeGetStreamingColumnCount(long sessionPtr);
 
     // Smart Wildcard Optimization Statistics (for testing/monitoring)
     private static native void resetSmartWildcardStats();

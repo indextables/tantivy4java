@@ -57,6 +57,7 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_prel
     }
 
     // Perform the warmup using async runtime
+    let _t_prewarm = std::time::Instant::now();
     match block_on_operation(async move {
         let mut errors = Vec::new();
 
@@ -151,10 +152,16 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_prel
         }
     }) {
         Ok(_) => {
+            if crate::ffi_profiler::is_enabled() {
+                crate::ffi_profiler::record(crate::ffi_profiler::Section::PrewarmComponents, _t_prewarm.elapsed().as_nanos() as u64);
+            }
             debug_println!("✅ PREWARM: All requested components warmed up successfully");
             1 // success
         },
         Err(e) => {
+            if crate::ffi_profiler::is_enabled() {
+                crate::ffi_profiler::record(crate::ffi_profiler::Section::PrewarmComponents, _t_prewarm.elapsed().as_nanos() as u64);
+            }
             debug_println!("❌ PREWARM: Component warmup failed: {}", e);
             0 // failure
         }

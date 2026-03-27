@@ -1,0 +1,14 @@
+# Linux version script for tantivy4java shared library
+# This script controls symbol visibility, only exporting JNI methods
+# Usage: rustc -C link-args="-Wl,--version-script=tantivy4java.version"
+
+# Version block defines what symbols to export
+TANTIVY4JAVA_1.0 {
+    global:
+        # Export all JNI methods (Java_ prefixed functions)
+        Java_*;
+
+    local:
+        # Hide all other symbols
+        *;
+};

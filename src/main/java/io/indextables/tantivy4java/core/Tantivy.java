@@ -23,6 +23,7 @@ import java.io.InputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.security.MessageDigest;
 
 /**
  * Main entry point for Tantivy4Java library.
@@ -58,15 +59,40 @@ public class Tantivy {
         try {
             // Load from resources
             InputStream is = Tantivy.class.getResourceAsStream("/native/" + libraryName);
-            
+
             if (is != null) {
-                Path tempFile = Files.createTempFile("tantivy4java", libraryName);
-                Files.copy(is, tempFile, StandardCopyOption.REPLACE_EXISTING);
-                System.load(tempFile.toAbsolutePath().toString());
+                // Read the library bytes once for hashing and writing
+                byte[] libBytes = is.readAllBytes();
+                is.close();
+
+                // Compute a content hash so all JVMs sharing the same dylib
+                // reuse a single temp file instead of creating one per process.
+                String hex = bytesToHex(MessageDigest.getInstance("SHA-256").digest(libBytes));
+                String shortHash = hex.substring(0, 16);
+                Path tempDir = Path.of(System.getProperty("java.io.tmpdir"));
+                Path stableFile = tempDir.resolve("tantivy4java-" + shortHash + "-" + libraryName);
+
+                if (!Files.exists(stableFile)) {
+                    // Write to a temp file first, then atomic-move to avoid races
+                    Path tmp = Files.createTempFile(tempDir, "tantivy4java", ".tmp");
+                    Files.write(tmp, libBytes);
+                    try {
+                        Files.move(tmp, stableFile,
+                                StandardCopyOption.ATOMIC_MOVE,
+                                StandardCopyOption.REPLACE_EXISTING);
+                    } catch (java.nio.file.AtomicMoveNotSupportedException e2) {
+                        Files.move(tmp, stableFile, StandardCopyOption.REPLACE_EXISTING);
+                    } catch (java.nio.file.FileAlreadyExistsException e2) {
+                        // Another JVM beat us — that's fine
+                        Files.deleteIfExists(tmp);
+                    }
+                }
+
+                System.load(stableFile.toAbsolutePath().toString());
                 loaded = true;
                 return;
             }
-            
+
             throw new RuntimeException("Native library not found in resources: /native/" + libraryName);
         } catch (Exception e) {
             throw new RuntimeException("Failed to load tantivy4java native library: " + libraryName, e);
@@ -107,6 +133,14 @@ public class Tantivy {
     }
     
     
+    private static String bytesToHex(byte[] bytes) {
+        StringBuilder sb = new StringBuilder(bytes.length * 2);
+        for (byte b : bytes) {
+            sb.append(String.format("%02x", b));
+        }
+        return sb.toString();
+    }
+
     /**
      * Get the version of the Tantivy4Java library.
      * @return Version string

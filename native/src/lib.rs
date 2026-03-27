@@ -22,6 +22,8 @@ use jni::sys::jstring;
 use jni::JNIEnv;
 
 mod debug;  // Debug utilities and conditional logging
+pub mod ffi_profiler;  // Near-zero-overhead FFI read-path profiler
+mod ffi_profiler_jni;  // JNI bridge for FFI profiler
 pub mod ip_expansion;  // CIDR and wildcard IP pattern expansion for transparent query rewriting
 pub mod memory_pool;  // Unified JVM-coordinated memory management
 mod runtime_manager;  // Global Quickwit runtime manager for async-first architecture
@@ -51,6 +53,7 @@ pub mod delta_reader;  // Delta Lake table file listing via delta-kernel-rs
 pub mod iceberg_reader;  // Iceberg table reading via apache/iceberg-rust
 pub mod parquet_schema_reader;  // Read schema from standalone parquet files
 pub mod parquet_reader;  // Hive-style partitioned parquet directory reading
+pub mod txlog;  // Indextables transaction log (Avro state format, v4)
 
 pub use schema::*;
 pub use document::*;

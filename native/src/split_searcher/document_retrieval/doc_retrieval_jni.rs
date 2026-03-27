@@ -36,6 +36,7 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_docB
         return std::ptr::null_mut();
     }
 
+    let _t_jni_extract = std::time::Instant::now();
     // Convert JNI arrays to proper JArray types
     let segments_array = unsafe { jni::objects::JIntArray::from_raw(segments) };
     let doc_ids_array = unsafe { jni::objects::JIntArray::from_raw(doc_ids) };
@@ -87,9 +88,16 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_docB
         .enumerate()
         .map(|(idx, (&seg, &doc))| (idx, tantivy::DocAddress::new(seg, doc)))
         .collect();
+    if crate::ffi_profiler::is_enabled() {
+        crate::ffi_profiler::record(crate::ffi_profiler::Section::DocBatchJniExtract, _t_jni_extract.elapsed().as_nanos() as u64);
+    }
 
     // Sort by document address for cache locality (following Quickwit pattern)
+    let _t_sort = std::time::Instant::now();
     indexed_addresses.sort_by_key(|(_, addr)| *addr);
+    if crate::ffi_profiler::is_enabled() {
+        crate::ffi_profiler::record(crate::ffi_profiler::Section::DocBatchSort, _t_sort.elapsed().as_nanos() as u64);
+    }
 
     // Extract sorted addresses for batch retrieval
     let sorted_addresses: Vec<tantivy::DocAddress> = indexed_addresses
@@ -104,14 +112,19 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_docB
     match retrieval_result {
         Ok(sorted_docs) => {
             // Reorder documents back to original input order
+            let _t_reorder = std::time::Instant::now();
             let mut ordered_doc_ptrs = vec![std::ptr::null_mut(); indexed_addresses.len()];
             for (i, (original_idx, _)) in indexed_addresses.iter().enumerate() {
                 if i < sorted_docs.len() {
                     ordered_doc_ptrs[*original_idx] = sorted_docs[i];
                 }
             }
+            if crate::ffi_profiler::is_enabled() {
+                crate::ffi_profiler::record(crate::ffi_profiler::Section::DocBatchReorder, _t_reorder.elapsed().as_nanos() as u64);
+            }
 
             // Create a Java Document array
+            let _t_java_objects = std::time::Instant::now();
             let document_class =
                 match env.find_class("io/indextables/tantivy4java/core/Document") {
                     Ok(class) => class,
@@ -167,6 +180,9 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_docB
                         &anyhow::anyhow!("Failed to set array element: {}", e),
                     );
                 }
+            }
+            if crate::ffi_profiler::is_enabled() {
+                crate::ffi_profiler::record(crate::ffi_profiler::Section::DocBatchCreateJavaObjects, _t_java_objects.elapsed().as_nanos() as u64);
             }
 
             doc_array.into_raw()
@@ -828,6 +844,172 @@ fn extract_jni_field_names(
     }
 }
 
+/// Parse type hint strings from a JNI String[] into a HashMap<String, DataType>.
+///
+/// Type hints are passed as alternating pairs: [fieldName, arrowType, fieldName, arrowType, ...].
+/// Supported type strings: "i8", "i16", "i32", "i64", "u64", "f32", "f64", "bool", "utf8",
+/// "date", "binary".
+///
+/// Returns None if the array is null or empty.
+fn parse_type_hints_from_env(
+    env: &mut JNIEnv,
+    type_hint_strs: jni::sys::jobjectArray,
+) -> anyhow::Result<Option<std::collections::HashMap<String, arrow_schema::DataType>>> {
+    if type_hint_strs.is_null() {
+        return Ok(None);
+    }
+    let hint_array = unsafe { jni::objects::JObjectArray::from_raw(type_hint_strs) };
+    let len = env.get_array_length(&hint_array)
+        .map_err(|e| anyhow::anyhow!("Failed to get type hints array length: {}", e))?;
+    if len == 0 || len % 2 != 0 {
+        return Ok(None);
+    }
+
+    let mut hints = std::collections::HashMap::new();
+    let mut i = 0;
+    while i < len {
+        let name_obj = env.get_object_array_element(&hint_array, i)
+            .map_err(|e| anyhow::anyhow!("Failed to get type hint name at {}: {}", i, e))?;
+        let type_obj = env.get_object_array_element(&hint_array, i + 1)
+            .map_err(|e| anyhow::anyhow!("Failed to get type hint type at {}: {}", i + 1, e))?;
+
+        if !name_obj.is_null() && !type_obj.is_null() {
+            let name: String = env.get_string((&name_obj).into())
+                .map_err(|e| anyhow::anyhow!("Failed to convert type hint name: {}", e))?
+                .into();
+            let type_str: String = env.get_string((&type_obj).into())
+                .map_err(|e| anyhow::anyhow!("Failed to convert type hint type: {}", e))?
+                .into();
+
+            if let Some(dt) = parse_arrow_type_string(&type_str) {
+                hints.insert(name, dt);
+            }
+        }
+        i += 2;
+    }
+
+    if hints.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(hints))
+    }
+}
+
+/// Parse an Arrow type string to a DataType.
+///
+/// Supports scalar type names (e.g. "i32", "string") and JSON-formatted
+/// complex types for Struct, List, and Map:
+///
+/// ```json
+/// {"struct": {"name": "string", "age": "i32"}}
+/// {"list": "string"}
+/// {"list": {"struct": {"x": "f64", "y": "f64"}}}
+/// {"map": ["string", "i64"]}
+/// ```
+fn parse_arrow_type_string(s: &str) -> Option<arrow_schema::DataType> {
+    // Try JSON complex type first (starts with '{')
+    if s.starts_with('{') {
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(s) {
+            return parse_complex_type_json(&json);
+        }
+    }
+
+    // Scalar types
+    match s {
+        "i8" | "int8" | "byte" => Some(arrow_schema::DataType::Int8),
+        "i16" | "int16" | "short" => Some(arrow_schema::DataType::Int16),
+        "i32" | "int32" | "int" => Some(arrow_schema::DataType::Int32),
+        "i64" | "int64" | "long" => Some(arrow_schema::DataType::Int64),
+        "u64" | "uint64" => Some(arrow_schema::DataType::UInt64),
+        "f32" | "float32" | "float" => Some(arrow_schema::DataType::Float32),
+        "f64" | "float64" | "double" => Some(arrow_schema::DataType::Float64),
+        "bool" | "boolean" => Some(arrow_schema::DataType::Boolean),
+        "utf8" | "string" => Some(arrow_schema::DataType::Utf8),
+        "date" | "timestamp" => Some(arrow_schema::DataType::Timestamp(
+            arrow_schema::TimeUnit::Microsecond, None,
+        )),
+        "date32" => Some(arrow_schema::DataType::Date32),
+        "binary" | "bytes" => Some(arrow_schema::DataType::Binary),
+        _ => None,
+    }
+}
+
+/// Parse a JSON value into an Arrow DataType, supporting recursive complex types.
+///
+/// String values are parsed as scalar types. Object values describe complex types:
+/// - `{"struct": {"field1": <type>, "field2": <type>, ...}}` → Struct
+/// - `{"list": <element_type>}` → List
+/// - `{"map": [<key_type>, <value_type>]}` → Map
+///
+/// Types can be nested arbitrarily:
+/// `{"struct": {"tags": {"list": "string"}, "coords": {"struct": {"x": "f64", "y": "f64"}}}}`
+/// Parse a JSON value into an Arrow DataType, supporting recursive complex types.
+///
+/// String values are parsed as scalar types. Object values describe complex types:
+/// - `{"struct": [["field1", <type>], ["field2", <type>], ...]}` → Struct (order-preserving)
+/// - `{"list": <element_type>}` → List
+/// - `{"map": [<key_type>, <value_type>]}` → Map
+///
+/// Struct fields use an array-of-pairs format to guarantee ordering. JSON objects
+/// are unordered by spec, and serde_json uses BTreeMap (alphabetical sort). Spark
+/// reads struct children by ordinal position, so ordering must be preserved.
+///
+/// Types can be nested arbitrarily:
+/// `{"struct": [["tags", {"list": "string"}], ["name", "string"]]}`
+fn parse_complex_type_json(v: &serde_json::Value) -> Option<arrow_schema::DataType> {
+    use arrow_schema::{DataType, Field};
+    use std::sync::Arc;
+
+    match v {
+        serde_json::Value::String(s) => parse_arrow_type_string(s),
+        serde_json::Value::Object(map) => {
+            if let Some(fields_val) = map.get("struct") {
+                // Struct: {"struct": [["name", "string"], ["age", "i32"]]}
+                // Array-of-pairs format guarantees field ordering.
+                let fields_arr = fields_val.as_array()?;
+                let mut fields = Vec::with_capacity(fields_arr.len());
+                for pair in fields_arr {
+                    let pair_arr = pair.as_array()?;
+                    if pair_arr.len() != 2 {
+                        return None;
+                    }
+                    let name = pair_arr[0].as_str()?;
+                    let dt = parse_complex_type_json(&pair_arr[1])?;
+                    fields.push(Arc::new(Field::new(name, dt, true)));
+                }
+                Some(DataType::Struct(fields.into()))
+            } else if let Some(elem_val) = map.get("list") {
+                // List: {"list": "string"} or {"list": {"struct": [...]}}
+                let elem_type = parse_complex_type_json(elem_val)?;
+                Some(DataType::List(Arc::new(Field::new("item", elem_type, true))))
+            } else if let Some(kv_val) = map.get("map") {
+                // Map: {"map": ["string", "i64"]}
+                let kv_arr = kv_val.as_array()?;
+                if kv_arr.len() != 2 {
+                    return None;
+                }
+                let key_type = parse_complex_type_json(&kv_arr[0])?;
+                let val_type = parse_complex_type_json(&kv_arr[1])?;
+                let entries_field = Field::new(
+                    "entries",
+                    DataType::Struct(
+                        vec![
+                            Arc::new(Field::new("key", key_type, false)),
+                            Arc::new(Field::new("value", val_type, true)),
+                        ]
+                        .into(),
+                    ),
+                    false,
+                );
+                Some(DataType::Map(Arc::new(entries_field), false))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
 /// Resolve doc addresses to parquet file groups via fast fields.
 ///
 /// This is the shared pipeline used by both nativeDocBatchProjected (TANT) and
@@ -850,11 +1032,15 @@ async fn resolve_doc_addresses_to_groups(
             .await
             .map_err(|e| anyhow::anyhow!("Failed to load __pq fields for seg {}: {}", seg, e))?;
     }
+    let pq_load_elapsed = t_pq_load.elapsed();
     perf_println!(
         "⏱️ PROJ_DIAG: ensure_pq_segment_loaded({} segments) took {}ms",
         unique_segments.len(),
-        t_pq_load.elapsed().as_millis()
+        pq_load_elapsed.as_millis()
     );
+    if crate::ffi_profiler::is_enabled() {
+        crate::ffi_profiler::record(crate::ffi_profiler::Section::PqDocEnsurePqFields, pq_load_elapsed.as_nanos() as u64);
+    }
 
     // Resolve all addresses via pre-loaded __pq data
     let t_resolve = std::time::Instant::now();
@@ -863,11 +1049,15 @@ async fn resolve_doc_addresses_to_groups(
         let (file_hash, row_in_file) = ctx.get_pq_location(seg_ord, doc_id)?;
         resolved_locations.push((idx, file_hash, row_in_file));
     }
+    let resolve_elapsed = t_resolve.elapsed();
     perf_println!(
         "⏱️ PROJ_DIAG: get_pq_location({} docs) took {}ms",
         addresses.len(),
-        t_resolve.elapsed().as_millis()
+        resolve_elapsed.as_millis()
     );
+    if crate::ffi_profiler::is_enabled() {
+        crate::ffi_profiler::record(crate::ffi_profiler::Section::PqDocResolveLocations, resolve_elapsed.as_nanos() as u64);
+    }
 
     let t_group = std::time::Instant::now();
     let groups = crate::parquet_companion::docid_mapping::group_resolved_locations_by_file(
@@ -875,11 +1065,15 @@ async fn resolve_doc_addresses_to_groups(
         &ctx.parquet_file_hash_index,
     )
     .map_err(|e| anyhow::anyhow!("{}", e))?;
+    let group_elapsed = t_group.elapsed();
     perf_println!(
         "⏱️ PROJ_DIAG: group_resolved_locations_by_file → {} file groups, took {}ms",
         groups.len(),
-        t_group.elapsed().as_millis()
+        group_elapsed.as_millis()
     );
+    if crate::ffi_profiler::is_enabled() {
+        crate::ffi_profiler::record(crate::ffi_profiler::Section::PqDocGroupByFile, group_elapsed.as_nanos() as u64);
+    }
 
     Ok(groups)
 }
@@ -944,11 +1138,15 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_nati
     use crate::utils::convert_throwable;
     convert_throwable(&mut env, |env| {
         // Extract JNI arrays
+        let _t_pq_jni_extract = std::time::Instant::now();
         let (segments_vec, doc_ids_vec) = extract_jni_int_arrays(env, segments, doc_ids)
             .map_err(|msg| anyhow::anyhow!("{}", msg))?;
 
         // Extract field names
         let projected_fields = extract_jni_field_names(env, field_names);
+        if crate::ffi_profiler::is_enabled() {
+            crate::ffi_profiler::record(crate::ffi_profiler::Section::PqDocJniExtract, _t_pq_jni_extract.elapsed().as_nanos() as u64);
+        }
 
         let t_jni_total = std::time::Instant::now();
         perf_println!(
@@ -989,10 +1187,14 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_nati
                         ctx.parquet_coalesce_config,
                     )
                     .await;
+                    let parquet_elapsed = t_parquet.elapsed();
                     perf_println!(
                         "⏱️ PROJ_DIAG: batch_parquet_to_tant_buffer_by_groups took {}ms",
-                        t_parquet.elapsed().as_millis()
+                        parquet_elapsed.as_millis()
                     );
+                    if crate::ffi_profiler::is_enabled() {
+                        crate::ffi_profiler::record(crate::ffi_profiler::Section::PqDocParquetRead, parquet_elapsed.as_nanos() as u64);
+                    }
                     result
                 })
             })
@@ -1012,10 +1214,14 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_nati
                 };
                 env.set_byte_array_region(&byte_array, 0, byte_slice)
                     .map_err(|e| anyhow::anyhow!("Failed to set byte array data: {}", e))?;
+                let jni_copy_elapsed = t_jni_copy.elapsed();
                 perf_println!(
                     "⏱️ PROJ_DIAG: JNI byte array copy took {}ms",
-                    t_jni_copy.elapsed().as_millis()
+                    jni_copy_elapsed.as_millis()
                 );
+                if crate::ffi_profiler::is_enabled() {
+                    crate::ffi_profiler::record(crate::ffi_profiler::Section::PqDocJniCopy, jni_copy_elapsed.as_nanos() as u64);
+                }
                 perf_println!(
                     "⏱️ PROJ_DIAG: === nativeDocBatchProjected TOTAL took {}ms ===",
                     t_jni_total.elapsed().as_millis()
@@ -1121,9 +1327,13 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_nati
 
             tokio::task::block_in_place(|| {
                 runtime.block_on(async {
+                    let _t_resolve = std::time::Instant::now();
                     let groups = resolve_doc_addresses_to_groups(ctx, &addresses).await?;
+                    if crate::ffi_profiler::is_enabled() {
+                        crate::ffi_profiler::record(crate::ffi_profiler::Section::ArrowFfiResolve, _t_resolve.elapsed().as_nanos() as u64);
+                    }
 
-                    let t_ffi = std::time::Instant::now();
+                    let _t_batch_read = std::time::Instant::now();
                     let row_count =
                         crate::parquet_companion::arrow_ffi_export::batch_parquet_to_arrow_ffi(
                             groups,
@@ -1138,9 +1348,12 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_nati
                             &schema_addrs_vec,
                         )
                         .await?;
+                    if crate::ffi_profiler::is_enabled() {
+                        crate::ffi_profiler::record(crate::ffi_profiler::Section::ArrowFfiBatchRead, _t_batch_read.elapsed().as_nanos() as u64);
+                    }
                     perf_println!(
                         "⏱️ FFI_DIAG: batch_parquet_to_arrow_ffi returned {} rows, took {}ms",
-                        row_count, t_ffi.elapsed().as_millis()
+                        row_count, _t_batch_read.elapsed().as_millis()
                     );
                     Ok::<usize, anyhow::Error>(row_count)
                 })
@@ -1165,4 +1378,415 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_nati
             None => Err(anyhow::anyhow!("Searcher context not found")),
         }
     }).unwrap_or(-1)
+}
+
+// =====================================================================
+// Streaming Retrieval Session JNI Methods
+// =====================================================================
+
+/// Start a streaming bulk retrieval session for companion mode.
+///
+/// Performs the search + resolve phases synchronously, then starts a background
+/// producer task that streams batches through a bounded channel.
+///
+/// Returns a session handle (jlong) that Java uses to poll batches via
+/// nativeNextBatch. Returns 0 on error (exception thrown) or if not a companion split.
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_nativeStartStreamingRetrieval(
+    mut env: JNIEnv,
+    _class: JClass,
+    searcher_ptr: jlong,
+    query_ast_json: jni::objects::JString,
+    field_names: jni::sys::jobjectArray,
+    type_hint_strs: jni::sys::jobjectArray,
+    max_docs: jni::sys::jint,
+) -> jlong {
+    if searcher_ptr == 0 {
+        to_java_exception(&mut env, &anyhow::anyhow!("Invalid searcher pointer"));
+        return 0;
+    }
+
+    // Check if this split has a parquet manifest (companion vs regular split)
+    let has_manifest = with_arc_safe(searcher_ptr, |ctx: &Arc<CachedSearcherContext>| {
+        ctx.parquet_manifest.is_some()
+    })
+    .unwrap_or(false);
+
+    use crate::utils::convert_throwable;
+    convert_throwable(&mut env, |env| {
+        // Extract query string
+        let query_json: String = env
+            .get_string(&query_ast_json)
+            .map_err(|e| anyhow::anyhow!("Failed to get query string: {}", e))?
+            .into();
+
+        // Extract field names
+        let projected_fields = extract_jni_field_names(env, field_names);
+
+        // Parse type hints (alternating pairs: [fieldName, arrowType, ...])
+        let type_hints = parse_type_hints_from_env(env, type_hint_strs)?;
+
+        let t_total = std::time::Instant::now();
+        perf_println!(
+            "⏱️ STREAMING_JNI: === nativeStartStreamingRetrieval START === companion={} fields={:?}",
+            has_manifest, projected_fields
+        );
+
+        let result = with_arc_safe(searcher_ptr, |ctx: &Arc<CachedSearcherContext>| {
+            let runtime = crate::runtime_manager::QuickwitRuntimeManager::global().handle();
+            let _guard = runtime.enter();
+
+            tokio::task::block_in_place(|| {
+                runtime.block_on(async {
+                    // Phase 1: No-score search (works for both companion and regular splits)
+                    let mut doc_ids = crate::split_searcher::bulk_retrieval::perform_bulk_search(
+                        ctx, &query_json,
+                    ).await?;
+
+                    perf_println!("⏱️ STREAMING_JNI: search found {} docs", doc_ids.len());
+
+                    // Apply maxDocs limit to avoid unnecessary S3 prefetch/retrieval
+                    if max_docs > 0 && (doc_ids.len() as i32) > max_docs {
+                        perf_println!(
+                            "⏱️ STREAMING_JNI: truncating {} docs to maxDocs={}",
+                            doc_ids.len(), max_docs
+                        );
+                        doc_ids.truncate(max_docs as usize);
+                    }
+
+                    if has_manifest {
+                        // === COMPANION PATH: parquet-based streaming ===
+                        if doc_ids.is_empty() {
+                            perf_println!("⏱️ STREAMING_JNI: no matches — returning empty session (companion)");
+                            let (_, rx) = tokio::sync::mpsc::channel::<anyhow::Result<arrow_array::RecordBatch>>(1);
+                            let manifest = ctx.parquet_manifest.as_ref().unwrap();
+                            let schema = crate::parquet_companion::streaming_ffi::build_tantivy_schema_pub(
+                                manifest, projected_fields.as_deref(),
+                            )?;
+                            let session = crate::parquet_companion::streaming_ffi::StreamingRetrievalSession::new_empty(
+                                rx, schema,
+                            );
+                            let handle = crate::utils::arc_to_jlong(std::sync::Arc::new(std::sync::Mutex::new(session)));
+                            return Ok::<jlong, anyhow::Error>(handle);
+                        }
+
+                        // Phase 2: Resolve to parquet locations
+                        let groups = crate::split_searcher::bulk_retrieval::resolve_to_parquet_locations(
+                            ctx, &doc_ids,
+                        ).await?;
+
+                        perf_println!(
+                            "⏱️ STREAMING_JNI: resolved to {} file groups (companion)",
+                            groups.len()
+                        );
+
+                        // Phase 3: Start companion streaming producer
+                        let manifest = ctx.parquet_manifest.as_ref().unwrap().clone();
+                        let storage = crate::split_searcher::bulk_retrieval::get_parquet_storage(ctx)?;
+
+                        let session = crate::parquet_companion::streaming_ffi::start_streaming_retrieval(
+                            groups,
+                            projected_fields,
+                            manifest,
+                            storage,
+                            Some(ctx.parquet_metadata_cache.clone()),
+                            Some(ctx.parquet_byte_range_cache.clone()),
+                            ctx.parquet_coalesce_config,
+                        )?;
+
+                        let handle = crate::utils::arc_to_jlong(std::sync::Arc::new(std::sync::Mutex::new(session)));
+                        Ok(handle)
+                    } else {
+                        // === REGULAR PATH: tantivy doc store streaming ===
+                        let session = crate::split_searcher::streaming_doc_retrieval::start_tantivy_streaming_retrieval(
+                            ctx, doc_ids, projected_fields, type_hints,
+                        ).await?;
+
+                        let handle = crate::utils::arc_to_jlong(std::sync::Arc::new(std::sync::Mutex::new(session)));
+                        Ok(handle)
+                    }
+                })
+            })
+        });
+
+        match result {
+            Some(Ok(handle)) => {
+                perf_println!(
+                    "⏱️ STREAMING_JNI: === session started, took {}ms ===",
+                    t_total.elapsed().as_millis()
+                );
+                Ok(handle)
+            }
+            Some(Err(e)) => {
+                perf_println!(
+                    "⏱️ STREAMING_JNI: === FAILED after {}ms: {} ===",
+                    t_total.elapsed().as_millis(), e
+                );
+                Err(anyhow::anyhow!("Failed to start streaming retrieval: {}", e))
+            }
+            None => Err(anyhow::anyhow!("Searcher context not found")),
+        }
+    })
+    .unwrap_or(0)
+}
+
+/// Poll the next batch from a streaming session.
+///
+/// Writes Arrow FFI data to the provided addresses.
+/// Returns: >0 = row count, 0 = end of stream, -1 = error.
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_nativeNextBatch(
+    mut env: JNIEnv,
+    _class: JClass,
+    session_ptr: jlong,
+    array_addrs: jni::sys::jlongArray,
+    schema_addrs: jni::sys::jlongArray,
+) -> jint {
+    if session_ptr == 0 {
+        to_java_exception(&mut env, &anyhow::anyhow!("Invalid session pointer"));
+        return -1;
+    }
+
+    use crate::utils::convert_throwable;
+    convert_throwable(&mut env, |env| {
+        // Look up session in registry (safe — no raw pointer dereference)
+        let session_arc = crate::utils::jlong_to_arc::<std::sync::Mutex<
+            crate::parquet_companion::streaming_ffi::StreamingRetrievalSession,
+        >>(session_ptr)
+        .ok_or_else(|| anyhow::anyhow!("Streaming session not found or already closed (handle={})", session_ptr))?;
+
+        // Extract FFI addresses
+        let array_addrs_jni = unsafe { jni::objects::JLongArray::from_raw(array_addrs) };
+        let schema_addrs_jni = unsafe { jni::objects::JLongArray::from_raw(schema_addrs) };
+
+        let addrs_len = env
+            .get_array_length(&array_addrs_jni)
+            .map_err(|e| anyhow::anyhow!("Failed to get array_addrs length: {}", e))?
+            as usize;
+
+        let mut array_addrs_vec = vec![0i64; addrs_len];
+        env.get_long_array_region(&array_addrs_jni, 0, &mut array_addrs_vec)
+            .map_err(|e| anyhow::anyhow!("Failed to get array_addrs: {}", e))?;
+
+        let mut schema_addrs_vec = vec![0i64; addrs_len];
+        env.get_long_array_region(&schema_addrs_jni, 0, &mut schema_addrs_vec)
+            .map_err(|e| anyhow::anyhow!("Failed to get schema_addrs: {}", e))?;
+
+        // Poll next batch from channel (blocking)
+        let mut session = session_arc.lock()
+            .map_err(|e| anyhow::anyhow!("Failed to lock streaming session: {}", e))?;
+        match session.blocking_next() {
+            Some(Ok(batch)) => {
+                let row_count = crate::parquet_companion::streaming_ffi::write_batch_to_ffi(
+                    &batch,
+                    &array_addrs_vec,
+                    &schema_addrs_vec,
+                )?;
+                perf_println!("⏱️ STREAMING_JNI: nextBatch returned {} rows", row_count);
+                Ok(row_count as jint)
+            }
+            Some(Err(e)) => {
+                perf_println!("⏱️ STREAMING_JNI: nextBatch error: {}", e);
+                Err(anyhow::anyhow!("Streaming batch read failed: {}", e))
+            }
+            None => {
+                perf_println!("⏱️ STREAMING_JNI: end of stream");
+                Ok(0) // End of stream
+            }
+        }
+    })
+    .unwrap_or(-1)
+}
+
+/// Close and free a streaming session.
+///
+/// Safe to call multiple times — second call is a no-op (registry entry already removed).
+/// Must be called to release native resources and stop the producer task.
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_nativeCloseStreamingSession(
+    _env: JNIEnv,
+    _class: JClass,
+    session_ptr: jlong,
+) {
+    if session_ptr != 0 {
+        perf_println!("⏱️ STREAMING_JNI: closing session (handle={})", session_ptr);
+        crate::utils::release_arc(session_ptr);
+    }
+}
+
+/// Get the number of columns in a streaming session's output schema.
+/// Used by Java to allocate the correct number of FFI address arrays.
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_nativeGetStreamingColumnCount(
+    mut env: JNIEnv,
+    _class: JClass,
+    session_ptr: jlong,
+) -> jint {
+    if session_ptr == 0 {
+        to_java_exception(&mut env, &anyhow::anyhow!("Invalid session pointer"));
+        return -1;
+    }
+
+    let session_arc = crate::utils::jlong_to_arc::<std::sync::Mutex<
+        crate::parquet_companion::streaming_ffi::StreamingRetrievalSession,
+    >>(session_ptr);
+
+    match session_arc {
+        Some(arc) => {
+            match arc.lock() {
+                Ok(session) => session.num_columns() as jint,
+                Err(_) => {
+                    to_java_exception(&mut env, &anyhow::anyhow!("Failed to lock streaming session"));
+                    -1
+                }
+            }
+        }
+        None => {
+            to_java_exception(&mut env, &anyhow::anyhow!("Streaming session not found or already closed"));
+            -1
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_schema::DataType;
+
+    #[test]
+    fn test_parse_scalar_types() {
+        assert_eq!(parse_arrow_type_string("i32"), Some(DataType::Int32));
+        assert_eq!(parse_arrow_type_string("string"), Some(DataType::Utf8));
+        assert_eq!(parse_arrow_type_string("bool"), Some(DataType::Boolean));
+        assert_eq!(parse_arrow_type_string("f64"), Some(DataType::Float64));
+        assert_eq!(parse_arrow_type_string("date32"), Some(DataType::Date32));
+        assert_eq!(parse_arrow_type_string("unknown"), None);
+    }
+
+    #[test]
+    fn test_parse_struct_type_hint() {
+        let json = r#"{"struct": [["name", "string"], ["age", "i64"]]}"#;
+        let dt = parse_arrow_type_string(json).unwrap();
+        match &dt {
+            DataType::Struct(fields) => {
+                assert_eq!(fields.len(), 2);
+                assert_eq!(fields[0].name(), "name");
+                assert_eq!(*fields[0].data_type(), DataType::Utf8);
+                assert_eq!(fields[1].name(), "age");
+                assert_eq!(*fields[1].data_type(), DataType::Int64);
+            }
+            _ => panic!("Expected Struct, got {:?}", dt),
+        }
+    }
+
+    #[test]
+    fn test_parse_list_type_hint() {
+        let json = r#"{"list": "string"}"#;
+        let dt = parse_arrow_type_string(json).unwrap();
+        match &dt {
+            DataType::List(inner) => {
+                assert_eq!(*inner.data_type(), DataType::Utf8);
+            }
+            _ => panic!("Expected List, got {:?}", dt),
+        }
+    }
+
+    #[test]
+    fn test_parse_map_type_hint() {
+        let json = r#"{"map": ["string", "i64"]}"#;
+        let dt = parse_arrow_type_string(json).unwrap();
+        match &dt {
+            DataType::Map(entries, sorted) => {
+                assert!(!sorted);
+                match entries.data_type() {
+                    DataType::Struct(fields) => {
+                        assert_eq!(*fields[0].data_type(), DataType::Utf8);
+                        assert_eq!(*fields[1].data_type(), DataType::Int64);
+                    }
+                    _ => panic!("Expected Struct entries"),
+                }
+            }
+            _ => panic!("Expected Map, got {:?}", dt),
+        }
+    }
+
+    #[test]
+    fn test_parse_nested_complex_type() {
+        // List of structs
+        let json = r#"{"list": {"struct": [["x", "f64"], ["y", "f64"]]}}"#;
+        let dt = parse_arrow_type_string(json).unwrap();
+        match &dt {
+            DataType::List(inner) => {
+                match inner.data_type() {
+                    DataType::Struct(fields) => {
+                        assert_eq!(fields.len(), 2);
+                        assert_eq!(fields[0].name(), "x");
+                        assert_eq!(fields[1].name(), "y");
+                    }
+                    _ => panic!("Expected Struct inside List"),
+                }
+            }
+            _ => panic!("Expected List, got {:?}", dt),
+        }
+    }
+
+    /// Struct field ordering matches the array-of-pairs order.
+    /// Spark reads struct children by ordinal position, so ordering is critical.
+    #[test]
+    fn test_struct_field_ordering_preserved() {
+        // "name" before "address" before "city" — would be wrong if sorted alphabetically
+        let json = r#"{"struct": [["name", "string"], ["address", "string"], ["city", "string"]]}"#;
+        let dt = parse_arrow_type_string(json).unwrap();
+        match &dt {
+            DataType::Struct(fields) => {
+                assert_eq!(fields.len(), 3);
+                assert_eq!(fields[0].name(), "name");
+                assert_eq!(fields[1].name(), "address");
+                assert_eq!(fields[2].name(), "city");
+            }
+            _ => panic!("Expected Struct, got {:?}", dt),
+        }
+    }
+
+    /// Alphabetically-first field appears last — confirms array order, not sort order.
+    #[test]
+    fn test_struct_field_ordering_alpha_last() {
+        let json = r#"{"struct": [["z_last", "i64"], ["a_first", "string"], ["m_middle", "f64"]]}"#;
+        let dt = parse_arrow_type_string(json).unwrap();
+        match &dt {
+            DataType::Struct(fields) => {
+                assert_eq!(fields.len(), 3);
+                assert_eq!(fields[0].name(), "z_last");
+                assert_eq!(*fields[0].data_type(), DataType::Int64);
+                assert_eq!(fields[1].name(), "a_first");
+                assert_eq!(*fields[1].data_type(), DataType::Utf8);
+                assert_eq!(fields[2].name(), "m_middle");
+                assert_eq!(*fields[2].data_type(), DataType::Float64);
+            }
+            _ => panic!("Expected Struct, got {:?}", dt),
+        }
+    }
+
+    /// Nested struct also preserves field ordering.
+    #[test]
+    fn test_nested_struct_field_ordering() {
+        let json = r#"{"struct": [["scores", {"list": "i64"}], ["name", "string"], ["address", {"struct": [["zip", "string"], ["city", "string"]]}]]}"#;
+        let dt = parse_arrow_type_string(json).unwrap();
+        match &dt {
+            DataType::Struct(fields) => {
+                assert_eq!(fields.len(), 3);
+                assert_eq!(fields[0].name(), "scores");
+                assert_eq!(fields[1].name(), "name");
+                assert_eq!(fields[2].name(), "address");
+                match fields[2].data_type() {
+                    DataType::Struct(inner) => {
+                        assert_eq!(inner[0].name(), "zip");
+                        assert_eq!(inner[1].name(), "city");
+                    }
+                    _ => panic!("Expected nested Struct"),
+                }
+            }
+            _ => panic!("Expected Struct, got {:?}", dt),
+        }
+    }
 }

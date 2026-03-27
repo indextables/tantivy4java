@@ -245,9 +245,11 @@ impl AsyncFileReader for CachedParquetReader {
         // Check L1 in-memory cache first
         if let Some(cached) = self.cache_get(&range) {
             perf_println!("⏱️ PROJ_DIAG: get_bytes L1 CACHE HIT {} bytes", cached.len());
+            crate::ffi_profiler::cache_inc(crate::ffi_profiler::CacheCounter::ByteRangeHit);
             return async move { Ok(cached) }.boxed();
         }
 
+        crate::ffi_profiler::cache_inc(crate::ffi_profiler::CacheCounter::ByteRangeMiss);
         perf_println!("⏱️ PROJ_DIAG: get_bytes CACHE MISS — fetching {} bytes from storage", byte_size);
 
         let byte_cache = self.byte_cache.clone();
@@ -307,9 +309,11 @@ impl AsyncFileReader for CachedParquetReader {
         for (i, range) in ranges.iter().enumerate() {
             if let Some(cached) = self.cache_get(range) {
                 results[i] = Some(cached);
+                crate::ffi_profiler::cache_inc(crate::ffi_profiler::CacheCounter::ByteRangeHit);
             } else {
                 uncached_indices.push(i);
                 uncached_ranges.push(range.clone());
+                crate::ffi_profiler::cache_inc(crate::ffi_profiler::CacheCounter::ByteRangeMiss);
             }
         }
 
