@@ -107,6 +107,7 @@ pub async fn build_hash_resolution_map(
     // Step 3: For each hash field, find representative doc_ids by scanning Column<u64>
     // Uses selective column reads via FastFieldReaders: downloads only the SSTable index
     // + specific column byte ranges instead of the entire .fast file (~100MB+).
+    let _t_scan = std::time::Instant::now();
     let seg_metas = cached_index
         .searchable_segment_metas()
         .map_err(|e| anyhow::anyhow!("Failed to get segment metas: {}", e))?;
@@ -161,6 +162,10 @@ pub async fn build_hash_resolution_map(
         }
     }
 
+    if crate::ffi_profiler::is_enabled() {
+        crate::ffi_profiler::record(crate::ffi_profiler::Section::PcHashScanFastField, _t_scan.elapsed().as_nanos() as u64);
+    }
+
     if hash_to_doc.is_empty() {
         debug_println!("⚠️ HASH_TOUCHUP: No representative docs found for hash values");
         return Ok(HashMap::new());
@@ -176,6 +181,7 @@ pub async fn build_hash_resolution_map(
     // Uses selective column reads via FastFieldReaders — same pattern as
     // CachedSearcherContext::ensure_pq_segment_loaded.
     // Caches Column<u64> handles for O(1) random access — no iteration needed.
+    let _t_load_pq = std::time::Instant::now();
     let seg_ords_needed: HashSet<u32> = hash_to_doc.values().map(|(s, _)| *s).collect();
     for &seg_ord in &seg_ords_needed {
         // Already loaded?
@@ -232,7 +238,12 @@ pub async fn build_hash_resolution_map(
         }
     }
 
+    if crate::ffi_profiler::is_enabled() {
+        crate::ffi_profiler::record(crate::ffi_profiler::Section::PcHashLoadPqColumns, _t_load_pq.elapsed().as_nanos() as u64);
+    }
+
     // Step 5: Look up parquet rows and read string values for each touchup field
+    let _t_pq_read = std::time::Instant::now();
     let manifest = parquet_manifest.unwrap();
     let parquet_storage = parquet_storage.unwrap();
 
@@ -335,6 +346,10 @@ pub async fn build_hash_resolution_map(
                 }
             }
         }
+    }
+
+    if crate::ffi_profiler::is_enabled() {
+        crate::ffi_profiler::record(crate::ffi_profiler::Section::PcHashParquetRead, _t_pq_read.elapsed().as_nanos() as u64);
     }
 
     debug_println!(

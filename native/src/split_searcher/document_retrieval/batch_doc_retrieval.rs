@@ -98,6 +98,7 @@ pub fn retrieve_documents_batch_from_split_optimized(
                         );
                         debug_println!("🔍 TRACE: Should optimize = true");
 
+                        let _t_consolidate = std::time::Instant::now();
                         match optimizer.consolidate_ranges(&doc_addresses, &cached_searcher) {
                             Ok(ranges) => {
                                 let num_segments = ranges
@@ -125,6 +126,8 @@ pub fn retrieve_documents_batch_from_split_optimized(
                                 }
 
                                 // 🚀 BATCH OPTIMIZATION FIX: Use prefetch_ranges_with_cache to populate the correct cache
+                                // underscore prefix suppresses warning; variable IS used in profiler guard below
+                                let _t_prefetch = std::time::Instant::now();
                                 let prefetch_result = if let Some(cache) = byte_range_cache {
                                     debug_println!(
                                         "🚀 BATCH_OPT: Using prefetch_ranges_with_cache (OPTIMIZED)"
@@ -155,6 +158,9 @@ pub fn retrieve_documents_batch_from_split_optimized(
                                         .await
                                 };
 
+                                if crate::ffi_profiler::is_enabled() {
+                                    crate::ffi_profiler::record(crate::ffi_profiler::Section::DocBatchPrefetch, _t_prefetch.elapsed().as_nanos() as u64);
+                                }
                                 match prefetch_result {
                                     Ok(stats) => {
                                         debug_println!(
@@ -194,6 +200,9 @@ pub fn retrieve_documents_batch_from_split_optimized(
                                 );
                                 // Non-fatal: continue with normal doc_async
                             }
+                        }
+                        if crate::ffi_profiler::is_enabled() {
+                            crate::ffi_profiler::record(crate::ffi_profiler::Section::DocBatchRangeConsolidate, _t_consolidate.elapsed().as_nanos() as u64);
                         }
                     } else {
                         debug_println!(
@@ -256,6 +265,7 @@ pub fn retrieve_documents_batch_from_split_optimized(
                     // buffer_unordered() returns results in completion order, which corrupts the
                     // document-to-address mapping and causes data corruption (wrong field values).
                     use futures::stream::{StreamExt, TryStreamExt};
+                    let t_doc_async = std::time::Instant::now();
                     let doc_ptrs: Vec<jobject> = futures::stream::iter(doc_futures)
                         .buffered(BASE_CONCURRENT_REQUESTS)
                         .try_collect::<Vec<_>>()
@@ -263,6 +273,9 @@ pub fn retrieve_documents_batch_from_split_optimized(
                         .map_err(|e| {
                             anyhow::anyhow!("Cached searcher batch retrieval failed: {}", e)
                         })?;
+                    if crate::ffi_profiler::is_enabled() {
+                        crate::ffi_profiler::record(crate::ffi_profiler::Section::DocBatchDocAsync, t_doc_async.elapsed().as_nanos() as u64);
+                    }
 
                     // 🚀 BATCH OPTIMIZATION FIX: Always return here - using context.cached_searcher
                     return Ok::<Vec<jobject>, anyhow::Error>(doc_ptrs);

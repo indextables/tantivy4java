@@ -214,7 +214,15 @@ impl ParquetAugmentedDirectory {
         if let (Some(ref cache), Some((ref storage_loc, ref split_id, ref component))) =
             (&disk_cache, &l2_cache_key)
         {
-            if let Some(cached_bytes) = cache.get(storage_loc, split_id, component, None) {
+            let l2_check_start = std::time::Instant::now();
+            let l2_result = cache.get(storage_loc, split_id, component, None);
+            let l2_check_elapsed = l2_check_start.elapsed();
+            if crate::ffi_profiler::is_enabled() {
+                crate::ffi_profiler::record(crate::ffi_profiler::Section::PcL2CacheCheck, l2_check_elapsed.as_nanos() as u64);
+            }
+
+            if let Some(cached_bytes) = l2_result {
+                crate::ffi_profiler::cache_inc(crate::ffi_profiler::CacheCounter::L2DiskHit);
                 debug_println!(
                     "📊 AUGMENTED_DIR: L2 cache hit for {:?} ({} bytes), skipping transcoding",
                     fast_file_path, cached_bytes.len()
@@ -225,6 +233,7 @@ impl ParquetAugmentedDirectory {
                 );
                 return Ok(());
             } else {
+                crate::ffi_profiler::cache_inc(crate::ffi_profiler::CacheCounter::L2DiskMiss);
                 debug_println!(
                     "📊 AUGMENTED_DIR: L2 cache miss for {:?} (component='{}')",
                     fast_file_path, component
@@ -271,12 +280,17 @@ impl ParquetAugmentedDirectory {
                         "📊 AUGMENTED_DIR: Reading native .fast bytes from split bundle: {:?} (range {}..{})",
                         fast_file_path, range.start, range.end
                     );
+                    let native_read_start = std::time::Instant::now();
                     let bytes = self.split_storage
                         .get_slice(&self.split_filename, range.start as usize..range.end as usize)
                         .await
                         .map_err(|e| anyhow::anyhow!(
                             "Failed to read native fast field bytes from split bundle: {}", e
                         ))?;
+                    let native_read_elapsed = native_read_start.elapsed();
+                    if crate::ffi_profiler::is_enabled() {
+                        crate::ffi_profiler::record(crate::ffi_profiler::Section::PcNativeFastRead, native_read_elapsed.as_nanos() as u64);
+                    }
                     Some(bytes)
                 } else {
                     debug_println!(
@@ -287,7 +301,15 @@ impl ParquetAugmentedDirectory {
                 };
 
                 match native_bytes {
-                    Some(ref bytes) => merge_columnar_bytes(Some(bytes), &parquet_columnar_bytes, self.mode)?,
+                    Some(ref bytes) => {
+                        let merge_start = std::time::Instant::now();
+                        let merged = merge_columnar_bytes(Some(bytes), &parquet_columnar_bytes, self.mode)?;
+                        let merge_elapsed = merge_start.elapsed();
+                        if crate::ffi_profiler::is_enabled() {
+                            crate::ffi_profiler::record(crate::ffi_profiler::Section::PcMergeColumnars, merge_elapsed.as_nanos() as u64);
+                        }
+                        merged
+                    }
                     None => parquet_columnar_bytes,
                 }
             }
@@ -321,7 +343,12 @@ impl ParquetAugmentedDirectory {
             // Use blocking put() instead of put_query_path() because this is a prewarm path.
             // put_query_path() may silently drop writes when drop_writes_when_full is enabled,
             // but prewarm must guarantee the data lands in disk cache.
+            let l2_write_start = std::time::Instant::now();
             cache.put(storage_loc, split_id, component, None, &wrapped_bytes);
+            let l2_write_elapsed = l2_write_start.elapsed();
+            if crate::ffi_profiler::is_enabled() {
+                crate::ffi_profiler::record(crate::ffi_profiler::Section::PcL2CacheWrite, l2_write_elapsed.as_nanos() as u64);
+            }
         }
 
         self.insert_transcoded(

@@ -477,6 +477,7 @@ pub async fn read_parquet_batches_for_file(
     };
 
     // First pass: build reader WITHOUT page locations to get schema
+    let _t_create_reader = std::time::Instant::now();
     let reader = make_reader(cached_meta);
     let t_builder = std::time::Instant::now();
     let builder = ParquetRecordBatchStreamBuilder::new(reader)
@@ -520,11 +521,16 @@ pub async fn read_parquet_batches_for_file(
         total_parquet_columns
     );
 
+    if crate::ffi_profiler::is_enabled() {
+        crate::ffi_profiler::record(crate::ffi_profiler::Section::PcDocCreateReader, _t_create_reader.elapsed().as_nanos() as u64);
+    }
+
     // Row indices within the file (already sorted by group_doc_addresses_by_file)
     let row_indices: Vec<usize> =
         rows.iter().map(|(_, row)| *row as usize).collect();
 
     // Determine which row groups to read (shared by all passes)
+    let _t_rg_filter = std::time::Instant::now();
     let rg_filter = compute_row_group_filter(&row_indices, &parquet_metadata);
     let selected_rgs: Option<Vec<usize>> = rg_filter.as_ref().map(|filter| {
         filter.iter().enumerate()
@@ -539,7 +545,12 @@ pub async fn read_parquet_batches_for_file(
         );
     }
 
+    if crate::ffi_profiler::is_enabled() {
+        crate::ffi_profiler::record(crate::ffi_profiler::Section::PcDocRowGroupFilter, _t_rg_filter.elapsed().as_nanos() as u64);
+    }
+
     // Build RowSelection (shared by all passes)
+    let _t_row_sel = std::time::Instant::now();
     let row_selection = build_row_selection_for_rows_in_selected_groups(
         &row_indices,
         &parquet_metadata,
@@ -549,6 +560,10 @@ pub async fn read_parquet_batches_for_file(
         "⏱️ PROJ_DIAG: file[{}] row_selection present={}, target_rows={:?}",
         file_idx, row_selection.is_some(), row_indices
     );
+
+    if crate::ffi_profiler::is_enabled() {
+        crate::ffi_profiler::record(crate::ffi_profiler::Section::PcDocRowSelection, _t_row_sel.elapsed().as_nanos() as u64);
+    }
 
     // --- 3-case read strategy ---
     //
@@ -564,6 +579,7 @@ pub async fn read_parquet_batches_for_file(
 
     let need_two_pass = uses_manifest_locs && has_nested_in_proj;
 
+    let _t_stream = std::time::Instant::now();
     // Helper: given a pre-configured reader, apply projection/filters, collect batches.
     async fn build_and_collect(
         reader: CachedParquetReader,
@@ -653,6 +669,10 @@ pub async fn read_parquet_batches_for_file(
         let reader = attach_page_locations(reader, file_entry);
         build_and_collect(reader, projection.as_ref(), &selected_rgs, row_selection).await?
     };
+
+    if crate::ffi_profiler::is_enabled() {
+        crate::ffi_profiler::record(crate::ffi_profiler::Section::PcDocStreamBatches, _t_stream.elapsed().as_nanos() as u64);
+    }
 
     perf_println!(
         "⏱️ PROJ_DIAG: file[{}] read {} batches ({} rows total), took {}ms",
@@ -748,6 +768,7 @@ pub async fn batch_parquet_to_tant_buffer_by_groups(
     .await?;
 
     // Convert each file's batches to TANT bytes and pair with original indices
+    let _t_serialize = std::time::Instant::now();
     let mut doc_buffers: Vec<Option<Vec<u8>>> = vec![None; result_count];
 
     for (rows, collected_batches) in file_results {
@@ -771,6 +792,9 @@ pub async fn batch_parquet_to_tant_buffer_by_groups(
             let data = drain_iter.next().unwrap_or_default();
             doc_buffers[*original_idx] = Some(data);
         }
+    }
+    if crate::ffi_profiler::is_enabled() {
+        crate::ffi_profiler::record(crate::ffi_profiler::Section::PcDocSerializeTant, _t_serialize.elapsed().as_nanos() as u64);
     }
 
     let result = assemble_tant_buffer(doc_buffers);

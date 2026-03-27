@@ -22,6 +22,8 @@ use jni::sys::jstring;
 use jni::JNIEnv;
 
 mod debug;  // Debug utilities and conditional logging
+pub mod ffi_profiler;  // Near-zero-overhead FFI read-path profiler
+mod ffi_profiler_jni;  // JNI bridge for FFI profiler
 pub mod memory_pool;  // Unified JVM-coordinated memory management
 mod runtime_manager;  // Global Quickwit runtime manager for async-first architecture
 mod schema;

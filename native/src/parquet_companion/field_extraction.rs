@@ -52,9 +52,13 @@ pub fn extract_all_fast_field_names(
     query_json: &str,
     aggregation_json: Option<&str>,
 ) -> HashSet<String> {
+    let start = std::time::Instant::now();
     let mut fields = extract_range_query_fields(query_json);
     if let Some(agg_json) = aggregation_json {
         fields.extend(extract_aggregation_fields(agg_json));
+    }
+    if crate::ffi_profiler::is_enabled() {
+        crate::ffi_profiler::record(crate::ffi_profiler::Section::PcFieldExtraction, start.elapsed().as_nanos() as u64);
     }
     fields
 }

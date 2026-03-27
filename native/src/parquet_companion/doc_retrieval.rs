@@ -294,6 +294,11 @@ async fn retrieve_single_doc_inner(
     let cached_meta = metadata_cache.and_then(|cache| {
         cache.lock().ok().and_then(|guard| guard.get(&path_buf).cloned())
     });
+    if cached_meta.is_some() {
+        crate::ffi_profiler::cache_inc(crate::ffi_profiler::CacheCounter::ParquetMetadataHit);
+    } else {
+        crate::ffi_profiler::cache_inc(crate::ffi_profiler::CacheCounter::ParquetMetadataMiss);
+    }
 
     // Build reader WITHOUT page locations first to get metadata and schema.
     // We'll decide whether to attach page locations after seeing the projection.

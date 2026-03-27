@@ -184,7 +184,7 @@ pub async fn batch_parquet_to_arrow_ffi(
         );
     }
 
-    let t_ffi = std::time::Instant::now();
+    let _t_ffi_export = std::time::Instant::now();
     let renamed_schema = renamed.schema();
     for (i, col) in renamed.columns().iter().enumerate() {
         // Validate addresses are non-null before unsafe write
@@ -242,9 +242,13 @@ pub async fn batch_parquet_to_arrow_ffi(
             );
         }
     }
+    let ffi_export_elapsed = _t_ffi_export.elapsed();
+    if crate::ffi_profiler::is_enabled() {
+        crate::ffi_profiler::record(crate::ffi_profiler::Section::ArrowFfiExport, ffi_export_elapsed.as_nanos() as u64);
+    }
     perf_println!(
         "⏱️ FFI_DIAG: FFI export of {} columns took {}ms",
-        num_cols, t_ffi.elapsed().as_millis()
+        num_cols, ffi_export_elapsed.as_millis()
     );
 
     let row_count = renamed.num_rows();

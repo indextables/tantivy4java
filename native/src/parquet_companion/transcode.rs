@@ -126,17 +126,36 @@ pub async fn transcode_columns_from_parquet(
 
     if str_columns.is_empty() {
         // All non-string: use existing ColumnarWriter path
-        return transcode_via_columnar_writer(&other_columns, manifest, storage, num_docs, metadata_cache).await;
+        let start = std::time::Instant::now();
+        let result = transcode_via_columnar_writer(&other_columns, manifest, storage, num_docs, metadata_cache).await;
+        if crate::ffi_profiler::is_enabled() {
+            crate::ffi_profiler::record(crate::ffi_profiler::Section::PcTranscodeNonStr, start.elapsed().as_nanos() as u64);
+        }
+        return result;
     }
 
     if other_columns.is_empty() {
         // All string: use direct serialization path
-        return transcode_str_columns_direct(&str_columns, manifest, storage, num_docs, metadata_cache).await;
+        let start = std::time::Instant::now();
+        let result = transcode_str_columns_direct(&str_columns, manifest, storage, num_docs, metadata_cache).await;
+        if crate::ffi_profiler::is_enabled() {
+            crate::ffi_profiler::record(crate::ffi_profiler::Section::PcTranscodeStr, start.elapsed().as_nanos() as u64);
+        }
+        return result;
     }
 
     // Both types: serialize each independently and merge
+    let non_str_start = std::time::Instant::now();
     let other_bytes = transcode_via_columnar_writer(&other_columns, manifest, storage, num_docs, metadata_cache).await?;
+    if crate::ffi_profiler::is_enabled() {
+        crate::ffi_profiler::record(crate::ffi_profiler::Section::PcTranscodeNonStr, non_str_start.elapsed().as_nanos() as u64);
+    }
+
+    let str_start = std::time::Instant::now();
     let str_bytes = transcode_str_columns_direct(&str_columns, manifest, storage, num_docs, metadata_cache).await?;
+    if crate::ffi_profiler::is_enabled() {
+        crate::ffi_profiler::record(crate::ffi_profiler::Section::PcTranscodeStr, str_start.elapsed().as_nanos() as u64);
+    }
 
     // merge_two_columnars expects first arg WITH tantivy footer, second arg raw
     let other_wrapped = wrap_with_tantivy_footer(&other_bytes);
