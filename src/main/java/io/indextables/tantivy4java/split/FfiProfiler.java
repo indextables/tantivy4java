@@ -228,7 +228,8 @@ public class FfiProfiler {
             return Collections.emptyMap();
         }
         Map<String, ProfileEntry> map = new LinkedHashMap<>();
-        for (int i = 0; i < SECTION_NAMES.length && (i * VALUES_PER_SECTION + 3) < raw.length; i++) {
+        // Bounds check: last accessed index is i*4+3, so require (i+1)*4 <= raw.length
+        for (int i = 0; i < SECTION_NAMES.length && (i + 1) * VALUES_PER_SECTION <= raw.length; i++) {
             long count     = raw[i * VALUES_PER_SECTION];
             long nanos     = raw[i * VALUES_PER_SECTION + 1];
             long minNanos  = raw[i * VALUES_PER_SECTION + 2];

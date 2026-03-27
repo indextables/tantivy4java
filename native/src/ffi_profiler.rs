@@ -290,21 +290,22 @@ pub fn record(section: Section, nanos: u64) {
     COUNTS[idx].fetch_add(1, Ordering::Relaxed);
     NANOS[idx].fetch_add(nanos, Ordering::Relaxed);
 
-    // Update min — CAS loop (typically 1 iteration)
-    let mut current_min = MINS[idx].load(Ordering::Relaxed);
-    while nanos < current_min {
-        match MINS[idx].compare_exchange_weak(current_min, nanos, Ordering::Relaxed, Ordering::Relaxed) {
-            Ok(_) => break,
-            Err(actual) => current_min = actual,
+    // Update min — CAS loop (typically 1 iteration).
+    // Load inside loop so the condition always uses the freshest value.
+    loop {
+        let current_min = MINS[idx].load(Ordering::Relaxed);
+        if nanos >= current_min { break; }
+        if MINS[idx].compare_exchange_weak(current_min, nanos, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+            break;
         }
     }
 
     // Update max — CAS loop (typically 1 iteration)
-    let mut current_max = MAXS[idx].load(Ordering::Relaxed);
-    while nanos > current_max {
-        match MAXS[idx].compare_exchange_weak(current_max, nanos, Ordering::Relaxed, Ordering::Relaxed) {
-            Ok(_) => break,
-            Err(actual) => current_max = actual,
+    loop {
+        let current_max = MAXS[idx].load(Ordering::Relaxed);
+        if nanos <= current_max { break; }
+        if MAXS[idx].compare_exchange_weak(current_max, nanos, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+            break;
         }
     }
 }
