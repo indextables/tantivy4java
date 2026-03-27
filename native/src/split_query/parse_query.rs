@@ -9,6 +9,7 @@ use quickwit_query::query_ast::{query_ast_from_user_text, QueryAst};
 
 use crate::debug_println;
 
+use super::schema_cache::SPLIT_SCHEMA_CACHE;
 
 /// Parse a query string into a SplitQuery
 pub fn parse_query_string(
@@ -54,46 +55,6 @@ pub fn parse_query_string(
     debug_println!(
         "RUST DEBUG: Final default search fields: {:?}",
         default_fields_vec
-    );
-
-    // Pre-process the query string: expand IP CIDR/wildcard patterns into explicit range syntax.
-    //
-    // Step A — when a single default field is set, prefix any bare CIDR/wildcard/quoted-IPv6
-    //   tokens with the field name so that Step B can expand them uniformly.
-    //   This handles the Spark `indexquery` operator which passes field name separately:
-    //     parseQuery("192.168.1.0/24", "ip")   → prefix → "ip:192.168.1.0/24"
-    //     parseQuery("192.168.1.0/24 OR 10.0.0.0/8", "ip")
-    //                                          → prefix → "ip:192.168.1.0/24 OR ip:10.0.0.0/8"
-    //     parseQuery("\"2001:db8::/32\"", "ip") → prefix → "ip:\"2001:db8::/32\""
-    //
-    // Step B — rewrite all field:CIDR and field:"quoted-CIDR" tokens to range syntax:
-    //     "ip:192.168.1.0/24"       → "ip:[192.168.1.0 TO 192.168.1.255]"
-    //     "ip:\"2001:db8::/32\""    → "ip:[2001:db8:: TO 2001:db8:ffff:...]"
-    //
-    // Both preprocessors now receive the set of IP-typed field names so that expansion
-    // is only attempted for fields whose schema type is actually IpAddr. This prevents
-    // accidental expansion for fields like `url` whose values may contain '/' or '*'.
-    //
-    // Outer fast-path: skip both preprocessing steps when no IP patterns are possible.
-    // This avoids both string clones and schema inspection in the common case (pure text queries).
-    let query_str = if query_str.contains('/') || query_str.contains('*') {
-        let ip_fields = extract_ip_fields_from_schema_ptr(schema_ptr);
-        if !ip_fields.is_empty() {
-            let after_prefix = if default_fields_vec.len() == 1 {
-                prefix_bare_ip_tokens(&query_str, &default_fields_vec[0], &ip_fields)
-            } else {
-                query_str
-            };
-            preprocess_ip_query_string(&after_prefix, &ip_fields)
-        } else {
-            query_str
-        }
-    } else {
-        query_str
-    };
-    debug_println!(
-        "RUST DEBUG: After IP preprocessing, query_str: '{}'",
-        query_str
     );
 
     // 🚀 PROPER QUICKWIT PARSING: Use Quickwit's proven two-step process
@@ -313,14 +274,28 @@ pub fn extract_text_fields_from_schema(
         "RUST DEBUG: This suggests either the pointer is invalid or the schema is not in the registry"
     );
 
-    // schema_ptr is invalid or stale — return empty rather than guessing from a random
-    // cached schema that may belong to a different split.
-    debug_println!(
-        "RUST DEBUG: extract_text_fields_from_schema: schema_ptr {} not in registry, returning empty",
-        schema_ptr
-    );
+    // NEW APPROACH: Try to get any cached schema from the split schema cache
+    // Since we don't have the split URI in this context, iterate through all cached schemas
+    debug_println!("RUST DEBUG: Attempting to retrieve schema from split schema cache...");
+    let cache = SPLIT_SCHEMA_CACHE.lock().unwrap();
+    for (split_uri, cached_schema) in cache.iter() {
+        debug_println!("RUST DEBUG: Found cached schema for split URI: {}", split_uri);
+        let text_fields = extract_fields_from_schema(cached_schema)?;
+        debug_println!(
+            "RUST DEBUG: ✅ Using cached schema from split: {} with text fields: {:?}",
+            split_uri,
+            text_fields
+        );
+        return Ok(text_fields);
+    }
+    drop(cache);
 
-    Ok(Vec::new())
+    debug_println!("RUST DEBUG: ❌ No cached schemas found in split schema cache");
+
+    Err(anyhow!(
+        "Schema registry lookup failed for pointer: {} and no cached schemas found - this indicates a schema pointer lifecycle issue",
+        schema_ptr
+    ))
 }
 
 /// Helper function to extract text fields from a schema
@@ -410,246 +385,6 @@ fn collect_fields_recursive(query_ast: &QueryAst, fields: &mut std::collections:
         }
     }
 }
-
-/// When a single default field is set, scan the query string for bare CIDR/wildcard tokens
-/// (those without an explicit `field:` qualifier) and prefix them with the default field name,
-/// but only when that default field is in `ip_fields`.
-///
-/// Also handles double-quoted IPv6 CIDR patterns: `"2001:db8::/32"` → `ip:"2001:db8::/32"`.
-///
-/// After this step, `preprocess_ip_query_string` can expand all `field:CIDR` patterns uniformly.
-///
-/// Performance design:
-///   - Fast-path early return when query contains neither '/' nor '*' (zero allocation).
-///   - Short-circuits immediately when `default_field` is not an IP field.
-///   - Byte-level scanner: no Vec<char> allocation; query strings are always ASCII.
-///   - `try_expand_ip_range` guards every prefix decision with zero allocation for plain IPs.
-///
-/// NOTE: Unquoted IPv6 CIDRs (e.g., fe80::1/10) are NOT supported here.
-/// The has_field_prefix heuristic detects letters before ':' to distinguish field names
-/// from pure-hex IPv6 groups (2001:db8), but link-local prefixes like fe80 contain
-/// letters and would be misidentified as field names. Users must quote IPv6 CIDRs.
-fn prefix_bare_ip_tokens(
-    query: &str,
-    default_field: &str,
-    ip_fields: &std::collections::HashSet<String>,
-) -> String {
-    // Fast path: CIDR requires '/' and wildcards require '*'.
-    // If neither is present there are no expandable patterns.
-    if !query.contains('/') && !query.contains('*') {
-        return query.to_string();
-    }
-
-    // Fast path: if the default field is not an IP field, there is nothing to prefix.
-    if !ip_fields.contains(default_field) {
-        return query.to_string();
-    }
-
-    // Byte-level scanner — query strings are ASCII, so byte indices == char indices.
-    let bytes = query.as_bytes();
-    let n = bytes.len();
-    let mut result = String::with_capacity(query.len() + 32);
-    let mut i = 0;
-
-    while i < n {
-        let b = bytes[i];
-
-        // Whitespace — pass through
-        if b.is_ascii_whitespace() {
-            result.push(b as char);
-            i += 1;
-            continue;
-        }
-
-        // Structural characters — pass through individually
-        if matches!(b, b'(' | b')' | b'[' | b']' | b'{' | b'}') {
-            result.push(b as char);
-            i += 1;
-            continue;
-        }
-
-        // Double-quoted token: `"2001:db8::/32"` — quoted because IPv6 colons
-        if b == b'"' {
-            let quote_start = i;
-            i += 1;
-            while i < n && bytes[i] != b'"' {
-                i += 1;
-            }
-            if i < n {
-                i += 1; // consume closing quote
-            }
-            // Byte slice is safe: all chars in range are ASCII
-            let quoted_token = &query[quote_start..i];
-            let inner = if quoted_token.len() >= 2 {
-                &quoted_token[1..quoted_token.len() - 1]
-            } else {
-                quoted_token
-            };
-            if crate::ip_expansion::try_expand_ip_range(inner).is_some() {
-                debug_println!(
-                    "RUST DEBUG: prefix_bare_ip_tokens: quoted '{}' → '{}:{}'",
-                    quoted_token, default_field, quoted_token
-                );
-                result.push_str(default_field);
-                result.push(':');
-            }
-            result.push_str(quoted_token);
-            continue;
-        }
-
-        // Collect a word token (stop at whitespace, parens, quotes)
-        let token_start = i;
-        while i < n
-            && !bytes[i].is_ascii_whitespace()
-            && !matches!(bytes[i], b'(' | b')' | b'[' | b']' | b'{' | b'}' | b'"')
-        {
-            i += 1;
-        }
-        let token = &query[token_start..i];
-
-        if token.is_empty() {
-            continue;
-        }
-
-        // Check if already has an explicit `field:` prefix.
-        // Rule: the substring before the first ':' consists entirely of word chars AND
-        // contains at least one letter — this distinguishes field names from IPv6 hex groups.
-        let has_field_prefix = token.find(':').map_or(false, |colon_pos| {
-            let before = &token[..colon_pos];
-            !before.is_empty()
-                && before.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_')
-                && before.bytes().any(|c| c.is_ascii_alphabetic())
-        });
-
-        if has_field_prefix {
-            result.push_str(token);
-            continue;
-        }
-
-        // Prefix with the default field only for expandable IP patterns (CIDR / wildcard).
-        // Boolean keywords (AND, OR, NOT) and plain IPs are left as-is for Quickwit.
-        if crate::ip_expansion::try_expand_ip_range(token).is_some() {
-            debug_println!(
-                "RUST DEBUG: prefix_bare_ip_tokens: '{}' → '{}:{}'",
-                token, default_field, token
-            );
-            result.push_str(default_field);
-            result.push(':');
-        }
-        result.push_str(token);
-    }
-
-    result
-}
-
-/// Pre-process a Quickwit user-text query string, rewriting any IP CIDR or wildcard patterns
-/// into explicit Quickwit range syntax so that the Quickwit parser never sees the '/' character
-/// in IP field values.
-///
-/// Only tokens whose field name is in `ip_fields` are candidates for expansion; all other
-/// `field:value` tokens (e.g. `url:http://example.com/path`) are passed through unchanged.
-///
-/// Handles both unquoted (`ip:192.168.1.0/24`) and quoted (`ip:"2001:db8::/32"`) forms.
-///
-/// Examples:
-///   `ip_addr:192.168.1.0/24`       →  `ip_addr:[192.168.1.0 TO 192.168.1.255]`
-///   `ip_addr:192.168.1.*`          →  `ip_addr:[192.168.1.0 TO 192.168.1.255]`
-///   `ip_addr:"2001:db8::/32"`      →  `ip_addr:[2001:db8:: TO 2001:db8:ffff:...]`
-///
-/// Performance design:
-///   - Fast-path early return when query contains neither '/' nor '*' (zero allocation).
-///   - Single regex pass handles both quoted and unquoted forms via alternation.
-///   - Regex compiled once via `once_cell::sync::Lazy`.
-///   - `ip_fields.contains(field)` short-circuits before `try_expand_ip_range` for non-IP tokens.
-///
-/// Must be called BEFORE `query_ast_from_user_text`.
-fn preprocess_ip_query_string(
-    query: &str,
-    ip_fields: &std::collections::HashSet<String>,
-) -> String {
-    use once_cell::sync::Lazy;
-    use regex::Regex;
-
-    // Fast path 1: no CIDR or wildcard patterns possible without '/' or '*'.
-    if !query.contains('/') && !query.contains('*') {
-        return query.to_string();
-    }
-
-    // Fast path 2: a field:CIDR or field:wildcard token always has a digit or opening
-    // quote immediately after the ':' (e.g. `ip:192...` or `ip:"2001...`).
-    // Queries like `url:http://example.com/path` have '/' present but are followed by
-    // '/' not a digit, so we can skip the regex entirely and avoid the Cow::Borrowed
-    // → into_owned() clone that would otherwise occur with no matches.
-    let has_ip_like_colon = query
-        .as_bytes()
-        .windows(2)
-        .any(|w| w[0] == b':' && (w[1].is_ascii_digit() || w[1] == b'"'));
-    if !has_ip_like_colon {
-        return query.to_string();
-    }
-
-    // Single pass: alternation matches both quoted and unquoted field:value forms.
-    // Group layout: 1 = field name (both arms), 2 = quoted value, 3 = unquoted value.
-    // The quoted arm is listed first so it takes priority when both could match.
-    static IP_TOKEN: Lazy<Regex> = Lazy::new(|| {
-        Regex::new(r#"(\b\w+):(?:"([\d.:/a-fA-F*]+)"|([\d.:/a-fA-F*]+))"#).unwrap()
-    });
-
-    IP_TOKEN
-        .replace_all(query, |caps: &regex::Captures| {
-            let field = &caps[1];
-            // Only expand tokens for fields that are actually IP-typed in the schema.
-            if !ip_fields.contains(field) {
-                // Reconstruct original token unchanged (avoids allocation for the common case).
-                return caps[0].to_string();
-            }
-            // Exactly one of caps[2] (quoted) or caps[3] (unquoted) is non-empty per match.
-            let (value, was_quoted) = match (caps.get(2), caps.get(3)) {
-                (Some(m), _) => (m.as_str(), true),
-                (_, Some(m)) => (m.as_str(), false),
-                _ => return String::new(),
-            };
-            if let Some((lower, upper)) = crate::ip_expansion::try_expand_ip_range(value) {
-                debug_println!(
-                    "RUST DEBUG: preprocess_ip_query_string: '{}:{}' → '{}:[{} TO {}]'",
-                    field, value, field, lower, upper
-                );
-                format!("{}:[{} TO {}]", field, lower, upper)
-            } else if was_quoted {
-                format!("{}:\"{}\"", field, value)
-            } else {
-                format!("{}:{}", field, value)
-            }
-        })
-        .into_owned()
-}
-
-/// Extract the names of all IpAddr-typed fields from the schema referenced by `schema_ptr`.
-/// Returns an empty set when the pointer is invalid or refers to no IP fields, so callers
-/// can safely skip IP preprocessing without schema context.
-fn extract_ip_fields_from_schema_ptr(schema_ptr: jni::sys::jlong) -> std::collections::HashSet<String> {
-    if let Some(schema) = crate::utils::jlong_to_arc::<tantivy::schema::Schema>(schema_ptr) {
-        schema
-            .fields()
-            .filter_map(|(_, entry)| {
-                if matches!(entry.field_type(), tantivy::schema::FieldType::IpAddr(_)) {
-                    Some(entry.name().to_string())
-                } else {
-                    None
-                }
-            })
-            .collect()
-    } else {
-        // schema_ptr is invalid or stale — return empty rather than guessing from a random
-        // cached schema that may belong to a different split.
-        debug_println!(
-            "RUST DEBUG: extract_ip_fields_from_schema_ptr: schema_ptr {} not in registry, returning empty",
-            schema_ptr
-        );
-        std::collections::HashSet::new()
-    }
-}
-
 
 /// Count the number of unique fields in a parsed query
 pub fn count_query_fields(
