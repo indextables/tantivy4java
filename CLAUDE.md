@@ -150,7 +150,7 @@ long expectedSize = fieldSizes.get("score.fastfield");
 - **✅ TermsAggregation** - Fully implemented and working
 - **✅ HistogramAggregation** - Fully implemented with arbitrary bucket sizes, extended_bounds, hard_bounds, keyed, and sub-aggregation support
 - **✅ DateHistogramAggregation** - Fully implemented with fixed_interval (ms, s, m, h, d), offset, hard_bounds, min_doc_count, keyed, and sub-aggregation support
-- **❌ RangeAggregation** - Not implemented in native layer. Returns empty aggregation map.
+- **✅ RangeAggregation** - Fully implemented with custom named ranges
 - **Note**: Terms, Histogram, and DateHistogram aggregations work correctly with SplitSearcher for Quickwit split files.
 
 **📊 Test Coverage Analysis:**
