@@ -728,7 +728,66 @@ public class ParquetCompanionStringHashTest {
     //     and then running queries — if they succeed, no parquet I/O occurred.
     // ═══════════════════════════════════════════════════════════════
 
+    // ═══════════════════════════════════════════════════════════════
+    //  17. Range agg with nested Terms — hash resolution on sub-agg
+    // ═══════════════════════════════════════════════════════════════
+
     @Test @org.junit.jupiter.api.Order(17)
+    @DisplayName("Range(score) + nested Terms(name) — nested string keys resolved from hashes")
+    void rangeWithNestedTermsHashResolution(@TempDir Path dir) throws Exception {
+        int numRows = 20;
+        // scores: 10.0, 11.5, 13.0, ..., 38.5  (i * 1.5 + 10.0)
+        // names:  item_0 .. item_19 (unique per row)
+        try (SplitSearcher s = createSearcher(dir, true, numRows, "range_terms")) {
+            RangeAggregation rangeAgg = new RangeAggregation("score_ranges", "score")
+                    .addRange("low",  null, 20.0)   // scores < 20.0  → ids 0..6  (7 docs)
+                    .addRange("high", 20.0, null)    // scores >= 20.0 → ids 7..19 (13 docs)
+                    .addSubAggregation("name_terms",
+                            new TermsAggregation("name_terms", "name", 50, 0));
+
+            SearchResult result = s.search(new SplitMatchAllQuery(), 0, "range", rangeAgg);
+            assertTrue(result.hasAggregations(), "Result should contain aggregations");
+
+            RangeResult rangeResult = (RangeResult) result.getAggregation("range");
+            assertNotNull(rangeResult, "Range aggregation result should be present");
+
+            List<RangeResult.RangeBucket> buckets = rangeResult.getBuckets();
+            assertEquals(2, buckets.size(), "Should have 2 range buckets (low, high)");
+
+            for (RangeResult.RangeBucket bucket : buckets) {
+                assertTrue(bucket.getDocCount() > 0,
+                        "Range bucket '" + bucket.getKey() + "' should have docs");
+
+                // The nested Terms sub-aggregation must be present with resolved string keys
+                TermsResult nestedTerms = bucket.getSubAggregation("name_terms", TermsResult.class);
+                assertNotNull(nestedTerms,
+                        "Nested terms sub-agg should be present in range bucket '" + bucket.getKey() + "'");
+
+                List<TermsResult.TermsBucket> termBuckets = nestedTerms.getBuckets();
+                assertFalse(termBuckets.isEmpty(),
+                        "Nested terms should have buckets");
+                assertEquals(bucket.getDocCount(), termBuckets.size(),
+                        "Each name is unique so nested Terms bucket count should equal range doc_count");
+
+                for (TermsResult.TermsBucket tb : termBuckets) {
+                    // This is the critical assertion: keys must be resolved strings, not U64 hashes
+                    assertTrue(tb.getKey() instanceof String,
+                            "Nested terms key should be a String, not a numeric hash: " + tb.getKey());
+                    String keyStr = (String) tb.getKey();
+                    assertTrue(keyStr.startsWith("item_"),
+                            "Nested terms key should be 'item_X' (resolved), got: " + keyStr);
+                    assertEquals(1, tb.getDocCount(),
+                            "Each name is unique so doc_count should be 1");
+                }
+            }
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    //  18. Native fields don't trigger parquet transcoding
+    // ═══════════════════════════════════════════════════════════════
+
+    @Test @org.junit.jupiter.api.Order(18)
     @DisplayName("Native fields (id, score, active) don't trigger parquet transcoding in HYBRID mode")
     void nativeFieldsNoParquetTranscode(@TempDir Path dir) throws Exception {
         int numRows = 20;

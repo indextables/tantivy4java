@@ -1049,4 +1049,73 @@ public class AggregationArrowFfiTest {
             hashCacheMgr.close();
         }
     }
+
+    @Test
+    @DisplayName("Regression: Arrow FFI Range agg with nested Terms on companion split resolves hash keys")
+    public void testArrowFfiRangeNestedTermsHashResolution(@TempDir Path dir) throws Exception {
+        int numRows = 20;
+        // scores: 10.0, 11.5, 13.0, ..., 38.5  (i * 1.5 + 10.0)
+        // category: "cat_0" .. "cat_4" cycling (i % 5)
+        Object[] pair = createCompanionSearcherWithHashOpt(dir, numRows);
+        SplitSearcher hashSearcher = (SplitSearcher) pair[0];
+        SplitCacheManager hashCacheMgr = (SplitCacheManager) pair[1];
+
+        try {
+            // Range on "score" with nested Terms on "category" (has _phash_category hash field)
+            String queryAst = "{\"type\":\"match_all\"}";
+            String aggJson = "{\"score_ranges\":{\"range\":{\"field\":\"score\"," +
+                    "\"ranges\":[{\"key\":\"low\",\"to\":20.0},{\"key\":\"high\",\"from\":20.0}]}," +
+                    "\"aggs\":{\"cat_terms\":{\"terms\":{\"field\":\"category\",\"size\":100}}}}}";
+
+            // Schema query to determine column count for the flattened output
+            String schemaJson = hashSearcher.getAggregationArrowSchema(
+                    queryAst, "score_ranges", aggJson);
+            assertNotNull(schemaJson, "Schema JSON should not be null");
+            // Flattened Range+Terms: key_0 (range), from, to, key_1 (category), doc_count = 5 cols
+            assertTrue(schemaJson.contains("\"key_0\""), "Should have key_0 (range bucket key)");
+            assertTrue(schemaJson.contains("\"key_1\""), "Should have key_1 (nested terms key)");
+
+            int numCols = 5; // key_0, from, to, key_1, doc_count
+            long[] arrayAddrs = new long[numCols];
+            long[] schemaAddrs = new long[numCols];
+            allocateFfiBuffers(arrayAddrs, schemaAddrs, numCols);
+            try {
+                int rowCount = hashSearcher.aggregateArrowFfi(queryAst, "score_ranges", aggJson,
+                        arrayAddrs, schemaAddrs);
+                assertTrue(rowCount > 0, "Should have flattened rows from Range × Terms");
+
+                String json = nativeReadAggArrowColumnsAsJson(arrayAddrs, schemaAddrs, numCols, rowCount);
+                assertNotNull(json, "Read-back JSON should not be null");
+
+                Map<String, Object> result = parseJson(json);
+                List<Map<String, Object>> columns = getColumns(result);
+                assertEquals(numCols, columns.size(), "Should have 5 columns");
+
+                // Find the key_1 column (nested terms keys — should be resolved strings)
+                Map<String, Object> colMap = columnsByName(columns);
+                List<?> innerKeys = getColumnValues(colMap, "key_1");
+                assertNotNull(innerKeys, "key_1 column should be present");
+
+                for (Object key : innerKeys) {
+                    String keyStr = key.toString();
+                    assertTrue(keyStr.startsWith("cat_"),
+                            "Arrow FFI nested terms key in Range should be 'cat_X' (resolved), got: " + keyStr);
+                    assertFalse(keyStr.matches("\\d{10,}"),
+                            "Arrow FFI nested terms key should NOT be a numeric hash, got: " + keyStr);
+                }
+
+                // Verify outer range keys are present
+                List<?> outerKeys = getColumnValues(colMap, "key_0");
+                Set<String> rangeKeys = new HashSet<>();
+                for (Object k : outerKeys) rangeKeys.add(k.toString());
+                assertTrue(rangeKeys.contains("low") || rangeKeys.contains("high"),
+                        "Should have range bucket keys 'low' and/or 'high', got: " + rangeKeys);
+            } finally {
+                freeFfiBuffers(arrayAddrs, schemaAddrs, numCols);
+            }
+        } finally {
+            hashSearcher.close();
+            hashCacheMgr.close();
+        }
+    }
 }
