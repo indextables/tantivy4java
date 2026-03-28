@@ -84,7 +84,18 @@ pub fn parse_query_string(
             } else {
                 query_str
             };
-            preprocess_ip_query_string(&after_prefix, &ip_fields)
+            let preprocessed = preprocess_ip_query_string(&after_prefix, &ip_fields);
+            // Reject non-contiguous wildcards: if a field:*pattern* token on an IP field
+            // still contains '*' after preprocessing it means expansion returned None
+            // (e.g. "10.*.1.*" cannot be collapsed to a single range). Surface this as an
+            // explicit error so `indexquery` callers receive a clear exception instead of
+            // silently getting 0 results.
+            if preprocessed.contains('*') {
+                if let Some(msg) = detect_non_contiguous_ip_wildcard(&preprocessed, &ip_fields) {
+                    return Err(anyhow::anyhow!("{}", msg));
+                }
+            }
+            preprocessed
         } else {
             query_str
         }
@@ -622,6 +633,47 @@ fn preprocess_ip_query_string(
             }
         })
         .into_owned()
+}
+
+/// Scan a pre-processed query string for any remaining `field:value` tokens where `field`
+/// is IP-typed AND `value` still contains `*`.  Such tokens were not expanded by
+/// `preprocess_ip_query_string` because `try_expand_ip_range` returned `None` — meaning the
+/// wildcard pattern is non-contiguous (e.g. "10.*.1.*") and cannot be collapsed into a single
+/// range without false positives.
+///
+/// Returns `Some(error_message)` when such a token is found, `None` otherwise.
+fn detect_non_contiguous_ip_wildcard(
+    preprocessed: &str,
+    ip_fields: &std::collections::HashSet<String>,
+) -> Option<String> {
+    use once_cell::sync::Lazy;
+    use regex::Regex;
+
+    // Same pattern as preprocess_ip_query_string — match field:value or field:"value" tokens.
+    static FIELD_STAR: Lazy<Regex> = Lazy::new(|| {
+        Regex::new(r#"(\b\w+):(?:"([\d.:/a-fA-F*]+)"|([\d.:/a-fA-F*]+))"#).unwrap()
+    });
+
+    for caps in FIELD_STAR.captures_iter(preprocessed) {
+        let field = &caps[1];
+        if !ip_fields.contains(field) {
+            continue;
+        }
+        let value = caps
+            .get(2)
+            .or_else(|| caps.get(3))
+            .map(|m| m.as_str())
+            .unwrap_or("");
+        if value.contains('*') {
+            return Some(format!(
+                "Non-contiguous IP wildcard pattern '{}' on field '{}' cannot be expressed as \
+                 a single contiguous IP range. Use a CIDR pattern (e.g. 10.0.0.0/8) or an \
+                 explicit range query instead.",
+                value, field
+            ));
+        }
+    }
+    None
 }
 
 /// Extract the names of all IpAddr-typed fields from the schema referenced by `schema_ptr`.

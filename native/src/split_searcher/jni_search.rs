@@ -123,7 +123,7 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_sear
     // Extract all JNI data at entry point - no JNI types should go into core functions
     debug_println!("🔥 NATIVE DEBUG: Converting SplitQuery to JSON");
     let query_json_str = profile_section!(Section::QueryConvert, {
-        match convert_split_query_to_json(&mut env, &split_query_obj, searcher_ptr) {
+        match convert_split_query_to_json(&mut env, &split_query_obj) {
             Ok(json_str) => {
                 debug_println!("🔥 NATIVE DEBUG: Successfully converted SplitQuery to JSON: {}", json_str);
                 json_str
@@ -227,7 +227,7 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_sear
 
     // Convert SplitQuery to QueryAst JSON (using existing infrastructure)
     let query_json = profile_section!(Section::QueryConvert, {
-        match convert_split_query_to_json(&mut env, &split_query, searcher_ptr) {
+        match convert_split_query_to_json(&mut env, &split_query) {
             Ok(json) => {
                 debug_println!("RUST DEBUG: Query conversion successful");
                 json
@@ -386,6 +386,17 @@ pub async fn perform_search_async_impl_leaf_response_with_aggregations(
         }
     } else {
         effective_query_json
+    };
+
+    // Phase 2a3: Rewrite IP CIDR/wildcard term queries to range queries using execution-time schema.
+    // Placed after hash-field and string-indexing rewrites so all aggregation paths receive
+    // correctly expanded IP queries regardless of whether searcher_ptr was available at
+    // serialization time.
+    let effective_query_json = {
+        let schema = context.cached_index.schema();
+        crate::split_query::rewrite_ip_term_queries(&effective_query_json, &schema)
+            .unwrap_or(None)
+            .unwrap_or(effective_query_json)
     };
 
     // Phase 2b: Rewrite aggregation JSON to replace string field references with _phash_* fields.
