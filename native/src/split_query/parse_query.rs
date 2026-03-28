@@ -422,6 +422,21 @@ fn collect_fields_recursive(query_ast: &QueryAst, fields: &mut std::collections:
     }
 }
 
+/// Returns true when `token` looks like an IPv4 wildcard pattern (four dot-separated parts
+/// where at least one part is `*` and all others are valid octets).  Used by
+/// `prefix_bare_ip_tokens` to ensure non-contiguous wildcards (e.g. "10.*.1.*") are
+/// still prefixed with the field name so that `detect_non_contiguous_ip_wildcard` can
+/// find and reject them via a "field:value" pattern.
+fn looks_like_ip_wildcard(token: &str) -> bool {
+    if !token.contains('*') {
+        return false;
+    }
+    let parts: Vec<&str> = token.split('.').collect();
+    parts.len() == 4
+        && parts.iter().any(|p| *p == "*")
+        && parts.iter().all(|p| *p == "*" || p.parse::<u8>().is_ok())
+}
+
 /// When a single default field is set, scan the query string for bare CIDR/wildcard tokens
 /// (those without an explicit `field:` qualifier) and prefix them with the default field name,
 /// but only when that default field is in `ip_fields`.
@@ -537,9 +552,14 @@ fn prefix_bare_ip_tokens(
             continue;
         }
 
-        // Prefix with the default field only for expandable IP patterns (CIDR / wildcard).
+        // Prefix with the default field for any IP-like pattern (CIDR, contiguous wildcard,
+        // or non-contiguous wildcard).  Non-contiguous patterns (e.g. "10.*.1.*") return None
+        // from try_expand_ip_range but must still be prefixed so that
+        // detect_non_contiguous_ip_wildcard can find a "field:value" token to reject.
         // Boolean keywords (AND, OR, NOT) and plain IPs are left as-is for Quickwit.
-        if crate::ip_expansion::try_expand_ip_range(token).is_some() {
+        if crate::ip_expansion::try_expand_ip_range(token).is_some()
+            || looks_like_ip_wildcard(token)
+        {
             debug_println!(
                 "RUST DEBUG: prefix_bare_ip_tokens: '{}' → '{}:{}'",
                 token, default_field, token
