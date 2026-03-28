@@ -386,6 +386,15 @@ mod tests {
         assert_eq!(year_col.value(0), "2024");
         assert_eq!(year_col.value(1), "2023");
 
+        // Verify footer offsets at columns 5 and 6
+        let fs_col = batch.column(5).as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(fs_col.value(0), 500); // from make_entry
+        let fe_col = batch.column(6).as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(fe_col.value(0), 1000);
+        // has_footer_offsets at column 7
+        let hfo_col = batch.column(7).as_any().downcast_ref::<BooleanArray>().unwrap();
+        assert_eq!(hfo_col.value(0), true);
+
         let tags_col = batch.column(9).as_any().downcast_ref::<ListArray>().unwrap();
         assert!(!tags_col.is_null(0));
         assert!(tags_col.is_null(1));

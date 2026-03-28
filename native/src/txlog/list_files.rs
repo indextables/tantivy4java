@@ -198,20 +198,12 @@ pub async unsafe fn list_files_arrow_ffi(
         cm.put_all_file_field_stats(&all_files);
     }
 
-    // 9. Export via Arrow FFI v2
+    // 9. Export via Arrow FFI
     let num_cols = arrow_ffi::column_count(&partition_columns, include_stats);
-    let schema = arrow_ffi::file_entry_arrow_schema(&partition_columns, include_stats);
 
-    // Serialize schema as JSON array of {name, type, nullable} objects
-    let schema_fields: Vec<serde_json::Value> = schema.fields().iter().map(|f| {
-        serde_json::json!({
-            "name": f.name(),
-            "type": format!("{:?}", f.data_type()),
-            "nullable": f.is_nullable(),
-        })
-    }).collect();
-    let schema_json = serde_json::to_string(&schema_fields)
-        .map_err(|e| TxLogError::Serde(format!("Failed to serialize schema fields: {}", e)))?;
+    // schemaJson is the TABLE's data schema (from MetadataAction.schema_string),
+    // NOT the Arrow column schema of the listing. The JVM needs this for StructType construction.
+    let schema_json = snapshot.metadata.schema_string.clone();
 
     let num_rows = arrow_ffi::export_file_entries_ffi(
         &all_files,
