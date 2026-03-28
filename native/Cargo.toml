@@ -1,8 +1,8 @@
 [package]
 name = "tantivy4java"
-version = "0.32.4"
+version = "0.33.1"
 edition = "2021"
-license = "MIT"
+license = "Apache-2.0"
 authors = ["Tantivy4Java Contributors"]
 description = "JNI bindings for Tantivy search engine"
 

@@ -334,4 +334,44 @@ public class TransactionLogWriter {
     private static native void nativeInitializeTable(String tablePath, Map<String, String> config, String protocolJson, String metadataJson);
     private static native String nativeDeleteExpiredStates(String tablePath, Map<String, String> config, long retentionMs, int dryRun);
     private static native String nativeDeleteExpiredVersions(String tablePath, Map<String, String> config, long retentionMs, int dryRun);
+
+    // FR2: Write a version file from Arrow batch via FFI
+    private static native byte[] nativeWriteVersionArrowFfi(
+        String tablePath, Map<String, String> config,
+        long arrayAddr, long schemaAddr, int retry);
+
+    /**
+     * Write a new version from an Arrow batch via FFI.
+     * The batch must contain an "action_type" column distinguishing add/remove/protocol/metadata/mergeskip rows.
+     *
+     * @param tablePath  table location
+     * @param config     storage credentials + cache config
+     * @param arrayAddr  Arrow C ArrowArray struct address
+     * @param schemaAddr Arrow C ArrowSchema struct address
+     * @param retry      if true, retry on conflict (like writeVersion); if false, single attempt
+     * @return WriteResult with version, retries, conflicts
+     */
+    public static WriteResult writeVersionArrowFfi(String tablePath, Map<String, String> config,
+                                                    long arrayAddr, long schemaAddr, boolean retry) {
+        if (tablePath == null || tablePath.isEmpty()) {
+            throw new IllegalArgumentException("tablePath must not be null or empty");
+        }
+        if (arrayAddr == 0 || schemaAddr == 0) {
+            throw new IllegalArgumentException("arrayAddr and schemaAddr must not be zero");
+        }
+        byte[] bytes = nativeWriteVersionArrowFfi(tablePath,
+                config != null ? config : Collections.emptyMap(),
+                arrayAddr, schemaAddr, retry ? 1 : 0);
+        if (bytes == null) {
+            throw new RuntimeException("Native writeVersionArrowFfi returned null");
+        }
+        java.nio.ByteBuffer buffer = java.nio.ByteBuffer.wrap(bytes);
+        buffer.order(java.nio.ByteOrder.nativeOrder());
+        BatchDocumentReader reader = new BatchDocumentReader();
+        java.util.List<Map<String, Object>> maps = reader.parseToMaps(buffer);
+        if (maps.isEmpty()) {
+            throw new RuntimeException("Empty write result from native writeVersionArrowFfi");
+        }
+        return WriteResult.fromMap(maps.get(0));
+    }
 }

@@ -1246,3 +1246,172 @@ fn test_replay_with_overwrite() {
     assert_eq!(file_paths, vec!["new-x.split", "new-y.split"]);
     assert!(result.skips.is_empty());
 }
+
+// ============================================================================
+// FR1-FR4 Integration Tests
+// ============================================================================
+
+/// FR1: Test can_skip_by_stats integration with file-level filtering
+#[test]
+fn test_data_skipping_with_partition_and_stats_filters() {
+    use crate::txlog::partition_pruning::PartitionFilter;
+
+    let mut entries = vec![
+        make_file_entry_full("file-young.split", 1, [("region".into(), "us".into())].into(), None, None, None, Some(50)),
+        make_file_entry_full("file-old.split", 2, [("region".into(), "eu".into())].into(), None, None, None, Some(100)),
+        make_file_entry_full("file-mixed.split", 3, [("region".into(), "us".into())].into(), None, None, None, Some(75)),
+    ];
+    // file-young: age 10-25
+    entries[0].add.min_values = Some([("age".to_string(), "10".to_string())].into());
+    entries[0].add.max_values = Some([("age".to_string(), "25".to_string())].into());
+    // file-old: age 50-80
+    entries[1].add.min_values = Some([("age".to_string(), "50".to_string())].into());
+    entries[1].add.max_values = Some([("age".to_string(), "80".to_string())].into());
+    // file-mixed: age 20-60
+    entries[2].add.min_values = Some([("age".to_string(), "20".to_string())].into());
+    entries[2].add.max_values = Some([("age".to_string(), "60".to_string())].into());
+
+    // Partition filter: region = "us"
+    let pf = PartitionFilter::Eq { column: "region".into(), value: "us".into() };
+    let after_partition: Vec<_> = entries.iter()
+        .filter(|e| pf.evaluate(&e.add.partition_values))
+        .collect();
+    assert_eq!(after_partition.len(), 2); // file-young, file-mixed
+
+    // Data filter: age > 30 (should skip file-young where max=25)
+    let df = PartitionFilter::Gt { column: "age".into(), value: "30".into() };
+    let after_data: Vec<_> = after_partition.iter()
+        .filter(|e| {
+            let min = e.add.min_values.as_ref();
+            let max = e.add.max_values.as_ref();
+            match (min, max) {
+                (Some(min_vals), Some(max_vals)) => !df.can_skip_by_stats(min_vals, max_vals),
+                _ => true,
+            }
+        })
+        .collect();
+    assert_eq!(after_data.len(), 1); // only file-mixed (age 20-60, max > 30)
+    assert_eq!(after_data[0].add.path, "file-mixed.split");
+}
+
+/// FR2: Test Arrow batch → actions round-trip
+#[test]
+fn test_arrow_import_add_action_roundtrip() {
+    use crate::txlog::arrow_ffi_import::arrow_batch_to_actions;
+    use crate::txlog::actions::Action;
+    use arrow::array::*;
+    use arrow::datatypes::{DataType, Field, Schema};
+
+    let schema = std::sync::Arc::new(Schema::new(vec![
+        Field::new("action_type", DataType::Utf8, false),
+        Field::new("path", DataType::Utf8, false),
+        Field::new("size", DataType::Int64, false),
+        Field::new("modification_time", DataType::Int64, false),
+        Field::new("data_change", DataType::Boolean, false),
+        Field::new("num_records", DataType::Int64, true),
+        Field::new("partition_values", DataType::Utf8, true),
+    ]));
+
+    let batch = arrow::record_batch::RecordBatch::try_new(schema, vec![
+        std::sync::Arc::new(StringArray::from(vec!["add", "add"])),
+        std::sync::Arc::new(StringArray::from(vec!["split1.split", "split2.split"])),
+        std::sync::Arc::new(Int64Array::from(vec![5000, 10000])),
+        std::sync::Arc::new(Int64Array::from(vec![1700000000000i64, 1700000001000i64])),
+        std::sync::Arc::new(BooleanArray::from(vec![true, true])),
+        std::sync::Arc::new(Int64Array::from(vec![Some(100), Some(200)])),
+        std::sync::Arc::new(StringArray::from(vec![
+            Some(r#"{"year":"2024"}"#),
+            Some(r#"{"year":"2023"}"#),
+        ])),
+    ]).unwrap();
+
+    let actions = arrow_batch_to_actions(&batch).unwrap();
+    assert_eq!(actions.len(), 2);
+
+    match &actions[0] {
+        Action::Add(add) => {
+            assert_eq!(add.path, "split1.split");
+            assert_eq!(add.size, 5000);
+            assert_eq!(add.num_records, Some(100));
+            assert_eq!(add.partition_values.get("year"), Some(&"2024".to_string()));
+        }
+        _ => panic!("Expected Add"),
+    }
+    match &actions[1] {
+        Action::Add(add) => {
+            assert_eq!(add.path, "split2.split");
+            assert_eq!(add.partition_values.get("year"), Some(&"2023".to_string()));
+        }
+        _ => panic!("Expected Add"),
+    }
+}
+
+/// FR4: Test range filter elimination with field stats
+#[test]
+fn test_range_filter_elimination_basic() {
+    use crate::split_searcher::async_impl::optimize_query_with_field_stats;
+    use std::collections::HashMap;
+
+    let min_vals: HashMap<String, String> = [("age".into(), "20".into())].into();
+    let max_vals: HashMap<String, String> = [("age".into(), "40".into())].into();
+
+    // Range filter: age >= 10 AND age <= 50 → redundant (all data in [20,40] is within [10,50])
+    let query = r#"{"type":"bool","must":[{"type":"range","field":"age","lower_bound":{"value":"10","inclusive":true},"upper_bound":{"value":"50","inclusive":true}}]}"#;
+    let optimized = optimize_query_with_field_stats(query, &min_vals, &max_vals);
+
+    // Should be replaced with match_all since the range is always true
+    let parsed: serde_json::Value = serde_json::from_str(&optimized).unwrap();
+    assert_eq!(parsed["type"], "match_all");
+}
+
+#[test]
+fn test_range_filter_elimination_not_redundant() {
+    use crate::split_searcher::async_impl::optimize_query_with_field_stats;
+    use std::collections::HashMap;
+
+    let min_vals: HashMap<String, String> = [("age".into(), "20".into())].into();
+    let max_vals: HashMap<String, String> = [("age".into(), "40".into())].into();
+
+    // Range filter: age >= 25 AND age <= 35 → NOT redundant (min=20 < 25)
+    let query = r#"{"type":"bool","must":[{"type":"range","field":"age","lower_bound":{"value":"25","inclusive":true},"upper_bound":{"value":"35","inclusive":true}}]}"#;
+    let optimized = optimize_query_with_field_stats(query, &min_vals, &max_vals);
+
+    // Should NOT be changed
+    let parsed: serde_json::Value = serde_json::from_str(&optimized).unwrap();
+    assert_eq!(parsed["type"], "bool");
+}
+
+#[test]
+fn test_range_filter_elimination_preserves_non_range_clauses() {
+    use crate::split_searcher::async_impl::optimize_query_with_field_stats;
+    use std::collections::HashMap;
+
+    let min_vals: HashMap<String, String> = [("age".into(), "20".into())].into();
+    let max_vals: HashMap<String, String> = [("age".into(), "40".into())].into();
+
+    // Bool with range (redundant) + term (not range) → only range removed
+    let query = r#"{"type":"bool","must":[{"type":"range","field":"age","lower_bound":{"value":"10","inclusive":true},"upper_bound":{"value":"50","inclusive":true}},{"type":"term","field":"name","value":"Alice"}]}"#;
+    let optimized = optimize_query_with_field_stats(query, &min_vals, &max_vals);
+
+    let parsed: serde_json::Value = serde_json::from_str(&optimized).unwrap();
+    // Should still be a bool with only the term clause remaining
+    assert_eq!(parsed["type"], "bool");
+    let must = parsed["must"].as_array().unwrap();
+    assert_eq!(must.len(), 1);
+    assert_eq!(must[0]["type"], "term");
+}
+
+#[test]
+fn test_range_filter_elimination_empty_stats() {
+    use crate::split_searcher::async_impl::optimize_query_with_field_stats;
+    use std::collections::HashMap;
+
+    let min_vals: HashMap<String, String> = HashMap::new();
+    let max_vals: HashMap<String, String> = HashMap::new();
+
+    let query = r#"{"type":"bool","must":[{"type":"range","field":"age","lower_bound":{"value":"10","inclusive":true}}]}"#;
+    let optimized = optimize_query_with_field_stats(query, &min_vals, &max_vals);
+
+    // No change — no stats available
+    assert_eq!(optimized, query);
+}

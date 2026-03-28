@@ -82,6 +82,8 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_crea
     let mut parquet_coalesce_max_gap: Option<u64> = None;
     let mut parquet_aws_config: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     let mut parquet_azure_config: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut field_min_values: Option<std::collections::HashMap<String, String>> = None;
+    let mut field_max_values: Option<std::collections::HashMap<String, String>> = None;
     
     if !split_config_map.is_null() {
         let split_config_jobject = unsafe { JObject::from_raw(split_config_map) };
@@ -235,6 +237,46 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_crea
                     if let Ok(v) = s.parse::<u64>() {
                         debug_println!("RUST DEBUG: Extracted parquet_coalesce_max_gap from Java config: {}", v);
                         parquet_coalesce_max_gap = Some(v);
+                    }
+                }
+            }
+        }
+
+        // FR4: Extract field min/max values for range filter elimination
+        if let Ok(ptr_obj) = env.call_method(&split_config_jobject, "get", "(Ljava/lang/Object;)Ljava/lang/Object;", &[(&env.new_string("field_min_values").unwrap()).into()]) {
+            let ptr_jobject = ptr_obj.l().unwrap();
+            if !ptr_jobject.is_null() {
+                if let Ok(ptr_str) = env.get_string((&ptr_jobject).into()) {
+                    let s: String = ptr_str.into();
+                    if !s.is_empty() {
+                        match serde_json::from_str::<std::collections::HashMap<String, String>>(&s) {
+                            Ok(map) => {
+                                debug_println!("RUST DEBUG: Extracted field_min_values ({} fields)", map.len());
+                                field_min_values = Some(map);
+                            }
+                            Err(e) => {
+                                debug_println!("RUST WARNING: Invalid field_min_values JSON, ignoring: {}", e);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if let Ok(ptr_obj) = env.call_method(&split_config_jobject, "get", "(Ljava/lang/Object;)Ljava/lang/Object;", &[(&env.new_string("field_max_values").unwrap()).into()]) {
+            let ptr_jobject = ptr_obj.l().unwrap();
+            if !ptr_jobject.is_null() {
+                if let Ok(ptr_str) = env.get_string((&ptr_jobject).into()) {
+                    let s: String = ptr_str.into();
+                    if !s.is_empty() {
+                        match serde_json::from_str::<std::collections::HashMap<String, String>>(&s) {
+                            Ok(map) => {
+                                debug_println!("RUST DEBUG: Extracted field_max_values ({} fields)", map.len());
+                                field_max_values = Some(map);
+                            }
+                            Err(e) => {
+                                debug_println!("RUST WARNING: Invalid field_max_values JSON, ignoring: {}", e);
+                            }
+                        }
                     }
                 }
             }
@@ -877,6 +919,8 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_crea
                                 parquet_file_hash_index,
                                 has_merge_safe_tracking,
                                 pq_columns: std::sync::Arc::new(std::sync::RwLock::new(Vec::new())),
+                                field_min_values,
+                                field_max_values,
                                 search_arena_reservation: None, // Global arena covers all concurrent slots
                             };
 

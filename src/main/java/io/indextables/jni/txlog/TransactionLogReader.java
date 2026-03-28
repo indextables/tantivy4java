@@ -378,4 +378,70 @@ public class TransactionLogReader {
     private static native void nativeCloseRetainedFilesCursor(long cursorHandle);
     private static native byte[] nativeListSkipActions(String tablePath, Map<String, String> config, long maxAgeMs);
     private static native void nativeInvalidateCache(String tablePath);
+
+    // FR1: List files with partition/data skipping, return via Arrow FFI
+    private static native String nativeListFilesArrowFfi(
+        String tablePath, Map<String, String> config,
+        String partitionFilterJson, String dataFilterJson,
+        int excludeCooldown, int includeStats,
+        long[] arrayAddrs, long[] schemaAddrs);
+
+    /**
+     * List files with all filtering applied natively, exported via Arrow FFI.
+     * Single-call replacement for getSnapshotInfo + readManifest + partition pruning + data skipping.
+     *
+     * @param tablePath           table location (s3://, file://, azure://)
+     * @param config              storage credentials + cache config
+     * @param partitionFilterJson partition filter as JSON (null = no partition filtering)
+     * @param dataFilterJson      data filter for min/max skipping as JSON (null = no data skipping)
+     * @param excludeCooldown     if true, exclude files in cooldown state
+     * @param includeStats        if true, include min_values/max_values columns in output
+     * @param arrayAddrs          pre-allocated Arrow C ArrowArray struct addresses
+     * @param schemaAddrs         pre-allocated Arrow C ArrowSchema struct addresses
+     * @return JSON with numRows, partitionColumns, protocolJson, metrics
+     */
+    public static String listFilesArrowFfi(String tablePath, Map<String, String> config,
+                                           String partitionFilterJson, String dataFilterJson,
+                                           boolean excludeCooldown, boolean includeStats,
+                                           long[] arrayAddrs, long[] schemaAddrs) {
+        if (tablePath == null || tablePath.isEmpty()) {
+            throw new IllegalArgumentException("tablePath must not be null or empty");
+        }
+        if (arrayAddrs == null || schemaAddrs == null) {
+            throw new IllegalArgumentException("arrayAddrs and schemaAddrs must not be null");
+        }
+        return nativeListFilesArrowFfi(tablePath,
+                config != null ? config : java.util.Collections.emptyMap(),
+                partitionFilterJson, dataFilterJson,
+                excludeCooldown ? 1 : 0, includeStats ? 1 : 0,
+                arrayAddrs, schemaAddrs);
+    }
+
+    // FR3: Read next batch of retained files via Arrow FFI
+    private static native int nativeReadNextRetainedFilesBatchArrowFfi(
+        long cursorHandle, int batchSize,
+        long[] arrayAddrs, long[] schemaAddrs);
+
+    /**
+     * Fetch the next batch of retained files from cursor, exported via Arrow FFI.
+     *
+     * @param cursorHandle opaque cursor from openRetainedFilesCursor()
+     * @param batchSize    maximum rows per batch
+     * @param arrayAddrs   pre-allocated Arrow C ArrowArray struct addresses
+     * @param schemaAddrs  pre-allocated Arrow C ArrowSchema struct addresses
+     * @return number of rows (0 = exhausted, -1 = error)
+     */
+    public static int readNextRetainedFilesBatchArrowFfi(long cursorHandle, int batchSize,
+                                                          long[] arrayAddrs, long[] schemaAddrs) {
+        if (arrayAddrs == null || schemaAddrs == null) {
+            throw new IllegalArgumentException("arrayAddrs and schemaAddrs must not be null");
+        }
+        return nativeReadNextRetainedFilesBatchArrowFfi(cursorHandle, batchSize, arrayAddrs, schemaAddrs);
+    }
+
+    // Test helper: list files with Rust-side FFI allocation, returns JSON summary
+    static native String nativeTestListFilesRoundtrip(
+        String tablePath, Map<String, String> config,
+        String partitionFilterJson, String dataFilterJson,
+        int excludeCooldown);
 }
