@@ -52,18 +52,27 @@ public class ArrowFfiListFilesIntegrationTest {
         add1.put("partitionValues", Map.of("year", "2023"));
         add1.put("minValues", Map.of("price", "10"));
         add1.put("maxValues", Map.of("price", "50"));
+        add1.put("footerStartOffset", 1024L);
+        add1.put("footerEndOffset", 2048L);
+        add1.put("hasFooterOffsets", true);
         adds.add(add1);
 
         Map<String, Object> add2 = makeAdd("year=2024/split-b.split", 2000, 100);
         add2.put("partitionValues", Map.of("year", "2024"));
         add2.put("minValues", Map.of("price", "100"));
         add2.put("maxValues", Map.of("price", "500"));
+        add2.put("footerStartOffset", 3000L);
+        add2.put("footerEndOffset", 5000L);
+        add2.put("hasFooterOffsets", true);
         adds.add(add2);
 
         Map<String, Object> add3 = makeAdd("year=2024/split-c.split", 3000, 200);
         add3.put("partitionValues", Map.of("year", "2024"));
         add3.put("minValues", Map.of("price", "200"));
         add3.put("maxValues", Map.of("price", "300"));
+        add3.put("footerStartOffset", 6000L);
+        add3.put("footerEndOffset", 9000L);
+        add3.put("hasFooterOffsets", true);
         adds.add(add3);
 
         TransactionLogWriter.addFiles(tablePath, config, MAPPER.writeValueAsString(adds));
@@ -243,6 +252,68 @@ public class ArrowFfiListFilesIntegrationTest {
         JsonNode json = MAPPER.readTree(result);
         // 19 base + 1 partition column ("year") = 20
         assertEquals(20, json.get("numColumns").asInt(), "Should have 20 columns (19 base + 1 partition)");
+    }
+
+    // ========================================================================
+    // Test: Footer offsets survive Arrow FFI round-trip
+    // ========================================================================
+
+    @Test
+    @Order(7)
+    @DisplayName("Footer offsets are correctly exported via Arrow FFI")
+    void testFooterOffsetsRoundtrip() throws Exception {
+        String result = TransactionLogReader.nativeTestListFilesRoundtrip(
+            tablePath, config, null, null, 0);
+
+        JsonNode json = MAPPER.readTree(result);
+        assertEquals(3, json.get("numRows").asLong());
+
+        // Verify footer offsets are present and non-zero
+        JsonNode footerStarts = json.get("footerStartOffsets");
+        JsonNode footerEnds = json.get("footerEndOffsets");
+        JsonNode numRecords = json.get("numRecords");
+
+        assertNotNull(footerStarts, "footerStartOffsets should be in result JSON");
+        assertNotNull(footerEnds, "footerEndOffsets should be in result JSON");
+        assertNotNull(numRecords, "numRecords should be in result JSON");
+
+        assertEquals(3, footerStarts.size());
+        assertEquals(3, footerEnds.size());
+
+        // All entries should have non-null, non-zero footer offsets
+        for (int i = 0; i < 3; i++) {
+            assertFalse(footerStarts.get(i).isNull(),
+                "footerStartOffset should not be null for entry " + i);
+            assertFalse(footerEnds.get(i).isNull(),
+                "footerEndOffset should not be null for entry " + i);
+            assertTrue(footerStarts.get(i).asLong() > 0,
+                "footerStartOffset should be > 0 for entry " + i + ", got: " + footerStarts.get(i));
+            assertTrue(footerEnds.get(i).asLong() > 0,
+                "footerEndOffset should be > 0 for entry " + i + ", got: " + footerEnds.get(i));
+            assertTrue(footerEnds.get(i).asLong() > footerStarts.get(i).asLong(),
+                "footerEndOffset should be > footerStartOffset for entry " + i);
+        }
+
+        // Verify specific values match what we wrote
+        // Entries are sorted by path, so order is: split-a (1024/2048), split-b (3000/5000), split-c (6000/9000)
+        List<String> paths = new ArrayList<>();
+        for (JsonNode p : json.get("paths")) paths.add(p.asText());
+
+        int aIdx = paths.indexOf("year=2023/split-a.split");
+        int bIdx = paths.indexOf("year=2024/split-b.split");
+        int cIdx = paths.indexOf("year=2024/split-c.split");
+
+        assertEquals(1024L, footerStarts.get(aIdx).asLong(), "split-a footerStart");
+        assertEquals(2048L, footerEnds.get(aIdx).asLong(), "split-a footerEnd");
+        assertEquals(3000L, footerStarts.get(bIdx).asLong(), "split-b footerStart");
+        assertEquals(5000L, footerEnds.get(bIdx).asLong(), "split-b footerEnd");
+        assertEquals(6000L, footerStarts.get(cIdx).asLong(), "split-c footerStart");
+        assertEquals(9000L, footerEnds.get(cIdx).asLong(), "split-c footerEnd");
+
+        // Verify numRecords too
+        assertEquals(50, numRecords.get(aIdx).asLong(), "split-a numRecords");
+        assertEquals(100, numRecords.get(bIdx).asLong(), "split-b numRecords");
+        assertEquals(200, numRecords.get(cIdx).asLong(), "split-c numRecords");
     }
 
     // ========================================================================

@@ -1187,29 +1187,46 @@ pub extern "system" fn Java_io_indextables_jni_txlog_TransactionLogReader_native
             Vec::new()
         };
 
-        // Read back sizes from Arrow column 1
-        let sizes: Vec<i64> = if result.num_rows > 0 {
-            let ffi_arr = unsafe { ffi_array_boxes[1].assume_init_read() };
-            let ffi_sch = unsafe { ffi_schema_boxes[1].assume_init_ref() };
+        // Helper to read back an Int64 column
+        let read_i64_col = |boxes: &mut Vec<Box<std::mem::MaybeUninit<FFI_ArrowArray>>>,
+                            schemas: &mut Vec<Box<std::mem::MaybeUninit<FFI_ArrowSchema>>>,
+                            col: usize, name: &str| -> std::result::Result<Vec<Option<i64>>, super::error::TxLogError> {
+            let ffi_arr = unsafe { boxes[col].assume_init_read() };
+            let ffi_sch = unsafe { schemas[col].assume_init_ref() };
             let data = unsafe { arrow::ffi::from_ffi(ffi_arr, ffi_sch) }
-                .map_err(|e| super::error::TxLogError::Storage(anyhow::anyhow!("Arrow reimport col 1: {}", e)))?;
-            let size_arr = arrow::array::make_array(data);
-            let int_arr = size_arr.as_any().downcast_ref::<arrow::array::Int64Array>()
-                .ok_or_else(|| super::error::TxLogError::Storage(anyhow::anyhow!("Column 1 not Int64Array")))?;
-            (0..int_arr.len()).map(|i| int_arr.value(i)).collect()
-        } else {
-            Vec::new()
+                .map_err(|e| super::error::TxLogError::Storage(anyhow::anyhow!("Arrow reimport col {} ({}): {}", col, name, e)))?;
+            let arr = arrow::array::make_array(data);
+            let int_arr = arr.as_any().downcast_ref::<arrow::array::Int64Array>()
+                .ok_or_else(|| super::error::TxLogError::Storage(anyhow::anyhow!("Column {} ({}) not Int64Array", col, name)))?;
+            Ok((0..int_arr.len()).map(|i| if int_arr.is_null(i) { None } else { Some(int_arr.value(i)) }).collect())
         };
 
+        // Read back sizes from column 1
+        let sizes: Vec<i64> = if result.num_rows > 0 {
+            read_i64_col(&mut ffi_array_boxes, &mut ffi_schema_boxes, 1, "size")?
+                .into_iter().map(|v| v.unwrap_or(0)).collect()
+        } else { Vec::new() };
+
+        // Read back footer offsets from columns 5, 6, 4 (num_records)
+        let footer_starts: Vec<Option<i64>> = if result.num_rows > 0 {
+            read_i64_col(&mut ffi_array_boxes, &mut ffi_schema_boxes, 5, "footer_start_offset")?
+        } else { Vec::new() };
+        let footer_ends: Vec<Option<i64>> = if result.num_rows > 0 {
+            read_i64_col(&mut ffi_array_boxes, &mut ffi_schema_boxes, 6, "footer_end_offset")?
+        } else { Vec::new() };
+        let num_records: Vec<Option<i64>> = if result.num_rows > 0 {
+            read_i64_col(&mut ffi_array_boxes, &mut ffi_schema_boxes, 4, "num_records")?
+        } else { Vec::new() };
+
         // Clean up remaining FFI resources to prevent memory leaks.
-        // Columns 0 and 1 were consumed above via assume_init_read → from_ffi.
-        // Remaining columns need their release callbacks invoked via drop.
-        for i in 2..ffi_array_boxes.len() {
-            unsafe { drop(ffi_array_boxes[i].assume_init_read()); }
+        // Columns 0, 1, 4, 5, 6 were consumed above. Clean up the rest.
+        let consumed: std::collections::HashSet<usize> = [0usize, 1, 4, 5, 6].into();
+        for i in 0..ffi_array_boxes.len() {
+            if !consumed.contains(&i) {
+                unsafe { drop(ffi_array_boxes[i].assume_init_read()); }
+            }
         }
         for i in 0..ffi_schema_boxes.len() {
-            // Schema 0 was only borrowed (assume_init_ref), not consumed — also needs cleanup.
-            // Schema 1 was borrowed too.
             unsafe { drop(ffi_schema_boxes[i].assume_init_read()); }
         }
 
@@ -1218,6 +1235,9 @@ pub extern "system" fn Java_io_indextables_jni_txlog_TransactionLogReader_native
             "numColumns": result.num_columns,
             "paths": paths,
             "sizes": sizes,
+            "numRecords": num_records,
+            "footerStartOffsets": footer_starts,
+            "footerEndOffsets": footer_ends,
             "partitionColumns": result.partition_columns,
             "protocolJson": result.protocol_json,
             "metrics": {
