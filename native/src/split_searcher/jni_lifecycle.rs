@@ -822,11 +822,7 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_crea
                                 return 0;
                             }
 
-                            // ✅ FIX: Always use index.schema() for now - doc_mapping reconstruction has issues with dynamic JSON fields
                             debug_println!("RUST DEBUG: 🔧 Using index.schema() directly (doc_mapping has compatibility issues with dynamic JSON fields)");
-                            let schema = cached_index.schema();
-                            let schema_ptr = crate::utils::arc_to_jlong(std::sync::Arc::new(schema));
-                            debug_println!("RUST DEBUG: 🔧 Created schema_ptr={} from reconstructed schema", schema_ptr);
 
                             // Build file hash index before parquet_manifest is moved into the struct
                             let parquet_file_hash_index = parquet_manifest.as_ref()
@@ -892,12 +888,6 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_crea
                                 debug_println!("❌ CRITICAL BUG: Arc {} was stored but CANNOT be retrieved immediately!", pointer);
                             }
 
-                            // ✅ FIX: Store direct mapping from searcher pointer to schema pointer for fallback
-                            debug_println!("RUST DEBUG: 🔧 Storing schema mapping: searcher_ptr={} -> schema_ptr={}", pointer, schema_ptr);
-                            crate::split_query::store_searcher_schema(pointer, schema_ptr);
-                            debug_println!("RUST DEBUG: 🔧 Schema mapping stored successfully");
-                            debug_println!("✅ SEARCHER_SCHEMA_MAPPING: Stored mapping {} -> {} for reliable schema access", pointer, schema_ptr);
-
                             debug_println!("🏁 SPLIT_SEARCHER: Thread {:?} COMPLETED successfully in {}ms - pointer: 0x{:x}",
                                           thread_id, start_time.elapsed().as_millis(), pointer);
                             pointer
@@ -959,10 +949,6 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_clos
             }
         }
     }
-
-    // ✅ FIX: Clean up direct schema mapping when searcher is closed
-    crate::split_query::remove_searcher_schema(searcher_ptr);
-    debug_println!("✅ CLEANUP: Removed direct schema mapping for searcher {}", searcher_ptr);
 
     // ✅ FIX: Evict from SEARCHER_CACHE before releasing Arc, to prevent
     // use-after-free panics on tokio worker threads during JVM shutdown.
