@@ -195,15 +195,22 @@ Eliminates redundant range filters in the search query when the split's min/max 
 
 ### Java API
 
-```java
-Map<String, Object> splitConfig = new HashMap<>();
-splitConfig.put("field_min_values", "{\"age\":\"20\",\"score\":\"0\"}");
-splitConfig.put("field_max_values", "{\"age\":\"40\",\"score\":\"100\"}");
-// ... other config ...
+No Java-side changes needed. The statistics flow entirely through the Rust layer:
 
-SplitSearcher searcher = cacheManager.createSplitSearcher(splitUri, splitConfig);
-// Range filters on "age" or "score" that encompass [min,max] will be auto-eliminated
+```java
+// Step 1: FR1 lists files — stats are cached on the Rust cache manager automatically
+String result = TransactionLogReader.listFilesArrowFfi(tablePath, config, ...);
+
+// Step 2: Create searcher — native layer looks up the split's stats from cache
+SplitSearcher searcher = cacheManager.createSplitSearcher(splitUri, metadata);
+// Range filters that encompass the split's [min,max] are auto-eliminated
 ```
+
+**How it works internally:**
+1. `nativeListFilesArrowFfi` loads file entries with min/max stats from the transaction log
+2. If a `cache_manager` is provided, it calls `put_all_file_field_stats()` to cache stats on the `GlobalSplitCacheManager`, keyed by file path
+3. When `createNativeWithSharedCache` creates a searcher, it looks up the split URI across all cache managers via `get_file_field_stats()`
+4. If found, the stats are stored on `CachedSearcherContext` and used by `optimize_query_with_field_stats()`
 
 ### Benefits
 
@@ -236,6 +243,7 @@ SplitSearcher searcher = cacheManager.createSplitSearcher(splitUri, splitConfig)
 | `native/src/split_searcher/jni_search.rs` | FR4 integration in aggregation path |
 | `native/src/split_searcher/jni_lifecycle.rs` | Extract field_min/max_values from splitConfigMap |
 | `native/src/split_searcher/types.rs` | +field_min_values, +field_max_values on CachedSearcherContext |
+| `native/src/split_cache_manager/manager.rs` | +file_field_stats cache, +put_all_file_field_stats(), +get_file_field_stats() |
 
 ### New Java Files
 | File | Purpose |

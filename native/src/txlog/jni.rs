@@ -978,6 +978,7 @@ pub extern "system" fn Java_io_indextables_jni_txlog_TransactionLogReader_native
                 include_stats_flag,
                 &arr_addrs,
                 &sch_addrs,
+                None, // TODO: pass cache_manager_ptr when JNI signature adds it
             ).await
         }
     }) {
@@ -1167,6 +1168,7 @@ pub extern "system" fn Java_io_indextables_jni_txlog_TransactionLogReader_native
                 pf_str.as_deref(), df_str.as_deref(),
                 exclude_cooldown_files, false,
                 &array_addrs, &schema_addrs,
+                None,
             ).await?
         };
 

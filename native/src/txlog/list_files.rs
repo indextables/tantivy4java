@@ -12,7 +12,10 @@
 
 use std::collections::{HashMap, HashSet};
 
+use std::sync::Arc;
+
 use crate::delta_reader::engine::DeltaStorageConfig;
+use crate::split_cache_manager::GlobalSplitCacheManager;
 
 use super::actions::{FileEntry, ManifestInfo};
 use super::arrow_ffi;
@@ -61,6 +64,7 @@ pub async unsafe fn list_files_arrow_ffi(
     include_stats: bool,
     array_addrs: &[i64],
     schema_addrs: &[i64],
+    cache_manager: Option<&Arc<GlobalSplitCacheManager>>,
 ) -> Result<ListFilesResult> {
     // 1. Get snapshot info (cached by table_path + TTL)
     let snapshot = distributed::get_txlog_snapshot_info_with_cache(
@@ -187,6 +191,12 @@ pub async unsafe fn list_files_arrow_ffi(
 
     // 8. Restore doc_mapping schemas from schema registry
     schema_dedup::restore_schemas(&mut all_files, &metadata_config);
+
+    // FR4: Cache per-file field statistics on the split cache manager for
+    // range filter elimination during SplitSearcher creation.
+    if let Some(cm) = cache_manager {
+        cm.put_all_file_field_stats(&all_files);
+    }
 
     // 9. Export via Arrow FFI v2
     let num_cols = arrow_ffi::column_count(&partition_columns, include_stats);
