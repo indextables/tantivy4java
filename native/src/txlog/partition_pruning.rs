@@ -455,30 +455,23 @@ pub fn compare_values_typed(a: &str, b: &str, field_type: Option<&str>) -> std::
 }
 
 /// Parse a value as epoch days. Handles:
-/// - Integer string ("19738") — epoch days directly
-/// - Date string ("2024-01-15") — parsed via chrono
+/// - Integer string ("19738") — epoch days directly (Spark stores DateType stats this way)
+/// - Date string ("2024-01-15") — parsed via chrono (Spark filter values)
+/// - ISO-8601 date with time ("2024-01-15T00:00:00Z") — date portion extracted
+///
+/// Spark convention: stats are stored as epoch days (Int), filter values as "YYYY-MM-DD".
 fn parse_as_epoch_days(s: &str) -> Option<i64> {
-    // Try integer first (stat values)
+    // Try integer first (stat values — epoch days)
     if let Ok(days) = s.parse::<i64>() {
         return Some(days);
     }
-    // Try date string (filter values from Spark)
-    // Format: YYYY-MM-DD
-    if s.len() == 10 && s.as_bytes().get(4) == Some(&b'-') {
-        let parts: Vec<&str> = s.splitn(3, '-').collect();
-        if parts.len() == 3 {
-            if let (Ok(y), Ok(m), Ok(d)) = (
-                parts[0].parse::<i32>(),
-                parts[1].parse::<u32>(),
-                parts[2].parse::<u32>(),
-            ) {
-                // Calculate epoch days: days from 1970-01-01
-                // Use a simple calculation (no leap second precision needed for day granularity)
-                if let Some(date) = chrono::NaiveDate::from_ymd_opt(y, m, d) {
-                    let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
-                    return Some((date - epoch).num_days());
-                }
-            }
+    // Try YYYY-MM-DD (exactly 10 chars)
+    if s.len() >= 10 && s.as_bytes().get(4) == Some(&b'-') && s.as_bytes().get(7) == Some(&b'-') {
+        // Take only the date portion (handles "2024-01-15" and "2024-01-15T00:00:00Z")
+        let date_part = &s[..10];
+        if let Ok(date) = chrono::NaiveDate::parse_from_str(date_part, "%Y-%m-%d") {
+            let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+            return Some((date - epoch).num_days());
         }
     }
     None
@@ -486,20 +479,29 @@ fn parse_as_epoch_days(s: &str) -> Option<i64> {
 
 /// Parse a value as epoch microseconds. Handles:
 /// - Integer string ("1699336800000000") — epoch microseconds directly
+/// - Integer string ("1699336800000") — epoch milliseconds → converted to micros
+/// - Integer string ("1699336800") — epoch seconds → converted to micros
 /// - Timestamp string ("2023-11-07 05:00:00") — parsed as UTC
-/// - Epoch milliseconds ("1699336800000") — converted to microseconds
+/// - ISO-8601 ("2023-11-07T05:00:00Z", "2023-11-07T05:00:00+05:00")
+///
+/// Epoch unit heuristic (for integer values):
+///   > 1e15 → microseconds (year 2001+ in micros)
+///   > 1e12 → milliseconds (year 2001+ in millis)
+///   > 0    → seconds (all positive epoch seconds, including < year 2001)
+///
+/// This matches Spark's convention: stats are stored as epoch microseconds,
+/// filter values may be epoch seconds or millis depending on the Spark version.
 fn parse_as_epoch_micros(s: &str) -> Option<i64> {
-    // Try integer first — could be micros or millis
+    // Try integer first — determine unit by magnitude
     if let Ok(v) = s.parse::<i64>() {
-        // Heuristic: if > 1e15, it's likely microseconds; if > 1e12, likely milliseconds
         if v > 1_000_000_000_000_000 {
-            return Some(v); // Already microseconds
+            return Some(v); // Microseconds
         } else if v > 1_000_000_000_000 {
-            return Some(v * 1000); // Milliseconds → microseconds
-        } else if v > 1_000_000_000 {
+            return Some(v * 1_000); // Milliseconds → microseconds
+        } else if v > 0 {
             return Some(v * 1_000_000); // Seconds → microseconds
         }
-        return Some(v); // Small value, treat as-is
+        return Some(0); // Zero or negative — epoch start
     }
     // Try full ISO-8601 with timezone (RFC 3339):
     //   "2023-11-07T05:00:00Z"
