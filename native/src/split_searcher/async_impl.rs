@@ -13,6 +13,213 @@ use super::types::CachedSearcherContext;
 use super::searcher_cache::extract_split_id_from_uri;
 use quickwit_storage::Storage;
 
+/// FR4: Optimize a QueryAst JSON by eliminating redundant range filters.
+///
+/// If the split's min/max stats prove that ALL data falls within a range filter's bounds,
+/// that filter is always-true and can be removed. This avoids unnecessary fast field
+/// transcoding and speeds up search execution.
+///
+/// Operates on Quickwit QueryAst JSON (snake_case tag names).
+/// Only eliminates range filters in "must" position of "bool" queries.
+/// Returns the original JSON unchanged if no optimization is possible.
+pub(crate) fn optimize_query_with_field_stats(
+    query_json: &str,
+    min_values: &std::collections::HashMap<String, String>,
+    max_values: &std::collections::HashMap<String, String>,
+) -> String {
+    if min_values.is_empty() && max_values.is_empty() {
+        return query_json.to_string();
+    }
+
+    let mut ast: serde_json::Value = match serde_json::from_str(query_json) {
+        Ok(v) => v,
+        Err(_) => return query_json.to_string(),
+    };
+
+    let changed = eliminate_redundant_ranges(&mut ast, min_values, max_values);
+    if changed {
+        debug_println!("📊 FR4: Eliminated redundant range filter(s) from query");
+        serde_json::to_string(&ast).unwrap_or_else(|_| query_json.to_string())
+    } else {
+        query_json.to_string()
+    }
+}
+
+/// Recursively walk the QueryAst and eliminate range filters that are always-true
+/// given the split's field statistics.
+fn eliminate_redundant_ranges(
+    ast: &mut serde_json::Value,
+    min_values: &std::collections::HashMap<String, String>,
+    max_values: &std::collections::HashMap<String, String>,
+) -> bool {
+    let obj = match ast.as_object_mut() {
+        Some(o) => o,
+        None => return false,
+    };
+
+    let ast_type = obj.get("type").and_then(|v| v.as_str()).map(|s| s.to_string());
+
+    match ast_type.as_deref() {
+        Some("bool") => {
+            // Process "must" clauses — remove always-true range filters
+            let mut changed = false;
+            if let Some(must) = obj.get_mut("must") {
+                if let Some(arr) = must.as_array_mut() {
+                    let before = arr.len();
+                    arr.retain(|clause| !is_redundant_range(clause, min_values, max_values));
+                    if arr.len() < before {
+                        changed = true;
+                    }
+                    // Recurse into remaining clauses
+                    for clause in arr.iter_mut() {
+                        changed |= eliminate_redundant_ranges(clause, min_values, max_values);
+                    }
+                }
+            }
+            // Recurse into "should" and "filter" as well (optimization only, no removal)
+            // "filter" has same AND semantics as "must" — also remove always-true ranges
+            if let Some(filter) = obj.get_mut("filter") {
+                if let Some(arr) = filter.as_array_mut() {
+                    let before = arr.len();
+                    arr.retain(|clause| !is_redundant_range(clause, min_values, max_values));
+                    if arr.len() < before {
+                        changed = true;
+                    }
+                    for clause in arr.iter_mut() {
+                        changed |= eliminate_redundant_ranges(clause, min_values, max_values);
+                    }
+                }
+            }
+            // "should" has OR semantics — only recurse, don't remove
+            if let Some(should) = obj.get_mut("should") {
+                if let Some(arr) = should.as_array_mut() {
+                    for clause in arr.iter_mut() {
+                        changed |= eliminate_redundant_ranges(clause, min_values, max_values);
+                    }
+                }
+            }
+            // If all "must" clauses were removed and no other clauses exist, replace with match_all
+            if let Some(must) = obj.get("must") {
+                if let Some(arr) = must.as_array() {
+                    if arr.is_empty() && changed {
+                        let has_should = obj.get("should").and_then(|v| v.as_array()).map_or(false, |a| !a.is_empty());
+                        let has_must_not = obj.get("must_not").and_then(|v| v.as_array()).map_or(false, |a| !a.is_empty());
+                        let has_filter = obj.get("filter").and_then(|v| v.as_array()).map_or(false, |a| !a.is_empty());
+                        if !has_should && !has_must_not && !has_filter {
+                            *ast = serde_json::json!({"type": "match_all"});
+                            return true;
+                        }
+                        // Other clauses exist — just remove the empty "must" key
+                        obj.remove("must");
+                    }
+                }
+            }
+            changed
+        }
+        Some("boost") => {
+            // Recurse into the inner query
+            if let Some(underlying) = obj.get_mut("underlying") {
+                eliminate_redundant_ranges(underlying, min_values, max_values)
+            } else {
+                false
+            }
+        }
+        _ => false,
+    }
+}
+
+/// Check if a range query clause is redundant (always-true) given field stats.
+///
+/// A range filter `field >= lower AND field <= upper` is redundant when:
+///   - max_value(field) <= upper  (upper bound always satisfied)
+///   - min_value(field) >= lower  (lower bound always satisfied)
+fn is_redundant_range(
+    clause: &serde_json::Value,
+    min_values: &std::collections::HashMap<String, String>,
+    max_values: &std::collections::HashMap<String, String>,
+) -> bool {
+    let obj = match clause.as_object() {
+        Some(o) => o,
+        None => return false,
+    };
+
+    if obj.get("type").and_then(|v| v.as_str()) != Some("range") {
+        return false;
+    }
+
+    let field = match obj.get("field").and_then(|v| v.as_str()) {
+        Some(f) => f,
+        None => return false,
+    };
+
+    let file_min = min_values.get(field);
+    let file_max = max_values.get(field);
+
+    // Need both min and max to determine redundancy
+    if file_min.is_none() || file_max.is_none() {
+        return false;
+    }
+    let file_min = file_min.unwrap();
+    let file_max = file_max.unwrap();
+
+    // Check lower bound: if lower_bound exists, file_min must be >= lower
+    // Truncation safety: if bound is a proper extension of file_min, min may be truncated
+    let lower_ok = match obj.get("lower_bound") {
+        Some(bound_obj) => {
+            match extract_bound_value(bound_obj) {
+                Some(bound_val) => {
+                    // If bound is a proper extension of file_min, can't determine redundancy
+                    if bound_val.len() > file_min.len() && bound_val.starts_with(file_min.as_str()) {
+                        false
+                    } else {
+                        let cmp = crate::txlog::partition_pruning::compare_values(file_min, &bound_val);
+                        let inclusive = bound_obj.get("inclusive").and_then(|v| v.as_bool()).unwrap_or(true);
+                        if inclusive { cmp != std::cmp::Ordering::Less } else { cmp == std::cmp::Ordering::Greater }
+                    }
+                }
+                None => true, // Unbounded lower
+            }
+        }
+        None => true, // No lower bound
+    };
+
+    // Check upper bound: if upper_bound exists, file_max must be <= upper
+    // Truncation safety: if bound is a proper extension of file_max, max may be truncated
+    let upper_ok = match obj.get("upper_bound") {
+        Some(bound_obj) => {
+            match extract_bound_value(bound_obj) {
+                Some(bound_val) => {
+                    // If bound is a proper extension of file_max, can't determine redundancy
+                    if bound_val.len() > file_max.len() && bound_val.starts_with(file_max.as_str()) {
+                        false
+                    } else {
+                        let cmp = crate::txlog::partition_pruning::compare_values(file_max, &bound_val);
+                        let inclusive = bound_obj.get("inclusive").and_then(|v| v.as_bool()).unwrap_or(true);
+                        if inclusive { cmp != std::cmp::Ordering::Greater } else { cmp == std::cmp::Ordering::Less }
+                    }
+                }
+                None => true, // Unbounded upper
+            }
+        }
+        None => true, // No upper bound
+    };
+
+    lower_ok && upper_ok
+}
+
+/// Extract the value from a Quickwit QueryAst range bound.
+/// Handles various formats: {"value": "123"}, {"value": 123}, etc.
+fn extract_bound_value(bound: &serde_json::Value) -> Option<String> {
+    // Quickwit QueryAst uses { "value": <val>, "inclusive": bool }
+    let val = bound.get("value")?;
+    match val {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        serde_json::Value::Bool(b) => Some(b.to_string()),
+        _ => None,
+    }
+}
+
 /// Ensure that the fast field columns needed by a query are transcoded from parquet.
 ///
 /// This is the core of the lazy transcoding model: instead of transcoding all columns
@@ -342,6 +549,19 @@ pub async fn perform_search_async_impl_leaf_response(
     };
     if crate::ffi_profiler::is_enabled() {
         crate::ffi_profiler::record(crate::ffi_profiler::Section::QueryRewriteStringIdx, _t_string_idx.elapsed().as_nanos() as u64);
+    }
+
+    // FR4: Eliminate redundant range filters using split field statistics
+    let _t_fr4 = std::time::Instant::now();
+    let effective_query_json = if let (Some(ref min_vals), Some(ref max_vals)) =
+        (&context.field_min_values, &context.field_max_values)
+    {
+        optimize_query_with_field_stats(&effective_query_json, min_vals, max_vals)
+    } else {
+        effective_query_json
+    };
+    if crate::ffi_profiler::is_enabled() {
+        crate::ffi_profiler::record(crate::ffi_profiler::Section::RangeFilterElimination, _t_fr4.elapsed().as_nanos() as u64);
     }
 
     // Lazy transcoding: ensure fast fields needed by range queries are transcoded

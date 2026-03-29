@@ -8,6 +8,7 @@
 
 pub mod actions;
 pub mod arrow_ffi;
+pub mod arrow_ffi_import;
 pub mod avro;
 pub mod cache;
 pub mod compression;
@@ -15,6 +16,7 @@ pub mod distributed;
 pub mod error;
 pub mod garbage_collection;
 pub mod jni;
+pub mod list_files;
 pub mod log_replay;
 pub mod metrics;
 pub mod partition_pruning;

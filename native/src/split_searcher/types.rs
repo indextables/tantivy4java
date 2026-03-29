@@ -109,6 +109,11 @@ pub(crate) struct CachedSearcherContext {
     // When true, doc retrieval uses merge-safe fast-field resolution.
     // When false, falls back to legacy segment-based positional resolution.
     pub(crate) has_merge_safe_tracking: bool,
+    // FR4: Optional per-field min/max statistics for range filter elimination.
+    // Populated from split_config_map "field_min_values" / "field_max_values" (JSON).
+    // Used to eliminate redundant range filters where the entire split is within range.
+    pub(crate) field_min_values: Option<HashMap<String, String>>,
+    pub(crate) field_max_values: Option<HashMap<String, String>>,
     // Memory pool reservation for search result arena (16MB pre-acquired budget).
     // Held for the lifetime of the SplitSearcher. Released on close via Drop.
     pub(crate) search_arena_reservation: Option<MemoryReservation>,

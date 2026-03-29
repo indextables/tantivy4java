@@ -111,6 +111,15 @@ public class FfiProfiler {
         "arrow_ffi_resolve",
         "arrow_ffi_batch_read",
         "arrow_ffi_export",
+        // TxLog list files pipeline (FR1)
+        "txlog_snapshot",
+        "txlog_manifest_prune",
+        "txlog_manifest_read",
+        "txlog_partition_filter",
+        "txlog_data_skip",
+        "txlog_arrow_export",
+        // FR4 range filter elimination
+        "range_filter_elimination",
     };
 
     private static final String[] CACHE_COUNTER_NAMES = {

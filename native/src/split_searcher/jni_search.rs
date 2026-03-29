@@ -388,6 +388,19 @@ pub async fn perform_search_async_impl_leaf_response_with_aggregations(
         effective_query_json
     };
 
+    // FR4: Eliminate redundant range filters using split field statistics
+    let _t_fr4 = std::time::Instant::now();
+    let effective_query_json = if let (Some(ref min_vals), Some(ref max_vals)) =
+        (&context.field_min_values, &context.field_max_values)
+    {
+        super::async_impl::optimize_query_with_field_stats(&effective_query_json, min_vals, max_vals)
+    } else {
+        effective_query_json
+    };
+    if crate::ffi_profiler::is_enabled() {
+        crate::ffi_profiler::record(crate::ffi_profiler::Section::RangeFilterElimination, _t_fr4.elapsed().as_nanos() as u64);
+    }
+
     // Phase 2b: Rewrite aggregation JSON to replace string field references with _phash_* fields.
     // This avoids expensive parquet transcoding for terms/value_count/cardinality aggregations.
     let (effective_agg_json, rewrite_output) =

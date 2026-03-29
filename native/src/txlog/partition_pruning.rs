@@ -16,11 +16,17 @@ use super::actions::{ManifestInfo, PartitionBounds};
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum PartitionFilter {
     Eq { column: String, value: String },
+    Neq { column: String, value: String },
     Gt { column: String, value: String },
     Gte { column: String, value: String },
     Lt { column: String, value: String },
     Lte { column: String, value: String },
     In { column: String, values: Vec<String> },
+    IsNull { column: String },
+    IsNotNull { column: String },
+    StringStartsWith { column: String, prefix: String },
+    StringEndsWith { column: String, suffix: String },
+    StringContains { column: String, value: String },
     And { filters: Vec<PartitionFilter> },
     Or { filters: Vec<PartitionFilter> },
     Not { filter: Box<PartitionFilter> },
@@ -53,8 +59,26 @@ impl PartitionFilter {
                     compare_values(v, value) != std::cmp::Ordering::Greater
                 })
             }
+            PartitionFilter::Neq { column, value } => {
+                partition_values.get(column).map_or(true, |v| v != value)
+            }
             PartitionFilter::In { column, values } => {
                 partition_values.get(column).map_or(false, |v| values.contains(v))
+            }
+            PartitionFilter::IsNull { column } => {
+                partition_values.get(column).map_or(true, |v| v.is_empty())
+            }
+            PartitionFilter::IsNotNull { column } => {
+                partition_values.get(column).map_or(false, |v| !v.is_empty())
+            }
+            PartitionFilter::StringStartsWith { column, prefix } => {
+                partition_values.get(column).map_or(false, |v| v.starts_with(prefix.as_str()))
+            }
+            PartitionFilter::StringEndsWith { column, suffix } => {
+                partition_values.get(column).map_or(false, |v| v.ends_with(suffix.as_str()))
+            }
+            PartitionFilter::StringContains { column, value } => {
+                partition_values.get(column).map_or(false, |v| v.contains(value.as_str()))
             }
             PartitionFilter::And { filters } => {
                 filters.iter().all(|f| f.evaluate(partition_values))
@@ -112,6 +136,15 @@ impl PartitionFilter {
                     None => true,
                 }
             }
+            PartitionFilter::Neq { column, value } => {
+                // Can only prune if the entire range is exactly one value equal to the excluded value
+                let min = bounds.min_values.get(column);
+                let max = bounds.max_values.get(column);
+                match (min, max) {
+                    (Some(min_val), Some(max_val)) if min_val == max_val && min_val == value => false,
+                    _ => true,
+                }
+            }
             PartitionFilter::In { column, values } => {
                 // At least one value must be in [min, max]
                 let min = bounds.min_values.get(column);
@@ -126,6 +159,13 @@ impl PartitionFilter {
                     _ => true, // No bounds, can't prune
                 }
             }
+            // IsNull/IsNotNull: can't determine nullability from bounds alone
+            PartitionFilter::IsNull { .. } => true,
+            PartitionFilter::IsNotNull { .. } => true,
+            // String operations: conservative — can't prune from bounds
+            PartitionFilter::StringStartsWith { .. } => true,
+            PartitionFilter::StringEndsWith { .. } => true,
+            PartitionFilter::StringContains { .. } => true,
             PartitionFilter::And { filters } => {
                 // All sub-filters must match bounds
                 filters.iter().all(|f| f.may_match_bounds(bounds))
@@ -152,6 +192,120 @@ impl PartitionFilter {
                 // Either way, we return true. This is correct and conservative.
                 let _ = filter;
                 true
+            }
+        }
+    }
+
+    /// Evaluate against file-level min/max statistics for data skipping.
+    /// Returns true if the file can be SKIPPED (i.e., definitely contains no matching data).
+    /// Conservative: returns false (don't skip) when uncertain.
+    ///
+    /// This operates on per-column min/max values from AddAction stats, NOT partition bounds.
+    /// Used for data skipping (FR1) after partition pruning.
+    pub fn can_skip_by_stats(
+        &self,
+        min_values: &HashMap<String, String>,
+        max_values: &HashMap<String, String>,
+    ) -> bool {
+        match self {
+            PartitionFilter::Eq { column, value } => {
+                // Skip if value < min OR value > max
+                if let Some(min_val) = min_values.get(column) {
+                    if compare_values(value, min_val) == std::cmp::Ordering::Less {
+                        return true;
+                    }
+                }
+                if let Some(max_val) = max_values.get(column) {
+                    if compare_values(value, max_val) == std::cmp::Ordering::Greater {
+                        return true;
+                    }
+                }
+                false
+            }
+            PartitionFilter::Neq { column, value } => {
+                // Can only skip if entire file has exactly one value matching the excluded value
+                let min = min_values.get(column);
+                let max = max_values.get(column);
+                match (min, max) {
+                    (Some(min_val), Some(max_val)) if min_val == max_val && min_val == value => true,
+                    _ => false,
+                }
+            }
+            PartitionFilter::Gt { column, value } => {
+                // Skip if max <= value (no value in file is > value)
+                if let Some(max_val) = max_values.get(column) {
+                    return compare_values(max_val, value) != std::cmp::Ordering::Greater;
+                }
+                false
+            }
+            PartitionFilter::Gte { column, value } => {
+                // Skip if max < value, BUT not if value is a proper extension of max
+                // (truncation safety: max="aaa" could mean actual max is "aaaz")
+                if let Some(max_val) = max_values.get(column) {
+                    if value.len() > max_val.len() && value.starts_with(max_val.as_str()) {
+                        return false; // max may be truncated
+                    }
+                    return compare_values(max_val, value) == std::cmp::Ordering::Less;
+                }
+                false
+            }
+            PartitionFilter::Lt { column, value } => {
+                // Skip if min >= value, BUT not if value is a proper extension of min
+                // (truncation safety: min="abc" could mean actual min is "abc..." which is < "abcd")
+                if let Some(min_val) = min_values.get(column) {
+                    if value.len() > min_val.len() && value.starts_with(min_val.as_str()) {
+                        return false; // min may be truncated
+                    }
+                    return compare_values(min_val, value) != std::cmp::Ordering::Less;
+                }
+                false
+            }
+            PartitionFilter::Lte { column, value } => {
+                // Skip if min > value, BUT not if value is a proper extension of min
+                if let Some(min_val) = min_values.get(column) {
+                    if value.len() > min_val.len() && value.starts_with(min_val.as_str()) {
+                        return false; // min may be truncated
+                    }
+                    return compare_values(min_val, value) == std::cmp::Ordering::Greater;
+                }
+                false
+            }
+            PartitionFilter::In { column, values } => {
+                // Skip if ALL values are outside [min, max]. Empty list → don't skip.
+                if values.is_empty() {
+                    return false;
+                }
+                let min = min_values.get(column);
+                let max = max_values.get(column);
+                match (min, max) {
+                    (Some(min_val), Some(max_val)) => {
+                        values.iter().all(|v| {
+                            compare_values(v, min_val) == std::cmp::Ordering::Less
+                                || compare_values(v, max_val) == std::cmp::Ordering::Greater
+                        })
+                    }
+                    _ => false,
+                }
+            }
+            // IsNull/IsNotNull: can't determine from min/max stats
+            PartitionFilter::IsNull { .. } => false,
+            PartitionFilter::IsNotNull { .. } => false,
+            // String operations: can't reliably skip from min/max
+            PartitionFilter::StringStartsWith { .. } => false,
+            PartitionFilter::StringEndsWith { .. } => false,
+            PartitionFilter::StringContains { .. } => false,
+            PartitionFilter::And { filters } => {
+                // Skip if ANY sub-filter says skip (intersection of predicates)
+                filters.iter().any(|f| f.can_skip_by_stats(min_values, max_values))
+            }
+            PartitionFilter::Or { filters } => {
+                // Skip only if ALL sub-filters say skip (union of predicates)
+                !filters.is_empty()
+                    && filters.iter().all(|f| f.can_skip_by_stats(min_values, max_values))
+            }
+            PartitionFilter::Not { .. } => {
+                // Conservative: can't skip
+                false
             }
         }
     }
@@ -610,6 +764,254 @@ mod tests {
     // ========================================================================
     // Deserialization tests
     // ========================================================================
+
+    // ========================================================================
+    // evaluate() tests for new variants
+    // ========================================================================
+
+    #[test]
+    fn test_evaluate_neq() {
+        let f = PartitionFilter::Neq { column: "year".into(), value: "2024".into() };
+        assert!(f.evaluate(&pv(&[("year", "2023")])));
+        assert!(!f.evaluate(&pv(&[("year", "2024")])));
+        // Missing column → true (null != value)
+        assert!(f.evaluate(&pv(&[])));
+    }
+
+    #[test]
+    fn test_evaluate_is_null() {
+        let f = PartitionFilter::IsNull { column: "region".into() };
+        assert!(f.evaluate(&pv(&[])));
+        assert!(f.evaluate(&pv(&[("region", "")])));
+        assert!(!f.evaluate(&pv(&[("region", "us-east-1")])));
+    }
+
+    #[test]
+    fn test_evaluate_is_not_null() {
+        let f = PartitionFilter::IsNotNull { column: "region".into() };
+        assert!(!f.evaluate(&pv(&[])));
+        assert!(!f.evaluate(&pv(&[("region", "")])));
+        assert!(f.evaluate(&pv(&[("region", "us-east-1")])));
+    }
+
+    #[test]
+    fn test_evaluate_string_starts_with() {
+        let f = PartitionFilter::StringStartsWith { column: "path".into(), prefix: "/data/".into() };
+        assert!(f.evaluate(&pv(&[("path", "/data/foo.parquet")])));
+        assert!(!f.evaluate(&pv(&[("path", "/logs/foo.parquet")])));
+        assert!(!f.evaluate(&pv(&[])));
+    }
+
+    #[test]
+    fn test_evaluate_string_ends_with() {
+        let f = PartitionFilter::StringEndsWith { column: "path".into(), suffix: ".parquet".into() };
+        assert!(f.evaluate(&pv(&[("path", "/data/foo.parquet")])));
+        assert!(!f.evaluate(&pv(&[("path", "/data/foo.csv")])));
+    }
+
+    #[test]
+    fn test_evaluate_string_contains() {
+        let f = PartitionFilter::StringContains { column: "path".into(), value: "foo".into() };
+        assert!(f.evaluate(&pv(&[("path", "/data/foo/bar")])));
+        assert!(!f.evaluate(&pv(&[("path", "/data/baz/bar")])));
+    }
+
+    // ========================================================================
+    // can_skip_by_stats() tests (data skipping)
+    // ========================================================================
+
+    fn stats(min: &[(&str, &str)], max: &[(&str, &str)]) -> (HashMap<String, String>, HashMap<String, String>) {
+        (
+            min.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+            max.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+        )
+    }
+
+    #[test]
+    fn test_skip_eq_below_min() {
+        let (min, max) = stats(&[("age", "20")], &[("age", "40")]);
+        let f = PartitionFilter::Eq { column: "age".into(), value: "10".into() };
+        assert!(f.can_skip_by_stats(&min, &max)); // 10 < min(20) → skip
+    }
+
+    #[test]
+    fn test_skip_eq_above_max() {
+        let (min, max) = stats(&[("age", "20")], &[("age", "40")]);
+        let f = PartitionFilter::Eq { column: "age".into(), value: "50".into() };
+        assert!(f.can_skip_by_stats(&min, &max)); // 50 > max(40) → skip
+    }
+
+    #[test]
+    fn test_no_skip_eq_in_range() {
+        let (min, max) = stats(&[("age", "20")], &[("age", "40")]);
+        let f = PartitionFilter::Eq { column: "age".into(), value: "30".into() };
+        assert!(!f.can_skip_by_stats(&min, &max)); // 30 in [20,40] → don't skip
+    }
+
+    #[test]
+    fn test_skip_gt_max_not_greater() {
+        let (min, max) = stats(&[("age", "20")], &[("age", "40")]);
+        let f = PartitionFilter::Gt { column: "age".into(), value: "40".into() };
+        assert!(f.can_skip_by_stats(&min, &max)); // max(40) not > 40 → skip
+    }
+
+    #[test]
+    fn test_no_skip_gt_max_greater() {
+        let (min, max) = stats(&[("age", "20")], &[("age", "40")]);
+        let f = PartitionFilter::Gt { column: "age".into(), value: "30".into() };
+        assert!(!f.can_skip_by_stats(&min, &max)); // max(40) > 30 → don't skip
+    }
+
+    #[test]
+    fn test_skip_lt_min_not_less() {
+        let (min, max) = stats(&[("age", "20")], &[("age", "40")]);
+        let f = PartitionFilter::Lt { column: "age".into(), value: "20".into() };
+        assert!(f.can_skip_by_stats(&min, &max)); // min(20) not < 20 → skip
+    }
+
+    #[test]
+    fn test_skip_and_any_skips() {
+        let (min, max) = stats(&[("age", "20")], &[("age", "40")]);
+        let f = PartitionFilter::And {
+            filters: vec![
+                PartitionFilter::Gt { column: "age".into(), value: "50".into() }, // skip
+                PartitionFilter::Lt { column: "age".into(), value: "100".into() }, // don't skip
+            ],
+        };
+        assert!(f.can_skip_by_stats(&min, &max)); // AND: any skip → skip
+    }
+
+    #[test]
+    fn test_skip_or_all_skip() {
+        let (min, max) = stats(&[("age", "20")], &[("age", "40")]);
+        let f = PartitionFilter::Or {
+            filters: vec![
+                PartitionFilter::Gt { column: "age".into(), value: "50".into() }, // skip
+                PartitionFilter::Lt { column: "age".into(), value: "10".into() }, // skip
+            ],
+        };
+        assert!(f.can_skip_by_stats(&min, &max)); // OR: all skip → skip
+    }
+
+    #[test]
+    fn test_no_skip_or_one_matches() {
+        let (min, max) = stats(&[("age", "20")], &[("age", "40")]);
+        let f = PartitionFilter::Or {
+            filters: vec![
+                PartitionFilter::Gt { column: "age".into(), value: "50".into() }, // skip
+                PartitionFilter::Lt { column: "age".into(), value: "30".into() }, // don't skip
+            ],
+        };
+        assert!(!f.can_skip_by_stats(&min, &max)); // OR: not all skip → don't skip
+    }
+
+    #[test]
+    fn test_no_skip_missing_stats() {
+        let (min, max) = stats(&[], &[]);
+        let f = PartitionFilter::Eq { column: "age".into(), value: "30".into() };
+        assert!(!f.can_skip_by_stats(&min, &max)); // no stats → conservative
+    }
+
+    #[test]
+    fn test_skip_in_all_outside() {
+        let (min, max) = stats(&[("id", "10")], &[("id", "20")]);
+        let f = PartitionFilter::In {
+            column: "id".into(),
+            values: vec!["1".into(), "5".into(), "25".into()],
+        };
+        assert!(f.can_skip_by_stats(&min, &max)); // all outside [10,20]
+    }
+
+    #[test]
+    fn test_no_skip_in_some_inside() {
+        let (min, max) = stats(&[("id", "10")], &[("id", "20")]);
+        let f = PartitionFilter::In {
+            column: "id".into(),
+            values: vec!["1".into(), "15".into(), "25".into()],
+        };
+        assert!(!f.can_skip_by_stats(&min, &max)); // 15 is in [10,20]
+    }
+
+    // ========================================================================
+    // Truncation awareness tests (can_skip_by_stats)
+    // ========================================================================
+
+    #[test]
+    fn test_no_skip_gte_truncated_max() {
+        // max="aaa" but actual max might be "aaaz" (truncated)
+        // filter: value >= "aaab" — should NOT skip because actual max could be "aaaz"
+        let (min, max) = stats(&[("name", "aaa")], &[("name", "aaa")]);
+        let f = PartitionFilter::Gte { column: "name".into(), value: "aaab".into() };
+        // "aaab".starts_with("aaa") → true → truncation safety → don't skip
+        assert!(!f.can_skip_by_stats(&min, &max));
+    }
+
+    #[test]
+    fn test_skip_gte_not_truncated() {
+        // max="aaa", filter: value >= "bbb" — safe to skip (no truncation concern)
+        let (min, max) = stats(&[("name", "aaa")], &[("name", "aaa")]);
+        let f = PartitionFilter::Gte { column: "name".into(), value: "bbb".into() };
+        assert!(f.can_skip_by_stats(&min, &max));
+    }
+
+    #[test]
+    fn test_no_skip_lte_truncated_min() {
+        // min="bbb", filter: value <= "bbba" — should NOT skip because actual min could be "bbb"
+        let (min, max) = stats(&[("name", "bbb")], &[("name", "zzz")]);
+        let f = PartitionFilter::Lte { column: "name".into(), value: "bbba".into() };
+        // "bbba".starts_with("bbb") → true → truncation safety → don't skip
+        assert!(!f.can_skip_by_stats(&min, &max));
+    }
+
+    #[test]
+    fn test_skip_lt_not_truncated() {
+        // min="ccc", filter: value < "bbb" — safe to skip
+        let (min, max) = stats(&[("name", "ccc")], &[("name", "zzz")]);
+        let f = PartitionFilter::Lt { column: "name".into(), value: "bbb".into() };
+        assert!(f.can_skip_by_stats(&min, &max));
+    }
+
+    #[test]
+    fn test_no_skip_lt_truncated_min() {
+        // min="abc", filter: value < "abcd" — should NOT skip
+        let (min, max) = stats(&[("name", "abc")], &[("name", "zzz")]);
+        let f = PartitionFilter::Lt { column: "name".into(), value: "abcd".into() };
+        assert!(!f.can_skip_by_stats(&min, &max));
+    }
+
+    #[test]
+    fn test_truncation_irrelevant_for_numeric() {
+        // Numeric: "100" >= "99" max — no truncation concern for numbers
+        let (min, max) = stats(&[("id", "50")], &[("id", "99")]);
+        let f = PartitionFilter::Gte { column: "id".into(), value: "100".into() };
+        // "100".starts_with("99") → false → normal comparison → max(99) < 100 → skip
+        assert!(f.can_skip_by_stats(&min, &max));
+    }
+
+    // ========================================================================
+    // Deserialization tests
+    // ========================================================================
+
+    #[test]
+    fn test_deserialize_new_variants() {
+        let json = r#"{"op": "neq", "column": "x", "value": "1"}"#;
+        assert!(matches!(serde_json::from_str::<PartitionFilter>(json).unwrap(), PartitionFilter::Neq { .. }));
+
+        let json = r#"{"op": "is_null", "column": "x"}"#;
+        assert!(matches!(serde_json::from_str::<PartitionFilter>(json).unwrap(), PartitionFilter::IsNull { .. }));
+
+        let json = r#"{"op": "is_not_null", "column": "x"}"#;
+        assert!(matches!(serde_json::from_str::<PartitionFilter>(json).unwrap(), PartitionFilter::IsNotNull { .. }));
+
+        let json = r#"{"op": "string_starts_with", "column": "p", "prefix": "/data/"}"#;
+        assert!(matches!(serde_json::from_str::<PartitionFilter>(json).unwrap(), PartitionFilter::StringStartsWith { .. }));
+
+        let json = r#"{"op": "string_ends_with", "column": "p", "suffix": ".parquet"}"#;
+        assert!(matches!(serde_json::from_str::<PartitionFilter>(json).unwrap(), PartitionFilter::StringEndsWith { .. }));
+
+        let json = r#"{"op": "string_contains", "column": "p", "value": "foo"}"#;
+        assert!(matches!(serde_json::from_str::<PartitionFilter>(json).unwrap(), PartitionFilter::StringContains { .. }));
+    }
 
     #[test]
     fn test_deserialize_eq() {
