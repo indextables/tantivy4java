@@ -461,9 +461,23 @@ pub fn compare_values_typed(a: &str, b: &str, field_type: Option<&str>) -> std::
 ///
 /// Spark convention: stats are stored as epoch days (Int), filter values as "YYYY-MM-DD".
 fn parse_as_epoch_days(s: &str) -> Option<i64> {
-    // Try integer first (stat values — epoch days)
-    if let Ok(days) = s.parse::<i64>() {
-        return Some(days);
+    // Try integer first. Stats may be stored as:
+    //   - epoch days (from Scala StatisticsCalculator): small integers like 19403
+    //   - epoch microseconds (from Rust Arrow FFI import): large integers like 1676419200000000
+    //   - epoch milliseconds: medium integers like 1676419200000
+    if let Ok(v) = s.parse::<i64>() {
+        if v > 1_000_000_000_000_000 {
+            // Epoch microseconds → convert to days
+            return Some(v / (86_400 * 1_000_000));
+        } else if v > 1_000_000_000_000 {
+            // Epoch milliseconds → convert to days
+            return Some(v / (86_400 * 1_000));
+        } else if v > 1_000_000_000 {
+            // Epoch seconds → convert to days
+            return Some(v / 86_400);
+        }
+        // Small integer — already epoch days
+        return Some(v);
     }
     // Try YYYY-MM-DD (exactly 10 chars)
     if s.len() >= 10 && s.as_bytes().get(4) == Some(&b'-') && s.as_bytes().get(7) == Some(&b'-') {
@@ -1185,20 +1199,30 @@ mod tests {
     // ========================================================================
 
     #[test]
-    fn test_date_eq_typed_match() {
-        // Stat stored as epoch days, filter as date string — should NOT skip
+    fn test_date_eq_typed_match_epoch_micros() {
+        // Rust Arrow FFI stores date stats as epoch MICROSECONDS (tantivy DateTime)
+        // 2023-02-15 = 19403 epoch days = 1676419200000000 epoch micros
+        let (min, max) = stats(&[("d", "1676419200000000")], &[("d", "1676419200000000")]);
+        let ft: HashMap<String, String> = [("d".into(), "date".into())].into();
+        let f = PartitionFilter::Eq { column: "d".into(), value: "2023-02-15".into() };
+        assert!(!f.can_skip_by_stats_typed(&min, &max, &ft), "Should NOT skip: date matches");
+    }
+
+    #[test]
+    fn test_date_eq_typed_match_epoch_days() {
+        // Scala StatisticsCalculator stores date stats as epoch days
         let (min, max) = stats(&[("d", "19403")], &[("d", "19403")]);
         let ft: HashMap<String, String> = [("d".into(), "date".into())].into();
         let f = PartitionFilter::Eq { column: "d".into(), value: "2023-02-15".into() };
-        assert!(!f.can_skip_by_stats_typed(&min, &max, &ft));
+        assert!(!f.can_skip_by_stats_typed(&min, &max, &ft), "Should NOT skip: date matches");
     }
 
     #[test]
     fn test_date_eq_typed_no_match() {
-        let (min, max) = stats(&[("d", "19403")], &[("d", "19403")]);
+        let (min, max) = stats(&[("d", "1676419200000000")], &[("d", "1676419200000000")]);
         let ft: HashMap<String, String> = [("d".into(), "date".into())].into();
         let f = PartitionFilter::Eq { column: "d".into(), value: "2024-01-01".into() };
-        assert!(f.can_skip_by_stats_typed(&min, &max, &ft));
+        assert!(f.can_skip_by_stats_typed(&min, &max, &ft), "Should skip: dates don't match");
     }
 
     #[test]

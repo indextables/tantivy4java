@@ -106,8 +106,11 @@ pub async unsafe fn list_files_arrow_ffi(
     // Extract field types from the table schema for type-aware data skipping.
     // The Rust layer owns the schema — field types are ALWAYS derived from
     // MetadataAction.schema_string, never passed from the JVM.
+    crate::debug_println!("LIST_FILES: schema_string length={}, first 200 chars: {}",
+        snapshot.metadata.schema_string.len(),
+        &snapshot.metadata.schema_string[..std::cmp::min(200, snapshot.metadata.schema_string.len())]);
     let field_types = extract_field_types_from_schema(&snapshot.metadata.schema_string);
-    crate::debug_println!("LIST_FILES: field_types from schema: {:?}", field_types);
+    crate::debug_println!("LIST_FILES: extracted field_types: {:?}", field_types);
 
     // 2. Convert ManifestPathInfo → ManifestInfo for pruning
     let manifest_infos: Vec<ManifestInfo> = snapshot.manifest_paths.iter().map(|mp| {
@@ -301,4 +304,32 @@ fn extract_field_types_from_schema(schema_string: &str) -> HashMap<String, Strin
     }
 
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_extract_field_types_from_spark_schema() {
+        let schema = r#"{"type":"struct","fields":[{"name":"id","type":"string","nullable":true,"metadata":{}},{"name":"data_date","type":"date","nullable":true,"metadata":{}},{"name":"ts","type":"timestamp","nullable":true,"metadata":{}},{"name":"seq_num","type":"integer","nullable":true,"metadata":{}}]}"#;
+        let types = extract_field_types_from_schema(schema);
+        assert_eq!(types.get("data_date"), Some(&"date".to_string()), "data_date should be date");
+        assert_eq!(types.get("ts"), Some(&"timestamp".to_string()), "ts should be timestamp");
+        assert!(types.get("id").is_none(), "string type should not be included");
+        assert!(types.get("seq_num").is_none(), "integer type should not be included");
+        assert_eq!(types.len(), 2);
+    }
+
+    #[test]
+    fn test_extract_empty_schema() {
+        let types = extract_field_types_from_schema("");
+        assert!(types.is_empty());
+    }
+
+    #[test]
+    fn test_extract_invalid_schema() {
+        let types = extract_field_types_from_schema("not json");
+        assert!(types.is_empty());
+    }
 }
