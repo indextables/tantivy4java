@@ -388,6 +388,17 @@ pub async fn perform_search_async_impl_leaf_response_with_aggregations(
         effective_query_json
     };
 
+    // Phase 2a3: Rewrite IP CIDR/wildcard term queries to range queries using execution-time schema.
+    // Placed after hash-field and string-indexing rewrites so all aggregation paths receive
+    // correctly expanded IP queries regardless of whether searcher_ptr was available at
+    // serialization time.
+    let effective_query_json = {
+        let schema = context.cached_index.schema();
+        crate::split_query::rewrite_ip_term_queries(&effective_query_json, &schema)
+            .unwrap_or(None)
+            .unwrap_or(effective_query_json)
+    };
+
     // Phase 2b: Rewrite aggregation JSON to replace string field references with _phash_* fields.
     // This avoids expensive parquet transcoding for terms/value_count/cardinality aggregations.
     let (effective_agg_json, rewrite_output) =

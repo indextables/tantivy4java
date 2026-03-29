@@ -344,6 +344,16 @@ pub async fn perform_search_async_impl_leaf_response(
         crate::ffi_profiler::record(crate::ffi_profiler::Section::QueryRewriteStringIdx, _t_string_idx.elapsed().as_nanos() as u64);
     }
 
+    // Rewrite IP CIDR/wildcard term queries to range queries using the execution-time schema.
+    // Runs after hash-field and string-indexing rewrites so all paths (regular search,
+    // simple aggregate, groupBy, histogram) receive correctly expanded IP queries.
+    let effective_query_json = {
+        let schema = context.cached_index.schema();
+        crate::split_query::rewrite_ip_term_queries(&effective_query_json, &schema)
+            .unwrap_or(None)
+            .unwrap_or(effective_query_json)
+    };
+
     // Lazy transcoding: ensure fast fields needed by range queries are transcoded
     let t_rewrite = t_total.elapsed();
     if crate::ffi_profiler::is_enabled() {
@@ -568,16 +578,9 @@ pub async fn perform_schema_retrieval_async_impl_thread_safe(
     // Extract searcher context using the safe Arc pattern with new struct-based approach
     let searcher_context = crate::utils::jlong_to_arc::<CachedSearcherContext>(searcher_ptr);
 
-    // ✅ FIX: If searcher context is missing, use direct schema mapping fallback
     if searcher_context.is_none() {
-        debug_println!("❌ ASYNC_IMPL: CachedSearcherContext missing for pointer {}, trying direct schema mapping", searcher_ptr);
-        if let Some(schema_ptr) = crate::split_query::get_searcher_schema(searcher_ptr) {
-            debug_println!("✅ FALLBACK: Found direct schema mapping {} for searcher {}", schema_ptr, searcher_ptr);
-            return Ok(schema_ptr);
-        } else {
-            debug_println!("❌ FALLBACK: No direct schema mapping found for searcher {}", searcher_ptr);
-            return Err(anyhow::anyhow!("Invalid searcher context - Arc and direct mapping not found for pointer: {}", searcher_ptr));
-        }
+        debug_println!("❌ ASYNC_IMPL: CachedSearcherContext missing for pointer {}", searcher_ptr);
+        return Err(anyhow::anyhow!("Invalid searcher context for pointer: {}", searcher_ptr));
     }
 
     let searcher_context = searcher_context.unwrap();
