@@ -131,6 +131,10 @@ impl Default for FormatSpec {
 #[serde(rename_all = "camelCase")]
 pub struct MetadataAction {
     pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
     pub schema_string: String,
     #[serde(default)]
     pub partition_columns: Vec<String>,
@@ -147,6 +151,8 @@ impl MetadataAction {
     pub fn empty() -> Self {
         MetadataAction {
             id: String::new(),
+            name: None,
+            description: None,
             schema_string: String::new(),
             partition_columns: vec![],
             format: FormatSpec::default(),

@@ -60,6 +60,7 @@ pub async unsafe fn list_files_arrow_ffi(
     config_map: &HashMap<String, String>,
     partition_filter_json: Option<&str>,
     data_filter_json: Option<&str>,
+    field_types_json: Option<&str>,
     exclude_cooldown_files: bool,
     include_stats: bool,
     array_addrs: &[i64],
@@ -101,6 +102,13 @@ pub async unsafe fn list_files_arrow_ffi(
         Some(s) if !s.is_empty() => Some(serde_json::from_str(s)
             .map_err(|e| TxLogError::Serde(format!("Invalid data filter JSON: {}", e)))?),
         _ => None,
+    };
+
+    // Parse field types for type-aware data skipping (date/timestamp support)
+    let field_types: HashMap<String, String> = match field_types_json {
+        Some(s) if !s.is_empty() => serde_json::from_str(s)
+            .map_err(|e| TxLogError::Serde(format!("Invalid field_types JSON: {}", e)))?,
+        _ => HashMap::new(),
     };
 
     // 2. Convert ManifestPathInfo → ManifestInfo for pruning
@@ -179,7 +187,9 @@ pub async unsafe fn list_files_arrow_ffi(
             let min = entry.add.min_values.as_ref();
             let max = entry.add.max_values.as_ref();
             match (min, max) {
-                (Some(min_vals), Some(max_vals)) => !df.can_skip_by_stats(min_vals, max_vals),
+                (Some(min_vals), Some(max_vals)) => {
+                    !df.can_skip_by_stats_typed(min_vals, max_vals, &field_types)
+                }
                 _ => true, // No stats → can't skip
             }
         });

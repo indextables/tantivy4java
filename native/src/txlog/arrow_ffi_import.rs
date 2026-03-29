@@ -242,9 +242,15 @@ fn extract_protocol_action(batch: &RecordBatch, row: usize) -> Result<ProtocolAc
 fn extract_metadata_action(batch: &RecordBatch, row: usize) -> Result<MetadataAction> {
     Ok(MetadataAction {
         id: get_string_required(batch, "id", row)?,
+        name: get_string(batch, "metadata_name", row),
+        description: get_string(batch, "metadata_description", row),
         schema_string: get_string(batch, "schema_string", row).unwrap_or_default(),
         partition_columns: get_string_list(batch, "partition_columns", row).unwrap_or_default(),
-        format: FormatSpec::default(),
+        format: FormatSpec {
+            provider: get_string(batch, "format_provider", row)
+                .unwrap_or_else(|| "parquet".to_string()),
+            options: get_json_map(batch, "format_options", row).unwrap_or_default(),
+        },
         configuration: get_json_map(batch, "configuration", row).unwrap_or_default(),
         created_time: get_i64(batch, "created_time", row),
     })

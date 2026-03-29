@@ -20,7 +20,7 @@ use super::error::{TxLogError, Result};
 
 /// Build the Arrow schema dynamically based on partition columns and options.
 ///
-/// Base schema has 19 fixed columns. Additional columns are appended:
+/// Base schema has 20 fixed columns. Additional columns are appended:
 ///   - N "partition:{name}" Utf8 columns (one per partition column)
 ///   - Optionally "min_values" and "max_values" Utf8 columns (JSON-encoded stats)
 pub fn file_entry_arrow_schema(
@@ -47,6 +47,9 @@ pub fn file_entry_arrow_schema(
         Field::new("companion_source_files", DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))), true),
         Field::new("companion_delta_version", DataType::Int64, true),
         Field::new("companion_fast_field_mode", DataType::Utf8, true),
+        // All partition values as JSON map — preserves undeclared partition keys
+        // that wouldn't have a dynamic partition:{name} column
+        Field::new("partition_values", DataType::Utf8, true),
     ];
 
     for col_name in partition_columns {
@@ -98,6 +101,7 @@ pub fn file_entries_to_record_batch(
 
     let mut split_tags_builder = ListBuilder::new(StringBuilder::new());
     let mut comp_src_files_builder = ListBuilder::new(StringBuilder::new());
+    let mut partition_vals_builder = StringBuilder::with_capacity(len, len * 64);
 
     let mut partition_builders: Vec<StringBuilder> = partition_columns.iter()
         .map(|_| StringBuilder::with_capacity(len, len * 32))
@@ -159,6 +163,16 @@ pub fn file_entries_to_record_batch(
             None => comp_src_files_builder.append(false),
         }
 
+        // All partition values as JSON map
+        if add.partition_values.is_empty() {
+            partition_vals_builder.append_null();
+        } else {
+            match serde_json::to_string(&add.partition_values) {
+                Ok(json) => partition_vals_builder.append_value(&json),
+                Err(_) => partition_vals_builder.append_null(),
+            }
+        }
+
         // Partition columns
         for (i, col_name) in partition_columns.iter().enumerate() {
             match add.partition_values.get(col_name) {
@@ -201,6 +215,7 @@ pub fn file_entries_to_record_batch(
         Arc::new(comp_src_files_builder.finish()),
         Arc::new(comp_delta_ver_builder.finish()),
         Arc::new(comp_ff_mode_builder.finish()),
+        Arc::new(partition_vals_builder.finish()),
     ];
 
     for builder in partition_builders.iter_mut() {
@@ -293,7 +308,7 @@ pub unsafe fn export_file_entries_ffi(
 
 /// Return the number of columns for a given configuration.
 pub fn column_count(partition_columns: &[String], include_stats: bool) -> usize {
-    let base = 19;
+    let base = 20; // 19 typed columns + partition_values JSON
     let partitions = partition_columns.len();
     let stats = if include_stats { 2 } else { 0 };
     base + partitions + stats
@@ -339,32 +354,32 @@ mod tests {
     #[test]
     fn test_schema_no_partitions() {
         let schema = file_entry_arrow_schema(&[], false);
-        assert_eq!(schema.fields().len(), 19);
+        assert_eq!(schema.fields().len(), 20);
     }
 
     #[test]
     fn test_schema_with_partitions() {
         let cols = vec!["year".to_string(), "month".to_string()];
         let schema = file_entry_arrow_schema(&cols, false);
-        assert_eq!(schema.fields().len(), 21);
-        assert_eq!(schema.field(19).name(), "partition:year");
-        assert_eq!(schema.field(20).name(), "partition:month");
+        assert_eq!(schema.fields().len(), 22);
+        assert_eq!(schema.field(20).name(), "partition:year");
+        assert_eq!(schema.field(21).name(), "partition:month");
     }
 
     #[test]
     fn test_schema_with_stats() {
         let schema = file_entry_arrow_schema(&[], true);
-        assert_eq!(schema.fields().len(), 21);
-        assert_eq!(schema.field(19).name(), "min_values");
-        assert_eq!(schema.field(20).name(), "max_values");
+        assert_eq!(schema.fields().len(), 22);
+        assert_eq!(schema.field(20).name(), "min_values");
+        assert_eq!(schema.field(21).name(), "max_values");
     }
 
     #[test]
     fn test_column_count() {
-        assert_eq!(column_count(&[], false), 19);
-        assert_eq!(column_count(&["a".into(), "b".into()], false), 21);
-        assert_eq!(column_count(&[], true), 21);
-        assert_eq!(column_count(&["a".into()], true), 22);
+        assert_eq!(column_count(&[], false), 20);
+        assert_eq!(column_count(&["a".into(), "b".into()], false), 22);
+        assert_eq!(column_count(&[], true), 22);
+        assert_eq!(column_count(&["a".into()], true), 23);
     }
 
     #[test]
@@ -376,13 +391,13 @@ mod tests {
         let partition_cols = vec!["year".to_string()];
         let batch = file_entries_to_record_batch(&entries, &partition_cols, false).unwrap();
         assert_eq!(batch.num_rows(), 2);
-        assert_eq!(batch.num_columns(), 20);
+        assert_eq!(batch.num_columns(), 21);
 
         let path_col = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
         assert_eq!(path_col.value(0), "file1.split");
         assert_eq!(path_col.value(1), "file2.split");
 
-        let year_col = batch.column(19).as_any().downcast_ref::<StringArray>().unwrap();
+        let year_col = batch.column(20).as_any().downcast_ref::<StringArray>().unwrap();
         assert_eq!(year_col.value(0), "2024");
         assert_eq!(year_col.value(1), "2023");
 
@@ -410,9 +425,9 @@ mod tests {
     fn test_record_batch_with_stats() {
         let entries = vec![make_entry("file1.split", &[], None)];
         let batch = file_entries_to_record_batch(&entries, &[], true).unwrap();
-        assert_eq!(batch.num_columns(), 21);
+        assert_eq!(batch.num_columns(), 22);
 
-        let min_col = batch.column(19).as_any().downcast_ref::<StringArray>().unwrap();
+        let min_col = batch.column(20).as_any().downcast_ref::<StringArray>().unwrap();
         assert!(!min_col.is_null(0));
         let min_json: HashMap<String, String> = serde_json::from_str(min_col.value(0)).unwrap();
         assert_eq!(min_json.get("age").unwrap(), "20");
@@ -424,7 +439,7 @@ mod tests {
         let partition_cols = vec!["year".to_string(), "month".to_string()];
         let batch = file_entries_to_record_batch(&entries, &partition_cols, false).unwrap();
 
-        let month_col = batch.column(20).as_any().downcast_ref::<StringArray>().unwrap();
+        let month_col = batch.column(21).as_any().downcast_ref::<StringArray>().unwrap();
         assert!(month_col.is_null(0));
     }
 
@@ -432,7 +447,7 @@ mod tests {
     fn test_empty_batch() {
         let batch = file_entries_to_record_batch(&[], &[], false).unwrap();
         assert_eq!(batch.num_rows(), 0);
-        assert_eq!(batch.num_columns(), 19);
+        assert_eq!(batch.num_columns(), 20);
     }
 
     #[test]
@@ -440,21 +455,21 @@ mod tests {
         let entries = vec![make_entry("f.split", &[("year", "2024")], None)];
         let partition_cols = vec!["year".to_string()];
         let batch = file_entries_to_record_batch(&entries, &partition_cols, true).unwrap();
-        // 19 base + 1 partition + 2 stats = 22
-        assert_eq!(batch.num_columns(), 22);
-        // partition:year at index 19
-        assert_eq!(batch.schema().field(19).name(), "partition:year");
-        let year_col = batch.column(19).as_any().downcast_ref::<StringArray>().unwrap();
+        // 20 base + 1 partition + 2 stats = 23
+        assert_eq!(batch.num_columns(), 23);
+        // partition:year at index 20
+        assert_eq!(batch.schema().field(20).name(), "partition:year");
+        let year_col = batch.column(20).as_any().downcast_ref::<StringArray>().unwrap();
         assert_eq!(year_col.value(0), "2024");
-        // min_values at index 20, max_values at index 21
-        assert_eq!(batch.schema().field(20).name(), "min_values");
-        assert_eq!(batch.schema().field(21).name(), "max_values");
+        // min_values at index 21, max_values at index 22
+        assert_eq!(batch.schema().field(21).name(), "min_values");
+        assert_eq!(batch.schema().field(22).name(), "max_values");
     }
 
     #[test]
     fn test_ffi_export_insufficient_addresses() {
         let entries = vec![make_entry("f.split", &[], None)];
-        // Only provide 10 addresses but need 19 columns
+        // Only provide 10 addresses but need 20 columns
         let mut arrays: Vec<std::mem::MaybeUninit<arrow::ffi::FFI_ArrowArray>> =
             (0..10).map(|_| std::mem::MaybeUninit::uninit()).collect();
         let mut schemas: Vec<std::mem::MaybeUninit<arrow::ffi::FFI_ArrowSchema>> =

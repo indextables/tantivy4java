@@ -250,8 +250,8 @@ public class ArrowFfiListFilesIntegrationTest {
             tablePath, config, null, null, 0);
 
         JsonNode json = MAPPER.readTree(result);
-        // 19 base + 1 partition column ("year") = 20
-        assertEquals(20, json.get("numColumns").asInt(), "Should have 20 columns (19 base + 1 partition)");
+        // 20 base + 1 partition column ("year") = 21
+        assertEquals(21, json.get("numColumns").asInt(), "Should have 21 columns (20 base + 1 partition)");
     }
 
     // ========================================================================

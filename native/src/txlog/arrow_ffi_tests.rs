@@ -128,6 +128,7 @@ fn test_ffi_batch_column_types() {
         ("companion_source_files", list_utf8),
         ("companion_delta_version", DataType::Int64),
         ("companion_fast_field_mode", DataType::Utf8),
+        ("partition_values", DataType::Utf8),
     ];
 
     assert_eq!(schema.fields().len(), expected.len());
@@ -201,6 +202,7 @@ fn test_ffi_batch_nullable_columns() {
         ("companion_source_files", 16),
         ("companion_delta_version", 17),
         ("companion_fast_field_mode", 18),
+        ("partition_values", 19),
     ];
 
     for (name, idx) in &nullable_columns {
@@ -330,7 +332,7 @@ fn test_ffi_batch_multiple_entries() {
 
     let batch = file_entries_to_record_batch(&entries, &[], false).unwrap();
     assert_eq!(batch.num_rows(), 100);
-    assert_eq!(batch.num_columns(), 19);
+    assert_eq!(batch.num_columns(), 20);
 
     // Spot-check: first entry
     let path_col = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
@@ -370,16 +372,16 @@ fn test_ffi_batch_partition_values_json() {
     let partition_cols = vec!["year".to_string(), "month".to_string()];
     let batch = file_entries_to_record_batch(&[entry], &partition_cols, false).unwrap();
 
-    // With 2 partition columns, schema has 19 base + 2 partition = 21 columns
-    assert_eq!(batch.num_columns(), 21);
+    // With 2 partition columns, schema has 20 base + 2 partition = 22 columns
+    assert_eq!(batch.num_columns(), 22);
 
-    // partition:year is at index 19
-    let year_col = batch.column(19).as_any().downcast_ref::<StringArray>().unwrap();
+    // partition:year is at index 20
+    let year_col = batch.column(20).as_any().downcast_ref::<StringArray>().unwrap();
     assert!(!year_col.is_null(0));
     assert_eq!(year_col.value(0), "2024");
 
-    // partition:month is at index 20
-    let month_col = batch.column(20).as_any().downcast_ref::<StringArray>().unwrap();
+    // partition:month is at index 21
+    let month_col = batch.column(21).as_any().downcast_ref::<StringArray>().unwrap();
     assert!(!month_col.is_null(0));
     assert_eq!(month_col.value(0), "01");
 }
@@ -608,7 +610,7 @@ async fn test_e2e_write_checkpoint_export_ffi() {
     // Step 4: Convert the read-back entries to Arrow RecordBatch
     let batch = file_entries_to_record_batch(&read_back, &[], false).unwrap();
     assert_eq!(batch.num_rows(), 5);
-    assert_eq!(batch.num_columns(), 19);
+    assert_eq!(batch.num_columns(), 20);
 
     // Step 5: Verify all fields match the original add_actions
     let path_col = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();

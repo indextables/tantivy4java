@@ -75,7 +75,7 @@ fn make_protocol() -> ProtocolAction {
 }
 
 fn make_metadata(id: &str) -> MetadataAction {
-    MetadataAction {
+    MetadataAction { name: None, description: None,
         id: id.to_string(),
         schema_string: r#"{"type":"struct","fields":[{"name":"id","type":"long"}]}"#.to_string(),
         partition_columns: vec![],

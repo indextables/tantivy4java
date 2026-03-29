@@ -129,6 +129,8 @@ fn make_protocol() -> ProtocolAction {
 fn make_metadata(id: &str) -> MetadataAction {
     MetadataAction {
         id: id.to_string(),
+        name: None,
+        description: None,
         schema_string: r#"{"type":"struct","fields":[{"name":"id","type":"long"}]}"#.to_string(),
         partition_columns: vec![],
         format: FormatSpec::default(),
@@ -140,6 +142,8 @@ fn make_metadata(id: &str) -> MetadataAction {
 fn make_metadata_with_partitions(id: &str, partitions: Vec<String>) -> MetadataAction {
     MetadataAction {
         id: id.to_string(),
+        name: None,
+        description: None,
         schema_string: r#"{"type":"struct","fields":[{"name":"id","type":"long"}]}"#.to_string(),
         partition_columns: partitions,
         format: FormatSpec::default(),

@@ -309,6 +309,92 @@ impl PartitionFilter {
             }
         }
     }
+
+    /// Type-aware variant of `can_skip_by_stats` that handles date/timestamp columns.
+    ///
+    /// `field_types` maps column names to Spark type strings ("date", "timestamp", etc.).
+    /// For columns with known types, uses type-specific parsing before comparison.
+    pub fn can_skip_by_stats_typed(
+        &self,
+        min_values: &HashMap<String, String>,
+        max_values: &HashMap<String, String>,
+        field_types: &HashMap<String, String>,
+    ) -> bool {
+        if field_types.is_empty() {
+            return self.can_skip_by_stats(min_values, max_values);
+        }
+        self.can_skip_by_stats_typed_inner(min_values, max_values, field_types)
+    }
+
+    fn can_skip_by_stats_typed_inner(
+        &self,
+        min_values: &HashMap<String, String>,
+        max_values: &HashMap<String, String>,
+        ft: &HashMap<String, String>,
+    ) -> bool {
+        match self {
+            PartitionFilter::Eq { column, value } => {
+                let ftype = ft.get(column).map(|s| s.as_str());
+                if let Some(min_val) = min_values.get(column) {
+                    if compare_values_typed(value, min_val, ftype) == std::cmp::Ordering::Less {
+                        return true;
+                    }
+                }
+                if let Some(max_val) = max_values.get(column) {
+                    if compare_values_typed(value, max_val, ftype) == std::cmp::Ordering::Greater {
+                        return true;
+                    }
+                }
+                false
+            }
+            PartitionFilter::Gt { column, value } => {
+                let ftype = ft.get(column).map(|s| s.as_str());
+                if let Some(max_val) = max_values.get(column) {
+                    return compare_values_typed(max_val, value, ftype) != std::cmp::Ordering::Greater;
+                }
+                false
+            }
+            PartitionFilter::Gte { column, value } => {
+                let ftype = ft.get(column).map(|s| s.as_str());
+                if let Some(max_val) = max_values.get(column) {
+                    if value.len() > max_val.len() && value.starts_with(max_val.as_str()) {
+                        return false;
+                    }
+                    return compare_values_typed(max_val, value, ftype) == std::cmp::Ordering::Less;
+                }
+                false
+            }
+            PartitionFilter::Lt { column, value } => {
+                let ftype = ft.get(column).map(|s| s.as_str());
+                if let Some(min_val) = min_values.get(column) {
+                    if value.len() > min_val.len() && value.starts_with(min_val.as_str()) {
+                        return false;
+                    }
+                    return compare_values_typed(min_val, value, ftype) != std::cmp::Ordering::Less;
+                }
+                false
+            }
+            PartitionFilter::Lte { column, value } => {
+                let ftype = ft.get(column).map(|s| s.as_str());
+                if let Some(min_val) = min_values.get(column) {
+                    if value.len() > min_val.len() && value.starts_with(min_val.as_str()) {
+                        return false;
+                    }
+                    return compare_values_typed(min_val, value, ftype) == std::cmp::Ordering::Greater;
+                }
+                false
+            }
+            PartitionFilter::And { filters } => {
+                filters.iter().any(|f| f.can_skip_by_stats_typed_inner(min_values, max_values, ft))
+            }
+            PartitionFilter::Or { filters } => {
+                !filters.is_empty()
+                    && filters.iter().all(|f| f.can_skip_by_stats_typed_inner(min_values, max_values, ft))
+            }
+            // All other variants delegate to untyped
+            _ => self.can_skip_by_stats(min_values, max_values),
+        }
+    }
 }
 
 /// Prune manifest list to only those whose bounds may match the filters.
@@ -331,6 +417,101 @@ pub fn prune_manifests<'a>(
             }
         }
     }).collect()
+}
+
+/// Type-aware comparison for data skipping.
+///
+/// When `field_type` is provided, uses type-specific conversion before comparison:
+/// - "date": converts date strings ("2024-01-15") to epoch days for comparison with
+///   stat values stored as epoch day integers ("19738")
+/// - "timestamp": converts timestamp strings to epoch microseconds for comparison
+///   with stat values stored as epoch microsecond integers
+/// - For all other types (or when field_type is None): falls through to `compare_values`
+pub fn compare_values_typed(a: &str, b: &str, field_type: Option<&str>) -> std::cmp::Ordering {
+    match field_type {
+        Some("date") => {
+            // Try to normalize both values to epoch days for comparison.
+            // Stats are stored as epoch day ints ("19738"), filter values as "2024-01-15".
+            let a_days = parse_as_epoch_days(a);
+            let b_days = parse_as_epoch_days(b);
+            if let (Some(ad), Some(bd)) = (a_days, b_days) {
+                return ad.cmp(&bd);
+            }
+            // Fallback to default comparison if either fails to parse
+            compare_values(a, b)
+        }
+        Some("timestamp") => {
+            // Stats are stored as epoch micros ("1699336800000000"),
+            // filter values as "2023-11-07 05:00:00" or epoch millis.
+            let a_micros = parse_as_epoch_micros(a);
+            let b_micros = parse_as_epoch_micros(b);
+            if let (Some(am), Some(bm)) = (a_micros, b_micros) {
+                return am.cmp(&bm);
+            }
+            compare_values(a, b)
+        }
+        _ => compare_values(a, b),
+    }
+}
+
+/// Parse a value as epoch days. Handles:
+/// - Integer string ("19738") — epoch days directly
+/// - Date string ("2024-01-15") — parsed via chrono
+fn parse_as_epoch_days(s: &str) -> Option<i64> {
+    // Try integer first (stat values)
+    if let Ok(days) = s.parse::<i64>() {
+        return Some(days);
+    }
+    // Try date string (filter values from Spark)
+    // Format: YYYY-MM-DD
+    if s.len() == 10 && s.as_bytes().get(4) == Some(&b'-') {
+        let parts: Vec<&str> = s.splitn(3, '-').collect();
+        if parts.len() == 3 {
+            if let (Ok(y), Ok(m), Ok(d)) = (
+                parts[0].parse::<i32>(),
+                parts[1].parse::<u32>(),
+                parts[2].parse::<u32>(),
+            ) {
+                // Calculate epoch days: days from 1970-01-01
+                // Use a simple calculation (no leap second precision needed for day granularity)
+                if let Some(date) = chrono::NaiveDate::from_ymd_opt(y, m, d) {
+                    let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+                    return Some((date - epoch).num_days());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Parse a value as epoch microseconds. Handles:
+/// - Integer string ("1699336800000000") — epoch microseconds directly
+/// - Timestamp string ("2023-11-07 05:00:00") — parsed as UTC
+/// - Epoch milliseconds ("1699336800000") — converted to microseconds
+fn parse_as_epoch_micros(s: &str) -> Option<i64> {
+    // Try integer first — could be micros or millis
+    if let Ok(v) = s.parse::<i64>() {
+        // Heuristic: if > 1e15, it's likely microseconds; if > 1e12, likely milliseconds
+        if v > 1_000_000_000_000_000 {
+            return Some(v); // Already microseconds
+        } else if v > 1_000_000_000_000 {
+            return Some(v * 1000); // Milliseconds → microseconds
+        } else if v > 1_000_000_000 {
+            return Some(v * 1_000_000); // Seconds → microseconds
+        }
+        return Some(v); // Small value, treat as-is
+    }
+    // Try timestamp string formats
+    // "2023-11-07 05:00:00" or "2023-11-07T05:00:00"
+    let normalized = s.replace('T', " ");
+    if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(&normalized, "%Y-%m-%d %H:%M:%S") {
+        return Some(dt.and_utc().timestamp_micros());
+    }
+    // Try with fractional seconds
+    if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(&normalized, "%Y-%m-%d %H:%M:%S%.f") {
+        return Some(dt.and_utc().timestamp_micros());
+    }
+    None
 }
 
 /// Numeric-aware comparison: try i64 first for exact integer precision,
