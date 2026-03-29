@@ -552,6 +552,7 @@ pub async fn perform_search_async_impl_leaf_response(
     }
 
     // FR4: Eliminate redundant range filters using split field statistics
+    let _t_fr4 = std::time::Instant::now();
     let effective_query_json = if let (Some(ref min_vals), Some(ref max_vals)) =
         (&context.field_min_values, &context.field_max_values)
     {
@@ -559,6 +560,9 @@ pub async fn perform_search_async_impl_leaf_response(
     } else {
         effective_query_json
     };
+    if crate::ffi_profiler::is_enabled() {
+        crate::ffi_profiler::record(crate::ffi_profiler::Section::RangeFilterElimination, _t_fr4.elapsed().as_nanos() as u64);
+    }
 
     // Lazy transcoding: ensure fast fields needed by range queries are transcoded
     let t_rewrite = t_total.elapsed();

@@ -67,9 +67,13 @@ pub async unsafe fn list_files_arrow_ffi(
     cache_manager: Option<&Arc<GlobalSplitCacheManager>>,
 ) -> Result<ListFilesResult> {
     // 1. Get snapshot info (cached by table_path + TTL)
+    let _t_snapshot = std::time::Instant::now();
     let snapshot = distributed::get_txlog_snapshot_info_with_cache(
         table_path, config, config_map,
     ).await?;
+    if crate::ffi_profiler::is_enabled() {
+        crate::ffi_profiler::record(crate::ffi_profiler::Section::TxLogSnapshot, _t_snapshot.elapsed().as_nanos() as u64);
+    }
 
     let protocol_json = snapshot.protocol
         .as_ref()
@@ -111,14 +115,19 @@ pub async unsafe fn list_files_arrow_ffi(
     let manifests_total = manifest_infos.len() as i64;
 
     // Manifest-level pruning with partition filter
+    let _t_prune = std::time::Instant::now();
     let surviving_manifests = if let Some(ref pf) = partition_filter {
         partition_pruning::prune_manifests(&manifest_infos, std::slice::from_ref(pf))
     } else {
         manifest_infos.iter().collect()
     };
     let manifests_pruned = manifests_total - surviving_manifests.len() as i64;
+    if crate::ffi_profiler::is_enabled() {
+        crate::ffi_profiler::record(crate::ffi_profiler::Section::TxLogManifestPrune, _t_prune.elapsed().as_nanos() as u64);
+    }
 
-    // 3. Read manifests in parallel (executors would do this in Spark)
+    // 3. Read manifests (executors would do this in Spark)
+    let _t_read = std::time::Instant::now();
     let mut checkpoint_entries: Vec<FileEntry> = Vec::new();
     for manifest in &surviving_manifests {
         let entries = distributed::read_manifest(
@@ -147,15 +156,24 @@ pub async unsafe fn list_files_arrow_ffi(
     let mut all_files: Vec<FileEntry> = file_map.into_values().collect();
     all_files.sort_by(|a, b| a.add.path.cmp(&b.add.path));
 
+    if crate::ffi_profiler::is_enabled() {
+        crate::ffi_profiler::record(crate::ffi_profiler::Section::TxLogManifestRead, _t_read.elapsed().as_nanos() as u64);
+    }
+
     let total_files_before_filtering = all_files.len() as i64;
 
     // 5. Partition filter (file-level)
+    let _t_filter = std::time::Instant::now();
     if let Some(ref pf) = partition_filter {
         all_files.retain(|entry| pf.evaluate(&entry.add.partition_values));
     }
     let files_after_partition_pruning = all_files.len() as i64;
+    if crate::ffi_profiler::is_enabled() {
+        crate::ffi_profiler::record(crate::ffi_profiler::Section::TxLogPartitionFilter, _t_filter.elapsed().as_nanos() as u64);
+    }
 
     // 6. Data skipping by min/max stats
+    let _t_skip = std::time::Instant::now();
     if let Some(ref df) = data_filter {
         all_files.retain(|entry| {
             let min = entry.add.min_values.as_ref();
@@ -167,6 +185,9 @@ pub async unsafe fn list_files_arrow_ffi(
         });
     }
     let files_after_data_skipping = all_files.len() as i64;
+    if crate::ffi_profiler::is_enabled() {
+        crate::ffi_profiler::record(crate::ffi_profiler::Section::TxLogDataSkip, _t_skip.elapsed().as_nanos() as u64);
+    }
 
     // 7. Cooldown filter (exclude files with active skip actions)
     if exclude_cooldown_files && !changes.skip_actions.is_empty() {
@@ -199,6 +220,7 @@ pub async unsafe fn list_files_arrow_ffi(
     }
 
     // 9. Export via Arrow FFI
+    let _t_export = std::time::Instant::now();
     let num_cols = arrow_ffi::column_count(&partition_columns, include_stats);
 
     // schemaJson is the TABLE's data schema (from MetadataAction.schema_string),
@@ -212,6 +234,9 @@ pub async unsafe fn list_files_arrow_ffi(
         array_addrs,
         schema_addrs,
     )? as i64;
+    if crate::ffi_profiler::is_enabled() {
+        crate::ffi_profiler::record(crate::ffi_profiler::Section::TxLogArrowExport, _t_export.elapsed().as_nanos() as u64);
+    }
 
     Ok(ListFilesResult {
         num_rows,
