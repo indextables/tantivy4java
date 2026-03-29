@@ -193,7 +193,7 @@ pub async unsafe fn list_files_arrow_ffi(
     if exclude_cooldown_files && !changes.skip_actions.is_empty() {
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as i64)
+            .map(|d| std::cmp::min(d.as_millis(), i64::MAX as u128) as i64)
             .unwrap_or(0);
 
         let cooldown_paths: HashSet<&str> = changes.skip_actions.iter()
