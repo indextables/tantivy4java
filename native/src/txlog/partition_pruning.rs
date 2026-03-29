@@ -319,11 +319,12 @@ impl PartitionFilter {
         min_values: &HashMap<String, String>,
         max_values: &HashMap<String, String>,
         field_types: &HashMap<String, String>,
+        tz_offset_secs: Option<i32>,
     ) -> bool {
         if field_types.is_empty() {
             return self.can_skip_by_stats(min_values, max_values);
         }
-        self.can_skip_by_stats_typed_inner(min_values, max_values, field_types)
+        self.can_skip_by_stats_typed_inner(min_values, max_values, field_types, tz_offset_secs)
     }
 
     fn can_skip_by_stats_typed_inner(
@@ -331,17 +332,18 @@ impl PartitionFilter {
         min_values: &HashMap<String, String>,
         max_values: &HashMap<String, String>,
         ft: &HashMap<String, String>,
+        tz_offset_secs: Option<i32>,
     ) -> bool {
         match self {
             PartitionFilter::Eq { column, value } => {
                 let ftype = ft.get(column).map(|s| s.as_str());
                 if let Some(min_val) = min_values.get(column) {
-                    if compare_values_typed(value, min_val, ftype) == std::cmp::Ordering::Less {
+                    if compare_values_typed(value, min_val, ftype, tz_offset_secs) == std::cmp::Ordering::Less {
                         return true;
                     }
                 }
                 if let Some(max_val) = max_values.get(column) {
-                    if compare_values_typed(value, max_val, ftype) == std::cmp::Ordering::Greater {
+                    if compare_values_typed(value, max_val, ftype, tz_offset_secs) == std::cmp::Ordering::Greater {
                         return true;
                     }
                 }
@@ -350,7 +352,7 @@ impl PartitionFilter {
             PartitionFilter::Gt { column, value } => {
                 let ftype = ft.get(column).map(|s| s.as_str());
                 if let Some(max_val) = max_values.get(column) {
-                    return compare_values_typed(max_val, value, ftype) != std::cmp::Ordering::Greater;
+                    return compare_values_typed(max_val, value, ftype, tz_offset_secs) != std::cmp::Ordering::Greater;
                 }
                 false
             }
@@ -360,7 +362,7 @@ impl PartitionFilter {
                     if value.len() > max_val.len() && value.starts_with(max_val.as_str()) {
                         return false;
                     }
-                    return compare_values_typed(max_val, value, ftype) == std::cmp::Ordering::Less;
+                    return compare_values_typed(max_val, value, ftype, tz_offset_secs) == std::cmp::Ordering::Less;
                 }
                 false
             }
@@ -370,7 +372,7 @@ impl PartitionFilter {
                     if value.len() > min_val.len() && value.starts_with(min_val.as_str()) {
                         return false;
                     }
-                    return compare_values_typed(min_val, value, ftype) != std::cmp::Ordering::Less;
+                    return compare_values_typed(min_val, value, ftype, tz_offset_secs) != std::cmp::Ordering::Less;
                 }
                 false
             }
@@ -380,16 +382,16 @@ impl PartitionFilter {
                     if value.len() > min_val.len() && value.starts_with(min_val.as_str()) {
                         return false;
                     }
-                    return compare_values_typed(min_val, value, ftype) == std::cmp::Ordering::Greater;
+                    return compare_values_typed(min_val, value, ftype, tz_offset_secs) == std::cmp::Ordering::Greater;
                 }
                 false
             }
             PartitionFilter::And { filters } => {
-                filters.iter().any(|f| f.can_skip_by_stats_typed_inner(min_values, max_values, ft))
+                filters.iter().any(|f| f.can_skip_by_stats_typed_inner(min_values, max_values, ft, tz_offset_secs))
             }
             PartitionFilter::Or { filters } => {
                 !filters.is_empty()
-                    && filters.iter().all(|f| f.can_skip_by_stats_typed_inner(min_values, max_values, ft))
+                    && filters.iter().all(|f| f.can_skip_by_stats_typed_inner(min_values, max_values, ft, tz_offset_secs))
             }
             // All other variants delegate to untyped
             _ => self.can_skip_by_stats(min_values, max_values),
@@ -423,11 +425,15 @@ pub fn prune_manifests<'a>(
 ///
 /// When `field_type` is provided, uses type-specific conversion before comparison:
 /// - "date": converts date strings ("2024-01-15") to epoch days for comparison with
-///   stat values stored as epoch day integers ("19738")
-/// - "timestamp": converts timestamp strings to epoch microseconds for comparison
-///   with stat values stored as epoch microsecond integers
+///   stat values stored as epoch day integers or epoch microseconds
+/// - "timestamp": converts timestamp strings to epoch microseconds using the session
+///   timezone offset. If no timezone offset is provided, falls back to conservative
+///   comparison (Ordering::Equal = never skip).
 /// - For all other types (or when field_type is None): falls through to `compare_values`
-pub fn compare_values_typed(a: &str, b: &str, field_type: Option<&str>) -> std::cmp::Ordering {
+///
+/// `tz_offset_seconds`: session timezone as seconds east of UTC (e.g., -18000 for EST).
+/// Passed from JVM via config map key "session.timezone.offset.seconds".
+pub fn compare_values_typed(a: &str, b: &str, field_type: Option<&str>, tz_offset_secs: Option<i32>) -> std::cmp::Ordering {
     match field_type {
         Some("date") => {
             // Try to normalize both values to epoch days for comparison.
@@ -440,15 +446,50 @@ pub fn compare_values_typed(a: &str, b: &str, field_type: Option<&str>) -> std::
             // Fallback to default comparison if either fails to parse
             compare_values(a, b)
         }
-        Some("timestamp") => {
-            // Stats are stored as epoch micros ("1699336800000000"),
-            // filter values as "2023-11-07 05:00:00" or epoch millis.
-            let a_micros = parse_as_epoch_micros(a);
-            let b_micros = parse_as_epoch_micros(b);
-            if let (Some(am), Some(bm)) = (a_micros, b_micros) {
-                return am.cmp(&bm);
+        Some("timestamp") | Some("timestamp_ntz") => {
+            // Stats are stored as epoch micros. Filter values may be bare datetime
+            // strings ("2025-11-07 05:00:00") that require a timezone to convert
+            // correctly to epoch micros.
+            //
+            // When both sides are numeric, compare directly as epoch micros.
+            // When a filter is a datetime string, use tz_offset_secs to convert.
+            // Without a timezone offset, be conservative (don't skip).
+            let a_is_numeric = a.parse::<i64>().is_ok();
+            let b_is_numeric = b.parse::<i64>().is_ok();
+
+            if a_is_numeric && b_is_numeric {
+                let a_micros = parse_as_epoch_micros(a);
+                let b_micros = parse_as_epoch_micros(b);
+                if let (Some(am), Some(bm)) = (a_micros, b_micros) {
+                    return am.cmp(&bm);
+                }
             }
-            compare_values(a, b)
+
+            // If either side has an explicit timezone (Z, +HH:MM), we can parse
+            // unambiguously without needing the session timezone
+            let has_explicit_tz = a.contains('Z') || b.contains('Z')
+                || a.contains('+') || b.contains('+')
+                || (a.len() > 19 && a[19..].contains('-'))
+                || (b.len() > 19 && b[19..].contains('-'));
+            if has_explicit_tz {
+                let a_micros = parse_as_epoch_micros(a);
+                let b_micros = parse_as_epoch_micros(b);
+                if let (Some(am), Some(bm)) = (a_micros, b_micros) {
+                    return am.cmp(&bm);
+                }
+            }
+
+            // Bare datetime string — need session timezone
+            if let Some(tz_offset) = tz_offset_secs {
+                let a_micros = parse_as_epoch_micros_with_tz(a, tz_offset);
+                let b_micros = parse_as_epoch_micros_with_tz(b, tz_offset);
+                if let (Some(am), Some(bm)) = (a_micros, b_micros) {
+                    return am.cmp(&bm);
+                }
+            }
+
+            // No timezone available — conservative (never skip)
+            std::cmp::Ordering::Equal
         }
         _ => compare_values(a, b),
     }
@@ -537,6 +578,30 @@ fn parse_as_epoch_micros(s: &str) -> Option<i64> {
         return Some(dt.and_utc().timestamp_micros());
     }
     None
+}
+
+/// Parse a value as epoch microseconds, using a timezone offset for bare datetime strings.
+/// The offset is seconds east of UTC (e.g., -18000 for EST/UTC-5, 0 for UTC).
+fn parse_as_epoch_micros_with_tz(s: &str, tz_offset_secs: i32) -> Option<i64> {
+    // If it's already a number, use the standard parser
+    if s.parse::<i64>().is_ok() {
+        return parse_as_epoch_micros(s);
+    }
+
+    // Try RFC 3339 first (has explicit timezone — ignore tz_offset_secs)
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
+        return Some(dt.timestamp_micros());
+    }
+
+    // Bare datetime string — apply the session timezone offset
+    let normalized = s.replace('T', " ");
+    let naive = chrono::NaiveDateTime::parse_from_str(&normalized, "%Y-%m-%d %H:%M:%S")
+        .or_else(|_| chrono::NaiveDateTime::parse_from_str(&normalized, "%Y-%m-%d %H:%M:%S%.f"))
+        .ok()?;
+
+    let offset = chrono::FixedOffset::east_opt(tz_offset_secs)?;
+    let dt = naive.and_local_timezone(offset).single()?;
+    Some(dt.timestamp_micros())
 }
 
 /// Numeric-aware comparison: try i64 first for exact integer precision,
@@ -1205,7 +1270,7 @@ mod tests {
         let (min, max) = stats(&[("d", "1676419200000000")], &[("d", "1676419200000000")]);
         let ft: HashMap<String, String> = [("d".into(), "date".into())].into();
         let f = PartitionFilter::Eq { column: "d".into(), value: "2023-02-15".into() };
-        assert!(!f.can_skip_by_stats_typed(&min, &max, &ft), "Should NOT skip: date matches");
+        assert!(!f.can_skip_by_stats_typed(&min, &max, &ft, None), "Should NOT skip: date matches");
     }
 
     #[test]
@@ -1214,7 +1279,7 @@ mod tests {
         let (min, max) = stats(&[("d", "19403")], &[("d", "19403")]);
         let ft: HashMap<String, String> = [("d".into(), "date".into())].into();
         let f = PartitionFilter::Eq { column: "d".into(), value: "2023-02-15".into() };
-        assert!(!f.can_skip_by_stats_typed(&min, &max, &ft), "Should NOT skip: date matches");
+        assert!(!f.can_skip_by_stats_typed(&min, &max, &ft, None), "Should NOT skip: date matches");
     }
 
     #[test]
@@ -1222,7 +1287,7 @@ mod tests {
         let (min, max) = stats(&[("d", "1676419200000000")], &[("d", "1676419200000000")]);
         let ft: HashMap<String, String> = [("d".into(), "date".into())].into();
         let f = PartitionFilter::Eq { column: "d".into(), value: "2024-01-01".into() };
-        assert!(f.can_skip_by_stats_typed(&min, &max, &ft), "Should skip: dates don't match");
+        assert!(f.can_skip_by_stats_typed(&min, &max, &ft, None), "Should skip: dates don't match");
     }
 
     #[test]
@@ -1231,7 +1296,7 @@ mod tests {
         let (min, max) = stats(&[("ts", "1699336800000000")], &[("ts", "1699336800000000")]);
         let ft: HashMap<String, String> = [("ts".into(), "timestamp".into())].into();
         let f = PartitionFilter::Eq { column: "ts".into(), value: "2023-11-07T06:00:00Z".into() };
-        assert!(!f.can_skip_by_stats_typed(&min, &max, &ft));
+        assert!(!f.can_skip_by_stats_typed(&min, &max, &ft, None));
     }
 
     #[test]
@@ -1241,7 +1306,7 @@ mod tests {
         let ft: HashMap<String, String> = [("ts".into(), "timestamp".into())].into();
         let f = PartitionFilter::Gt { column: "ts".into(), value: "2023-11-06T00:00:00Z".into() };
         // max (2023-11-08) > filter (2023-11-06) → should NOT skip
-        assert!(!f.can_skip_by_stats_typed(&min, &max, &ft));
+        assert!(!f.can_skip_by_stats_typed(&min, &max, &ft, None));
     }
 
     #[test]
@@ -1250,7 +1315,7 @@ mod tests {
         let (min, max) = stats(&[("d", "19403")], &[("d", "19403")]);
         let ft: HashMap<String, String> = HashMap::new();
         let f = PartitionFilter::Eq { column: "d".into(), value: "19403".into() };
-        assert!(!f.can_skip_by_stats_typed(&min, &max, &ft));
+        assert!(!f.can_skip_by_stats_typed(&min, &max, &ft, None));
     }
 
     // ========================================================================

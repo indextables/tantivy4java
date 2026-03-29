@@ -768,6 +768,23 @@ fn build_doc_from_arrow_row(
 }
 
 /// Convert statistics accumulators into string min/max maps.
+/// Convert epoch microseconds to ISO date string ("2023-02-15") for date fields.
+fn micros_to_iso_date(micros: i64) -> String {
+    let days = micros / (86_400 * 1_000_000);
+    match chrono::NaiveDate::from_num_days_from_ce_opt(
+        (days + 719_163) as i32, // 719163 = days from year 1 CE to 1970-01-01
+    ) {
+        Some(date) => date.format("%Y-%m-%d").to_string(),
+        None => micros.to_string(), // Fallback to raw value
+    }
+}
+
+/// Convert epoch microseconds to epoch micros string for timestamp fields.
+/// Timestamps are stored as raw epoch micros — no conversion needed.
+fn micros_to_timestamp_string(micros: i64) -> String {
+    micros.to_string()
+}
+
 fn finalize_statistics_to_string_maps(
     accumulators: &mut HashMap<String, StatisticsAccumulator>,
 ) -> (HashMap<String, String>, HashMap<String, String>) {
@@ -775,6 +792,11 @@ fn finalize_statistics_to_string_maps(
     let mut max_values = HashMap::new();
     for (col_name, acc) in accumulators.drain() {
         let stats = acc.finalize();
+        let is_date = stats.field_type == "Date";
+
+        // For date fields, convert epoch micros to ISO date strings
+        // to match the Scala StatisticsCalculator format.
+        // For timestamp fields, keep as epoch micros.
         if let Some(v) = stats.min_long {
             min_values.insert(col_name.clone(), v.to_string());
         } else if let Some(v) = stats.min_double {
@@ -782,7 +804,11 @@ fn finalize_statistics_to_string_maps(
         } else if let Some(v) = &stats.min_string {
             min_values.insert(col_name.clone(), v.clone());
         } else if let Some(v) = stats.min_timestamp_micros {
-            min_values.insert(col_name.clone(), v.to_string());
+            if is_date {
+                min_values.insert(col_name.clone(), micros_to_iso_date(v));
+            } else {
+                min_values.insert(col_name.clone(), v.to_string());
+            }
         } else if let Some(v) = stats.min_bool {
             min_values.insert(col_name.clone(), v.to_string());
         }
@@ -794,7 +820,11 @@ fn finalize_statistics_to_string_maps(
         } else if let Some(v) = &stats.max_string {
             max_values.insert(col_name.clone(), v.clone());
         } else if let Some(v) = stats.max_timestamp_micros {
-            max_values.insert(col_name.clone(), v.to_string());
+            if is_date {
+                max_values.insert(col_name.clone(), micros_to_iso_date(v));
+            } else {
+                max_values.insert(col_name.clone(), v.to_string());
+            }
         } else if let Some(v) = stats.max_bool {
             max_values.insert(col_name.clone(), v.to_string());
         }

@@ -112,6 +112,11 @@ pub async unsafe fn list_files_arrow_ffi(
     let field_types = extract_field_types_from_schema(&snapshot.metadata.schema_string);
     crate::debug_println!("LIST_FILES: extracted field_types: {:?}", field_types);
 
+    // Extract session timezone offset for timestamp data skipping.
+    // Passed from JVM as "session.timezone.offset.seconds" in the config map.
+    let tz_offset_secs: Option<i32> = config_map.get("session.timezone.offset.seconds")
+        .and_then(|s| s.parse::<i32>().ok());
+
     // 2. Convert ManifestPathInfo → ManifestInfo for pruning
     let manifest_infos: Vec<ManifestInfo> = snapshot.manifest_paths.iter().map(|mp| {
         ManifestInfo {
@@ -189,7 +194,7 @@ pub async unsafe fn list_files_arrow_ffi(
             let max = entry.add.max_values.as_ref();
             match (min, max) {
                 (Some(min_vals), Some(max_vals)) => {
-                    !df.can_skip_by_stats_typed(min_vals, max_vals, &field_types)
+                    !df.can_skip_by_stats_typed(min_vals, max_vals, &field_types, tz_offset_secs)
                 }
                 _ => true, // No stats → can't skip
             }
