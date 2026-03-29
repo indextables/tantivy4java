@@ -383,7 +383,6 @@ public class TransactionLogReader {
     private static native String nativeListFilesArrowFfi(
         String tablePath, Map<String, String> config,
         String partitionFilterJson, String dataFilterJson,
-        String fieldTypesJson,
         int excludeCooldown, int includeStats,
         long[] arrayAddrs, long[] schemaAddrs);
 
@@ -403,7 +402,6 @@ public class TransactionLogReader {
      */
     public static String listFilesArrowFfi(String tablePath, Map<String, String> config,
                                            String partitionFilterJson, String dataFilterJson,
-                                           String fieldTypesJson,
                                            boolean excludeCooldown, boolean includeStats,
                                            long[] arrayAddrs, long[] schemaAddrs) {
         if (tablePath == null || tablePath.isEmpty()) {
@@ -415,7 +413,6 @@ public class TransactionLogReader {
         return nativeListFilesArrowFfi(tablePath,
                 config != null ? config : java.util.Collections.emptyMap(),
                 partitionFilterJson, dataFilterJson,
-                fieldTypesJson,
                 excludeCooldown ? 1 : 0, includeStats ? 1 : 0,
                 arrayAddrs, schemaAddrs);
     }

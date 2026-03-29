@@ -929,7 +929,6 @@ pub extern "system" fn Java_io_indextables_jni_txlog_TransactionLogReader_native
     config_map: JObject,
     partition_filter_json: JString,
     data_filter_json: JString,
-    field_types_json: JString,
     exclude_cooldown: jint,
     include_stats: jint,
     array_addrs: jni::sys::jlongArray,
@@ -944,7 +943,6 @@ pub extern "system" fn Java_io_indextables_jni_txlog_TransactionLogReader_native
 
     let pf_str = extract_optional_jstring(&mut env, &partition_filter_json);
     let df_str = extract_optional_jstring(&mut env, &data_filter_json);
-    let ft_str = extract_optional_jstring(&mut env, &field_types_json);
     let exclude_cooldown_files = exclude_cooldown != 0;
     let include_stats_flag = include_stats != 0;
 
@@ -976,7 +974,6 @@ pub extern "system" fn Java_io_indextables_jni_txlog_TransactionLogReader_native
                 &cache_config,
                 pf_str.as_deref(),
                 df_str.as_deref(),
-                ft_str.as_deref(),
                 exclude_cooldown_files,
                 include_stats_flag,
                 &arr_addrs,
@@ -1169,7 +1166,6 @@ pub extern "system" fn Java_io_indextables_jni_txlog_TransactionLogReader_native
             super::list_files::list_files_arrow_ffi(
                 &path, &config, &cache_config,
                 pf_str.as_deref(), df_str.as_deref(),
-                None, // no field_types for test helper
                 exclude_cooldown_files, false,
                 &array_addrs, &schema_addrs,
                 None,

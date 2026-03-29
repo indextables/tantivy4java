@@ -1181,6 +1181,55 @@ mod tests {
     }
 
     // ========================================================================
+    // Type-aware data skipping tests
+    // ========================================================================
+
+    #[test]
+    fn test_date_eq_typed_match() {
+        // Stat stored as epoch days, filter as date string — should NOT skip
+        let (min, max) = stats(&[("d", "19403")], &[("d", "19403")]);
+        let ft: HashMap<String, String> = [("d".into(), "date".into())].into();
+        let f = PartitionFilter::Eq { column: "d".into(), value: "2023-02-15".into() };
+        assert!(!f.can_skip_by_stats_typed(&min, &max, &ft));
+    }
+
+    #[test]
+    fn test_date_eq_typed_no_match() {
+        let (min, max) = stats(&[("d", "19403")], &[("d", "19403")]);
+        let ft: HashMap<String, String> = [("d".into(), "date".into())].into();
+        let f = PartitionFilter::Eq { column: "d".into(), value: "2024-01-01".into() };
+        assert!(f.can_skip_by_stats_typed(&min, &max, &ft));
+    }
+
+    #[test]
+    fn test_timestamp_eq_typed_match() {
+        // Stat as epoch micros, filter as ISO-8601
+        let (min, max) = stats(&[("ts", "1699336800000000")], &[("ts", "1699336800000000")]);
+        let ft: HashMap<String, String> = [("ts".into(), "timestamp".into())].into();
+        let f = PartitionFilter::Eq { column: "ts".into(), value: "2023-11-07T06:00:00Z".into() };
+        assert!(!f.can_skip_by_stats_typed(&min, &max, &ft));
+    }
+
+    #[test]
+    fn test_timestamp_range_typed() {
+        // Range: ts > "2023-11-06T00:00:00Z", stats [2023-11-07, 2023-11-08] in micros
+        let (min, max) = stats(&[("ts", "1699315200000000")], &[("ts", "1699401600000000")]);
+        let ft: HashMap<String, String> = [("ts".into(), "timestamp".into())].into();
+        let f = PartitionFilter::Gt { column: "ts".into(), value: "2023-11-06T00:00:00Z".into() };
+        // max (2023-11-08) > filter (2023-11-06) → should NOT skip
+        assert!(!f.can_skip_by_stats_typed(&min, &max, &ft));
+    }
+
+    #[test]
+    fn test_no_field_types_falls_back() {
+        // Without field_types, uses numeric comparison (both are parseable as i64)
+        let (min, max) = stats(&[("d", "19403")], &[("d", "19403")]);
+        let ft: HashMap<String, String> = HashMap::new();
+        let f = PartitionFilter::Eq { column: "d".into(), value: "19403".into() };
+        assert!(!f.can_skip_by_stats_typed(&min, &max, &ft));
+    }
+
+    // ========================================================================
     // Deserialization tests
     // ========================================================================
 
@@ -1238,3 +1287,4 @@ mod tests {
         }
     }
 }
+

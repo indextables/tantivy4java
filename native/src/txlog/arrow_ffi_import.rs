@@ -241,9 +241,14 @@ fn extract_protocol_action(batch: &RecordBatch, row: usize) -> Result<ProtocolAc
 
 fn extract_metadata_action(batch: &RecordBatch, row: usize) -> Result<MetadataAction> {
     Ok(MetadataAction {
-        id: get_string_required(batch, "id", row)?,
-        name: get_string(batch, "metadata_name", row),
-        description: get_string(batch, "metadata_description", row),
+        // Accept both "metadata_id" (per FR2 spec) and "id" (short form)
+        id: get_string(batch, "metadata_id", row)
+            .or_else(|| get_string(batch, "id", row))
+            .unwrap_or_default(),
+        name: get_string(batch, "metadata_name", row)
+            .or_else(|| get_string(batch, "name", row)),
+        description: get_string(batch, "metadata_description", row)
+            .or_else(|| get_string(batch, "description", row)),
         schema_string: get_string(batch, "schema_string", row).unwrap_or_default(),
         partition_columns: get_string_list(batch, "partition_columns", row).unwrap_or_default(),
         format: FormatSpec {

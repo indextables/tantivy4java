@@ -60,7 +60,6 @@ pub async unsafe fn list_files_arrow_ffi(
     config_map: &HashMap<String, String>,
     partition_filter_json: Option<&str>,
     data_filter_json: Option<&str>,
-    field_types_json: Option<&str>,
     exclude_cooldown_files: bool,
     include_stats: bool,
     array_addrs: &[i64],
@@ -104,12 +103,11 @@ pub async unsafe fn list_files_arrow_ffi(
         _ => None,
     };
 
-    // Parse field types for type-aware data skipping (date/timestamp support)
-    let field_types: HashMap<String, String> = match field_types_json {
-        Some(s) if !s.is_empty() => serde_json::from_str(s)
-            .map_err(|e| TxLogError::Serde(format!("Invalid field_types JSON: {}", e)))?,
-        _ => HashMap::new(),
-    };
+    // Extract field types from the table schema for type-aware data skipping.
+    // The Rust layer owns the schema — field types are ALWAYS derived from
+    // MetadataAction.schema_string, never passed from the JVM.
+    let field_types = extract_field_types_from_schema(&snapshot.metadata.schema_string);
+    crate::debug_println!("LIST_FILES: field_types from schema: {:?}", field_types);
 
     // 2. Convert ManifestPathInfo → ManifestInfo for pruning
     let manifest_infos: Vec<ManifestInfo> = snapshot.manifest_paths.iter().map(|mp| {
@@ -262,4 +260,45 @@ pub async unsafe fn list_files_arrow_ffi(
         manifests_total,
         manifests_pruned,
     })
+}
+
+/// Extract field name → type mappings from a Spark StructType JSON schema.
+///
+/// The schema_string format is:
+/// ```json
+/// {"type":"struct","fields":[{"name":"id","type":"long","nullable":true,"metadata":{}},
+///   {"name":"event_date","type":"date","nullable":true,"metadata":{}}]}
+/// ```
+///
+/// Returns a map like {"id":"long","event_date":"date","ts":"timestamp"}.
+/// Only date and timestamp types matter for typed data skipping — all other types
+/// use the default numeric-aware comparison which already works correctly.
+fn extract_field_types_from_schema(schema_string: &str) -> HashMap<String, String> {
+    let mut result = HashMap::new();
+    if schema_string.is_empty() {
+        return result;
+    }
+
+    let schema: serde_json::Value = match serde_json::from_str(schema_string) {
+        Ok(v) => v,
+        Err(_) => return result,
+    };
+
+    if let Some(fields) = schema.get("fields").and_then(|f| f.as_array()) {
+        for field in fields {
+            let name = field.get("name").and_then(|n| n.as_str());
+            let ftype = field.get("type").and_then(|t| t.as_str());
+            if let (Some(name), Some(ftype)) = (name, ftype) {
+                // Only store types that need special handling
+                match ftype {
+                    "date" | "timestamp" | "timestamp_ntz" => {
+                        result.insert(name.to_string(), ftype.to_string());
+                    }
+                    _ => {} // numeric/string types handled by default compare_values
+                }
+            }
+        }
+    }
+
+    result
 }
