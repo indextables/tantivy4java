@@ -388,6 +388,14 @@ pub async fn perform_search_async_impl_leaf_response_with_aggregations(
         effective_query_json
     };
 
+    // Phase 2a3: Rewrite IP CIDR/wildcard term queries to range queries using execution-time schema.
+    let effective_query_json = {
+        let schema = context.cached_index.schema();
+        crate::split_query::rewrite_ip_term_queries(&effective_query_json, &schema)
+            .unwrap_or(None)
+            .unwrap_or(effective_query_json)
+    };
+
     // FR4: Eliminate redundant range filters using split field statistics
     let _t_fr4 = std::time::Instant::now();
     let effective_query_json = if let (Some(ref min_vals), Some(ref max_vals)) =

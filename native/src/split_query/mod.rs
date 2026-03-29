@@ -1,6 +1,7 @@
 // split_query/mod.rs - Native implementation for SplitQuery classes using Quickwit libraries
 // Refactored from split_query.rs into submodules for better maintainability
 
+pub mod ip_rewriter;
 pub mod parse_query;
 pub mod query_converters;
 pub mod query_optimizer;
@@ -26,9 +27,10 @@ pub use query_converters::{
     convert_term_query_to_ast, convert_term_query_to_query_ast,
 };
 #[allow(unused_imports)]
+pub use ip_rewriter::rewrite_ip_term_queries;
+#[allow(unused_imports)]
 pub use schema_cache::{
-    clear_split_schema_cache, get_searcher_schema, get_split_schema, remove_searcher_schema,
-    store_searcher_schema, store_split_schema, SEARCHER_SCHEMA_MAPPING, SPLIT_SCHEMA_CACHE,
+    clear_split_schema_cache, get_split_schema, store_split_schema, SPLIT_SCHEMA_CACHE,
 };
 #[allow(unused_imports)]
 pub use wildcard_analysis::{
