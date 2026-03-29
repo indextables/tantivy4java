@@ -501,13 +501,22 @@ fn parse_as_epoch_micros(s: &str) -> Option<i64> {
         }
         return Some(v); // Small value, treat as-is
     }
-    // Try timestamp string formats
-    // "2023-11-07 05:00:00" or "2023-11-07T05:00:00"
+    // Try full ISO-8601 with timezone (RFC 3339):
+    //   "2023-11-07T05:00:00Z"
+    //   "2023-11-07T05:00:00+05:00"
+    //   "2023-11-07T05:00:00.123456Z"
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
+        return Some(dt.timestamp_micros());
+    }
+
+    // Try JDBC / Spark format (no timezone — treated as UTC):
+    //   "2023-11-07 05:00:00"
+    //   "2023-11-07T05:00:00"
     let normalized = s.replace('T', " ");
     if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(&normalized, "%Y-%m-%d %H:%M:%S") {
         return Some(dt.and_utc().timestamp_micros());
     }
-    // Try with fractional seconds
+    // With fractional seconds
     if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(&normalized, "%Y-%m-%d %H:%M:%S%.f") {
         return Some(dt.and_utc().timestamp_micros());
     }
