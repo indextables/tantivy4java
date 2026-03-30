@@ -34,16 +34,16 @@ bytesize = "2"
 # Quickwit dependencies (for main library only - binaries use lightweight approach)
 # Pin to specific commit on indextables/quickwit fork (upgrade/quickwit-upstream-main branch)
 # Azure feature enabled for Azure Blob Storage support
-quickwit-storage = { git = "https://github.com/indextables/quickwit", rev = "d9a7443415a1c0f376a88f894f11f1b364fa3eb7", features = ["azure"] }
-quickwit-metastore = { git = "https://github.com/indextables/quickwit", rev = "d9a7443415a1c0f376a88f894f11f1b364fa3eb7" }
-quickwit-proto = { git = "https://github.com/indextables/quickwit", rev = "d9a7443415a1c0f376a88f894f11f1b364fa3eb7" }
-quickwit-directories = { git = "https://github.com/indextables/quickwit", rev = "d9a7443415a1c0f376a88f894f11f1b364fa3eb7" }
-quickwit-common = { git = "https://github.com/indextables/quickwit", rev = "d9a7443415a1c0f376a88f894f11f1b364fa3eb7" }
-quickwit-config = { git = "https://github.com/indextables/quickwit", rev = "d9a7443415a1c0f376a88f894f11f1b364fa3eb7" }
-quickwit-search = { git = "https://github.com/indextables/quickwit", rev = "d9a7443415a1c0f376a88f894f11f1b364fa3eb7" }
-quickwit-indexing = { git = "https://github.com/indextables/quickwit", rev = "d9a7443415a1c0f376a88f894f11f1b364fa3eb7" }
-quickwit-doc-mapper = { git = "https://github.com/indextables/quickwit", rev = "d9a7443415a1c0f376a88f894f11f1b364fa3eb7" }
-quickwit-query = { git = "https://github.com/indextables/quickwit", rev = "d9a7443415a1c0f376a88f894f11f1b364fa3eb7" }
+quickwit-storage = { git = "https://github.com/indextables/quickwit", rev = "3026b228a71bfb6be16f3966ff80c8641834cb21", features = ["azure"] }
+quickwit-metastore = { git = "https://github.com/indextables/quickwit", rev = "3026b228a71bfb6be16f3966ff80c8641834cb21" }
+quickwit-proto = { git = "https://github.com/indextables/quickwit", rev = "3026b228a71bfb6be16f3966ff80c8641834cb21" }
+quickwit-directories = { git = "https://github.com/indextables/quickwit", rev = "3026b228a71bfb6be16f3966ff80c8641834cb21" }
+quickwit-common = { git = "https://github.com/indextables/quickwit", rev = "3026b228a71bfb6be16f3966ff80c8641834cb21" }
+quickwit-config = { git = "https://github.com/indextables/quickwit", rev = "3026b228a71bfb6be16f3966ff80c8641834cb21" }
+quickwit-search = { git = "https://github.com/indextables/quickwit", rev = "3026b228a71bfb6be16f3966ff80c8641834cb21" }
+quickwit-indexing = { git = "https://github.com/indextables/quickwit", rev = "3026b228a71bfb6be16f3966ff80c8641834cb21" }
+quickwit-doc-mapper = { git = "https://github.com/indextables/quickwit", rev = "3026b228a71bfb6be16f3966ff80c8641834cb21" }
+quickwit-query = { git = "https://github.com/indextables/quickwit", rev = "3026b228a71bfb6be16f3966ff80c8641834cb21" }
 
 # Additional dependencies
 anyhow = "1.0"
