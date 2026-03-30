@@ -25,7 +25,7 @@ import static org.junit.jupiter.api.Assertions.*;
  * is correctly round-tripped through create_schema_from_doc_mapping, including:
  * - All field types: text, i64, u64, f64, bool, datetime, date, bytes, ip, ip_addr, object
  * - All option flags: stored, indexed, fast in every combination
- * - Tokenizer variations: default, raw, en_stem for text fields
+ * - Tokenizer variations: default, raw for text fields
  * - JSON object options: expand_dots, fast_tokenizer
  * - Alias type strings: "date" for "datetime", "ip_addr" for "ip"
  * - Parquet companion __pq tracking fields
@@ -355,14 +355,14 @@ public class CompanionIndexerTypesTest {
 
     @Test
     @Order(32)
-    void testTextFieldEnStemTokenizer() {
-        String json = "[{\"name\":\"content\",\"type\":\"text\",\"stored\":false,\"indexed\":true,\"fast\":false,\"tokenizer\":\"en_stem\"}]";
+    void testTextFieldWhitespaceTokenizer() {
+        String json = "[{\"name\":\"content\",\"type\":\"text\",\"stored\":false,\"indexed\":true,\"fast\":false,\"tokenizer\":\"whitespace\"}]";
         try (Schema schema = Schema.fromDocMappingJson(json)) {
             FieldInfo info = schema.getFieldInfo("content");
             assertNotNull(info);
             assertEquals(FieldType.TEXT, info.getType());
             assertTrue(info.isIndexed());
-            assertEquals("en_stem", info.getTokenizerName(), "Tokenizer must be 'en_stem'");
+            assertEquals("whitespace", info.getTokenizerName(), "Tokenizer must be 'whitespace'");
         }
     }
 

@@ -64,7 +64,7 @@ public class TextFieldIndexing {
      * <ul>
      *   <li><b>"default"</b> - Standard tokenization with lowercasing</li>
      *   <li><b>"raw"</b> - No tokenization, treats entire value as single token</li>
-     *   <li><b>"en_stem"</b> - English stemming tokenizer</li>
+     *   <li><b>"whitespace"</b> - Whitespace-only tokenization</li>
      * </ul>
      *
      * @param tokenizerName Name of the tokenizer
