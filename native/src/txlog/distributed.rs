@@ -676,7 +676,11 @@ pub async fn maybe_auto_checkpoint(
     let metadata = version_metadata.or(cp_metadata).unwrap_or_else(MetadataAction::empty);
 
     // Full checkpoint: state dir + _last_checkpoint (every write)
-    match write_checkpoint(table_path, config, replay_result.files, metadata, protocol).await {
+    // Use written_version (not list_versions().last()) to avoid a race where
+    // a concurrent write advances the version but our replay only covers up to
+    // written_version. Using list_versions().last() would create a checkpoint
+    // that claims a higher version than its contents actually cover.
+    match write_checkpoint_at_version(table_path, config, replay_result.files, metadata, protocol, written_version).await {
         Ok(cp_info) => {
             debug_println!("✅ DISTRIBUTED: checkpoint at v{}, {:?} files",
                 cp_info.version, cp_info.num_files);
@@ -708,6 +712,31 @@ pub async fn write_checkpoint(
     ).await?;
 
     // Invalidate cache after checkpoint write
+    cache::invalidate_table_cache(table_path);
+    Ok(result)
+}
+
+/// Create an Avro state checkpoint at a specific version.
+/// Used by auto-checkpoint to avoid a race where list_versions().last() advances
+/// past the version that was actually replayed.
+pub async fn write_checkpoint_at_version(
+    table_path: &str,
+    config: &DeltaStorageConfig,
+    entries: Vec<FileEntry>,
+    metadata: MetadataAction,
+    protocol: ProtocolAction,
+    version: i64,
+) -> Result<LastCheckpointInfo> {
+    let storage = TxLogStorage::new(table_path, config)?;
+
+    let result = super::avro::state_writer::write_state_checkpoint(
+        &storage,
+        version,
+        &entries,
+        &protocol,
+        &metadata,
+    ).await?;
+
     cache::invalidate_table_cache(table_path);
     Ok(result)
 }
