@@ -556,9 +556,11 @@ pub async fn perform_search_async_impl_leaf_response(
     // simple aggregate, groupBy, histogram) receive correctly expanded IP queries.
     let effective_query_json = {
         let schema = context.cached_index.schema();
-        crate::split_query::rewrite_ip_term_queries(&effective_query_json, &schema)
-            .unwrap_or(None)
-            .unwrap_or(effective_query_json)
+        match crate::split_query::rewrite_ip_term_queries(&effective_query_json, &schema) {
+            Ok(Some(rewritten)) => rewritten,
+            Ok(None) => effective_query_json,
+            Err(e) => return Err(e),
+        }
     };
 
     // FR4: Eliminate redundant range filters using split field statistics
