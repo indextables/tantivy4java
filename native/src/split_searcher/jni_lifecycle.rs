@@ -82,6 +82,24 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_crea
     let mut parquet_coalesce_max_gap: Option<u64> = None;
     let mut parquet_aws_config: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     let mut parquet_azure_config: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    // FR4: Look up per-file field statistics from the cache manager.
+    // These are populated by list_files_arrow_ffi and keyed by file path.
+    let (field_min_values, field_max_values) = {
+        use crate::split_cache_manager::CACHE_MANAGERS;
+        let managers = CACHE_MANAGERS.lock().unwrap();
+        // Try all cache managers — the split path may match in any of them
+        let mut found = None;
+        for manager in managers.values() {
+            if let Some(stats) = manager.get_file_field_stats(&split_uri) {
+                found = Some(stats);
+                break;
+            }
+        }
+        match found {
+            Some((min, max)) => (Some(min), Some(max)),
+            None => (None, None),
+        }
+    };
     
     if !split_config_map.is_null() {
         let split_config_jobject = unsafe { JObject::from_raw(split_config_map) };
@@ -873,6 +891,8 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_crea
                                 parquet_file_hash_index,
                                 has_merge_safe_tracking,
                                 pq_columns: std::sync::Arc::new(std::sync::RwLock::new(Vec::new())),
+                                field_min_values,
+                                field_max_values,
                                 search_arena_reservation: None, // Global arena covers all concurrent slots
                             };
 

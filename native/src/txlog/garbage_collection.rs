@@ -194,7 +194,7 @@ mod tests {
         // Write versions 0, 1, 2
         let v0 = vec![
             Action::Protocol(ProtocolAction::v4()),
-            Action::MetaData(MetadataAction {
+            Action::MetaData(MetadataAction { name: None, description: None,
                 id: "gc-test".into(),
                 schema_string: "{}".into(),
                 partition_columns: vec![],
@@ -213,7 +213,7 @@ mod tests {
             make_file_entry("s1.split", 0),
             make_file_entry("s2.split", 1),
         ];
-        let metadata = MetadataAction {
+        let metadata = MetadataAction { name: None, description: None,
             id: "gc-test".into(),
             schema_string: "{}".into(),
             partition_columns: vec![],

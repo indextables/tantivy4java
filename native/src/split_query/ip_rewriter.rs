@@ -97,9 +97,13 @@ fn rewrite_ast(
                     }
                     None => {
                         // Non-contiguous wildcard (e.g. "10.*.1.*") — cannot be collapsed
-                        // to a single contiguous range without false positives.
-                        // Leave the term query unchanged; tantivy will find no matches for
-                        // the literal value on an IP field (filter-pushdown 0-result behaviour).
+                        // to a single contiguous range. Return error so callers get an
+                        // exception instead of silently returning 0 results.
+                        return Err(anyhow::anyhow!(
+                            "Non-contiguous IP wildcard pattern '{}' on field '{}' is not supported. \
+                             Only trailing wildcards (e.g., '10.0.*') are allowed.",
+                            value, term_query.field
+                        ));
                     }
                 }
             }
@@ -228,10 +232,13 @@ mod tests {
     }
 
     #[test]
-    fn test_non_contiguous_wildcard_not_rewritten() {
-        // Non-contiguous wildcards pass through unchanged (0-result behaviour via tantivy)
+    fn test_non_contiguous_wildcard_returns_error() {
+        // Non-contiguous wildcards return an error so callers get an exception
         let schema = build_test_schema();
         let json = r#"{"type":"term","field":"ip","value":"10.*.1.*"}"#;
-        assert_eq!(rewrite_ip_term_queries(json, &schema).unwrap(), None);
+        let result = rewrite_ip_term_queries(json, &schema);
+        assert!(result.is_err(), "Non-contiguous wildcard should return error");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("Non-contiguous"), "Error should mention non-contiguous: {}", err_msg);
     }
 }

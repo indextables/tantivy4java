@@ -72,9 +72,7 @@ pub async fn perform_bulk_search(
     let ip_rewritten;
     let effective_json_str = {
         let schema = ctx.cached_index.schema();
-        match crate::split_query::rewrite_ip_term_queries(effective_json_str, &schema)
-            .unwrap_or(None)
-        {
+        match crate::split_query::rewrite_ip_term_queries(effective_json_str, &schema)? {
             Some(rewritten) => {
                 ip_rewritten = rewritten;
                 &ip_rewritten as &str

@@ -82,6 +82,9 @@ public class PartitionFilter implements Serializable {
         node.put("column", column);
         ArrayNode arr = node.putArray("values");
         for (String v : values) {
+            if (v == null) {
+                throw new IllegalArgumentException("values must not contain null elements");
+            }
             arr.add(v);
         }
         return new PartitionFilter(node.toString());
@@ -139,6 +142,41 @@ public class PartitionFilter implements Serializable {
         ObjectNode node = MAPPER.createObjectNode();
         node.put("op", "is_not_null");
         node.put("column", column);
+        return new PartitionFilter(node.toString());
+    }
+
+    // -- String pattern matching --
+
+    /** Match rows where {@code column} starts with {@code prefix}. */
+    public static PartitionFilter stringStartsWith(String column, String prefix) {
+        requireNonNull(column, "column");
+        requireNonNull(prefix, "prefix");
+        ObjectNode node = MAPPER.createObjectNode();
+        node.put("op", "string_starts_with");
+        node.put("column", column);
+        node.put("prefix", prefix);
+        return new PartitionFilter(node.toString());
+    }
+
+    /** Match rows where {@code column} ends with {@code suffix}. */
+    public static PartitionFilter stringEndsWith(String column, String suffix) {
+        requireNonNull(column, "column");
+        requireNonNull(suffix, "suffix");
+        ObjectNode node = MAPPER.createObjectNode();
+        node.put("op", "string_ends_with");
+        node.put("column", column);
+        node.put("suffix", suffix);
+        return new PartitionFilter(node.toString());
+    }
+
+    /** Match rows where {@code column} contains {@code value} as a substring. */
+    public static PartitionFilter stringContains(String column, String value) {
+        requireNonNull(column, "column");
+        requireNonNull(value, "value");
+        ObjectNode node = MAPPER.createObjectNode();
+        node.put("op", "string_contains");
+        node.put("column", column);
+        node.put("value", value);
         return new PartitionFilter(node.toString());
     }
 

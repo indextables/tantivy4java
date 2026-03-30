@@ -97,9 +97,20 @@ pub enum Section {
     ArrowFfiResolve         = 51,
     ArrowFfiBatchRead       = 52,
     ArrowFfiExport          = 53,
+
+    // -- TxLog list files pipeline (FR1) (6) --
+    TxLogSnapshot           = 54,
+    TxLogManifestPrune      = 55,
+    TxLogManifestRead       = 56,
+    TxLogPartitionFilter    = 57,
+    TxLogDataSkip           = 58,
+    TxLogArrowExport        = 59,
+
+    // -- FR4 range filter elimination (1) --
+    RangeFilterElimination  = 60,
 }
 
-pub const NUM_SECTIONS: usize = 54;
+pub const NUM_SECTIONS: usize = 61;
 
 impl Section {
     pub const fn name(self) -> &'static str {
@@ -158,6 +169,13 @@ impl Section {
             Self::ArrowFfiResolve         => "arrow_ffi_resolve",
             Self::ArrowFfiBatchRead       => "arrow_ffi_batch_read",
             Self::ArrowFfiExport          => "arrow_ffi_export",
+            Self::TxLogSnapshot          => "txlog_snapshot",
+            Self::TxLogManifestPrune     => "txlog_manifest_prune",
+            Self::TxLogManifestRead      => "txlog_manifest_read",
+            Self::TxLogPartitionFilter   => "txlog_partition_filter",
+            Self::TxLogDataSkip          => "txlog_data_skip",
+            Self::TxLogArrowExport       => "txlog_arrow_export",
+            Self::RangeFilterElimination => "range_filter_elimination",
         }
     }
 
@@ -182,6 +200,9 @@ impl Section {
         Self::PcDocStreamBatches, Self::PcDocSerializeTant,
         Self::StreamSetup, Self::StreamBatchRead, Self::StreamBatchNext,
         Self::ArrowFfiResolve, Self::ArrowFfiBatchRead, Self::ArrowFfiExport,
+        Self::TxLogSnapshot, Self::TxLogManifestPrune, Self::TxLogManifestRead,
+        Self::TxLogPartitionFilter, Self::TxLogDataSkip, Self::TxLogArrowExport,
+        Self::RangeFilterElimination,
     ];
 }
 
@@ -235,7 +256,7 @@ impl CacheCounter {
 // Compile-time safety: ensure ALL array and enum stay in sync
 // ═══════════════════════════════════════════════════════════════════════
 
-const _: () = assert!(Section::ArrowFfiExport as usize == NUM_SECTIONS - 1,
+const _: () = assert!(Section::RangeFilterElimination as usize == NUM_SECTIONS - 1,
     "Section enum last variant must equal NUM_SECTIONS - 1");
 const _: () = assert!(CacheCounter::PqColumnMiss as usize == NUM_CACHE_COUNTERS - 1,
     "CacheCounter enum last variant must equal NUM_CACHE_COUNTERS - 1");

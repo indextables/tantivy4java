@@ -43,6 +43,11 @@ pub struct GlobalSplitCacheManager {
 
     // Managed splits
     pub(crate) managed_splits: Mutex<HashMap<String, u64>>, // split_path -> last_access_time
+
+    // FR4: Per-file min/max field statistics for native range filter elimination.
+    // Populated by list_files_arrow_ffi, keyed by file path (same key as split_uri).
+    // Follows cache manager lifecycle — cleared when manager is closed.
+    pub(crate) file_field_stats: Mutex<HashMap<String, (HashMap<String, String>, HashMap<String, String>)>>,
 }
 
 impl GlobalSplitCacheManager {
@@ -76,6 +81,7 @@ impl GlobalSplitCacheManager {
             total_evictions: AtomicU64::new(0),
             current_size: AtomicU64::new(0),
             managed_splits: Mutex::new(HashMap::new()),
+            file_field_stats: Mutex::new(HashMap::new()),
         }
     }
 
@@ -127,6 +133,24 @@ impl GlobalSplitCacheManager {
     pub fn remove_split(&self, split_path: &str) {
         let mut splits = self.managed_splits.lock().unwrap();
         splits.remove(split_path);
+    }
+
+    /// FR4: Bulk-store per-file field statistics for range filter elimination.
+    /// Called by list_files_arrow_ffi after loading file entries.
+    pub fn put_all_file_field_stats(&self, entries: &[crate::txlog::actions::FileEntry]) {
+        let mut stats = self.file_field_stats.lock().unwrap();
+        for entry in entries {
+            if let (Some(min), Some(max)) = (&entry.add.min_values, &entry.add.max_values) {
+                if !min.is_empty() || !max.is_empty() {
+                    stats.insert(entry.add.path.clone(), (min.clone(), max.clone()));
+                }
+            }
+        }
+    }
+
+    /// FR4: Look up field statistics for a split by path.
+    pub fn get_file_field_stats(&self, file_path: &str) -> Option<(HashMap<String, String>, HashMap<String, String>)> {
+        self.file_field_stats.lock().unwrap().get(file_path).cloned()
     }
 
     pub fn get_managed_split_count(&self) -> usize {

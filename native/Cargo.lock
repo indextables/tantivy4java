@@ -6846,7 +6846,7 @@ dependencies = [
 
 [[package]]
 name = "tantivy4java"
-version = "0.32.4"
+version = "0.33.1"
 dependencies = [
  "anyhow",
  "apache-avro",

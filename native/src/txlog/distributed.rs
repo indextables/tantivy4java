@@ -83,15 +83,34 @@ pub async fn get_txlog_snapshot_info_with_cache(
                     })
                     .collect();
 
-                debug_println!("📊 DISTRIBUTED: snapshot_info from CACHE: checkpoint v{}, {} manifests",
-                    cached_cp.version, manifest_paths.len());
+                // If there are post-checkpoint versions, read them for potential
+                // protocol/metadata overrides. This is critical for concurrent
+                // metadata updates — the cached metadata may be stale.
+                let (effective_protocol, effective_metadata) = if post_cp_paths.is_empty() {
+                    (Some(cached_meta.0.clone()), cached_meta.1.clone())
+                } else {
+                    let mut post_cp_actions: Vec<(i64, Vec<Action>)> = Vec::new();
+                    for v in all_versions.iter().filter(|v| **v > cached_cp.version) {
+                        if let Ok(actions) = version_file::read_version(&storage, *v).await {
+                            post_cp_actions.push((*v, actions));
+                        }
+                    }
+                    let (post_protocol, post_metadata) = log_replay::extract_metadata(&[], &post_cp_actions);
+                    (
+                        post_protocol.or(Some(cached_meta.0.clone())),
+                        post_metadata.unwrap_or_else(|| cached_meta.1.clone()),
+                    )
+                };
+
+                debug_println!("📊 DISTRIBUTED: snapshot_info from CACHE: checkpoint v{}, {} manifests, {} post-cp versions",
+                    cached_cp.version, manifest_paths.len(), post_cp_paths.len());
 
                 return Ok(TxLogSnapshotInfo {
                     checkpoint_version: cached_cp.version,
                     manifest_paths,
                     post_checkpoint_version_paths: post_cp_paths,
-                    protocol: Some(cached_meta.0.clone()),
-                    metadata: cached_meta.1.clone(),
+                    protocol: effective_protocol,
+                    metadata: effective_metadata,
                     state_dir,
                 });
             }

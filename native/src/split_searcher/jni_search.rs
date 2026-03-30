@@ -389,15 +389,27 @@ pub async fn perform_search_async_impl_leaf_response_with_aggregations(
     };
 
     // Phase 2a3: Rewrite IP CIDR/wildcard term queries to range queries using execution-time schema.
-    // Placed after hash-field and string-indexing rewrites so all aggregation paths receive
-    // correctly expanded IP queries regardless of whether searcher_ptr was available at
-    // serialization time.
     let effective_query_json = {
         let schema = context.cached_index.schema();
-        crate::split_query::rewrite_ip_term_queries(&effective_query_json, &schema)
-            .unwrap_or(None)
-            .unwrap_or(effective_query_json)
+        match crate::split_query::rewrite_ip_term_queries(&effective_query_json, &schema) {
+            Ok(Some(rewritten)) => rewritten,
+            Ok(None) => effective_query_json,
+            Err(e) => return Err(e),
+        }
     };
+
+    // FR4: Eliminate redundant range filters using split field statistics
+    let _t_fr4 = std::time::Instant::now();
+    let effective_query_json = if let (Some(ref min_vals), Some(ref max_vals)) =
+        (&context.field_min_values, &context.field_max_values)
+    {
+        super::async_impl::optimize_query_with_field_stats(&effective_query_json, min_vals, max_vals)
+    } else {
+        effective_query_json
+    };
+    if crate::ffi_profiler::is_enabled() {
+        crate::ffi_profiler::record(crate::ffi_profiler::Section::RangeFilterElimination, _t_fr4.elapsed().as_nanos() as u64);
+    }
 
     // Phase 2b: Rewrite aggregation JSON to replace string field references with _phash_* fields.
     // This avoids expensive parquet transcoding for terms/value_count/cardinality aggregations.

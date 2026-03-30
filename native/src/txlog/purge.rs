@@ -241,6 +241,44 @@ pub fn read_next_retained_files_batch(cursor_id: i64, batch_size: usize) -> Resu
     Ok(Some(batch))
 }
 
+/// Read next batch of retained files from cursor via Arrow FFI export.
+/// Returns the number of rows exported (0 when exhausted).
+///
+/// # Safety
+///
+/// The caller must ensure that `array_addrs` and `schema_addrs` point to valid,
+/// writable FFI memory locations.
+pub unsafe fn read_next_retained_files_batch_ffi(
+    cursor_id: i64,
+    batch_size: usize,
+    array_addrs: &[i64],
+    schema_addrs: &[i64],
+) -> Result<usize> {
+    // Clone entries under lock, then drop lock before FFI export
+    let batch_entries = {
+        let mut registry = CURSOR_REGISTRY.lock();
+        let cursor = registry.get_mut(&cursor_id)
+            .ok_or_else(|| TxLogError::Storage(anyhow::anyhow!("Invalid cursor handle: {}", cursor_id)))?;
+
+        if cursor.position >= cursor.entries.len() {
+            return Ok(0); // Exhausted
+        }
+
+        let end = std::cmp::min(cursor.position + batch_size, cursor.entries.len());
+        let entries = cursor.entries[cursor.position..end].to_vec();
+        cursor.position = end;
+        entries
+    }; // lock dropped here
+
+    super::arrow_ffi::export_file_entries_ffi(
+        &batch_entries,
+        &[], // no partition columns for purge
+        false, // no stats for purge
+        array_addrs,
+        schema_addrs,
+    )
+}
+
 /// Close a retained files cursor and release resources.
 pub fn close_retained_files_cursor(cursor_id: i64) {
     let removed = CURSOR_REGISTRY.lock().remove(&cursor_id);
