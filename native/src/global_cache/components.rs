@@ -3,7 +3,8 @@
 
 use std::sync::Arc;
 
-use quickwit_config::SearcherConfig;
+use bytesize::ByteSize;
+use quickwit_config::{CacheConfig, SearcherConfig};
 use quickwit_search::list_fields_cache::ListFieldsCache;
 use quickwit_search::leaf_cache::LeafSearchCache;
 use quickwit_search::search_permit_provider::SearchPermitProvider;
@@ -13,7 +14,6 @@ use quickwit_storage::{
 };
 use tantivy::aggregation::AggregationLimitsGuard;
 use tempfile::TempDir;
-use tokio::sync::Semaphore;
 
 use super::cache_debug::{debug_arc_string_cache_identity, debug_cache_summary};
 use crate::debug_println;
@@ -36,8 +36,6 @@ pub struct GlobalSearcherComponents {
     pub list_fields_cache: Arc<ListFieldsCache>,
     /// Search permit provider - manages concurrent searches (wrapped in Arc for sharing)
     pub search_permit_provider: Arc<SearchPermitProvider>,
-    /// Split stream semaphore - limits concurrent streams
-    pub split_stream_semaphore: Arc<Semaphore>,
     /// Aggregation limits guard - shared memory tracking
     pub aggregation_limit: AggregationLimitsGuard,
     /// Split cache - caches entire split files on disk (optional)
@@ -54,23 +52,23 @@ impl GlobalSearcherComponents {
         debug_println!("RUST DEBUG: Creating new GlobalSearcherComponents");
 
         // Create fast field cache
-        let fast_field_cache_capacity = config.fast_field_cache_capacity.as_u64() as usize;
-        let fast_fields_cache = Arc::new(QuickwitCache::new(fast_field_cache_capacity));
+        let fast_field_cache_config = CacheConfig::default_with_capacity(config.fast_field_cache_capacity);
+        let fast_fields_cache = Arc::new(QuickwitCache::new(&fast_field_cache_config));
 
         // Create split footer cache (wrapped in Arc for sharing)
-        let split_footer_cache_capacity = config.split_footer_cache_capacity.as_u64() as usize;
-        let split_footer_cache = Arc::new(MemorySizedCache::with_capacity_in_bytes(
-            split_footer_cache_capacity,
+        let split_footer_cache_config = CacheConfig::default_with_capacity(config.split_footer_cache_capacity);
+        let split_footer_cache = Arc::new(MemorySizedCache::from_config(
+            &split_footer_cache_config,
             &STORAGE_METRICS.split_footer_cache,
         ));
         debug_arc_string_cache_identity(&split_footer_cache, "split_footer_cache");
 
         // Create leaf search cache (wrapped in Arc for sharing)
-        let partial_cache_capacity = config.partial_request_cache_capacity.as_u64() as usize;
-        let leaf_search_cache = Arc::new(LeafSearchCache::new(partial_cache_capacity));
+        let partial_cache_config = CacheConfig::default_with_capacity(config.partial_request_cache_capacity);
+        let leaf_search_cache = Arc::new(LeafSearchCache::new(&partial_cache_config));
 
         // Create list fields cache (wrapped in Arc for sharing)
-        let list_fields_cache = Arc::new(ListFieldsCache::new(partial_cache_capacity));
+        let list_fields_cache = Arc::new(ListFieldsCache::new(&partial_cache_config));
 
         // Create sync search permit provider to avoid async channel conflicts
         // Using new_sync() method that doesn't use async channels
@@ -78,9 +76,6 @@ impl GlobalSearcherComponents {
             config.max_concurrent_splits,
             config.warmup_memory_budget,
         ));
-
-        // Create split stream semaphore (using 10 as default like Quickwit)
-        let split_stream_semaphore = Arc::new(Semaphore::new(10));
 
         // Create aggregation limits guard
         let aggregation_limit = AggregationLimitsGuard::new(
@@ -169,7 +164,6 @@ impl GlobalSearcherComponents {
             leaf_search_cache,
             list_fields_cache,
             search_permit_provider,
-            split_stream_semaphore,
             aggregation_limit,
             split_cache_opt,
             disk_cache,
@@ -185,41 +179,10 @@ impl GlobalSearcherComponents {
         debug_arc_string_cache_identity(&self.split_footer_cache, "split_footer_cache");
         debug_cache_summary();
 
-        // CRITICAL: Create a custom SearcherContext that shares ALL cache instances
-        // This requires careful construction to ensure cache sharing
-        Arc::new(SearcherContext {
-            searcher_config: searcher_config.clone(),
-            // ✅ SHARED: Fast fields cache (already Arc<dyn StorageCache>)
-            fast_fields_cache: self.fast_fields_cache.clone(),
-            // ✅ SHARED: Create sync search permit provider for this context
-            // Using sync mode to avoid async channel conflicts when sharing contexts
-            search_permit_provider: SearchPermitProvider::new_sync(
-                searcher_config.max_num_concurrent_split_searches,
-                searcher_config.warmup_memory_budget,
-            ),
-            // ✅ INDIVIDUAL: Split footer cache (follows Quickwit pattern - individual instances, shared metrics)
-            // This follows Quickwit's design where each SearcherContext gets its own cache instance
-            // but all instances share the same STORAGE_METRICS for global coordination
-            split_footer_cache: MemorySizedCache::with_capacity_in_bytes(
-                searcher_config.split_footer_cache_capacity.as_u64() as usize,
-                &STORAGE_METRICS.split_footer_cache, // SHARED metrics for global coordination
-            ),
-            // ✅ INDIVIDUAL: Split stream semaphore (per-context limiting is correct)
-            split_stream_semaphore: Semaphore::new(
-                searcher_config.max_num_concurrent_split_streams,
-            ),
-            // ✅ INDIVIDUAL: Leaf search cache (follows Quickwit pattern - individual instances)
-            leaf_search_cache: LeafSearchCache::new(
-                searcher_config.partial_request_cache_capacity.as_u64() as usize,
-            ),
-            // ✅ INDIVIDUAL: List fields cache (follows Quickwit pattern - individual instances)
-            list_fields_cache: ListFieldsCache::new(
-                searcher_config.partial_request_cache_capacity.as_u64() as usize,
-            ),
-            // ✅ SHARED: Split cache (already Option<Arc<SplitCache>>)
-            split_cache_opt: self.split_cache_opt.clone(),
-            // ✅ SHARED: Aggregation limits (clone preserves shared memory tracking)
-            aggregation_limit: self.aggregation_limit.clone(),
-        })
+        // Use SearcherContext::new_without_invoker which handles all required fields correctly
+        Arc::new(SearcherContext::new_without_invoker(
+            searcher_config,
+            self.split_cache_opt.clone(),
+        ))
     }
 }

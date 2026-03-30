@@ -925,6 +925,8 @@ async fn perform_real_quickwit_search(
         aggregation_request: None,
         scroll_ttl_secs: None,
         search_after: None,
+        ignore_missing_indexes: false,
+        skip_aggregation_finalization: false,
     };
 
     // Create SplitIdAndFooterOffsets for Quickwit
@@ -1003,13 +1005,12 @@ async fn perform_real_quickwit_search(
     let leaf_search_result = tokio::time::timeout(
         std::time::Duration::from_secs(15), // 15 second timeout for leaf search
         quickwit_search::leaf_search_single_split(
-            &searcher_context,
             search_request,
+            searcher_context,
             storage,
             split_metadata,
             doc_mapper,
             split_filter,
-            aggregations_limits,
             &mut search_permit,
             overrides,
         )
@@ -1021,6 +1022,7 @@ async fn perform_real_quickwit_search(
         Ok(search_result) => {
             debug_println!("✅ CRITICAL_DEBUG: leaf_search_single_split succeeded");
             search_result.map_err(|e| anyhow::anyhow!("Quickwit leaf search failed: {}", e))?
+                .unwrap_or_default()
         },
         Err(_timeout) => {
             debug_println!("❌ CRITICAL_DEBUG: TIMEOUT in leaf_search_single_split - THIS IS THE HANG LOCATION!");
@@ -1117,6 +1119,8 @@ pub async fn perform_real_quickwit_search_with_aggregations(
         aggregation_request: aggregation_request_json, // ENABLE AGGREGATIONS
         scroll_ttl_secs: None,
         search_after: None,
+        ignore_missing_indexes: false,
+        skip_aggregation_finalization: false,
     };
 
     debug_println!("🔍 AGGREGATION_SEARCH: SearchRequest configured with aggregations: {}",
@@ -1177,13 +1181,12 @@ pub async fn perform_real_quickwit_search_with_aggregations(
     let leaf_search_result = tokio::time::timeout(
         std::time::Duration::from_secs(15), // 15 second timeout
         quickwit_search::leaf_search_single_split(
-            &searcher_context,
             search_request,
+            searcher_context,
             storage,
             split_metadata,
             doc_mapper,
             split_filter,
-            aggregations_limits,
             &mut search_permit,
             overrides,
         )
@@ -1193,6 +1196,7 @@ pub async fn perform_real_quickwit_search_with_aggregations(
         Ok(search_result) => {
             debug_println!("✅ AGGREGATION_SEARCH: leaf_search_single_split succeeded with aggregations");
             search_result.map_err(|e| anyhow::anyhow!("Quickwit leaf search with aggregations failed: {}", e))?
+                .unwrap_or_default()
         },
         Err(_timeout) => {
             debug_println!("❌ AGGREGATION_SEARCH: TIMEOUT in leaf_search_single_split with aggregations");

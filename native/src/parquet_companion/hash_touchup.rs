@@ -405,6 +405,8 @@ fn collect_all_hashes_recursive(
                 BucketResult::Range { buckets } => {
                     recurse_bucket_entries(buckets, |b| &b.sub_aggregation, target_name, out);
                 }
+                BucketResult::Filter(_) => {}
+                BucketResult::Composite { .. } => {}
             }
         }
     }

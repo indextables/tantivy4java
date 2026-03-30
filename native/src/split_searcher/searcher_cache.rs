@@ -123,7 +123,7 @@ pub async fn parse_bundle_file_offsets(
 
     // 🚀 OPTIMIZATION: Check quickwit's split_footer_cache first (same cache open_index_with_caches uses)
     let footer_bytes = {
-        let cached = searcher_context.split_footer_cache.get(split_id);
+        let cached = searcher_context.split_footer_cache.get(&split_id.to_string());
         if let Some(footer_data) = cached {
             debug_println!("🔍 BUNDLE_METADATA: Footer cache HIT - {} bytes from split_footer_cache (no S3 request)", footer_data.len());
             footer_data

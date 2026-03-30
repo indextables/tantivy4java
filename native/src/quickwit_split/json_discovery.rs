@@ -30,7 +30,7 @@ pub fn discover_json_subfields(
     let searcher = reader.searcher();
 
     // Collect sample documents (up to sample_size)
-    let top_docs = searcher.search(&AllQuery, &TopDocs::with_limit(sample_size))?;
+    let top_docs = searcher.search(&AllQuery, &TopDocs::with_limit(sample_size).order_by_score())?;
 
     debug_log!("  Sampling {} documents for field discovery", top_docs.len());
 

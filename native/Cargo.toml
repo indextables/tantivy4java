@@ -13,7 +13,7 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 # Main library dependencies (for JNI functions and core search functionality)
 # Pin to specific commit for reproducible builds (v0.22.0-indextables-1)
-tantivy = { git = "https://github.com/indextables/tantivy", rev = "4b6d7d49", default-features = false, features = [
+tantivy = { git = "https://github.com/indextables/tantivy", rev = "ffe408f49bb1f605d8eb28de9d18edd29c5245d5", default-features = false, features = [
   "lz4-compression",
   "mmap",
   "quickwit",
@@ -29,21 +29,21 @@ serde_yaml = "0.9"
 base64 = "0.22"
 futures = "0.3.31"
 once_cell = "1.19.0"
-bytesize = "1.3"
+bytesize = "2"
 
 # Quickwit dependencies (for main library only - binaries use lightweight approach)
-# Pin to specific commit on indextables/quickwit fork (fix/zero_copy branch)
+# Pin to specific commit on indextables/quickwit fork (upgrade/quickwit-upstream-main branch)
 # Azure feature enabled for Azure Blob Storage support
-quickwit-storage = { git = "https://github.com/indextables/quickwit", rev = "7af2361e", features = ["azure"] }
-quickwit-metastore = { git = "https://github.com/indextables/quickwit", rev = "7af2361e" }
-quickwit-proto = { git = "https://github.com/indextables/quickwit", rev = "7af2361e" }
-quickwit-directories = { git = "https://github.com/indextables/quickwit", rev = "7af2361e" }
-quickwit-common = { git = "https://github.com/indextables/quickwit", rev = "7af2361e" }
-quickwit-config = { git = "https://github.com/indextables/quickwit", rev = "7af2361e" }
-quickwit-search = { git = "https://github.com/indextables/quickwit", rev = "7af2361e" }
-quickwit-indexing = { git = "https://github.com/indextables/quickwit", rev = "7af2361e" }
-quickwit-doc-mapper = { git = "https://github.com/indextables/quickwit", rev = "7af2361e" }
-quickwit-query = { git = "https://github.com/indextables/quickwit", rev = "7af2361e" }
+quickwit-storage = { git = "https://github.com/indextables/quickwit", rev = "7730627269fe81216e83b5622589f29ff646a8c3", features = ["azure"] }
+quickwit-metastore = { git = "https://github.com/indextables/quickwit", rev = "7730627269fe81216e83b5622589f29ff646a8c3" }
+quickwit-proto = { git = "https://github.com/indextables/quickwit", rev = "7730627269fe81216e83b5622589f29ff646a8c3" }
+quickwit-directories = { git = "https://github.com/indextables/quickwit", rev = "7730627269fe81216e83b5622589f29ff646a8c3" }
+quickwit-common = { git = "https://github.com/indextables/quickwit", rev = "7730627269fe81216e83b5622589f29ff646a8c3" }
+quickwit-config = { git = "https://github.com/indextables/quickwit", rev = "7730627269fe81216e83b5622589f29ff646a8c3" }
+quickwit-search = { git = "https://github.com/indextables/quickwit", rev = "7730627269fe81216e83b5622589f29ff646a8c3" }
+quickwit-indexing = { git = "https://github.com/indextables/quickwit", rev = "7730627269fe81216e83b5622589f29ff646a8c3" }
+quickwit-doc-mapper = { git = "https://github.com/indextables/quickwit", rev = "7730627269fe81216e83b5622589f29ff646a8c3" }
+quickwit-query = { git = "https://github.com/indextables/quickwit", rev = "7730627269fe81216e83b5622589f29ff646a8c3" }
 
 # Additional dependencies
 anyhow = "1.0"
@@ -63,8 +63,8 @@ async-trait = "0.1"  # For Storage trait implementation
 aws-sdk-s3 = "=1.62"  # For streaming file uploads (PutPayload implementation)
 
 # Tantivy sub-crates for direct columnar serialization (bypass ColumnarWriter for string fast fields)
-sstable = { git = "https://github.com/indextables/tantivy", rev = "4b6d7d49", package = "tantivy-sstable" }
-common = { git = "https://github.com/indextables/tantivy", rev = "4b6d7d49", package = "tantivy-common" }
+sstable = { git = "https://github.com/indextables/tantivy", rev = "ffe408f49bb1f605d8eb28de9d18edd29c5245d5", package = "tantivy-sstable" }
+common = { git = "https://github.com/indextables/tantivy", rev = "ffe408f49bb1f605d8eb28de9d18edd29c5245d5", package = "tantivy-common" }
 
 # Parquet companion mode - enables minimal splits referencing external parquet files
 parquet = { version = "57", default-features = false, features = ["async", "arrow", "zstd", "lz4", "snap", "flate2", "flate2-rust_backened"] }
@@ -101,7 +101,7 @@ jni = "0.21.1"
 # Patch to redirect quickwit-oss tantivy references to indextables fork (for pub mod iterable and direct columnar APIs)
 # Note: [patch."indextables/tantivy"] is not needed since the main tantivy dep already points there
 [patch."https://github.com/quickwit-oss/tantivy/"]
-tantivy = { git = "https://github.com/indextables/tantivy", rev = "4b6d7d49" }
+tantivy = { git = "https://github.com/indextables/tantivy", rev = "ffe408f49bb1f605d8eb28de9d18edd29c5245d5" }
 
 # Debug symbols configuration for maximum debug information
 [profile.dev]

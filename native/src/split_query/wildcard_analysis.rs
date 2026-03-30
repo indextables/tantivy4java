@@ -81,6 +81,7 @@ pub fn convert_wildcard_query_to_query_ast(env: &mut JNIEnv, obj: &JObject) -> R
         field,
         value: pattern,
         lenient: true, // Be lenient with missing fields
+        case_insensitive: false,
     };
 
     let query_ast = QueryAst::Wildcard(wildcard_query);

@@ -15,8 +15,8 @@ pub struct CacheStats {
 pub fn get_footer_cache_stats() -> CacheStats {
     let metrics = &STORAGE_METRICS.split_footer_cache;
 
-    let hits = metrics.hits_num_items.get();
-    let misses = metrics.misses_num_items.get();
+    let hits = metrics.cache_metrics.hits_num_items.get();
+    let misses = metrics.cache_metrics.misses_num_items.get();
     let total_requests = hits + misses;
     let hit_rate = if total_requests > 0 {
         (hits * 100) / total_requests
@@ -25,9 +25,9 @@ pub fn get_footer_cache_stats() -> CacheStats {
     };
 
     CacheStats {
-        current_items: metrics.in_cache_count.get() as u64,
+        current_items: metrics.cache_metrics.in_cache_count.get() as u64,
         hit_rate_percent: hit_rate,
-        current_bytes: metrics.in_cache_num_bytes.get() as u64,
+        current_bytes: metrics.cache_metrics.in_cache_num_bytes.get() as u64,
     }
 }
 
@@ -54,26 +54,26 @@ pub fn debug_cache_summary() {
 
         // Byte range cache stats
         let byte_range = &STORAGE_METRICS.shortlived_cache;
-        let br_hits = byte_range.hits_num_items.get();
-        let br_misses = byte_range.misses_num_items.get();
+        let br_hits = byte_range.cache_metrics.hits_num_items.get();
+        let br_misses = byte_range.cache_metrics.misses_num_items.get();
         let br_total = br_hits + br_misses;
         let br_hit_rate = if br_total > 0 { (br_hits * 100) / br_total } else { 0 };
 
         debug_println!("  Byte Range Cache: {} items, {} KB, {}% hit rate",
-                     byte_range.in_cache_count.get(),
-                     byte_range.in_cache_num_bytes.get() / 1024,
+                     byte_range.cache_metrics.in_cache_count.get(),
+                     byte_range.cache_metrics.in_cache_num_bytes.get() / 1024,
                      br_hit_rate);
 
         // Fast field cache stats
         let ff_cache = &STORAGE_METRICS.fast_field_cache;
-        let ff_hits = ff_cache.hits_num_items.get();
-        let ff_misses = ff_cache.misses_num_items.get();
+        let ff_hits = ff_cache.cache_metrics.hits_num_items.get();
+        let ff_misses = ff_cache.cache_metrics.misses_num_items.get();
         let ff_total = ff_hits + ff_misses;
         let ff_hit_rate = if ff_total > 0 { (ff_hits * 100) / ff_total } else { 0 };
 
         debug_println!("  Fast Field Cache: {} items, {} KB, {}% hit rate",
-                     ff_cache.in_cache_count.get(),
-                     ff_cache.in_cache_num_bytes.get() / 1024,
+                     ff_cache.cache_metrics.in_cache_count.get(),
+                     ff_cache.cache_metrics.in_cache_num_bytes.get() / 1024,
                      ff_hit_rate);
     }
 }

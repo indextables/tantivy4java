@@ -113,7 +113,7 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_
     let storage_metrics = &quickwit_storage::STORAGE_METRICS;
 
     // Debug: Print the actual values being returned
-    let byte_range_size = storage_metrics.shortlived_cache.in_cache_num_bytes.get();
+    let byte_range_size = storage_metrics.shortlived_cache.cache_metrics.in_cache_num_bytes.get();
     println!(
         "📊 NATIVE getComprehensiveCacheStatsNative: ByteRangeCache.in_cache_num_bytes = {}",
         byte_range_size
@@ -123,31 +123,31 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_
     let per_cache_metrics = vec![
         // ByteRangeCache metrics (shortlived_cache)
         vec![
-            storage_metrics.shortlived_cache.hits_num_items.get() as jlong,
-            storage_metrics.shortlived_cache.misses_num_items.get() as jlong,
-            storage_metrics.shortlived_cache.evict_num_items.get() as jlong,
+            storage_metrics.shortlived_cache.cache_metrics.hits_num_items.get() as jlong,
+            storage_metrics.shortlived_cache.cache_metrics.misses_num_items.get() as jlong,
+            storage_metrics.shortlived_cache.cache_metrics.evict_num_items.get() as jlong,
             byte_range_size as jlong,
         ],
         // FooterCache metrics (split_footer_cache)
         vec![
-            storage_metrics.split_footer_cache.hits_num_items.get() as jlong,
-            storage_metrics.split_footer_cache.misses_num_items.get() as jlong,
-            storage_metrics.split_footer_cache.evict_num_items.get() as jlong,
-            storage_metrics.split_footer_cache.in_cache_num_bytes.get() as jlong,
+            storage_metrics.split_footer_cache.cache_metrics.hits_num_items.get() as jlong,
+            storage_metrics.split_footer_cache.cache_metrics.misses_num_items.get() as jlong,
+            storage_metrics.split_footer_cache.cache_metrics.evict_num_items.get() as jlong,
+            storage_metrics.split_footer_cache.cache_metrics.in_cache_num_bytes.get() as jlong,
         ],
         // FastFieldCache metrics (fast_field_cache)
         vec![
-            storage_metrics.fast_field_cache.hits_num_items.get() as jlong,
-            storage_metrics.fast_field_cache.misses_num_items.get() as jlong,
-            storage_metrics.fast_field_cache.evict_num_items.get() as jlong,
-            storage_metrics.fast_field_cache.in_cache_num_bytes.get() as jlong,
+            storage_metrics.fast_field_cache.cache_metrics.hits_num_items.get() as jlong,
+            storage_metrics.fast_field_cache.cache_metrics.misses_num_items.get() as jlong,
+            storage_metrics.fast_field_cache.cache_metrics.evict_num_items.get() as jlong,
+            storage_metrics.fast_field_cache.cache_metrics.in_cache_num_bytes.get() as jlong,
         ],
         // SplitCache metrics (searcher_split_cache)
         vec![
-            storage_metrics.searcher_split_cache.hits_num_items.get() as jlong,
-            storage_metrics.searcher_split_cache.misses_num_items.get() as jlong,
-            storage_metrics.searcher_split_cache.evict_num_items.get() as jlong,
-            storage_metrics.searcher_split_cache.in_cache_num_bytes.get() as jlong,
+            storage_metrics.searcher_split_cache.cache_metrics.hits_num_items.get() as jlong,
+            storage_metrics.searcher_split_cache.cache_metrics.misses_num_items.get() as jlong,
+            storage_metrics.searcher_split_cache.cache_metrics.evict_num_items.get() as jlong,
+            storage_metrics.searcher_split_cache.cache_metrics.in_cache_num_bytes.get() as jlong,
         ],
     ];
 

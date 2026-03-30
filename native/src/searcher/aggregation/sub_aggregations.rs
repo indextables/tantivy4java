@@ -213,6 +213,12 @@ pub(crate) fn create_java_aggregation_from_final_result(
                     debug_println!("RUST DEBUG: Creating RangeResult");
                     create_range_result_object(env, aggregation_name, buckets, resolution_map, redirected_names)
                 }
+                BucketResult::Filter(_) => {
+                    Err(anyhow::anyhow!("Filter aggregation result not supported"))
+                }
+                BucketResult::Composite { .. } => {
+                    Err(anyhow::anyhow!("Composite aggregation result not supported"))
+                }
                 BucketResult::Histogram { buckets } => {
                     // Use the hint from the aggregation request JSON if available
                     // Fall back to detecting by checking if any bucket has key_as_string set
