@@ -123,6 +123,7 @@ public class SplitCacheManager implements AutoCloseable {
         private String parquetTableRoot = null;
         private ParquetCompanionConfig.ParquetStorageConfig parquetStorageConfig = null;
         private long coalesceMaxGapBytes = 0; // 0 = use Rust default (512KB)
+        private long predicateCacheSize = 256L * 1024 * 1024; // 256MB default (matches Quickwit)
 
         public CacheConfig(String cacheName) {
             this.cacheName = cacheName;
@@ -324,6 +325,25 @@ public class SplitCacheManager implements AutoCloseable {
         }
 
         public long getCoalesceMaxGapBytes() { return coalesceMaxGapBytes; }
+
+        /**
+         * Configure the predicate cache capacity used by SearcherContext.
+         *
+         * <p>The predicate cache stores results of filter/predicate evaluations (e.g.
+         * search_after cursor state). It is allocated once per searcher context and
+         * its capacity is counted toward the unified memory budget.
+         *
+         * <p>Default: 256MB (matches Quickwit's default).
+         *
+         * @param bytes maximum predicate cache size in bytes
+         * @return this CacheConfig for method chaining
+         */
+        public CacheConfig withPredicateCacheSize(long bytes) {
+            this.predicateCacheSize = bytes;
+            return this;
+        }
+
+        public long getPredicateCacheSize() { return predicateCacheSize; }
 
         public String getParquetTableRoot() { return parquetTableRoot; }
         public ParquetCompanionConfig.ParquetStorageConfig getParquetStorageConfig() { return parquetStorageConfig; }

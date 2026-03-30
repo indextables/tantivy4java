@@ -15,6 +15,8 @@ use quickwit_storage::{
 use tantivy::aggregation::AggregationLimitsGuard;
 use tempfile::TempDir;
 
+use crate::memory_pool::{global_pool, MemoryReservation};
+
 use super::cache_debug::{debug_arc_string_cache_identity, debug_cache_summary};
 use crate::debug_println;
 use crate::disk_cache::L2DiskCache;
@@ -44,6 +46,10 @@ pub struct GlobalSearcherComponents {
     pub disk_cache: Option<Arc<L2DiskCache>>,
     /// Temp directory for split cache (kept alive to prevent cleanup)
     _temp_dir: Option<TempDir>,
+    /// Predicate cache capacity — stored so SearcherContext can be built with the right size
+    pub predicate_cache_capacity: ByteSize,
+    /// Memory reservation for the predicate cache, held for the lifetime of the components
+    _predicate_cache_reservation: Option<MemoryReservation>,
 }
 
 impl GlobalSearcherComponents {
@@ -129,6 +135,29 @@ impl GlobalSearcherComponents {
             (None, None)
         };
 
+        // Reserve memory for the predicate cache in the unified memory pool
+        let predicate_cache_capacity = config.predicate_cache_capacity;
+        let predicate_cache_reservation = match MemoryReservation::try_new(
+            &global_pool(),
+            predicate_cache_capacity.as_u64() as usize,
+            "predicate_cache",
+        ) {
+            Ok(r) => {
+                debug_println!(
+                    "RUST DEBUG: Reserved {} MB for predicate_cache in memory pool",
+                    predicate_cache_capacity.as_u64() / 1024 / 1024
+                );
+                Some(r)
+            }
+            Err(e) => {
+                debug_println!(
+                    "RUST WARNING: Memory pool denied predicate_cache reservation of {} MB: {}. Proceeding anyway.",
+                    predicate_cache_capacity.as_u64() / 1024 / 1024, e
+                );
+                None
+            }
+        };
+
         // Create L2 disk cache if configured
         let disk_cache = if let Some(disk_config) = config.disk_cache_config {
             debug_println!(
@@ -168,7 +197,17 @@ impl GlobalSearcherComponents {
             split_cache_opt,
             disk_cache,
             _temp_dir: temp_dir,
+            predicate_cache_capacity,
+            _predicate_cache_reservation: predicate_cache_reservation,
         }
+    }
+
+    /// Build a SearcherConfig with the predicate cache capacity stored in this component set.
+    /// Use this for the default/credential contexts so they respect Java-configured cache sizes.
+    pub fn build_searcher_config(&self) -> SearcherConfig {
+        let mut config = SearcherConfig::default();
+        config.predicate_cache = CacheConfig::default_with_capacity(self.predicate_cache_capacity);
+        config
     }
 
     /// Create a SearcherContext from these global components

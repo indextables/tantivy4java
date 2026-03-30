@@ -93,6 +93,7 @@ pub extern "system" fn Java_io_indextables_tantivy4java_config_GlobalCacheConfig
     split_cache_gb: jni::sys::jlong,
     split_cache_max_splits: jni::sys::jint,
     split_cache_path: jni::objects::JString,
+    predicate_cache_mb: jni::sys::jlong,
 ) -> jni::sys::jboolean {
     use bytesize::ByteSize;
     use std::num::NonZeroU32;
@@ -138,6 +139,11 @@ pub extern "system" fn Java_io_indextables_tantivy4java_config_GlobalCacheConfig
         split_cache_limits,
         split_cache_root_path: split_cache_path_opt,
         disk_cache_config: None, // L2 disk cache configured separately via SplitCacheManager
+        predicate_cache_capacity: if predicate_cache_mb > 0 {
+            ByteSize::mb(predicate_cache_mb as u64)
+        } else {
+            ByteSize::mb(256) // default 256MB
+        },
     };
     
     if initialize_global_cache(config) {
