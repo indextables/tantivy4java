@@ -887,7 +887,7 @@ fn copy_all_columns(
 ) -> Result<()> {
     use tantivy::columnar::DynamicColumn;
 
-    let num_rows = reader.num_rows();
+    let num_rows = reader.num_docs();
 
     for (col_name, handle) in reader.list_columns()
         .context("Failed to list columns in columnar")?
@@ -993,7 +993,7 @@ fn merge_two_columnars(
                 .context("Failed to strip footer from native fast fields")?;
             let reader = ColumnarReader::open(body.to_vec())
                 .context("Failed to open native columnar for merge")?;
-            num_docs = reader.num_rows();
+            num_docs = reader.num_docs();
             copy_all_columns(&reader, &mut writer)
                 .context("Failed to copy native columns")?;
         }
@@ -1004,7 +1004,7 @@ fn merge_two_columnars(
         let reader = ColumnarReader::open(parquet_bytes.to_vec())
             .context("Failed to open parquet columnar for merge")?;
         if num_docs == 0 {
-            num_docs = reader.num_rows();
+            num_docs = reader.num_docs();
         }
         copy_all_columns(&reader, &mut writer)
             .context("Failed to copy parquet columns")?;
@@ -1134,7 +1134,7 @@ mod tests {
 
         // Verify we can open it back
         let reader = tantivy::columnar::ColumnarReader::open(output).unwrap();
-        assert_eq!(reader.num_rows(), 2);
+        assert_eq!(reader.num_docs(), 2);
     }
 
     #[test]
@@ -1188,7 +1188,7 @@ mod tests {
 
         // Verify merged columnar has both columns
         let reader = tantivy::columnar::ColumnarReader::open(merged).unwrap();
-        assert_eq!(reader.num_rows(), 2);
+        assert_eq!(reader.num_docs(), 2);
         let columns = reader.list_columns().unwrap();
         let col_names: Vec<&str> = columns.iter().map(|(n, _)| n.as_str()).collect();
         assert!(col_names.contains(&"count"), "Should have 'count' column, got {:?}", col_names);
@@ -1205,7 +1205,7 @@ mod tests {
 
         let merged = merge_two_columnars(None, &bytes).unwrap();
         let reader = tantivy::columnar::ColumnarReader::open(merged).unwrap();
-        assert_eq!(reader.num_rows(), 1);
+        assert_eq!(reader.num_docs(), 1);
         let columns = reader.list_columns().unwrap();
         assert_eq!(columns.len(), 1);
         assert_eq!(columns[0].0, "city");
@@ -1230,7 +1230,7 @@ mod tests {
 
         // Verify ColumnarReader can open and read it
         let reader = tantivy::columnar::ColumnarReader::open(bytes).unwrap();
-        assert_eq!(reader.num_rows(), 3);
+        assert_eq!(reader.num_docs(), 3);
 
         let columns = reader.list_columns().unwrap();
         assert_eq!(columns.len(), 1, "Expected 1 column, got {}", columns.len());
@@ -1281,7 +1281,7 @@ mod tests {
         let bytes = serialize_str_columnar(vec![col], 3).unwrap();
 
         let reader = tantivy::columnar::ColumnarReader::open(bytes).unwrap();
-        assert_eq!(reader.num_rows(), 3);
+        assert_eq!(reader.num_docs(), 3);
 
         let columns = reader.list_columns().unwrap();
         assert_eq!(columns.len(), 1);
@@ -1324,7 +1324,7 @@ mod tests {
         let bytes = serialize_str_columnar(vec![col1, col2], 2).unwrap();
 
         let reader = tantivy::columnar::ColumnarReader::open(bytes).unwrap();
-        assert_eq!(reader.num_rows(), 2);
+        assert_eq!(reader.num_docs(), 2);
 
         let columns = reader.list_columns().unwrap();
         assert_eq!(columns.len(), 2, "Expected 2 columns, got {}", columns.len());
@@ -1370,7 +1370,7 @@ mod tests {
         let direct_reader = tantivy::columnar::ColumnarReader::open(direct_bytes).unwrap();
 
         // Both should have same structure
-        assert_eq!(cw_reader.num_rows(), direct_reader.num_rows());
+        assert_eq!(cw_reader.num_docs(), direct_reader.num_docs());
         let cw_cols = cw_reader.list_columns().unwrap();
         let direct_cols = direct_reader.list_columns().unwrap();
         assert_eq!(cw_cols.len(), direct_cols.len());
@@ -1472,7 +1472,7 @@ mod tests {
 
         let bytes = serialize_str_columnar(vec![col], 4).unwrap();
         let reader = tantivy::columnar::ColumnarReader::open(bytes).unwrap();
-        assert_eq!(reader.num_rows(), 4);
+        assert_eq!(reader.num_docs(), 4);
 
         let columns = reader.list_columns().unwrap();
         let (_, handle) = &columns[0];
@@ -1532,7 +1532,7 @@ mod tests {
 
         let bytes = serialize_str_columnar(vec![col], num_terms as u32).unwrap();
         let reader = tantivy::columnar::ColumnarReader::open(bytes).unwrap();
-        assert_eq!(reader.num_rows(), num_terms as u32);
+        assert_eq!(reader.num_docs(), num_terms as u32);
 
         let columns = reader.list_columns().unwrap();
         assert_eq!(columns.len(), 1);
@@ -1571,7 +1571,7 @@ mod tests {
 
         let bytes = serialize_str_columnar(vec![col], num_docs).unwrap();
         let reader = tantivy::columnar::ColumnarReader::open(bytes).unwrap();
-        assert_eq!(reader.num_rows(), num_docs);
+        assert_eq!(reader.num_docs(), num_docs);
 
         let columns = reader.list_columns().unwrap();
         let (_, handle) = &columns[0];
@@ -1612,7 +1612,7 @@ mod tests {
 
         let bytes = serialize_str_columnar(vec![col], 5).unwrap();
         let reader = tantivy::columnar::ColumnarReader::open(bytes).unwrap();
-        assert_eq!(reader.num_rows(), 5);
+        assert_eq!(reader.num_docs(), 5);
 
         let columns = reader.list_columns().unwrap();
         assert_eq!(columns.len(), 1);
@@ -1643,7 +1643,7 @@ mod tests {
 
         let bytes = serialize_str_columnar(vec![col], 5).unwrap();
         let reader = tantivy::columnar::ColumnarReader::open(bytes).unwrap();
-        assert_eq!(reader.num_rows(), 5);
+        assert_eq!(reader.num_docs(), 5);
 
         let columns = reader.list_columns().unwrap();
         let (_, handle) = &columns[0];
@@ -1674,7 +1674,7 @@ mod tests {
 
         let bytes = serialize_str_columnar(vec![col], 5).unwrap();
         let reader = tantivy::columnar::ColumnarReader::open(bytes).unwrap();
-        assert_eq!(reader.num_rows(), 5);
+        assert_eq!(reader.num_docs(), 5);
 
         let columns = reader.list_columns().unwrap();
         let (_, handle) = &columns[0];
@@ -1719,7 +1719,7 @@ mod tests {
 
         let bytes = serialize_str_columnar(vec![col1, col2], 3).unwrap();
         let reader = tantivy::columnar::ColumnarReader::open(bytes).unwrap();
-        assert_eq!(reader.num_rows(), 3);
+        assert_eq!(reader.num_docs(), 3);
 
         let columns = reader.list_columns().unwrap();
         assert_eq!(columns.len(), 2);

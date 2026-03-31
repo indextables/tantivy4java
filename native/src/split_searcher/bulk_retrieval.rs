@@ -91,8 +91,14 @@ pub async fn perform_bulk_search(
 
     // Convert QueryAst → tantivy Query
     // with_validation=false to silently handle fields not in schema
+    let build_context = quickwit_query::query_ast::BuildTantivyAstContext {
+        schema: &schema,
+        tokenizer_manager: &tokenizer_manager,
+        search_fields: &[],
+        with_validation: false,
+    };
     let tantivy_query = query_ast
-        .build_tantivy_query(&schema, &tokenizer_manager, &[], false)
+        .build_tantivy_query(&build_context)
         .map_err(|e| anyhow!("Failed to build tantivy query: {}", e))?;
 
     perf_println!(
@@ -362,7 +368,7 @@ fn prefix_term_to_range(prefix: Term) -> (Bound<Term>, Bound<Term>) {
             *last_byte += 1;
             return (
                 Bound::Included(prefix),
-                Bound::Excluded(Term::wrap(end_bound)),
+                Bound::Excluded(Term::wrap(&end_bound)),
             );
         }
         end_bound.pop();

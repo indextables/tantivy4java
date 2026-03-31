@@ -400,6 +400,7 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_
 ) -> jlong {
     quickwit_storage::STORAGE_METRICS
         .shortlived_cache
+        .cache_metrics
         .evict_num_items
         .get() as jlong
 }
@@ -412,6 +413,7 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_
 ) -> jlong {
     quickwit_storage::STORAGE_METRICS
         .shortlived_cache
+        .cache_metrics
         .evict_num_bytes
         .get() as jlong
 }
@@ -424,6 +426,7 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_
 ) -> jlong {
     quickwit_storage::STORAGE_METRICS
         .shortlived_cache
+        .cache_metrics
         .hits_num_items
         .get() as jlong
 }
@@ -436,6 +439,7 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_
 ) -> jlong {
     quickwit_storage::STORAGE_METRICS
         .shortlived_cache
+        .cache_metrics
         .misses_num_items
         .get() as jlong
 }

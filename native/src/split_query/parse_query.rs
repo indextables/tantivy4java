@@ -419,6 +419,9 @@ fn collect_fields_recursive(query_ast: &QueryAst, fields: &mut std::collections:
         QueryAst::MatchAll | QueryAst::MatchNone => {
             // No fields for match_all/match_none
         }
+        QueryAst::Cache(cache_node) => {
+            collect_fields_recursive(&cache_node.inner, fields);
+        }
     }
 }
 

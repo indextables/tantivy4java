@@ -82,7 +82,7 @@ pub extern "system" fn Java_io_indextables_tantivy4java_core_Searcher_nativeSear
 
     let result = with_arc_safe::<Mutex<TantivySearcher>, Result<Vec<(f32, tantivy::DocAddress)>, String>>(ptr, |searcher_mutex| {
         let searcher = searcher_mutex.lock().unwrap();
-        let collector = tantivy::collector::TopDocs::with_limit(limit as usize);
+        let collector = tantivy::collector::TopDocs::with_limit(limit as usize).order_by_score();
         let search_result = searcher.search(query_clone.as_ref(), &collector).map_err(|e| e.to_string())?;
         Ok(search_result)
     });

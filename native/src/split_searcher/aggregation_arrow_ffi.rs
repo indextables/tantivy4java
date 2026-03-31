@@ -245,6 +245,8 @@ fn bucket_to_record_batch(
         BucketResult::Terms { .. } => "Terms",
         BucketResult::Histogram { .. } => "Histogram",
         BucketResult::Range { .. } => "Range",
+        BucketResult::Filter(_) => "Filter",
+        BucketResult::Composite { .. } => "Composite",
     });
     match bucket {
         BucketResult::Terms { buckets, .. } => terms_to_record_batch(buckets, hash_resolution_map),
@@ -256,6 +258,8 @@ fn bucket_to_record_batch(
             }
         }
         BucketResult::Range { buckets } => range_to_record_batch(buckets, hash_resolution_map),
+        BucketResult::Filter(_) => Err(anyhow::anyhow!("Filter aggregation result not supported in Arrow FFI")),
+        BucketResult::Composite { .. } => Err(anyhow::anyhow!("Composite aggregation result not supported in Arrow FFI")),
     }
 }
 
@@ -597,6 +601,8 @@ fn extract_inner_buckets(bucket: &BucketResult) -> Vec<&BucketEntry> {
             BucketEntries::HashMap(m) => m.values().collect(),
         },
         BucketResult::Range { .. } => Vec::new(),
+        BucketResult::Filter(_) => Vec::new(),
+        BucketResult::Composite { .. } => Vec::new(),
     }
 }
 

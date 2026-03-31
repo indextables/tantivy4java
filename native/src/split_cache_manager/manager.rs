@@ -165,28 +165,28 @@ impl GlobalSplitCacheManager {
         let storage_metrics = &quickwit_storage::STORAGE_METRICS;
 
         // 🎯 ByteRangeCache-specific metrics (shortlived_cache is used by ByteRangeCache)
-        let byte_range_hits = storage_metrics.shortlived_cache.hits_num_items.get();
-        let byte_range_misses = storage_metrics.shortlived_cache.misses_num_items.get();
-        let byte_range_evictions = storage_metrics.shortlived_cache.evict_num_items.get();
-        let byte_range_bytes = storage_metrics.shortlived_cache.in_cache_num_bytes.get() as u64;
+        let byte_range_hits = storage_metrics.shortlived_cache.cache_metrics.hits_num_items.get();
+        let byte_range_misses = storage_metrics.shortlived_cache.cache_metrics.misses_num_items.get();
+        let byte_range_evictions = storage_metrics.shortlived_cache.cache_metrics.evict_num_items.get();
+        let byte_range_bytes = storage_metrics.shortlived_cache.cache_metrics.in_cache_num_bytes.get() as u64;
 
         // 🎯 Split Footer Cache metrics (MemorySizedCache)
-        let footer_hits = storage_metrics.split_footer_cache.hits_num_items.get();
-        let footer_misses = storage_metrics.split_footer_cache.misses_num_items.get();
-        let footer_evictions = storage_metrics.split_footer_cache.evict_num_items.get();
-        let footer_bytes = storage_metrics.split_footer_cache.in_cache_num_bytes.get() as u64;
+        let footer_hits = storage_metrics.split_footer_cache.cache_metrics.hits_num_items.get();
+        let footer_misses = storage_metrics.split_footer_cache.cache_metrics.misses_num_items.get();
+        let footer_evictions = storage_metrics.split_footer_cache.cache_metrics.evict_num_items.get();
+        let footer_bytes = storage_metrics.split_footer_cache.cache_metrics.in_cache_num_bytes.get() as u64;
 
         // 🎯 Fast Field Cache metrics (component-level caching)
-        let fastfield_hits = storage_metrics.fast_field_cache.hits_num_items.get();
-        let fastfield_misses = storage_metrics.fast_field_cache.misses_num_items.get();
-        let fastfield_evictions = storage_metrics.fast_field_cache.evict_num_items.get();
-        let fastfield_bytes = storage_metrics.fast_field_cache.in_cache_num_bytes.get() as u64;
+        let fastfield_hits = storage_metrics.fast_field_cache.cache_metrics.hits_num_items.get();
+        let fastfield_misses = storage_metrics.fast_field_cache.cache_metrics.misses_num_items.get();
+        let fastfield_evictions = storage_metrics.fast_field_cache.cache_metrics.evict_num_items.get();
+        let fastfield_bytes = storage_metrics.fast_field_cache.cache_metrics.in_cache_num_bytes.get() as u64;
 
         // 🎯 Searcher Split Cache metrics (SplitCache tracking)
-        let split_hits = storage_metrics.searcher_split_cache.hits_num_items.get();
-        let split_misses = storage_metrics.searcher_split_cache.misses_num_items.get();
-        let split_evictions = storage_metrics.searcher_split_cache.evict_num_items.get();
-        let split_bytes = storage_metrics.searcher_split_cache.in_cache_num_bytes.get() as u64;
+        let split_hits = storage_metrics.searcher_split_cache.cache_metrics.hits_num_items.get();
+        let split_misses = storage_metrics.searcher_split_cache.cache_metrics.misses_num_items.get();
+        let split_evictions = storage_metrics.searcher_split_cache.cache_metrics.evict_num_items.get();
+        let split_bytes = storage_metrics.searcher_split_cache.cache_metrics.in_cache_num_bytes.get() as u64;
 
         // Aggregate comprehensive metrics across all cache types
         let total_hits = byte_range_hits + footer_hits + fastfield_hits + split_hits;

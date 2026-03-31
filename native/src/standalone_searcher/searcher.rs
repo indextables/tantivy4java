@@ -314,7 +314,6 @@ impl StandaloneSearcher {
         
         // Create required dependencies for leaf_search_single_split
         let split_filter = Arc::new(RwLock::new(CanSplitDoBetter::Uninformative));
-        let aggregations_limits = searcher_context.aggregation_limit.clone();
 
         // Save split_id before move
         let split_id = split.split_id.clone();
@@ -330,19 +329,18 @@ impl StandaloneSearcher {
         // Use Quickwit's proven leaf_search_single_split function directly
         // This eliminates all the complexity we had in the previous implementation
         let result = leaf_search_single_split(
-            &searcher_context,
             search_request,
+            searcher_context.clone(),
             storage,
             split,  // split is moved here
             doc_mapper,
             split_filter,
-            aggregations_limits,
             search_permit,
             None,
         ).await
         .with_context(|| format!("Failed to search split: {}", split_id))?;
-        
-        Ok(result)
+
+        Ok(result.unwrap_or_default())
     }
     
     /// Synchronous search method for JNI bridge that avoids block_on deadlocks
