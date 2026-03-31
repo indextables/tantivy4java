@@ -39,6 +39,15 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_
         _ => 200_000_000, // 200MB default
     };
 
+    // Extract and apply predicate cache size before global components are initialized
+    let predicate_cache_size = match env.call_method(&config, "getPredicateCacheSize", "()J", &[]) {
+        Ok(result) => result.j().unwrap_or(0) as u64,
+        _ => 0,
+    };
+    if predicate_cache_size > 0 {
+        crate::global_cache::set_predicate_cache_capacity(predicate_cache_size);
+    }
+
     let mut manager = GlobalSplitCacheManager::new(cache_name.clone(), max_cache_size);
 
     // Extract AWS configuration from the Java CacheConfig

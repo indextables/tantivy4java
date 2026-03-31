@@ -631,7 +631,7 @@ pub fn is_multi_token_pattern_for_quoted_content(schema: &tantivy::schema::Schem
             
             // For most tokenizers, we can simulate tokenization by splitting on common boundaries
             let tokens: Vec<&str> = match tokenizer_name {
-                "default" | "simple" | "en_stem" => {
+                "default" | "simple" => {
                     // Default tokenizer splits on whitespace and punctuation
                     content.split_whitespace()
                         .flat_map(|word| word.split(|c: char| c.is_ascii_punctuation()))

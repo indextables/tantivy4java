@@ -54,6 +54,25 @@ use crate::disk_cache::L2DiskCache;
 /// This ensures only one instance is ever created across all Spark tasks/executors
 static GLOBAL_SEARCHER_COMPONENTS: OnceLock<Arc<GlobalSearcherComponents>> = OnceLock::new();
 
+/// Configured predicate cache capacity from Java CacheConfig.withPredicateCacheSize()
+/// Set before the global components are first initialized so the right size is baked in.
+static CONFIGURED_PREDICATE_CACHE_CAPACITY: OnceLock<std::sync::RwLock<Option<u64>>> = OnceLock::new();
+
+fn get_predicate_capacity_holder() -> &'static std::sync::RwLock<Option<u64>> {
+    CONFIGURED_PREDICATE_CACHE_CAPACITY.get_or_init(|| std::sync::RwLock::new(None))
+}
+
+/// Set the predicate cache capacity from Java configuration.
+/// Must be called before the first split search (before GlobalSearcherComponents is initialized).
+pub fn set_predicate_cache_capacity(capacity_bytes: u64) {
+    let mut guard = get_predicate_capacity_holder().write().unwrap();
+    debug_println!(
+        "⚙️ PREDICATE_CACHE_CONFIG: Setting predicate cache capacity from Java: {} MB",
+        capacity_bytes / 1024 / 1024
+    );
+    *guard = Some(capacity_bytes);
+}
+
 /// Global cached SearcherContext - using RwLock<Option<...>> pattern to allow reset for test isolation
 /// The OnceLock holds the RwLock, which holds an Option that can be cleared
 static GLOBAL_SEARCHER_CONTEXT: OnceLock<std::sync::RwLock<Option<Arc<SearcherContext>>>> = OnceLock::new();
@@ -116,7 +135,16 @@ pub fn initialize_global_cache(config: GlobalCacheConfig) -> bool {
 pub fn get_global_components() -> &'static Arc<GlobalSearcherComponents> {
     GLOBAL_SEARCHER_COMPONENTS.get_or_init(|| {
         debug_println!("RUST DEBUG: Initializing global searcher components with SHARED defaults");
-        let components = Arc::new(GlobalSearcherComponents::new(GlobalCacheConfig::default()));
+        let mut config = GlobalCacheConfig::default();
+        // Apply any separately-configured predicate cache capacity (set via CacheConfig.withPredicateCacheSize)
+        if let Some(cap) = *get_predicate_capacity_holder().read().unwrap() {
+            config.predicate_cache_capacity = bytesize::ByteSize::b(cap);
+            debug_println!(
+                "RUST DEBUG: Applied configured predicate_cache_capacity: {} MB",
+                cap / 1024 / 1024
+            );
+        }
+        let components = Arc::new(GlobalSearcherComponents::new(config));
         let cache_ptr = Arc::as_ptr(&components) as usize;
         debug_println!(
             "RUST DEBUG: Created default GlobalSearcherComponents at address: 0x{:x}",
@@ -165,7 +193,7 @@ pub fn get_global_searcher_context() -> Arc<SearcherContext> {
     // Create new context
     debug_println!("🔍 CACHE INIT: Creating THE SINGLE SHARED SearcherContext instance");
     let components = get_global_components();
-    let context = components.create_searcher_context(SearcherConfig::default());
+    let context = components.create_searcher_context(components.build_searcher_config());
     debug_println!(
         "🔍 CACHE CREATED: THE SHARED SearcherContext created at {:p}",
         Arc::as_ptr(&context)
@@ -236,7 +264,7 @@ pub fn get_credential_searcher_context(credential_key: &str) -> Arc<SearcherCont
         credential_key
     );
     let components = get_global_components();
-    let context = components.create_searcher_context(SearcherConfig::default());
+    let context = components.create_searcher_context(components.build_searcher_config());
     debug_println!(
         "🔐 CREDENTIAL_CONTEXT_CREATED: New SearcherContext at {:p} for key: {}",
         Arc::as_ptr(&context),

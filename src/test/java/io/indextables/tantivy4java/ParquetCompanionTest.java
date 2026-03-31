@@ -397,7 +397,7 @@ public class ParquetCompanionTest {
     @Order(11)
     void testConfigJsonSerialization() {
         Map<String, String> tokenizers = new HashMap<>();
-        tokenizers.put("description", "en_stem");
+        tokenizers.put("description", "default");
 
         Map<String, String> fieldMapping = new HashMap<>();
         fieldMapping.put("col_1", "user_id");

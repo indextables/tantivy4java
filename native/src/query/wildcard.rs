@@ -75,7 +75,7 @@ pub(crate) fn tokenize_pattern_for_field(schema: &Schema, field: Field, pattern:
             
             // For most tokenizers, we can simulate tokenization by splitting on common boundaries
             match tokenizer_name {
-                "default" | "simple" | "en_stem" => {
+                "default" | "simple" => {
                     // For wildcard patterns, split only on whitespace to preserve wildcards
                     // Don't split on punctuation because * and ? are wildcard characters
                     pattern.split_whitespace()
