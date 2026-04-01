@@ -741,7 +741,7 @@ pub async fn maybe_auto_checkpoint(
                         Err(e) => debug_println!("⚠️ DISTRIBUTED: selective compaction failed (non-fatal): {}", e),
                     }
                 } else {
-                    // Full compaction — read everything, replay, write fresh
+                    // Full compaction — read everything, apply tombstones, replay, write fresh
                     debug_println!("📊 DISTRIBUTED: full compaction (selective not beneficial)");
                     let state_dir = cp_info.state_dir.unwrap_or_else(|| TxLogStorage::state_dir_name(cp_version));
                     let metadata_config = base_manifest.schema_registry.clone();
@@ -752,6 +752,15 @@ pub async fn maybe_auto_checkpoint(
                         ).await {
                             cp_entries.extend(entries);
                         }
+                    }
+                    // Filter out tombstoned entries from base checkpoint before replay
+                    if !base_manifest.tombstones.is_empty() {
+                        let tombstone_set: std::collections::HashSet<&str> =
+                            base_manifest.tombstones.iter().map(|s| s.as_str()).collect();
+                        let before = cp_entries.len();
+                        cp_entries.retain(|e| !tombstone_set.contains(e.add.path.as_str()));
+                        debug_println!("📖 DISTRIBUTED: Applied {} base tombstones during compaction, {} → {} entries",
+                            base_manifest.tombstones.len(), before, cp_entries.len());
                     }
                     let replay_result = log_replay::replay(cp_entries, post_cp_actions);
                     match write_checkpoint_at_version(table_path, config, replay_result.files, metadata, protocol, written_version).await {

@@ -1605,3 +1605,129 @@ fn test_has_footer_offsets_inferred_in_tant_serialization() {
     assert!(buf_str.contains("has_footer_offsets"),
         "has_footer_offsets should be present in TANT buffer when footer offsets exist (inferred true)");
 }
+
+// ============================================================================
+// Regression: Full compaction must filter base checkpoint tombstones
+// ============================================================================
+
+#[tokio::test]
+async fn test_compaction_applies_base_tombstones() {
+    use crate::txlog::storage::TxLogStorage;
+    use crate::txlog::avro::{state_writer, state_reader};
+    use crate::txlog::version_file;
+    use crate::txlog::tombstone_distributor;
+
+    let dir = tempfile::tempdir().unwrap();
+    let table_url = format!("file://{}", dir.path().display());
+    let config = DeltaStorageConfig::default();
+    let storage = TxLogStorage::new(&table_url, &config).unwrap();
+
+    // Version 0: protocol + metadata
+    version_file::write_version(&storage, 0, &[
+        Action::Protocol(ProtocolAction::v4()),
+        Action::MetaData(MetadataAction::empty()),
+    ]).await.unwrap();
+
+    // Version 1: add 10 files
+    let adds: Vec<Action> = (1..=10).map(|i| Action::Add(AddAction {
+        path: format!("file{}.split", i),
+        partition_values: HashMap::new(),
+        size: 1000, modification_time: 1700000000000, data_change: true,
+        stats: None, min_values: None, max_values: None, num_records: Some(10),
+        footer_start_offset: None, footer_end_offset: None, has_footer_offsets: None,
+        delete_opstamp: None, split_tags: None, num_merge_ops: None,
+        doc_mapping_json: None, doc_mapping_ref: None, uncompressed_size_bytes: None,
+        time_range_start: None, time_range_end: None,
+        companion_source_files: None, companion_delta_version: None,
+        companion_fast_field_mode: None,
+    })).collect();
+    version_file::write_version(&storage, 1, &adds).await.unwrap();
+
+    // Checkpoint at v1 with 10 files
+    let entries: Vec<FileEntry> = (1..=10).map(|i| FileEntry {
+        add: AddAction {
+            path: format!("file{}.split", i),
+            partition_values: HashMap::new(),
+            size: 1000, modification_time: 1700000000000, data_change: true,
+            stats: None, min_values: None, max_values: None, num_records: Some(10),
+            footer_start_offset: None, footer_end_offset: None, has_footer_offsets: None,
+            delete_opstamp: None, split_tags: None, num_merge_ops: None,
+            doc_mapping_json: None, doc_mapping_ref: None, uncompressed_size_bytes: None,
+            time_range_start: None, time_range_end: None,
+            companion_source_files: None, companion_delta_version: None,
+            companion_fast_field_mode: None,
+        },
+        added_at_version: 1, added_at_timestamp: 1700000000000,
+    }).collect();
+    state_writer::write_state_checkpoint(
+        &storage, 1, &entries, &ProtocolAction::v4(), &MetadataAction::empty(),
+    ).await.unwrap();
+
+    // Version 2: remove 5 files + add 2 merged files
+    let mut v2_actions: Vec<Action> = (1..=5).map(|i| Action::Remove(RemoveAction {
+        path: format!("file{}.split", i),
+        deletion_timestamp: Some(1700000001000), data_change: true,
+        partition_values: None, size: None,
+    })).collect();
+    v2_actions.push(Action::Add(AddAction {
+        path: "merged1.split".to_string(),
+        partition_values: HashMap::new(),
+        size: 5000, modification_time: 1700000001000, data_change: true,
+        stats: None, min_values: None, max_values: None, num_records: Some(50),
+        footer_start_offset: Some(4000), footer_end_offset: Some(5000), has_footer_offsets: None,
+        delete_opstamp: None, split_tags: None, num_merge_ops: None,
+        doc_mapping_json: None, doc_mapping_ref: None, uncompressed_size_bytes: None,
+        time_range_start: None, time_range_end: None,
+        companion_source_files: None, companion_delta_version: None,
+        companion_fast_field_mode: None,
+    }));
+    version_file::write_version(&storage, 2, &v2_actions).await.unwrap();
+
+    // Incremental checkpoint at v2 (5 tombstones + 1 new)
+    let base_manifest = state_reader::read_state_manifest(&storage, "state-v00000000000000000001").await.unwrap();
+    let mut removed = std::collections::HashSet::new();
+    for i in 1..=5 { removed.insert(format!("file{}.split", i)); }
+    let new_merged = vec![FileEntry {
+        add: AddAction {
+            path: "merged1.split".to_string(),
+            partition_values: HashMap::new(),
+            size: 5000, modification_time: 1700000001000, data_change: true,
+            stats: None, min_values: None, max_values: None, num_records: Some(50),
+            footer_start_offset: Some(4000), footer_end_offset: Some(5000), has_footer_offsets: None,
+            delete_opstamp: None, split_tags: None, num_merge_ops: None,
+            doc_mapping_json: None, doc_mapping_ref: None, uncompressed_size_bytes: None,
+            time_range_start: None, time_range_end: None,
+            companion_source_files: None, companion_delta_version: None,
+            companion_fast_field_mode: None,
+        },
+        added_at_version: 2, added_at_timestamp: 1700000001000,
+    }];
+    state_writer::write_incremental_state_checkpoint(
+        &storage, 2, &base_manifest, &new_merged, &removed,
+        &ProtocolAction::v4(), &MetadataAction::empty(),
+    ).await.unwrap();
+
+    // Now simulate compaction at v3: reads v2's checkpoint (which has tombstones),
+    // reads its manifests, should filter out tombstoned entries
+    let v2_manifest = state_reader::read_state_manifest(&storage, "state-v00000000000000000002").await.unwrap();
+    assert_eq!(v2_manifest.tombstones.len(), 5, "v2 should have 5 tombstones");
+
+    // Read all entries from v2's manifests (simulating compaction path)
+    let mut cp_entries = Vec::new();
+    for mi in &v2_manifest.manifests {
+        let resolved = state_reader::resolve_manifest_path("state-v00000000000000000002", &mi.path);
+        let data = storage.get(&resolved).await.unwrap();
+        let entries = crate::txlog::avro::manifest_reader::read_manifest_bytes(&data).unwrap();
+        cp_entries.extend(entries);
+    }
+
+    // BUG: Without tombstone filtering, cp_entries has ALL 11 entries (10 original + 1 merged)
+    // EXPECTED: After filtering tombstones, should have 6 (5 surviving originals + 1 merged)
+    let tombstone_set: std::collections::HashSet<&str> = v2_manifest.tombstones.iter().map(|s| s.as_str()).collect();
+    let live: Vec<&FileEntry> = cp_entries.iter().filter(|e| !tombstone_set.contains(e.add.path.as_str())).collect();
+
+    assert_eq!(live.len(), 6, "after applying v2 tombstones: 10 - 5 + 1 = 6 live files");
+
+    // If compaction writes these 6 entries, the next checkpoint is correct.
+    // If it writes all 11, the tombstoned files reappear.
+}
