@@ -206,6 +206,13 @@ fn test_ffi_batch_nullable_columns() {
     ];
 
     for (name, idx) in &nullable_columns {
+        // has_footer_offsets is inferred (false when no offsets), never null
+        if *name == "has_footer_offsets" {
+            let col = batch.column(*idx);
+            assert!(!col.is_null(0),
+                "has_footer_offsets should be inferred (not null) even when source is None");
+            continue;
+        }
         let col = batch.column(*idx);
         assert!(
             col.is_null(0),

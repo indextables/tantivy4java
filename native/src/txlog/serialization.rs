@@ -43,7 +43,12 @@ fn serialize_file_entry(buf: &mut Vec<u8>, entry: &FileEntry) {
     if a.max_values.is_some() { field_count += 1; }
     if a.footer_start_offset.is_some() { field_count += 1; }
     if a.footer_end_offset.is_some() { field_count += 1; }
-    if a.has_footer_offsets.is_some() { field_count += 1; }
+    // Infer has_footer_offsets if not explicitly set but footer offsets are present
+    let has_footer = a.has_footer_offsets.unwrap_or_else(|| {
+        a.footer_start_offset.map(|s| s > 0).unwrap_or(false)
+            && a.footer_end_offset.map(|e| e > 0).unwrap_or(false)
+    });
+    if a.has_footer_offsets.is_some() || has_footer { field_count += 1; }
     if a.delete_opstamp.is_some() { field_count += 1; }
     if a.split_tags.is_some() { field_count += 1; }
     if a.num_merge_ops.is_some() { field_count += 1; }
@@ -108,9 +113,9 @@ fn serialize_file_entry(buf: &mut Vec<u8>, entry: &FileEntry) {
         write_field_header(buf, "footer_end_offset", FIELD_TYPE_INTEGER, 1);
         buf.extend_from_slice(&v.to_ne_bytes());
     }
-    if let Some(v) = a.has_footer_offsets {
+    if a.has_footer_offsets.is_some() || has_footer {
         write_field_header(buf, "has_footer_offsets", FIELD_TYPE_BOOLEAN, 1);
-        buf.push(if v { 1 } else { 0 });
+        buf.push(if has_footer { 1 } else { 0 });
     }
     if let Some(v) = a.delete_opstamp {
         write_field_header(buf, "delete_opstamp", FIELD_TYPE_INTEGER, 1);

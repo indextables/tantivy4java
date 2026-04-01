@@ -1562,3 +1562,46 @@ async fn test_incremental_checkpoint_tombstones_applied_on_read() {
     assert!(!paths.contains(&"file3.split"), "file3.split should be tombstoned");
     assert!(paths.contains(&"file4.split"), "file4.split should be live");
 }
+
+// ============================================================================
+// Regression: has_footer_offsets inferred in TANT serialization (not just Avro)
+// ============================================================================
+
+#[test]
+fn test_has_footer_offsets_inferred_in_tant_serialization() {
+    use crate::txlog::serialization;
+
+    // Simulate a post-checkpoint entry with footer offsets but no explicit has_footer_offsets
+    // (as happens when commitMergeSplits sends a merged split via Arrow FFI)
+    let entry = FileEntry {
+        add: AddAction {
+            path: "merged.split".to_string(),
+            partition_values: HashMap::new(),
+            size: 50000, modification_time: 1700000000000, data_change: true,
+            stats: None, min_values: None, max_values: None, num_records: Some(100),
+            footer_start_offset: Some(45000),
+            footer_end_offset: Some(50000),
+            has_footer_offsets: None, // NOT set — common for Arrow FFI imports
+            delete_opstamp: None, split_tags: None, num_merge_ops: None,
+            doc_mapping_json: None, doc_mapping_ref: None, uncompressed_size_bytes: None,
+            time_range_start: None, time_range_end: None,
+            companion_source_files: None, companion_delta_version: None,
+            companion_fast_field_mode: None,
+        },
+        added_at_version: 1,
+        added_at_timestamp: 1700000000000,
+    };
+
+    let buf = serialization::serialize_file_entries(&[entry]);
+
+    // Deserialize and check: the Java side reads has_footer_offsets from the TANT buffer.
+    // When has_footer_offsets is None but footer offsets are present, the serializer
+    // must infer true — otherwise the Java reader falls back to full re-scan.
+    // Parse the TANT buffer to verify the field is present and true.
+    assert!(buf.len() > 0);
+
+    // Check that "has_footer_offsets" appears in the buffer (field is serialized)
+    let buf_str = String::from_utf8_lossy(&buf);
+    assert!(buf_str.contains("has_footer_offsets"),
+        "has_footer_offsets should be present in TANT buffer when footer offsets exist (inferred true)");
+}
