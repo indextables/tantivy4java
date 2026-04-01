@@ -74,18 +74,28 @@ pub async fn write_state_directory(
     let mut total_size_bytes: i64 = 0;
 
     for group in &groups {
+        if group.is_empty() {
+            continue; // Skip empty groups (defensive — group_entries_by_partition shouldn't produce them)
+        }
+
         let manifest_id = generate_manifest_id();
         let manifest_relative_path = format!("manifests/manifest-{}.avro", manifest_id);
         let avro_bytes = manifest_writer::write_manifest_bytes(group)?;
         total_size_bytes += avro_bytes.len() as i64;
 
-        // Use put_if_absent for conflict detection
-        let _written = storage.put_if_absent(&manifest_relative_path, Bytes::from(avro_bytes)).await
-            .unwrap_or_else(|_| {
-                // If conflict (extremely unlikely with UUID), just proceed — data is identical
-                debug_println!("⚠️ STATE_WRITER: Manifest already exists: {}", manifest_relative_path);
-                false
-            });
+        // Write manifest — use put_if_absent for conflict detection.
+        // UUID collisions are near-impossible, but propagate real storage errors.
+        match storage.put_if_absent(&manifest_relative_path, Bytes::from(avro_bytes)).await {
+            Ok(_written) => {}
+            Err(e) => {
+                let err_str = format!("{}", e);
+                if err_str.contains("already exists") || err_str.contains("AlreadyExists") || err_str.contains("409") {
+                    debug_println!("⚠️ STATE_WRITER: Manifest already exists (UUID collision): {}", manifest_relative_path);
+                } else {
+                    return Err(e);
+                }
+            }
+        }
 
         // Compute partition bounds for this manifest
         let bounds = compute_partition_bounds(group, &metadata.partition_columns);
@@ -94,8 +104,8 @@ pub async fn write_state_directory(
             path: manifest_relative_path,
             file_count: group.len() as i64,
             partition_bounds: bounds,
-            min_added_at_version: group.iter().map(|e| e.added_at_version).min().unwrap_or(0),
-            max_added_at_version: group.iter().map(|e| e.added_at_version).max().unwrap_or(0),
+            min_added_at_version: group.iter().map(|e| e.added_at_version).min().unwrap(), // safe: group is non-empty
+            max_added_at_version: group.iter().map(|e| e.added_at_version).max().unwrap(), // safe: group is non-empty
             tombstone_count: 0,
             live_entry_count: group.len() as i64,
         });
@@ -197,16 +207,26 @@ pub async fn write_incremental_state_directory(
     if !new_entries.is_empty() {
         let groups = group_entries_by_partition(new_entries, &metadata.partition_columns);
         for group in &groups {
+            if group.is_empty() {
+                continue;
+            }
+
             let manifest_id = generate_manifest_id();
             let manifest_relative_path = format!("manifests/manifest-{}.avro", manifest_id);
             let avro_bytes = manifest_writer::write_manifest_bytes(group)?;
             total_size_bytes += group.iter().map(|e| e.add.size).sum::<i64>();
 
-            let _written = storage.put_if_absent(&manifest_relative_path, Bytes::from(avro_bytes)).await
-                .unwrap_or_else(|_| {
-                    debug_println!("⚠️ STATE_WRITER: Manifest already exists: {}", manifest_relative_path);
-                    false
-                });
+            match storage.put_if_absent(&manifest_relative_path, Bytes::from(avro_bytes)).await {
+                Ok(_) => {}
+                Err(e) => {
+                    let err_str = format!("{}", e);
+                    if err_str.contains("already exists") || err_str.contains("AlreadyExists") || err_str.contains("409") {
+                        debug_println!("⚠️ STATE_WRITER: Manifest already exists (UUID collision): {}", manifest_relative_path);
+                    } else {
+                        return Err(e);
+                    }
+                }
+            }
 
             let bounds = compute_partition_bounds(group, &metadata.partition_columns);
 
@@ -214,8 +234,8 @@ pub async fn write_incremental_state_directory(
                 path: manifest_relative_path,
                 file_count: group.len() as i64,
                 partition_bounds: bounds,
-                min_added_at_version: group.iter().map(|e| e.added_at_version).min().unwrap_or(0),
-                max_added_at_version: group.iter().map(|e| e.added_at_version).max().unwrap_or(0),
+                min_added_at_version: group.iter().map(|e| e.added_at_version).min().unwrap(), // safe: non-empty
+                max_added_at_version: group.iter().map(|e| e.added_at_version).max().unwrap(), // safe: non-empty
                 tombstone_count: 0,
                 live_entry_count: group.len() as i64,
             });
