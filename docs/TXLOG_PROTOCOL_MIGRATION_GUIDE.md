@@ -15,7 +15,7 @@ The Rust txlog implementation has been updated to match the Scala v0.5.4 protoco
 |--------|--------|-------|--------|
 | `_manifest.avro` format | JSON | Avro binary (zstd compressed) | Tables written by new Rust cannot be read by old Rust |
 | Manifest directory | Per-state (`state-vN/manifest-NNNN.avro`) | Shared (`manifests/manifest-{uuid8}.avro`) | Path resolution changed |
-| `timeRangeStart/End` type | `Option[Long]` (epoch ms) | `Option[String]` (ISO 8601) | Arrow FFI column type changed from Int64 to Utf8 |
+| `timeRangeStart/End` internal type | `Option[Long]` (epoch ms) | `Option[String]` (ISO 8601 or epoch string) | Internal change only — Arrow FFI stays Int64 |
 | `SkipAction.operation` | `Option[String]` | `String` (required, default empty) | Always present in JSON |
 | `SkipAction.skipCount` | `Option[Int]` | `Int` (required, default 1) | Always present in JSON |
 | `LastCheckpointInfo.sizeInBytes` | `Option[Long]` | `Long` (required) | Always present in `_last_checkpoint` JSON |
@@ -35,33 +35,11 @@ The Rust txlog implementation has been updated to match the Scala v0.5.4 protoco
 
 ## What search_test Needs to Change
 
-### 1. Arrow FFI Column Type Changes
+### 1. Arrow FFI Column Types — NO CHANGE for timeRange
 
-**`timeRangeStart` and `timeRangeEnd`** columns in the Arrow FFI batch changed from `Int64` to `Utf8`.
+**`timeRangeStart` and `timeRangeEnd`** columns remain `Int64` in the Arrow FFI batch. No code changes needed in `ArrowFileEntryExtractor` or `ActionsToArrowConverter`.
 
-**In `ArrowFileEntryExtractor.scala`:**
-```scala
-// BEFORE (reading Int64):
-val timeRangeStart = getOptionalLong(batch, row, "time_range_start")
-val timeRangeEnd = getOptionalLong(batch, row, "time_range_end")
-
-// AFTER (reading Utf8/String):
-val timeRangeStart = getOptionalString(batch, row, "time_range_start")
-val timeRangeEnd = getOptionalString(batch, row, "time_range_end")
-```
-
-**In `ActionsToArrowConverter.scala`:**
-```scala
-// BEFORE:
-Field.nullable("time_range_start", new ArrowType.Int(64, true))
-Field.nullable("time_range_end", new ArrowType.Int(64, true))
-
-// AFTER:
-Field.nullable("time_range_start", ArrowType.Utf8.INSTANCE)
-Field.nullable("time_range_end", ArrowType.Utf8.INSTANCE)
-```
-
-Your `AddAction` already uses `Option[String]` for these fields (matching Scala), so the case class itself is fine. Only the Arrow FFI extraction needs updating.
+Internally, the Rust code now stores these as `Option<String>` (for Scala protocol compatibility with ISO 8601 format), but the Arrow FFI export converts String→i64 transparently. Values written as integers in version files are preserved through the roundtrip.
 
 ### 2. SkipAction Field Changes
 
@@ -241,7 +219,7 @@ JAVA_HOME=/opt/homebrew/opt/openjdk@11 mvn test-compile scalatest:test \
 ## JNI API Surface
 
 No JNI method signatures changed. The changes are all in the data format:
-- `TransactionLogReader.listFilesArrowFfi()` — Arrow column types changed (timeRange Int64→Utf8, skipAction fields always present)
+- `TransactionLogReader.listFilesArrowFfi()` — SkipAction fields always present (operation, skipCount no longer nullable); timeRange columns unchanged (still Int64)
 - `TransactionLogWriter.writeVersionArrowFfi()` — expects new column types
 - `TransactionLogWriter.writeVersion()` — JSON format unchanged
 - `TransactionLogWriter.initializeTable()` — unchanged
