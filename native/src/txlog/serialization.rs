@@ -138,12 +138,22 @@ fn serialize_file_entry(buf: &mut Vec<u8>, entry: &FileEntry) {
         buf.extend_from_slice(&v.to_ne_bytes());
     }
     if let Some(ref v) = a.time_range_start {
-        write_field_header(buf, "time_range_start", FIELD_TYPE_TEXT, 1);
-        write_string(buf, v);
+        if let Ok(n) = v.parse::<i64>() {
+            write_field_header(buf, "time_range_start", FIELD_TYPE_INTEGER, 1);
+            buf.extend_from_slice(&n.to_ne_bytes());
+        } else {
+            write_field_header(buf, "time_range_start", FIELD_TYPE_TEXT, 1);
+            write_string(buf, v);
+        }
     }
     if let Some(ref v) = a.time_range_end {
-        write_field_header(buf, "time_range_end", FIELD_TYPE_TEXT, 1);
-        write_string(buf, v);
+        if let Ok(n) = v.parse::<i64>() {
+            write_field_header(buf, "time_range_end", FIELD_TYPE_INTEGER, 1);
+            buf.extend_from_slice(&n.to_ne_bytes());
+        } else {
+            write_field_header(buf, "time_range_end", FIELD_TYPE_TEXT, 1);
+            write_string(buf, v);
+        }
     }
     if let Some(ref files) = a.companion_source_files {
         write_field_header(buf, "companion_source_files", FIELD_TYPE_JSON, 1);
