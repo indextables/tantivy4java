@@ -34,6 +34,8 @@ pub const FILE_ENTRY_SCHEMA_JSON: &str = r#"{
     {"name": "docMappingJson",    "type": ["null", "string"],  "default": null,      "field-id": 133},
     {"name": "docMappingRef",     "type": ["null", "string"],  "default": null,      "field-id": 135},
     {"name": "uncompressedSizeBytes", "type": ["null", "long"], "default": null,     "field-id": 136},
+    {"name": "timeRangeStart",    "type": ["null", "string"],  "default": null,      "field-id": 137},
+    {"name": "timeRangeEnd",      "type": ["null", "string"],  "default": null,      "field-id": 138},
     {"name": "addedAtVersion",    "type": "long",              "default": 0,         "field-id": 140},
     {"name": "addedAtTimestamp",  "type": "long",              "default": 0,         "field-id": 141},
     {"name": "companionSourceFiles",    "type": ["null", {"type": "array", "items": "string"}], "default": null, "field-id": 150},
@@ -95,7 +97,7 @@ mod tests {
         match &schema {
             apache_avro::Schema::Record(r) => {
                 assert_eq!(r.name.fullname(None), "io.indextables.state.FileEntry");
-                assert_eq!(r.fields.len(), 23);
+                assert_eq!(r.fields.len(), 25);
             }
             other => panic!("expected Record schema, got {:?}", other),
         }

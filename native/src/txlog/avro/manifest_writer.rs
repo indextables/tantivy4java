@@ -49,6 +49,8 @@ fn file_entry_to_avro_value(entry: &FileEntry) -> Value {
         ("docMappingJson".to_string(), nullable_string(&a.doc_mapping_json)),
         ("docMappingRef".to_string(), nullable_string(&a.doc_mapping_ref)),
         ("uncompressedSizeBytes".to_string(), nullable_long(&a.uncompressed_size_bytes)),
+        ("timeRangeStart".to_string(), nullable_string(&a.time_range_start)),
+        ("timeRangeEnd".to_string(), nullable_string(&a.time_range_end)),
         ("addedAtVersion".to_string(), Value::Long(entry.added_at_version)),
         ("addedAtTimestamp".to_string(), Value::Long(entry.added_at_timestamp)),
         ("companionSourceFiles".to_string(), nullable_string_array(&a.companion_source_files)),

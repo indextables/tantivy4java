@@ -452,9 +452,9 @@ async fn test_checkpoint_manifest_roundtrip() {
     let entry = &read_entries[0];
     assert_eq!(entry.add.path, "split-rich.split");
     assert_eq!(entry.add.num_records, Some(500));
-    // time_range_start/end and doc_mapping_json are removed from Avro schema (Scala compat)
-    assert_eq!(entry.add.time_range_start, None);
-    assert_eq!(entry.add.time_range_end, None);
+    // time_range_start/end are preserved in Avro schema (as strings)
+    assert_eq!(entry.add.time_range_start, Some("1000".to_string()));
+    assert_eq!(entry.add.time_range_end, Some("2000".to_string()));
     assert_eq!(entry.add.uncompressed_size_bytes, Some(2000)); // size * 2
     assert!(entry.add.split_tags.is_some());
     let tags = entry.add.split_tags.as_ref().unwrap();
