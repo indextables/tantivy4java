@@ -32,25 +32,21 @@ fn file_entry_to_avro_value(entry: &FileEntry) -> Value {
 
     Value::Record(vec![
         ("path".to_string(), Value::String(a.path.clone())),
+        ("partitionValues".to_string(), Value::Map(partition_values)),
         ("size".to_string(), Value::Long(a.size)),
         ("modificationTime".to_string(), Value::Long(a.modification_time)),
         ("dataChange".to_string(), Value::Boolean(a.data_change)),
-        ("partitionValues".to_string(), Value::Map(partition_values)),
         ("stats".to_string(), nullable_string(&a.stats)),
         ("minValues".to_string(), nullable_string_map(&a.min_values)),
         ("maxValues".to_string(), nullable_string_map(&a.max_values)),
         ("numRecords".to_string(), nullable_long(&a.num_records)),
         ("footerStartOffset".to_string(), nullable_long(&a.footer_start_offset)),
         ("footerEndOffset".to_string(), nullable_long(&a.footer_end_offset)),
-        ("hasFooterOffsets".to_string(), nullable_bool(&a.has_footer_offsets)),
-        ("deleteOpstamp".to_string(), nullable_long(&a.delete_opstamp)),
+        ("hasFooterOffsets".to_string(), Value::Boolean(a.has_footer_offsets.unwrap_or(false))),
         ("splitTags".to_string(), nullable_string_array(&a.split_tags)),
         ("numMergeOps".to_string(), nullable_int(&a.num_merge_ops)),
-        ("docMappingJson".to_string(), nullable_string(&a.doc_mapping_json)),
         ("docMappingRef".to_string(), nullable_string(&a.doc_mapping_ref)),
         ("uncompressedSizeBytes".to_string(), nullable_long(&a.uncompressed_size_bytes)),
-        ("timeRangeStart".to_string(), nullable_long(&a.time_range_start)),
-        ("timeRangeEnd".to_string(), nullable_long(&a.time_range_end)),
         ("addedAtVersion".to_string(), Value::Long(entry.added_at_version)),
         ("addedAtTimestamp".to_string(), Value::Long(entry.added_at_timestamp)),
         ("companionSourceFiles".to_string(), nullable_string_array(&a.companion_source_files)),
@@ -80,13 +76,6 @@ fn nullable_long(opt: &Option<i64>) -> Value {
 fn nullable_int(opt: &Option<i32>) -> Value {
     match opt {
         Some(n) => Value::Union(1, Box::new(Value::Int(*n))),
-        None => Value::Union(0, Box::new(Value::Null)),
-    }
-}
-
-fn nullable_bool(opt: &Option<bool>) -> Value {
-    match opt {
-        Some(b) => Value::Union(1, Box::new(Value::Boolean(*b))),
         None => Value::Union(0, Box::new(Value::Null)),
     }
 }
@@ -133,7 +122,7 @@ mod tests {
                 split_tags: None, num_merge_ops: None,
                 doc_mapping_json: None, doc_mapping_ref: Some("abc123".to_string()),
                 uncompressed_size_bytes: Some(5000),
-                time_range_start: Some(1000), time_range_end: Some(2000),
+                time_range_start: Some("1000".to_string()), time_range_end: Some("2000".to_string()),
                 companion_source_files: None, companion_delta_version: None,
                 companion_fast_field_mode: None,
             },

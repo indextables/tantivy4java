@@ -370,7 +370,7 @@ pub async fn delete_expired_states(
         // Check age using the _manifest file's last_modified timestamp.
         // Primary: head() on _manifest (works on local FS and cloud).
         // Fallback: newest file mtime from list_with_meta().
-        let manifest_path = format!("{}/_manifest", state_dir);
+        let manifest_path = format!("{}/{}", state_dir, crate::txlog::actions::STATE_MANIFEST_FILENAME);
         let is_expired = if retention_ms <= 0 {
             true // Immediate cleanup of all non-protected
         } else {

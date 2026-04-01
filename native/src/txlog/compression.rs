@@ -41,10 +41,20 @@ pub fn is_gzip(data: &[u8]) -> bool {
     data.len() >= 2 && data[0] == 0x1f && data[1] == 0x8b
 }
 
+/// Detect if bytes have a 2-byte compression indicator prefix followed by gzip data.
+/// Scala writes version files with a 2-byte prefix (e.g., 0x01 0x01) before the gzip stream.
+fn is_prefixed_gzip(data: &[u8]) -> bool {
+    data.len() >= 4 && data[2] == 0x1f && data[3] == 0x8b
+}
+
 /// Transparently decompress data if gzip, otherwise return as-is.
+/// Handles both raw gzip and Scala's 2-byte-prefixed gzip format.
 pub fn maybe_decompress(data: &[u8]) -> std::io::Result<Vec<u8>> {
     if is_gzip(data) {
         gzip_decompress(data)
+    } else if is_prefixed_gzip(data) {
+        // Skip the 2-byte compression indicator prefix
+        gzip_decompress(&data[2..])
     } else {
         Ok(data.to_vec())
     }

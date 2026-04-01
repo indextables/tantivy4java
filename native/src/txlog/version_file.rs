@@ -141,7 +141,7 @@ mod tests {
             Action::MergeSkip(s) => {
                 assert_eq!(s.path, "bad.split");
                 assert_eq!(s.reason, "merge");
-                assert_eq!(s.skip_count, Some(2));
+                assert_eq!(s.skip_count, 2);
             }
             other => panic!("expected MergeSkip, got {:?}", other),
         }

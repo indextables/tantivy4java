@@ -42,8 +42,8 @@ pub fn file_entry_arrow_schema(
         Field::new("doc_mapping_json", DataType::Utf8, true),
         Field::new("doc_mapping_ref", DataType::Utf8, true),
         Field::new("uncompressed_size_bytes", DataType::Int64, true),
-        Field::new("time_range_start", DataType::Int64, true),
-        Field::new("time_range_end", DataType::Int64, true),
+        Field::new("time_range_start", DataType::Utf8, true),
+        Field::new("time_range_end", DataType::Utf8, true),
         Field::new("companion_source_files", DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))), true),
         Field::new("companion_delta_version", DataType::Int64, true),
         Field::new("companion_fast_field_mode", DataType::Utf8, true),
@@ -94,8 +94,8 @@ pub fn file_entries_to_record_batch(
     let mut doc_mapping_builder = StringBuilder::with_capacity(len, len * 128);
     let mut doc_mapping_ref_builder = StringBuilder::with_capacity(len, len * 32);
     let mut uncomp_size_builder = Int64Builder::with_capacity(len);
-    let mut time_start_builder = Int64Builder::with_capacity(len);
-    let mut time_end_builder = Int64Builder::with_capacity(len);
+    let mut time_start_builder = StringBuilder::with_capacity(len, len * 32);
+    let mut time_end_builder = StringBuilder::with_capacity(len, len * 32);
     let mut comp_delta_ver_builder = Int64Builder::with_capacity(len);
     let mut comp_ff_mode_builder = StringBuilder::with_capacity(len, len * 16);
 
@@ -124,8 +124,14 @@ pub fn file_entries_to_record_batch(
         delete_opstamp_builder.append_option(add.delete_opstamp);
         num_merge_ops_builder.append_option(add.num_merge_ops);
         uncomp_size_builder.append_option(add.uncompressed_size_bytes);
-        time_start_builder.append_option(add.time_range_start);
-        time_end_builder.append_option(add.time_range_end);
+        match &add.time_range_start {
+            Some(s) => time_start_builder.append_value(s),
+            None => time_start_builder.append_null(),
+        }
+        match &add.time_range_end {
+            Some(s) => time_end_builder.append_value(s),
+            None => time_end_builder.append_null(),
+        }
         comp_delta_ver_builder.append_option(add.companion_delta_version);
 
         match &add.doc_mapping_json {

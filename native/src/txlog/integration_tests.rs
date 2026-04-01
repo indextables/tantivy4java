@@ -82,8 +82,8 @@ fn make_add_action_full(
         doc_mapping_json,
         doc_mapping_ref: None,
         uncompressed_size_bytes: Some(size * 2),
-        time_range_start: time_range.map(|(s, _)| s),
-        time_range_end: time_range.map(|(_, e)| e),
+        time_range_start: time_range.map(|(s, _)| s.to_string()),
+        time_range_end: time_range.map(|(_, e)| e.to_string()),
         companion_source_files: None,
         companion_delta_version: None,
         companion_fast_field_mode: None,
@@ -324,7 +324,7 @@ async fn test_write_checkpoint_and_read() {
 
     assert_eq!(checkpoint_info.version, 0);
     assert_eq!(checkpoint_info.size, 2);
-    assert_eq!(checkpoint_info.format, "avro-state");
+    assert_eq!(checkpoint_info.format, Some("avro-state".to_string()));
     assert!(checkpoint_info.state_dir.is_some());
 
     // Read state manifest
@@ -391,11 +391,16 @@ async fn test_checkpoint_with_partitions() {
         &storage, &state_dir,
     ).await.unwrap();
 
-    // Global bounds should span 2023-2025
-    let global_bounds = state_manifest.partition_bounds.as_ref()
-        .expect("Should have global partition bounds");
-    assert_eq!(global_bounds.min_values.get("year"), Some(&"2023".to_string()));
-    assert_eq!(global_bounds.max_values.get("year"), Some(&"2025".to_string()));
+    // Global partition bounds are not stored in the Avro StateManifest schema;
+    // they are available per-manifest in the manifests array.
+    assert!(state_manifest.partition_bounds.is_none(),
+        "Global partition bounds not in Avro schema; only per-manifest bounds");
+    // Verify per-manifest partition bounds exist
+    assert!(!state_manifest.manifests.is_empty());
+    let manifest_bounds = state_manifest.manifests[0].partition_bounds.as_ref()
+        .expect("Should have per-manifest partition bounds");
+    assert!(manifest_bounds.min_values.contains_key("year"));
+    assert!(manifest_bounds.max_values.contains_key("year"));
 }
 
 #[tokio::test]
@@ -447,18 +452,16 @@ async fn test_checkpoint_manifest_roundtrip() {
     let entry = &read_entries[0];
     assert_eq!(entry.add.path, "split-rich.split");
     assert_eq!(entry.add.num_records, Some(500));
-    assert_eq!(entry.add.time_range_start, Some(1000));
-    assert_eq!(entry.add.time_range_end, Some(2000));
+    // time_range_start/end and doc_mapping_json are removed from Avro schema (Scala compat)
+    assert_eq!(entry.add.time_range_start, None);
+    assert_eq!(entry.add.time_range_end, None);
     assert_eq!(entry.add.uncompressed_size_bytes, Some(2000)); // size * 2
     assert!(entry.add.split_tags.is_some());
     let tags = entry.add.split_tags.as_ref().unwrap();
     assert!(tags.contains(&"env:prod".to_string()));
     assert!(tags.contains(&"region:us-east-1".to_string()));
-    // doc_mapping_json should survive the roundtrip
-    assert_eq!(
-        entry.add.doc_mapping_json,
-        Some(r#"{"fields":[{"name":"title","type":"text"}]}"#.to_string())
-    );
+    // doc_mapping_json is removed from Avro schema; only docMappingRef survives
+    assert_eq!(entry.add.doc_mapping_json, None);
 }
 
 // ============================================================================
@@ -849,11 +852,11 @@ fn test_serialize_changes() {
                 path: "skipped-001.split".to_string(),
                 skip_timestamp: 1700000000000,
                 reason: "merge_in_progress".to_string(),
-                operation: Some("merge_v2".to_string()),
+                operation: "merge_v2".to_string(),
                 partition_values: None,
                 size: None,
                 retry_after: None,
-                skip_count: Some(2),
+                skip_count: 2,
             },
         ],
         max_version: 5,
@@ -942,11 +945,13 @@ fn test_cache_metadata_persistence() {
     let cp_info = LastCheckpointInfo {
         version: 42,
         size: 1000,
-        size_in_bytes: Some(50000),
-        num_files: Some(1000),
-        format: "avro-state".to_string(),
+        size_in_bytes: 50000,
+        num_files: 1000,
+        format: Some("avro-state".to_string()),
         state_dir: Some("state-v42".to_string()),
-        created_time: Some(1700000000000),
+        created_time: 1700000000000,
+        parts: None,
+        checkpoint_id: None,
     };
     cache.put_last_checkpoint(cp_info.clone());
 
@@ -954,7 +959,7 @@ fn test_cache_metadata_persistence() {
     assert!(cached_cp.is_some());
     let cached_cp = cached_cp.unwrap();
     assert_eq!(cached_cp.version, 42);
-    assert_eq!(cached_cp.format, "avro-state");
+    assert_eq!(cached_cp.format, Some("avro-state".to_string()));
     assert_eq!(cached_cp.state_dir, Some("state-v42".to_string()));
 
     // Invalidate mutable (should not clear metadata)
@@ -1165,11 +1170,11 @@ fn test_replay_full_lifecycle() {
             path: "file-b.split".to_string(),
             skip_timestamp: 1700000001000,
             reason: "merge_in_progress".to_string(),
-            operation: None,
+            operation: String::new(),
             partition_values: None,
             size: None,
             retry_after: None,
-            skip_count: Some(1),
+            skip_count: 1,
         }),
     ];
 

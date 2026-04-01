@@ -928,8 +928,8 @@ mod tests {
     #[test]
     fn test_prune_manifests_empty_filters() {
         let manifests = vec![
-            ManifestInfo { path: "m1.avro".into(), file_count: 10, partition_bounds: None },
-            ManifestInfo { path: "m2.avro".into(), file_count: 20, partition_bounds: None },
+            ManifestInfo { path: "m1.avro".into(), file_count: 10, partition_bounds: None, ..Default::default() },
+            ManifestInfo { path: "m2.avro".into(), file_count: 20, partition_bounds: None, ..Default::default() },
         ];
         let result = prune_manifests(&manifests, &[]);
         assert_eq!(result.len(), 2);
@@ -938,7 +938,7 @@ mod tests {
     #[test]
     fn test_prune_manifests_no_bounds_kept() {
         let manifests = vec![
-            ManifestInfo { path: "m1.avro".into(), file_count: 10, partition_bounds: None },
+            ManifestInfo { path: "m1.avro".into(), file_count: 10, partition_bounds: None, ..Default::default() },
         ];
         let filters = vec![
             PartitionFilter::Eq { column: "year".into(), value: "2024".into() },
@@ -955,21 +955,25 @@ mod tests {
                 path: "m-2023.avro".into(),
                 file_count: 10,
                 partition_bounds: Some(bounds(&[("year", "2023")], &[("year", "2023")])),
+                ..Default::default()
             },
             ManifestInfo {
                 path: "m-2024.avro".into(),
                 file_count: 20,
                 partition_bounds: Some(bounds(&[("year", "2024")], &[("year", "2024")])),
+                ..Default::default()
             },
             ManifestInfo {
                 path: "m-2025.avro".into(),
                 file_count: 30,
                 partition_bounds: Some(bounds(&[("year", "2025")], &[("year", "2025")])),
+                ..Default::default()
             },
             ManifestInfo {
                 path: "m-no-bounds.avro".into(),
                 file_count: 5,
                 partition_bounds: None,
+                ..Default::default()
             },
         ];
         let filters = vec![
@@ -990,11 +994,13 @@ mod tests {
                 path: "m-old.avro".into(),
                 file_count: 10,
                 partition_bounds: Some(bounds(&[("year", "2020")], &[("year", "2021")])),
+                ..Default::default()
             },
             ManifestInfo {
                 path: "m-recent.avro".into(),
                 file_count: 20,
                 partition_bounds: Some(bounds(&[("year", "2023")], &[("year", "2025")])),
+                ..Default::default()
             },
         ];
         let filters = vec![
@@ -1015,11 +1021,13 @@ mod tests {
                 path: "m-low.avro".into(),
                 file_count: 10,
                 partition_bounds: Some(bounds(&[("id", "1")], &[("id", "9")])),
+                ..Default::default()
             },
             ManifestInfo {
                 path: "m-high.avro".into(),
                 file_count: 20,
                 partition_bounds: Some(bounds(&[("id", "10")], &[("id", "100")])),
+                ..Default::default()
             },
         ];
         // With numeric comparison, Gt id > 9 should match m-high (max=100 > 9)

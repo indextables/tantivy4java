@@ -137,13 +137,13 @@ fn serialize_file_entry(buf: &mut Vec<u8>, entry: &FileEntry) {
         write_field_header(buf, "uncompressed_size_bytes", FIELD_TYPE_INTEGER, 1);
         buf.extend_from_slice(&v.to_ne_bytes());
     }
-    if let Some(v) = a.time_range_start {
-        write_field_header(buf, "time_range_start", FIELD_TYPE_INTEGER, 1);
-        buf.extend_from_slice(&v.to_ne_bytes());
+    if let Some(ref v) = a.time_range_start {
+        write_field_header(buf, "time_range_start", FIELD_TYPE_TEXT, 1);
+        write_string(buf, v);
     }
-    if let Some(v) = a.time_range_end {
-        write_field_header(buf, "time_range_end", FIELD_TYPE_INTEGER, 1);
-        buf.extend_from_slice(&v.to_ne_bytes());
+    if let Some(ref v) = a.time_range_end {
+        write_field_header(buf, "time_range_end", FIELD_TYPE_TEXT, 1);
+        write_string(buf, v);
     }
     if let Some(ref files) = a.companion_source_files {
         write_field_header(buf, "companion_source_files", FIELD_TYPE_JSON, 1);
@@ -251,7 +251,7 @@ pub fn serialize_changes(changes: &TxLogChanges) -> Vec<u8> {
     for skip in &changes.skip_actions {
         offsets.push(buf.len() as u32);
         let mut fc: u16 = 4; // path, reason, skip_count, skip_timestamp
-        if skip.operation.is_some() { fc += 1; }
+        if !skip.operation.is_empty() { fc += 1; }
         if skip.partition_values.is_some() { fc += 1; }
         if skip.size.is_some() { fc += 1; }
         if skip.retry_after.is_some() { fc += 1; }
@@ -263,8 +263,9 @@ pub fn serialize_changes(changes: &TxLogChanges) -> Vec<u8> {
         write_field_header(&mut buf, "reason", FIELD_TYPE_TEXT, 1);
         write_string(&mut buf, &skip.reason);
         write_field_header(&mut buf, "skip_count", FIELD_TYPE_INTEGER, 1);
-        buf.extend_from_slice(&(skip.skip_count.unwrap_or(0) as i64).to_ne_bytes());
-        if let Some(ref op) = skip.operation {
+        buf.extend_from_slice(&(skip.skip_count as i64).to_ne_bytes());
+        if !skip.operation.is_empty() {
+            let op = &skip.operation;
             write_field_header(&mut buf, "operation", FIELD_TYPE_TEXT, 1);
             write_string(&mut buf, op);
         }
@@ -336,10 +337,10 @@ pub fn serialize_last_checkpoint(info: &LastCheckpointInfo) -> Vec<u8> {
     buf.extend_from_slice(&info.size.to_ne_bytes());
 
     write_field_header(&mut buf, "format", FIELD_TYPE_TEXT, 1);
-    write_string(&mut buf, &info.format);
+    write_string(&mut buf, info.format.as_deref().unwrap_or("avro-state"));
 
     write_field_header(&mut buf, "num_files", FIELD_TYPE_INTEGER, 1);
-    buf.extend_from_slice(&info.num_files.unwrap_or(0).to_ne_bytes());
+    buf.extend_from_slice(&info.num_files.to_ne_bytes());
 
     write_footer(&mut buf, &offsets);
     buf
@@ -357,7 +358,7 @@ pub fn serialize_skip_actions(skips: &[super::actions::SkipAction]) -> Vec<u8> {
     for skip in skips {
         offsets.push(buf.len() as u32);
         let mut fc: u16 = 4; // path, skip_timestamp, reason, skip_count
-        if skip.operation.is_some() { fc += 1; }
+        if !skip.operation.is_empty() { fc += 1; }
         if skip.partition_values.is_some() { fc += 1; }
         if skip.size.is_some() { fc += 1; }
         if skip.retry_after.is_some() { fc += 1; }
@@ -369,8 +370,9 @@ pub fn serialize_skip_actions(skips: &[super::actions::SkipAction]) -> Vec<u8> {
         write_field_header(&mut buf, "reason", FIELD_TYPE_TEXT, 1);
         write_string(&mut buf, &skip.reason);
         write_field_header(&mut buf, "skip_count", FIELD_TYPE_INTEGER, 1);
-        buf.extend_from_slice(&(skip.skip_count.unwrap_or(0) as i64).to_ne_bytes());
-        if let Some(ref op) = skip.operation {
+        buf.extend_from_slice(&(skip.skip_count as i64).to_ne_bytes());
+        if !skip.operation.is_empty() {
+            let op = &skip.operation;
             write_field_header(&mut buf, "operation", FIELD_TYPE_TEXT, 1);
             write_string(&mut buf, op);
         }

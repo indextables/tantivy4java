@@ -123,6 +123,10 @@ pub async unsafe fn list_files_arrow_ffi(
             path: mp.path.clone(),
             file_count: mp.file_count,
             partition_bounds: mp.partition_bounds.clone(),
+            min_added_at_version: 0,
+            max_added_at_version: 0,
+            tombstone_count: 0,
+            live_entry_count: -1,
         }
     }).collect();
 
