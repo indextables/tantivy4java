@@ -83,19 +83,9 @@ pub async fn write_state_directory(
         let avro_bytes = manifest_writer::write_manifest_bytes(group)?;
         total_size_bytes += avro_bytes.len() as i64;
 
-        // Write manifest — use put_if_absent for conflict detection.
-        // UUID collisions are near-impossible, but propagate real storage errors.
-        match storage.put_if_absent(&manifest_relative_path, Bytes::from(avro_bytes)).await {
-            Ok(_written) => {}
-            Err(e) => {
-                let err_str = format!("{}", e);
-                if err_str.contains("already exists") || err_str.contains("AlreadyExists") || err_str.contains("409") {
-                    debug_println!("⚠️ STATE_WRITER: Manifest already exists (UUID collision): {}", manifest_relative_path);
-                } else {
-                    return Err(e);
-                }
-            }
-        }
+        // Write manifest with put_if_absent for conflict detection.
+        // AlreadyExists is handled by TxLogStorage (returns Ok(false)); any Err here is a real storage failure.
+        storage.put_if_absent(&manifest_relative_path, Bytes::from(avro_bytes)).await?;
 
         // Compute partition bounds for this manifest
         let bounds = compute_partition_bounds(group, &metadata.partition_columns);
@@ -216,17 +206,8 @@ pub async fn write_incremental_state_directory(
             let avro_bytes = manifest_writer::write_manifest_bytes(group)?;
             total_size_bytes += group.iter().map(|e| e.add.size).sum::<i64>();
 
-            match storage.put_if_absent(&manifest_relative_path, Bytes::from(avro_bytes)).await {
-                Ok(_) => {}
-                Err(e) => {
-                    let err_str = format!("{}", e);
-                    if err_str.contains("already exists") || err_str.contains("AlreadyExists") || err_str.contains("409") {
-                        debug_println!("⚠️ STATE_WRITER: Manifest already exists (UUID collision): {}", manifest_relative_path);
-                    } else {
-                        return Err(e);
-                    }
-                }
-            }
+            // AlreadyExists handled by TxLogStorage (Ok(false)); any Err is a real failure.
+            storage.put_if_absent(&manifest_relative_path, Bytes::from(avro_bytes)).await?;
 
             let bounds = compute_partition_bounds(group, &metadata.partition_columns);
 
@@ -479,7 +460,10 @@ fn current_timestamp_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
+        .unwrap_or_else(|_| {
+            debug_println!("⚠️ STATE_WRITER: SystemTime::now() failed, using epoch 0");
+            0
+        })
 }
 
 /// Write _last_checkpoint only if this version is newer than the existing one.
