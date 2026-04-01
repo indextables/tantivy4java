@@ -123,8 +123,8 @@ fn test_ffi_batch_column_types() {
         ("doc_mapping_json", DataType::Utf8),
         ("doc_mapping_ref", DataType::Utf8),
         ("uncompressed_size_bytes", DataType::Int64),
-        ("time_range_start", DataType::Utf8),
-        ("time_range_end", DataType::Utf8),
+        ("time_range_start", DataType::Int64),
+        ("time_range_end", DataType::Int64),
         ("companion_source_files", list_utf8),
         ("companion_delta_version", DataType::Int64),
         ("companion_fast_field_mode", DataType::Utf8),
@@ -284,13 +284,13 @@ fn test_ffi_batch_all_fields_populated() {
     let usb_col = batch.column(13).as_any().downcast_ref::<Int64Array>().unwrap();
     assert_eq!(usb_col.value(0), 100000);
 
-    // time_range_start (col 14)
-    let trs_col = batch.column(14).as_any().downcast_ref::<StringArray>().unwrap();
-    assert_eq!(trs_col.value(0), "1000");
+    // time_range_start (col 14) — stored as String internally, exported as Int64
+    let trs_col = batch.column(14).as_any().downcast_ref::<Int64Array>().unwrap();
+    assert_eq!(trs_col.value(0), 1000);
 
     // time_range_end (col 15)
-    let tre_col = batch.column(15).as_any().downcast_ref::<StringArray>().unwrap();
-    assert_eq!(tre_col.value(0), "2000");
+    let tre_col = batch.column(15).as_any().downcast_ref::<Int64Array>().unwrap();
+    assert_eq!(tre_col.value(0), 2000);
 
     // companion_source_files (List<Utf8>, col 16)
     let csf_col = batch.column(16).as_any().downcast_ref::<ListArray>().unwrap();
