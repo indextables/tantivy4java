@@ -62,13 +62,16 @@ pub fn filter_entries_by_version_range(
         .collect()
 }
 
-/// Filter file entries to only those added at a specific version.
+/// Filter file entries to only those added at a specific version,
+/// excluding tombstoned paths.
 pub fn filter_entries_at_version(
     entries: &[FileEntry],
     version: i64,
+    tombstones: &HashSet<String>,
 ) -> Vec<FileEntry> {
     entries.iter()
         .filter(|e| e.added_at_version == version)
+        .filter(|e| !tombstones.contains(&e.add.path))
         .cloned()
         .collect()
 }
@@ -87,11 +90,15 @@ pub fn compute_changes(
 
     let adds = filter_entries_by_version_range(all_entries, from_version, to_version, &tombstone_set);
 
-    // For removes, tombstones don't carry version info — return all tombstones
-    // that reference entries present in the manifest
-    let all_paths: HashSet<&str> = all_entries.iter().map(|e| e.add.path.as_str()).collect();
+    // For removes, tombstones don't carry version info — return only tombstones
+    // that reference entries in the requested version range (entries that were
+    // added before or during this range and are now tombstoned).
+    let range_paths: HashSet<&str> = all_entries.iter()
+        .filter(|e| e.added_at_version <= to_version)
+        .map(|e| e.add.path.as_str())
+        .collect();
     let removes: Vec<String> = manifest.tombstones.iter()
-        .filter(|path| all_paths.contains(path.as_str()))
+        .filter(|path| range_paths.contains(path.as_str()))
         .cloned()
         .collect();
 
@@ -214,6 +221,81 @@ mod tests {
     }
 
     #[test]
+    fn test_compute_changes() {
+        let entries = vec![
+            make_entry("a.split", 5),
+            make_entry("b.split", 10),
+            make_entry("c.split", 15),
+            make_entry("d.split", 20),
+        ];
+
+        let manifest = StateManifest {
+            version: 20,
+            manifests: vec![],
+            partition_bounds: None,
+            created_time: 0,
+            total_file_count: 4,
+            format: String::new(),
+            protocol_json: None,
+            metadata: None,
+            schema_registry: HashMap::new(),
+            tombstones: vec!["a.split".to_string()], // a.split is tombstoned
+            format_version: 1,
+            total_bytes: 0,
+            protocol_version: 4,
+        };
+
+        // Query changes from version 8 to 18
+        let changes = compute_changes(&manifest, &entries, 8, 18);
+
+        // Adds: b.split(v10) and c.split(v15) are in range, but not a.split (tombstoned)
+        assert_eq!(changes.adds.len(), 2);
+        assert_eq!(changes.adds[0].add.path, "b.split");
+        assert_eq!(changes.adds[1].add.path, "c.split");
+
+        // Removes: a.split is tombstoned and was added at v5 (<=18), so it's included
+        assert_eq!(changes.removes.len(), 1);
+        assert_eq!(changes.removes[0], "a.split");
+
+        assert_eq!(changes.new_version, 18);
+    }
+
+    #[test]
+    fn test_compute_changes_no_tombstones_outside_range() {
+        let entries = vec![
+            make_entry("a.split", 5),
+            make_entry("b.split", 25), // outside to_version=20
+        ];
+
+        let manifest = StateManifest {
+            version: 25,
+            manifests: vec![],
+            partition_bounds: None,
+            created_time: 0,
+            total_file_count: 2,
+            format: String::new(),
+            protocol_json: None,
+            metadata: None,
+            schema_registry: HashMap::new(),
+            tombstones: vec!["b.split".to_string()], // tombstone for entry beyond range
+            format_version: 1,
+            total_bytes: 0,
+            protocol_version: 4,
+        };
+
+        let changes = compute_changes(&manifest, &entries, 0, 20);
+
+        // a.split(v5) is in range
+        assert_eq!(changes.adds.len(), 1);
+        assert_eq!(changes.adds[0].add.path, "a.split");
+
+        // b.split is tombstoned but added at v25 (>20), so it's included in removes
+        // because all_entries filter is <= to_version
+        assert_eq!(changes.removes.len(), 0,
+            "tombstones for entries beyond to_version should not be returned");
+    }
+
+    #[test]
     fn test_filter_entries_at_version() {
         let entries = vec![
             make_entry("a.split", 5),
@@ -221,8 +303,9 @@ mod tests {
             make_entry("c.split", 10),
             make_entry("d.split", 15),
         ];
+        let tombstones = HashSet::new();
 
-        let filtered = filter_entries_at_version(&entries, 10);
+        let filtered = filter_entries_at_version(&entries, 10, &tombstones);
         assert_eq!(filtered.len(), 2);
         assert_eq!(filtered[0].add.path, "b.split");
         assert_eq!(filtered[1].add.path, "c.split");

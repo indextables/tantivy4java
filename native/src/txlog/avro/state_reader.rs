@@ -10,7 +10,7 @@ use super::manifest_reader;
 
 /// Read the StateManifest from a state directory.
 ///
-/// Tries Avro binary format first (Scala-written), falls back to JSON (Rust-written).
+/// Parses the `_manifest.avro` file in Avro binary format (Scala/Rust-written).
 pub async fn read_state_manifest(
     storage: &TxLogStorage,
     state_dir: &str,
@@ -121,7 +121,9 @@ fn avro_value_to_state_manifest(value: &apache_avro::types::Value) -> Result<Sta
         _ => 0,
     };
 
-    // Construct protocol_json from protocolVersion so distributed.rs can parse it
+    // Construct protocol_json from protocolVersion so distributed.rs can parse it.
+    // Note: Scala's Avro schema uses a single `protocolVersion` field (not separate
+    // reader/writer versions), so we map it to both min_reader_version and min_writer_version.
     let protocol_json = {
         let protocol = crate::txlog::actions::ProtocolAction {
             min_reader_version: protocol_version as u32,
@@ -345,10 +347,14 @@ pub async fn read_single_manifest(
 
 /// Resolve a manifest file path relative to the txlog root.
 ///
-/// Manifest paths in the StateManifest may be:
+/// Manifest paths in the StateManifest may be in one of three formats:
 /// - `manifests/manifest-{id}.avro` — shared directory (already relative to txlog root)
 /// - `state-vN/manifest-{id}.avro` — normalized legacy (already relative to txlog root)
 /// - `manifest-NNNN.avro` — bare filename (relative to state dir, needs prefix)
+///
+/// The heuristic uses the presence of `/` to distinguish: paths with a `/` are already
+/// relative to the txlog root (formats 1 and 2), while bare filenames (format 3) need
+/// the state directory prepended. This is safe because manifest filenames never contain `/`.
 pub fn resolve_manifest_path(state_dir: &str, manifest_path: &str) -> String {
     if manifest_path.contains('/') {
         // Already contains a directory component — treat as relative to txlog root

@@ -714,9 +714,11 @@ pub async fn maybe_auto_checkpoint(
                             rewritten_entries.extend(live);
                         }
                     }
-                    // Combine: new adds + rewritten live entries
+                    // Combine: new adds (filtered against removes) + rewritten live entries
                     let mut all_live = rewritten_entries;
-                    all_live.extend(new_adds.iter().cloned());
+                    all_live.extend(new_adds.iter()
+                        .filter(|e| !all_tombstones.contains(&e.add.path))
+                        .cloned());
 
                     // Clean manifests are reused; write new manifest for rewritten + new
                     // For simplicity, do a compacted write with all live files from
@@ -881,13 +883,20 @@ async fn verify_checkpoint_version(
     storage: &TxLogStorage,
     hint_version: i64,
 ) -> i64 {
+    const MAX_VERSION_PROBE: i64 = 1000;
     let mut version = hint_version;
+    let mut probed = 0i64;
     loop {
+        if probed >= MAX_VERSION_PROBE {
+            debug_println!("⚠️ DISTRIBUTED: verify_checkpoint_version hit probe limit ({}) at v{}", MAX_VERSION_PROBE, version);
+            break;
+        }
         let next_dir = TxLogStorage::state_dir_name(version + 1);
         let next_manifest = format!("{}/{}", next_dir, STATE_MANIFEST_FILENAME);
         match storage.get(&next_manifest).await {
             Ok(_) => {
                 version += 1;
+                probed += 1;
                 debug_println!("📊 DISTRIBUTED: _last_checkpoint regression: found state at v{}", version);
             }
             Err(_) => break,

@@ -1597,12 +1597,14 @@ fn test_has_footer_offsets_inferred_in_tant_serialization() {
     // Deserialize and check: the Java side reads has_footer_offsets from the TANT buffer.
     // When has_footer_offsets is None but footer offsets are present, the serializer
     // must infer true — otherwise the Java reader falls back to full re-scan.
-    // Parse the TANT buffer to verify the field is present and true.
-    assert!(buf.len() > 0);
+    assert!(!buf.is_empty());
 
-    // Check that "has_footer_offsets" appears in the buffer (field is serialized)
-    let buf_str = String::from_utf8_lossy(&buf);
-    assert!(buf_str.contains("has_footer_offsets"),
+    // Check that "has_footer_offsets" field name bytes appear in the binary buffer.
+    // The TANT format writes field names as length-prefixed UTF-8 strings, so we can
+    // search for the exact byte sequence.
+    let field_name = b"has_footer_offsets";
+    let found = buf.windows(field_name.len()).any(|w| w == field_name);
+    assert!(found,
         "has_footer_offsets should be present in TANT buffer when footer offsets exist (inferred true)");
 }
 

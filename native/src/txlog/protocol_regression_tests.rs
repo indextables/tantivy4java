@@ -594,10 +594,10 @@ mod tests {
 
     #[test]
     fn test_manifest_id_format() {
-        // Scala generates 8-char hex from UUID
+        // Generate 16-char hex from UUID for sufficient entropy
         for _ in 0..10 {
             let id = state_writer::tests::generate_manifest_id_for_test();
-            assert_eq!(id.len(), 8, "Manifest ID must be 8 chars");
+            assert_eq!(id.len(), 16, "Manifest ID must be 16 chars");
             assert!(id.chars().all(|c| c.is_ascii_hexdigit()),
                 "Manifest ID must be hex: {}", id);
         }
@@ -1647,8 +1647,8 @@ mod tests {
                 for entry in &entries {
                     assert!(!entry.add.path.is_empty(),
                         "{}: entry should have non-empty path", fixture_name);
-                    assert!(entry.add.size > 0 || entry.add.size == 0,
-                        "{}: entry size should be valid", fixture_name);
+                    assert!(entry.add.size >= 0,
+                        "{}: entry size should be non-negative", fixture_name);
                     assert!(entry.added_at_version >= 0,
                         "{}: added_at_version should be >= 0", fixture_name);
                 }

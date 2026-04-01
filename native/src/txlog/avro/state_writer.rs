@@ -71,7 +71,6 @@ pub async fn write_state_directory(
 
     // Write manifest files to shared manifests/ directory
     let mut manifest_infos = Vec::new();
-    let mut total_size_bytes: i64 = 0;
 
     for group in &groups {
         if group.is_empty() {
@@ -81,7 +80,6 @@ pub async fn write_state_directory(
         let manifest_id = generate_manifest_id();
         let manifest_relative_path = format!("manifests/manifest-{}.avro", manifest_id);
         let avro_bytes = manifest_writer::write_manifest_bytes(group)?;
-        total_size_bytes += avro_bytes.len() as i64;
 
         // Write manifest with put_if_absent for conflict detection.
         // AlreadyExists is handled by TxLogStorage (returns Ok(false)); any Err here is a real storage failure.
@@ -101,11 +99,7 @@ pub async fn write_state_directory(
         });
     }
 
-    // Compute global partition bounds
-    let global_bounds = compute_partition_bounds(entries, &metadata.partition_columns);
-
     let now = current_timestamp_ms();
-    let protocol_json = serde_json::to_string(protocol).ok();
     let metadata_json_cached = serde_json::to_string(metadata).ok();
 
     // Build schema registry from metadata configuration
@@ -114,19 +108,21 @@ pub async fn write_state_directory(
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
 
+    let total_file_bytes: i64 = entries.iter().map(|e| e.add.size).sum();
+
     let state_manifest = StateManifest {
         version,
         manifests: manifest_infos,
-        partition_bounds: global_bounds,
+        partition_bounds: None, // Computed from manifests at read time
         created_time: now,
         total_file_count: entries.len() as i64,
         format: "avro-state".to_string(),
-        protocol_json,
+        protocol_json: None, // Not part of Avro schema; reconstructed from protocol_version on read
         metadata: metadata_json_cached,
         schema_registry,
         tombstones: vec![],
         format_version: 1,
-        total_bytes: entries.iter().map(|e| e.add.size).sum(),
+        total_bytes: total_file_bytes,
         protocol_version: protocol.min_writer_version as i32,
     };
 
@@ -136,13 +132,14 @@ pub async fn write_state_directory(
     let manifest_path = format!("{}/{}", state_dir, STATE_MANIFEST_FILENAME);
     let written = storage.put_if_absent(&manifest_path, Bytes::from(avro_bytes)).await?;
     if !written {
-        debug_println!("⚠️ STATE_WRITER: State manifest already exists at {}, concurrent write detected", manifest_path);
+        return Err(TxLogError::Storage(anyhow::anyhow!(
+            "State manifest already exists at {}, concurrent write detected", manifest_path)));
     }
 
     let last_checkpoint = LastCheckpointInfo {
         version,
         size: entries.len() as i64,
-        size_in_bytes: total_size_bytes,
+        size_in_bytes: total_file_bytes,
         num_files: entries.len() as i64,
         format: Some("avro-state".to_string()),
         state_dir: Some(state_dir),
@@ -183,9 +180,8 @@ pub async fn write_incremental_state_directory(
             // Normalize legacy bare filenames to include their source state dir
             if !normalized.path.contains('/') {
                 // Legacy path — prefix with source state dir path
-                if let Some(ref base_state_dir) = find_state_dir_for_manifest(base_manifest.version) {
-                    normalized.path = format!("{}/{}", base_state_dir, info.path);
-                }
+                let base_state_dir = find_state_dir_for_manifest(base_manifest.version);
+                normalized.path = format!("{}/{}", base_state_dir, info.path);
             }
             normalized
         })
@@ -232,7 +228,6 @@ pub async fn write_incremental_state_directory(
     let total_manifest_entries: i64 = manifest_infos.iter().map(|m| m.file_count).sum();
     let live_file_count = total_manifest_entries - tombstones.len() as i64;
 
-    let protocol_json = serde_json::to_string(protocol).ok();
     let metadata_json_cached = serde_json::to_string(metadata).ok();
 
     let schema_registry: HashMap<String, String> = metadata.configuration.iter()
@@ -247,7 +242,7 @@ pub async fn write_incremental_state_directory(
         created_time: now,
         total_file_count: live_file_count,
         format: "avro-state".to_string(),
-        protocol_json,
+        protocol_json: None, // Not part of Avro schema; reconstructed from protocol_version on read
         metadata: metadata_json_cached,
         schema_registry,
         tombstones,
@@ -261,7 +256,8 @@ pub async fn write_incremental_state_directory(
     let manifest_path = format!("{}/{}", state_dir, STATE_MANIFEST_FILENAME);
     let written = storage.put_if_absent(&manifest_path, Bytes::from(avro_bytes)).await?;
     if !written {
-        debug_println!("⚠️ STATE_WRITER: Incremental state manifest already exists at {}", manifest_path);
+        return Err(TxLogError::Storage(anyhow::anyhow!(
+            "Incremental state manifest already exists at {}, concurrent write detected", manifest_path)));
     }
 
     let last_checkpoint = LastCheckpointInfo {
@@ -287,7 +283,7 @@ fn serialize_state_manifest_avro(state_manifest: &StateManifest) -> Result<Vec<u
     use apache_avro::{Writer, Codec};
 
     let schema = super::schemas::state_manifest_schema();
-    let avro_value = state_manifest_to_avro_value(state_manifest, &schema);
+    let avro_value = state_manifest_to_avro_value(state_manifest);
 
     let mut writer = Writer::with_codec(&schema, Vec::new(), Codec::Zstandard(Default::default()));
     writer.append(avro_value)
@@ -297,7 +293,7 @@ fn serialize_state_manifest_avro(state_manifest: &StateManifest) -> Result<Vec<u
 }
 
 /// Convert a StateManifest to an Avro Value matching the Scala schema.
-fn state_manifest_to_avro_value(manifest: &StateManifest, _schema: &apache_avro::Schema) -> Value {
+fn state_manifest_to_avro_value(manifest: &StateManifest) -> Value {
     // Build manifests array (nested ManifestInfoItem records)
     let manifests_array: Vec<Value> = manifest.manifests.iter().map(|info| {
         let partition_bounds = match &info.partition_bounds {
@@ -367,14 +363,19 @@ fn state_manifest_to_avro_value(manifest: &StateManifest, _schema: &apache_avro:
     ])
 }
 
-/// Generate a short manifest ID from UUID v4.
+/// Generate a manifest ID from UUID v4 (16 hex chars for sufficient entropy).
 fn generate_manifest_id() -> String {
-    uuid::Uuid::new_v4().to_string().replace('-', "")[..8].to_string()
+    uuid::Uuid::new_v4().to_string().replace('-', "")[..16].to_string()
 }
 
 /// Infer the state directory name for a given version.
-fn find_state_dir_for_manifest(version: i64) -> Option<String> {
-    Some(TxLogStorage::state_dir_name(version))
+///
+/// Always returns a value — the directory name is deterministic from the version.
+/// Note: uses the base manifest's version to reconstruct the path, which is correct
+/// because manifest files written by the current implementation always reside in their
+/// originating state directory.
+fn find_state_dir_for_manifest(version: i64) -> String {
+    TxLogStorage::state_dir_name(version)
 }
 
 /// Group entries into manifest-sized partitions.
@@ -468,6 +469,12 @@ fn current_timestamp_ms() -> i64 {
 
 /// Write _last_checkpoint only if this version is newer than the existing one.
 /// Matches Scala's `writeLastCheckpointIfNewer` behavior.
+///
+/// Note: There is a inherent TOCTOU race between reading the existing checkpoint
+/// and writing the new one. This is acceptable because: (1) checkpoint writes are
+/// idempotent — a stale checkpoint just means the next reader re-verifies via
+/// `verify_checkpoint_version`, and (2) the worst case is a slightly older checkpoint
+/// version being written, which is detected and corrected on the next read.
 async fn write_last_checkpoint_if_newer(
     storage: &TxLogStorage,
     info: &LastCheckpointInfo,
@@ -476,8 +483,8 @@ async fn write_last_checkpoint_if_newer(
     if let Ok(existing_data) = storage.get("_last_checkpoint").await {
         match serde_json::from_slice::<LastCheckpointInfo>(&existing_data) {
             Ok(existing) => {
-                if existing.version > info.version {
-                    debug_println!("⚠️ STATE_WRITER: Skipping _last_checkpoint update: existing v{} > new v{}",
+                if existing.version >= info.version {
+                    debug_println!("⚠️ STATE_WRITER: Skipping _last_checkpoint update: existing v{} >= new v{}",
                         existing.version, info.version);
                     return Ok(());
                 }
@@ -602,7 +609,7 @@ pub(crate) mod tests {
     #[test]
     fn test_generate_manifest_id() {
         let id = generate_manifest_id();
-        assert_eq!(id.len(), 8);
+        assert_eq!(id.len(), 16);
         // Should be hex characters
         assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
     }

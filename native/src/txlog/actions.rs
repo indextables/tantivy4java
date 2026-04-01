@@ -287,7 +287,8 @@ where
         }
 
         fn visit_f64<E: de::Error>(self, v: f64) -> Result<Self::Value, E> {
-            Ok(Some(v.to_string()))
+            // Format without scientific notation to ensure integer round-tripping
+            Ok(Some(format!("{:.0}", v)))
         }
     }
 
@@ -322,7 +323,7 @@ pub struct SkipAction {
     pub path: String,
     pub skip_timestamp: i64,
     pub reason: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub operation: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub partition_values: Option<HashMap<String, String>>,
@@ -439,8 +440,11 @@ pub struct StateManifest {
 pub struct LastCheckpointInfo {
     pub version: i64,
     pub size: i64,
+    #[serde(default)]
     pub size_in_bytes: i64,
+    #[serde(default)]
     pub num_files: i64,
+    #[serde(default)]
     pub created_time: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub format: Option<String>,
