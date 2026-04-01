@@ -35,57 +35,21 @@ The Rust txlog implementation has been updated to match the Scala v0.5.4 protoco
 
 ## What search_test Needs to Change
 
-### 1. Arrow FFI Column Types — NO CHANGE for timeRange
+**Short answer: almost nothing.** All data types and field presence in the JNI API (Arrow FFI and TANT byte buffer) are unchanged. The changes are internal to how the Rust code stores and processes transaction log data on disk.
 
-**`timeRangeStart` and `timeRangeEnd`** columns remain `Int64` in the Arrow FFI batch. No code changes needed in `ArrowFileEntryExtractor` or `ActionsToArrowConverter`.
+### No API Changes Required
 
-Internally, the Rust code now stores these as `Option<String>` (for Scala protocol compatibility with ISO 8601 format), but the Arrow FFI export converts String→i64 transparently. Values written as integers in version files are preserved through the roundtrip.
+The following are explicitly **unchanged** from the consumer's perspective:
+- `timeRangeStart` / `timeRangeEnd` — still `Int64` (epoch ms) in Arrow FFI and TANT serialization
+- `deleteOpstamp` — still present and survives checkpoint roundtrip
+- `docMappingJson` — still present and survives checkpoint roundtrip
+- All Arrow FFI column types — unchanged
+- All TANT byte buffer field types — unchanged
+- `SkipAction` fields — `operation` and `skipCount` are now always present (non-null) but this is backward compatible since they have sensible defaults (empty string and 1)
 
-### 2. SkipAction Field Changes
+### Version File Compression
 
-**`operation`** is now always present (empty string default). **`skipCount`** is now always present (default 1).
-
-**In Arrow FFI reading:**
-```scala
-// BEFORE:
-val operation = getOptionalString(batch, row, "operation")
-val skipCount = getOptionalInt(batch, row, "skip_count")
-
-// AFTER:
-val operation = getString(batch, row, "operation")  // never null
-val skipCount = getInt(batch, row, "skip_count")    // never null, default 1
-```
-
-Your `SkipAction` case class should match:
-```scala
-case class SkipAction(
-  path: String,
-  skipTimestamp: Long,
-  reason: String,
-  operation: String = "",       // was Option[String]
-  partitionValues: Option[Map[String, String]] = None,
-  size: Option[Long] = None,
-  retryAfter: Option[Long] = None,
-  skipCount: Int = 1            // was Option[Int]
-)
-```
-
-### 3. LastCheckpointInfo Field Changes
-
-Your existing `LastCheckpointInfo` case class already matches Scala. No changes needed — the Rust layer now produces the same JSON format as Scala.
-
-### 4. FileEntry Fields Not in Avro
-
-The following `AddAction` fields are **no longer written to Avro manifest files** (removed for Scala compatibility):
-- `deleteOpstamp`
-- `docMappingJson` (use `docMappingRef` + schema registry instead)
-- `timeRangeStart` / `timeRangeEnd`
-
-These fields are still present in **version files** (JSON) and in the **Arrow FFI** batch. They are just not persisted in the Avro state checkpoint manifests. If your code reads these from the Arrow FFI listFiles result, they will still be populated from version file replay.
-
-### 5. Version File Compression
-
-Version files have a **2-byte compression indicator prefix** before the gzip data. The Rust reader now correctly handles this format (strips prefix, then decompresses). If your code reads version files directly, be aware of this prefix.
+Version files have a **2-byte compression indicator prefix** before the gzip data. The Rust reader now correctly handles this format (strips prefix, then decompresses). If your code reads version files directly (not through the JNI API), be aware of this prefix.
 
 ---
 
@@ -218,9 +182,10 @@ JAVA_HOME=/opt/homebrew/opt/openjdk@11 mvn test-compile scalatest:test \
 
 ## JNI API Surface
 
-No JNI method signatures changed. The changes are all in the data format:
-- `TransactionLogReader.listFilesArrowFfi()` — SkipAction fields always present (operation, skipCount no longer nullable); timeRange columns unchanged (still Int64)
-- `TransactionLogWriter.writeVersionArrowFfi()` — expects new column types
+No JNI method signatures or data types changed:
+- `TransactionLogReader.listFilesArrowFfi()` — all column types unchanged
+- `TransactionLogReader.readManifest()` — all TANT field types unchanged
+- `TransactionLogWriter.writeVersionArrowFfi()` — unchanged
 - `TransactionLogWriter.writeVersion()` — JSON format unchanged
 - `TransactionLogWriter.initializeTable()` — unchanged
 
