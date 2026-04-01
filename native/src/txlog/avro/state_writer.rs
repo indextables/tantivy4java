@@ -474,11 +474,18 @@ async fn write_last_checkpoint_if_newer(
 ) -> Result<()> {
     // Read existing checkpoint version
     if let Ok(existing_data) = storage.get("_last_checkpoint").await {
-        if let Ok(existing) = serde_json::from_slice::<LastCheckpointInfo>(&existing_data) {
-            if existing.version > info.version {
-                debug_println!("⚠️ STATE_WRITER: Skipping _last_checkpoint update: existing v{} > new v{}",
+        match serde_json::from_slice::<LastCheckpointInfo>(&existing_data) {
+            Ok(existing) => {
+                if existing.version > info.version {
+                    debug_println!("⚠️ STATE_WRITER: Skipping _last_checkpoint update: existing v{} > new v{}",
+                        existing.version, info.version);
+                    return Ok(());
+                }
+                debug_println!("📝 STATE_WRITER: Updating _last_checkpoint: existing v{} → new v{}",
                     existing.version, info.version);
-                return Ok(());
+            }
+            Err(e) => {
+                debug_println!("⚠️ STATE_WRITER: Failed to parse existing _last_checkpoint: {}", e);
             }
         }
     }

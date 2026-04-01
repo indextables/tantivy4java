@@ -820,6 +820,7 @@ fn test_serialize_snapshot_info() {
         protocol: Some(make_protocol()),
         metadata: make_metadata("snapshot-test"),
         state_dir: "state-v42".to_string(),
+        tombstones: vec![],
     };
 
     let buf = serialization::serialize_snapshot_info(&info);
@@ -1423,4 +1424,141 @@ fn test_range_filter_elimination_empty_stats() {
 
     // No change — no stats available
     assert_eq!(optimized, query);
+}
+
+// ============================================================================
+// Regression: Tombstones in checkpoint must be applied by listFiles (issue from DescribeStateCommandTest)
+// ============================================================================
+
+#[tokio::test]
+async fn test_incremental_checkpoint_tombstones_applied_on_read() {
+    use crate::txlog::storage::TxLogStorage;
+    use crate::txlog::avro::{state_writer, state_reader};
+    use crate::txlog::version_file;
+
+    let dir = tempfile::tempdir().unwrap();
+    let table_url = format!("file://{}", dir.path().display());
+    let config = DeltaStorageConfig::default();
+    let storage = TxLogStorage::new(&table_url, &config).unwrap();
+
+    // Write version 0: protocol + metadata
+    let v0_actions = vec![
+        Action::Protocol(ProtocolAction::v4()),
+        Action::MetaData(MetadataAction::empty()),
+    ];
+    version_file::write_version(&storage, 0, &v0_actions).await.unwrap();
+
+    // Write version 1: 10 adds
+    let add_actions: Vec<Action> = (1..=10).map(|i| {
+        Action::Add(AddAction {
+            path: format!("file{}.split", i),
+            partition_values: HashMap::new(),
+            size: 1000, modification_time: 1700000000000, data_change: true,
+            stats: None, min_values: None, max_values: None, num_records: Some(10),
+            footer_start_offset: None, footer_end_offset: None, has_footer_offsets: None,
+            delete_opstamp: None, split_tags: None, num_merge_ops: None,
+            doc_mapping_json: None, doc_mapping_ref: None, uncompressed_size_bytes: None,
+            time_range_start: None, time_range_end: None,
+            companion_source_files: None, companion_delta_version: None,
+            companion_fast_field_mode: None,
+        })
+    }).collect();
+    version_file::write_version(&storage, 1, &add_actions).await.unwrap();
+
+    // Create initial checkpoint at v1 with 10 files
+    let entries: Vec<FileEntry> = (1..=10).map(|i| FileEntry {
+        add: AddAction {
+            path: format!("file{}.split", i),
+            partition_values: HashMap::new(),
+            size: 1000, modification_time: 1700000000000, data_change: true,
+            stats: None, min_values: None, max_values: None, num_records: Some(10),
+            footer_start_offset: None, footer_end_offset: None, has_footer_offsets: None,
+            delete_opstamp: None, split_tags: None, num_merge_ops: None,
+            doc_mapping_json: None, doc_mapping_ref: None, uncompressed_size_bytes: None,
+            time_range_start: None, time_range_end: None,
+            companion_source_files: None, companion_delta_version: None,
+            companion_fast_field_mode: None,
+        },
+        added_at_version: 1,
+        added_at_timestamp: 1700000000000,
+    }).collect();
+
+    state_writer::write_state_checkpoint(
+        &storage, 1, &entries, &ProtocolAction::v4(), &MetadataAction::empty(),
+    ).await.unwrap();
+
+    // Write version 2: remove 3 files
+    let remove_actions: Vec<Action> = (1..=3).map(|i| {
+        Action::Remove(RemoveAction {
+            path: format!("file{}.split", i),
+            deletion_timestamp: Some(1700000001000),
+            data_change: true,
+            partition_values: None,
+            size: None,
+        })
+    }).collect();
+    version_file::write_version(&storage, 2, &remove_actions).await.unwrap();
+
+    // Create incremental checkpoint at v2 with tombstones
+    let base_manifest = state_reader::read_state_manifest(&storage, "state-v00000000000000000001").await.unwrap();
+    let mut removed_paths = std::collections::HashSet::new();
+    removed_paths.insert("file1.split".to_string());
+    removed_paths.insert("file2.split".to_string());
+    removed_paths.insert("file3.split".to_string());
+
+    state_writer::write_incremental_state_checkpoint(
+        &storage, 2, &base_manifest, &[], &removed_paths,
+        &ProtocolAction::v4(), &MetadataAction::empty(),
+    ).await.unwrap();
+
+    // Now read via get_txlog_snapshot_info + read_manifest (the listFiles path)
+    let snapshot = crate::txlog::distributed::get_txlog_snapshot_info(&table_url, &config).await.unwrap();
+    assert_eq!(snapshot.checkpoint_version, 2, "should read checkpoint v2");
+
+    // Verify tombstones are carried through the snapshot
+    assert_eq!(snapshot.tombstones.len(), 3,
+        "snapshot should carry 3 tombstones from incremental checkpoint");
+
+    // Read all manifests via the distributed path (same as listFiles)
+    let mut all_entries = Vec::new();
+    for mi in &snapshot.manifest_paths {
+        let entries = crate::txlog::distributed::read_manifest(
+            &table_url, &config, &snapshot.state_dir, &mi.path, &HashMap::new(),
+        ).await.unwrap();
+        all_entries.extend(entries);
+    }
+
+    // Apply checkpoint tombstones (this is the fix — listFiles must do this)
+    if !snapshot.tombstones.is_empty() {
+        let tombstone_set: std::collections::HashSet<&str> = snapshot.tombstones.iter().map(|s| s.as_str()).collect();
+        all_entries.retain(|e| !tombstone_set.contains(e.add.path.as_str()));
+    }
+
+    // Post-checkpoint changes
+    let changes = crate::txlog::distributed::read_post_checkpoint_changes(
+        &table_url, &config, &snapshot.post_checkpoint_version_paths, &HashMap::new(),
+    ).await.unwrap();
+
+    // Apply post-checkpoint removes
+    let mut file_map: HashMap<String, FileEntry> = HashMap::new();
+    for entry in all_entries {
+        file_map.insert(entry.add.path.clone(), entry);
+    }
+    for path in &changes.removed_paths {
+        file_map.remove(path);
+    }
+
+    let live_files: Vec<FileEntry> = file_map.into_values().collect();
+
+    // After applying tombstones: 10 entries - 3 tombstones = 7 live
+    assert_eq!(live_files.len(), 7,
+        "listFiles path must apply checkpoint tombstones. Got {} files, expected 7 (10 - 3 tombstones)",
+        live_files.len());
+
+    // Verify the removed files are not present
+    let paths: Vec<&str> = live_files.iter().map(|e| e.add.path.as_str()).collect();
+    assert!(!paths.contains(&"file1.split"), "file1.split should be tombstoned");
+    assert!(!paths.contains(&"file2.split"), "file2.split should be tombstoned");
+    assert!(!paths.contains(&"file3.split"), "file3.split should be tombstoned");
+    assert!(paths.contains(&"file4.split"), "file4.split should be live");
 }

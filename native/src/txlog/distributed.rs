@@ -31,6 +31,8 @@ pub struct TxLogSnapshotInfo {
     pub protocol: Option<ProtocolAction>,
     pub metadata: MetadataAction,
     pub state_dir: String,
+    /// Tombstones from the checkpoint's StateManifest (paths of removed files).
+    pub tombstones: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -112,6 +114,7 @@ pub async fn get_txlog_snapshot_info_with_cache(
                     protocol: effective_protocol,
                     metadata: effective_metadata,
                     state_dir,
+                    tombstones: state_manifest.tombstones.clone(),
                 });
             }
         }
@@ -214,6 +217,7 @@ async fn snapshot_from_checkpoint(
         protocol: protocol_opt,
         metadata,
         state_dir,
+        tombstones: state_manifest.tombstones.clone(),
     })
 }
 
@@ -273,6 +277,7 @@ async fn snapshot_from_version_scan(
         protocol: protocol_opt,
         metadata,
         state_dir: String::new(),
+        tombstones: vec![],
     })
 }
 
