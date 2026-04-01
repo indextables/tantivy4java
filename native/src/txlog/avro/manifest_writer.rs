@@ -42,7 +42,11 @@ fn file_entry_to_avro_value(entry: &FileEntry) -> Value {
         ("numRecords".to_string(), nullable_long(&a.num_records)),
         ("footerStartOffset".to_string(), nullable_long(&a.footer_start_offset)),
         ("footerEndOffset".to_string(), nullable_long(&a.footer_end_offset)),
-        ("hasFooterOffsets".to_string(), Value::Boolean(a.has_footer_offsets.unwrap_or(false))),
+        ("hasFooterOffsets".to_string(), Value::Boolean(a.has_footer_offsets.unwrap_or_else(|| {
+            // Infer from actual offset values when caller doesn't set the flag explicitly
+            a.footer_start_offset.map(|s| s > 0).unwrap_or(false)
+                && a.footer_end_offset.map(|e| e > 0).unwrap_or(false)
+        }))),
         ("deleteOpstamp".to_string(), nullable_long(&a.delete_opstamp)),
         ("splitTags".to_string(), nullable_string_array(&a.split_tags)),
         ("numMergeOps".to_string(), nullable_int(&a.num_merge_ops)),
@@ -165,5 +169,49 @@ mod tests {
         let read_back = read_manifest_bytes(&bytes).unwrap();
         assert_eq!(read_back[0].add.partition_values.get("year"), Some(&"2024".to_string()));
         assert_eq!(read_back[0].add.partition_values.get("month"), Some(&"01".to_string()));
+    }
+
+    // Regression test for issue #145: has_footer_offsets inferred when absent
+    #[test]
+    fn test_has_footer_offsets_inferred_when_absent() {
+        let mut entry = make_entry("footer-infer.split");
+        entry.add.footer_start_offset = Some(49000);
+        entry.add.footer_end_offset = Some(50000);
+        entry.add.has_footer_offsets = None; // deliberately absent
+
+        let bytes = write_manifest_bytes(&[entry]).unwrap();
+        let read_back = read_manifest_bytes(&bytes).unwrap();
+
+        assert_eq!(read_back[0].add.has_footer_offsets, Some(true),
+            "has_footer_offsets should be inferred true when offsets are present (issue #145)");
+        assert_eq!(read_back[0].add.footer_start_offset, Some(49000));
+        assert_eq!(read_back[0].add.footer_end_offset, Some(50000));
+    }
+
+    #[test]
+    fn test_has_footer_offsets_false_when_no_offsets() {
+        let mut entry = make_entry("no-footer.split");
+        entry.add.footer_start_offset = None;
+        entry.add.footer_end_offset = None;
+        entry.add.has_footer_offsets = None;
+
+        let bytes = write_manifest_bytes(&[entry]).unwrap();
+        let read_back = read_manifest_bytes(&bytes).unwrap();
+
+        assert_eq!(read_back[0].add.has_footer_offsets, Some(false),
+            "has_footer_offsets should be false when no offsets present");
+    }
+
+    #[test]
+    fn test_has_footer_offsets_explicit_true_preserved() {
+        let mut entry = make_entry("explicit-footer.split");
+        entry.add.footer_start_offset = Some(49000);
+        entry.add.footer_end_offset = Some(50000);
+        entry.add.has_footer_offsets = Some(true);
+
+        let bytes = write_manifest_bytes(&[entry]).unwrap();
+        let read_back = read_manifest_bytes(&bytes).unwrap();
+
+        assert_eq!(read_back[0].add.has_footer_offsets, Some(true));
     }
 }
