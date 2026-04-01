@@ -652,11 +652,13 @@ async fn test_e2e_write_checkpoint_export_ffi() {
         assert_eq!(nmo_col.value(i), i as i32);
     }
 
-    // doc_mapping_json is removed from Avro FileEntry schema (Scala compat),
-    // so it comes back as null after the Avro roundtrip.
+    // doc_mapping_json is preserved in Avro FileEntry schema (for search_test compat).
+    // Row 0 had doc_mapping_json set, so it survives the roundtrip.
     let dm_col = batch.column(11).as_any().downcast_ref::<StringArray>().unwrap();
-    for i in 0..5 {
-        assert!(dm_col.is_null(i), "doc_mapping_json should be null after Avro roundtrip (row {})", i);
+    assert!(!dm_col.is_null(0), "row 0 should have doc_mapping_json");
+    // Rows 1-4 didn't have it set
+    for i in 1..5 {
+        assert!(dm_col.is_null(i), "row {} should not have doc_mapping_json", i);
     }
 
     // Verify companion fields: only row 2 has them (col 16/17/18)

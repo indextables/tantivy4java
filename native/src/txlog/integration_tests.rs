@@ -460,8 +460,8 @@ async fn test_checkpoint_manifest_roundtrip() {
     let tags = entry.add.split_tags.as_ref().unwrap();
     assert!(tags.contains(&"env:prod".to_string()));
     assert!(tags.contains(&"region:us-east-1".to_string()));
-    // doc_mapping_json is removed from Avro schema; only docMappingRef survives
-    assert_eq!(entry.add.doc_mapping_json, None);
+    // doc_mapping_json is preserved in Avro schema (for search_test compat)
+    assert_eq!(entry.add.doc_mapping_json, Some("{\"fields\":[{\"name\":\"title\",\"type\":\"text\"}]}".to_string()));
 }
 
 // ============================================================================

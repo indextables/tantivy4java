@@ -222,10 +222,10 @@ pub struct AddAction {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub uncompressed_size_bytes: Option<i64>,
 
-    // Time range (String for Scala protocol compat)
-    #[serde(skip_serializing_if = "Option::is_none")]
+    // Time range — accepts both String (ISO 8601, Scala) and integer (epoch ms, legacy)
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_string_or_int")]
     pub time_range_start: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_string_or_int")]
     pub time_range_end: Option<String>,
 
     // Companion mode
@@ -243,6 +243,55 @@ fn default_true() -> bool {
 
 fn default_one() -> i32 {
     1
+}
+
+/// Deserialize a field that can be either a string or an integer.
+/// Integers are converted to their string representation.
+fn deserialize_string_or_int<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de;
+
+    struct StringOrInt;
+
+    impl<'de> de::Visitor<'de> for StringOrInt {
+        type Value = Option<String>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("a string, integer, or null")
+        }
+
+        fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
+            Ok(Some(v.to_string()))
+        }
+
+        fn visit_string<E: de::Error>(self, v: String) -> Result<Self::Value, E> {
+            Ok(Some(v))
+        }
+
+        fn visit_i64<E: de::Error>(self, v: i64) -> Result<Self::Value, E> {
+            Ok(Some(v.to_string()))
+        }
+
+        fn visit_u64<E: de::Error>(self, v: u64) -> Result<Self::Value, E> {
+            Ok(Some(v.to_string()))
+        }
+
+        fn visit_f64<E: de::Error>(self, v: f64) -> Result<Self::Value, E> {
+            Ok(Some(v.to_string()))
+        }
+    }
+
+    deserializer.deserialize_any(StringOrInt)
 }
 
 // ============================================================================

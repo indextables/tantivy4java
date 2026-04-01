@@ -80,15 +80,25 @@ pub fn deduplicate_schemas(
 }
 
 /// On read: restore docMappingJson from docMappingRef using metadata config.
+///
+/// The schema registry may store keys either with prefix (`docMappingSchema.HASH`)
+/// or without prefix (`HASH`) depending on whether it came from MetadataAction.configuration
+/// (prefixed) or StateManifest.schemaRegistry (may be unprefixed in Scala-written manifests).
 pub fn restore_schemas(
     entries: &mut [FileEntry],
     metadata_config: &HashMap<String, String>,
 ) {
-    let schema_map: HashMap<&str, &str> = metadata_config
-        .iter()
-        .filter(|(k, _)| k.starts_with(DOC_MAPPING_SCHEMA_PREFIX))
-        .map(|(k, v)| (&k[DOC_MAPPING_SCHEMA_PREFIX.len()..], v.as_str()))
-        .collect();
+    // Build lookup map: hash → schema JSON
+    // Support both prefixed and unprefixed keys
+    let mut schema_map: HashMap<&str, &str> = HashMap::new();
+    for (k, v) in metadata_config {
+        if let Some(hash) = k.strip_prefix(DOC_MAPPING_SCHEMA_PREFIX) {
+            schema_map.insert(hash, v.as_str());
+        } else {
+            // Unprefixed key — treat as raw hash
+            schema_map.insert(k.as_str(), v.as_str());
+        }
+    }
 
     for entry in entries.iter_mut() {
         if let Some(ref doc_ref) = entry.add.doc_mapping_ref {
@@ -106,11 +116,14 @@ pub fn restore_schemas_on_adds(
     adds: &mut [AddAction],
     metadata_config: &HashMap<String, String>,
 ) {
-    let schema_map: HashMap<&str, &str> = metadata_config
-        .iter()
-        .filter(|(k, _)| k.starts_with(DOC_MAPPING_SCHEMA_PREFIX))
-        .map(|(k, v)| (&k[DOC_MAPPING_SCHEMA_PREFIX.len()..], v.as_str()))
-        .collect();
+    let mut schema_map: HashMap<&str, &str> = HashMap::new();
+    for (k, v) in metadata_config {
+        if let Some(hash) = k.strip_prefix(DOC_MAPPING_SCHEMA_PREFIX) {
+            schema_map.insert(hash, v.as_str());
+        } else {
+            schema_map.insert(k.as_str(), v.as_str());
+        }
+    }
 
     for add in adds.iter_mut() {
         if let Some(ref doc_ref) = add.doc_mapping_ref {

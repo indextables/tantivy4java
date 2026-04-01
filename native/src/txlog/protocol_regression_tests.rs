@@ -262,15 +262,16 @@ mod tests {
                 assert!(field_names.contains(&"addedAtTimestamp"));
                 assert!(field_names.contains(&"companionSourceFiles"));
 
-                // Rust-only fields should NOT be in schema (removed for Scala compat)
-                assert!(!field_names.contains(&"deleteOpstamp"),
-                    "deleteOpstamp should not be in Scala-compatible schema");
-                assert!(!field_names.contains(&"docMappingJson"),
-                    "docMappingJson should not be in Scala-compatible schema");
+                // Rust-extension fields (kept for search_test roundtrip compat,
+                // Scala ignores unknown fields via schema evolution)
+                assert!(field_names.contains(&"deleteOpstamp"));
+                assert!(field_names.contains(&"docMappingJson"));
+
+                // timeRangeStart/End NOT in Avro schema (only in version file JSON)
                 assert!(!field_names.contains(&"timeRangeStart"),
-                    "timeRangeStart should not be in Scala-compatible schema");
+                    "timeRangeStart should not be in Avro schema");
                 assert!(!field_names.contains(&"timeRangeEnd"),
-                    "timeRangeEnd should not be in Scala-compatible schema");
+                    "timeRangeEnd should not be in Avro schema");
             }
             _ => panic!("Expected Record schema"),
         }

@@ -28,8 +28,10 @@ pub const FILE_ENTRY_SCHEMA_JSON: &str = r#"{
     {"name": "footerStartOffset", "type": ["null", "long"],    "default": null,      "field-id": 120},
     {"name": "footerEndOffset",   "type": ["null", "long"],    "default": null,      "field-id": 121},
     {"name": "hasFooterOffsets",  "type": "boolean",           "default": false,     "field-id": 124},
+    {"name": "deleteOpstamp",     "type": ["null", "long"],    "default": null,      "field-id": 123},
     {"name": "splitTags",         "type": ["null", {"type": "array", "items": "string"}], "default": null, "field-id": 132},
     {"name": "numMergeOps",       "type": ["null", "int"],     "default": null,      "field-id": 134},
+    {"name": "docMappingJson",    "type": ["null", "string"],  "default": null,      "field-id": 133},
     {"name": "docMappingRef",     "type": ["null", "string"],  "default": null,      "field-id": 135},
     {"name": "uncompressedSizeBytes", "type": ["null", "long"], "default": null,     "field-id": 136},
     {"name": "addedAtVersion",    "type": "long",              "default": 0,         "field-id": 140},
@@ -93,7 +95,7 @@ mod tests {
         match &schema {
             apache_avro::Schema::Record(r) => {
                 assert_eq!(r.name.fullname(None), "io.indextables.state.FileEntry");
-                assert_eq!(r.fields.len(), 21);
+                assert_eq!(r.fields.len(), 23);
             }
             other => panic!("expected Record schema, got {:?}", other),
         }
