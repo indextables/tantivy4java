@@ -778,14 +778,22 @@ pub async fn maybe_auto_checkpoint(
                             &storage, &state_dir, &mi.path, &metadata_config,
                         ))
                         .collect();
-                    let rewritten_entries: Vec<FileEntry> = stream::iter(rewrite_futs)
+                    let rewrite_results = stream::iter(rewrite_futs)
                         .buffer_unordered(max_concurrent)
-                        .collect::<Vec<super::error::Result<Vec<FileEntry>>>>().await
+                        .collect::<Vec<super::error::Result<Vec<FileEntry>>>>().await;
+                    let rewritten_entries: Vec<FileEntry> = match rewrite_results
                         .into_iter()
-                        .filter_map(|r| r.ok())
-                        .flat_map(|entries| entries.into_iter()
-                            .filter(|e| !all_tombstones.contains(&e.add.path)))
-                        .collect();
+                        .collect::<super::error::Result<Vec<Vec<FileEntry>>>>()
+                    {
+                        Err(e) => {
+                            debug_println!("⚠️ DISTRIBUTED: selective compaction aborted — dirty manifest read failed: {}", e);
+                            return;
+                        }
+                        Ok(nested) => nested.into_iter()
+                            .flat_map(|entries| entries.into_iter()
+                                .filter(|e| !all_tombstones.contains(&e.add.path)))
+                            .collect(),
+                    };
                     // Combine: new adds (filtered against removes) + rewritten live entries
                     let mut all_live = rewritten_entries;
                     all_live.extend(new_adds.iter()
@@ -804,14 +812,22 @@ pub async fn maybe_auto_checkpoint(
                             &storage, &state_dir, &mi.path, &metadata_config,
                         ))
                         .collect();
-                    let keep_live: Vec<FileEntry> = stream::iter(keep_futs)
+                    let keep_results = stream::iter(keep_futs)
                         .buffer_unordered(max_concurrent)
-                        .collect::<Vec<super::error::Result<Vec<FileEntry>>>>().await
+                        .collect::<Vec<super::error::Result<Vec<FileEntry>>>>().await;
+                    let keep_live: Vec<FileEntry> = match keep_results
                         .into_iter()
-                        .filter_map(|r| r.ok())
-                        .flat_map(|entries| entries.into_iter()
-                            .filter(|e| !all_tombstones.contains(&e.add.path)))
-                        .collect();
+                        .collect::<super::error::Result<Vec<Vec<FileEntry>>>>()
+                    {
+                        Err(e) => {
+                            debug_println!("⚠️ DISTRIBUTED: selective compaction aborted — clean manifest read failed: {}", e);
+                            return;
+                        }
+                        Ok(nested) => nested.into_iter()
+                            .flat_map(|entries| entries.into_iter()
+                                .filter(|e| !all_tombstones.contains(&e.add.path)))
+                            .collect(),
+                    };
                     all_live.extend(keep_live);
                     all_live.sort_by(|a, b| a.add.path.cmp(&b.add.path));
 
@@ -830,13 +846,19 @@ pub async fn maybe_auto_checkpoint(
                             &storage, &state_dir, &mi.path, &metadata_config,
                         ))
                         .collect();
-                    let mut cp_entries: Vec<FileEntry> = stream::iter(cp_futs)
+                    let cp_results = stream::iter(cp_futs)
                         .buffer_unordered(max_concurrent)
-                        .collect::<Vec<super::error::Result<Vec<FileEntry>>>>().await
+                        .collect::<Vec<super::error::Result<Vec<FileEntry>>>>().await;
+                    let mut cp_entries: Vec<FileEntry> = match cp_results
                         .into_iter()
-                        .filter_map(|r: super::error::Result<Vec<FileEntry>>| r.ok())
-                        .flatten()
-                        .collect();
+                        .collect::<super::error::Result<Vec<Vec<FileEntry>>>>()
+                    {
+                        Err(e) => {
+                            debug_println!("⚠️ DISTRIBUTED: full compaction aborted — manifest read failed: {}", e);
+                            return;
+                        }
+                        Ok(nested) => nested.into_iter().flatten().collect(),
+                    };
                     // Filter out tombstoned entries from base checkpoint before replay
                     if !base_manifest.tombstones.is_empty() {
                         let tombstone_set: std::collections::HashSet<&str> =
