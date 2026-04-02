@@ -10,7 +10,7 @@ use std::sync::Arc;
 use crate::delta_reader::engine::DeltaStorageConfig;
 use crate::debug_println;
 
-use super::actions::*;
+use super::actions::{*, STATE_MANIFEST_FILENAME};
 use super::cache;
 use super::error::{TxLogError, Result};
 use super::log_replay;
@@ -31,6 +31,8 @@ pub struct TxLogSnapshotInfo {
     pub protocol: Option<ProtocolAction>,
     pub metadata: MetadataAction,
     pub state_dir: String,
+    /// Tombstones from the checkpoint's StateManifest (paths of removed files).
+    pub tombstones: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -112,6 +114,7 @@ pub async fn get_txlog_snapshot_info_with_cache(
                     protocol: effective_protocol,
                     metadata: effective_metadata,
                     state_dir,
+                    tombstones: state_manifest.tombstones.clone(),
                 });
             }
         }
@@ -124,8 +127,15 @@ pub async fn get_txlog_snapshot_info_with_cache(
 
     match checkpoint_result {
         Ok(checkpoint_data) => {
-            // Normal path: checkpoint exists
-            let last_cp: LastCheckpointInfo = serde_json::from_slice(&checkpoint_data)?;
+            // Normal path: checkpoint exists — verify version hint isn't stale
+            let mut last_cp: LastCheckpointInfo = serde_json::from_slice(&checkpoint_data)?;
+            let verified_version = verify_checkpoint_version(&storage, last_cp.version).await;
+            if verified_version > last_cp.version {
+                debug_println!("⚠️ DISTRIBUTED: _last_checkpoint stale: hint={}, actual={}",
+                    last_cp.version, verified_version);
+                last_cp.version = verified_version;
+                last_cp.state_dir = Some(TxLogStorage::state_dir_name(verified_version));
+            }
             snapshot_from_checkpoint(&storage, table_path, config_map, last_cp).await
         }
         Err(_) => {
@@ -207,6 +217,7 @@ async fn snapshot_from_checkpoint(
         protocol: protocol_opt,
         metadata,
         state_dir,
+        tombstones: state_manifest.tombstones.clone(),
     })
 }
 
@@ -266,6 +277,7 @@ async fn snapshot_from_version_scan(
         protocol: protocol_opt,
         metadata,
         state_dir: String::new(),
+        tombstones: vec![],
     })
 }
 
@@ -588,10 +600,12 @@ fn is_auto_checkpoint_enabled(config_map: &HashMap<String, String>) -> bool {
     }
 }
 
-/// Create a full checkpoint (state directory + _last_checkpoint) after every write.
+/// Create a checkpoint (state directory + _last_checkpoint) after every write.
 ///
-/// Matches Scala behavior: every successful write creates a state-v<N>/ directory
-/// and updates _last_checkpoint. Set checkpoint_interval=0 to disable entirely.
+/// Matches Scala behavior: uses incremental writes when a previous checkpoint exists
+/// (reusing existing manifest references and accumulating tombstones), falling back to
+/// compacted writes when no checkpoint exists or tombstone ratio is high.
+/// Set checkpoint_interval=0 to disable entirely.
 /// Failures are logged but never fail the write operation.
 pub async fn maybe_auto_checkpoint(
     table_path: &str,
@@ -605,7 +619,6 @@ pub async fn maybe_auto_checkpoint(
 
     debug_println!("📊 DISTRIBUTED: auto-checkpoint at version {}", written_version);
 
-    // Replay all versions to compute current state
     let storage = match TxLogStorage::new(table_path, config) {
         Ok(s) => s,
         Err(e) => {
@@ -614,79 +627,196 @@ pub async fn maybe_auto_checkpoint(
         }
     };
 
-    let all_versions = match storage.list_versions().await {
-        Ok(v) => v,
-        Err(e) => {
-            debug_println!("⚠️ DISTRIBUTED: auto-checkpoint list_versions failed: {}", e);
-            return;
-        }
-    };
+    // Try to read previous checkpoint
+    let prev_checkpoint = read_previous_checkpoint(&storage).await;
 
-    let mut versioned_actions: Vec<(i64, Vec<Action>)> = Vec::new();
-    for v in &all_versions {
-        if *v > written_version { break; }
-        if let Ok(actions) = version_file::read_version(&storage, *v).await {
-            versioned_actions.push((*v, actions));
-        }
-    }
+    match prev_checkpoint {
+        Some((cp_info, base_manifest, cp_protocol, cp_metadata)) => {
+            // Previous checkpoint exists — try incremental write
+            let cp_version = cp_info.version;
 
-    // Read previous checkpoint as baseline for both metadata AND file entries.
-    // After purge, old version files (including version 0 with MetadataAction and
-    // early versions with AddActions) may be deleted. The previous checkpoint's
-    // StateManifest + manifests contain the full consolidated state.
-    let (mut cp_protocol, mut cp_metadata): (Option<ProtocolAction>, Option<MetadataAction>) = (None, None);
-    let mut cp_file_entries: Vec<FileEntry> = Vec::new();
-    let mut cp_version: i64 = -1;
-    if let Ok(cp_data) = storage.get("_last_checkpoint").await {
-        if let Ok(cp) = serde_json::from_slice::<LastCheckpointInfo>(&cp_data) {
-            cp_version = cp.version;
-            let state_dir = cp.state_dir.unwrap_or_else(|| TxLogStorage::state_dir_name(cp.version));
-            let manifest_path = format!("{}/_manifest", state_dir);
-            if let Ok(manifest_data) = storage.get(&manifest_path).await {
-                if let Ok(manifest) = serde_json::from_slice::<StateManifest>(&manifest_data) {
-                    cp_protocol = manifest.protocol_json.as_ref()
-                        .and_then(|s| serde_json::from_str(s).ok());
-                    cp_metadata = manifest.metadata.as_ref()
-                        .and_then(|s| serde_json::from_str(s).ok());
+            // Read only post-checkpoint version files
+            let all_versions = match storage.list_versions().await {
+                Ok(v) => v,
+                Err(e) => {
+                    debug_println!("⚠️ DISTRIBUTED: list_versions failed: {}", e);
+                    return;
+                }
+            };
+            let mut post_cp_actions: Vec<(i64, Vec<Action>)> = Vec::new();
+            for v in all_versions.iter().filter(|v| **v > cp_version && **v <= written_version) {
+                if let Ok(actions) = version_file::read_version(&storage, *v).await {
+                    post_cp_actions.push((*v, actions));
+                }
+            }
 
-                    // Read file entries from checkpoint manifests
-                    let metadata_config = manifest.schema_registry.clone();
-                    for mi in &manifest.manifests {
-                        if let Ok(entries) = super::avro::state_reader::read_single_manifest(
-                            &storage, &state_dir, &mi.path, &metadata_config,
-                        ).await {
-                            cp_file_entries.extend(entries);
+            // Extract new adds and removes from post-checkpoint versions
+            let mut new_adds: Vec<FileEntry> = Vec::new();
+            let mut removed_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
+            for (version, actions) in &post_cp_actions {
+                for action in actions {
+                    match action {
+                        Action::Add(add) => {
+                            let timestamp = add.modification_time;
+                            new_adds.push(FileEntry {
+                                add: add.clone(),
+                                added_at_version: *version,
+                                added_at_timestamp: timestamp,
+                            });
                         }
+                        Action::Remove(r) => {
+                            removed_paths.insert(r.path.clone());
+                        }
+                        _ => {}
                     }
                 }
             }
+
+            // Determine protocol/metadata: post-checkpoint overrides checkpoint
+            let (version_protocol, version_metadata) = log_replay::extract_metadata(&[], &post_cp_actions);
+            let protocol = version_protocol.or(cp_protocol).unwrap_or_else(ProtocolAction::v4);
+            let metadata = version_metadata.or(cp_metadata).unwrap_or_else(MetadataAction::empty);
+
+            // Decide: incremental, selective compaction, or full compaction
+            use super::tombstone_distributor;
+
+            if tombstone_distributor::needs_compaction(&base_manifest, removed_paths.len()) {
+                // Compaction needed — try selective first, fall back to full
+                let partition_columns = metadata.partition_columns.clone();
+                let all_tombstones: std::collections::HashSet<String> = base_manifest.tombstones.iter()
+                    .chain(removed_paths.iter())
+                    .cloned()
+                    .collect();
+
+                let manifests_with_tombstones = tombstone_distributor::distribute_tombstones_to_manifests(
+                    &base_manifest.manifests, &all_tombstones, &partition_columns,
+                );
+                let (keep, rewrite) = tombstone_distributor::selective_partition(
+                    &manifests_with_tombstones, tombstone_distributor::COMPACTION_TOMBSTONE_THRESHOLD,
+                );
+
+                if tombstone_distributor::is_selective_compaction_beneficial(&keep, &rewrite) {
+                    debug_println!("📊 DISTRIBUTED: selective compaction: keeping {} clean, rewriting {} dirty manifests",
+                        keep.len(), rewrite.len());
+
+                    // Read only dirty manifests, filter tombstones, write new
+                    let state_dir = cp_info.state_dir.clone()
+                        .unwrap_or_else(|| TxLogStorage::state_dir_name(cp_version));
+                    let metadata_config = base_manifest.schema_registry.clone();
+                    let mut rewritten_entries = Vec::new();
+                    for mi in &rewrite {
+                        if let Ok(entries) = super::avro::state_reader::read_single_manifest(
+                            &storage, &state_dir, &mi.path, &metadata_config,
+                        ).await {
+                            let live: Vec<FileEntry> = entries.into_iter()
+                                .filter(|e| !all_tombstones.contains(&e.add.path))
+                                .collect();
+                            rewritten_entries.extend(live);
+                        }
+                    }
+                    // Combine: new adds (filtered against removes) + rewritten live entries
+                    let mut all_live = rewritten_entries;
+                    all_live.extend(new_adds.iter()
+                        .filter(|e| !all_tombstones.contains(&e.add.path))
+                        .cloned());
+
+                    // Clean manifests are reused; write new manifest for rewritten + new
+                    // For simplicity, do a compacted write with all live files from
+                    // kept manifests + rewritten entries + new adds.
+                    // A full selective compaction would reuse kept manifest refs, but
+                    // that requires state_writer changes beyond scope here.
+                    // Instead, read kept manifest entries too for a clean compacted write.
+                    for mi in &keep {
+                        if let Ok(entries) = super::avro::state_reader::read_single_manifest(
+                            &storage, &state_dir, &mi.path, &metadata_config,
+                        ).await {
+                            let live: Vec<FileEntry> = entries.into_iter()
+                                .filter(|e| !all_tombstones.contains(&e.add.path))
+                                .collect();
+                            all_live.extend(live);
+                        }
+                    }
+                    all_live.sort_by(|a, b| a.add.path.cmp(&b.add.path));
+
+                    match write_checkpoint_at_version(table_path, config, all_live, metadata, protocol, written_version).await {
+                        Ok(info) => debug_println!("✅ DISTRIBUTED: selective compaction at v{}, {} files", info.version, info.num_files),
+                        Err(e) => debug_println!("⚠️ DISTRIBUTED: selective compaction failed (non-fatal): {}", e),
+                    }
+                } else {
+                    // Full compaction — read everything, apply tombstones, replay, write fresh
+                    debug_println!("📊 DISTRIBUTED: full compaction (selective not beneficial)");
+                    let state_dir = cp_info.state_dir.unwrap_or_else(|| TxLogStorage::state_dir_name(cp_version));
+                    let metadata_config = base_manifest.schema_registry.clone();
+                    let mut cp_entries = Vec::new();
+                    for mi in &base_manifest.manifests {
+                        if let Ok(entries) = super::avro::state_reader::read_single_manifest(
+                            &storage, &state_dir, &mi.path, &metadata_config,
+                        ).await {
+                            cp_entries.extend(entries);
+                        }
+                    }
+                    // Filter out tombstoned entries from base checkpoint before replay
+                    if !base_manifest.tombstones.is_empty() {
+                        let tombstone_set: std::collections::HashSet<&str> =
+                            base_manifest.tombstones.iter().map(|s| s.as_str()).collect();
+                        let before = cp_entries.len();
+                        cp_entries.retain(|e| !tombstone_set.contains(e.add.path.as_str()));
+                        debug_println!("📖 DISTRIBUTED: Applied {} base tombstones during compaction, {} → {} entries",
+                            base_manifest.tombstones.len(), before, cp_entries.len());
+                    }
+                    let replay_result = log_replay::replay(cp_entries, post_cp_actions);
+                    match write_checkpoint_at_version(table_path, config, replay_result.files, metadata, protocol, written_version).await {
+                        Ok(info) => debug_println!("✅ DISTRIBUTED: full compaction at v{}, {} files", info.version, info.num_files),
+                        Err(e) => debug_println!("⚠️ DISTRIBUTED: full compaction failed (non-fatal): {}", e),
+                    }
+                }
+            } else {
+                // Low tombstone ratio — incremental write (reuse existing manifests)
+                match super::avro::state_writer::write_incremental_state_checkpoint(
+                    &storage, written_version, &base_manifest, &new_adds, &removed_paths, &protocol, &metadata,
+                ).await {
+                    Ok(info) => {
+                        cache::invalidate_table_cache(table_path);
+                        debug_println!("✅ DISTRIBUTED: incremental checkpoint at v{}, {} files", info.version, info.num_files);
+                    }
+                    Err(e) => debug_println!("⚠️ DISTRIBUTED: incremental checkpoint failed (non-fatal): {}", e),
+                }
+            }
         }
-    }
+        None => {
+            // No previous checkpoint — full replay and compacted write
+            debug_println!("📊 DISTRIBUTED: no previous checkpoint, doing full replay");
+            let all_versions = match storage.list_versions().await {
+                Ok(v) => v,
+                Err(e) => {
+                    debug_println!("⚠️ DISTRIBUTED: list_versions failed: {}", e);
+                    return;
+                }
+            };
+            let mut versioned_actions: Vec<(i64, Vec<Action>)> = Vec::new();
+            for v in &all_versions {
+                if *v > written_version { break; }
+                if let Ok(actions) = version_file::read_version(&storage, *v).await {
+                    versioned_actions.push((*v, actions));
+                }
+            }
+            let v0_actions = versioned_actions.iter()
+                .find(|(v, _)| *v == 0)
+                .map(|(_, a)| a.clone())
+                .unwrap_or_default();
+            let non_v0: Vec<(i64, Vec<Action>)> = versioned_actions.iter()
+                .filter(|(v, _)| *v > 0)
+                .cloned()
+                .collect();
+            let (protocol_opt, metadata_opt) = log_replay::extract_metadata(&v0_actions, &non_v0);
+            let protocol = protocol_opt.unwrap_or_else(ProtocolAction::v4);
+            let metadata = metadata_opt.unwrap_or_else(MetadataAction::empty);
+            let replay_result = log_replay::replay(vec![], versioned_actions);
 
-    // Replay: use checkpoint entries as baseline, apply only POST-checkpoint version changes
-    let post_cp_actions: Vec<(i64, Vec<Action>)> = versioned_actions.iter()
-        .filter(|(v, _)| *v > cp_version)
-        .cloned()
-        .collect();
-    let replay_result = log_replay::replay(cp_file_entries, post_cp_actions.clone());
-
-    // Extract protocol/metadata: post-checkpoint versions override checkpoint baseline
-    let (version_protocol, version_metadata) = log_replay::extract_metadata(&[], &post_cp_actions);
-    let protocol = version_protocol.or(cp_protocol).unwrap_or_else(ProtocolAction::v4);
-    let metadata = version_metadata.or(cp_metadata).unwrap_or_else(MetadataAction::empty);
-
-    // Full checkpoint: state dir + _last_checkpoint (every write)
-    // Use written_version (not list_versions().last()) to avoid a race where
-    // a concurrent write advances the version but our replay only covers up to
-    // written_version. Using list_versions().last() would create a checkpoint
-    // that claims a higher version than its contents actually cover.
-    match write_checkpoint_at_version(table_path, config, replay_result.files, metadata, protocol, written_version).await {
-        Ok(cp_info) => {
-            debug_println!("✅ DISTRIBUTED: checkpoint at v{}, {:?} files",
-                cp_info.version, cp_info.num_files);
-        }
-        Err(e) => {
-            debug_println!("⚠️ DISTRIBUTED: checkpoint failed (non-fatal): {}", e);
+            match write_checkpoint_at_version(table_path, config, replay_result.files, metadata, protocol, written_version).await {
+                Ok(info) => debug_println!("✅ DISTRIBUTED: initial checkpoint at v{}, {} files", info.version, info.num_files),
+                Err(e) => debug_println!("⚠️ DISTRIBUTED: initial checkpoint failed (non-fatal): {}", e),
+            }
         }
     }
 }
@@ -703,17 +833,22 @@ pub async fn write_checkpoint(
     let version = storage.list_versions().await?
         .last().copied().unwrap_or(0);
 
-    let result = super::avro::state_writer::write_state_checkpoint(
-        &storage,
-        version,
-        &entries,
-        &protocol,
-        &metadata,
-    ).await?;
-
-    // Invalidate cache after checkpoint write
-    cache::invalidate_table_cache(table_path);
-    Ok(result)
+    match super::avro::state_writer::write_state_checkpoint(
+        &storage, version, &entries, &protocol, &metadata,
+    ).await {
+        Ok(result) => {
+            cache::invalidate_table_cache(table_path);
+            Ok(result)
+        }
+        Err(super::error::TxLogError::AlreadyExists(_)) => {
+            // Checkpoint already exists at this version (e.g., auto-checkpoint wrote it).
+            // Read the existing state manifest directly — _last_checkpoint may not yet
+            // be updated by the winning writer (TOCTOU window).
+            debug_println!("📊 DISTRIBUTED: checkpoint already exists at v{}, reading existing", version);
+            read_existing_checkpoint_info(&storage, version).await
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// Create an Avro state checkpoint at a specific version.
@@ -729,14 +864,107 @@ pub async fn write_checkpoint_at_version(
 ) -> Result<LastCheckpointInfo> {
     let storage = TxLogStorage::new(table_path, config)?;
 
-    let result = super::avro::state_writer::write_state_checkpoint(
-        &storage,
-        version,
-        &entries,
-        &protocol,
-        &metadata,
-    ).await?;
+    match super::avro::state_writer::write_state_checkpoint(
+        &storage, version, &entries, &protocol, &metadata,
+    ).await {
+        Ok(result) => {
+            cache::invalidate_table_cache(table_path);
+            Ok(result)
+        }
+        Err(super::error::TxLogError::AlreadyExists(_)) => {
+            // Checkpoint already exists — concurrent or auto-checkpoint wrote it first.
+            debug_println!("📊 DISTRIBUTED: checkpoint already exists at v{}, reading existing", version);
+            read_existing_checkpoint_info(&storage, version).await
+        }
+        Err(e) => Err(e),
+    }
+}
 
-    cache::invalidate_table_cache(table_path);
-    Ok(result)
+/// Read checkpoint info from an existing state manifest at a given version.
+///
+/// Used when our checkpoint write was rejected (AlreadyExists). Reads the winning
+/// writer's `_manifest.avro` directly rather than `_last_checkpoint`, because
+/// `_last_checkpoint` may not yet be updated (TOCTOU window between the winning
+/// writer's `_manifest.avro` write and its `_last_checkpoint` update).
+async fn read_existing_checkpoint_info(
+    storage: &TxLogStorage,
+    version: i64,
+) -> Result<LastCheckpointInfo> {
+    let state_dir = TxLogStorage::state_dir_name(version);
+    let manifest = super::avro::state_reader::read_state_manifest(storage, &state_dir).await?;
+
+    Ok(LastCheckpointInfo {
+        version,
+        size: manifest.total_file_count,
+        size_in_bytes: manifest.total_bytes,
+        num_files: manifest.total_file_count,
+        format: Some(manifest.format),
+        state_dir: Some(state_dir),
+        created_time: manifest.created_time,
+        parts: None,
+        checkpoint_id: None,
+    })
+}
+
+// ============================================================================
+// Stale checkpoint detection
+// ============================================================================
+
+/// Verify a checkpoint version hint by probing for newer state directories.
+///
+/// Matches Scala's `verifyCheckpointVersion`: sequentially checks for state-v(N+1),
+/// state-v(N+2), etc. until no more exist. Returns the actual latest version.
+async fn verify_checkpoint_version(
+    storage: &TxLogStorage,
+    hint_version: i64,
+) -> i64 {
+    const MAX_VERSION_PROBE: i64 = 1000;
+    let mut version = hint_version;
+    let mut probed = 0i64;
+    loop {
+        if probed >= MAX_VERSION_PROBE {
+            debug_println!("⚠️ DISTRIBUTED: verify_checkpoint_version hit probe limit ({}) at v{}", MAX_VERSION_PROBE, version);
+            break;
+        }
+        let next_dir = TxLogStorage::state_dir_name(version + 1);
+        let next_manifest = format!("{}/{}", next_dir, STATE_MANIFEST_FILENAME);
+        match storage.get(&next_manifest).await {
+            Ok(_) => {
+                version += 1;
+                probed += 1;
+                debug_println!("📊 DISTRIBUTED: _last_checkpoint regression: found state at v{}", version);
+            }
+            Err(_) => break,
+        }
+    }
+    version
+}
+
+/// Read the previous checkpoint's metadata and StateManifest.
+/// Returns None if no checkpoint exists or it can't be read.
+async fn read_previous_checkpoint(
+    storage: &TxLogStorage,
+) -> Option<(LastCheckpointInfo, StateManifest, Option<ProtocolAction>, Option<MetadataAction>)> {
+    let cp_data = storage.get("_last_checkpoint").await.ok()?;
+    let mut cp_info: LastCheckpointInfo = serde_json::from_slice(&cp_data).ok()?;
+
+    // Verify checkpoint isn't stale
+    let verified = verify_checkpoint_version(storage, cp_info.version).await;
+    if verified > cp_info.version {
+        cp_info.version = verified;
+        cp_info.state_dir = Some(TxLogStorage::state_dir_name(verified));
+    }
+
+    let state_dir = cp_info.state_dir.clone()
+        .unwrap_or_else(|| TxLogStorage::state_dir_name(cp_info.version));
+    let manifest_path = format!("{}/{}", state_dir, STATE_MANIFEST_FILENAME);
+    let manifest_data = storage.get(&manifest_path).await.ok()?;
+    let manifest = super::avro::state_reader::parse_state_manifest(&manifest_data).ok()?;
+
+    let protocol: Option<ProtocolAction> = manifest.protocol_json.as_ref()
+        .and_then(|s| serde_json::from_str(s).ok());
+    let metadata: Option<MetadataAction> = manifest.metadata.as_ref()
+        .and_then(|s| serde_json::from_str(s).ok());
+
+    Some((cp_info, manifest, protocol, metadata))
 }

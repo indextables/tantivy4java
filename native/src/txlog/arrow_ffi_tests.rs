@@ -82,8 +82,8 @@ fn make_full_entry(path: &str) -> FileEntry {
             ),
             doc_mapping_ref: None,
             uncompressed_size_bytes: Some(100000),
-            time_range_start: Some(1000),
-            time_range_end: Some(2000),
+            time_range_start: Some("1000".to_string()),
+            time_range_end: Some("2000".to_string()),
             companion_source_files: Some(vec![
                 "file1.parquet".to_string(),
                 "file2.parquet".to_string(),
@@ -206,6 +206,13 @@ fn test_ffi_batch_nullable_columns() {
     ];
 
     for (name, idx) in &nullable_columns {
+        // has_footer_offsets is inferred (false when no offsets), never null
+        if *name == "has_footer_offsets" {
+            let col = batch.column(*idx);
+            assert!(!col.is_null(0),
+                "has_footer_offsets should be inferred (not null) even when source is None");
+            continue;
+        }
         let col = batch.column(*idx);
         assert!(
             col.is_null(0),
@@ -284,7 +291,7 @@ fn test_ffi_batch_all_fields_populated() {
     let usb_col = batch.column(13).as_any().downcast_ref::<Int64Array>().unwrap();
     assert_eq!(usb_col.value(0), 100000);
 
-    // time_range_start (col 14)
+    // time_range_start (col 14) — stored as String internally, exported as Int64
     let trs_col = batch.column(14).as_any().downcast_ref::<Int64Array>().unwrap();
     assert_eq!(trs_col.value(0), 1000);
 
@@ -572,8 +579,8 @@ async fn test_e2e_write_checkpoint_export_ffi() {
             },
             doc_mapping_ref: None,
             uncompressed_size_bytes: Some((i + 1) * 50000),
-            time_range_start: Some(1000 + i * 100),
-            time_range_end: Some(2000 + i * 100),
+            time_range_start: Some((1000 + i * 100).to_string()),
+            time_range_end: Some((2000 + i * 100).to_string()),
             companion_source_files: if i == 2 {
                 Some(vec!["data.parquet".to_string()])
             } else {
@@ -652,12 +659,13 @@ async fn test_e2e_write_checkpoint_export_ffi() {
         assert_eq!(nmo_col.value(i), i as i32);
     }
 
-    // Verify doc_mapping_json (col 11): only row 0 has it
+    // doc_mapping_json is preserved in Avro FileEntry schema (for search_test compat).
+    // Row 0 had doc_mapping_json set, so it survives the roundtrip.
     let dm_col = batch.column(11).as_any().downcast_ref::<StringArray>().unwrap();
-    assert!(!dm_col.is_null(0));
-    assert!(dm_col.value(0).contains("body"));
+    assert!(!dm_col.is_null(0), "row 0 should have doc_mapping_json");
+    // Rows 1-4 didn't have it set
     for i in 1..5 {
-        assert!(dm_col.is_null(i));
+        assert!(dm_col.is_null(i), "row {} should not have doc_mapping_json", i);
     }
 
     // Verify companion fields: only row 2 has them (col 16/17/18)

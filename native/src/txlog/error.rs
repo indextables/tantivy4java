@@ -33,6 +33,9 @@ pub enum TxLogError {
 
     #[error("Conditional write failed: version file already exists at {path}")]
     ConditionalWriteFailed { path: String },
+
+    #[error("Already exists: {0}")]
+    AlreadyExists(String),
 }
 
 impl From<serde_json::Error> for TxLogError {

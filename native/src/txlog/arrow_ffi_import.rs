@@ -212,8 +212,8 @@ fn extract_add_action(batch: &RecordBatch, row: usize) -> Result<AddAction> {
         doc_mapping_json: get_string(batch, "doc_mapping_json", row),
         doc_mapping_ref: get_string(batch, "doc_mapping_ref", row),
         uncompressed_size_bytes: get_i64(batch, "uncompressed_size_bytes", row),
-        time_range_start: get_i64(batch, "time_range_start", row),
-        time_range_end: get_i64(batch, "time_range_end", row),
+        time_range_start: get_i64(batch, "time_range_start", row).map(|v| v.to_string()),
+        time_range_end: get_i64(batch, "time_range_end", row).map(|v| v.to_string()),
         companion_source_files: get_string_list(batch, "companion_source_files", row),
         companion_delta_version: get_i64(batch, "companion_delta_version", row),
         companion_fast_field_mode: get_string(batch, "companion_fast_field_mode", row),
@@ -266,11 +266,11 @@ fn extract_skip_action(batch: &RecordBatch, row: usize) -> Result<SkipAction> {
         path: get_string_required(batch, "path", row)?,
         skip_timestamp: get_i64_or(batch, "skip_timestamp", row, 0),
         reason: get_string(batch, "reason", row).unwrap_or_default(),
-        operation: get_string(batch, "operation", row),
+        operation: get_string(batch, "operation", row).unwrap_or_default(),
         partition_values: get_json_map(batch, "partition_values", row),
         size: get_i64(batch, "size", row),
         retry_after: get_i64(batch, "retry_after", row),
-        skip_count: get_i32(batch, "skip_count", row),
+        skip_count: get_i32(batch, "skip_count", row).unwrap_or(1),
     })
 }
 

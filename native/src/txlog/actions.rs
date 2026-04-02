@@ -4,7 +4,18 @@
 // exact JSON serialization format for backward compatibility.
 
 use std::collections::HashMap;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
+
+/// Deserialize a field that may be null in JSON into a Default value.
+/// Handles the case where Scala writes `"field": null` instead of omitting it.
+fn deserialize_null_as_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Default + Deserialize<'de>,
+{
+    let opt = Option::deserialize(deserializer)?;
+    Ok(opt.unwrap_or_default())
+}
 
 // ============================================================================
 // Action envelope — wraps each action type for JSON line serialization
@@ -83,9 +94,9 @@ pub enum Action {
 pub struct ProtocolAction {
     pub min_reader_version: u32,
     pub min_writer_version: u32,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty", deserialize_with = "deserialize_null_as_default")]
     pub reader_features: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty", deserialize_with = "deserialize_null_as_default")]
     pub writer_features: Vec<String>,
 }
 
@@ -136,11 +147,11 @@ pub struct MetadataAction {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     pub schema_string: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_as_default")]
     pub partition_columns: Vec<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_as_default")]
     pub format: FormatSpec,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_as_default")]
     pub configuration: HashMap<String, String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub created_time: Option<i64>,
@@ -211,11 +222,11 @@ pub struct AddAction {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub uncompressed_size_bytes: Option<i64>,
 
-    // Time range
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub time_range_start: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub time_range_end: Option<i64>,
+    // Time range — accepts both String (ISO 8601, Scala) and integer (epoch ms, legacy)
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_string_or_int")]
+    pub time_range_start: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_string_or_int")]
+    pub time_range_end: Option<String>,
 
     // Companion mode
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -228,6 +239,60 @@ pub struct AddAction {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_one() -> i32 {
+    1
+}
+
+/// Deserialize a field that can be either a string or an integer.
+/// Integers are converted to their string representation.
+fn deserialize_string_or_int<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de;
+
+    struct StringOrInt;
+
+    impl<'de> de::Visitor<'de> for StringOrInt {
+        type Value = Option<String>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("a string, integer, or null")
+        }
+
+        fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
+            Ok(Some(v.to_string()))
+        }
+
+        fn visit_string<E: de::Error>(self, v: String) -> Result<Self::Value, E> {
+            Ok(Some(v))
+        }
+
+        fn visit_i64<E: de::Error>(self, v: i64) -> Result<Self::Value, E> {
+            Ok(Some(v.to_string()))
+        }
+
+        fn visit_u64<E: de::Error>(self, v: u64) -> Result<Self::Value, E> {
+            Ok(Some(v.to_string()))
+        }
+
+        fn visit_f64<E: de::Error>(self, v: f64) -> Result<Self::Value, E> {
+            // Format without scientific notation to ensure integer round-tripping
+            Ok(Some(format!("{:.0}", v)))
+        }
+    }
+
+    deserializer.deserialize_any(StringOrInt)
 }
 
 // ============================================================================
@@ -258,16 +323,16 @@ pub struct SkipAction {
     pub path: String,
     pub skip_timestamp: i64,
     pub reason: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub operation: Option<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub operation: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub partition_values: Option<HashMap<String, String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub size: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub retry_after: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub skip_count: Option<i32>,
+    #[serde(default = "default_one")]
+    pub skip_count: i32,
 }
 
 // ============================================================================
@@ -296,20 +361,55 @@ pub struct PartitionBounds {
 #[serde(rename_all = "camelCase")]
 pub struct ManifestInfo {
     pub path: String,
+    #[serde(alias = "numEntries")]
     pub file_count: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub partition_bounds: Option<PartitionBounds>,
+    // Scala compat fields
+    #[serde(default)]
+    pub min_added_at_version: i64,
+    #[serde(default)]
+    pub max_added_at_version: i64,
+    #[serde(default)]
+    pub tombstone_count: i64,
+    #[serde(default = "default_neg_one")]
+    pub live_entry_count: i64,
 }
+
+fn default_neg_one() -> i64 {
+    -1
+}
+
+impl Default for ManifestInfo {
+    fn default() -> Self {
+        Self {
+            path: String::new(),
+            file_count: 0,
+            partition_bounds: None,
+            min_added_at_version: 0,
+            max_added_at_version: 0,
+            tombstone_count: 0,
+            live_entry_count: -1,
+        }
+    }
+}
+
+/// State manifest filename constant — matches Scala's StateManifestIO.MANIFEST_FILE_NAME.
+pub const STATE_MANIFEST_FILENAME: &str = "_manifest.avro";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StateManifest {
+    #[serde(alias = "stateVersion")]
     pub version: i64,
     pub manifests: Vec<ManifestInfo>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub partition_bounds: Option<PartitionBounds>,
+    #[serde(alias = "createdAt")]
     pub created_time: i64,
+    #[serde(alias = "numFiles")]
     pub total_file_count: i64,
+    #[serde(default)]
     pub format: String,
     /// Cached protocol action JSON (so checkpoint is self-contained after TRUNCATE)
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -320,6 +420,19 @@ pub struct StateManifest {
     /// Schema registry for doc mapping deduplication — matches Scala StateManifest.schemaRegistry
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub schema_registry: HashMap<String, String>,
+    // --- Scala compat fields ---
+    /// Paths of removed files (applied during read to filter out dead entries)
+    #[serde(default)]
+    pub tombstones: Vec<String>,
+    /// State format version
+    #[serde(default)]
+    pub format_version: i32,
+    /// Total size of all live files in bytes
+    #[serde(default)]
+    pub total_bytes: i64,
+    /// Protocol version (4 = Avro state format)
+    #[serde(default)]
+    pub protocol_version: i32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -327,15 +440,20 @@ pub struct StateManifest {
 pub struct LastCheckpointInfo {
     pub version: i64,
     pub size: i64,
+    #[serde(default)]
+    pub size_in_bytes: i64,
+    #[serde(default)]
+    pub num_files: i64,
+    #[serde(default)]
+    pub created_time: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub size_in_bytes: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub num_files: Option<i64>,
-    pub format: String,
+    pub format: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub state_dir: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub created_time: Option<i64>,
+    pub parts: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checkpoint_id: Option<String>,
 }
 
 // ============================================================================
@@ -392,11 +510,11 @@ mod tests {
             path: "bad-split.split".to_string(),
             skip_timestamp: 1700000000000,
             reason: "merge".to_string(),
-            operation: Some("merge_v2".to_string()),
+            operation: "merge_v2".to_string(),
             partition_values: None,
             size: None,
             retry_after: Some(1700000060000),
-            skip_count: Some(3),
+            skip_count: 3,
         };
         let envelope = ActionEnvelope::from_action(&Action::MergeSkip(skip));
         let json = serde_json::to_string(&envelope).unwrap();
@@ -407,7 +525,7 @@ mod tests {
         match action {
             Action::MergeSkip(s) => {
                 assert_eq!(s.reason, "merge");
-                assert_eq!(s.skip_count, Some(3));
+                assert_eq!(s.skip_count, 3);
             }
             other => panic!("expected MergeSkip, got {:?}", other),
         }
@@ -425,16 +543,18 @@ mod tests {
         let info = LastCheckpointInfo {
             version: 42,
             size: 1000,
-            size_in_bytes: Some(50000),
-            num_files: Some(1000),
-            format: "avro-state".to_string(),
+            size_in_bytes: 50000,
+            num_files: 1000,
+            format: Some("avro-state".to_string()),
             state_dir: Some("state-v42".to_string()),
-            created_time: Some(1700000000000),
+            created_time: 1700000000000,
+            parts: None,
+            checkpoint_id: None,
         };
         let json = serde_json::to_string(&info).unwrap();
         let parsed: LastCheckpointInfo = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.version, 42);
-        assert_eq!(parsed.format, "avro-state");
+        assert_eq!(parsed.format, Some("avro-state".to_string()));
         assert_eq!(parsed.state_dir, Some("state-v42".to_string()));
     }
 }

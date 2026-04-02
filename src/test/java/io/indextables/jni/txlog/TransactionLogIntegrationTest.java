@@ -1851,6 +1851,111 @@ public class TransactionLogIntegrationTest {
     }
 
     // ========================================================================
+    // Regression: has_footer_offsets inferred when absent (issue #145)
+    // ========================================================================
+
+    @Test
+    @Order(38)
+    @DisplayName("has_footer_offsets inferred from actual offsets when flag absent")
+    void testHasFooterOffsetsInferredWhenAbsent() throws Exception {
+        Path dir = Files.createTempDirectory("txlog-footer-infer");
+        Files.createDirectories(dir.resolve("_transaction_log"));
+        String table = "file://" + dir.toAbsolutePath();
+
+        try {
+            // Write an add with footer offsets but WITHOUT has_footer_offsets flag
+            Map<String, Object> add = new LinkedHashMap<>();
+            add.put("path", "footer-test.split");
+            add.put("partitionValues", Map.of());
+            add.put("size", 50000);
+            add.put("modificationTime", 1700000000000L);
+            add.put("dataChange", true);
+            add.put("numRecords", 100);
+            add.put("footerStartOffset", 49000);
+            add.put("footerEndOffset", 50000);
+            // Deliberately NOT setting has_footer_offsets
+
+            String addsJson = MAPPER.writeValueAsString(List.of(add));
+            TransactionLogWriter.addFiles(table, config, addsJson);
+
+            // Checkpoint and read back through Avro roundtrip
+            String metadataJson = MAPPER.writeValueAsString(Map.of(
+                "id", "footer-test", "schemaString", "{}",
+                "partitionColumns", List.of(),
+                "format", Map.of("provider", "parquet"),
+                "configuration", Map.of()));
+            String protocolJson = MAPPER.writeValueAsString(Map.of(
+                "minReaderVersion", 4, "minWriterVersion", 4));
+
+            TransactionLogWriter.createCheckpoint(table, config, addsJson, metadataJson, protocolJson);
+
+            TxLogSnapshotInfo info = TransactionLogReader.getSnapshotInfo(table, config);
+            List<TxLogFileEntry> entries = new ArrayList<>();
+            for (String mp : info.getManifestPaths()) {
+                entries.addAll(TransactionLogReader.readManifest(
+                    table, config, info.getStateDir(), mp, null));
+            }
+
+            assertEquals(1, entries.size());
+            TxLogFileEntry entry = entries.get(0);
+
+            // Footer offsets should survive the Avro roundtrip
+            assertEquals(49000, entry.getFooterStartOffset(),
+                "footerStartOffset should survive Avro roundtrip");
+            assertEquals(50000, entry.getFooterEndOffset(),
+                "footerEndOffset should survive Avro roundtrip");
+            // has_footer_offsets should be inferred as true from the actual offset values
+            assertTrue(entry.getHasFooterOffsets(),
+                "has_footer_offsets should be inferred true when offsets are present");
+        } finally {
+            deleteRecursively(dir.toFile());
+        }
+    }
+
+    @Test
+    @Order(39)
+    @DisplayName("has_footer_offsets false when no offsets present")
+    void testHasFooterOffsetsFalseWhenNoOffsets() throws Exception {
+        Path dir = Files.createTempDirectory("txlog-footer-none");
+        Files.createDirectories(dir.resolve("_transaction_log"));
+        String table = "file://" + dir.toAbsolutePath();
+
+        try {
+            // Write an add WITHOUT any footer offset fields
+            Map<String, Object> add = makeAddAction("no-footer.split", 5000, 50);
+
+            String addsJson = MAPPER.writeValueAsString(List.of(add));
+            TransactionLogWriter.addFiles(table, config, addsJson);
+
+            String metadataJson = MAPPER.writeValueAsString(Map.of(
+                "id", "no-footer-test", "schemaString", "{}",
+                "partitionColumns", List.of(),
+                "format", Map.of("provider", "parquet"),
+                "configuration", Map.of()));
+            String protocolJson = MAPPER.writeValueAsString(Map.of(
+                "minReaderVersion", 4, "minWriterVersion", 4));
+
+            TransactionLogWriter.createCheckpoint(table, config, addsJson, metadataJson, protocolJson);
+
+            TxLogSnapshotInfo info = TransactionLogReader.getSnapshotInfo(table, config);
+            List<TxLogFileEntry> entries = new ArrayList<>();
+            for (String mp : info.getManifestPaths()) {
+                entries.addAll(TransactionLogReader.readManifest(
+                    table, config, info.getStateDir(), mp, null));
+            }
+
+            assertEquals(1, entries.size());
+            TxLogFileEntry entry = entries.get(0);
+
+            // No footer offsets → has_footer_offsets should be false
+            assertFalse(entry.getHasFooterOffsets(),
+                "has_footer_offsets should be false when no offsets present");
+        } finally {
+            deleteRecursively(dir.toFile());
+        }
+    }
+
+    // ========================================================================
     // Helpers
     // ========================================================================
 

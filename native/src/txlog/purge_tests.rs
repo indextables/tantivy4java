@@ -119,11 +119,13 @@ async fn write_last_checkpoint(storage: &TxLogStorage, version: i64, state_dir: 
     let cp = LastCheckpointInfo {
         version,
         size: 1,
-        size_in_bytes: None,
-        num_files: None,
-        format: "avro-state".to_string(),
+        size_in_bytes: 0,
+        num_files: 0,
+        format: Some("avro-state".to_string()),
         state_dir: Some(state_dir.to_string()),
-        created_time: Some(1700000000000),
+        created_time: 1700000000000,
+        parts: None,
+        checkpoint_id: None,
     };
     let json = serde_json::to_vec(&cp).unwrap();
     storage.put("_last_checkpoint", Bytes::from(json)).await.unwrap();

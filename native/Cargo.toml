@@ -1,6 +1,6 @@
 [package]
 name = "tantivy4java"
-version = "0.34.0"
+version = "0.34.1"
 edition = "2021"
 license = "Apache-2.0"
 authors = ["Tantivy4Java Contributors"]
@@ -78,7 +78,7 @@ xxhash-rust = { version = "0.8", features = ["xxh64"] }
 regex = "1"
 
 # Transaction log (Avro state format for indextables txlog)
-apache-avro = "0.21"
+apache-avro = { version = "0.21", features = ["zstandard"] }
 sha2 = "0.10"
 flate2 = "1"
 thiserror = "1"

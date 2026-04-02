@@ -179,8 +179,8 @@ mod tests {
                     path: "bad.split".to_string(),
                     skip_timestamp: 0,
                     reason: "merge".to_string(),
-                    operation: None, partition_values: None, size: None,
-                    retry_after: None, skip_count: Some(1),
+                    operation: String::new(), partition_values: None, size: None,
+                    retry_after: None, skip_count: 1,
                 }),
             ]),
         ];

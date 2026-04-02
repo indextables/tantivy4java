@@ -24,6 +24,7 @@ pub mod purge;
 pub mod schema_dedup;
 pub mod serialization;
 pub mod storage;
+pub mod streaming;
 pub mod tombstone_distributor;
 pub mod version_file;
 
@@ -31,5 +32,7 @@ pub mod version_file;
 mod arrow_ffi_tests;
 #[cfg(test)]
 mod integration_tests;
+#[cfg(test)]
+mod protocol_regression_tests;
 #[cfg(test)]
 mod purge_tests;

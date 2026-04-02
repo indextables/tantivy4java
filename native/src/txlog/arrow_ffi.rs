@@ -120,12 +120,17 @@ pub fn file_entries_to_record_batch(
         num_records_builder.append_option(add.num_records);
         footer_start_builder.append_option(add.footer_start_offset);
         footer_end_builder.append_option(add.footer_end_offset);
-        has_footer_offsets_builder.append_option(add.has_footer_offsets);
+        // Infer has_footer_offsets from actual offset values when not explicitly set
+        let has_footer = add.has_footer_offsets.unwrap_or_else(|| {
+            add.footer_start_offset.map(|s| s > 0).unwrap_or(false)
+                && add.footer_end_offset.map(|e| e > 0).unwrap_or(false)
+        });
+        has_footer_offsets_builder.append_option(Some(has_footer));
         delete_opstamp_builder.append_option(add.delete_opstamp);
         num_merge_ops_builder.append_option(add.num_merge_ops);
         uncomp_size_builder.append_option(add.uncompressed_size_bytes);
-        time_start_builder.append_option(add.time_range_start);
-        time_end_builder.append_option(add.time_range_end);
+        time_start_builder.append_option(add.time_range_start.as_ref().and_then(|s| s.parse::<i64>().ok()));
+        time_end_builder.append_option(add.time_range_end.as_ref().and_then(|s| s.parse::<i64>().ok()));
         comp_delta_ver_builder.append_option(add.companion_delta_version);
 
         match &add.doc_mapping_json {

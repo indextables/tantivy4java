@@ -123,6 +123,10 @@ pub async unsafe fn list_files_arrow_ffi(
             path: mp.path.clone(),
             file_count: mp.file_count,
             partition_bounds: mp.partition_bounds.clone(),
+            min_added_at_version: 0,
+            max_added_at_version: 0,
+            tombstone_count: 0,
+            live_entry_count: -1,
         }
     }).collect();
 
@@ -148,6 +152,15 @@ pub async unsafe fn list_files_arrow_ffi(
             table_path, config, &snapshot.state_dir, &manifest.path, &metadata_config,
         ).await?;
         checkpoint_entries.extend(entries);
+    }
+
+    // 3b. Apply checkpoint tombstones (from incremental checkpoints)
+    if !snapshot.tombstones.is_empty() {
+        let tombstone_set: HashSet<String> = snapshot.tombstones.iter().cloned().collect();
+        let before = checkpoint_entries.len();
+        checkpoint_entries.retain(|e| !tombstone_set.contains(&e.add.path));
+        crate::debug_println!("📖 LIST_FILES: Applied {} checkpoint tombstones, {} → {} entries",
+            snapshot.tombstones.len(), before, checkpoint_entries.len());
     }
 
     // 4. Read post-checkpoint changes and merge

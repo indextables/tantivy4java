@@ -73,7 +73,7 @@ pub async fn garbage_collect(
         //
         // For simplicity and correctness, we check the checkpoint's created_time.
         // If checkpoint is recent but retention is long, we won't delete.
-        let checkpoint_age_ms = last_cp.created_time.map(|ct| now_ms - ct).unwrap_or(0);
+        let checkpoint_age_ms = if last_cp.created_time > 0 { now_ms - last_cp.created_time } else { 0 };
         if checkpoint_age_ms >= retention_ms {
             let path = TxLogStorage::version_path(*version);
             match storage.delete(&path).await {
@@ -105,11 +105,11 @@ pub async fn garbage_collect(
             continue;
         }
 
-        // Try to read the _manifest to check created_time
-        let manifest_path = format!("{}/_manifest", state_dir);
+        // Try to read the _manifest.avro to check created_time
+        let manifest_path = format!("{}/{}", state_dir, super::actions::STATE_MANIFEST_FILENAME);
         let should_delete = match storage.get(&manifest_path).await {
             Ok(data) => {
-                match serde_json::from_slice::<super::actions::StateManifest>(&data) {
+                match super::avro::state_reader::parse_state_manifest(&data) {
                     Ok(manifest) => {
                         let age_ms = now_ms - manifest.created_time;
                         age_ms >= cp_retention_ms

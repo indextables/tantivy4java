@@ -3,6 +3,7 @@ name: CI
 on:
   push:
     branches: [main]
+  pull_request:
   workflow_dispatch:
 
 jobs:
@@ -27,6 +28,9 @@ jobs:
       - name: Test
         run: make test
 
+      - name: Rust tests
+        run: cd native && cargo test --lib --tests
+
   build-and-test-linux:
     name: Build & Test (Linux X64)
     runs-on: [self-hosted, Linux, X64]
@@ -46,3 +50,6 @@ jobs:
 
       - name: Test
         run: make test
+
+      - name: Rust tests
+        run: cd native && cargo test --lib --tests
