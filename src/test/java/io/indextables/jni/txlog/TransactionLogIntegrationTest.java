@@ -1956,6 +1956,177 @@ public class TransactionLogIntegrationTest {
     }
 
     // ========================================================================
+    // Concurrency Config Tests
+    // ========================================================================
+
+    @Test
+    @Order(40)
+    @DisplayName("max_concurrent_reads config key is accepted and produces correct results")
+    void testMaxConcurrentReadsConfig() throws Exception {
+        Path dir = Files.createTempDirectory("txlog-concurrent-config");
+        Files.createDirectories(dir.resolve("_transaction_log"));
+        String table = "file://" + dir.toAbsolutePath();
+
+        try {
+            // Write 10 version files
+            for (int i = 0; i < 10; i++) {
+                String addsJson = MAPPER.writeValueAsString(List.of(
+                    makeAddAction("split-" + i + ".split", 1000 + i, i)));
+                TransactionLogWriter.addFiles(table, config, addsJson);
+            }
+
+            // Create checkpoint at version 5 so later tests exercise post-checkpoint reads
+            String metadataJson = MAPPER.writeValueAsString(Map.of(
+                "id", "concurrent-config-table", "schemaString", "{}",
+                "partitionColumns", List.of(),
+                "format", Map.of("provider", "parquet"),
+                "configuration", Map.of()));
+            String protocolJson = MAPPER.writeValueAsString(Map.of(
+                "minReaderVersion", 4, "minWriterVersion", 4));
+
+            // Disable auto-checkpoint so we control it
+            Map<String, String> noCpConfig = new HashMap<>(config);
+            noCpConfig.put("checkpoint_interval", "0");
+
+            // Re-write to the table without auto-checkpoint
+            Path dir2 = Files.createTempDirectory("txlog-concurrent-config-2");
+            Files.createDirectories(dir2.resolve("_transaction_log"));
+            String table2 = "file://" + dir2.toAbsolutePath();
+            try {
+                List<Map<String, Object>> checkpointEntries = new ArrayList<>();
+                for (int i = 0; i < 5; i++) {
+                    String addsJson = MAPPER.writeValueAsString(List.of(
+                        makeAddAction("split-cp-" + i + ".split", 1000 + i, i)));
+                    TransactionLogWriter.addFiles(table2, noCpConfig, addsJson);
+                    checkpointEntries.add(makeAddAction("split-cp-" + i + ".split", 1000 + i, i));
+                }
+
+                // Create explicit checkpoint
+                TransactionLogWriter.createCheckpoint(table2, noCpConfig,
+                    MAPPER.writeValueAsString(checkpointEntries), metadataJson, protocolJson);
+
+                // Write 5 more post-checkpoint versions
+                for (int i = 5; i < 10; i++) {
+                    String addsJson = MAPPER.writeValueAsString(List.of(
+                        makeAddAction("split-cp-" + i + ".split", 1000 + i, i)));
+                    TransactionLogWriter.addFiles(table2, noCpConfig, addsJson);
+                }
+
+                // Test with max_concurrent_reads = 1 (fully serial) — correctness must hold
+                Map<String, String> serial = new HashMap<>(noCpConfig);
+                serial.put("max_concurrent_reads", "1");
+                TxLogSnapshotInfo infoSerial = TransactionLogReader.getSnapshotInfo(table2, serial);
+                assertNotNull(infoSerial);
+                assertEquals(5, infoSerial.getPostCheckpointPaths().size(),
+                    "Serial mode should read 5 post-checkpoint versions");
+
+                // Test with max_concurrent_reads = 4 — same result
+                Map<String, String> parallel4 = new HashMap<>(noCpConfig);
+                parallel4.put("max_concurrent_reads", "4");
+                TxLogSnapshotInfo infoParallel4 = TransactionLogReader.getSnapshotInfo(table2, parallel4);
+                assertNotNull(infoParallel4);
+                assertEquals(5, infoParallel4.getPostCheckpointPaths().size(),
+                    "Parallel-4 mode should also read 5 post-checkpoint versions");
+
+                // Test with max_concurrent_reads = 64 — same result
+                Map<String, String> parallel64 = new HashMap<>(noCpConfig);
+                parallel64.put("max_concurrent_reads", "64");
+                TxLogSnapshotInfo infoParallel64 = TransactionLogReader.getSnapshotInfo(table2, parallel64);
+                assertEquals(5, infoParallel64.getPostCheckpointPaths().size(),
+                    "Parallel-64 mode should also read 5 post-checkpoint versions");
+
+                // All three modes must return identical post-checkpoint path sets
+                assertEquals(
+                    new HashSet<>(infoSerial.getPostCheckpointPaths()),
+                    new HashSet<>(infoParallel4.getPostCheckpointPaths()),
+                    "Serial and parallel-4 must return the same paths");
+                assertEquals(
+                    new HashSet<>(infoParallel4.getPostCheckpointPaths()),
+                    new HashSet<>(infoParallel64.getPostCheckpointPaths()),
+                    "Parallel-4 and parallel-64 must return the same paths");
+
+                // Verify the post-checkpoint changes are read correctly with each concurrency setting
+                String versionPathsJson = MAPPER.writeValueAsString(infoSerial.getPostCheckpointPaths());
+                TxLogChanges changesSerial = TransactionLogReader.readPostCheckpointChanges(
+                    table2, serial, versionPathsJson, null);
+                TxLogChanges changesParallel = TransactionLogReader.readPostCheckpointChanges(
+                    table2, parallel64, versionPathsJson, null);
+                assertEquals(changesSerial.getAddedFiles().size(),
+                    changesParallel.getAddedFiles().size(),
+                    "readPostCheckpointChanges must return same count regardless of concurrency");
+
+            } finally {
+                deleteRecursively(dir2.toFile());
+            }
+        } finally {
+            deleteRecursively(dir.toFile());
+        }
+    }
+
+    @Test
+    @Order(41)
+    @DisplayName("Cache config keys (capacity, TTL, enabled) are accepted from config map")
+    void testCacheConfigKeys() throws Exception {
+        Path dir = Files.createTempDirectory("txlog-cache-config");
+        Files.createDirectories(dir.resolve("_transaction_log"));
+        String table = "file://" + dir.toAbsolutePath();
+
+        try {
+            // Write and checkpoint
+            String addsJson = MAPPER.writeValueAsString(List.of(
+                makeAddAction("split-cache-a.split", 1000, 10),
+                makeAddAction("split-cache-b.split", 2000, 20)));
+            TransactionLogWriter.addFiles(table, config, addsJson);
+
+            String metadataJson = MAPPER.writeValueAsString(Map.of(
+                "id", "cache-config-table", "schemaString", "{}",
+                "partitionColumns", List.of(),
+                "format", Map.of("provider", "parquet"),
+                "configuration", Map.of()));
+            String protocolJson = MAPPER.writeValueAsString(Map.of(
+                "minReaderVersion", 4, "minWriterVersion", 4));
+
+            Map<String, String> noCpConfig = new HashMap<>(config);
+            noCpConfig.put("checkpoint_interval", "0");
+            TransactionLogWriter.createCheckpoint(table, noCpConfig, addsJson, metadataJson, protocolJson);
+
+            // Config with all cache-tuning keys set — must still return correct results
+            Map<String, String> tunedConfig = new HashMap<>(noCpConfig);
+            tunedConfig.put("cache.version.capacity", "500");
+            tunedConfig.put("cache.snapshot.capacity", "50");
+            tunedConfig.put("cache.file_list.capacity", "25");
+            tunedConfig.put("cache.version.ttl.ms", "60000");
+            tunedConfig.put("cache.snapshot.ttl.ms", "120000");
+            tunedConfig.put("cache.metadata.ttl.ms", "300000");
+            tunedConfig.put("max_concurrent_reads", "8");
+
+            TxLogSnapshotInfo info = TransactionLogReader.getSnapshotInfo(table, tunedConfig);
+            assertNotNull(info, "Snapshot info must succeed with tuned cache config");
+            assertTrue(info.getCheckpointVersion() >= 0);
+            assertFalse(info.getManifestPaths().isEmpty(), "Must have manifests");
+
+            // Read all manifests — correctness must hold with custom cache config
+            List<TxLogFileEntry> entries = new ArrayList<>();
+            for (String mp : info.getManifestPaths()) {
+                entries.addAll(TransactionLogReader.readManifest(
+                    table, tunedConfig, info.getStateDir(), mp, null));
+            }
+            assertEquals(2, entries.size(), "Must read 2 file entries with tuned cache config");
+
+            // With cache disabled — same results
+            Map<String, String> noCache = new HashMap<>(noCpConfig);
+            noCache.put("cache.enabled", "false");
+            TxLogSnapshotInfo infoNoCaching = TransactionLogReader.getSnapshotInfo(table, noCache);
+            assertNotNull(infoNoCaching);
+            assertEquals(info.getCheckpointVersion(), infoNoCaching.getCheckpointVersion(),
+                "Disabled cache must return same checkpoint version as enabled cache");
+
+        } finally {
+            deleteRecursively(dir.toFile());
+        }
+    }
+
+    // ========================================================================
     // Helpers
     // ========================================================================
 

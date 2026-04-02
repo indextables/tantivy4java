@@ -1,6 +1,6 @@
 [package]
 name = "tantivy4java"
-version = "0.34.1"
+version = "0.34.2"
 edition = "2021"
 license = "Apache-2.0"
 authors = ["Tantivy4Java Contributors"]
@@ -83,6 +83,7 @@ sha2 = "0.10"
 flate2 = "1"
 thiserror = "1"
 parking_lot = "0.12"
+moka = { version = "0.12", features = ["sync"] }
 
 # Delta Lake table file listing via delta-kernel-rs
 delta_kernel = { version = "0.19", features = ["default-engine-rustls", "arrow"] }

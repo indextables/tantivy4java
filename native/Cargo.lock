@@ -7134,7 +7134,7 @@ dependencies = [
 
 [[package]]
 name = "tantivy4java"
-version = "0.34.1"
+version = "0.34.2"
 dependencies = [
  "anyhow",
  "apache-avro",
@@ -7163,6 +7163,7 @@ dependencies = [
  "lru 0.12.5",
  "lz4_flex 0.11.5",
  "memmap2",
+ "moka",
  "num_cpus",
  "object_store",
  "once_cell",
