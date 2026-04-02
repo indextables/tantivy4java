@@ -81,19 +81,27 @@ pub async fn write_state_directory(
         let manifest_relative_path = format!("manifests/manifest-{}.avro", manifest_id);
         let avro_bytes = manifest_writer::write_manifest_bytes(group)?;
 
-        // Write manifest with put_if_absent for conflict detection.
-        // AlreadyExists is handled by TxLogStorage (returns Ok(false)); any Err here is a real storage failure.
+        // Write manifest data file with put_if_absent. Content-addressed by UUID, so
+        // collisions are astronomically unlikely. If one does occur (Ok(false)), we proceed
+        // with the existing file — it would have different content, but the _manifest.avro
+        // commit point below will fail if another writer already committed this version,
+        // preventing any inconsistency. Note: if _manifest.avro fails (AlreadyExists),
+        // these manifest data files become orphans — acceptable storage leak cleaned by purge.
         storage.put_if_absent(&manifest_relative_path, Bytes::from(avro_bytes)).await?;
 
         // Compute partition bounds for this manifest
         let bounds = compute_partition_bounds(group, &metadata.partition_columns);
 
+        // min/max safe: group guaranteed non-empty by the is_empty() check above
+        let min_version = group.iter().map(|e| e.added_at_version).min().unwrap_or(0);
+        let max_version = group.iter().map(|e| e.added_at_version).max().unwrap_or(0);
+
         manifest_infos.push(ManifestInfo {
             path: manifest_relative_path,
             file_count: group.len() as i64,
             partition_bounds: bounds,
-            min_added_at_version: group.iter().map(|e| e.added_at_version).min().unwrap(), // safe: group is non-empty
-            max_added_at_version: group.iter().map(|e| e.added_at_version).max().unwrap(), // safe: group is non-empty
+            min_added_at_version: min_version,
+            max_added_at_version: max_version,
             tombstone_count: 0,
             live_entry_count: group.len() as i64,
         });
@@ -132,8 +140,9 @@ pub async fn write_state_directory(
     let manifest_path = format!("{}/{}", state_dir, STATE_MANIFEST_FILENAME);
     let written = storage.put_if_absent(&manifest_path, Bytes::from(avro_bytes)).await?;
     if !written {
-        return Err(TxLogError::Storage(anyhow::anyhow!(
-            "State manifest already exists at {}, concurrent write detected", manifest_path)));
+        // Another writer already committed this version. Return an error so callers
+        // can decide how to handle it (e.g., retry at a higher version or skip).
+        return Err(TxLogError::AlreadyExists(manifest_path));
     }
 
     let last_checkpoint = LastCheckpointInfo {
@@ -202,17 +211,21 @@ pub async fn write_incremental_state_directory(
             let avro_bytes = manifest_writer::write_manifest_bytes(group)?;
             total_size_bytes += group.iter().map(|e| e.add.size).sum::<i64>();
 
-            // AlreadyExists handled by TxLogStorage (Ok(false)); any Err is a real failure.
+            // Content-addressed by UUID — collision astronomically unlikely.
+            // If _manifest.avro commit fails, these become orphans (cleaned by purge).
             storage.put_if_absent(&manifest_relative_path, Bytes::from(avro_bytes)).await?;
 
             let bounds = compute_partition_bounds(group, &metadata.partition_columns);
+
+            let min_version = group.iter().map(|e| e.added_at_version).min().unwrap_or(0);
+            let max_version = group.iter().map(|e| e.added_at_version).max().unwrap_or(0);
 
             manifest_infos.push(ManifestInfo {
                 path: manifest_relative_path,
                 file_count: group.len() as i64,
                 partition_bounds: bounds,
-                min_added_at_version: group.iter().map(|e| e.added_at_version).min().unwrap(), // safe: non-empty
-                max_added_at_version: group.iter().map(|e| e.added_at_version).max().unwrap(), // safe: non-empty
+                min_added_at_version: min_version,
+                max_added_at_version: max_version,
                 tombstone_count: 0,
                 live_entry_count: group.len() as i64,
             });
@@ -256,8 +269,7 @@ pub async fn write_incremental_state_directory(
     let manifest_path = format!("{}/{}", state_dir, STATE_MANIFEST_FILENAME);
     let written = storage.put_if_absent(&manifest_path, Bytes::from(avro_bytes)).await?;
     if !written {
-        return Err(TxLogError::Storage(anyhow::anyhow!(
-            "Incremental state manifest already exists at {}, concurrent write detected", manifest_path)));
+        return Err(TxLogError::AlreadyExists(manifest_path));
     }
 
     let last_checkpoint = LastCheckpointInfo {
@@ -458,13 +470,14 @@ fn compute_partition_bounds(
 }
 
 fn current_timestamp_ms() -> i64 {
+    // SystemTime::now() can only fail if the clock is before UNIX_EPOCH,
+    // which indicates a fundamentally broken system clock. Default to 0
+    // as a safe sentinel rather than panicking — checkpoint ordering uses
+    // version numbers, not timestamps, so a 0 timestamp is benign.
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
-        .unwrap_or_else(|_| {
-            debug_println!("⚠️ STATE_WRITER: SystemTime::now() failed, using epoch 0");
-            0
-        })
+        .unwrap_or(0)
 }
 
 /// Write _last_checkpoint only if this version is newer than the existing one.

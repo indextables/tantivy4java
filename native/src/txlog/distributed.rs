@@ -833,17 +833,22 @@ pub async fn write_checkpoint(
     let version = storage.list_versions().await?
         .last().copied().unwrap_or(0);
 
-    let result = super::avro::state_writer::write_state_checkpoint(
-        &storage,
-        version,
-        &entries,
-        &protocol,
-        &metadata,
-    ).await?;
-
-    // Invalidate cache after checkpoint write
-    cache::invalidate_table_cache(table_path);
-    Ok(result)
+    match super::avro::state_writer::write_state_checkpoint(
+        &storage, version, &entries, &protocol, &metadata,
+    ).await {
+        Ok(result) => {
+            cache::invalidate_table_cache(table_path);
+            Ok(result)
+        }
+        Err(super::error::TxLogError::AlreadyExists(_)) => {
+            // Checkpoint already exists at this version (e.g., auto-checkpoint wrote it).
+            // Read the existing state manifest directly — _last_checkpoint may not yet
+            // be updated by the winning writer (TOCTOU window).
+            debug_println!("📊 DISTRIBUTED: checkpoint already exists at v{}, reading existing", version);
+            read_existing_checkpoint_info(&storage, version).await
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// Create an Avro state checkpoint at a specific version.
@@ -859,16 +864,46 @@ pub async fn write_checkpoint_at_version(
 ) -> Result<LastCheckpointInfo> {
     let storage = TxLogStorage::new(table_path, config)?;
 
-    let result = super::avro::state_writer::write_state_checkpoint(
-        &storage,
-        version,
-        &entries,
-        &protocol,
-        &metadata,
-    ).await?;
+    match super::avro::state_writer::write_state_checkpoint(
+        &storage, version, &entries, &protocol, &metadata,
+    ).await {
+        Ok(result) => {
+            cache::invalidate_table_cache(table_path);
+            Ok(result)
+        }
+        Err(super::error::TxLogError::AlreadyExists(_)) => {
+            // Checkpoint already exists — concurrent or auto-checkpoint wrote it first.
+            debug_println!("📊 DISTRIBUTED: checkpoint already exists at v{}, reading existing", version);
+            read_existing_checkpoint_info(&storage, version).await
+        }
+        Err(e) => Err(e),
+    }
+}
 
-    cache::invalidate_table_cache(table_path);
-    Ok(result)
+/// Read checkpoint info from an existing state manifest at a given version.
+///
+/// Used when our checkpoint write was rejected (AlreadyExists). Reads the winning
+/// writer's `_manifest.avro` directly rather than `_last_checkpoint`, because
+/// `_last_checkpoint` may not yet be updated (TOCTOU window between the winning
+/// writer's `_manifest.avro` write and its `_last_checkpoint` update).
+async fn read_existing_checkpoint_info(
+    storage: &TxLogStorage,
+    version: i64,
+) -> Result<LastCheckpointInfo> {
+    let state_dir = TxLogStorage::state_dir_name(version);
+    let manifest = super::avro::state_reader::read_state_manifest(storage, &state_dir).await?;
+
+    Ok(LastCheckpointInfo {
+        version,
+        size: manifest.total_file_count,
+        size_in_bytes: manifest.total_bytes,
+        num_files: manifest.total_file_count,
+        format: Some(manifest.format),
+        state_dir: Some(state_dir),
+        created_time: manifest.created_time,
+        parts: None,
+        checkpoint_id: None,
+    })
 }
 
 // ============================================================================
