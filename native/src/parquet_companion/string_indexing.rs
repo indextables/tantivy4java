@@ -16,6 +16,9 @@ pub const UUID_REGEX: &str = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9
 /// Suffix appended to the original field name to create the companion hash field.
 pub const COMPANION_SUFFIX: &str = "__uuids";
 
+/// Suffix appended to the original field name to create the text companion field.
+pub const TEXT_COMPANION_SUFFIX: &str = "__text";
+
 /// Compact string indexing mode for a field.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "mode", rename_all = "snake_case")]
@@ -35,6 +38,9 @@ pub enum StringIndexingMode {
     /// Strip custom regex matches from text, index remaining text with "default" tokenizer.
     /// Matches are discarded.
     TextCustomStrip { regex: String },
+    /// Dual-field indexing: primary field uses "raw" tokenizer for exact string matching,
+    /// secondary `<field>__text` field uses "default" tokenizer for full-text search.
+    TextAndString,
 }
 
 /// Metadata about a companion hash field created for a string indexing mode.
@@ -55,6 +61,7 @@ pub fn parse_tokenizer_override(value: &str) -> Option<StringIndexingMode> {
         "exact_only" => Some(StringIndexingMode::ExactOnly),
         "text_uuid_exactonly" => Some(StringIndexingMode::TextUuidExactonly),
         "text_uuid_strip" => Some(StringIndexingMode::TextUuidStrip),
+        "text_and_string" => Some(StringIndexingMode::TextAndString),
         _ => {
             if let Some(regex) = value.strip_prefix("text_custom_exactonly:") {
                 if !regex.is_empty() {
@@ -80,13 +87,18 @@ pub fn companion_field_name(original: &str) -> String {
     format!("{}{}", original, COMPANION_SUFFIX)
 }
 
+/// Build the text companion field name for a given original field name.
+pub fn text_companion_field_name(field_name: &str) -> String {
+    format!("{}{}", field_name, TEXT_COMPANION_SUFFIX)
+}
+
 /// Get the regex pattern for a string indexing mode.
 ///
 /// Returns the UUID regex for uuid variants, the custom regex for custom variants,
 /// and None for ExactOnly (which has no regex pattern).
 pub fn regex_pattern(mode: &StringIndexingMode) -> Option<&str> {
     match mode {
-        StringIndexingMode::ExactOnly => None,
+        StringIndexingMode::ExactOnly | StringIndexingMode::TextAndString => None,
         StringIndexingMode::TextUuidExactonly | StringIndexingMode::TextUuidStrip => Some(UUID_REGEX),
         StringIndexingMode::TextCustomExactonly { regex } | StringIndexingMode::TextCustomStrip { regex } => {
             Some(regex.as_str())
@@ -371,5 +383,31 @@ mod tests {
         let (stripped, matches) = extract_pattern(text, &re);
         assert_eq!(stripped, "no matches here");
         assert!(matches.is_empty());
+    }
+
+    #[test]
+    fn test_parse_text_and_string() {
+        assert_eq!(
+            parse_tokenizer_override("text_and_string"),
+            Some(StringIndexingMode::TextAndString)
+        );
+    }
+
+    #[test]
+    fn test_text_companion_field_name() {
+        assert_eq!(text_companion_field_name("message"), "message__text");
+    }
+
+    #[test]
+    fn test_regex_pattern_text_and_string() {
+        assert_eq!(regex_pattern(&StringIndexingMode::TextAndString), None);
+    }
+
+    #[test]
+    fn test_serde_roundtrip_text_and_string() {
+        let mode = StringIndexingMode::TextAndString;
+        let json = serde_json::to_string(&mode).unwrap();
+        let parsed: StringIndexingMode = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, mode);
     }
 }

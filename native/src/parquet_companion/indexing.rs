@@ -1089,6 +1089,18 @@ pub(crate) fn add_string_value_to_doc(
                     doc.add_text(field, val);
                 }
             }
+            StringIndexingMode::TextAndString => {
+                // Primary field: raw string value
+                doc.add_text(field, val);
+                // Secondary field: tokenized text companion
+                let text_name = string_indexing::text_companion_field_name(field_name);
+                if let Ok(text_field) = tantivy_schema.get_field(&text_name) {
+                    doc.add_text(text_field, val);
+                }
+                if let Some(acc) = accumulators.get_mut(field_name) {
+                    acc.observe_string(val);
+                }
+            }
         }
     } else {
         // Standard text field path
@@ -3393,5 +3405,125 @@ mod tests {
             "_phash_name should exist (not excluded)");
         assert!(schema.get_field(&format!("{}category", PHASH_FIELD_PREFIX)).is_err(),
             "_phash_category should NOT exist (excluded)");
+    }
+
+    // ── TextAndString integration test ──────────────────────────────────
+
+    /// Helper: create a parquet file with id (Int64) and message (Utf8) columns
+    /// for text_and_string indexing mode tests.
+    fn write_test_parquet_for_text_and_string(path: &std::path::Path, messages: &[&str]) {
+        use arrow_array::*;
+        use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+        use parquet::arrow::ArrowWriter;
+        use std::sync::Arc;
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("message", DataType::Utf8, false),
+        ]));
+
+        let ids: Vec<i64> = (0..messages.len()).map(|i| i as i64).collect();
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(ids)),
+                Arc::new(StringArray::from(messages.to_vec())),
+            ],
+        ).unwrap();
+
+        let file = std::fs::File::create(path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+    }
+
+    /// Integration test: create a split with text_and_string indexing mode and verify
+    /// both exact (raw) and tokenized (default) searches work.
+    #[tokio::test]
+    async fn test_create_split_with_text_and_string_indexing() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let parquet_path = temp_dir.path().join("tas.parquet");
+        let output_path = temp_dir.path().join("tas.split");
+
+        let messages = &[
+            "the quick brown fox",
+            "hello world",
+            "the lazy dog sleeps",
+        ];
+        write_test_parquet_for_text_and_string(&parquet_path, messages);
+
+        let mut tokenizer_overrides = HashMap::new();
+        tokenizer_overrides.insert("message".to_string(), "text_and_string".to_string());
+
+        let config = CreateFromParquetConfig {
+            table_root: temp_dir.path().to_string_lossy().to_string(),
+            schema_config: SchemaDerivationConfig {
+                tokenizer_overrides,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let storage: Arc<dyn quickwit_storage::Storage> =
+            Arc::new(quickwit_storage::RamStorage::default());
+
+        let result = create_split_from_parquet(
+            &[parquet_path.to_string_lossy().to_string()],
+            output_path.to_str().unwrap(),
+            &config,
+            &storage,
+        ).await.expect("text_and_string split creation should succeed");
+
+        assert_eq!(result.metadata.num_docs, 3);
+        assert!(output_path.exists());
+
+        // Open the split and verify schema
+        let (index, _bundle_dir) = crate::quickwit_split::split_utils::open_split_with_quickwit_native(
+            output_path.to_str().unwrap()
+        ).expect("Should open the created split");
+
+        let schema = index.schema();
+
+        // Verify both fields exist
+        let msg_field = schema.get_field("message").unwrap();
+        let msg_entry = schema.get_field_entry(msg_field);
+        assert!(
+            matches!(msg_entry.field_type(), tantivy::schema::FieldType::Str(_)),
+            "Primary field 'message' should be Str type, got {:?}", msg_entry.field_type()
+        );
+
+        let text_field = schema.get_field("message__text").unwrap();
+        let text_entry = schema.get_field_entry(text_field);
+        assert!(
+            matches!(text_entry.field_type(), tantivy::schema::FieldType::Str(_)),
+            "Companion field 'message__text' should be Str type, got {:?}", text_entry.field_type()
+        );
+
+        let reader = index.reader().expect("Should create reader");
+        reader.reload().expect("Should reload");
+        let searcher = reader.searcher();
+        assert_eq!(searcher.num_docs(), 3);
+
+        // Verify exact search on "message" field (raw tokenizer) finds results
+        let exact_term = tantivy::Term::from_field_text(msg_field, "the quick brown fox");
+        let exact_query = tantivy::query::TermQuery::new(exact_term, tantivy::schema::IndexRecordOption::Basic);
+        let exact_results = searcher.search(&exact_query, &tantivy::collector::TopDocs::with_limit(10)).unwrap();
+        assert_eq!(exact_results.len(), 1,
+            "Exact search for 'the quick brown fox' on raw-tokenized 'message' should find 1 doc");
+
+        // Verify tokenized search on "message__text" field (default tokenizer) finds results
+        let token_term = tantivy::Term::from_field_text(text_field, "quick");
+        let token_query = tantivy::query::TermQuery::new(token_term, tantivy::schema::IndexRecordOption::Basic);
+        let token_results = searcher.search(&token_query, &tantivy::collector::TopDocs::with_limit(10)).unwrap();
+        assert_eq!(token_results.len(), 1,
+            "Tokenized search for 'quick' on default-tokenized 'message__text' should find 1 doc");
+
+        // Verify another tokenized search works
+        let the_term = tantivy::Term::from_field_text(text_field, "the");
+        let the_query = tantivy::query::TermQuery::new(the_term, tantivy::schema::IndexRecordOption::Basic);
+        let the_results = searcher.search(&the_query, &tantivy::collector::TopDocs::with_limit(10)).unwrap();
+        assert_eq!(the_results.len(), 2,
+            "Tokenized search for 'the' on 'message__text' should find 2 docs (rows 0 and 2)");
     }
 }
