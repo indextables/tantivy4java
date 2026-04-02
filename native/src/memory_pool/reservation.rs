@@ -9,7 +9,7 @@ use super::pool::{MemoryError, MemoryPool};
 /// Automatically releases the reserved memory when dropped.
 ///
 /// # Example
-/// ```
+/// ```ignore
 /// let reservation = MemoryReservation::try_new(&pool, 1024, "index_writer")?;
 /// // ... use the memory ...
 /// // reservation is automatically released when it goes out of scope
