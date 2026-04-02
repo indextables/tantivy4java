@@ -18,6 +18,58 @@ use super::schema_dedup;
 use super::storage::TxLogStorage;
 use super::version_file;
 
+use futures::stream::{self, StreamExt};
+
+// ============================================================================
+// Concurrency helpers
+// ============================================================================
+
+/// Extract the maximum concurrent read limit from a config map.
+/// Key: `max_concurrent_reads` (integer, default 32, 0 → default).
+fn extract_max_concurrent(config_map: &HashMap<String, String>) -> usize {
+    config_map.get("max_concurrent_reads")
+        .and_then(|s| s.parse::<usize>().ok())
+        .map(|n| if n == 0 { 32 } else { n })
+        .unwrap_or(32)
+}
+
+/// Read multiple version files concurrently, silently ignoring all errors
+/// (including NotFound). Returns (version, actions) pairs sorted ascending.
+///
+/// `max_concurrent` bounds the number of in-flight object-store GETs to prevent
+/// S3/Azure rate-limit throttling on large catch-up reads.
+async fn read_versions_concurrent(
+    storage: &TxLogStorage,
+    versions: impl IntoIterator<Item = i64>,
+    max_concurrent: usize,
+) -> Vec<(i64, Vec<Action>)> {
+    let versions: Vec<i64> = versions.into_iter().collect();
+    let futures = versions.into_iter().map(|v| {
+        let storage = storage; // copy &TxLogStorage (references are Copy)
+        async move {
+            match version_file::read_version(storage, v).await {
+                Ok(actions) => Some((v, actions)),
+                Err(_) => None,
+            }
+        }
+    });
+    let mut results: Vec<(i64, Vec<Action>)> = stream::iter(futures)
+        .buffer_unordered(max_concurrent)
+        .filter_map(|opt| async move { opt })
+        .collect()
+        .await;
+    results.sort_by_key(|(v, _)| *v);
+    results
+}
+
+/// Returns true if the error represents a "not found" condition from
+/// any object store backend (S3, Azure, local filesystem).
+fn is_not_found_error(e: &TxLogError) -> bool {
+    let s = e.to_string();
+    s.contains("not found") || s.contains("NotFound")
+        || s.contains("No such file") || s.contains("404")
+}
+
 // ============================================================================
 // Driver-side primitive: get_txlog_snapshot_info
 // ============================================================================
@@ -59,9 +111,12 @@ pub async fn get_txlog_snapshot_info_with_cache(
     config: &DeltaStorageConfig,
     config_map: &HashMap<String, String>,
 ) -> Result<TxLogSnapshotInfo> {
+    let cache_cfg = cache::CacheConfig::from_map(config_map);
+    let max_concurrent = cache_cfg.max_concurrent_reads;
+
     // Check cache first
-    if let Some(ttl) = cache::extract_cache_ttl(config_map) {
-        let c = cache::get_or_create_cache(table_path, ttl);
+    if cache_cfg.enabled {
+        let c = cache::get_or_create_cache(table_path, cache_cfg.clone());
         if let Some(cached_meta) = c.get_metadata() {
             if let Some(cached_cp) = c.get_last_checkpoint() {
                 let state_dir = cached_cp.state_dir.clone()
@@ -91,12 +146,10 @@ pub async fn get_txlog_snapshot_info_with_cache(
                 let (effective_protocol, effective_metadata) = if post_cp_paths.is_empty() {
                     (Some(cached_meta.0.clone()), cached_meta.1.clone())
                 } else {
-                    let mut post_cp_actions: Vec<(i64, Vec<Action>)> = Vec::new();
-                    for v in all_versions.iter().filter(|v| **v > cached_cp.version) {
-                        if let Ok(actions) = version_file::read_version(&storage, *v).await {
-                            post_cp_actions.push((*v, actions));
-                        }
-                    }
+                    let post_cp_versions: Vec<i64> = all_versions.iter().copied()
+                        .filter(|&v| v > cached_cp.version)
+                        .collect();
+                    let post_cp_actions = read_versions_concurrent(&storage, post_cp_versions, max_concurrent).await;
                     let (post_protocol, post_metadata) = log_replay::extract_metadata(&[], &post_cp_actions);
                     (
                         post_protocol.or(Some(cached_meta.0.clone())),
@@ -153,6 +206,8 @@ async fn snapshot_from_checkpoint(
     config_map: &HashMap<String, String>,
     last_cp: LastCheckpointInfo,
 ) -> Result<TxLogSnapshotInfo> {
+    let max_concurrent = extract_max_concurrent(config_map);
+    let cache_cfg = cache::CacheConfig::from_map(config_map);
     let state_dir = last_cp.state_dir.clone()
         .unwrap_or_else(|| TxLogStorage::state_dir_name(last_cp.version));
 
@@ -167,12 +222,10 @@ async fn snapshot_from_checkpoint(
         .collect();
 
     // Read post-checkpoint versions for potential protocol/metadata updates
-    let mut all_version_actions: Vec<(i64, Vec<Action>)> = Vec::new();
-    for v in all_versions.iter().filter(|v| **v > last_cp.version) {
-        if let Ok(actions) = version_file::read_version(storage, *v).await {
-            all_version_actions.push((*v, actions));
-        }
-    }
+    let post_cp_versions: Vec<i64> = all_versions.iter().copied()
+        .filter(|&v| v > last_cp.version)
+        .collect();
+    let all_version_actions = read_versions_concurrent(storage, post_cp_versions, max_concurrent).await;
 
     // Source protocol/metadata from the checkpoint's cached JSON first,
     // then override with any updates from post-checkpoint version files.
@@ -203,8 +256,8 @@ async fn snapshot_from_checkpoint(
     let checkpoint_version = last_cp.version;
 
     // Populate cache (use v4 default for cache since it needs a concrete value)
-    if let Some(ttl) = cache::extract_cache_ttl(config_map) {
-        let c = cache::get_or_create_cache(table_path, ttl);
+    if cache_cfg.enabled {
+        let c = cache::get_or_create_cache(table_path, cache_cfg);
         let cache_protocol = protocol_opt.clone().unwrap_or_else(ProtocolAction::v4);
         c.put_metadata(cache_protocol, metadata.clone());
         c.put_last_checkpoint(last_cp);
@@ -227,6 +280,8 @@ async fn snapshot_from_version_scan(
     table_path: &str,
     config_map: &HashMap<String, String>,
 ) -> Result<TxLogSnapshotInfo> {
+    let max_concurrent = extract_max_concurrent(config_map);
+    let cache_cfg = cache::CacheConfig::from_map(config_map);
     let all_versions = storage.list_versions().await?;
 
     if all_versions.is_empty() {
@@ -235,13 +290,8 @@ async fn snapshot_from_version_scan(
         });
     }
 
-    // Read ALL version files to extract protocol/metadata
-    let mut all_version_actions: Vec<(i64, Vec<Action>)> = Vec::new();
-    for v in &all_versions {
-        if let Ok(actions) = version_file::read_version(storage, *v).await {
-            all_version_actions.push((*v, actions));
-        }
-    }
+    // Read ALL version files to extract protocol/metadata — concurrently
+    let all_version_actions = read_versions_concurrent(storage, all_versions.iter().copied(), max_concurrent).await;
 
     // Extract protocol/metadata from all versions
     let v0_actions = all_version_actions.iter()
@@ -264,8 +314,8 @@ async fn snapshot_from_version_scan(
         all_versions.len());
 
     // Populate cache (use v4 default for cache since it needs a concrete value)
-    if let Some(ttl) = cache::extract_cache_ttl(config_map) {
-        let c = cache::get_or_create_cache(table_path, ttl);
+    if cache_cfg.enabled {
+        let c = cache::get_or_create_cache(table_path, cache_cfg);
         let cache_protocol = protocol_opt.clone().unwrap_or_else(ProtocolAction::v4);
         c.put_metadata(cache_protocol, metadata.clone());
     }
@@ -321,14 +371,46 @@ pub async fn read_post_checkpoint_changes(
 ) -> Result<TxLogChanges> {
     let storage = TxLogStorage::new(table_path, config)?;
 
+    // max_version reflects the highest version in the input list regardless of
+    // whether files are present (matches original behavior: update before fetch check).
+    let max_version: i64 = version_paths.iter()
+        .filter_map(|path| {
+            let name = path.rsplit('/').next().unwrap_or(path);
+            name.trim_end_matches(".json").parse::<i64>().ok()
+        })
+        .max()
+        .unwrap_or(0);
+
+    // Fetch all version files concurrently. Tolerate NotFound (TRUNCATE/PURGE races);
+    // propagate real I/O errors via try_join_all short-circuit.
+    let fetch_futs: Vec<_> = version_paths.iter().map(|path| {
+        let storage = &storage;
+        async move {
+            match storage.get(path).await {
+                Ok(data) => Ok(Some(data)),
+                Err(e) => {
+                    if is_not_found_error(&e) {
+                        debug_println!("⚠️ DISTRIBUTED: Version file {} not found, skipping (may have been deleted by TRUNCATE/PURGE)", path);
+                        Ok(None)
+                    } else {
+                        Err(e)
+                    }
+                }
+            }
+        }
+    }).collect();
+    let fetch_results = futures::future::try_join_all(fetch_futs).await?;
+
     let mut added = Vec::new();
     let mut removed = Vec::new();
     let mut skips = Vec::new();
-    let mut max_version: i64 = 0;
 
-    for path in version_paths {
-        // Parse version number from path (e.g., "00000000000000000042.json" → 42)
-        // The 20-digit zero-padded format is safe to parse directly as i64.
+    // Process in original path order (try_join_all preserves input order).
+    for (path, maybe_data) in version_paths.iter().zip(fetch_results.into_iter()) {
+        let data = match maybe_data {
+            Some(d) => d,
+            None => continue,
+        };
         let name = path.rsplit('/').next().unwrap_or(path);
         let version = name.trim_end_matches(".json")
             .parse::<i64>()
@@ -336,27 +418,7 @@ pub async fn read_post_checkpoint_changes(
                 crate::debug_println!("⚠️ TXLOG: Failed to parse version from path: {}", path);
                 0
             });
-        if version > max_version {
-            max_version = version;
-        }
-
-        let data = match storage.get(path).await {
-            Ok(d) => d,
-            Err(e) => {
-                // Tolerate missing version files — they may have been deleted by
-                // TRUNCATE TIME TRAVEL or PURGE between getSnapshotInfo and this call.
-                let err_str = format!("{}", e);
-                if err_str.contains("not found") || err_str.contains("NotFound")
-                    || err_str.contains("No such file") || err_str.contains("404")
-                {
-                    debug_println!("⚠️ DISTRIBUTED: Version file {} not found, skipping (may have been deleted by TRUNCATE/PURGE)", path);
-                    continue;
-                }
-                return Err(e); // Real errors still propagate
-            }
-        };
         let actions = version_file::parse_version_file(&data)?;
-
         for action in actions {
             match action {
                 Action::Add(mut add) => {
@@ -364,7 +426,6 @@ pub async fn read_post_checkpoint_changes(
                         std::slice::from_mut(&mut add),
                         metadata_config,
                     );
-                    // Use the file's own modification_time as the added_at_timestamp
                     let timestamp = add.modification_time;
                     added.push(FileEntry {
                         add,
@@ -462,11 +523,19 @@ pub async fn write_version(
 ) -> Result<WriteResult> {
     let storage = TxLogStorage::new(table_path, config)?;
     let mut conflicted = Vec::new();
+    // On the first attempt we LIST to find the current version. On each conflict
+    // the correct next candidate is last_conflict + 1 — no re-LIST needed.
+    let mut next_version: Option<i64> = None;
 
     for attempt in 0..retry_config.max_attempts {
-        // Determine target version
-        let current_versions = storage.list_versions().await?;
-        let target_version = current_versions.last().map(|v| v + 1).unwrap_or(0);
+        // Determine target version: LIST on first attempt; derive from conflict thereafter.
+        let target_version = match next_version {
+            Some(v) => v,
+            None => {
+                let current_versions = storage.list_versions().await?;
+                current_versions.last().map(|v| v + 1).unwrap_or(0)
+            }
+        };
 
         // Try to write
         let written = version_file::write_version(&storage, target_version, &actions).await?;
@@ -481,8 +550,9 @@ pub async fn write_version(
             });
         }
 
-        // Conflict
+        // Conflict: target_version is now taken; next candidate is target_version + 1.
         conflicted.push(target_version);
+        next_version = Some(target_version + 1);
         debug_println!("⚠️ DISTRIBUTED: Version conflict at {}, retry {}/{}",
             target_version, attempt + 1, retry_config.max_attempts);
 
@@ -616,6 +686,7 @@ pub async fn maybe_auto_checkpoint(
     if written_version < 0 || !is_auto_checkpoint_enabled(config_map) {
         return;
     }
+    let max_concurrent = extract_max_concurrent(config_map);
 
     debug_println!("📊 DISTRIBUTED: auto-checkpoint at version {}", written_version);
 
@@ -643,12 +714,10 @@ pub async fn maybe_auto_checkpoint(
                     return;
                 }
             };
-            let mut post_cp_actions: Vec<(i64, Vec<Action>)> = Vec::new();
-            for v in all_versions.iter().filter(|v| **v > cp_version && **v <= written_version) {
-                if let Ok(actions) = version_file::read_version(&storage, *v).await {
-                    post_cp_actions.push((*v, actions));
-                }
-            }
+            let post_cp_versions: Vec<i64> = all_versions.iter().copied()
+                .filter(|&v| v > cp_version && v <= written_version)
+                .collect();
+            let post_cp_actions = read_versions_concurrent(&storage, post_cp_versions, max_concurrent).await;
 
             // Extract new adds and removes from post-checkpoint versions
             let mut new_adds: Vec<FileEntry> = Vec::new();
@@ -703,17 +772,20 @@ pub async fn maybe_auto_checkpoint(
                     let state_dir = cp_info.state_dir.clone()
                         .unwrap_or_else(|| TxLogStorage::state_dir_name(cp_version));
                     let metadata_config = base_manifest.schema_registry.clone();
-                    let mut rewritten_entries = Vec::new();
-                    for mi in &rewrite {
-                        if let Ok(entries) = super::avro::state_reader::read_single_manifest(
+                    // Read dirty manifests concurrently (bounded); filter tombstones after.
+                    let rewrite_futs: Vec<_> = rewrite.iter()
+                        .map(|mi| super::avro::state_reader::read_single_manifest(
                             &storage, &state_dir, &mi.path, &metadata_config,
-                        ).await {
-                            let live: Vec<FileEntry> = entries.into_iter()
-                                .filter(|e| !all_tombstones.contains(&e.add.path))
-                                .collect();
-                            rewritten_entries.extend(live);
-                        }
-                    }
+                        ))
+                        .collect();
+                    let rewritten_entries: Vec<FileEntry> = stream::iter(rewrite_futs)
+                        .buffer_unordered(max_concurrent)
+                        .collect::<Vec<super::error::Result<Vec<FileEntry>>>>().await
+                        .into_iter()
+                        .filter_map(|r| r.ok())
+                        .flat_map(|entries| entries.into_iter()
+                            .filter(|e| !all_tombstones.contains(&e.add.path)))
+                        .collect();
                     // Combine: new adds (filtered against removes) + rewritten live entries
                     let mut all_live = rewritten_entries;
                     all_live.extend(new_adds.iter()
@@ -726,16 +798,21 @@ pub async fn maybe_auto_checkpoint(
                     // A full selective compaction would reuse kept manifest refs, but
                     // that requires state_writer changes beyond scope here.
                     // Instead, read kept manifest entries too for a clean compacted write.
-                    for mi in &keep {
-                        if let Ok(entries) = super::avro::state_reader::read_single_manifest(
+                    // Read clean manifests concurrently (bounded).
+                    let keep_futs: Vec<_> = keep.iter()
+                        .map(|mi| super::avro::state_reader::read_single_manifest(
                             &storage, &state_dir, &mi.path, &metadata_config,
-                        ).await {
-                            let live: Vec<FileEntry> = entries.into_iter()
-                                .filter(|e| !all_tombstones.contains(&e.add.path))
-                                .collect();
-                            all_live.extend(live);
-                        }
-                    }
+                        ))
+                        .collect();
+                    let keep_live: Vec<FileEntry> = stream::iter(keep_futs)
+                        .buffer_unordered(max_concurrent)
+                        .collect::<Vec<super::error::Result<Vec<FileEntry>>>>().await
+                        .into_iter()
+                        .filter_map(|r| r.ok())
+                        .flat_map(|entries| entries.into_iter()
+                            .filter(|e| !all_tombstones.contains(&e.add.path)))
+                        .collect();
+                    all_live.extend(keep_live);
                     all_live.sort_by(|a, b| a.add.path.cmp(&b.add.path));
 
                     match write_checkpoint_at_version(table_path, config, all_live, metadata, protocol, written_version).await {
@@ -747,14 +824,19 @@ pub async fn maybe_auto_checkpoint(
                     debug_println!("📊 DISTRIBUTED: full compaction (selective not beneficial)");
                     let state_dir = cp_info.state_dir.unwrap_or_else(|| TxLogStorage::state_dir_name(cp_version));
                     let metadata_config = base_manifest.schema_registry.clone();
-                    let mut cp_entries = Vec::new();
-                    for mi in &base_manifest.manifests {
-                        if let Ok(entries) = super::avro::state_reader::read_single_manifest(
+                    // Read all checkpoint manifests concurrently (bounded).
+                    let cp_futs: Vec<_> = base_manifest.manifests.iter()
+                        .map(|mi| super::avro::state_reader::read_single_manifest(
                             &storage, &state_dir, &mi.path, &metadata_config,
-                        ).await {
-                            cp_entries.extend(entries);
-                        }
-                    }
+                        ))
+                        .collect();
+                    let mut cp_entries: Vec<FileEntry> = stream::iter(cp_futs)
+                        .buffer_unordered(max_concurrent)
+                        .collect::<Vec<super::error::Result<Vec<FileEntry>>>>().await
+                        .into_iter()
+                        .filter_map(|r: super::error::Result<Vec<FileEntry>>| r.ok())
+                        .flatten()
+                        .collect();
                     // Filter out tombstoned entries from base checkpoint before replay
                     if !base_manifest.tombstones.is_empty() {
                         let tombstone_set: std::collections::HashSet<&str> =
@@ -793,13 +875,10 @@ pub async fn maybe_auto_checkpoint(
                     return;
                 }
             };
-            let mut versioned_actions: Vec<(i64, Vec<Action>)> = Vec::new();
-            for v in &all_versions {
-                if *v > written_version { break; }
-                if let Ok(actions) = version_file::read_version(&storage, *v).await {
-                    versioned_actions.push((*v, actions));
-                }
-            }
+            let versions_to_read: Vec<i64> = all_versions.iter().copied()
+                .filter(|&v| v <= written_version)
+                .collect();
+            let versioned_actions = read_versions_concurrent(&storage, versions_to_read, max_concurrent).await;
             let v0_actions = versioned_actions.iter()
                 .find(|(v, _)| *v == 0)
                 .map(|(_, a)| a.clone())

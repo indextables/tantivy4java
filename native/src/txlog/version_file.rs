@@ -31,16 +31,18 @@ pub fn parse_version_file(data: &[u8]) -> Result<Vec<Action>> {
 }
 
 /// Serialize actions into gzip-compressed JSON lines (Scala-compatible format).
+/// Writes each action directly into the GzEncoder to avoid a full intermediate String allocation.
 pub fn serialize_version_file(actions: &[Action]) -> Result<Vec<u8>> {
-    let mut lines = String::new();
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+    use std::io::Write;
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::new(6));
     for action in actions {
         let envelope = ActionEnvelope::from_action(action);
-        let json = serde_json::to_string(&envelope)?;
-        lines.push_str(&json);
-        lines.push('\n');
+        serde_json::to_writer(&mut encoder, &envelope)?;
+        encoder.write_all(b"\n")?;
     }
-    let compressed = compression::gzip_compress(lines.as_bytes())?;
-    Ok(compressed)
+    Ok(encoder.finish()?)
 }
 
 /// Read and parse a version file from storage.

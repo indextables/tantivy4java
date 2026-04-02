@@ -14,10 +14,37 @@ use crate::runtime_manager::block_on_operation;
 use super::distributed;
 use super::serialization;
 
-/// Extract cache and checkpoint config from the Java Map into a Rust HashMap.
+/// Extract cache, checkpoint, and concurrency config from the Java Map into a Rust HashMap.
+///
+/// Recognised keys (all optional):
+/// - `cache.ttl.ms` / `cache_ttl_ms`        — all-tier TTL override in milliseconds
+/// - `cache.version.ttl.ms`                  — version cache TTL in ms
+/// - `cache.snapshot.ttl.ms`                 — snapshot cache TTL in ms
+/// - `cache.file_list.ttl.ms`                — file-list cache TTL in ms
+/// - `cache.metadata.ttl.ms`                 — metadata cache TTL in ms
+/// - `cache.version.capacity`                — version cache max entries
+/// - `cache.snapshot.capacity`               — snapshot cache max entries
+/// - `cache.file_list.capacity`              — file-list cache max entries
+/// - `cache.enabled`                         — "false" to disable caching
+/// - `max_concurrent_reads`                  — max parallel object-store GETs (default 32)
+/// - `checkpoint_interval` / `checkpoint.interval` — checkpoint frequency
 fn extract_extended_config(env: &mut JNIEnv, config_map: &JObject) -> std::collections::HashMap<String, String> {
     let mut map = std::collections::HashMap::new();
-    for key in &["cache.ttl.ms", "cache_ttl_ms", "checkpoint_interval", "checkpoint.interval"] {
+    for key in &[
+        "cache.ttl.ms",
+        "cache_ttl_ms",
+        "cache.version.ttl.ms",
+        "cache.snapshot.ttl.ms",
+        "cache.file_list.ttl.ms",
+        "cache.metadata.ttl.ms",
+        "cache.version.capacity",
+        "cache.snapshot.capacity",
+        "cache.file_list.capacity",
+        "cache.enabled",
+        "max_concurrent_reads",
+        "checkpoint_interval",
+        "checkpoint.interval",
+    ] {
         if let Some(val) = extract_string(env, config_map, key) {
             map.insert(key.to_string(), val);
         }
