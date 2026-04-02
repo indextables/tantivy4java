@@ -266,6 +266,35 @@ fn add_field_for_arrow_type(
                             );
                         builder.add_text_field(name, text_opts);
                     }
+                    StringIndexingMode::TextAndString => {
+                        // Primary field: raw string for exact matching
+                        let raw_opts = TextOptions::default()
+                            .set_indexing_options(
+                                TextFieldIndexing::default()
+                                    .set_tokenizer("raw")
+                                    .set_index_option(IndexRecordOption::Basic)
+                                    .set_fieldnorms(config.fieldnorms_enabled),
+                            );
+                        builder.add_text_field(name, raw_opts);
+
+                        // Secondary field: tokenized text for full-text search
+                        let text_name = string_indexing::text_companion_field_name(name);
+                        if all_field_names.contains(&text_name) {
+                            anyhow::bail!(
+                                "Text companion field name '{}' for field '{}' collides with an existing column. \
+                                 Rename the column or use a different indexing mode.",
+                                text_name, name
+                            );
+                        }
+                        let text_opts = TextOptions::default()
+                            .set_indexing_options(
+                                TextFieldIndexing::default()
+                                    .set_tokenizer("default")
+                                    .set_index_option(IndexRecordOption::WithFreqsAndPositions)
+                                    .set_fieldnorms(config.fieldnorms_enabled),
+                            );
+                        builder.add_text_field(&text_name, text_opts);
+                    }
                 }
             } else {
                 // Standard tokenizer path
@@ -1240,6 +1269,51 @@ mod tests {
 
         assert!(schema.get_field("log_line").is_ok());
         assert!(schema.get_field("log_line__uuids").is_err());
+    }
+
+    #[test]
+    fn test_text_and_string_creates_two_fields() {
+        let arrow = ArrowSchema::new(vec![
+            Field::new("message", DataType::Utf8, true),
+        ]);
+        let mut config = SchemaDerivationConfig::default();
+        config.tokenizer_overrides.insert("message".to_string(), "text_and_string".to_string());
+
+        let schema = derive_tantivy_schema(&arrow, &config).unwrap();
+
+        // Primary field: "message" with raw tokenizer for exact matching
+        let msg_field = schema.get_field("message").unwrap();
+        let msg_entry = schema.get_field_entry(msg_field);
+        assert!(
+            matches!(msg_entry.field_type(), tantivy::schema::FieldType::Str(_)),
+            "text_and_string primary field 'message' should be Str type, got {:?}", msg_entry.field_type()
+        );
+
+        // Secondary field: "message__text" with default tokenizer for full-text search
+        let text_field = schema.get_field("message__text").unwrap();
+        let text_entry = schema.get_field_entry(text_field);
+        assert!(
+            matches!(text_entry.field_type(), tantivy::schema::FieldType::Str(_)),
+            "text_and_string companion field 'message__text' should be Str type, got {:?}", text_entry.field_type()
+        );
+    }
+
+    #[test]
+    fn test_text_and_string_collision_detection() {
+        // Create an Arrow schema where "message__text" already exists as a column
+        let arrow = ArrowSchema::new(vec![
+            Field::new("message", DataType::Utf8, true),
+            Field::new("message__text", DataType::Utf8, true),
+        ]);
+        let mut config = SchemaDerivationConfig::default();
+        config.tokenizer_overrides.insert("message".to_string(), "text_and_string".to_string());
+
+        let result = derive_tantivy_schema(&arrow, &config);
+        assert!(result.is_err(), "Should fail when companion field name collides with existing column");
+        assert!(
+            result.unwrap_err().to_string().contains("collides"),
+            "Error message should mention collision"
+        );
     }
 }
 

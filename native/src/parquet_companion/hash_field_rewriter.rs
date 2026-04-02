@@ -499,6 +499,9 @@ fn rewrite_string_indexing_node(
                     StringIndexingMode::TextUuidStrip | StringIndexingMode::TextCustomStrip { .. } => {
                         // No rewriting needed
                     }
+                    StringIndexingMode::TextAndString => {
+                        // No rewriting needed — queries target raw or text companion field directly
+                    }
                 }
             }
             Ok(false)
