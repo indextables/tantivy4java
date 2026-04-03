@@ -1065,7 +1065,7 @@ async fn read_existing_checkpoint_info(
 ///
 /// Falls back to a full LIST once the probe count exceeds `MAX_PROBE` (100) to
 /// avoid issuing thousands of serial HEADs on a very stale table.
-pub async fn probe_versions_since(
+pub(crate) async fn probe_versions_since(
     storage: &TxLogStorage,
     since_version: i64,
 ) -> Result<Vec<i64>> {
