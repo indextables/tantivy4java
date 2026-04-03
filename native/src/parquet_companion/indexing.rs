@@ -353,7 +353,27 @@ pub async fn create_split_from_parquet(
         string_hash_fields.len()
     );
 
-    // ── Step 5: Build column mapping ────────────────────────────────────
+    // Pre-resolve text companion fields for TextAndString modes (avoids per-doc HashMap lookup + allocation)
+    let text_companion_fields: HashMap<String, Field> = {
+        let mut cache = HashMap::new();
+        for (field_name, mode) in &string_indexing_modes {
+            if matches!(mode, StringIndexingMode::TextAndString) {
+                let text_name = string_indexing::text_companion_field_name(field_name);
+                match tantivy_schema.get_field(&text_name) {
+                    Ok(f) => { cache.insert(field_name.clone(), f); }
+                    Err(_) => {
+                        debug_println!(
+                            "WARNING: TextAndString companion field '{}' not found in schema for field '{}'",
+                            text_name, field_name
+                        );
+                    }
+                }
+            }
+        }
+        cache
+    };
+
+    // ── Step 5: Build column mapping ─────────���──────────────────────────
     let mut column_mapping = build_column_mapping(&arrow_schema, &name_mapping, &parquet_metadata, &config);
 
     // Patch tantivy_type for exact_only fields: they are U64, not Str
@@ -561,6 +581,7 @@ pub async fn create_split_from_parquet(
                     &mut accumulators,
                     &string_indexing_modes,
                     &compiled_regexes,
+                    &text_companion_fields,
                 )?;
 
                 // Attach merge-safe parquet coordinates to each document
@@ -732,6 +753,7 @@ pub(crate) fn arrow_row_to_tantivy_doc(
     accumulators: &mut HashMap<String, StatisticsAccumulator>,
     string_indexing_modes: &HashMap<String, StringIndexingMode>,
     compiled_regexes: &HashMap<String, regex::Regex>,
+    text_companion_fields: &HashMap<String, Field>,
 ) -> Result<TantivyDocument> {
     let mut doc = TantivyDocument::new();
 
@@ -769,6 +791,7 @@ pub(crate) fn arrow_row_to_tantivy_doc(
             &mut doc, field, array, arrow_field.data_type(), row_idx,
             tantivy_field_name, config, string_hash_fields, tantivy_schema,
             accumulators, string_indexing_modes, compiled_regexes,
+            text_companion_fields,
         )?;
     }
 
@@ -792,6 +815,7 @@ pub(crate) fn add_arrow_value_to_doc(
     accumulators: &mut HashMap<String, StatisticsAccumulator>,
     string_indexing_modes: &HashMap<String, StringIndexingMode>,
     compiled_regexes: &HashMap<String, regex::Regex>,
+    text_companion_fields: &HashMap<String, Field>,
 ) -> Result<()> {
     match data_type {
         DataType::Boolean => {
@@ -892,6 +916,7 @@ pub(crate) fn add_arrow_value_to_doc(
             add_string_value_to_doc(
                 doc, field, val, field_name, config, string_hash_fields,
                 tantivy_schema, accumulators, string_indexing_modes, compiled_regexes,
+                text_companion_fields,
             )?;
         }
         DataType::LargeUtf8 => {
@@ -900,6 +925,7 @@ pub(crate) fn add_arrow_value_to_doc(
             add_string_value_to_doc(
                 doc, field, val, field_name, config, string_hash_fields,
                 tantivy_schema, accumulators, string_indexing_modes, compiled_regexes,
+                text_companion_fields,
             )?;
         }
 
@@ -1043,6 +1069,7 @@ pub(crate) fn add_string_value_to_doc(
     accumulators: &mut HashMap<String, StatisticsAccumulator>,
     string_indexing_modes: &HashMap<String, StringIndexingMode>,
     compiled_regexes: &HashMap<String, regex::Regex>,
+    text_companion_fields: &HashMap<String, Field>,
 ) -> Result<()> {
     if config.ip_address_fields.contains(field_name) {
         add_ip_addr_value(doc, field, val, field_name)?;
@@ -1092,9 +1119,8 @@ pub(crate) fn add_string_value_to_doc(
             StringIndexingMode::TextAndString => {
                 // Primary field: raw string value
                 doc.add_text(field, val);
-                // Secondary field: tokenized text companion
-                let text_name = string_indexing::text_companion_field_name(field_name);
-                if let Ok(text_field) = tantivy_schema.get_field(&text_name) {
+                // Secondary field: tokenized text companion (resolved once at setup, not per-doc)
+                if let Some(&text_field) = text_companion_fields.get(field_name) {
                     doc.add_text(text_field, val);
                 }
                 if let Some(acc) = accumulators.get_mut(field_name) {
@@ -1595,6 +1621,13 @@ fn build_column_mapping(
                 .get(&tantivy_field_name)
                 .cloned()
                 .unwrap_or_else(|| "raw".to_string());
+            // Normalize string indexing mode keywords to their actual primary tokenizer.
+            // text_and_string and exact_only both use "raw" as their primary tokenizer;
+            // the mode keyword itself is not a valid tantivy tokenizer name.
+            let tok = match tok.as_str() {
+                "text_and_string" | "exact_only" => "raw".to_string(),
+                _ => tok,
+            };
             Some(tok)
         } else {
             None
@@ -3525,5 +3558,151 @@ mod tests {
         let the_results = searcher.search(&the_query, &tantivy::collector::TopDocs::with_limit(10)).unwrap();
         assert_eq!(the_results.len(), 2,
             "Tokenized search for 'the' on 'message__text' should find 2 docs (rows 0 and 2)");
+    }
+
+    // ── TextAndString edge-case integration test ────────────────────────
+
+    /// Helper: create a parquet file with id (Int64), message (Utf8), and tag (Utf8)
+    /// columns for multi-column text_and_string edge-case tests.
+    fn write_test_parquet_for_text_and_string_multi(
+        path: &std::path::Path,
+        messages: &[&str],
+        tags: &[&str],
+    ) {
+        use arrow_array::*;
+        use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+        use parquet::arrow::ArrowWriter;
+        use std::sync::Arc;
+
+        assert_eq!(messages.len(), tags.len(), "messages and tags must have same length");
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("message", DataType::Utf8, false),
+            Field::new("tag", DataType::Utf8, false),
+        ]));
+
+        let ids: Vec<i64> = (0..messages.len()).map(|i| i as i64).collect();
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(ids)),
+                Arc::new(StringArray::from(messages.to_vec())),
+                Arc::new(StringArray::from(tags.to_vec())),
+            ],
+        ).unwrap();
+
+        let file = std::fs::File::create(path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+    }
+
+    /// Integration test: text_and_string with multiple columns and empty strings.
+    #[tokio::test]
+    async fn test_text_and_string_edge_cases() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let parquet_path = temp_dir.path().join("tas_edge.parquet");
+        let output_path = temp_dir.path().join("tas_edge.split");
+
+        let messages = &[
+            "the quick brown fox",
+            "",
+            "hello world",
+        ];
+        let tags = &[
+            "animal",
+            "empty-message",
+            "",
+        ];
+        write_test_parquet_for_text_and_string_multi(&parquet_path, messages, tags);
+
+        let mut tokenizer_overrides = HashMap::new();
+        tokenizer_overrides.insert("message".to_string(), "text_and_string".to_string());
+        tokenizer_overrides.insert("tag".to_string(), "text_and_string".to_string());
+
+        let config = CreateFromParquetConfig {
+            table_root: temp_dir.path().to_string_lossy().to_string(),
+            schema_config: SchemaDerivationConfig {
+                tokenizer_overrides,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let storage: Arc<dyn quickwit_storage::Storage> =
+            Arc::new(quickwit_storage::RamStorage::default());
+
+        let result = create_split_from_parquet(
+            &[parquet_path.to_string_lossy().to_string()],
+            output_path.to_str().unwrap(),
+            &config,
+            &storage,
+        ).await.expect("text_and_string multi-column split creation should succeed");
+
+        assert_eq!(result.metadata.num_docs, 3);
+        assert!(output_path.exists());
+
+        // Open the split and verify schema
+        let (index, _bundle_dir) = crate::quickwit_split::split_utils::open_split_with_quickwit_native(
+            output_path.to_str().unwrap()
+        ).expect("Should open the created split");
+
+        let schema = index.schema();
+
+        // Verify all four text_and_string fields exist
+        let msg_field = schema.get_field("message")
+            .expect("message field should exist");
+        let msg_text_field = schema.get_field("message__text")
+            .expect("message__text companion field should exist");
+        let tag_field = schema.get_field("tag")
+            .expect("tag field should exist");
+        let tag_text_field = schema.get_field("tag__text")
+            .expect("tag__text companion field should exist");
+
+        // Verify field types
+        assert!(
+            matches!(schema.get_field_entry(msg_field).field_type(), tantivy::schema::FieldType::Str(_)),
+            "message should be Str type"
+        );
+        assert!(
+            matches!(schema.get_field_entry(msg_text_field).field_type(), tantivy::schema::FieldType::Str(_)),
+            "message__text should be Str type"
+        );
+        assert!(
+            matches!(schema.get_field_entry(tag_field).field_type(), tantivy::schema::FieldType::Str(_)),
+            "tag should be Str type"
+        );
+        assert!(
+            matches!(schema.get_field_entry(tag_text_field).field_type(), tantivy::schema::FieldType::Str(_)),
+            "tag__text should be Str type"
+        );
+
+        let reader = index.reader().expect("Should create reader");
+        reader.reload().expect("Should reload");
+        let searcher = reader.searcher();
+        assert_eq!(searcher.num_docs(), 3);
+
+        // Tokenized search for "quick" on message__text should find 1 doc
+        let quick_term = tantivy::Term::from_field_text(msg_text_field, "quick");
+        let quick_query = tantivy::query::TermQuery::new(quick_term, tantivy::schema::IndexRecordOption::Basic);
+        let quick_results = searcher.search(&quick_query, &tantivy::collector::TopDocs::with_limit(10)).unwrap();
+        assert_eq!(quick_results.len(), 1,
+            "Tokenized search for 'quick' on message__text should find 1 doc");
+
+        // Tokenized search for "animal" on tag__text should find 1 doc
+        let animal_term = tantivy::Term::from_field_text(tag_text_field, "animal");
+        let animal_query = tantivy::query::TermQuery::new(animal_term, tantivy::schema::IndexRecordOption::Basic);
+        let animal_results = searcher.search(&animal_query, &tantivy::collector::TopDocs::with_limit(10)).unwrap();
+        assert_eq!(animal_results.len(), 1,
+            "Tokenized search for 'animal' on tag__text should find 1 doc");
+
+        // Exact search for "" (empty string) on message field should find 1 doc (row 1)
+        let empty_term = tantivy::Term::from_field_text(msg_field, "");
+        let empty_query = tantivy::query::TermQuery::new(empty_term, tantivy::schema::IndexRecordOption::Basic);
+        let empty_results = searcher.search(&empty_query, &tantivy::collector::TopDocs::with_limit(10)).unwrap();
+        assert_eq!(empty_results.len(), 1,
+            "Exact search for empty string on 'message' should find 1 doc (the empty-message row)");
     }
 }

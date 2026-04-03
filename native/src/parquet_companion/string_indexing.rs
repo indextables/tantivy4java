@@ -410,4 +410,13 @@ mod tests {
         let parsed: StringIndexingMode = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, mode);
     }
+
+    #[test]
+    fn test_serde_wire_format_text_and_string() {
+        // Pin the exact JSON wire format to prevent accidental breaking changes
+        let json = r#"{"mode":"text_and_string"}"#;
+        let mode: StringIndexingMode = serde_json::from_str(json).unwrap();
+        assert_eq!(mode, StringIndexingMode::TextAndString);
+        assert_eq!(serde_json::to_string(&mode).unwrap(), json);
+    }
 }

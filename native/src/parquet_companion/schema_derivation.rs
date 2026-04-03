@@ -266,6 +266,10 @@ fn add_field_for_arrow_type(
                             );
                         builder.add_text_field(name, text_opts);
                     }
+                    // TextAndString creates two index-only fields (no stored/fast).
+                    // In companion mode, document storage comes from the parquet source,
+                    // and aggregations use hashed fast fields (_phash_) configured separately.
+                    // Neither the raw field nor the __text companion needs storage or fast field access.
                     StringIndexingMode::TextAndString => {
                         // Primary field: raw string for exact matching
                         let raw_opts = TextOptions::default()
