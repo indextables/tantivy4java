@@ -25,6 +25,7 @@ Similarly, log messages like `"Error processing request 550e8400-e29b-41d4-a716-
 | **Text UUID Strip** | `text_uuid_strip` | Strip UUIDs → "default" tokenizer text. UUIDs discarded. | Log messages where UUIDs aren't queryable |
 | **Text Custom Exactonly** | `text_custom_exactonly:<regex>` | Like UUID exactonly but with custom regex. | Custom patterns (SSNs, order IDs) |
 | **Text Custom Strip** | `text_custom_strip:<regex>` | Like UUID strip but with custom regex. | Strip custom patterns from text |
+| **Text and String** | `text_and_string` | Dual-field: raw Str (exact match/range) + `__text` companion (tokenized full-text search). | Fields needing both exact match and full-text search |
 
 UUID pattern used: `[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}` (dashed only)
 
@@ -65,6 +66,7 @@ ParquetCompanionConfig config = new ParquetCompanionConfig(tableRoot)
 When a field has a compact indexing mode, the schema derivation creates different field types:
 
 - **`exact_only`**: Creates a single U64 field (indexed + fast) instead of a Str field
+- **`text_and_string`**: Creates a raw Str field `<name>` (indexed with raw tokenizer, `IndexRecordOption::Basic`) + a text Str field `<name>__text` (indexed with default tokenizer, `IndexRecordOption::WithFreqsAndPositions`). Neither field is stored or fast — in companion mode, storage comes from parquet and aggregations use hashed fast fields.
 - **`text_*_exactonly`**: Creates a Str field (with "default" tokenizer) + a U64 companion field `<name>__uuids`
 - **`text_*_strip`**: Creates a Str field (with "default" tokenizer) only
 
@@ -73,6 +75,7 @@ When a field has a compact indexing mode, the schema derivation creates differen
 During document indexing:
 
 - **`exact_only`**: Computes xxHash64 of the string value and stores it as U64
+- **`text_and_string`**: Indexes the original string value into both the raw field (whole-string, for exact match) and the `__text` companion field (tokenized, for full-text search). Text companion fields are pre-resolved once at split creation time for performance.
 - **`text_*_exactonly`**: Extracts regex matches, stores stripped text in the Str field, and stores xxHash64 of each match in the companion U64 field
 - **`text_*_strip`**: Strips regex matches and stores the cleaned text in the Str field
 
@@ -81,6 +84,9 @@ During document indexing:
 At query time, queries are automatically rewritten for compact string indexing:
 
 - **Term queries** on `exact_only`: The search term is hashed and the query targets the U64 field
+- **Term queries** on `text_and_string`: Not rewritten — term queries target the raw field for exact match
+- **Full-text queries** on `text_and_string`: Redirected to the `__text` companion field (the raw field uses the raw tokenizer and cannot perform tokenized search)
+- **Phrase queries** on `text_and_string`: Redirected to the `__text` companion field (the raw field stores `IndexRecordOption::Basic` with no positions)
 - **Term queries** on `text_*_exactonly`: If the search term contains a regex match (unanchored), the matched portion is extracted and hashed, and the query is redirected to the companion `__uuids` hash field. Non-matching terms query the text field directly.
 - **Term queries** on `text_*_strip`: No rewriting — queries hit the text field directly
 - **`parseQuery()` / full_text queries** on `exact_only`: Automatically converted to a hashed term query (the original text is preserved in the `full_text` AST node)
@@ -99,14 +105,14 @@ The existing hash-based aggregation pipeline handles compact indexing modes auto
 
 ## Querying Behavior
 
-| Query Type | `exact_only` | `text_*_exactonly` | `text_*_strip` |
-|-----------|-------------|-------------------|---------------|
-| **Term (exact)** | Hash match on U64 | Regex match → companion hash; else text search | Text search (stripped) |
-| **parseQuery / full_text** | Converted to hashed term | Regex match → companion hash; else text search | Text search (stripped) |
-| **Phrase** | Converted to hashed term | Regex match → companion hash; else stripped text | On stripped text |
-| **Wildcard** | **Blocked** (error) | On stripped text only | On stripped text |
-| **Regex** | **Blocked** (error) | On stripped text only | On stripped text |
-| **Exists** | U64 field presence | Text field presence | Text field presence |
+| Query Type | `exact_only` | `text_and_string` | `text_*_exactonly` | `text_*_strip` |
+|-----------|-------------|------------------|-------------------|---------------|
+| **Term (exact)** | Hash match on U64 | Raw field (exact match) | Regex match → companion hash; else text search | Text search (stripped) |
+| **parseQuery / full_text** | Converted to hashed term | Redirected to `__text` companion | Regex match → companion hash; else text search | Text search (stripped) |
+| **Phrase** | Converted to hashed term | Redirected to `__text` companion | Regex match → companion hash; else stripped text | On stripped text |
+| **Wildcard** | **Blocked** (error) | On `__text` companion | On stripped text only | On stripped text |
+| **Regex** | **Blocked** (error) | On `__text` companion | On stripped text only | On stripped text |
+| **Exists** | U64 field presence | Raw field presence | Text field presence | Text field presence |
 | **Range** | Not meaningful | On text field | On text field |
 | **Terms agg** | Via hash touchup | Text or companion depending on field | On text field |
 
