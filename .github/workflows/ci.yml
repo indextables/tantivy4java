@@ -29,7 +29,9 @@ jobs:
         run: make test
 
       - name: Rust tests
-        run: cd native && cargo test --lib --tests
+        run: cd native && cargo test
+        env:
+          RUST_BACKTRACE: 1
 
   build-and-test-linux:
     name: Build & Test (Linux X64)
@@ -52,4 +54,6 @@ jobs:
         run: make test
 
       - name: Rust tests
-        run: cd native && cargo test --lib --tests
+        run: cd native && cargo test
+        env:
+          RUST_BACKTRACE: 1

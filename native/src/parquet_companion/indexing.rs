@@ -2495,10 +2495,25 @@ mod tests {
 
         // Read the manifest from the split bundle
         let split_bytes = std::fs::read(&split_path).unwrap();
+        eprintln!(
+            "🔍 TEST: Split file size = {} bytes, path = {}",
+            split_bytes.len(),
+            split_path.display()
+        );
         let file_slice = tantivy::directory::FileSlice::new(Arc::new(
             tantivy::directory::OwnedBytes::new(split_bytes),
         ));
-        let bundle = quickwit_directories::BundleDirectory::open_split(file_slice).unwrap();
+        let bundle = quickwit_directories::BundleDirectory::open_split(file_slice)
+            .unwrap_or_else(|e| {
+                // On failure, dump the bundle footer for diagnosis
+                let split_bytes2 = std::fs::read(&split_path).unwrap();
+                let len = split_bytes2.len();
+                let footer_preview = if len > 256 { &split_bytes2[len-256..] } else { &split_bytes2[..] };
+                eprintln!("❌ BundleDirectory::open_split FAILED: {}", e);
+                eprintln!("   Split file size: {} bytes", len);
+                eprintln!("   Last 256 bytes (hex): {:02x?}", footer_preview);
+                panic!("BundleDirectory::open_split failed: {}", e);
+            });
 
         use tantivy::directory::Directory;
         use crate::parquet_companion::manifest_io::{MANIFEST_FILENAME, deserialize_manifest};
