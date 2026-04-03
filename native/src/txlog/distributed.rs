@@ -33,6 +33,27 @@ fn extract_max_concurrent(config_map: &HashMap<String, String>) -> usize {
         .unwrap_or(32)
 }
 
+/// Parse a cached metadata JSON string, handling both formats:
+/// - Rust-written (bare):    `{"id":"...", "schemaString":"...", ...}`
+/// - Scala-written (wrapped): `{"metaData": {"id":"...", ...}}`
+///
+/// Scala's `CheckpointCommand.scala` wraps the metadata before serialising:
+/// ```scala
+/// val metadataWrapper = Map("metaData" -> metadata)
+/// ```
+/// The `.ok()` fallback means a parse failure is silent, which previously
+/// caused `getSchema()` to return `None` when no version files were available.
+pub(crate) fn parse_metadata_json(json_str: &str) -> Option<MetadataAction> {
+    // Fast path: bare format written by Rust
+    if let Ok(m) = serde_json::from_str::<MetadataAction>(json_str) {
+        return Some(m);
+    }
+    // Slow path: Scala-written envelope {"metaData": {...}}
+    let value: serde_json::Value = serde_json::from_str(json_str).ok()?;
+    let inner = value.get("metaData")?;
+    serde_json::from_value(inner.clone()).ok()
+}
+
 /// Read multiple version files concurrently, silently ignoring all errors
 /// (including NotFound). Returns (version, actions) pairs sorted ascending.
 ///
@@ -122,11 +143,34 @@ pub async fn get_txlog_snapshot_info_with_cache(
                 let state_dir = cached_cp.state_dir.clone()
                     .unwrap_or_else(|| TxLogStorage::state_dir_name(cached_cp.version));
 
-                // We still need to read the state manifest for manifest paths,
-                // but we can use the cached protocol/metadata
+                // Use per-table caches to avoid S3 calls on every query:
+                // - state_manifests: immutable per checkpoint, cached indefinitely
+                // - version_list: cached with version_ttl (default 5 min)
+                // TxLogStorage::new() is cheap (no I/O), so always create it;
+                // the S3 calls below are guarded by the cache checks.
                 let storage = TxLogStorage::new(table_path, config)?;
-                let state_manifest = super::avro::state_reader::read_state_manifest(&storage, &state_dir).await?;
-                let all_versions = storage.list_versions().await?;
+
+                let state_manifest = if let Some(cached_sm) = c.get_state_manifest(&state_dir) {
+                    debug_println!("📊 DISTRIBUTED: state_manifest cache hit for {}", state_dir);
+                    cached_sm
+                } else {
+                    let m = super::avro::state_reader::read_state_manifest(&storage, &state_dir).await?;
+                    c.put_state_manifest(&state_dir, m.clone());
+                    m
+                };
+
+                let all_versions = if let Some(cached_vl) = c.get_version_list() {
+                    debug_println!("📊 DISTRIBUTED: version_list cache hit for {}", table_path);
+                    cached_vl
+                } else {
+                    // Probe for post-checkpoint versions using HEAD requests instead of LIST.
+                    // For a stable table (no new commits) this costs 1 HEAD (~50ms) vs
+                    // 1 LIST (~500–1000ms).
+                    let versions = probe_versions_since(&storage, cached_cp.version).await?;
+                    c.put_version_list(versions.clone());
+                    versions
+                };
+
                 let post_cp_paths: Vec<String> = all_versions.iter()
                     .filter(|v| **v > cached_cp.version)
                     .map(|v| TxLogStorage::version_path(*v))
@@ -214,18 +258,14 @@ async fn snapshot_from_checkpoint(
     // Read state manifest
     let state_manifest = super::avro::state_reader::read_state_manifest(storage, &state_dir).await?;
 
-    // List post-checkpoint version files
-    let all_versions = storage.list_versions().await?;
-    let post_cp_paths: Vec<String> = all_versions.iter()
-        .filter(|v| **v > last_cp.version)
+    // Find post-checkpoint version files by probing with HEAD requests instead of LIST.
+    // Cost: O(n) HEADs where n = post-checkpoint commits + 1 miss; for a stable table
+    // that is exactly 1 HEAD (~50ms) vs 1 LIST (~500–1000ms).
+    let post_cp_versions = probe_versions_since(storage, last_cp.version).await?;
+    let post_cp_paths: Vec<String> = post_cp_versions.iter()
         .map(|v| TxLogStorage::version_path(*v))
         .collect();
-
-    // Read post-checkpoint versions for potential protocol/metadata updates
-    let post_cp_versions: Vec<i64> = all_versions.iter().copied()
-        .filter(|&v| v > last_cp.version)
-        .collect();
-    let all_version_actions = read_versions_concurrent(storage, post_cp_versions, max_concurrent).await;
+    let all_version_actions = read_versions_concurrent(storage, post_cp_versions.clone(), max_concurrent).await;
 
     // Source protocol/metadata from the checkpoint's cached JSON first,
     // then override with any updates from post-checkpoint version files.
@@ -233,7 +273,7 @@ async fn snapshot_from_checkpoint(
     let cp_protocol: Option<ProtocolAction> = state_manifest.protocol_json.as_ref()
         .and_then(|s| serde_json::from_str(s).ok());
     let cp_metadata: Option<MetadataAction> = state_manifest.metadata.as_ref()
-        .and_then(|s| serde_json::from_str(s).ok());
+        .and_then(|s| parse_metadata_json(s));
 
     // Check post-checkpoint versions for overrides
     let (post_protocol, post_metadata) = log_replay::extract_metadata(&[], &all_version_actions);
@@ -255,12 +295,16 @@ async fn snapshot_from_checkpoint(
 
     let checkpoint_version = last_cp.version;
 
-    // Populate cache (use v4 default for cache since it needs a concrete value)
+    // Populate cache (use v4 default for cache since it needs a concrete value).
+    // Also cache state_manifest and version_list so the next query's cache-hit path
+    // can skip both the S3 GET (_manifest.avro) and the S3 LIST (version files).
     if cache_cfg.enabled {
         let c = cache::get_or_create_cache(table_path, cache_cfg);
         let cache_protocol = protocol_opt.clone().unwrap_or_else(ProtocolAction::v4);
         c.put_metadata(cache_protocol, metadata.clone());
         c.put_last_checkpoint(last_cp);
+        c.put_state_manifest(&state_dir, state_manifest.clone());
+        c.put_version_list(post_cp_versions);
     }
 
     Ok(TxLogSnapshotInfo {
@@ -1008,6 +1052,49 @@ async fn read_existing_checkpoint_info(
 }
 
 // ============================================================================
+// Post-checkpoint version probing
+// ============================================================================
+
+/// Find version JSON files (incremental commits) newer than `since_version` by
+/// probing with HEAD requests rather than an S3 LIST.
+///
+/// **Why probe instead of LIST?**
+/// - S3 LIST scans the entire `_delta_log/` prefix → ~500–1000 ms
+/// - HEAD per file → ~30–50 ms each
+/// - For the common case (no commits since checkpoint), cost is 1 HEAD → ~50 ms
+///
+/// Falls back to a full LIST once the probe count exceeds `MAX_PROBE` (100) to
+/// avoid issuing thousands of serial HEADs on a very stale table.
+pub async fn probe_versions_since(
+    storage: &TxLogStorage,
+    since_version: i64,
+) -> Result<Vec<i64>> {
+    const MAX_PROBE: i64 = 100;
+    let mut versions = Vec::new();
+    let mut v = since_version + 1;
+    loop {
+        if v - (since_version + 1) >= MAX_PROBE {
+            // Fell off the fast path — too many versions; switch to a full LIST
+            debug_println!("⚠️ DISTRIBUTED: probe_versions_since hit limit at v{}, falling back to list_versions", v);
+            let all = storage.list_versions().await?;
+            let remaining: Vec<i64> = all.into_iter().filter(|&x| x >= v).collect();
+            versions.extend(remaining);
+            break;
+        }
+        let path = TxLogStorage::version_path(v);
+        match storage.exists(&path).await {
+            Ok(true) => { versions.push(v); v += 1; }
+            Ok(false) => break,
+            Err(e) => {
+                debug_println!("⚠️ DISTRIBUTED: probe_versions_since HEAD error at v{}: {}", v, e);
+                break;
+            }
+        }
+    }
+    Ok(versions)
+}
+
+// ============================================================================
 // Stale checkpoint detection
 // ============================================================================
 
@@ -1065,7 +1152,7 @@ async fn read_previous_checkpoint(
     let protocol: Option<ProtocolAction> = manifest.protocol_json.as_ref()
         .and_then(|s| serde_json::from_str(s).ok());
     let metadata: Option<MetadataAction> = manifest.metadata.as_ref()
-        .and_then(|s| serde_json::from_str(s).ok());
+        .and_then(|s| parse_metadata_json(s));
 
     Some((cp_info, manifest, protocol, metadata))
 }
