@@ -175,11 +175,18 @@ pub struct TxLogCache {
     versions: MokaCache<i64, Vec<super::actions::Action>>,
     snapshots: MokaCache<i64, Arc<Vec<FileEntry>>>,
     file_lists: MokaCache<FileListKey, Arc<Vec<FileEntry>>>,
-    // metadata and last_checkpoint are single-entry, infrequently accessed —
-    // kept as RwLock<Option<Timed<...>>> rather than a moka cache.
+    // State manifests are immutable per checkpoint version — cached with no TTL using
+    // a moka LRU (capacity 100). Key is the state_dir string (e.g. "state-v000...042").
+    state_manifests: MokaCache<String, super::actions::StateManifest>,
+    // metadata, last_checkpoint, and version_list are single-entry, infrequently
+    // updated — kept as RwLock<Option<Timed<...>>> rather than a moka cache.
     metadata: RwLock<Option<Timed<Arc<(ProtocolAction, MetadataAction)>>>>,
     last_checkpoint: RwLock<Option<Timed<LastCheckpointInfo>>>,
+    /// Cached result of storage.list_versions() — avoids the expensive S3 LIST call on
+    /// every query when metadata/checkpoint are already cached.  TTL matches version_ttl.
+    version_list: RwLock<Option<Timed<Vec<i64>>>>,
     metadata_ttl: Duration,
+    version_ttl: Duration,
     config: CacheConfig,
     // Hit/miss counters for statistics. Evictions are tracked by moka internally
     // but not exposed without an eviction listener; returning 0 is acceptable
@@ -202,13 +209,21 @@ impl TxLogCache {
             .max_capacity(config.file_list_capacity as u64)
             .time_to_live(config.file_list_ttl)
             .build();
+        // State manifests are immutable — no TTL, bounded by capacity.
+        let state_manifests = MokaCache::builder()
+            .max_capacity(100)
+            .build();
+        let version_ttl = config.version_ttl;
         Self {
             versions,
             snapshots,
             file_lists,
+            state_manifests,
             metadata: RwLock::new(None),
             last_checkpoint: RwLock::new(None),
+            version_list: RwLock::new(None),
             metadata_ttl: config.metadata_ttl,
+            version_ttl,
             config,
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
@@ -270,6 +285,30 @@ impl TxLogCache {
         None
     }
 
+    /// Returns the cached state manifest for `state_dir` if present.
+    /// State manifests are immutable per checkpoint — safe to cache indefinitely.
+    pub fn get_state_manifest(&self, state_dir: &str) -> Option<super::actions::StateManifest> {
+        if !self.config.enabled { return None; }
+        match self.state_manifests.get(state_dir) {
+            Some(v) => { self.hits.fetch_add(1, Ordering::Relaxed); Some(v) }
+            None    => { self.misses.fetch_add(1, Ordering::Relaxed); None }
+        }
+    }
+
+    /// Returns the cached version list if present and within TTL.
+    pub fn get_version_list(&self) -> Option<Vec<i64>> {
+        if !self.config.enabled { return None; }
+        let inner = self.version_list.read();
+        if let Some(ref entry) = *inner {
+            if entry.inserted_at.elapsed() < self.version_ttl {
+                self.hits.fetch_add(1, Ordering::Relaxed);
+                return Some(entry.value.clone());
+            }
+        }
+        self.misses.fetch_add(1, Ordering::Relaxed);
+        None
+    }
+
     // -- Write / Cache --
 
     pub fn put_version(&self, version: i64, actions: Vec<super::actions::Action>) {
@@ -304,20 +343,37 @@ impl TxLogCache {
         });
     }
 
+    pub fn put_state_manifest(&self, state_dir: &str, manifest: super::actions::StateManifest) {
+        if !self.config.enabled { return; }
+        self.state_manifests.insert(state_dir.to_string(), manifest);
+    }
+
+    pub fn put_version_list(&self, versions: Vec<i64>) {
+        if !self.config.enabled { return; }
+        *self.version_list.write() = Some(Timed {
+            value: versions,
+            inserted_at: Instant::now(),
+        });
+    }
+
     // -- Invalidate --
 
     pub fn invalidate_all(&self) {
         self.versions.invalidate_all();
         self.snapshots.invalidate_all();
         self.file_lists.invalidate_all();
+        self.state_manifests.invalidate_all();
         *self.metadata.write() = None;
         *self.last_checkpoint.write() = None;
+        *self.version_list.write() = None;
     }
 
     pub fn invalidate_mutable(&self) {
         self.versions.invalidate_all();
         self.snapshots.invalidate_all();
         self.file_lists.invalidate_all();
+        // version_list may be stale after a write; state_manifests are immutable so kept.
+        *self.version_list.write() = None;
     }
 
     // -- Stats --

@@ -1479,6 +1479,62 @@ mod tests {
     }
 
     // ========================================================================
+    // Wrapped metadata format (Scala compatibility)
+    // ========================================================================
+
+    /// `parse_metadata_json` must handle both the bare format written by Rust
+    /// and the `{"metaData": {...}}` envelope written by Scala's CheckpointCommand.
+    #[test]
+    fn test_parse_metadata_json_bare_format() {
+        let bare = r#"{"id":"abc","schemaString":"{}","partitionColumns":[],"configuration":{},"createdTime":0,"format":{"provider":"delta","options":{}}}"#;
+        let m = crate::txlog::distributed::parse_metadata_json(bare);
+        assert!(m.is_some(), "bare format should parse successfully");
+        assert_eq!(m.unwrap().id, "abc");
+    }
+
+    #[test]
+    fn test_parse_metadata_json_scala_wrapped_format() {
+        let inner = r#"{"id":"72200663-test","schemaString":"{}","partitionColumns":["message_date"],"configuration":{},"createdTime":1234,"format":{"provider":"delta","options":{}}}"#;
+        let wrapped = format!(r#"{{"metaData": {}}}"#, inner);
+        let m = crate::txlog::distributed::parse_metadata_json(&wrapped);
+        assert!(m.is_some(), "Scala-wrapped {{\"metaData\": ...}} format should parse successfully");
+        let m = m.unwrap();
+        assert_eq!(m.id, "72200663-test");
+        assert_eq!(m.partition_columns, vec!["message_date"]);
+    }
+
+    #[test]
+    fn test_parse_metadata_json_invalid_returns_none() {
+        assert!(crate::txlog::distributed::parse_metadata_json("not json").is_none());
+        assert!(crate::txlog::distributed::parse_metadata_json(r#"{"other":"key"}"#).is_none());
+        assert!(crate::txlog::distributed::parse_metadata_json(r#"{"metaData": null}"#).is_none());
+    }
+
+    /// Round-trip: writer emits wrapped format; reader unwraps it back to MetadataAction.
+    #[test]
+    fn test_writer_emits_wrapped_metadata_reader_can_parse() {
+        use crate::txlog::actions::MetadataAction;
+        let original = MetadataAction {
+            id: "roundtrip-id".to_string(),
+            name: None,
+            description: None,
+            schema_string: r#"{"type":"struct","fields":[]}"#.to_string(),
+            partition_columns: vec!["date".to_string()],
+            configuration: std::collections::HashMap::new(),
+            created_time: Some(9999),
+            format: Default::default(),
+        };
+        // Simulate writer: wrap in {"metaData": {...}}
+        let written = serde_json::to_value(&original).unwrap();
+        let on_disk = serde_json::json!({"metaData": written}).to_string();
+        // Simulate reader: parse_metadata_json should unwrap correctly
+        let parsed = crate::txlog::distributed::parse_metadata_json(&on_disk)
+            .expect("parse_metadata_json should succeed on writer output");
+        assert_eq!(parsed.id, original.id);
+        assert_eq!(parsed.partition_columns, original.partition_columns);
+    }
+
+    // ========================================================================
     // Protocol aspect tests — footer offsets scan
     // ========================================================================
 
