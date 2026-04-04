@@ -266,38 +266,18 @@ fn add_field_for_arrow_type(
                             );
                         builder.add_text_field(name, text_opts);
                     }
-                    // TextAndString creates two index-only fields (no stored/fast).
-                    // In companion mode, document storage comes from the parquet source,
-                    // and aggregations use hashed fast fields (_phash_) configured separately.
-                    // Neither the raw field nor the __text companion needs storage or fast field access.
+                    // Single-field: default-tokenized inverted index for full-text search
+                    // and PhraseQuery equality, raw fast field for aggregations/sorting.
                     StringIndexingMode::TextAndString => {
-                        // Primary field: raw string for exact matching
-                        let raw_opts = TextOptions::default()
-                            .set_indexing_options(
-                                TextFieldIndexing::default()
-                                    .set_tokenizer("raw")
-                                    .set_index_option(IndexRecordOption::Basic)
-                                    .set_fieldnorms(config.fieldnorms_enabled),
-                            );
-                        builder.add_text_field(name, raw_opts);
-
-                        // Secondary field: tokenized text for full-text search
-                        let text_name = string_indexing::text_companion_field_name(name);
-                        if all_field_names.contains(&text_name) {
-                            anyhow::bail!(
-                                "Text companion field name '{}' for field '{}' collides with an existing column. \
-                                 Rename the column or use a different indexing mode.",
-                                text_name, name
-                            );
-                        }
-                        let text_opts = TextOptions::default()
+                        let opts = TextOptions::default()
                             .set_indexing_options(
                                 TextFieldIndexing::default()
                                     .set_tokenizer("default")
                                     .set_index_option(IndexRecordOption::WithFreqsAndPositions)
                                     .set_fieldnorms(config.fieldnorms_enabled),
-                            );
-                        builder.add_text_field(&text_name, text_opts);
+                            )
+                            .set_fast(Some("raw"));
+                        builder.add_text_field(name, opts);
                     }
                 }
             } else {
@@ -1276,7 +1256,7 @@ mod tests {
     }
 
     #[test]
-    fn test_text_and_string_creates_two_fields() {
+    fn test_text_and_string_creates_single_field() {
         let arrow = ArrowSchema::new(vec![
             Field::new("message", DataType::Utf8, true),
         ]);
@@ -1285,39 +1265,18 @@ mod tests {
 
         let schema = derive_tantivy_schema(&arrow, &config).unwrap();
 
-        // Primary field: "message" with raw tokenizer for exact matching
         let msg_field = schema.get_field("message").unwrap();
-        let msg_entry = schema.get_field_entry(msg_field);
-        assert!(
-            matches!(msg_entry.field_type(), tantivy::schema::FieldType::Str(_)),
-            "text_and_string primary field 'message' should be Str type, got {:?}", msg_entry.field_type()
-        );
-
-        // Secondary field: "message__text" with default tokenizer for full-text search
-        let text_field = schema.get_field("message__text").unwrap();
-        let text_entry = schema.get_field_entry(text_field);
-        assert!(
-            matches!(text_entry.field_type(), tantivy::schema::FieldType::Str(_)),
-            "text_and_string companion field 'message__text' should be Str type, got {:?}", text_entry.field_type()
-        );
-    }
-
-    #[test]
-    fn test_text_and_string_collision_detection() {
-        // Create an Arrow schema where "message__text" already exists as a column
-        let arrow = ArrowSchema::new(vec![
-            Field::new("message", DataType::Utf8, true),
-            Field::new("message__text", DataType::Utf8, true),
-        ]);
-        let mut config = SchemaDerivationConfig::default();
-        config.tokenizer_overrides.insert("message".to_string(), "text_and_string".to_string());
-
-        let result = derive_tantivy_schema(&arrow, &config);
-        assert!(result.is_err(), "Should fail when companion field name collides with existing column");
-        assert!(
-            result.unwrap_err().to_string().contains("collides"),
-            "Error message should mention collision"
-        );
+        match schema.get_field_entry(msg_field).field_type() {
+            tantivy::schema::FieldType::Str(text_opts) => {
+                let indexing = text_opts.get_indexing_options()
+                    .expect("Should have indexing options");
+                assert_eq!(indexing.tokenizer(), "default");
+                assert_eq!(indexing.index_option(),
+                    tantivy::schema::IndexRecordOption::WithFreqsAndPositions);
+                assert!(text_opts.is_fast(), "Should have fast field enabled");
+            }
+            other => panic!("Expected Str type, got {:?}", other),
+        }
     }
 }
 

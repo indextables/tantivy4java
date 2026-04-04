@@ -38,8 +38,8 @@ pub enum StringIndexingMode {
     /// Strip custom regex matches from text, index remaining text with "default" tokenizer.
     /// Matches are discarded.
     TextCustomStrip { regex: String },
-    /// Dual-field indexing: primary field uses "raw" tokenizer for exact string matching,
-    /// secondary `<field>__text` field uses "default" tokenizer for full-text search.
+    /// Single-field indexing: inverted index uses "default" tokenizer for full-text search
+    /// and PhraseQuery equality, fast field uses "raw" tokenizer for aggregations and sorting.
     TextAndString,
 }
 
