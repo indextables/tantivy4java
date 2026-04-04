@@ -28,6 +28,7 @@ use super::schema_derivation::{
 use super::statistics::{StatisticsAccumulator, ColumnStatisticsResult, validate_statistics_fields};
 use super::name_mapping;
 use super::string_indexing::{self, StringIndexingMode, CompanionFieldInfo};
+use crate::quickwit_split::json_discovery::JsonSubfieldMap;
 
 use crate::debug_println;
 use crate::quickwit_split::QuickwitSplitMetadata;
@@ -408,6 +409,15 @@ pub async fn create_split_from_parquet(
         }
     }
 
+    // ── Step 8b: JSON sub-field accumulator ────────────────────────────
+    // Collects discovered sub-field names and types from JSON/object fields
+    // during indexing, replacing .store-based sampling.
+    // After JSON_SUBFIELD_SAMPLE_LIMIT rows, discovery stops to avoid
+    // redundant HashMap lookups and string allocations on large datasets.
+    let mut json_subfields: JsonSubfieldMap = HashMap::new();
+    let mut json_subfield_rows_sampled: u64 = 0;
+    const JSON_SUBFIELD_SAMPLE_LIMIT: u64 = 1000;
+
     // ── Step 9: Iterate parquet files and index rows ─────────────────────
     let mut parquet_file_entries: Vec<ParquetFileEntry> = Vec::new();
     let mut cumulative_row_offset: u64 = 0;
@@ -549,7 +559,17 @@ pub async fn create_split_from_parquet(
             let batch = batch_result.context("Failed to read record batch")?;
             let batch_schema = batch.schema();
 
+            let mut throwaway_subfields: JsonSubfieldMap = HashMap::new();
             for row_idx in 0..batch.num_rows() {
+                // After sampling enough rows, stop accumulating json_subfields
+                // to avoid per-row HashMap overhead on large datasets.
+                let subfield_ref = if json_subfield_rows_sampled < JSON_SUBFIELD_SAMPLE_LIMIT {
+                    json_subfield_rows_sampled += 1;
+                    &mut json_subfields
+                } else {
+                    throwaway_subfields.clear();
+                    &mut throwaway_subfields
+                };
                 let mut tantivy_doc = arrow_row_to_tantivy_doc(
                     &batch,
                     &batch_schema,
@@ -561,6 +581,7 @@ pub async fn create_split_from_parquet(
                     &mut accumulators,
                     &string_indexing_modes,
                     &compiled_regexes,
+                    subfield_ref,
                 )?;
 
                 // Attach merge-safe parquet coordinates to each document
@@ -591,6 +612,11 @@ pub async fn create_split_from_parquet(
     // segment_row_ranges are kept for backward compatibility but are no
     // longer used for correctness in the retrieval path.
     index.load_metas().context("Failed to load index metas after commit")?;
+
+    // NOTE: .store files are NOT deleted here. They must remain on disk for
+    // hotcache generation (write_hotcache_mmap opens the full tantivy index).
+    // Instead, create_quickwit_split excludes .store files from the bundle
+    // when a parquet manifest is present (companion mode).
 
     let segment_metas = index.searchable_segment_metas()
         .context("Failed to read segment metas after commit")?;
@@ -647,7 +673,7 @@ pub async fn create_split_from_parquet(
     // but the doc_mapping returned to the client must report all fields as fast so that
     // when the client passes it back to create a SplitSearcher, the runtime knows it can
     // serve fast field data (either from native .fast files or from parquet).
-    let raw_doc_mapping = crate::quickwit_split::json_discovery::extract_doc_mapping_from_index(&index)
+    let raw_doc_mapping = crate::quickwit_split::json_discovery::extract_doc_mapping_with_json_subfields(&index, &json_subfields)
         .map_err(|e| anyhow::anyhow!("Failed to extract doc mapping from parquet index: {}", e))?;
     let doc_mapping_json = super::schema_derivation::promote_doc_mapping_all_fast(&raw_doc_mapping)?;
 
@@ -732,6 +758,7 @@ pub(crate) fn arrow_row_to_tantivy_doc(
     accumulators: &mut HashMap<String, StatisticsAccumulator>,
     string_indexing_modes: &HashMap<String, StringIndexingMode>,
     compiled_regexes: &HashMap<String, regex::Regex>,
+    json_subfields: &mut JsonSubfieldMap,
 ) -> Result<TantivyDocument> {
     let mut doc = TantivyDocument::new();
 
@@ -769,6 +796,7 @@ pub(crate) fn arrow_row_to_tantivy_doc(
             &mut doc, field, array, arrow_field.data_type(), row_idx,
             tantivy_field_name, config, string_hash_fields, tantivy_schema,
             accumulators, string_indexing_modes, compiled_regexes,
+            json_subfields,
         )?;
     }
 
@@ -792,6 +820,7 @@ pub(crate) fn add_arrow_value_to_doc(
     accumulators: &mut HashMap<String, StatisticsAccumulator>,
     string_indexing_modes: &HashMap<String, StringIndexingMode>,
     compiled_regexes: &HashMap<String, regex::Regex>,
+    json_subfields: &mut JsonSubfieldMap,
 ) -> Result<()> {
     match data_type {
         DataType::Boolean => {
@@ -892,6 +921,7 @@ pub(crate) fn add_arrow_value_to_doc(
             add_string_value_to_doc(
                 doc, field, val, field_name, config, string_hash_fields,
                 tantivy_schema, accumulators, string_indexing_modes, compiled_regexes,
+                json_subfields,
             )?;
         }
         DataType::LargeUtf8 => {
@@ -900,6 +930,7 @@ pub(crate) fn add_arrow_value_to_doc(
             add_string_value_to_doc(
                 doc, field, val, field_name, config, string_hash_fields,
                 tantivy_schema, accumulators, string_indexing_modes, compiled_regexes,
+                json_subfields,
             )?;
         }
 
@@ -1002,6 +1033,9 @@ pub(crate) fn add_arrow_value_to_doc(
             let owned = convert_arrow_to_owned_value(array, row_idx)?;
             match owned {
                 tantivy::schema::OwnedValue::Object(entries) => {
+                    // Collect JSON sub-field info during indexing (replaces .store sampling)
+                    let subfields = json_subfields.entry(field_name.to_string()).or_default();
+                    crate::quickwit_split::json_discovery::discover_fields_from_object(&entries, "", subfields);
                     doc.add_object(field, entries.into_iter().collect());
                 }
                 tantivy::schema::OwnedValue::Array(_) => {
@@ -1043,11 +1077,12 @@ pub(crate) fn add_string_value_to_doc(
     accumulators: &mut HashMap<String, StatisticsAccumulator>,
     string_indexing_modes: &HashMap<String, StringIndexingMode>,
     compiled_regexes: &HashMap<String, regex::Regex>,
+    json_subfields: &mut JsonSubfieldMap,
 ) -> Result<()> {
     if config.ip_address_fields.contains(field_name) {
         add_ip_addr_value(doc, field, val, field_name)?;
     } else if config.json_fields.contains(field_name) {
-        add_json_string_value(doc, field, val, field_name)?;
+        add_json_string_value(doc, field, val, field_name, json_subfields)?;
     } else if let Some(mode) = string_indexing_modes.get(field_name) {
         match mode {
             StringIndexingMode::ExactOnly => {
@@ -1129,6 +1164,7 @@ fn add_json_string_value(
     field: Field,
     json_str: &str,
     field_name: &str,
+    json_subfields: &mut JsonSubfieldMap,
 ) -> Result<()> {
     let parsed: serde_json::Value = serde_json::from_str(json_str)
         .with_context(|| format!(
@@ -1140,6 +1176,9 @@ fn add_json_string_value(
         serde_json::Value::Object(_) => {
             let owned: tantivy::schema::OwnedValue = serde_json::from_str(json_str)?;
             if let tantivy::schema::OwnedValue::Object(obj) = owned {
+                // Collect JSON sub-field info during indexing
+                let subfields = json_subfields.entry(field_name.to_string()).or_default();
+                crate::quickwit_split::json_discovery::discover_fields_from_object(&obj, "", subfields);
                 let json_map: std::collections::BTreeMap<String, tantivy::schema::OwnedValue> =
                     obj.into_iter().collect();
                 doc.add_object(field, json_map);
@@ -2238,16 +2277,28 @@ mod tests {
         let schema = builder.build();
 
         let mut doc = TantivyDocument::new();
+        let mut json_subfields: JsonSubfieldMap = HashMap::new();
         add_json_string_value(
             &mut doc,
             field,
             r#"{"user":"alice","score":42}"#,
             "payload",
+            &mut json_subfields,
         ).expect("Valid JSON object should succeed");
 
         // Verify the document has the JSON field
         let json_val = doc.get_first(field);
         assert!(json_val.is_some(), "Document should have the JSON field");
+
+        // Verify json_subfields was populated correctly
+        assert!(json_subfields.contains_key("payload"), "json_subfields should contain 'payload' entry");
+        let payload_subs = json_subfields.get("payload").unwrap();
+        assert_eq!(payload_subs.get("user").map(String::as_str), Some("text"),
+            "Sub-field 'user' should be discovered as 'text'");
+        assert!(
+            payload_subs.get("score").map(|t| t == "i64" || t == "u64" || t == "f64").unwrap_or(false),
+            "Sub-field 'score' should be discovered as a numeric type, got: {:?}", payload_subs.get("score")
+        );
     }
 
     #[test]
@@ -2259,11 +2310,13 @@ mod tests {
         let _schema = builder.build();
 
         let mut doc = TantivyDocument::new();
+        let mut json_subfields: JsonSubfieldMap = HashMap::new();
         let result = add_json_string_value(
             &mut doc,
             field,
             "not valid json",
             "payload",
+            &mut json_subfields,
         );
         assert!(result.is_err(), "Invalid JSON should fail");
         assert!(result.unwrap_err().to_string().contains("Failed to parse JSON"));
@@ -2278,12 +2331,14 @@ mod tests {
         let _schema = builder.build();
 
         let mut doc = TantivyDocument::new();
+        let mut json_subfields: JsonSubfieldMap = HashMap::new();
         // Array is not an object
         let result = add_json_string_value(
             &mut doc,
             field,
             r#"[1,2,3]"#,
             "payload",
+            &mut json_subfields,
         );
         assert!(result.is_err(), "Non-object JSON should fail");
         assert!(result.unwrap_err().to_string().contains("non-object"));
@@ -2295,6 +2350,7 @@ mod tests {
             field,
             r#""hello""#,
             "payload",
+            &mut json_subfields,
         );
         assert!(result2.is_err(), "String literal JSON should fail");
     }
@@ -3393,5 +3449,88 @@ mod tests {
             "_phash_name should exist (not excluded)");
         assert!(schema.get_field(&format!("{}category", PHASH_FIELD_PREFIX)).is_err(),
             "_phash_category should NOT exist (excluded)");
+    }
+
+    #[tokio::test]
+    async fn test_json_subfield_discovery_in_companion_split() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let parquet_path = temp_dir.path().join("json_discovery.parquet");
+        let output_path = temp_dir.path().join("json_discovery.split");
+
+        // Creates rows with payload: {"user":"user_N","score":N*10,"active":bool}
+        write_test_parquet_with_json_strings(&parquet_path, 20, 0);
+
+        let mut json_fields = HashSet::new();
+        json_fields.insert("payload".to_string());
+
+        let config = CreateFromParquetConfig {
+            table_root: temp_dir.path().to_string_lossy().to_string(),
+            schema_config: SchemaDerivationConfig {
+                json_fields,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let storage: std::sync::Arc<dyn quickwit_storage::Storage> =
+            std::sync::Arc::new(quickwit_storage::RamStorage::default());
+
+        let result = create_split_from_parquet(
+            &[parquet_path.to_string_lossy().to_string()],
+            output_path.to_str().unwrap(),
+            &config,
+            &storage,
+        ).await.expect("Split creation with JSON fields should succeed");
+
+        assert_eq!(result.metadata.num_docs, 20);
+
+        // Verify doc_mapping_json is present in metadata
+        let doc_mapping_json = result.metadata.doc_mapping_json
+            .as_ref()
+            .expect("doc_mapping_json should be present in split metadata");
+
+        // Parse the doc_mapping and verify JSON sub-fields were discovered
+        let doc_mapping: serde_json::Value = serde_json::from_str(doc_mapping_json)
+            .expect("doc_mapping_json should be valid JSON");
+
+        let field_mappings = doc_mapping.as_array()
+            .expect("doc_mapping should be an array of field mappings");
+
+        // Find the payload object field
+        let payload_mapping = field_mappings.iter()
+            .find(|m| m["name"] == "payload" && m["type"] == "object")
+            .expect("Should find 'payload' as an object-type field in doc_mapping");
+
+        let sub_fields = payload_mapping["field_mappings"].as_array()
+            .expect("payload object should have field_mappings");
+
+        // Verify exact sub-field count (user, score, active — no phantom extras)
+        assert_eq!(sub_fields.len(), 3,
+            "payload should have exactly 3 sub-fields, got: {:?}",
+            sub_fields.iter().map(|f| f["name"].as_str().unwrap_or("?")).collect::<Vec<_>>());
+
+        // Verify discovered sub-fields by name
+        let sub_field_names: HashSet<String> = sub_fields.iter()
+            .map(|f| f["name"].as_str().unwrap().to_string())
+            .collect();
+
+        assert!(sub_field_names.contains("user"),
+            "Should discover 'user' sub-field, got: {:?}", sub_field_names);
+        assert!(sub_field_names.contains("score"),
+            "Should discover 'score' sub-field, got: {:?}", sub_field_names);
+        assert!(sub_field_names.contains("active"),
+            "Should discover 'active' sub-field, got: {:?}", sub_field_names);
+
+        // Verify exact types
+        let user_field = sub_fields.iter().find(|f| f["name"] == "user").unwrap();
+        assert_eq!(user_field["type"], "text", "user should be text type");
+
+        // Test data produces non-negative integer scores (idx*10: 0,10,20,...).
+        // Tantivy's OwnedValue deserializer maps non-negative JSON integers to U64.
+        let score_field = sub_fields.iter().find(|f| f["name"] == "score").unwrap();
+        assert_eq!(score_field["type"], "u64", "score should be u64 (non-negative integer test data)");
+
+        let active_field = sub_fields.iter().find(|f| f["name"] == "active").unwrap();
+        assert_eq!(active_field["type"], "bool", "active should be bool type");
     }
 }

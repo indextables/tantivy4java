@@ -146,11 +146,10 @@ fn add_field_for_arrow_type(
     if config.json_fields.contains(name) {
         match data_type {
             DataType::Utf8 | DataType::LargeUtf8 => {
-                // STRING column forced to JSON: stored + indexed + fast
+                // STRING column forced to JSON: indexed + fast (stored only if requested)
                 // Fast fields are required for range queries on numeric sub-fields
                 // Use "raw" tokenizer to match TANT batch path behavior (exact string matching)
-                let opts = JsonObjectOptions::default()
-                    .set_stored()
+                let mut opts = JsonObjectOptions::default()
                     .set_indexing_options(
                         TextFieldIndexing::default()
                             .set_tokenizer("raw")
@@ -158,6 +157,9 @@ fn add_field_for_arrow_type(
                             .set_fieldnorms(config.fieldnorms_enabled),
                     )
                     .set_fast(None);
+                if config.store_fields {
+                    opts = opts.set_stored();
+                }
                 builder.add_json_field(name, opts);
                 return Ok(());
             }
@@ -341,11 +343,10 @@ fn add_field_for_arrow_type(
         }
 
         DataType::List(_) | DataType::LargeList(_) | DataType::FixedSizeList(_, _) | DataType::Map(_, _) | DataType::Struct(_) => {
-            // Complex types → JSON object field: stored + indexed + fast
+            // Complex types → JSON object field: indexed + fast (stored only if requested)
             // Fast fields are required for range queries on numeric sub-fields
             // Use "raw" tokenizer to match TANT batch path behavior (exact string matching)
-            let opts = JsonObjectOptions::default()
-                .set_stored()
+            let mut opts = JsonObjectOptions::default()
                 .set_indexing_options(
                     TextFieldIndexing::default()
                         .set_tokenizer("raw")
@@ -353,6 +354,9 @@ fn add_field_for_arrow_type(
                         .set_fieldnorms(config.fieldnorms_enabled),
                 )
                 .set_fast(None);
+            if config.store_fields {
+                opts = opts.set_stored();
+            }
             builder.add_json_field(name, opts);
         }
 
@@ -1112,10 +1116,12 @@ mod tests {
 
     #[test]
     fn test_json_fields_stored_and_indexed() {
+        // Tests the standard split path (FFI) where store_fields is true
         let arrow = ArrowSchema::new(vec![
             Field::new("payload", DataType::Utf8, true),
         ]);
         let mut config = SchemaDerivationConfig::default();
+        config.store_fields = true;
         config.json_fields.insert("payload".to_string());
 
         let schema = derive_tantivy_schema(&arrow, &config).unwrap();
@@ -1128,6 +1134,27 @@ mod tests {
 
         // Should be indexed (JsonObject with indexing options)
         assert!(payload_entry.is_indexed(), "JSON field should be indexed");
+    }
+
+    #[test]
+    fn test_json_fields_not_stored_in_companion_mode() {
+        // Companion path: store_fields is false because parquet is the document store
+        let arrow = ArrowSchema::new(vec![
+            Field::new("payload", DataType::Utf8, true),
+        ]);
+        let mut config = SchemaDerivationConfig::default();
+        config.json_fields.insert("payload".to_string());
+
+        let schema = derive_tantivy_schema(&arrow, &config).unwrap();
+
+        let payload_field = schema.get_field("payload").unwrap();
+        let payload_entry = schema.get_field_entry(payload_field);
+
+        // Should NOT be stored — parquet serves as the document store
+        assert!(!payload_entry.is_stored(), "JSON field should not be stored in companion mode");
+
+        // Should still be indexed for search
+        assert!(payload_entry.is_indexed(), "JSON field should be indexed in companion mode");
     }
 
     // ── String indexing mode tests ─────────────────────────────────────
@@ -1223,6 +1250,79 @@ mod tests {
 
         assert!(schema.get_field("log_line").is_ok());
         assert!(schema.get_field("log_line__uuids").is_ok());
+    }
+
+    #[test]
+    fn test_json_field_stored_respects_store_fields_flag() {
+        let arrow = ArrowSchema::new(vec![
+            Field::new("payload", DataType::Utf8, true),
+        ]);
+
+        // Case 1: store_fields=false (companion mode) → JSON field must NOT be stored
+        let mut config_no_store = SchemaDerivationConfig::default();
+        config_no_store.json_fields.insert("payload".to_string());
+        config_no_store.store_fields = false;
+
+        let schema = derive_tantivy_schema(&arrow, &config_no_store).unwrap();
+        let entry = schema.get_field_entry(schema.get_field("payload").unwrap());
+        assert!(
+            matches!(entry.field_type(), tantivy::schema::FieldType::JsonObject(_)),
+            "payload should be JsonObject type"
+        );
+        assert!(!entry.is_stored(),
+            "JSON field must NOT be stored when store_fields=false (companion mode)");
+
+        // Case 2: store_fields=true (standard split) → JSON field must be stored
+        let mut config_store = SchemaDerivationConfig::default();
+        config_store.json_fields.insert("payload".to_string());
+        config_store.store_fields = true;
+
+        let schema = derive_tantivy_schema(&arrow, &config_store).unwrap();
+        let entry = schema.get_field_entry(schema.get_field("payload").unwrap());
+        assert!(
+            matches!(entry.field_type(), tantivy::schema::FieldType::JsonObject(_)),
+            "payload should be JsonObject type"
+        );
+        assert!(entry.is_stored(),
+            "JSON field must be stored when store_fields=true (standard split)");
+    }
+
+    #[test]
+    fn test_complex_type_json_stored_respects_store_fields_flag() {
+        // Tests the List/Map/Struct JSON path (line ~345), separate from the Utf8 override path
+        let arrow = ArrowSchema::new(vec![
+            Field::new(
+                "tags",
+                DataType::List(std::sync::Arc::new(Field::new("item", DataType::Utf8, true))),
+                true,
+            ),
+        ]);
+
+        // Case 1: store_fields=false (companion mode) → complex-type JSON field must NOT be stored
+        let mut config_no_store = SchemaDerivationConfig::default();
+        config_no_store.store_fields = false;
+
+        let schema = derive_tantivy_schema(&arrow, &config_no_store).unwrap();
+        let entry = schema.get_field_entry(schema.get_field("tags").unwrap());
+        assert!(
+            matches!(entry.field_type(), tantivy::schema::FieldType::JsonObject(_)),
+            "List field should be JsonObject type"
+        );
+        assert!(!entry.is_stored(),
+            "Complex-type JSON field must NOT be stored when store_fields=false (companion mode)");
+
+        // Case 2: store_fields=true (standard split) → complex-type JSON field must be stored
+        let mut config_store = SchemaDerivationConfig::default();
+        config_store.store_fields = true;
+
+        let schema = derive_tantivy_schema(&arrow, &config_store).unwrap();
+        let entry = schema.get_field_entry(schema.get_field("tags").unwrap());
+        assert!(
+            matches!(entry.field_type(), tantivy::schema::FieldType::JsonObject(_)),
+            "List field should be JsonObject type"
+        );
+        assert!(entry.is_stored(),
+            "Complex-type JSON field must be stored when store_fields=true (standard split)");
     }
 
     #[test]
