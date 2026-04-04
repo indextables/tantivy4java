@@ -33,7 +33,7 @@ use crate::quickwit_split::{
     SplitConfig, QuickwitSplitMetadata, FooterOffsets,
     default_split_config, create_quickwit_split,
 };
-use crate::quickwit_split::json_discovery::extract_doc_mapping_from_index;
+use crate::quickwit_split::json_discovery::{extract_doc_mapping_from_index, JsonSubfieldMap};
 
 /// Context for streaming Arrow FFI split creation.
 /// Wrapped in Arc<Mutex<>> at the JNI layer (IndexWriter is !Sync).
@@ -72,6 +72,12 @@ pub(crate) struct ArrowFfiSplitContext {
     /// Column names for which to compute min/max statistics (empty = none).
     /// Populated from the "stats" flag in fieldConfigJson.
     stats_columns: std::collections::HashSet<String>,
+    /// Throwaway accumulator for JSON sub-field discovery during row conversion.
+    /// The FFI path is non-companion (store_fields: true), so the accumulated data
+    /// is unused — finish_partition_split uses extract_doc_mapping_from_index which
+    /// samples from .store instead. Kept as a field to avoid changing shared function
+    /// signatures that require &mut HashMap.
+    json_subfields: JsonSubfieldMap,
 }
 
 /// Per-partition state: each partition gets its own Index + IndexWriter + temp dir.
@@ -320,6 +326,7 @@ pub(crate) fn begin_split_from_arrow(
         output_dir,
         rolled_splits: Vec::new(),
         stats_columns,
+        json_subfields: HashMap::new(),
     })
 }
 
@@ -595,6 +602,7 @@ pub(crate) async fn add_arrow_batch(ctx: &mut ArrowFfiSplitContext, batch: &Reco
                 &string_indexing_modes,
                 &compiled_regexes,
                 &prebuilt,
+                &mut ctx.json_subfields,
             )?;
             pw.writer.add_document(doc)?;
             pw.doc_count += 1;
@@ -655,6 +663,7 @@ pub(crate) async fn add_arrow_batch(ctx: &mut ArrowFfiSplitContext, batch: &Reco
                     &string_indexing_modes,
                     &compiled_regexes,
                     &prebuilt,
+                    &mut ctx.json_subfields,
                 )?;
                 pw.writer.add_document(doc)?;
                 pw.doc_count += 1;
@@ -712,6 +721,7 @@ fn build_doc_from_arrow_row(
     string_indexing_modes: &HashMap<String, StringIndexingMode>,
     compiled_regexes: &HashMap<String, regex::Regex>,
     prebuilt: &PrebuiltComplexColumns,
+    json_subfields: &mut JsonSubfieldMap,
 ) -> Result<TantivyDocument> {
     let mut doc = TantivyDocument::new();
 
@@ -761,6 +771,7 @@ fn build_doc_from_arrow_row(
             accumulators,
             string_indexing_modes,
             compiled_regexes,
+            json_subfields,
         )?;
     }
 
