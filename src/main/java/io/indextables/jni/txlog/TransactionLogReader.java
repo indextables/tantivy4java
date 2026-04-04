@@ -364,6 +364,17 @@ public class TransactionLogReader {
         }
     }
 
+    /**
+     * Invalidate all cached transaction log data across every table.
+     *
+     * <p>Clears the global snapshot/manifest cache registry entirely. Use this when you need to
+     * force all subsequent reads to fetch fresh data from storage, regardless of which table they
+     * access.
+     */
+    public static void invalidateCacheGlobal() {
+        nativeInvalidateCacheGlobal();
+    }
+
     // --- Native methods ---
 
     private static native byte[] nativeGetSnapshotInfo(String tablePath, Map<String, String> config);
@@ -378,6 +389,7 @@ public class TransactionLogReader {
     private static native void nativeCloseRetainedFilesCursor(long cursorHandle);
     private static native byte[] nativeListSkipActions(String tablePath, Map<String, String> config, long maxAgeMs);
     private static native void nativeInvalidateCache(String tablePath);
+    private static native void nativeInvalidateCacheGlobal();
 
     // FR1: List files with partition/data skipping, return via Arrow FFI
     private static native String nativeListFilesArrowFfi(

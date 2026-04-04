@@ -674,6 +674,42 @@ mod tests {
     }
 
     #[test]
+    fn test_clear_all_caches_removes_all_entries() {
+        // Populate caches for two distinct tables
+        let c1 = get_or_create_cache("test://table_clear1_moka", CacheConfig::default());
+        let c2 = get_or_create_cache("test://table_clear2_moka", CacheConfig::default());
+        c1.put_version(1, vec![]);
+        c2.put_version(2, vec![]);
+        assert!(c1.get_version(1).is_some());
+        assert!(c2.get_version(2).is_some());
+
+        // Also populate the global manifest cache
+        let entries = Arc::new(vec![]);
+        put_cached_manifest("test://table_clear1_moka/manifest.avro", entries);
+        assert!(get_cached_manifest("test://table_clear1_moka/manifest.avro").is_some());
+
+        // Global clear
+        clear_all_caches();
+
+        // Both table caches must be empty (registry was cleared)
+        assert!(c1.get_version(1).is_none());
+        assert!(c2.get_version(2).is_none());
+
+        // Global manifest cache must also be cleared
+        assert!(get_cached_manifest("test://table_clear1_moka/manifest.avro").is_none());
+    }
+
+    #[test]
+    fn test_clear_all_caches_then_repopulate() {
+        // Verify the registry is usable after a global clear
+        clear_all_caches();
+
+        let c = get_or_create_cache("test://table_repop_moka", CacheConfig::default());
+        c.put_version(5, vec![]);
+        assert!(c.get_version(5).is_some());
+    }
+
+    #[test]
     fn test_concurrent_reads() {
         use std::sync::Arc;
         let cache = Arc::new(TxLogCache::new(CacheConfig::default()));
