@@ -39,7 +39,7 @@ use super::temp_management::create_temp_directory_with_base;
 use super::download::download_and_extract_splits_parallel;
 use super::{is_configuration_error, create_merged_split_file, upload_split_to_s3, estimate_peak_memory_usage};
 use super::resilient_ops;
-use super::json_discovery::extract_doc_mapping_from_index;
+use super::json_discovery::{extract_doc_mapping_from_index, extract_doc_mapping_with_json_subfields};
 use super::merge_types::SkippedSplit;
 
 // Debug logging macro - controlled by TANTIVY4JAVA_DEBUG environment variable
@@ -375,7 +375,15 @@ pub fn merge_splits_impl(split_urls: &[String], output_path: &str, config: &Inte
     let merged_directory = MmapDirectory::open(&output_temp_dir)?;
     let tokenizer_manager = get_quickwit_fastfield_normalizer_manager().tantivy_manager();
     let merged_index = open_index(merged_directory, tokenizer_manager)?;
-    let raw_doc_mapping = extract_doc_mapping_from_index(&merged_index)?;
+    let raw_doc_mapping = if is_companion_merge {
+        // Companion splits lack stored JSON data (.store files were removed).
+        // Discover JSON sub-fields from fast field columns instead of sampling .store.
+        let json_subfields = super::json_discovery::discover_json_subfields_from_fast_fields(&merged_index)
+            .unwrap_or_default();
+        extract_doc_mapping_with_json_subfields(&merged_index, &json_subfields)?
+    } else {
+        extract_doc_mapping_from_index(&merged_index)?
+    };
     // For companion splits, promote all fields to fast in the doc mapping so that
     // clients know aggregations are available via parquet transcoding. This matches
     // what the build path (createFromParquet) does. Only apply to companion merges —
