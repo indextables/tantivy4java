@@ -1766,4 +1766,151 @@ mod tests {
         }
         assert!(total_entries >= 1, "should have readable entries even after truncation");
     }
+
+    // -------------------------------------------------------------------------
+    // Bug fix regression tests: null-metadata fallback + schema registry merge
+    // -------------------------------------------------------------------------
+
+    /// Bug 2: Schema registry entries should be merged into metadata.configuration
+    /// so that doc_mapping_ref → doc_mapping_json resolution works in list_files.rs.
+    #[test]
+    fn test_schema_registry_merged_into_metadata_configuration() {
+        use crate::txlog::actions::MetadataAction;
+
+        let mut metadata = MetadataAction {
+            id: "test-id".to_string(),
+            name: None,
+            description: None,
+            schema_string: r#"{"type":"record","name":"test","fields":[]}"#.to_string(),
+            partition_columns: vec![],
+            configuration: HashMap::from([
+                ("docMappingSchema.ABC123".to_string(), "prefixed_value".to_string()),
+            ]),
+            created_time: None,
+            format: Default::default(),
+        };
+
+        let schema_registry: HashMap<String, String> = HashMap::from([
+            ("DEF456".to_string(), r#"{"doc_mapping":"new"}"#.to_string()),
+            ("ABC123".to_string(), "should_not_overwrite_different_key".to_string()),
+        ]);
+
+        // Apply the merge logic (mirrors what snapshot_from_checkpoint now does)
+        for (k, v) in &schema_registry {
+            metadata.configuration.entry(k.clone()).or_insert_with(|| v.clone());
+        }
+
+        // New key should be inserted
+        assert_eq!(
+            metadata.configuration.get("DEF456"),
+            Some(&r#"{"doc_mapping":"new"}"#.to_string()),
+            "schema_registry entries should be merged into configuration"
+        );
+        // Unprefixed "ABC123" was not already in configuration, so it gets inserted
+        assert!(
+            metadata.configuration.contains_key("ABC123"),
+            "unprefixed key from schema_registry should be added"
+        );
+        // Pre-existing prefixed key must not be touched
+        assert_eq!(
+            metadata.configuration.get("docMappingSchema.ABC123"),
+            Some(&"prefixed_value".to_string()),
+            "existing prefixed key must not be overwritten"
+        );
+    }
+
+    /// Bug 2: or_insert_with semantics — existing key is never overwritten.
+    #[test]
+    fn test_schema_registry_does_not_overwrite_existing_configuration_key() {
+        use crate::txlog::actions::MetadataAction;
+
+        let existing_value = r#"{"original":"schema"}"#.to_string();
+        let mut metadata = MetadataAction {
+            id: "test-id".to_string(),
+            name: None,
+            description: None,
+            schema_string: r#"{"type":"record","name":"test","fields":[]}"#.to_string(),
+            partition_columns: vec![],
+            configuration: HashMap::from([
+                ("HASH1".to_string(), existing_value.clone()),
+            ]),
+            created_time: None,
+            format: Default::default(),
+        };
+
+        let schema_registry: HashMap<String, String> = HashMap::from([
+            ("HASH1".to_string(), r#"{"replacement":"schema"}"#.to_string()),
+        ]);
+
+        for (k, v) in &schema_registry {
+            metadata.configuration.entry(k.clone()).or_insert_with(|| v.clone());
+        }
+
+        // Pre-existing value must be preserved
+        assert_eq!(
+            metadata.configuration.get("HASH1"),
+            Some(&existing_value),
+            "or_insert_with must not overwrite an existing key"
+        );
+    }
+
+    /// Bug 1: Backward-probe logic — parse_metadata_json handles the wrapped format
+    /// that the probe would encounter in a Scala-written previous checkpoint.
+    /// This validates the key building block of the backward-probe fallback.
+    #[test]
+    fn test_backward_probe_parse_wrapped_metadata_from_previous_checkpoint() {
+        use crate::txlog::distributed::parse_metadata_json;
+
+        // Simulates what state-v309/_manifest.avro would contain after TRUNCATE TIME TRAVEL
+        // when state-v310 has metadata: null.  The Scala writer wraps with "metaData".
+        let v309_metadata_json = serde_json::json!({
+            "metaData": {
+                "id": "72200663-abcd-4321-beef-000000000309",
+                "schemaString": r#"{"type":"struct","fields":[{"name":"id","type":"long"},{"name":"message_date","type":"string"}]}"#,
+                "partitionColumns": ["message_date"],
+                "configuration": {
+                    "docMappingSchema.HASH1": r#"{"doc_mapping":"from_v309"}"#
+                },
+                "createdTime": 1700000000000i64
+            }
+        }).to_string();
+
+        let result = parse_metadata_json(&v309_metadata_json);
+        assert!(result.is_some(), "should parse wrapped metadata from a previous checkpoint");
+
+        let m = result.unwrap();
+        assert_eq!(m.id, "72200663-abcd-4321-beef-000000000309");
+        assert!(!m.schema_string.is_empty(), "schema_string must not be empty after probe");
+        assert_eq!(m.partition_columns, vec!["message_date"]);
+        assert!(
+            m.configuration.contains_key("docMappingSchema.HASH1"),
+            "configuration should carry through from wrapped metadata"
+        );
+    }
+
+    /// Bug 1: When the current checkpoint has null metadata AND the previous checkpoint
+    /// also has null metadata, the probe should continue and eventually stop gracefully.
+    /// Verifies: empty schema_string is the sentinel that drives the probe loop.
+    #[test]
+    fn test_backward_probe_sentinel_is_empty_schema_string() {
+        use crate::txlog::distributed::parse_metadata_json;
+
+        // Simulates a checkpoint where metadata IS present but schema_string is empty
+        // (malformed) — the probe should still try to look further.
+        let empty_schema = serde_json::json!({
+            "metaData": {
+                "id": "some-id",
+                "schemaString": "",
+                "partitionColumns": [],
+                "configuration": {},
+                "createdTime": 1700000000000i64
+            }
+        }).to_string();
+
+        let result = parse_metadata_json(&empty_schema);
+        assert!(result.is_some(), "parse_metadata_json should succeed");
+        let m = result.unwrap();
+        assert!(m.schema_string.is_empty(), "empty schemaString should be empty after parsing");
+        // The probe loop condition `metadata.schema_string.is_empty()` would continue probing.
+    }
 }

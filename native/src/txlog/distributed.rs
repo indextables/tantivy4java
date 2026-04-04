@@ -187,7 +187,7 @@ pub async fn get_txlog_snapshot_info_with_cache(
                 // If there are post-checkpoint versions, read them for potential
                 // protocol/metadata overrides. This is critical for concurrent
                 // metadata updates — the cached metadata may be stale.
-                let (effective_protocol, effective_metadata) = if post_cp_paths.is_empty() {
+                let (effective_protocol, mut effective_metadata) = if post_cp_paths.is_empty() {
                     (Some(cached_meta.0.clone()), cached_meta.1.clone())
                 } else {
                     let post_cp_versions: Vec<i64> = all_versions.iter().copied()
@@ -200,6 +200,12 @@ pub async fn get_txlog_snapshot_info_with_cache(
                         post_metadata.unwrap_or_else(|| cached_meta.1.clone()),
                     )
                 };
+
+                // Bug 2b fix: Merge schema_registry into effective_metadata.configuration
+                // (same as non-cached path — see snapshot_from_checkpoint()).
+                for (k, v) in &state_manifest.schema_registry {
+                    effective_metadata.configuration.entry(k.clone()).or_insert_with(|| v.clone());
+                }
 
                 debug_println!("📊 DISTRIBUTED: snapshot_info from CACHE: checkpoint v{}, {} manifests, {} post-cp versions",
                     cached_cp.version, manifest_paths.len(), post_cp_paths.len());
@@ -280,7 +286,49 @@ async fn snapshot_from_checkpoint(
 
     // Post-checkpoint overrides checkpoint
     let protocol_opt = post_protocol.or(cp_protocol);
-    let metadata = post_metadata.or(cp_metadata).unwrap_or_else(MetadataAction::empty);
+    let mut metadata = post_metadata.or(cp_metadata).unwrap_or_else(MetadataAction::empty);
+
+    // Bug 1 fix: Backward-probing fallback — if the current checkpoint has null metadata
+    // (schema_string is empty), walk earlier checkpoints to find one that has it.
+    // Mirrors the Scala reader's getMetadata() fallback (OptimizedTransactionLog.scala:1321-1330),
+    // which scans backwards through version files.  After TRUNCATE TIME TRAVEL the version files
+    // are gone, but a previous checkpoint's state manifest may still carry the cached metadata.
+    if metadata.schema_string.is_empty() && last_cp.version > 0 {
+        let mut probe_version = last_cp.version - 1;
+        while metadata.schema_string.is_empty() {
+            let probe_state_dir = TxLogStorage::state_dir_name(probe_version);
+            match super::avro::state_reader::read_state_manifest(storage, &probe_state_dir).await {
+                Ok(prev_manifest) => {
+                    if let Some(ref md_str) = prev_manifest.metadata {
+                        if let Some(m) = parse_metadata_json(md_str) {
+                            if !m.schema_string.is_empty() {
+                                metadata = m;
+                                // Also merge the earlier checkpoint's schema_registry so that
+                                // older doc_mapping_ref hashes can be resolved (Fix 2c).
+                                for (k, v) in &prev_manifest.schema_registry {
+                                    metadata.configuration.entry(k.clone())
+                                        .or_insert_with(|| v.clone());
+                                }
+                            }
+                        }
+                    }
+                    if probe_version == 0 { break; }
+                    probe_version -= 1;
+                }
+                Err(_) => break, // State directory doesn't exist — stop probing
+            }
+        }
+    }
+
+    // Bug 2a fix: Merge the current checkpoint's schema_registry into metadata.configuration
+    // so that doc_mapping_ref → doc_mapping_json resolution works in list_files.rs.
+    // The Scala reader passes stateManifest.schemaRegistry separately to toAddActions()
+    // (TransactionLogCheckpoint.scala:669); we merge it into the configuration map that
+    // list_files.rs line 95 uses for restore_schemas().  Use or_insert_with to avoid
+    // overwriting prefixed entries already present in metadata.configuration.
+    for (k, v) in &state_manifest.schema_registry {
+        metadata.configuration.entry(k.clone()).or_insert_with(|| v.clone());
+    }
 
     let manifest_paths: Vec<ManifestPathInfo> = state_manifest.manifests.iter()
         .map(|m| ManifestPathInfo {
