@@ -23,7 +23,7 @@ use serde_json::{json, Value};
 
 use crate::parquet_companion::indexing::hash_string_value;
 use crate::parquet_companion::string_indexing::{
-    StringIndexingMode, companion_field_name, compile_regexes, text_companion_field_name,
+    StringIndexingMode, companion_field_name, compile_regexes,
 };
 
 /// Info needed to resolve hash bucket keys back to strings after aggregation (Phase 3).
@@ -551,12 +551,7 @@ fn rewrite_string_indexing_node(
                         // Non-matching text: leave as full_text on stripped text field
                     }
                     StringIndexingMode::TextAndString => {
-                        // Redirect full_text queries to the tokenized __text companion field.
-                        // The primary field uses "raw" tokenizer (whole-string), so full_text
-                        // queries would not match individual tokens.
-                        let text_name = text_companion_field_name(&field);
-                        obj.insert("field".to_string(), Value::String(text_name));
-                        return Ok(true);
+                        // Single-field: the field uses "default" tokenizer, so full_text works directly.
                     }
                     _ => {} // strip modes: leave as-is
                 }
@@ -626,12 +621,7 @@ fn rewrite_string_indexing_node(
                         // Non-matching: leave as phrase query on stripped text field
                     }
                     StringIndexingMode::TextAndString => {
-                        // Redirect phrase queries to the tokenized __text companion field.
-                        // The primary field uses IndexRecordOption::Basic (no positions),
-                        // so phrase queries cannot match.
-                        let text_name = text_companion_field_name(&field);
-                        obj.insert("field".to_string(), Value::String(text_name));
-                        return Ok(true);
+                        // Single-field: has WithFreqsAndPositions, so phrase queries work directly.
                     }
                     _ => {} // strip modes: leave as-is
                 }
@@ -1196,25 +1186,19 @@ mod tests {
     }
 
     #[test]
-    fn test_string_indexing_text_and_string_full_text_redirected() {
+    fn test_string_indexing_text_and_string_full_text_not_rewritten() {
         let query = r#"{"type":"full_text","field":"body","text":"hello world","params":{}}"#;
         let modes = make_string_indexing_modes();
         let result = rewrite_query_for_string_indexing(query, &modes).unwrap();
-        assert!(result.is_some(), "full_text on TextAndString should be redirected");
-        let parsed: Value = serde_json::from_str(&result.unwrap()).unwrap();
-        assert_eq!(parsed["type"], "full_text");
-        assert_eq!(parsed["field"], "body__text");
+        assert!(result.is_none(), "full_text on TextAndString should not be rewritten");
     }
 
     #[test]
-    fn test_string_indexing_text_and_string_phrase_redirected() {
+    fn test_string_indexing_text_and_string_phrase_not_rewritten() {
         let query = r#"{"type":"phrase","field":"body","phrases":["hello","world"],"slop":0}"#;
         let modes = make_string_indexing_modes();
         let result = rewrite_query_for_string_indexing(query, &modes).unwrap();
-        assert!(result.is_some(), "phrase on TextAndString should be redirected");
-        let parsed: Value = serde_json::from_str(&result.unwrap()).unwrap();
-        assert_eq!(parsed["type"], "phrase");
-        assert_eq!(parsed["field"], "body__text");
+        assert!(result.is_none(), "phrase on TextAndString should not be rewritten");
     }
 
     #[test]
@@ -1222,7 +1206,6 @@ mod tests {
         let query = r#"{"type":"term","field":"body","value":"hello world"}"#;
         let modes = make_string_indexing_modes();
         let result = rewrite_query_for_string_indexing(query, &modes).unwrap();
-        // Term queries on TextAndString should NOT be rewritten — they target the raw field for exact match
         assert!(result.is_none(), "term on TextAndString should not be rewritten");
     }
 }
