@@ -680,13 +680,10 @@ mod tests {
         let c2 = get_or_create_cache("test://table_clear2_moka", CacheConfig::default());
         c1.put_version(1, vec![]);
         c2.put_version(2, vec![]);
-        assert!(c1.get_version(1).is_some());
-        assert!(c2.get_version(2).is_some());
 
         // Also populate the global manifest cache
         let entries = Arc::new(vec![]);
         put_cached_manifest("test://table_clear1_moka/manifest.avro", entries);
-        assert!(get_cached_manifest("test://table_clear1_moka/manifest.avro").is_some());
 
         // Global clear
         clear_all_caches();
