@@ -716,7 +716,7 @@ mod tests {
             Field::new("content", DataType::Utf8, true),
         ]);
         let mut config = SchemaDerivationConfig::default();
-        config.tokenizer_overrides.insert("content".to_string(), "en_stem".to_string());
+        config.tokenizer_overrides.insert("content".to_string(), "default".to_string());
 
         let schema = derive_tantivy_schema(&arrow, &config).unwrap();
         assert!(schema.get_field("content").is_ok());

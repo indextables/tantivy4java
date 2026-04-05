@@ -43,6 +43,11 @@ pub struct GlobalSplitCacheManager {
 
     // Managed splits
     pub(crate) managed_splits: Mutex<HashMap<String, u64>>, // split_path -> last_access_time
+
+    // FR4: Per-file min/max field statistics for native range filter elimination.
+    // Populated by list_files_arrow_ffi, keyed by file path (same key as split_uri).
+    // Follows cache manager lifecycle — cleared when manager is closed.
+    pub(crate) file_field_stats: Mutex<HashMap<String, (HashMap<String, String>, HashMap<String, String>)>>,
 }
 
 impl GlobalSplitCacheManager {
@@ -76,6 +81,7 @@ impl GlobalSplitCacheManager {
             total_evictions: AtomicU64::new(0),
             current_size: AtomicU64::new(0),
             managed_splits: Mutex::new(HashMap::new()),
+            file_field_stats: Mutex::new(HashMap::new()),
         }
     }
 
@@ -129,6 +135,32 @@ impl GlobalSplitCacheManager {
         splits.remove(split_path);
     }
 
+    /// FR4: Bulk-store per-file field statistics for range filter elimination.
+    /// Called by list_files_arrow_ffi after loading file entries.
+    pub fn put_all_file_field_stats(&self, entries: &[crate::txlog::actions::FileEntry]) {
+        let mut stats = self.file_field_stats.lock().unwrap();
+        for entry in entries {
+            if let (Some(min), Some(max)) = (&entry.add.min_values, &entry.add.max_values) {
+                if !min.is_empty() || !max.is_empty() {
+                    stats.insert(entry.add.path.clone(), (min.clone(), max.clone()));
+                }
+            }
+        }
+    }
+
+    /// FR4: Look up field statistics for a split by path.
+    pub fn get_file_field_stats(&self, file_path: &str) -> Option<(HashMap<String, String>, HashMap<String, String>)> {
+        self.file_field_stats.lock().unwrap().get(file_path).cloned()
+    }
+
+    /// Invalidate all file_field_stats entries whose path starts with the given table prefix.
+    /// Called by nativeInvalidateCache so that stale range-filter statistics don't survive
+    /// a TRUNCATE / PURGE operation and cause incorrect file pruning on the next query.
+    pub fn invalidate_file_field_stats_for_table(&self, table_path: &str) {
+        let mut stats = self.file_field_stats.lock().unwrap();
+        stats.retain(|path, _| !path.starts_with(table_path));
+    }
+
     pub fn get_managed_split_count(&self) -> usize {
         self.managed_splits.lock().unwrap().len()
     }
@@ -141,28 +173,28 @@ impl GlobalSplitCacheManager {
         let storage_metrics = &quickwit_storage::STORAGE_METRICS;
 
         // 🎯 ByteRangeCache-specific metrics (shortlived_cache is used by ByteRangeCache)
-        let byte_range_hits = storage_metrics.shortlived_cache.hits_num_items.get();
-        let byte_range_misses = storage_metrics.shortlived_cache.misses_num_items.get();
-        let byte_range_evictions = storage_metrics.shortlived_cache.evict_num_items.get();
-        let byte_range_bytes = storage_metrics.shortlived_cache.in_cache_num_bytes.get() as u64;
+        let byte_range_hits = storage_metrics.shortlived_cache.cache_metrics.hits_num_items.get();
+        let byte_range_misses = storage_metrics.shortlived_cache.cache_metrics.misses_num_items.get();
+        let byte_range_evictions = storage_metrics.shortlived_cache.cache_metrics.evict_num_items.get();
+        let byte_range_bytes = storage_metrics.shortlived_cache.cache_metrics.in_cache_num_bytes.get() as u64;
 
         // 🎯 Split Footer Cache metrics (MemorySizedCache)
-        let footer_hits = storage_metrics.split_footer_cache.hits_num_items.get();
-        let footer_misses = storage_metrics.split_footer_cache.misses_num_items.get();
-        let footer_evictions = storage_metrics.split_footer_cache.evict_num_items.get();
-        let footer_bytes = storage_metrics.split_footer_cache.in_cache_num_bytes.get() as u64;
+        let footer_hits = storage_metrics.split_footer_cache.cache_metrics.hits_num_items.get();
+        let footer_misses = storage_metrics.split_footer_cache.cache_metrics.misses_num_items.get();
+        let footer_evictions = storage_metrics.split_footer_cache.cache_metrics.evict_num_items.get();
+        let footer_bytes = storage_metrics.split_footer_cache.cache_metrics.in_cache_num_bytes.get() as u64;
 
         // 🎯 Fast Field Cache metrics (component-level caching)
-        let fastfield_hits = storage_metrics.fast_field_cache.hits_num_items.get();
-        let fastfield_misses = storage_metrics.fast_field_cache.misses_num_items.get();
-        let fastfield_evictions = storage_metrics.fast_field_cache.evict_num_items.get();
-        let fastfield_bytes = storage_metrics.fast_field_cache.in_cache_num_bytes.get() as u64;
+        let fastfield_hits = storage_metrics.fast_field_cache.cache_metrics.hits_num_items.get();
+        let fastfield_misses = storage_metrics.fast_field_cache.cache_metrics.misses_num_items.get();
+        let fastfield_evictions = storage_metrics.fast_field_cache.cache_metrics.evict_num_items.get();
+        let fastfield_bytes = storage_metrics.fast_field_cache.cache_metrics.in_cache_num_bytes.get() as u64;
 
         // 🎯 Searcher Split Cache metrics (SplitCache tracking)
-        let split_hits = storage_metrics.searcher_split_cache.hits_num_items.get();
-        let split_misses = storage_metrics.searcher_split_cache.misses_num_items.get();
-        let split_evictions = storage_metrics.searcher_split_cache.evict_num_items.get();
-        let split_bytes = storage_metrics.searcher_split_cache.in_cache_num_bytes.get() as u64;
+        let split_hits = storage_metrics.searcher_split_cache.cache_metrics.hits_num_items.get();
+        let split_misses = storage_metrics.searcher_split_cache.cache_metrics.misses_num_items.get();
+        let split_evictions = storage_metrics.searcher_split_cache.cache_metrics.evict_num_items.get();
+        let split_bytes = storage_metrics.searcher_split_cache.cache_metrics.in_cache_num_bytes.get() as u64;
 
         // Aggregate comprehensive metrics across all cache types
         let total_hits = byte_range_hits + footer_hits + fastfield_hits + split_hits;

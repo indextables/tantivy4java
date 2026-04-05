@@ -109,6 +109,11 @@ pub(crate) struct CachedSearcherContext {
     // When true, doc retrieval uses merge-safe fast-field resolution.
     // When false, falls back to legacy segment-based positional resolution.
     pub(crate) has_merge_safe_tracking: bool,
+    // FR4: Optional per-field min/max statistics for range filter elimination.
+    // Populated from split_config_map "field_min_values" / "field_max_values" (JSON).
+    // Used to eliminate redundant range filters where the entire split is within range.
+    pub(crate) field_min_values: Option<HashMap<String, String>>,
+    pub(crate) field_max_values: Option<HashMap<String, String>>,
     // Memory pool reservation for search result arena (16MB pre-acquired budget).
     // Held for the lifetime of the SplitSearcher. Released on close via Drop.
     pub(crate) search_arena_reservation: Option<MemoryReservation>,
@@ -155,8 +160,10 @@ impl CachedSearcherContext {
             if cache.get(seg_ord as usize).and_then(|o| o.as_ref()).is_some() {
                 perf_println!("⏱️ PROJ_DIAG: ensure_pq_segment_loaded seg={} CACHE HIT (cache has {} segments, self={:p}) took {}ms",
                     seg_ord, cache_len, self, t0.elapsed().as_millis());
+                crate::ffi_profiler::cache_inc(crate::ffi_profiler::CacheCounter::PqColumnHit);
                 return Ok(());
             }
+            crate::ffi_profiler::cache_inc(crate::ffi_profiler::CacheCounter::PqColumnMiss);
             perf_println!("⏱️ PROJ_DIAG: ensure_pq_segment_loaded seg={} CACHE MISS (cache has {} segments, self={:p}) — loading via searcher fast fields",
                 seg_ord, cache_len, self);
         }

@@ -31,6 +31,9 @@ pub struct GlobalCacheConfig {
     pub split_cache_root_path: Option<PathBuf>,
     /// L2 disk cache configuration (optional)
     pub disk_cache_config: Option<DiskCacheConfig>,
+    /// Predicate cache capacity (default: 256MB)
+    /// Used by SearcherContext for caching predicate/filter results (e.g. search_after cursors)
+    pub predicate_cache_capacity: ByteSize,
 }
 
 impl Default for GlobalCacheConfig {
@@ -54,6 +57,7 @@ impl Default for GlobalCacheConfig {
             split_cache_limits: default_split_cache_limits,
             split_cache_root_path: None, // Will use temp directory if not specified
             disk_cache_config: None,     // L2 disk cache disabled by default
+            predicate_cache_capacity: ByteSize::mb(256),
         }
     }
 }

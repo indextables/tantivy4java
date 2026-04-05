@@ -66,6 +66,21 @@ pub async fn perform_bulk_search(
     let effective_json = rewrite_companion_query(ctx, query_ast_json)?;
     let effective_json_str = effective_json.as_deref().unwrap_or(query_ast_json);
 
+    // Rewrite IP CIDR/wildcard term queries to range queries using the execution-time schema.
+    // Must run here (not just in perform_search_leaf_response) because the streaming path
+    // (startStreamingRetrieval) calls perform_bulk_search directly with pre-serialized JSON.
+    let ip_rewritten;
+    let effective_json_str = {
+        let schema = ctx.cached_index.schema();
+        match crate::split_query::rewrite_ip_term_queries(effective_json_str, &schema)? {
+            Some(rewritten) => {
+                ip_rewritten = rewritten;
+                &ip_rewritten as &str
+            }
+            None => effective_json_str,
+        }
+    };
+
     // Parse QueryAst from (possibly rewritten) JSON
     let query_ast: QueryAst = serde_json::from_str(effective_json_str)
         .with_context(|| format!("Failed to parse QueryAst JSON: {}", &effective_json_str[..effective_json_str.len().min(1000)]))?;
@@ -76,8 +91,14 @@ pub async fn perform_bulk_search(
 
     // Convert QueryAst → tantivy Query
     // with_validation=false to silently handle fields not in schema
+    let build_context = quickwit_query::query_ast::BuildTantivyAstContext {
+        schema: &schema,
+        tokenizer_manager: &tokenizer_manager,
+        search_fields: &[],
+        with_validation: false,
+    };
     let tantivy_query = query_ast
-        .build_tantivy_query(&schema, &tokenizer_manager, &[], false)
+        .build_tantivy_query(&build_context)
         .map_err(|e| anyhow!("Failed to build tantivy query: {}", e))?;
 
     perf_println!(
@@ -347,7 +368,7 @@ fn prefix_term_to_range(prefix: Term) -> (Bound<Term>, Bound<Term>) {
             *last_byte += 1;
             return (
                 Bound::Included(prefix),
-                Bound::Excluded(Term::wrap(end_bound)),
+                Bound::Excluded(Term::wrap(&end_bound)),
             );
         }
         end_bound.pop();

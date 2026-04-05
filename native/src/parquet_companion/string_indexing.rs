@@ -48,7 +48,7 @@ pub struct CompanionFieldInfo {
 
 /// Parse a tokenizer override value into a StringIndexingMode.
 ///
-/// Returns `None` for standard tokenizer names ("raw", "default", "en_stem", etc.).
+/// Returns `None` for standard tokenizer names ("raw", "default", "whitespace", etc.).
 /// Returns `Some(mode)` for recognized compact indexing mode strings.
 pub fn parse_tokenizer_override(value: &str) -> Option<StringIndexingMode> {
     match value {
@@ -198,7 +198,7 @@ mod tests {
     fn test_parse_standard_tokenizers_return_none() {
         assert_eq!(parse_tokenizer_override("raw"), None);
         assert_eq!(parse_tokenizer_override("default"), None);
-        assert_eq!(parse_tokenizer_override("en_stem"), None);
+        assert_eq!(parse_tokenizer_override("whitespace"), None);
         assert_eq!(parse_tokenizer_override("whitespace"), None);
     }
 

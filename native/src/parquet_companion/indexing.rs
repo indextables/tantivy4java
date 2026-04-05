@@ -2584,7 +2584,7 @@ mod tests {
                 let term = tantivy::Term::from_field_text(uuid_field, &uuid);
                 let query = TermQuery::new(term, IndexRecordOption::Basic);
                 let top_docs = searcher
-                    .search(&query, &tantivy::collector::TopDocs::with_limit(1))
+                    .search(&query, &tantivy::collector::TopDocs::with_limit(1).order_by_score())
                     .unwrap();
 
                 if top_docs.is_empty() {
@@ -2731,7 +2731,7 @@ mod tests {
         for expected_id in &test_ids {
             let term = tantivy::Term::from_field_text(tag_field, &format!("tag_{}", expected_id));
             let query = TermQuery::new(term, IndexRecordOption::Basic);
-            let top = searcher.search(&query, &TopDocs::with_limit(1)).unwrap();
+            let top = searcher.search(&query, &TopDocs::with_limit(1).order_by_score()).unwrap();
             if let Some((_, addr)) = top.first() {
                 if addr.doc_id as u64 != *expected_id {
                     reordered += 1;
@@ -3230,7 +3230,7 @@ mod tests {
                 // Search the companion field for this hash
                 let term = tantivy::Term::from_field_u64(companion_field, hash);
                 let query = tantivy::query::TermQuery::new(term, tantivy::schema::IndexRecordOption::Basic);
-                let top_docs = searcher.search(&query, &tantivy::collector::TopDocs::with_limit(10)).unwrap();
+                let top_docs = searcher.search(&query, &tantivy::collector::TopDocs::with_limit(10).order_by_score()).unwrap();
 
                 assert_eq!(
                     top_docs.len(), 1,
@@ -3244,7 +3244,7 @@ mod tests {
         // "status" appears in every log_line after stripping
         let status_term = tantivy::Term::from_field_text(log_field, "status");
         let query = tantivy::query::TermQuery::new(status_term, tantivy::schema::IndexRecordOption::Basic);
-        let top_docs = searcher.search(&query, &tantivy::collector::TopDocs::with_limit(num_rows)).unwrap();
+        let top_docs = searcher.search(&query, &tantivy::collector::TopDocs::with_limit(num_rows).order_by_score()).unwrap();
         assert_eq!(top_docs.len(), num_rows,
             "Text search for 'status' should find all {} docs after UUID stripping", num_rows);
     }

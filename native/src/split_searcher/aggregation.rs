@@ -302,6 +302,8 @@ fn perform_search_with_query_ast_and_aggregations_using_working_infrastructure(
                 search_after: None,
                 scroll_ttl_secs: None,
                 count_hits: quickwit_proto::search::CountHits::CountAll as i32,
+                ignore_missing_indexes: false,
+                skip_aggregation_finalization: false,
             };
 
             debug_println!("RUST DEBUG: ⏱️ 🔍 SEARCH EXECUTION - Calling StandaloneSearcher.search_split with parameters:");

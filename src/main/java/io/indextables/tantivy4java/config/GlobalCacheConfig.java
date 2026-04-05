@@ -24,6 +24,9 @@ public class GlobalCacheConfig {
     private long splitCacheGB = 10; // 10GB default
     private int splitCacheMaxSplits = 10000;
     private String splitCachePath = null; // null means use temp directory
+
+    // Predicate cache capacity
+    private long predicateCacheMB = 256; // 256MB default (matches Quickwit)
     
     private static boolean initialized = false;
     
@@ -124,6 +127,17 @@ public class GlobalCacheConfig {
         this.splitCachePath = path;
         return this;
     }
+
+    /**
+     * Set the predicate cache capacity in MB.
+     * The predicate cache stores filter/predicate evaluation results and is counted
+     * toward the unified memory budget.
+     * Default: 256 MB (matches Quickwit's default)
+     */
+    public GlobalCacheConfig withPredicateCacheMB(long mb) {
+        this.predicateCacheMB = mb;
+        return this;
+    }
     
     /**
      * Initialize the global cache with this configuration.
@@ -146,7 +160,8 @@ public class GlobalCacheConfig {
             warmupMemoryGB,
             splitCacheGB,
             splitCacheMaxSplits,
-            splitCachePath
+            splitCachePath,
+            predicateCacheMB
         );
         
         if (success) {
@@ -174,7 +189,8 @@ public class GlobalCacheConfig {
         long warmupMemoryGB,
         long splitCacheGB,
         int splitCacheMaxSplits,
-        String splitCachePath
+        String splitCachePath,
+        long predicateCacheMB
     );
     
     static {

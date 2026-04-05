@@ -8,9 +8,217 @@ use jni::JNIEnv;
 
 use crate::debug_println;
 use crate::perf_println;
+use crate::ffi_profiler::Section;
 use super::types::CachedSearcherContext;
 use super::searcher_cache::extract_split_id_from_uri;
 use quickwit_storage::Storage;
+
+/// FR4: Optimize a QueryAst JSON by eliminating redundant range filters.
+///
+/// If the split's min/max stats prove that ALL data falls within a range filter's bounds,
+/// that filter is always-true and can be removed. This avoids unnecessary fast field
+/// transcoding and speeds up search execution.
+///
+/// Operates on Quickwit QueryAst JSON (snake_case tag names).
+/// Only eliminates range filters in "must" position of "bool" queries.
+/// Returns the original JSON unchanged if no optimization is possible.
+pub(crate) fn optimize_query_with_field_stats(
+    query_json: &str,
+    min_values: &std::collections::HashMap<String, String>,
+    max_values: &std::collections::HashMap<String, String>,
+) -> String {
+    if min_values.is_empty() && max_values.is_empty() {
+        return query_json.to_string();
+    }
+
+    let mut ast: serde_json::Value = match serde_json::from_str(query_json) {
+        Ok(v) => v,
+        Err(_) => return query_json.to_string(),
+    };
+
+    let changed = eliminate_redundant_ranges(&mut ast, min_values, max_values);
+    if changed {
+        debug_println!("📊 FR4: Eliminated redundant range filter(s) from query");
+        serde_json::to_string(&ast).unwrap_or_else(|_| query_json.to_string())
+    } else {
+        query_json.to_string()
+    }
+}
+
+/// Recursively walk the QueryAst and eliminate range filters that are always-true
+/// given the split's field statistics.
+fn eliminate_redundant_ranges(
+    ast: &mut serde_json::Value,
+    min_values: &std::collections::HashMap<String, String>,
+    max_values: &std::collections::HashMap<String, String>,
+) -> bool {
+    let obj = match ast.as_object_mut() {
+        Some(o) => o,
+        None => return false,
+    };
+
+    let ast_type = obj.get("type").and_then(|v| v.as_str()).map(|s| s.to_string());
+
+    match ast_type.as_deref() {
+        Some("bool") => {
+            // Process "must" clauses — remove always-true range filters
+            let mut changed = false;
+            if let Some(must) = obj.get_mut("must") {
+                if let Some(arr) = must.as_array_mut() {
+                    let before = arr.len();
+                    arr.retain(|clause| !is_redundant_range(clause, min_values, max_values));
+                    if arr.len() < before {
+                        changed = true;
+                    }
+                    // Recurse into remaining clauses
+                    for clause in arr.iter_mut() {
+                        changed |= eliminate_redundant_ranges(clause, min_values, max_values);
+                    }
+                }
+            }
+            // Recurse into "should" and "filter" as well (optimization only, no removal)
+            // "filter" has same AND semantics as "must" — also remove always-true ranges
+            if let Some(filter) = obj.get_mut("filter") {
+                if let Some(arr) = filter.as_array_mut() {
+                    let before = arr.len();
+                    arr.retain(|clause| !is_redundant_range(clause, min_values, max_values));
+                    if arr.len() < before {
+                        changed = true;
+                    }
+                    for clause in arr.iter_mut() {
+                        changed |= eliminate_redundant_ranges(clause, min_values, max_values);
+                    }
+                }
+            }
+            // "should" has OR semantics — only recurse, don't remove
+            if let Some(should) = obj.get_mut("should") {
+                if let Some(arr) = should.as_array_mut() {
+                    for clause in arr.iter_mut() {
+                        changed |= eliminate_redundant_ranges(clause, min_values, max_values);
+                    }
+                }
+            }
+            // If all "must" clauses were removed and no other clauses exist, replace with match_all
+            if let Some(must) = obj.get("must") {
+                if let Some(arr) = must.as_array() {
+                    if arr.is_empty() && changed {
+                        let has_should = obj.get("should").and_then(|v| v.as_array()).map_or(false, |a| !a.is_empty());
+                        let has_must_not = obj.get("must_not").and_then(|v| v.as_array()).map_or(false, |a| !a.is_empty());
+                        let has_filter = obj.get("filter").and_then(|v| v.as_array()).map_or(false, |a| !a.is_empty());
+                        if !has_should && !has_must_not && !has_filter {
+                            *ast = serde_json::json!({"type": "match_all"});
+                            return true;
+                        }
+                        // Other clauses exist — just remove the empty "must" key
+                        obj.remove("must");
+                    }
+                }
+            }
+            changed
+        }
+        Some("boost") => {
+            // Recurse into the inner query
+            if let Some(underlying) = obj.get_mut("underlying") {
+                eliminate_redundant_ranges(underlying, min_values, max_values)
+            } else {
+                false
+            }
+        }
+        _ => false,
+    }
+}
+
+/// Check if a range query clause is redundant (always-true) given field stats.
+///
+/// A range filter `field >= lower AND field <= upper` is redundant when:
+///   - max_value(field) <= upper  (upper bound always satisfied)
+///   - min_value(field) >= lower  (lower bound always satisfied)
+fn is_redundant_range(
+    clause: &serde_json::Value,
+    min_values: &std::collections::HashMap<String, String>,
+    max_values: &std::collections::HashMap<String, String>,
+) -> bool {
+    let obj = match clause.as_object() {
+        Some(o) => o,
+        None => return false,
+    };
+
+    if obj.get("type").and_then(|v| v.as_str()) != Some("range") {
+        return false;
+    }
+
+    let field = match obj.get("field").and_then(|v| v.as_str()) {
+        Some(f) => f,
+        None => return false,
+    };
+
+    let file_min = min_values.get(field);
+    let file_max = max_values.get(field);
+
+    // Need both min and max to determine redundancy
+    if file_min.is_none() || file_max.is_none() {
+        return false;
+    }
+    let file_min = file_min.unwrap();
+    let file_max = file_max.unwrap();
+
+    // Check lower bound: if lower_bound exists, file_min must be >= lower
+    // Truncation safety: if bound is a proper extension of file_min, min may be truncated
+    let lower_ok = match obj.get("lower_bound") {
+        Some(bound_obj) => {
+            match extract_bound_value(bound_obj) {
+                Some(bound_val) => {
+                    // If bound is a proper extension of file_min, can't determine redundancy
+                    if bound_val.len() > file_min.len() && bound_val.starts_with(file_min.as_str()) {
+                        false
+                    } else {
+                        let cmp = crate::txlog::partition_pruning::compare_values(file_min, &bound_val);
+                        let inclusive = bound_obj.get("inclusive").and_then(|v| v.as_bool()).unwrap_or(true);
+                        if inclusive { cmp != std::cmp::Ordering::Less } else { cmp == std::cmp::Ordering::Greater }
+                    }
+                }
+                None => true, // Unbounded lower
+            }
+        }
+        None => true, // No lower bound
+    };
+
+    // Check upper bound: if upper_bound exists, file_max must be <= upper
+    // Truncation safety: if bound is a proper extension of file_max, max may be truncated
+    let upper_ok = match obj.get("upper_bound") {
+        Some(bound_obj) => {
+            match extract_bound_value(bound_obj) {
+                Some(bound_val) => {
+                    // If bound is a proper extension of file_max, can't determine redundancy
+                    if bound_val.len() > file_max.len() && bound_val.starts_with(file_max.as_str()) {
+                        false
+                    } else {
+                        let cmp = crate::txlog::partition_pruning::compare_values(file_max, &bound_val);
+                        let inclusive = bound_obj.get("inclusive").and_then(|v| v.as_bool()).unwrap_or(true);
+                        if inclusive { cmp != std::cmp::Ordering::Greater } else { cmp == std::cmp::Ordering::Less }
+                    }
+                }
+                None => true, // Unbounded upper
+            }
+        }
+        None => true, // No upper bound
+    };
+
+    lower_ok && upper_ok
+}
+
+/// Extract the value from a Quickwit QueryAst range bound.
+/// Handles various formats: {"value": "123"}, {"value": 123}, etc.
+fn extract_bound_value(bound: &serde_json::Value) -> Option<String> {
+    // Quickwit QueryAst uses { "value": <val>, "inclusive": bool }
+    let val = bound.get("value")?;
+    match val {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        serde_json::Value::Bool(b) => Some(b.to_string()),
+        _ => None,
+    }
+}
 
 /// Ensure that the fast field columns needed by a query are transcoded from parquet.
 ///
@@ -221,6 +429,7 @@ pub async fn perform_search_async_impl_leaf_response(
     // creation, before any intersection happens. Moving clauses to filter only affects
     // scoring, not execution order.
 
+    let _t_wildcard = std::time::Instant::now();
     let effective_query_json = if let Ok(analysis) = crate::split_query::analyze_query_ast_json(&query_json) {
         // Track that we analyzed this query
         crate::split_query::increment_queries_analyzed();
@@ -292,9 +501,13 @@ pub async fn perform_search_async_impl_leaf_response(
     // ========================================================================
     // End of Smart Wildcard Optimization
     // ========================================================================
+    if crate::ffi_profiler::is_enabled() {
+        crate::ffi_profiler::record(crate::ffi_profiler::Section::WildcardAnalysis, _t_wildcard.elapsed().as_nanos() as u64);
+    }
 
     // Rewrite FieldPresence (exists) queries on string hash fields to use the native
     // _phash_* U64 field, avoiding string column transcoding.
+    let _t_rewrite_start = std::time::Instant::now();
     let effective_query_json = if let Some(ref manifest) = context.parquet_manifest {
         if !manifest.string_hash_fields.is_empty() {
             if let Some(rewritten) = crate::parquet_companion::hash_field_rewriter::rewrite_query_for_hash_fields(
@@ -315,6 +528,7 @@ pub async fn perform_search_async_impl_leaf_response(
 
     // Rewrite term queries for compact string indexing modes (exact_only, text_*_exactonly).
     // Also blocks unsupported query types (wildcard, phrase, regex) on exact_only fields.
+    let _t_string_idx = std::time::Instant::now();
     let effective_query_json = if let Some(ref manifest) = context.parquet_manifest {
         if !manifest.string_indexing_modes.is_empty() {
             match crate::parquet_companion::hash_field_rewriter::rewrite_query_for_string_indexing(
@@ -333,9 +547,40 @@ pub async fn perform_search_async_impl_leaf_response(
     } else {
         effective_query_json
     };
+    if crate::ffi_profiler::is_enabled() {
+        crate::ffi_profiler::record(crate::ffi_profiler::Section::QueryRewriteStringIdx, _t_string_idx.elapsed().as_nanos() as u64);
+    }
+
+    // Rewrite IP CIDR/wildcard term queries to range queries using the execution-time schema.
+    // Runs after hash-field and string-indexing rewrites so all paths (regular search,
+    // simple aggregate, groupBy, histogram) receive correctly expanded IP queries.
+    let effective_query_json = {
+        let schema = context.cached_index.schema();
+        match crate::split_query::rewrite_ip_term_queries(&effective_query_json, &schema) {
+            Ok(Some(rewritten)) => rewritten,
+            Ok(None) => effective_query_json,
+            Err(e) => return Err(e),
+        }
+    };
+
+    // FR4: Eliminate redundant range filters using split field statistics
+    let _t_fr4 = std::time::Instant::now();
+    let effective_query_json = if let (Some(ref min_vals), Some(ref max_vals)) =
+        (&context.field_min_values, &context.field_max_values)
+    {
+        optimize_query_with_field_stats(&effective_query_json, min_vals, max_vals)
+    } else {
+        effective_query_json
+    };
+    if crate::ffi_profiler::is_enabled() {
+        crate::ffi_profiler::record(crate::ffi_profiler::Section::RangeFilterElimination, _t_fr4.elapsed().as_nanos() as u64);
+    }
 
     // Lazy transcoding: ensure fast fields needed by range queries are transcoded
     let t_rewrite = t_total.elapsed();
+    if crate::ffi_profiler::is_enabled() {
+        crate::ffi_profiler::record(Section::QueryRewriteHash, _t_rewrite_start.elapsed().as_nanos() as u64);
+    }
     perf_println!("⏱️ PROJ_DIAG: perform_search_leaf_response query rewriting took {}ms", t_rewrite.as_millis());
     let t_transcode = std::time::Instant::now();
     let overrides = if context.augmented_directory.is_some() {
@@ -346,8 +591,12 @@ pub async fn perform_search_async_impl_leaf_response(
             fast_field_data: o.fast_field_data.clone(),
         })
     };
+    let transcode_elapsed = t_transcode.elapsed();
+    if crate::ffi_profiler::is_enabled() {
+        crate::ffi_profiler::record(Section::EnsureFastFields, transcode_elapsed.as_nanos() as u64);
+    }
     perf_println!("⏱️ PROJ_DIAG: perform_search_leaf_response ensure_fast_fields took {}ms",
-        t_transcode.elapsed().as_millis());
+        transcode_elapsed.as_millis());
 
     // Use Quickwit's real search functionality with cached searcher following their patterns
     let t_leaf = std::time::Instant::now();
@@ -364,6 +613,9 @@ pub async fn perform_search_async_impl_leaf_response(
         limit as usize,
         overrides,
     ).await?;
+    if crate::ffi_profiler::is_enabled() {
+        crate::ffi_profiler::record(Section::LeafSearch, t_leaf.elapsed().as_nanos() as u64);
+    }
 
     perf_println!("⏱️ PROJ_DIAG: perform_search_leaf_response TOTAL {}ms (rewrite={}ms, transcode={}ms, leaf={}ms) — {} hits",
         t_total.elapsed().as_millis(), t_rewrite.as_millis(), t_transcode.elapsed().as_millis(),
@@ -548,16 +800,9 @@ pub async fn perform_schema_retrieval_async_impl_thread_safe(
     // Extract searcher context using the safe Arc pattern with new struct-based approach
     let searcher_context = crate::utils::jlong_to_arc::<CachedSearcherContext>(searcher_ptr);
 
-    // ✅ FIX: If searcher context is missing, use direct schema mapping fallback
     if searcher_context.is_none() {
-        debug_println!("❌ ASYNC_IMPL: CachedSearcherContext missing for pointer {}, trying direct schema mapping", searcher_ptr);
-        if let Some(schema_ptr) = crate::split_query::get_searcher_schema(searcher_ptr) {
-            debug_println!("✅ FALLBACK: Found direct schema mapping {} for searcher {}", schema_ptr, searcher_ptr);
-            return Ok(schema_ptr);
-        } else {
-            debug_println!("❌ FALLBACK: No direct schema mapping found for searcher {}", searcher_ptr);
-            return Err(anyhow::anyhow!("Invalid searcher context - Arc and direct mapping not found for pointer: {}", searcher_ptr));
-        }
+        debug_println!("❌ ASYNC_IMPL: CachedSearcherContext missing for pointer {}", searcher_ptr);
+        return Err(anyhow::anyhow!("Invalid searcher context for pointer: {}", searcher_ptr));
     }
 
     let searcher_context = searcher_context.unwrap();
@@ -661,6 +906,9 @@ async fn perform_real_quickwit_search(
     };
 
     let t_docmapper = t0.elapsed();
+    if crate::ffi_profiler::is_enabled() {
+        crate::ffi_profiler::record(Section::DocMapperCreate, t_docmapper.as_nanos() as u64);
+    }
     perf_println!("⏱️ PROJ_DIAG: perform_real_quickwit_search DocMapper creation took {}ms", t_docmapper.as_millis());
 
     // Create SearchRequest following Quickwit patterns
@@ -677,6 +925,8 @@ async fn perform_real_quickwit_search(
         aggregation_request: None,
         scroll_ttl_secs: None,
         search_after: None,
+        ignore_missing_indexes: false,
+        skip_aggregation_finalization: false,
     };
 
     // Create SplitIdAndFooterOffsets for Quickwit
@@ -736,6 +986,9 @@ async fn perform_real_quickwit_search(
     debug_println!("🔍 PERMIT_FIX: Acquiring permit from dedicated provider - should be immediate");
     let t_permit = std::time::Instant::now();
     let mut search_permit = permit_future.await;
+    if crate::ffi_profiler::is_enabled() {
+        crate::ffi_profiler::record(Section::PermitAcquire, t_permit.elapsed().as_nanos() as u64);
+    }
     perf_println!("⏱️ PROJ_DIAG: perform_real_quickwit_search permit acquisition took {}ms", t_permit.elapsed().as_millis());
     debug_println!("✅ PERMIT_FIX: Successfully acquired search permit from dedicated provider - no timeout needed!");
 
@@ -752,13 +1005,12 @@ async fn perform_real_quickwit_search(
     let leaf_search_result = tokio::time::timeout(
         std::time::Duration::from_secs(15), // 15 second timeout for leaf search
         quickwit_search::leaf_search_single_split(
-            &searcher_context,
             search_request,
+            searcher_context,
             storage,
             split_metadata,
             doc_mapper,
             split_filter,
-            aggregations_limits,
             &mut search_permit,
             overrides,
         )
@@ -770,6 +1022,7 @@ async fn perform_real_quickwit_search(
         Ok(search_result) => {
             debug_println!("✅ CRITICAL_DEBUG: leaf_search_single_split succeeded");
             search_result.map_err(|e| anyhow::anyhow!("Quickwit leaf search failed: {}", e))?
+                .unwrap_or_default()
         },
         Err(_timeout) => {
             debug_println!("❌ CRITICAL_DEBUG: TIMEOUT in leaf_search_single_split - THIS IS THE HANG LOCATION!");
@@ -866,6 +1119,8 @@ pub async fn perform_real_quickwit_search_with_aggregations(
         aggregation_request: aggregation_request_json, // ENABLE AGGREGATIONS
         scroll_ttl_secs: None,
         search_after: None,
+        ignore_missing_indexes: false,
+        skip_aggregation_finalization: false,
     };
 
     debug_println!("🔍 AGGREGATION_SEARCH: SearchRequest configured with aggregations: {}",
@@ -926,13 +1181,12 @@ pub async fn perform_real_quickwit_search_with_aggregations(
     let leaf_search_result = tokio::time::timeout(
         std::time::Duration::from_secs(15), // 15 second timeout
         quickwit_search::leaf_search_single_split(
-            &searcher_context,
             search_request,
+            searcher_context,
             storage,
             split_metadata,
             doc_mapper,
             split_filter,
-            aggregations_limits,
             &mut search_permit,
             overrides,
         )
@@ -942,6 +1196,7 @@ pub async fn perform_real_quickwit_search_with_aggregations(
         Ok(search_result) => {
             debug_println!("✅ AGGREGATION_SEARCH: leaf_search_single_split succeeded with aggregations");
             search_result.map_err(|e| anyhow::anyhow!("Quickwit leaf search with aggregations failed: {}", e))?
+                .unwrap_or_default()
         },
         Err(_timeout) => {
             debug_println!("❌ AGGREGATION_SEARCH: TIMEOUT in leaf_search_single_split with aggregations");

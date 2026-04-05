@@ -22,6 +22,9 @@ use jni::sys::jstring;
 use jni::JNIEnv;
 
 mod debug;  // Debug utilities and conditional logging
+pub mod ffi_profiler;  // Near-zero-overhead FFI read-path profiler
+mod ffi_profiler_jni;  // JNI bridge for FFI profiler
+pub mod ip_expansion;  // CIDR and wildcard IP pattern expansion for transparent query rewriting
 pub mod memory_pool;  // Unified JVM-coordinated memory management
 mod runtime_manager;  // Global Quickwit runtime manager for async-first architecture
 mod schema;
@@ -50,6 +53,7 @@ pub mod delta_reader;  // Delta Lake table file listing via delta-kernel-rs
 pub mod iceberg_reader;  // Iceberg table reading via apache/iceberg-rust
 pub mod parquet_schema_reader;  // Read schema from standalone parquet files
 pub mod parquet_reader;  // Hive-style partitioned parquet directory reading
+pub mod txlog;  // Indextables transaction log (Avro state format, v4)
 
 pub use schema::*;
 pub use document::*;
@@ -89,6 +93,7 @@ pub extern "system" fn Java_io_indextables_tantivy4java_config_GlobalCacheConfig
     split_cache_gb: jni::sys::jlong,
     split_cache_max_splits: jni::sys::jint,
     split_cache_path: jni::objects::JString,
+    predicate_cache_mb: jni::sys::jlong,
 ) -> jni::sys::jboolean {
     use bytesize::ByteSize;
     use std::num::NonZeroU32;
@@ -134,6 +139,11 @@ pub extern "system" fn Java_io_indextables_tantivy4java_config_GlobalCacheConfig
         split_cache_limits,
         split_cache_root_path: split_cache_path_opt,
         disk_cache_config: None, // L2 disk cache configured separately via SplitCacheManager
+        predicate_cache_capacity: if predicate_cache_mb > 0 {
+            ByteSize::mb(predicate_cache_mb as u64)
+        } else {
+            ByteSize::mb(256) // default 256MB
+        },
     };
     
     if initialize_global_cache(config) {
