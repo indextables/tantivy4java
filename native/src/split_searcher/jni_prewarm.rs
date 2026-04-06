@@ -866,15 +866,27 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_nati
             let json_str = "{}";
             return match string_to_jstring(env, json_str) {
                 Ok(jstr) => Ok(jstr.into_raw()),
-                Err(_) => Ok(std::ptr::null_mut()),
+                Err(e) => {
+                    debug_println!("ERROR: Failed to create JNI string for empty string_indexing_modes: {}", e);
+                    Ok(std::ptr::null_mut())
+                },
             };
         }
 
         // Serialize directly — StringIndexingMode derives serde::Serialize
-        let json_str = serde_json::to_string(&manifest.string_indexing_modes).unwrap_or_default();
+        let json_str = match serde_json::to_string(&manifest.string_indexing_modes) {
+            Ok(s) => s,
+            Err(e) => {
+                debug_println!("ERROR: Failed to serialize string_indexing_modes: {}", e);
+                String::from("{}")
+            }
+        };
         match string_to_jstring(env, &json_str) {
             Ok(jstr) => Ok(jstr.into_raw()),
-            Err(_) => Ok(std::ptr::null_mut()),
+            Err(e) => {
+                debug_println!("ERROR: Failed to create JNI string for string_indexing_modes: {}", e);
+                Ok(std::ptr::null_mut())
+            },
         }
     }).unwrap_or(std::ptr::null_mut())
 }

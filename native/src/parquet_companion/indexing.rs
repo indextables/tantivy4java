@@ -1594,21 +1594,30 @@ fn build_column_mapping(
             arrow_type_to_tantivy_type(arrow_field.data_type()).to_string()
         };
 
-        // For Str columns, record the fast field tokenizer.
-        // Defaults to "raw" for text fields (no tokenization in fast field).
+        // For Str columns, record the fast field tokenizer used during parquet transcoding.
+        // TextAndString fields have native fast data (from set_fast(Some("raw")) in schema_derivation),
+        // so they don't need parquet transcoding — set fast_field_tokenizer to None.
+        // All other Str columns need transcoding and default to "raw" tokenizer.
         let fast_field_tokenizer = if tantivy_type_str == "Str" {
-            let tok = config.tokenizer_overrides
+            let mode = config.tokenizer_overrides
                 .get(&tantivy_field_name)
-                .cloned()
-                .unwrap_or_else(|| "raw".to_string());
-            // Normalize string indexing mode keywords to their actual primary tokenizer.
-            // text_and_string and exact_only both use "raw" as their primary tokenizer;
-            // the mode keyword itself is not a valid tantivy tokenizer name.
-            let tok = match tok.as_str() {
-                "text_and_string" | "exact_only" => "raw".to_string(),
-                _ => tok,
-            };
-            Some(tok)
+                .map(|s| s.as_str())
+                .unwrap_or("");
+            if mode == "text_and_string" {
+                // TextAndString has native fast data — no transcoding needed
+                None
+            } else {
+                let tok = config.tokenizer_overrides
+                    .get(&tantivy_field_name)
+                    .cloned()
+                    .unwrap_or_else(|| "raw".to_string());
+                // Normalize string indexing mode keywords to their actual primary tokenizer.
+                let tok = match tok.as_str() {
+                    "exact_only" => "raw".to_string(),
+                    _ => tok,
+                };
+                Some(tok)
+            }
         } else {
             None
         };
