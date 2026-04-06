@@ -87,6 +87,19 @@ pub(crate) async fn ensure_fast_fields_for_query(
                         if hash_values.contains(col.as_str()) {
                             return true;
                         }
+                        // In Hybrid mode, TextAndString fields have native fast data
+                        if mode == crate::parquet_companion::manifest::FastFieldMode::Hybrid {
+                            use crate::parquet_companion::string_indexing::StringIndexingMode;
+                            if let Some(StringIndexingMode::TextAndString) =
+                                manifest.string_indexing_modes.get(col.as_str())
+                            {
+                                debug_println!(
+                                    "📊 LAZY_TRANSCODE: '{}' is TextAndString — using native fast data (no parquet transcode)",
+                                    col
+                                );
+                                return true;
+                            }
+                        }
                         // Check if this field's type is native in the current mode
                         if let Some(tantivy_type) = field_types.get(col.as_str()) {
                             crate::parquet_companion::transcode::field_source(tantivy_type, mode)

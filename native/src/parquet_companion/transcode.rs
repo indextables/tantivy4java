@@ -777,6 +777,27 @@ pub fn columns_to_transcode(
             if source != FieldSource::Parquet {
                 return false;
             }
+            // In Hybrid mode, TextAndString fields have native fast field data in the split
+            // (from set_fast(Some("raw")) in schema_derivation). Skip transcoding — the
+            // native data is already correct and transcoding would create duplicate ordinals
+            // in the merge.
+            //
+            // Backward compat: string_indexing_modes is #[serde(default)] so old manifests
+            // deserialize with an empty map. TextAndString and string_indexing_modes were
+            // introduced together, so no old manifest can have TextAndString native fast data
+            // without the corresponding entry here.
+            if mode == FastFieldMode::Hybrid {
+                use crate::parquet_companion::string_indexing::StringIndexingMode;
+                if let Some(StringIndexingMode::TextAndString) =
+                    manifest.string_indexing_modes.get(&mapping.tantivy_field_name)
+                {
+                    debug_println!(
+                        "📊 TRANSCODE: Skipping '{}' — TextAndString has native fast data in split",
+                        mapping.tantivy_field_name
+                    );
+                    return false;
+                }
+            }
             // If specific columns requested, filter to those
             if let Some(requested) = requested_columns {
                 return requested.iter().any(|r| r == &mapping.tantivy_field_name);
@@ -1094,18 +1115,37 @@ mod tests {
     fn test_columns_to_transcode_hybrid() {
         let manifest = make_test_manifest();
         let cols = columns_to_transcode(&manifest, FastFieldMode::Hybrid, None);
-        // Only Str columns should be transcoded in hybrid mode
+        // In Hybrid mode, TextAndString fields ("name") have native fast data → skipped.
+        // Regular string fields ("description") need parquet transcoding even though
+        // both have fast_field_tokenizer=Some("raw").
         assert_eq!(cols.len(), 1);
-        assert_eq!(cols[0].tantivy_name, "name");
+        assert_eq!(cols[0].tantivy_name, "description");
         assert_eq!(cols[0].tantivy_type, "Str");
+    }
+
+    #[test]
+    fn test_columns_to_transcode_hybrid_distinguishes_text_and_string_from_regular() {
+        // Regression test: fast_field_tokenizer.is_some() would skip BOTH Str fields,
+        // but only TextAndString has native fast data. Regular string must be transcoded.
+        let manifest = make_test_manifest();
+        let cols = columns_to_transcode(&manifest, FastFieldMode::Hybrid, None);
+        let col_names: Vec<&str> = cols.iter().map(|c| c.tantivy_name.as_str()).collect();
+        // "name" (TextAndString) → skipped (native fast data)
+        assert!(!col_names.contains(&"name"), "TextAndString field should NOT be transcoded in Hybrid mode");
+        // "description" (regular string) → transcoded (no native fast data)
+        assert!(col_names.contains(&"description"), "Regular string field SHOULD be transcoded in Hybrid mode");
     }
 
     #[test]
     fn test_columns_to_transcode_parquet_only() {
         let manifest = make_test_manifest();
         let cols = columns_to_transcode(&manifest, FastFieldMode::ParquetOnly, None);
-        // All columns should be transcoded
-        assert_eq!(cols.len(), 3);
+        // In ParquetOnly mode, ALL columns are transcoded including TextAndString,
+        // because native data is ignored in this mode.
+        assert_eq!(cols.len(), 4);
+        let col_names: Vec<&str> = cols.iter().map(|c| c.tantivy_name.as_str()).collect();
+        assert!(col_names.contains(&"name"), "TextAndString should be transcoded in ParquetOnly mode");
+        assert!(col_names.contains(&"description"), "Regular string should be transcoded in ParquetOnly mode");
     }
 
     #[test]
@@ -1115,6 +1155,16 @@ mod tests {
         let cols = columns_to_transcode(&manifest, FastFieldMode::ParquetOnly, Some(&requested));
         assert_eq!(cols.len(), 1);
         assert_eq!(cols[0].tantivy_name, "score");
+    }
+
+    #[test]
+    fn test_columns_to_transcode_hybrid_requested_text_and_string_still_skipped() {
+        // Even when explicitly requested, TextAndString fields should NOT be transcoded
+        // in Hybrid mode — they have native fast data and transcoding would double ordinals.
+        let manifest = make_test_manifest();
+        let requested = vec!["name".to_string()];
+        let cols = columns_to_transcode(&manifest, FastFieldMode::Hybrid, Some(&requested));
+        assert!(cols.is_empty(), "TextAndString should be skipped even when explicitly requested in Hybrid mode");
     }
 
     #[test]
@@ -1776,13 +1826,15 @@ mod tests {
                     fast_field_tokenizer: None,
                 },
                 ColumnMapping {
+                    // TextAndString field — fast_field_tokenizer is None because it has native
+                    // fast data from set_fast(Some("raw")) in schema_derivation. No transcoding needed.
                     tantivy_field_name: "name".to_string(),
                     parquet_column_name: "name".to_string(),
                     physical_ordinal: 1,
                     parquet_type: "BYTE_ARRAY".to_string(),
                     tantivy_type: "Str".to_string(),
                     field_id: None,
-                    fast_field_tokenizer: Some("raw".to_string()),
+                    fast_field_tokenizer: None,
                 },
                 ColumnMapping {
                     tantivy_field_name: "score".to_string(),
@@ -1793,12 +1845,30 @@ mod tests {
                     field_id: None,
                     fast_field_tokenizer: None,
                 },
+                // Regular Str field — has fast_field_tokenizer (all Str columns do in production)
+                // but is NOT TextAndString, so it has no native fast data and needs transcoding.
+                ColumnMapping {
+                    tantivy_field_name: "description".to_string(),
+                    parquet_column_name: "description".to_string(),
+                    physical_ordinal: 3,
+                    parquet_type: "BYTE_ARRAY".to_string(),
+                    tantivy_type: "Str".to_string(),
+                    field_id: None,
+                    fast_field_tokenizer: Some("raw".to_string()),
+                },
             ],
             total_rows: 100,
             storage_config: None,
             metadata: std::collections::HashMap::new(),
             string_hash_fields: std::collections::HashMap::new(),
-            string_indexing_modes: std::collections::HashMap::new(),
+            string_indexing_modes: {
+                let mut modes = std::collections::HashMap::new();
+                modes.insert(
+                    "name".to_string(),
+                    crate::parquet_companion::string_indexing::StringIndexingMode::TextAndString,
+                );
+                modes
+            },
             companion_hash_fields: std::collections::HashMap::new(),
         }
     }
