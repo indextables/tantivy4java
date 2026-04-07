@@ -33,7 +33,7 @@ use crate::quickwit_split::{
     SplitConfig, QuickwitSplitMetadata, FooterOffsets,
     default_split_config, create_quickwit_split,
 };
-use crate::quickwit_split::json_discovery::{extract_doc_mapping_from_index, JsonSubfieldMap};
+use crate::quickwit_split::json_discovery::{extract_doc_mapping_from_index, write_doc_mapping_to_dir};
 
 /// Context for streaming Arrow FFI split creation.
 /// Wrapped in Arc<Mutex<>> at the JNI layer (IndexWriter is !Sync).
@@ -72,12 +72,6 @@ pub(crate) struct ArrowFfiSplitContext {
     /// Column names for which to compute min/max statistics (empty = none).
     /// Populated from the "stats" flag in fieldConfigJson.
     stats_columns: std::collections::HashSet<String>,
-    /// Throwaway accumulator for JSON sub-field discovery during row conversion.
-    /// The FFI path is non-companion (store_fields: true), so the accumulated data
-    /// is unused — finish_partition_split uses extract_doc_mapping_from_index which
-    /// samples from .store instead. Kept as a field to avoid changing shared function
-    /// signatures that require &mut HashMap.
-    json_subfields: JsonSubfieldMap,
 }
 
 /// Per-partition state: each partition gets its own Index + IndexWriter + temp dir.
@@ -326,7 +320,6 @@ pub(crate) fn begin_split_from_arrow(
         output_dir,
         rolled_splits: Vec::new(),
         stats_columns,
-        json_subfields: HashMap::new(),
     })
 }
 
@@ -602,7 +595,6 @@ pub(crate) async fn add_arrow_batch(ctx: &mut ArrowFfiSplitContext, batch: &Reco
                 &string_indexing_modes,
                 &compiled_regexes,
                 &prebuilt,
-                &mut ctx.json_subfields,
             )?;
             pw.writer.add_document(doc)?;
             pw.doc_count += 1;
@@ -663,7 +655,6 @@ pub(crate) async fn add_arrow_batch(ctx: &mut ArrowFfiSplitContext, batch: &Reco
                     &string_indexing_modes,
                     &compiled_regexes,
                     &prebuilt,
-                    &mut ctx.json_subfields,
                 )?;
                 pw.writer.add_document(doc)?;
                 pw.doc_count += 1;
@@ -721,7 +712,6 @@ fn build_doc_from_arrow_row(
     string_indexing_modes: &HashMap<String, StringIndexingMode>,
     compiled_regexes: &HashMap<String, regex::Regex>,
     prebuilt: &PrebuiltComplexColumns,
-    json_subfields: &mut JsonSubfieldMap,
 ) -> Result<TantivyDocument> {
     let mut doc = TantivyDocument::new();
 
@@ -771,7 +761,6 @@ fn build_doc_from_arrow_row(
             accumulators,
             string_indexing_modes,
             compiled_regexes,
-            json_subfields,
         )?;
     }
 
@@ -909,8 +898,15 @@ async fn finalize_partition_writer_into_split(
         skipped_splits: Vec::new(),
     };
 
-    if let Ok(doc_mapping_json) = extract_doc_mapping_from_index(&pw.index) {
-        metadata.doc_mapping_json = Some(doc_mapping_json);
+    match extract_doc_mapping_from_index(&pw.index) {
+        Ok(doc_mapping_json) => {
+            // Persist so future merges recover JSON sub-fields from file instead of re-sampling.
+            write_doc_mapping_to_dir(&index_dir_path, &doc_mapping_json)?;
+            metadata.doc_mapping_json = Some(doc_mapping_json);
+        }
+        Err(e) => {
+            debug_println!("⚠️ ARROW_FFI: Failed to extract doc_mapping from index: {}. Split will have no doc_mapping.", e);
+        }
     }
 
     let footer = create_quickwit_split(

@@ -1114,47 +1114,100 @@ mod tests {
         assert!(payload_entry.is_fast(), "JSON fields should be fast for range queries on sub-fields");
     }
 
+    /// Exhaustive test: verify that EVERY column type branch in add_field_for_arrow_type
+    /// respects store_fields=false (companion mode). No field should be stored.
     #[test]
-    fn test_json_fields_stored_and_indexed() {
-        // Tests the standard split path (FFI) where store_fields is true
+    fn test_store_fields_false_no_field_stored_for_any_type() {
         let arrow = ArrowSchema::new(vec![
-            Field::new("payload", DataType::Utf8, true),
+            // Numeric types
+            Field::new("col_bool", DataType::Boolean, true),
+            Field::new("col_i32", DataType::Int32, true),
+            Field::new("col_i64", DataType::Int64, true),
+            Field::new("col_u32", DataType::UInt32, true),
+            Field::new("col_u64", DataType::UInt64, true),
+            Field::new("col_f32", DataType::Float32, true),
+            Field::new("col_f64", DataType::Float64, true),
+            // Text types
+            Field::new("col_utf8", DataType::Utf8, true),
+            Field::new("col_large_utf8", DataType::LargeUtf8, true),
+            // Decimal types
+            Field::new("col_decimal128", DataType::Decimal128(10, 2), true),
+            Field::new("col_decimal256", DataType::Decimal256(20, 4), true),
+            // Binary types
+            Field::new("col_binary", DataType::Binary, true),
+            Field::new("col_large_binary", DataType::LargeBinary, true),
+            // Date/time types
+            Field::new("col_date32", DataType::Date32, true),
+            Field::new("col_date64", DataType::Date64, true),
+            Field::new("col_timestamp", DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None), true),
+            // Complex types → JSON
+            Field::new("col_list", DataType::List(std::sync::Arc::new(Field::new("item", DataType::Utf8, true))), true),
+            Field::new("col_struct", DataType::Struct(
+                vec![Field::new("a", DataType::Int32, true)].into(),
+            ), true),
+            // IP address (Utf8 declared as IP)
+            Field::new("col_ip", DataType::Utf8, true),
+            // JSON (Utf8 declared as JSON)
+            Field::new("col_json", DataType::Utf8, true),
         ]);
+
         let mut config = SchemaDerivationConfig::default();
-        config.store_fields = true;
-        config.json_fields.insert("payload".to_string());
+        config.store_fields = false; // Companion mode
+        config.ip_address_fields.insert("col_ip".to_string());
+        config.json_fields.insert("col_json".to_string());
 
         let schema = derive_tantivy_schema(&arrow, &config).unwrap();
 
-        let payload_field = schema.get_field("payload").unwrap();
-        let payload_entry = schema.get_field_entry(payload_field);
-
-        // Should be stored
-        assert!(payload_entry.is_stored(), "JSON field should be stored");
-
-        // Should be indexed (JsonObject with indexing options)
-        assert!(payload_entry.is_indexed(), "JSON field should be indexed");
+        // Every field must NOT be stored
+        for (_field, entry) in schema.fields() {
+            assert!(!entry.is_stored(),
+                "Field '{}' is stored with store_fields=false — companion mode must not store any field",
+                entry.name());
+        }
     }
 
+    /// Verify that store_fields=true (standard/FFI mode) correctly stores all fields.
+    /// Uses the same exhaustive schema as the false test to ensure symmetric coverage.
     #[test]
-    fn test_json_fields_not_stored_in_companion_mode() {
-        // Companion path: store_fields is false because parquet is the document store
+    fn test_store_fields_true_all_fields_stored_for_all_types() {
         let arrow = ArrowSchema::new(vec![
-            Field::new("payload", DataType::Utf8, true),
+            Field::new("col_bool", DataType::Boolean, true),
+            Field::new("col_i32", DataType::Int32, true),
+            Field::new("col_i64", DataType::Int64, true),
+            Field::new("col_u32", DataType::UInt32, true),
+            Field::new("col_u64", DataType::UInt64, true),
+            Field::new("col_f32", DataType::Float32, true),
+            Field::new("col_f64", DataType::Float64, true),
+            Field::new("col_utf8", DataType::Utf8, true),
+            Field::new("col_large_utf8", DataType::LargeUtf8, true),
+            Field::new("col_decimal128", DataType::Decimal128(10, 2), true),
+            Field::new("col_decimal256", DataType::Decimal256(20, 4), true),
+            Field::new("col_binary", DataType::Binary, true),
+            Field::new("col_large_binary", DataType::LargeBinary, true),
+            Field::new("col_date32", DataType::Date32, true),
+            Field::new("col_date64", DataType::Date64, true),
+            Field::new("col_timestamp", DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None), true),
+            Field::new("col_list", DataType::List(std::sync::Arc::new(Field::new("item", DataType::Utf8, true))), true),
+            Field::new("col_struct", DataType::Struct(
+                vec![Field::new("a", DataType::Int32, true)].into(),
+            ), true),
+            Field::new("col_ip", DataType::Utf8, true),
+            Field::new("col_json", DataType::Utf8, true),
         ]);
+
         let mut config = SchemaDerivationConfig::default();
-        config.json_fields.insert("payload".to_string());
+        config.store_fields = true; // Standard/FFI mode
+        config.ip_address_fields.insert("col_ip".to_string());
+        config.json_fields.insert("col_json".to_string());
 
         let schema = derive_tantivy_schema(&arrow, &config).unwrap();
 
-        let payload_field = schema.get_field("payload").unwrap();
-        let payload_entry = schema.get_field_entry(payload_field);
-
-        // Should NOT be stored — parquet serves as the document store
-        assert!(!payload_entry.is_stored(), "JSON field should not be stored in companion mode");
-
-        // Should still be indexed for search
-        assert!(payload_entry.is_indexed(), "JSON field should be indexed in companion mode");
+        // Every field must be stored
+        for (_field, entry) in schema.fields() {
+            assert!(entry.is_stored(),
+                "Field '{}' is NOT stored with store_fields=true — standard mode must store all fields",
+                entry.name());
+        }
     }
 
     // ── String indexing mode tests ─────────────────────────────────────
