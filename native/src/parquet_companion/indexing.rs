@@ -353,9 +353,6 @@ pub async fn create_split_from_parquet(
         string_hash_fields.len()
     );
 
-    // Single-field TextAndString has no companion fields to resolve.
-    let text_companion_fields: HashMap<String, Field> = HashMap::new();
-
     // ── Step 5: Build column mapping ─────────���──────────────────────────
     let mut column_mapping = build_column_mapping(&arrow_schema, &name_mapping, &parquet_metadata, &config);
 
@@ -564,7 +561,6 @@ pub async fn create_split_from_parquet(
                     &mut accumulators,
                     &string_indexing_modes,
                     &compiled_regexes,
-                    &text_companion_fields,
                 )?;
 
                 // Attach merge-safe parquet coordinates to each document
@@ -736,7 +732,6 @@ pub(crate) fn arrow_row_to_tantivy_doc(
     accumulators: &mut HashMap<String, StatisticsAccumulator>,
     string_indexing_modes: &HashMap<String, StringIndexingMode>,
     compiled_regexes: &HashMap<String, regex::Regex>,
-    text_companion_fields: &HashMap<String, Field>,
 ) -> Result<TantivyDocument> {
     let mut doc = TantivyDocument::new();
 
@@ -774,7 +769,6 @@ pub(crate) fn arrow_row_to_tantivy_doc(
             &mut doc, field, array, arrow_field.data_type(), row_idx,
             tantivy_field_name, config, string_hash_fields, tantivy_schema,
             accumulators, string_indexing_modes, compiled_regexes,
-            text_companion_fields,
         )?;
     }
 
@@ -798,7 +792,6 @@ pub(crate) fn add_arrow_value_to_doc(
     accumulators: &mut HashMap<String, StatisticsAccumulator>,
     string_indexing_modes: &HashMap<String, StringIndexingMode>,
     compiled_regexes: &HashMap<String, regex::Regex>,
-    text_companion_fields: &HashMap<String, Field>,
 ) -> Result<()> {
     match data_type {
         DataType::Boolean => {
@@ -899,7 +892,6 @@ pub(crate) fn add_arrow_value_to_doc(
             add_string_value_to_doc(
                 doc, field, val, field_name, config, string_hash_fields,
                 tantivy_schema, accumulators, string_indexing_modes, compiled_regexes,
-                text_companion_fields,
             )?;
         }
         DataType::LargeUtf8 => {
@@ -908,7 +900,6 @@ pub(crate) fn add_arrow_value_to_doc(
             add_string_value_to_doc(
                 doc, field, val, field_name, config, string_hash_fields,
                 tantivy_schema, accumulators, string_indexing_modes, compiled_regexes,
-                text_companion_fields,
             )?;
         }
 
@@ -1052,7 +1043,6 @@ pub(crate) fn add_string_value_to_doc(
     accumulators: &mut HashMap<String, StatisticsAccumulator>,
     string_indexing_modes: &HashMap<String, StringIndexingMode>,
     compiled_regexes: &HashMap<String, regex::Regex>,
-    text_companion_fields: &HashMap<String, Field>,
 ) -> Result<()> {
     if config.ip_address_fields.contains(field_name) {
         add_ip_addr_value(doc, field, val, field_name)?;

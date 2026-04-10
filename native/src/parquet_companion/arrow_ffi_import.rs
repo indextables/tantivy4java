@@ -566,7 +566,6 @@ pub(crate) async fn add_arrow_batch(ctx: &mut ArrowFfiSplitContext, batch: &Reco
     let string_hash_fields: HashMap<String, String> = HashMap::new();
     let string_indexing_modes: HashMap<String, StringIndexingMode> = HashMap::new();
     let compiled_regexes: HashMap<String, regex::Regex> = HashMap::new();
-    let text_companion_fields: HashMap<String, Field> = HashMap::new();
 
     let num_rows = batch.num_rows();
 
@@ -596,7 +595,6 @@ pub(crate) async fn add_arrow_batch(ctx: &mut ArrowFfiSplitContext, batch: &Reco
                 &string_indexing_modes,
                 &compiled_regexes,
                 &prebuilt,
-                &text_companion_fields,
             )?;
             pw.writer.add_document(doc)?;
             pw.doc_count += 1;
@@ -657,7 +655,6 @@ pub(crate) async fn add_arrow_batch(ctx: &mut ArrowFfiSplitContext, batch: &Reco
                     &string_indexing_modes,
                     &compiled_regexes,
                     &prebuilt,
-                    &text_companion_fields,
                 )?;
                 pw.writer.add_document(doc)?;
                 pw.doc_count += 1;
@@ -715,7 +712,6 @@ fn build_doc_from_arrow_row(
     string_indexing_modes: &HashMap<String, StringIndexingMode>,
     compiled_regexes: &HashMap<String, regex::Regex>,
     prebuilt: &PrebuiltComplexColumns,
-    text_companion_fields: &HashMap<String, Field>,
 ) -> Result<TantivyDocument> {
     let mut doc = TantivyDocument::new();
 
@@ -765,7 +761,6 @@ fn build_doc_from_arrow_row(
             accumulators,
             string_indexing_modes,
             compiled_regexes,
-            text_companion_fields,
         )?;
     }
 
