@@ -499,6 +499,9 @@ fn rewrite_string_indexing_node(
                     StringIndexingMode::TextUuidStrip | StringIndexingMode::TextCustomStrip { .. } => {
                         // No rewriting needed
                     }
+                    StringIndexingMode::TextAndString => {
+                        // No rewriting needed — queries target raw or text companion field directly
+                    }
                 }
             }
             Ok(false)
@@ -546,6 +549,9 @@ fn rewrite_string_indexing_node(
                             }
                         }
                         // Non-matching text: leave as full_text on stripped text field
+                    }
+                    StringIndexingMode::TextAndString => {
+                        // Single-field: the field uses "default" tokenizer, so full_text works directly.
                     }
                     _ => {} // strip modes: leave as-is
                 }
@@ -613,6 +619,9 @@ fn rewrite_string_indexing_node(
                             }
                         }
                         // Non-matching: leave as phrase query on stripped text field
+                    }
+                    StringIndexingMode::TextAndString => {
+                        // Single-field: has WithFreqsAndPositions, so phrase queries work directly.
                     }
                     _ => {} // strip modes: leave as-is
                 }
@@ -900,6 +909,7 @@ mod tests {
         m.insert("data".to_string(), StringIndexingMode::TextCustomExactonly {
             regex: r"\d{3}-\d{2}-\d{4}".to_string()
         });
+        m.insert("body".to_string(), StringIndexingMode::TextAndString);
         m
     }
 
@@ -1173,5 +1183,29 @@ mod tests {
         assert!(result.is_err(), "invalid regex should return Err");
         assert!(result.unwrap_err().to_string().contains("Invalid regex"),
             "error should mention invalid regex");
+    }
+
+    #[test]
+    fn test_string_indexing_text_and_string_full_text_not_rewritten() {
+        let query = r#"{"type":"full_text","field":"body","text":"hello world","params":{}}"#;
+        let modes = make_string_indexing_modes();
+        let result = rewrite_query_for_string_indexing(query, &modes).unwrap();
+        assert!(result.is_none(), "full_text on TextAndString should not be rewritten");
+    }
+
+    #[test]
+    fn test_string_indexing_text_and_string_phrase_not_rewritten() {
+        let query = r#"{"type":"phrase","field":"body","phrases":["hello","world"],"slop":0}"#;
+        let modes = make_string_indexing_modes();
+        let result = rewrite_query_for_string_indexing(query, &modes).unwrap();
+        assert!(result.is_none(), "phrase on TextAndString should not be rewritten");
+    }
+
+    #[test]
+    fn test_string_indexing_text_and_string_term_not_rewritten() {
+        let query = r#"{"type":"term","field":"body","value":"hello world"}"#;
+        let modes = make_string_indexing_modes();
+        let result = rewrite_query_for_string_indexing(query, &modes).unwrap();
+        assert!(result.is_none(), "term on TextAndString should not be rewritten");
     }
 }

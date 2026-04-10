@@ -266,6 +266,19 @@ fn add_field_for_arrow_type(
                             );
                         builder.add_text_field(name, text_opts);
                     }
+                    // Single-field: default-tokenized inverted index for full-text search
+                    // and PhraseQuery equality, raw fast field for aggregations/sorting.
+                    StringIndexingMode::TextAndString => {
+                        let opts = TextOptions::default()
+                            .set_indexing_options(
+                                TextFieldIndexing::default()
+                                    .set_tokenizer("default")
+                                    .set_index_option(IndexRecordOption::WithFreqsAndPositions)
+                                    .set_fieldnorms(config.fieldnorms_enabled),
+                            )
+                            .set_fast(Some("raw"));
+                        builder.add_text_field(name, opts);
+                    }
                 }
             } else {
                 // Standard tokenizer path
@@ -1240,6 +1253,30 @@ mod tests {
 
         assert!(schema.get_field("log_line").is_ok());
         assert!(schema.get_field("log_line__uuids").is_err());
+    }
+
+    #[test]
+    fn test_text_and_string_creates_single_field() {
+        let arrow = ArrowSchema::new(vec![
+            Field::new("message", DataType::Utf8, true),
+        ]);
+        let mut config = SchemaDerivationConfig::default();
+        config.tokenizer_overrides.insert("message".to_string(), "text_and_string".to_string());
+
+        let schema = derive_tantivy_schema(&arrow, &config).unwrap();
+
+        let msg_field = schema.get_field("message").unwrap();
+        match schema.get_field_entry(msg_field).field_type() {
+            tantivy::schema::FieldType::Str(text_opts) => {
+                let indexing = text_opts.get_indexing_options()
+                    .expect("Should have indexing options");
+                assert_eq!(indexing.tokenizer(), "default");
+                assert_eq!(indexing.index_option(),
+                    tantivy::schema::IndexRecordOption::WithFreqsAndPositions);
+                assert!(text_opts.is_fast(), "Should have fast field enabled");
+            }
+            other => panic!("Expected Str type, got {:?}", other),
+        }
     }
 }
 

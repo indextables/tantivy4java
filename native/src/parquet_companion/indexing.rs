@@ -353,7 +353,7 @@ pub async fn create_split_from_parquet(
         string_hash_fields.len()
     );
 
-    // ── Step 5: Build column mapping ────────────────────────────────────
+    // ── Step 5: Build column mapping ─────────���──────────────────────────
     let mut column_mapping = build_column_mapping(&arrow_schema, &name_mapping, &parquet_metadata, &config);
 
     // Patch tantivy_type for exact_only fields: they are U64, not Str
@@ -1089,6 +1089,14 @@ pub(crate) fn add_string_value_to_doc(
                     doc.add_text(field, val);
                 }
             }
+            StringIndexingMode::TextAndString => {
+                // Single field: tokenized by "default" for inverted index,
+                // stored raw in the fast field — both handled by tantivy automatically.
+                doc.add_text(field, val);
+                if let Some(acc) = accumulators.get_mut(field_name) {
+                    acc.observe_string(val);
+                }
+            }
         }
     } else {
         // Standard text field path
@@ -1576,14 +1584,30 @@ fn build_column_mapping(
             arrow_type_to_tantivy_type(arrow_field.data_type()).to_string()
         };
 
-        // For Str columns, record the fast field tokenizer.
-        // Defaults to "raw" for text fields (no tokenization in fast field).
+        // For Str columns, record the fast field tokenizer used during parquet transcoding.
+        // TextAndString fields have native fast data (from set_fast(Some("raw")) in schema_derivation),
+        // so they don't need parquet transcoding — set fast_field_tokenizer to None.
+        // All other Str columns need transcoding and default to "raw" tokenizer.
         let fast_field_tokenizer = if tantivy_type_str == "Str" {
-            let tok = config.tokenizer_overrides
+            let mode = config.tokenizer_overrides
                 .get(&tantivy_field_name)
-                .cloned()
-                .unwrap_or_else(|| "raw".to_string());
-            Some(tok)
+                .map(|s| s.as_str())
+                .unwrap_or("");
+            if mode == "text_and_string" {
+                // TextAndString has native fast data — no transcoding needed
+                None
+            } else {
+                let tok = config.tokenizer_overrides
+                    .get(&tantivy_field_name)
+                    .cloned()
+                    .unwrap_or_else(|| "raw".to_string());
+                // Normalize string indexing mode keywords to their actual primary tokenizer.
+                let tok = match tok.as_str() {
+                    "exact_only" => "raw".to_string(),
+                    _ => tok,
+                };
+                Some(tok)
+            }
         } else {
             None
         };
@@ -3393,5 +3417,352 @@ mod tests {
             "_phash_name should exist (not excluded)");
         assert!(schema.get_field(&format!("{}category", PHASH_FIELD_PREFIX)).is_err(),
             "_phash_category should NOT exist (excluded)");
+    }
+
+    // ── TextAndString integration test ──────────────────────────────────
+
+    /// Helper: create a parquet file with id (Int64) and message (Utf8) columns
+    /// for text_and_string indexing mode tests.
+    fn write_test_parquet_for_text_and_string(path: &std::path::Path, messages: &[&str]) {
+        use arrow_array::*;
+        use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+        use parquet::arrow::ArrowWriter;
+        use std::sync::Arc;
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("message", DataType::Utf8, false),
+        ]));
+
+        let ids: Vec<i64> = (0..messages.len()).map(|i| i as i64).collect();
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(ids)),
+                Arc::new(StringArray::from(messages.to_vec())),
+            ],
+        ).unwrap();
+
+        let file = std::fs::File::create(path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+    }
+
+    /// Integration test: single-field text_and_string — tokenized search + fast field retrieval.
+    #[tokio::test]
+    async fn test_create_split_with_text_and_string_indexing() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let parquet_path = temp_dir.path().join("tas.parquet");
+        let output_path = temp_dir.path().join("tas.split");
+
+        let messages = &["the quick brown fox", "hello world", "the lazy dog sleeps"];
+        write_test_parquet_for_text_and_string(&parquet_path, messages);
+
+        let mut tokenizer_overrides = HashMap::new();
+        tokenizer_overrides.insert("message".to_string(), "text_and_string".to_string());
+
+        let config = CreateFromParquetConfig {
+            table_root: temp_dir.path().to_string_lossy().to_string(),
+            schema_config: SchemaDerivationConfig {
+                tokenizer_overrides,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let storage: Arc<dyn quickwit_storage::Storage> =
+            Arc::new(quickwit_storage::RamStorage::default());
+
+        let result = create_split_from_parquet(
+            &[parquet_path.to_string_lossy().to_string()],
+            output_path.to_str().unwrap(),
+            &config,
+            &storage,
+        ).await.expect("text_and_string split creation should succeed");
+
+        assert_eq!(result.metadata.num_docs, 3);
+
+        let (index, _bundle_dir) = crate::quickwit_split::split_utils::open_split_with_quickwit_native(
+            output_path.to_str().unwrap()
+        ).expect("Should open the created split");
+
+        let schema = index.schema();
+
+        // Single field with default tokenizer + raw fast field
+        let msg_field = schema.get_field("message").unwrap();
+        match schema.get_field_entry(msg_field).field_type() {
+            tantivy::schema::FieldType::Str(text_opts) => {
+                assert_eq!(text_opts.get_indexing_options().unwrap().tokenizer(), "default");
+                assert!(text_opts.is_fast());
+            }
+            other => panic!("Expected Str, got {:?}", other),
+        }
+        assert!(schema.get_field("message__text").is_err());
+
+        let reader = index.reader().unwrap();
+        reader.reload().unwrap();
+        let searcher = reader.searcher();
+        assert_eq!(searcher.num_docs(), 3);
+
+        // Tokenized search on the single field
+        let quick_term = tantivy::Term::from_field_text(msg_field, "quick");
+        let quick_query = tantivy::query::TermQuery::new(quick_term, tantivy::schema::IndexRecordOption::WithFreqsAndPositions);
+        assert_eq!(searcher.search(&quick_query, &tantivy::collector::TopDocs::with_limit(10)).unwrap().len(), 1);
+
+        let the_term = tantivy::Term::from_field_text(msg_field, "the");
+        let the_query = tantivy::query::TermQuery::new(the_term, tantivy::schema::IndexRecordOption::WithFreqsAndPositions);
+        assert_eq!(searcher.search(&the_query, &tantivy::collector::TopDocs::with_limit(10)).unwrap().len(), 2);
+
+        // Fast field returns original untokenized strings
+        let segment_reader = searcher.segment_readers().first().unwrap();
+        let fast_field = segment_reader.fast_fields().str("message").unwrap().unwrap();
+        let mut fast_values: Vec<String> = Vec::new();
+        for doc_id in 0..segment_reader.num_docs() {
+            let mut output = String::new();
+            let ord = fast_field.term_ords(doc_id).next().unwrap();
+            fast_field.ord_to_str(ord, &mut output).unwrap();
+            fast_values.push(output);
+        }
+        assert!(fast_values.contains(&"the quick brown fox".to_string()));
+        assert!(fast_values.contains(&"hello world".to_string()));
+        assert!(fast_values.contains(&"the lazy dog sleeps".to_string()));
+    }
+
+    // ── TextAndString edge-case integration test ────────────────────────
+
+    /// Helper: create a parquet file with id, message, and tag columns.
+    fn write_test_parquet_for_text_and_string_multi(
+        path: &std::path::Path,
+        messages: &[&str],
+        tags: &[&str],
+    ) {
+        use arrow_array::*;
+        use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+        use parquet::arrow::ArrowWriter;
+        use std::sync::Arc;
+
+        assert_eq!(messages.len(), tags.len());
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("message", DataType::Utf8, false),
+            Field::new("tag", DataType::Utf8, false),
+        ]));
+        let ids: Vec<i64> = (0..messages.len()).map(|i| i as i64).collect();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(ids)),
+                Arc::new(StringArray::from(messages.to_vec())),
+                Arc::new(StringArray::from(tags.to_vec())),
+            ],
+        ).unwrap();
+        let file = std::fs::File::create(path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+    }
+
+    /// Integration test: multi-column text_and_string with empty strings.
+    #[tokio::test]
+    async fn test_text_and_string_edge_cases() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let parquet_path = temp_dir.path().join("tas_edge.parquet");
+        let output_path = temp_dir.path().join("tas_edge.split");
+
+        let messages = &["the quick brown fox", "", "hello world"];
+        let tags = &["animal", "empty-message", ""];
+        write_test_parquet_for_text_and_string_multi(&parquet_path, messages, tags);
+
+        let mut tokenizer_overrides = HashMap::new();
+        tokenizer_overrides.insert("message".to_string(), "text_and_string".to_string());
+        tokenizer_overrides.insert("tag".to_string(), "text_and_string".to_string());
+
+        let config = CreateFromParquetConfig {
+            table_root: temp_dir.path().to_string_lossy().to_string(),
+            schema_config: SchemaDerivationConfig {
+                tokenizer_overrides,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let storage: Arc<dyn quickwit_storage::Storage> =
+            Arc::new(quickwit_storage::RamStorage::default());
+
+        let result = create_split_from_parquet(
+            &[parquet_path.to_string_lossy().to_string()],
+            output_path.to_str().unwrap(),
+            &config,
+            &storage,
+        ).await.expect("edge case split creation should succeed");
+
+        assert_eq!(result.metadata.num_docs, 3);
+
+        let (index, _bundle_dir) = crate::quickwit_split::split_utils::open_split_with_quickwit_native(
+            output_path.to_str().unwrap()
+        ).expect("Should open the created split");
+
+        let schema = index.schema();
+        let msg_field = schema.get_field("message").unwrap();
+        let tag_field = schema.get_field("tag").unwrap();
+        assert!(schema.get_field("message__text").is_err());
+        assert!(schema.get_field("tag__text").is_err());
+
+        for (field, name) in [(msg_field, "message"), (tag_field, "tag")] {
+            match schema.get_field_entry(field).field_type() {
+                tantivy::schema::FieldType::Str(text_opts) => {
+                    assert_eq!(text_opts.get_indexing_options().unwrap().tokenizer(), "default",
+                        "{name} should use default tokenizer");
+                    assert!(text_opts.is_fast(), "{name} should have fast field");
+                }
+                other => panic!("{name}: expected Str, got {:?}", other),
+            }
+        }
+
+        let reader = index.reader().unwrap();
+        reader.reload().unwrap();
+        let searcher = reader.searcher();
+        assert_eq!(searcher.num_docs(), 3);
+
+        let quick_term = tantivy::Term::from_field_text(msg_field, "quick");
+        let quick_query = tantivy::query::TermQuery::new(quick_term, tantivy::schema::IndexRecordOption::WithFreqsAndPositions);
+        assert_eq!(searcher.search(&quick_query, &tantivy::collector::TopDocs::with_limit(10)).unwrap().len(), 1);
+
+        let animal_term = tantivy::Term::from_field_text(tag_field, "animal");
+        let animal_query = tantivy::query::TermQuery::new(animal_term, tantivy::schema::IndexRecordOption::WithFreqsAndPositions);
+        assert_eq!(searcher.search(&animal_query, &tantivy::collector::TopDocs::with_limit(10)).unwrap().len(), 1);
+
+        // Empty string produces no tokens with default tokenizer
+        let empty_term = tantivy::Term::from_field_text(msg_field, "");
+        let empty_query = tantivy::query::TermQuery::new(empty_term, tantivy::schema::IndexRecordOption::WithFreqsAndPositions);
+        assert_eq!(searcher.search(&empty_query, &tantivy::collector::TopDocs::with_limit(10)).unwrap().len(), 0);
+    }
+
+    /// PhraseQuery(slop=0) on "New York" also matches "New York City" — this is the expected
+    /// false positive that Spark post-filters away. Verifies the core trade-off of the
+    /// single-field approach.
+    #[tokio::test]
+    async fn test_text_and_string_phrase_query_false_positives() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let parquet_path = temp_dir.path().join("tas_fp.parquet");
+        let output_path = temp_dir.path().join("tas_fp.split");
+
+        let messages = &[
+            "New York",
+            "New York City",
+            "York New",          // wrong order — should NOT match
+            "New Jersey",        // different second token — should NOT match
+            "I love New York!",  // "new york" at positions 2,3 — WILL match (false positive)
+        ];
+        write_test_parquet_for_text_and_string(&parquet_path, messages);
+
+        let mut tokenizer_overrides = HashMap::new();
+        tokenizer_overrides.insert("message".to_string(), "text_and_string".to_string());
+
+        let config = CreateFromParquetConfig {
+            table_root: temp_dir.path().to_string_lossy().to_string(),
+            schema_config: SchemaDerivationConfig {
+                tokenizer_overrides,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let storage: Arc<dyn quickwit_storage::Storage> =
+            Arc::new(quickwit_storage::RamStorage::default());
+
+        create_split_from_parquet(
+            &[parquet_path.to_string_lossy().to_string()],
+            output_path.to_str().unwrap(),
+            &config,
+            &storage,
+        ).await.unwrap();
+
+        let (index, _bundle_dir) = crate::quickwit_split::split_utils::open_split_with_quickwit_native(
+            output_path.to_str().unwrap()
+        ).unwrap();
+
+        let msg_field = index.schema().get_field("message").unwrap();
+        let reader = index.reader().unwrap();
+        reader.reload().unwrap();
+        let searcher = reader.searcher();
+
+        // PhraseQuery for "new york" (slop=0): matches docs where "new" is immediately followed by "york"
+        let phrase_query = tantivy::query::PhraseQuery::new(vec![
+            tantivy::Term::from_field_text(msg_field, "new"),
+            tantivy::Term::from_field_text(msg_field, "york"),
+        ]);
+        let results = searcher.search(&phrase_query, &tantivy::collector::TopDocs::with_limit(10)).unwrap();
+
+        // Should match: "New York" (exact), "New York City" (prefix), "I love New York!" (contains)
+        // Should NOT match: "York New" (wrong order), "New Jersey" (different token)
+        assert_eq!(results.len(), 3, "PhraseQuery should match 3 docs (1 exact + 2 false positives)");
+    }
+
+    /// Fast field correctly stores values with punctuation that the default tokenizer splits.
+    #[tokio::test]
+    async fn test_text_and_string_punctuation_in_fast_field() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let parquet_path = temp_dir.path().join("tas_punct.parquet");
+        let output_path = temp_dir.path().join("tas_punct.split");
+
+        let messages = &[
+            "user@example.com",
+            "https://google.com/search?q=test",
+            "hello-world_v2.0",
+        ];
+        write_test_parquet_for_text_and_string(&parquet_path, messages);
+
+        let mut tokenizer_overrides = HashMap::new();
+        tokenizer_overrides.insert("message".to_string(), "text_and_string".to_string());
+
+        let config = CreateFromParquetConfig {
+            table_root: temp_dir.path().to_string_lossy().to_string(),
+            schema_config: SchemaDerivationConfig {
+                tokenizer_overrides,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let storage: Arc<dyn quickwit_storage::Storage> =
+            Arc::new(quickwit_storage::RamStorage::default());
+
+        create_split_from_parquet(
+            &[parquet_path.to_string_lossy().to_string()],
+            output_path.to_str().unwrap(),
+            &config,
+            &storage,
+        ).await.unwrap();
+
+        let (index, _bundle_dir) = crate::quickwit_split::split_utils::open_split_with_quickwit_native(
+            output_path.to_str().unwrap()
+        ).unwrap();
+
+        let reader = index.reader().unwrap();
+        reader.reload().unwrap();
+        let searcher = reader.searcher();
+
+        // Tokenized search finds "google" inside the URL
+        let msg_field = index.schema().get_field("message").unwrap();
+        let google_term = tantivy::Term::from_field_text(msg_field, "google");
+        let google_query = tantivy::query::TermQuery::new(google_term, tantivy::schema::IndexRecordOption::WithFreqsAndPositions);
+        assert_eq!(searcher.search(&google_query, &tantivy::collector::TopDocs::with_limit(10)).unwrap().len(), 1);
+
+        // Fast field returns the original string with all punctuation intact
+        let segment_reader = searcher.segment_readers().first().unwrap();
+        let fast_field = segment_reader.fast_fields().str("message").unwrap().unwrap();
+        let mut fast_values: Vec<String> = Vec::new();
+        for doc_id in 0..segment_reader.num_docs() {
+            let mut output = String::new();
+            let ord = fast_field.term_ords(doc_id).next().unwrap();
+            fast_field.ord_to_str(ord, &mut output).unwrap();
+            fast_values.push(output);
+        }
+        assert!(fast_values.contains(&"user@example.com".to_string()));
+        assert!(fast_values.contains(&"https://google.com/search?q=test".to_string()));
+        assert!(fast_values.contains(&"hello-world_v2.0".to_string()));
     }
 }
