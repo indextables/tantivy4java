@@ -8,6 +8,8 @@ A guided tour of the tantivy4java codebase: how the modules are organized, what 
 2. **[02-java-api.md](02-java-api.md)** — Walkthrough of every Java package under `src/main/java/io/indextables/tantivy4java/`. Identifies user-facing API vs. internal plumbing and notes which native module each package bridges to.
 3. **[03-rust-native.md](03-rust-native.md)** — Walkthrough of every module under `native/src/`. Separates pure JNI bridges from pure Rust logic, and groups modules by responsibility (core index, searcher, cache, storage, etc).
 4. **[04-data-flow.md](04-data-flow.md)** — How requests actually flow through the layers. Traces a search query, a document retrieval, an index write, and a split merge end-to-end so you can see how the modules from docs 02 and 03 connect in practice.
+5. **[05-java-design.md](05-java-design.md)** — Design deep dive for the Java side. The thin-shim contract, native handle ownership, builder patterns, `SplitCacheManager` singleton lifecycle, query tree semantics, aggregation request/result pairing, threading model, and the error surface.
+6. **[06-rust-design.md](06-rust-design.md)** — Design deep dive for the Rust crate. The Arc registry, JNI bridge conventions, the two async runtime strategies, tiered storage with range coalescing, L2 disk cache internals, the `MemoryPool` trait and RAII reservations, query optimization, panic propagation, and the invariants a Rust contributor needs to hold.
 
 ## Source tree at a glance
 
@@ -73,7 +75,8 @@ tantivy4java/
 
 ## How to use these docs
 
-- If you're **new to the codebase**, read all four in order.
+- If you're **new to the codebase**, read all six in order. Docs 01–04 are orientation; 05–06 are the design rationale behind what you saw.
 - If you're **debugging a query**, jump to `04-data-flow.md` to see the path, then drill into the relevant module in `02` or `03`.
-- If you're **adding a new feature**, start with `01-architecture.md` to find the right layer, then the package/module walkthrough for the conventions used by neighbors.
+- If you're **adding a new feature**, start with `01-architecture.md` to find the right layer, then read the matching deep dive (`05` for Java, `06` for Rust) to learn the conventions neighbors follow, then use `02`/`03` as a module reference while you work.
+- If you're **writing new Rust code**, the invariants list at the end of `06-rust-design.md` is the short version of what not to break.
 - If you're **looking for a specific module**, the file trees in `02` and `03` are alphabetized within each section.

@@ -185,7 +185,7 @@ rust:quickwit_split/  (entry point)
 java:split.QuickwitSplit.SplitMetadata  (returned to caller)
 ```
 
-**Process isolation:** for high-parallelism merges, this whole path is invoked from a separate Rust binary (the `tantivy4java-merge` standalone executable) so each concurrent merge gets its own Tokio runtime, heap, and address space. The Java side uses `MergeBinaryExtractor` to spawn and coordinate processes. This is what gets the system to 99.5–100% parallel efficiency on N-way merges.
+**In-process execution:** merges run in-process inside the JVM. Concurrency is managed by the `QuickwitRuntimeManager`'s semaphores (`max_concurrent_downloads`, `max_concurrent_uploads`) in `rust:runtime_manager.rs` rather than by OS-level process isolation. (Some earlier design notes under `detail_designs/PROCESS_BASED_MERGE_GUIDE.md` describe a standalone `tantivy4java-merge` binary, but that binary does not exist in the current crate — there is no `[[bin]]` target in `native/Cargo.toml`.)
 
 ## Scenario 6 — Listing files in an external table (Delta example)
 
