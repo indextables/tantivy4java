@@ -10,7 +10,6 @@ pub mod cached_reader;
 pub mod docid_mapping;
 pub mod doc_retrieval;
 pub mod validation;
-pub mod store_stub;
 pub mod schema_derivation;
 pub mod indexing;
 pub mod augmented_directory;

@@ -28,8 +28,12 @@ use super::schema_derivation::{
 use super::statistics::{StatisticsAccumulator, ColumnStatisticsResult, validate_statistics_fields};
 use super::name_mapping;
 use super::string_indexing::{self, StringIndexingMode, CompanionFieldInfo};
-
 use crate::debug_println;
+use crate::quickwit_split::json_discovery::{
+    discover_json_subfields_from_fast_fields,
+    extract_doc_mapping_with_json_subfields,
+    write_doc_mapping_to_dir,
+};
 use crate::quickwit_split::QuickwitSplitMetadata;
 
 /// Hidden u64 fast field storing a hash of the parquet file's relative path.
@@ -592,6 +596,10 @@ pub async fn create_split_from_parquet(
     // longer used for correctness in the retrieval path.
     index.load_metas().context("Failed to load index metas after commit")?;
 
+    // Companion mode: .store files are not generated because store_fields=false
+    // in SchemaDerivationConfig. JSON sub-field metadata is discovered post-commit
+    // from fast field columns rather than from stored documents.
+
     let segment_metas = index.searchable_segment_metas()
         .context("Failed to read segment metas after commit")?;
 
@@ -642,13 +650,18 @@ pub async fn create_split_from_parquet(
     // ── Step 12: Create split with embedded manifest ────────────────────
     let output_path_buf = PathBuf::from(output_path);
 
-    // Extract doc mapping from the index schema (required for aggregations).
-    // The indexing schema may have suppressed .fast for some fields (HYBRID/PARQUET_ONLY),
-    // but the doc_mapping returned to the client must report all fields as fast so that
+    // Discover JSON sub-fields from fast field columns post-commit (no .store in companion mode).
+    let json_subfields = discover_json_subfields_from_fast_fields(&index)
+        .map_err(|e| anyhow::anyhow!("Failed to discover JSON sub-fields from fast fields: {}", e))?;
+    let raw_doc_mapping = extract_doc_mapping_with_json_subfields(&index, &json_subfields)
+        .map_err(|e| anyhow::anyhow!("Failed to extract doc mapping from parquet index: {}", e))?;
+
+    // Persist raw doc_mapping into the index directory so it gets bundled into the split.
+    write_doc_mapping_to_dir(&index_dir, &raw_doc_mapping)?;
+
+    // The doc_mapping returned to the client must report all fields as fast so that
     // when the client passes it back to create a SplitSearcher, the runtime knows it can
     // serve fast field data (either from native .fast files or from parquet).
-    let raw_doc_mapping = crate::quickwit_split::json_discovery::extract_doc_mapping_from_index(&index)
-        .map_err(|e| anyhow::anyhow!("Failed to extract doc mapping from parquet index: {}", e))?;
     let doc_mapping_json = super::schema_derivation::promote_doc_mapping_all_fast(&raw_doc_mapping)?;
 
     // Create split metadata
@@ -2235,7 +2248,7 @@ mod tests {
 
         let mut builder = SchemaBuilder::new();
         let field = builder.add_json_field("payload", JsonObjectOptions::default().set_stored());
-        let schema = builder.build();
+        let _schema = builder.build();
 
         let mut doc = TantivyDocument::new();
         add_json_string_value(
@@ -3393,5 +3406,276 @@ mod tests {
             "_phash_name should exist (not excluded)");
         assert!(schema.get_field(&format!("{}category", PHASH_FIELD_PREFIX)).is_err(),
             "_phash_category should NOT exist (excluded)");
+    }
+
+    #[tokio::test]
+    async fn test_json_subfield_discovery_in_companion_split() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let parquet_path = temp_dir.path().join("json_discovery.parquet");
+        let output_path = temp_dir.path().join("json_discovery.split");
+
+        // Creates rows with payload: {"user":"user_N","score":N*10,"active":bool}
+        write_test_parquet_with_json_strings(&parquet_path, 20, 0);
+
+        let mut json_fields = HashSet::new();
+        json_fields.insert("payload".to_string());
+
+        let config = CreateFromParquetConfig {
+            table_root: temp_dir.path().to_string_lossy().to_string(),
+            schema_config: SchemaDerivationConfig {
+                json_fields,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let storage: std::sync::Arc<dyn quickwit_storage::Storage> =
+            std::sync::Arc::new(quickwit_storage::RamStorage::default());
+
+        let result = create_split_from_parquet(
+            &[parquet_path.to_string_lossy().to_string()],
+            output_path.to_str().unwrap(),
+            &config,
+            &storage,
+        ).await.expect("Split creation with JSON fields should succeed");
+
+        assert_eq!(result.metadata.num_docs, 20);
+
+        // Verify doc_mapping_json is present in metadata
+        let doc_mapping_json = result.metadata.doc_mapping_json
+            .as_ref()
+            .expect("doc_mapping_json should be present in split metadata");
+
+        // Parse the doc_mapping and verify JSON sub-fields were discovered
+        let doc_mapping: serde_json::Value = serde_json::from_str(doc_mapping_json)
+            .expect("doc_mapping_json should be valid JSON");
+
+        let field_mappings = doc_mapping.as_array()
+            .expect("doc_mapping should be an array of field mappings");
+
+        // Find the payload object field
+        let payload_mapping = field_mappings.iter()
+            .find(|m| m["name"] == "payload" && m["type"] == "object")
+            .expect("Should find 'payload' as an object-type field in doc_mapping");
+
+        let sub_fields = payload_mapping["field_mappings"].as_array()
+            .expect("payload object should have field_mappings");
+
+        // Verify exact sub-field count (user, score, active — no phantom extras)
+        assert_eq!(sub_fields.len(), 3,
+            "payload should have exactly 3 sub-fields, got: {:?}",
+            sub_fields.iter().map(|f| f["name"].as_str().unwrap_or("?")).collect::<Vec<_>>());
+
+        // Verify discovered sub-fields by name
+        let sub_field_names: HashSet<String> = sub_fields.iter()
+            .map(|f| f["name"].as_str().unwrap().to_string())
+            .collect();
+
+        assert!(sub_field_names.contains("user"),
+            "Should discover 'user' sub-field, got: {:?}", sub_field_names);
+        assert!(sub_field_names.contains("score"),
+            "Should discover 'score' sub-field, got: {:?}", sub_field_names);
+        assert!(sub_field_names.contains("active"),
+            "Should discover 'active' sub-field, got: {:?}", sub_field_names);
+
+        // Verify exact types
+        let user_field = sub_fields.iter().find(|f| f["name"] == "user").unwrap();
+        assert_eq!(user_field["type"], "text", "user should be text type");
+
+        // Post-commit fast-field discovery reports i64 because tantivy's columnar
+        // storage normalizes all JSON integers to i64 regardless of the original sign.
+        let score_field = sub_fields.iter().find(|f| f["name"] == "score").unwrap();
+        assert_eq!(score_field["type"], "i64", "score should be i64 (columnar fast fields normalize integers to i64)");
+
+        let active_field = sub_fields.iter().find(|f| f["name"] == "active").unwrap();
+        assert_eq!(active_field["type"], "bool", "active should be bool type");
+    }
+
+    /// E2E test: create two companion splits with JSON fields, merge them,
+    /// and verify the merged doc_mapping_json preserves all JSON sub-fields.
+    /// This validates the full _doc_mapping.json persistence → read → union pipeline.
+    #[test]
+    fn test_merge_companion_splits_preserves_json_subfields() {
+        // Use a dedicated runtime because merge_splits_impl spawns its own threads
+        // with block_on calls that conflict with #[tokio::test]'s runtime.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let temp_dir = tempfile::tempdir().unwrap();
+
+        // ── Create split A: 10 rows with payload {user, score, active} ──
+        let parquet_a = temp_dir.path().join("split_a.parquet");
+        let split_a = temp_dir.path().join("split_a.split");
+        write_test_parquet_with_json_strings(&parquet_a, 10, 0);
+
+        let mut json_fields = HashSet::new();
+        json_fields.insert("payload".to_string());
+
+        let config = CreateFromParquetConfig {
+            table_root: temp_dir.path().to_string_lossy().to_string(),
+            schema_config: SchemaDerivationConfig {
+                json_fields,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let storage: std::sync::Arc<dyn quickwit_storage::Storage> =
+            std::sync::Arc::new(quickwit_storage::RamStorage::default());
+
+        let result_a = rt.block_on(create_split_from_parquet(
+            &[parquet_a.to_string_lossy().to_string()],
+            split_a.to_str().unwrap(),
+            &config,
+            &storage,
+        )).expect("Split A creation should succeed");
+        assert_eq!(result_a.metadata.num_docs, 10);
+
+        // ── Create split B: 10 rows with same schema, different id_offset ──
+        let parquet_b = temp_dir.path().join("split_b.parquet");
+        let split_b = temp_dir.path().join("split_b.split");
+        write_test_parquet_with_json_strings(&parquet_b, 10, 100);
+
+        let result_b = rt.block_on(create_split_from_parquet(
+            &[parquet_b.to_string_lossy().to_string()],
+            split_b.to_str().unwrap(),
+            &config,
+            &storage,
+        )).expect("Split B creation should succeed");
+        assert_eq!(result_b.metadata.num_docs, 10);
+
+        // Verify both splits have doc_mapping_json
+        assert!(result_a.metadata.doc_mapping_json.is_some(), "Split A should have doc_mapping_json");
+        assert!(result_b.metadata.doc_mapping_json.is_some(), "Split B should have doc_mapping_json");
+
+        // ── Merge the two splits ──
+        let merged_path = temp_dir.path().join("merged.split");
+
+        let merge_config = crate::quickwit_split::merge_config::InternalMergeConfig {
+            index_uid: "test-index".to_string(),
+            source_id: "test-source".to_string(),
+            node_id: "test-node".to_string(),
+            doc_mapping_uid: "default".to_string(),
+            partition_id: 0,
+            delete_queries: None,
+            aws_config: None,
+            azure_config: None,
+            temp_directory_path: None,
+            max_concurrent_splits: 0,
+        };
+
+        let merged_result = crate::quickwit_split::merge_impl::merge_splits_impl(
+            &[split_a.to_string_lossy().to_string(), split_b.to_string_lossy().to_string()],
+            merged_path.to_str().unwrap(),
+            &merge_config,
+        ).expect("Merge should succeed");
+
+        // ── Verify merged metadata ──
+        assert_eq!(merged_result.num_docs, 20, "Merged split should have 20 docs (10 + 10)");
+
+        let merged_doc_mapping = merged_result.doc_mapping_json
+            .as_ref()
+            .expect("Merged split should have doc_mapping_json");
+
+        let doc_mapping: serde_json::Value = serde_json::from_str(merged_doc_mapping)
+            .expect("Merged doc_mapping should be valid JSON");
+
+        let field_mappings = doc_mapping.as_array()
+            .expect("doc_mapping should be an array");
+
+        // Find the payload object field
+        let payload_mapping = field_mappings.iter()
+            .find(|m| m["name"] == "payload" && m["type"] == "object")
+            .expect("Merged doc_mapping should have 'payload' as object type");
+
+        let sub_fields = payload_mapping["field_mappings"].as_array()
+            .expect("payload should have field_mappings in merged doc_mapping");
+
+        // Verify all 3 sub-fields survived the merge
+        let sub_field_names: HashSet<String> = sub_fields.iter()
+            .map(|f| f["name"].as_str().unwrap().to_string())
+            .collect();
+
+        assert_eq!(sub_fields.len(), 3,
+            "Merged payload should have exactly 3 sub-fields, got: {:?}", sub_field_names);
+
+        // Verify sub-field names AND types survived the merge
+        let sub_by_name: std::collections::HashMap<&str, &serde_json::Value> = sub_fields.iter()
+            .map(|f| (f["name"].as_str().unwrap(), f))
+            .collect();
+        assert_eq!(sub_by_name["user"]["type"], "text");
+        assert_eq!(sub_by_name["score"]["type"], "i64");
+        assert_eq!(sub_by_name["active"]["type"], "bool");
+    }
+
+    /// Verify companion splits have no stored fields and DO contain _doc_mapping.json.
+    /// This is the core guarantee: companion mode uses parquet as the document store,
+    /// so no field should have the STORED flag (preventing redundant data in .store files).
+    /// Note: tantivy always creates .store segment files as part of its format, but they
+    /// contain no document data when no fields are stored.
+    #[test]
+    fn test_companion_split_no_stored_fields_and_has_doc_mapping() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let parquet_path = temp_dir.path().join("no_store.parquet");
+        let split_path = temp_dir.path().join("no_store.split");
+
+        write_test_parquet_with_json_strings(&parquet_path, 5, 0);
+
+        let mut json_fields = HashSet::new();
+        json_fields.insert("payload".to_string());
+
+        let config = CreateFromParquetConfig {
+            table_root: temp_dir.path().to_string_lossy().to_string(),
+            schema_config: SchemaDerivationConfig {
+                json_fields,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let storage: std::sync::Arc<dyn quickwit_storage::Storage> =
+            std::sync::Arc::new(quickwit_storage::RamStorage::default());
+
+        let result = rt.block_on(create_split_from_parquet(
+            &[parquet_path.to_string_lossy().to_string()],
+            split_path.to_str().unwrap(),
+            &config,
+            &storage,
+        )).expect("Split creation should succeed");
+
+        // Verify the doc_mapping reports no stored fields — this is the core invariant.
+        // If any field is stored, tantivy writes document data into .store files,
+        // which duplicates data that should only live in parquet.
+        let doc_mapping_json = result.metadata.doc_mapping_json
+            .as_ref()
+            .expect("doc_mapping_json should be present");
+        let doc_mapping: serde_json::Value = serde_json::from_str(doc_mapping_json).unwrap();
+        let field_mappings = doc_mapping.as_array().unwrap();
+
+        for field in field_mappings {
+            let name = field["name"].as_str().unwrap_or("?");
+            let stored = field.get("stored").and_then(|v| v.as_bool()).unwrap_or(false);
+            assert!(!stored,
+                "Field '{}' is stored in companion mode doc_mapping — this will cause redundant .store data. \
+                 Companion splits must have store_fields=false for all fields.", name);
+        }
+
+        // Extract the split and verify _doc_mapping.json IS present in the bundle
+        let extract_dir = temp_dir.path().join("extracted");
+        std::fs::create_dir_all(&extract_dir).unwrap();
+        crate::quickwit_split::temp_management::extract_split_to_directory_impl(
+            &split_path, &extract_dir,
+        ).expect("Split extraction should succeed");
+
+        let doc_mapping_path = extract_dir.join(
+            crate::quickwit_split::json_discovery::DOC_MAPPING_FILENAME
+        );
+        assert!(doc_mapping_path.exists(),
+            "_doc_mapping.json must be present in companion split bundle");
+
+        // Verify the bundled _doc_mapping.json contains JSON sub-field metadata
+        let doc_mapping_content = std::fs::read_to_string(&doc_mapping_path).unwrap();
+        let subfields = crate::quickwit_split::json_discovery::extract_json_subfields_from_doc_mapping(&doc_mapping_content);
+        assert!(!subfields.is_empty(),
+            "_doc_mapping.json should contain JSON sub-field metadata, got empty map");
     }
 }

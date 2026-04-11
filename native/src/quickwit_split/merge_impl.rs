@@ -39,7 +39,12 @@ use super::temp_management::create_temp_directory_with_base;
 use super::download::download_and_extract_splits_parallel;
 use super::{is_configuration_error, create_merged_split_file, upload_split_to_s3, estimate_peak_memory_usage};
 use super::resilient_ops;
-use super::json_discovery::extract_doc_mapping_from_index;
+use super::json_discovery::{
+    extract_doc_mapping_from_index, extract_doc_mapping_with_json_subfields,
+    read_doc_mapping_from_dir, extract_json_subfields_from_doc_mapping,
+    combine_json_subfield_maps, discover_json_subfields_from_fast_fields,
+    write_doc_mapping_to_dir, JsonSubfieldMap,
+};
 use super::merge_types::SkippedSplit;
 
 // Debug logging macro - controlled by TANTIVY4JAVA_DEBUG environment variable
@@ -360,6 +365,29 @@ pub fn merge_splits_impl(split_urls: &[String], output_path: &str, config: &Inte
         }
     };
 
+    // Must happen before temp dirs are dropped.
+    let source_doc_mappings: Vec<Option<String>> = temp_dirs.iter()
+        .map(|td| read_doc_mapping_from_dir(td.path())
+            .unwrap_or_else(|e| {
+                debug_log!("⚠️ DOC_MAPPING: Failed to read _doc_mapping.json from {:?}: {}", td.path(), e);
+                None
+            }))
+        .collect();
+
+    let parsed_subfield_maps: Vec<JsonSubfieldMap> = source_doc_mappings.iter()
+        .filter_map(|opt| opt.as_ref())
+        .map(|dm| extract_json_subfields_from_doc_mapping(dm))
+        .collect();
+    let has_source_doc_mappings = !parsed_subfield_maps.is_empty();
+    let combined_json_subfields = combine_json_subfield_maps(&parsed_subfield_maps);
+
+    if has_source_doc_mappings {
+        debug_log!("📦 DOC_MAPPING: Read _doc_mapping.json from {} of {} input splits, combined {} JSON fields",
+                   parsed_subfield_maps.len(), source_doc_mappings.len(), combined_json_subfields.len());
+    } else {
+        debug_log!("📦 DOC_MAPPING: No _doc_mapping.json found in input splits (legacy splits), will fall back to post-merge discovery");
+    }
+
     // ✅ MEMORY OPTIMIZATION: Early temp directory cleanup
     // Source split temp directories are no longer needed after merge completes
     // The merged data is now in output_temp_dir, so we can free the source temp dirs
@@ -375,17 +403,54 @@ pub fn merge_splits_impl(split_urls: &[String], output_path: &str, config: &Inte
     let merged_directory = MmapDirectory::open(&output_temp_dir)?;
     let tokenizer_manager = get_quickwit_fastfield_normalizer_manager().tantivy_manager();
     let merged_index = open_index(merged_directory, tokenizer_manager)?;
-    let raw_doc_mapping = extract_doc_mapping_from_index(&merged_index)?;
+    let raw_doc_mapping = if has_source_doc_mappings {
+        // Primary path: use pre-read _doc_mapping.json from input splits.
+        // If only some splits had _doc_mapping.json (mixed legacy/modern merge),
+        // supplement with fast-field discovery on the merged index so sub-fields
+        // unique to legacy splits are not lost.
+        let subfields = if parsed_subfield_maps.len() < source_doc_mappings.len() {
+            debug_log!("⚠️ DOC_MAPPING: Only {} of {} splits had _doc_mapping.json — supplementing with fast-field discovery",
+                       parsed_subfield_maps.len(), source_doc_mappings.len());
+            let ff_subfields = discover_json_subfields_from_fast_fields(&merged_index)
+                .unwrap_or_default();
+            combine_json_subfield_maps(&[combined_json_subfields, ff_subfields])
+        } else {
+            combined_json_subfields
+        };
+        extract_doc_mapping_with_json_subfields(&merged_index, &subfields)?
+    } else if is_companion_merge {
+        // Fallback for legacy companion splits without _doc_mapping.json:
+        // discover from fast fields. All JSON fields are fast in companion mode.
+        let json_subfields = discover_json_subfields_from_fast_fields(&merged_index)
+            .map_err(|e| {
+                debug_log!("⚠️ DOC_MAPPING: Fast field discovery failed for legacy companion merge: {}", e);
+                e
+            })?;
+        extract_doc_mapping_with_json_subfields(&merged_index, &json_subfields)?
+    } else {
+        // Fallback for legacy non-companion splits: sample .store
+        extract_doc_mapping_from_index(&merged_index)?
+    };
+    // Persist the raw doc_mapping into the merged output directory so it gets bundled
+    // into the merged split. Future merges read this to recover JSON sub-field metadata.
+    write_doc_mapping_to_dir(&output_temp_dir, &raw_doc_mapping)?;
+
     // For companion splits, promote all fields to fast in the doc mapping so that
     // clients know aggregations are available via parquet transcoding. This matches
     // what the build path (createFromParquet) does. Only apply to companion merges —
     // non-companion splits should report their actual fast field configuration.
     let doc_mapping_json = if is_companion_merge {
-        crate::parquet_companion::schema_derivation::promote_doc_mapping_all_fast(&raw_doc_mapping)
-            .unwrap_or(raw_doc_mapping)
+        match crate::parquet_companion::schema_derivation::promote_doc_mapping_all_fast(&raw_doc_mapping) {
+            Ok(promoted) => promoted,
+            Err(e) => {
+                debug_log!("⚠️ DOC_MAPPING: Failed to promote fields to fast for companion merge: {}. Using unpromoted mapping.", e);
+                raw_doc_mapping
+            }
+        }
     } else {
         raw_doc_mapping
     };
+
     debug_log!("✅ DOCMAPPING EXTRACT: Extracted doc mapping from merged index ({} bytes)", doc_mapping_json.len());
     debug_log!("✅ DOCMAPPING CONTENT: {}", &doc_mapping_json);
 
