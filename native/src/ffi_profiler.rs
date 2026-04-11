@@ -108,9 +108,13 @@ pub enum Section {
 
     // -- FR4 range filter elimination (1) --
     RangeFilterElimination  = 60,
+
+    // -- TxLog parallel improvements (#153) (2) --
+    TxLogCheckpointVerify   = 61,
+    TxLogBackwardProbe      = 62,
 }
 
-pub const NUM_SECTIONS: usize = 61;
+pub const NUM_SECTIONS: usize = 63;
 
 impl Section {
     pub const fn name(self) -> &'static str {
@@ -176,6 +180,8 @@ impl Section {
             Self::TxLogDataSkip          => "txlog_data_skip",
             Self::TxLogArrowExport       => "txlog_arrow_export",
             Self::RangeFilterElimination => "range_filter_elimination",
+            Self::TxLogCheckpointVerify => "txlog_checkpoint_verify",
+            Self::TxLogBackwardProbe    => "txlog_backward_probe",
         }
     }
 
@@ -203,6 +209,7 @@ impl Section {
         Self::TxLogSnapshot, Self::TxLogManifestPrune, Self::TxLogManifestRead,
         Self::TxLogPartitionFilter, Self::TxLogDataSkip, Self::TxLogArrowExport,
         Self::RangeFilterElimination,
+        Self::TxLogCheckpointVerify, Self::TxLogBackwardProbe,
     ];
 }
 
@@ -256,7 +263,7 @@ impl CacheCounter {
 // Compile-time safety: ensure ALL array and enum stay in sync
 // ═══════════════════════════════════════════════════════════════════════
 
-const _: () = assert!(Section::RangeFilterElimination as usize == NUM_SECTIONS - 1,
+const _: () = assert!(Section::TxLogBackwardProbe as usize == NUM_SECTIONS - 1,
     "Section enum last variant must equal NUM_SECTIONS - 1");
 const _: () = assert!(CacheCounter::PqColumnMiss as usize == NUM_CACHE_COUNTERS - 1,
     "CacheCounter enum last variant must equal NUM_CACHE_COUNTERS - 1");

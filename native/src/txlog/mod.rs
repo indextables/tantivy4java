@@ -36,3 +36,5 @@ mod integration_tests;
 mod protocol_regression_tests;
 #[cfg(test)]
 mod purge_tests;
+#[cfg(test)]
+mod parallel_bench_tests;
