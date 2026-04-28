@@ -48,7 +48,7 @@ quickwit-query = { git = "https://github.com/indextables/quickwit", rev = "3026b
 # Additional dependencies
 anyhow = "1.0"
 uuid = { version = "1.0", features = ["v4", "serde"] }
-tokio = { version = "1.45", features = ["full"] }
+tokio = { version = "1.50", features = ["full"] }
 lazy_static = "1.4"
 tempfile = "3"
 postcard = { version = "1.1", features = ["heapless"] }
