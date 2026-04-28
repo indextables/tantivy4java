@@ -7190,7 +7190,7 @@ dependencies = [
  "tantivy-common",
  "tantivy-sstable",
  "tempfile",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
  "time",
  "tokio",
  "url",
