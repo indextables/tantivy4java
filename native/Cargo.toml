@@ -27,7 +27,7 @@ serde_json = "1.0.142"
 crc32fast = "1.5"
 serde_yaml = "0.9"
 base64 = "0.22"
-futures = "0.3.31"
+futures = "0.3.32"
 once_cell = "1.19.0"
 bytesize = "2"
 
@@ -48,7 +48,7 @@ quickwit-query = { git = "https://github.com/indextables/quickwit", rev = "3026b
 # Additional dependencies
 anyhow = "1.0"
 uuid = { version = "1.0", features = ["v4", "serde"] }
-tokio = { version = "1.45", features = ["full"] }
+tokio = { version = "1.50", features = ["full"] }
 lazy_static = "1.4"
 tempfile = "3"
 postcard = { version = "1.1", features = ["heapless"] }
@@ -56,7 +56,7 @@ num_cpus = "1.0"
 memmap2 = "0.9.5"
 stable_deref_trait = "1.2"  # For implementing StableDeref on Mmap wrapper
 libc = "0.2"
-lru = "0.12"  # LRU cache for searcher caching
+lru = "0.16"  # LRU cache for searcher caching
 lz4_flex = "0.11"  # Pure Rust LZ4 for disk cache compression
 fs2 = "0.4"  # Disk space detection for cache auto-sizing
 async-trait = "0.1"  # For Storage trait implementation
@@ -79,9 +79,9 @@ regex = "1"
 
 # Transaction log (Avro state format for indextables txlog)
 apache-avro = { version = "0.21", features = ["zstandard"] }
-sha2 = "0.10"
+sha2 = "0.11"
 flate2 = "1"
-thiserror = "1"
+thiserror = "2"
 parking_lot = "0.12"
 moka = { version = "0.12", features = ["sync"] }
 

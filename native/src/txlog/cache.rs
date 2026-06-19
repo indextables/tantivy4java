@@ -566,6 +566,17 @@ pub fn hash_snapshot_key(checkpoint_version: i64, post_cp_count: usize) -> i64 {
 mod tests {
     use super::*;
 
+    // Tests that touch the process-wide cache registry or the global manifest
+    // cache (especially the destructive `clear_all_caches()`) race with each
+    // other under cargo's parallel test runner. Serialize them on a shared
+    // mutex. `into_inner()` keeps the lock usable after a test panics (a failed
+    // assertion would otherwise poison it and cascade failures into later tests).
+    static GLOBAL_STATE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn lock_global_state() -> std::sync::MutexGuard<'static, ()> {
+        GLOBAL_STATE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     #[test]
     fn test_cache_disabled() {
         let config = CacheConfig { enabled: false, ..Default::default() };
@@ -604,6 +615,7 @@ mod tests {
 
     #[test]
     fn test_global_manifest_cache() {
+        let _guard = lock_global_state();
         let entries = Arc::new(vec![]);
         put_cached_manifest("test-manifest.avro", entries.clone());
         let cached = get_cached_manifest("test-manifest.avro");
@@ -646,6 +658,7 @@ mod tests {
 
     #[test]
     fn test_get_or_create_cache_reuse() {
+        let _guard = lock_global_state();
         let config = CacheConfig { version_ttl: Duration::from_secs(60), ..Default::default() };
         let c1 = get_or_create_cache("test://table1-moka", config.clone());
         let c2 = get_or_create_cache("test://table1-moka", config);
@@ -655,6 +668,7 @@ mod tests {
 
     #[test]
     fn test_invalidate_table_cache() {
+        let _guard = lock_global_state();
         let c = get_or_create_cache("test://table_inv_moka", CacheConfig::default());
         c.put_version(1, vec![]);
         assert!(c.get_version(1).is_some());
@@ -664,6 +678,7 @@ mod tests {
 
     #[test]
     fn test_global_cache_stats() {
+        let _guard = lock_global_state();
         let c = get_or_create_cache("test://table_stats_moka", CacheConfig::default());
         c.get_version(99); // miss
         c.put_version(99, vec![]);
@@ -675,6 +690,7 @@ mod tests {
 
     #[test]
     fn test_clear_all_caches_removes_all_entries() {
+        let _guard = lock_global_state();
         // Populate caches for two distinct tables
         let c1 = get_or_create_cache("test://table_clear1_moka", CacheConfig::default());
         let c2 = get_or_create_cache("test://table_clear2_moka", CacheConfig::default());
@@ -698,6 +714,7 @@ mod tests {
 
     #[test]
     fn test_clear_all_caches_then_repopulate() {
+        let _guard = lock_global_state();
         // Verify the registry is usable after a global clear
         clear_all_caches();
 
