@@ -47,7 +47,7 @@
         <maven.compiler.target>11</maven.compiler.target> -->
         <maven.compiler.release>11</maven.compiler.release>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
-        <junit.version>6.0.3</junit.version>
+        <junit.version>5.12.2</junit.version>
         <rust.target.dir>${project.build.directory}/rust</rust.target.dir>
         <!-- Empty by default; the jdk17plus profile sets this for Java 17+ -->
         <surefire.argLine></surefire.argLine>
