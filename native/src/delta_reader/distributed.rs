@@ -57,10 +57,11 @@ pub struct DeltaLogChanges {
 }
 
 /// Parsed _last_checkpoint JSON content.
+/// (The spec's `size` field — checkpoint action count — is not parsed because
+/// nothing consumes it.)
 #[derive(Debug, Clone)]
 struct LastCheckpointInfo {
     version: u64,
-    size: u64,
     parts: Option<u64>,
     num_of_add_files: Option<u64>,
 }
@@ -104,12 +105,58 @@ pub fn get_snapshot_info(
         );
 
         // Step 2: Construct checkpoint part paths
-        let checkpoint_part_paths =
+        let mut checkpoint_version = checkpoint_info.version;
+        let mut checkpoint_part_paths =
             construct_checkpoint_paths(checkpoint_info.version, checkpoint_info.parts);
 
         // Step 3: List post-checkpoint commit files
-        let commit_file_paths =
-            list_commit_files_after(&store, &log_prefix, checkpoint_info.version).await?;
+        let mut commit_file_paths =
+            list_commit_files_after(&store, &log_prefix, checkpoint_version).await?;
+
+        // Step 3b: Guard against a stale _last_checkpoint. If a newer
+        // checkpoint exists and log cleanup removed the commit JSONs between
+        // the stale one and it, the sequential probe above stopped early and
+        // this snapshot would silently be outdated.
+        let probed_version = checkpoint_version + commit_file_paths.len() as u64;
+        let markers = find_log_markers_after(&store, &log_prefix, probed_version).await?;
+        if let Some((newer_cp_version, newer_cp_files)) = markers.newest_checkpoint {
+            debug_println!(
+                "🔧 DELTA_DIST: _last_checkpoint is stale (points at {}, newest checkpoint is {})",
+                checkpoint_version, newer_cp_version
+            );
+            checkpoint_version = newer_cp_version;
+            checkpoint_part_paths = newer_cp_files;
+            commit_file_paths =
+                list_commit_files_after(&store, &log_prefix, checkpoint_version).await?;
+
+            // The same staleness scan may also have observed a commit JSON
+            // version beyond what the sequential probe from the newly-adopted
+            // checkpoint reached — i.e. a second, deeper gap. Don't silently
+            // drop that information; fail loudly instead of returning a
+            // snapshot that is still stale.
+            let reached_version = checkpoint_version + commit_file_paths.len() as u64;
+            if let Some(max_commit) = markers.max_commit_version {
+                if max_commit > reached_version {
+                    anyhow::bail!(
+                        "Delta log is not contiguous: commit version {} exists but versions after {} \
+                         are missing, and the newest checkpoint found ({}) does not cover the gap",
+                        max_commit,
+                        reached_version,
+                        newer_cp_version
+                    );
+                }
+            }
+        } else if let Some(max_commit) = markers.max_commit_version {
+            // Commits exist beyond a gap with no covering checkpoint — the
+            // contiguous chain is broken (cleanup/corruption); fail loudly
+            // rather than silently returning an old snapshot.
+            anyhow::bail!(
+                "Delta log is not contiguous: commit version {} exists but versions after {} \
+                 are missing and no newer checkpoint covers the gap",
+                max_commit,
+                probed_version
+            );
+        }
 
         debug_println!(
             "🔧 DELTA_DIST: {} checkpoint parts, {} post-checkpoint commits",
@@ -117,11 +164,67 @@ pub fn get_snapshot_info(
             commit_file_paths.len()
         );
 
-        // Step 4: Read schema from first checkpoint part
-        let first_part = &checkpoint_part_paths[0];
-        let first_part_obj_path = make_log_path(&log_prefix, first_part);
-        let (schema_json, partition_columns) =
-            read_metadata_from_checkpoint(&store, &first_part_obj_path).await?;
+        // Step 4: Read metaData + protocol, scanning checkpoint parts in
+        // order — the Delta protocol does not guarantee which part of a
+        // multi-part checkpoint contains these action rows.
+        let mut metadata: Option<CheckpointMetadata> = None;
+        let mut protocol: Option<ProtocolInfo> = None;
+        for part in &checkpoint_part_paths {
+            let part_obj_path = make_log_path(&log_prefix, part);
+            let (m, p) = read_metadata_from_checkpoint(&store, &part_obj_path).await?;
+            if metadata.is_none() {
+                metadata = m;
+            }
+            if protocol.is_none() {
+                protocol = p;
+            }
+            if metadata.is_some() && protocol.is_some() {
+                break;
+            }
+        }
+        let metadata = metadata.ok_or_else(|| {
+            anyhow::anyhow!(
+                "No metaData row found in any part of checkpoint version {} for table {}",
+                checkpoint_version,
+                url_str
+            )
+        })?;
+
+        // Step 4b: Reject tables whose reader requirements this reader does
+        // not implement (v2 checkpoints, unknown future features, id-mode
+        // column mapping) instead of failing confusingly or returning wrong
+        // results later.
+        //
+        // A checkpoint is a full state snapshot, so — like `metaData` — the
+        // `protocol` action must be present in every checkpoint (it is a
+        // Delta protocol requirement, not optional). Treat a missing row as
+        // a hard error rather than silently skipping reader-feature
+        // validation: doing so would defeat H4 for exactly the malformed or
+        // unsupported checkpoints it exists to catch, with no error and no
+        // visible warning in production (debug_println! is a no-op unless
+        // TANTIVY4JAVA_DEBUG=1 is set).
+        let protocol = protocol.ok_or_else(|| {
+            anyhow::anyhow!(
+                "No protocol row found in any part of checkpoint version {} for table {}",
+                checkpoint_version,
+                url_str
+            )
+        })?;
+        validate_protocol(&protocol)?;
+        let column_mapping_mode = metadata
+            .configuration
+            .get("delta.columnMapping.mode")
+            .map(|s| s.as_str())
+            .unwrap_or("none");
+        if column_mapping_mode == "id" {
+            anyhow::bail!(
+                "Unsupported Delta table: column mapping mode 'id' is not implemented \
+                 (only 'name' and 'none' are supported)"
+            );
+        }
+
+        let schema_json = metadata.schema_json;
+        let partition_columns = metadata.partition_columns;
 
         // Step 5: Build column mapping and translate partition column names
         let column_mapping = build_column_mapping(&schema_json);
@@ -140,13 +243,21 @@ pub fn get_snapshot_info(
             partition_columns
         );
 
+        // numOfAddFiles from _last_checkpoint only describes the checkpoint it
+        // points at — drop it if the stale-checkpoint guard switched to a newer one
+        let num_add_files = if checkpoint_version == checkpoint_info.version {
+            checkpoint_info.num_of_add_files
+        } else {
+            None
+        };
+
         Ok(DeltaSnapshotInfo {
-            version: checkpoint_info.version,
+            version: checkpoint_version,
             schema_json,
             partition_columns,
             checkpoint_part_paths,
             commit_file_paths,
-            num_add_files: checkpoint_info.num_of_add_files,
+            num_add_files,
             column_mapping,
         })
     })
@@ -262,7 +373,44 @@ pub fn get_current_version(
         };
 
         let commit_files = list_commit_files_after(&store, &log_prefix, base_version).await?;
-        let current_version = base_version + commit_files.len() as u64;
+        let mut current_version = base_version + commit_files.len() as u64;
+
+        // Stale-_last_checkpoint guard: if a newer checkpoint exists past the
+        // contiguous commit chain (log cleanup removed the commits in
+        // between), continue probing from it instead of silently returning
+        // the old version.
+        let markers = find_log_markers_after(&store, &log_prefix, current_version).await?;
+        if let Some((newer_cp_version, _)) = markers.newest_checkpoint {
+            let newer_commits =
+                list_commit_files_after(&store, &log_prefix, newer_cp_version).await?;
+            debug_println!(
+                "🔧 DELTA_DIST: _last_checkpoint is stale (probe reached {}, newest checkpoint is {})",
+                current_version, newer_cp_version
+            );
+            current_version = newer_cp_version + newer_commits.len() as u64;
+
+            // Guard against a second, deeper gap: the same staleness scan may
+            // have observed a commit JSON version beyond what the sequential
+            // probe from the newly-adopted checkpoint reached.
+            if let Some(max_commit) = markers.max_commit_version {
+                if max_commit > current_version {
+                    anyhow::bail!(
+                        "Delta log is not contiguous: commit version {} exists but versions after {} \
+                         are missing, and the newest checkpoint found ({}) does not cover the gap",
+                        max_commit,
+                        current_version,
+                        newer_cp_version
+                    );
+                }
+            }
+        } else if let Some(max_commit) = markers.max_commit_version {
+            anyhow::bail!(
+                "Delta log is not contiguous: commit version {} exists but versions after {} \
+                 are missing and no newer checkpoint covers the gap",
+                max_commit,
+                current_version
+            );
+        }
 
         debug_println!(
             "🔧 DELTA_DIST: Current version={} (checkpoint={}, +{} commits)",
@@ -336,13 +484,11 @@ fn parse_last_checkpoint(json_str: &str) -> Result<LastCheckpointInfo> {
     let version = v["version"]
         .as_u64()
         .ok_or_else(|| anyhow::anyhow!("_last_checkpoint missing 'version' field"))?;
-    let size = v["size"].as_u64().unwrap_or(0);
     let parts = v["parts"].as_u64();
     let num_of_add_files = v["numOfAddFiles"].as_u64();
 
     Ok(LastCheckpointInfo {
         version,
-        size,
         parts,
         num_of_add_files,
     })
@@ -408,6 +554,69 @@ async fn list_commit_files_after(
     Ok(commit_files)
 }
 
+/// Newer log markers found past the sequentially-probed version (see
+/// `find_log_markers_after`).
+#[derive(Debug, Default)]
+struct NewerLogMarkers {
+    /// Highest checkpoint version found, with its actual file names
+    newest_checkpoint: Option<(u64, Vec<String>)>,
+    /// Highest commit JSON version found
+    max_commit_version: Option<u64>,
+}
+
+/// Guard against a stale `_last_checkpoint`: one LIST bounded by an offset key
+/// so only objects sorting after `{after_version:020}.json` are returned
+/// (normally zero). The Delta spec allows `_last_checkpoint` to lag behind the
+/// newest checkpoint; if log cleanup then removes the commit JSONs in between,
+/// the sequential HEAD probe stops early and would silently report an old
+/// version. This detects any newer checkpoint/commit markers.
+async fn find_log_markers_after(
+    store: &Arc<dyn ObjectStore>,
+    log_prefix: &str,
+    after_version: u64,
+) -> Result<NewerLogMarkers> {
+    use futures::TryStreamExt;
+
+    let prefix = ObjectPath::from(log_prefix.to_string());
+    let offset = make_log_path(log_prefix, &format!("{:020}.json", after_version));
+
+    let mut markers = NewerLogMarkers::default();
+    let mut checkpoint_files: HashMap<u64, Vec<String>> = HashMap::new();
+
+    let mut stream = store.list_with_offset(Some(&prefix), &offset);
+    while let Some(meta) = stream.try_next().await.map_err(|e| {
+        anyhow::anyhow!("Failed to list {} for staleness check: {}", log_prefix, e)
+    })? {
+        let name = match meta.location.filename() {
+            Some(n) => n,
+            None => continue,
+        };
+        if name.len() < 20 {
+            continue;
+        }
+        let version = match name[..20].parse::<u64>() {
+            Ok(v) => v,
+            Err(_) => continue, // _last_checkpoint, _sidecars/, etc.
+        };
+        if version <= after_version {
+            continue;
+        }
+        if name.ends_with(".json") {
+            markers.max_commit_version = markers.max_commit_version.max(Some(version));
+        } else if name.contains(".checkpoint.") && name.ends_with(".parquet") {
+            checkpoint_files.entry(version).or_default().push(name.to_string());
+        }
+    }
+
+    if let Some((&version, _)) = checkpoint_files.iter().max_by_key(|(v, _)| **v) {
+        let mut files = checkpoint_files.remove(&version).unwrap_or_default();
+        files.sort();
+        markers.newest_checkpoint = Some((version, files));
+    }
+
+    Ok(markers)
+}
+
 /// Find the current version of a table that has no _last_checkpoint.
 ///
 /// Checks if version 0 exists, then counts how many sequential versions follow.
@@ -428,11 +637,80 @@ async fn find_latest_version_from_zero(
     }
 }
 
-/// Read metaData from the first checkpoint part (column-projected, single row).
+/// Table metadata extracted from a checkpoint's `metaData` action row.
+#[derive(Debug, Clone)]
+struct CheckpointMetadata {
+    schema_json: String,
+    partition_columns: Vec<String>,
+    /// Table configuration (delta.columnMapping.mode etc.)
+    configuration: HashMap<String, String>,
+}
+
+/// Protocol information extracted from a checkpoint's `protocol` action row.
+#[derive(Debug, Clone)]
+struct ProtocolInfo {
+    min_reader_version: i64,
+    reader_features: Vec<String>,
+}
+
+/// Reader features this hand-rolled distributed reader actually implements.
+///
+/// - `columnMapping`: name mode only (id mode is rejected via table
+///   configuration in `get_snapshot_info`)
+/// - `deletionVectors`: DVs are not applied, but `has_deletion_vector` is
+///   surfaced on every entry (including compact mode) so consumers can act
+/// - `timestampNtz` / `variantType-preview` style type features only affect
+///   how consumers read the data files, not the log — accept the common ones
+///   that require no log-format changes
+/// - `v2Checkpoint` is intentionally absent: checkpoint files would be
+///   UUID-named with sidecar actions, which construct_checkpoint_paths does
+///   not understand
+const SUPPORTED_READER_FEATURES: &[&str] = &[
+    "columnMapping",
+    "deletionVectors",
+    "timestampNtz",
+    "vacuumProtocolCheck",
+];
+
+/// Validate a table's protocol against what this reader implements.
+///
+/// Converts silent/confusing failures on unsupported tables (v2 checkpoints,
+/// future reader features) into a clear error. The non-distributed
+/// list_delta_files path is protected by delta-kernel's own protocol check.
+fn validate_protocol(protocol: &ProtocolInfo) -> Result<()> {
+    if protocol.min_reader_version > 3 {
+        anyhow::bail!(
+            "Unsupported Delta table: minReaderVersion {} exceeds the maximum supported (3)",
+            protocol.min_reader_version
+        );
+    }
+    let unsupported: Vec<&str> = protocol
+        .reader_features
+        .iter()
+        .map(|s| s.as_str())
+        .filter(|f| !SUPPORTED_READER_FEATURES.contains(f))
+        .collect();
+    if !unsupported.is_empty() {
+        anyhow::bail!(
+            "Unsupported Delta reader feature(s) {:?}: this table requires reader capabilities \
+             the distributed reader does not implement (supported: {:?})",
+            unsupported,
+            SUPPORTED_READER_FEATURES
+        );
+    }
+    Ok(())
+}
+
+/// Read the `metaData` and `protocol` action rows from one checkpoint part
+/// (column-projected).
+///
+/// Returns `Ok((None, None))` when this part contains neither action — for
+/// multi-part checkpoints the Delta protocol does not guarantee which part
+/// holds them, so the caller must scan subsequent parts.
 async fn read_metadata_from_checkpoint(
     store: &Arc<dyn ObjectStore>,
     checkpoint_path: &ObjectPath,
-) -> Result<(String, Vec<String>)> {
+) -> Result<(Option<CheckpointMetadata>, Option<ProtocolInfo>)> {
     use parquet::arrow::async_reader::ParquetObjectReader;
     use parquet::arrow::ParquetRecordBatchStreamBuilder;
     use arrow_array::cast::AsArray;
@@ -447,49 +725,106 @@ async fn read_metadata_from_checkpoint(
     let builder = ParquetRecordBatchStreamBuilder::new(reader).await?;
     let arrow_schema = builder.schema().clone();
 
-    // Find the metaData column index
+    // Locate metaData/protocol columns; either may be absent from a part's
+    // schema (not an error — the actions can live in another part)
     let metadata_idx = arrow_schema
         .fields()
         .iter()
-        .position(|f| f.name() == "metaData")
-        .ok_or_else(|| anyhow::anyhow!("Checkpoint parquet has no 'metaData' column"))?;
+        .position(|f| f.name() == "metaData");
+    let protocol_idx = arrow_schema
+        .fields()
+        .iter()
+        .position(|f| f.name() == "protocol");
 
-    // Project only metaData column
+    let mut projected: Vec<usize> = [metadata_idx, protocol_idx].iter().flatten().copied().collect();
+    if projected.is_empty() {
+        return Ok((None, None));
+    }
+    // ProjectionMask::roots() returns columns in ascending physical schema
+    // order regardless of the order indices are passed in, so the projected
+    // batch's column order must be derived from `projected` sorted ascending
+    // (NOT assumed to be metaData-then-protocol — the Delta spec does not
+    // guarantee action-column ordering in a checkpoint part's schema).
+    projected.sort_unstable();
+
     let mask = parquet::arrow::ProjectionMask::roots(
         builder.parquet_schema(),
-        std::iter::once(metadata_idx),
+        projected.iter().copied(),
     );
 
     let mut stream = builder.with_projection(mask).build()?;
 
+    let mut found_meta: Option<CheckpointMetadata> = None;
+    let mut found_protocol: Option<ProtocolInfo> = None;
+
     while let Some(batch_result) = stream.next().await {
         let batch = batch_result?;
-        let metadata_col = batch.column(0);
 
-        // metaData is a struct column — find non-null rows
-        let struct_array = metadata_col.as_struct();
+        let meta_col = metadata_idx.and_then(|idx| {
+            projected
+                .iter()
+                .position(|&p| p == idx)
+                .map(|pos| batch.column(pos).clone())
+        });
+        let proto_col = protocol_idx.and_then(|idx| {
+            projected
+                .iter()
+                .position(|&p| p == idx)
+                .map(|pos| batch.column(pos).clone())
+        });
 
-        for row in 0..struct_array.len() {
-            if struct_array.is_null(row) {
-                continue;
+        if let (None, Some(col)) = (&found_meta, &meta_col) {
+            let struct_array = col.as_struct();
+            for row in 0..struct_array.len() {
+                if struct_array.is_null(row) {
+                    continue;
+                }
+                let schema_json = extract_struct_string_field(struct_array, "schemaString", row)
+                    .unwrap_or_default();
+                if schema_json.is_empty() {
+                    continue;
+                }
+                let partition_columns =
+                    extract_struct_string_list_field(struct_array, "partitionColumns", row)
+                        .unwrap_or_default();
+                let configuration =
+                    extract_struct_string_map_field(struct_array, "configuration", row);
+                found_meta = Some(CheckpointMetadata {
+                    schema_json,
+                    partition_columns,
+                    configuration,
+                });
+                break;
             }
+        }
 
-            // Extract schemaString and partitionColumns from the struct
-            let schema_json = extract_struct_string_field(struct_array, "schemaString", row)
-                .unwrap_or_default();
-            let partition_columns = extract_struct_string_list_field(struct_array, "partitionColumns", row)
-                .unwrap_or_default();
-
-            if !schema_json.is_empty() {
-                return Ok((schema_json, partition_columns));
+        if let (None, Some(col)) = (&found_protocol, &proto_col) {
+            let struct_array = col.as_struct();
+            for row in 0..struct_array.len() {
+                if struct_array.is_null(row) {
+                    continue;
+                }
+                let min_reader_version =
+                    extract_struct_i64_field(struct_array, "minReaderVersion", row)
+                        .or_else(|| extract_struct_i32_field(struct_array, "minReaderVersion", row))
+                        .unwrap_or(1);
+                let reader_features =
+                    extract_struct_string_list_field(struct_array, "readerFeatures", row)
+                        .unwrap_or_default();
+                found_protocol = Some(ProtocolInfo {
+                    min_reader_version,
+                    reader_features,
+                });
+                break;
             }
+        }
+
+        if found_meta.is_some() && found_protocol.is_some() {
+            break;
         }
     }
 
-    Err(anyhow::anyhow!(
-        "No metaData row found in checkpoint {}",
-        checkpoint_path
-    ))
+    Ok((found_meta, found_protocol))
 }
 
 /// Read one checkpoint parquet part and extract add file entries.
@@ -562,7 +897,8 @@ fn extract_add_files_from_batch(
             continue;
         }
 
-        let size = extract_struct_i64_field(struct_array, "size", row).unwrap_or(0);
+        // -1 = unknown (0 is a legal file size), matching num_records' sentinel
+        let size = extract_struct_i64_field(struct_array, "size", row).unwrap_or(-1);
         let modification_time =
             extract_struct_i64_field(struct_array, "modificationTime", row).unwrap_or(0);
 
@@ -610,21 +946,39 @@ async fn read_post_checkpoint_changes_async(
 
     for commit_file in &sorted_paths {
         let path = make_log_path(log_prefix, commit_file);
-        let result = store.get(&path).await
-            .map_err(|e| anyhow::anyhow!("Failed to read commit {}: {}", commit_file, e))?;
+        let result = match store.get(&path).await {
+            Ok(r) => r,
+            Err(object_store::Error::NotFound { .. }) => {
+                return Err(anyhow::anyhow!(
+                    "Commit file {} not found — the requested version may exceed the table's \
+                     latest version, or the commit has been removed by log cleanup",
+                    commit_file
+                ));
+            }
+            Err(e) => {
+                return Err(anyhow::anyhow!("Failed to read commit {}: {}", commit_file, e));
+            }
+        };
         let bytes = result.bytes().await?;
         let text = std::str::from_utf8(&bytes)?;
 
-        for line in text.lines() {
+        for (line_no, line) in text.lines().enumerate() {
             let line = line.trim();
             if line.is_empty() {
                 continue;
             }
 
-            let v: serde_json::Value = match serde_json::from_str(line) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
+            // A malformed non-empty line means a truncated/corrupted commit
+            // (partial upload, torn write). Skipping it would silently
+            // produce an incomplete file list, so fail the whole call.
+            let v: serde_json::Value = serde_json::from_str(line).map_err(|e| {
+                anyhow::anyhow!(
+                    "Malformed JSON at line {} of commit {}: {}",
+                    line_no + 1,
+                    commit_file,
+                    e
+                )
+            })?;
 
             if let Some(add) = v.get("add") {
                 let file_path = add["path"].as_str().unwrap_or_default().to_string();
@@ -634,7 +988,8 @@ async fn read_post_checkpoint_changes_async(
 
                 let entry = DeltaFileEntry {
                     path: file_path.clone(),
-                    size: add["size"].as_i64().unwrap_or(0),
+                    // -1 = unknown (0 is a legal file size)
+                    size: add["size"].as_i64().unwrap_or(-1),
                     modification_time: add["modificationTime"].as_i64().unwrap_or(0),
                     num_records: add["stats"]
                         .as_str()
@@ -678,8 +1033,6 @@ fn extract_struct_string_field(
     field_name: &str,
     row: usize,
 ) -> Option<String> {
-    use arrow_array::cast::AsArray;
-
     let col_idx = struct_array
         .fields()
         .iter()
@@ -720,6 +1073,52 @@ fn extract_struct_i64_field(
         Some(arr.value(row))
     } else {
         None
+    }
+}
+
+/// Extract an i32 field from a StructArray at the given row (as i64).
+fn extract_struct_i32_field(
+    struct_array: &arrow_array::StructArray,
+    field_name: &str,
+    row: usize,
+) -> Option<i64> {
+    let col_idx = struct_array
+        .fields()
+        .iter()
+        .position(|f| f.name() == field_name)?;
+    let col = struct_array.column(col_idx);
+
+    if col.is_null(row) {
+        return None;
+    }
+
+    col.as_any()
+        .downcast_ref::<arrow_array::Int32Array>()
+        .map(|arr| arr.value(row) as i64)
+}
+
+/// Extract a string→string map field from a StructArray (e.g. metaData.configuration).
+fn extract_struct_string_map_field(
+    struct_array: &arrow_array::StructArray,
+    field_name: &str,
+    row: usize,
+) -> HashMap<String, String> {
+    let col_idx = match struct_array
+        .fields()
+        .iter()
+        .position(|f| f.name() == field_name)
+    {
+        Some(i) => i,
+        None => return HashMap::new(),
+    };
+    let col = struct_array.column(col_idx);
+    if col.is_null(row) {
+        return HashMap::new();
+    }
+    if let Some(map_arr) = col.as_any().downcast_ref::<arrow_array::MapArray>() {
+        parse_map_array(map_arr, row)
+    } else {
+        HashMap::new()
     }
 }
 
@@ -924,9 +1323,13 @@ pub fn parse_column_mapping_json(json: Option<&str>) -> HashMap<String, String> 
 // ─── Path helpers ───────────────────────────────────────────────────────────
 
 /// Get the _delta_log prefix for an object store path.
+///
+/// `Url::path()` is percent-encoded and `ObjectPath::from` does not decode,
+/// so decode first — otherwise table paths containing spaces/unicode would
+/// resolve to the wrong object keys.
 fn delta_log_prefix(url: &Url) -> String {
-    let path = url.path();
-    let path = path.strip_prefix('/').unwrap_or(path);
+    let path = crate::common::percent_decode(url.path());
+    let path = path.strip_prefix('/').unwrap_or(&path);
     let path = path.strip_suffix('/').unwrap_or(path);
     if path.is_empty() {
         "_delta_log".to_string()
@@ -1061,7 +1464,6 @@ mod tests {
         let json = r#"{"version":94320,"size":61126995,"parts":1123,"numOfAddFiles":61126995}"#;
         let info = parse_last_checkpoint(json).unwrap();
         assert_eq!(info.version, 94320);
-        assert_eq!(info.size, 61126995);
         assert_eq!(info.parts, Some(1123));
         assert_eq!(info.num_of_add_files, Some(61126995));
     }
@@ -1071,9 +1473,55 @@ mod tests {
         let json = r#"{"version":100,"size":5000}"#;
         let info = parse_last_checkpoint(json).unwrap();
         assert_eq!(info.version, 100);
-        assert_eq!(info.size, 5000);
         assert_eq!(info.parts, None);
         assert_eq!(info.num_of_add_files, None);
+    }
+
+    #[test]
+    fn test_validate_protocol_basic_versions() {
+        // Reader versions 1-2 without features are fine
+        assert!(validate_protocol(&ProtocolInfo {
+            min_reader_version: 1,
+            reader_features: vec![],
+        })
+        .is_ok());
+        assert!(validate_protocol(&ProtocolInfo {
+            min_reader_version: 2,
+            reader_features: vec![],
+        })
+        .is_ok());
+    }
+
+    #[test]
+    fn test_validate_protocol_supported_features() {
+        assert!(validate_protocol(&ProtocolInfo {
+            min_reader_version: 3,
+            reader_features: vec![
+                "columnMapping".to_string(),
+                "deletionVectors".to_string(),
+                "timestampNtz".to_string(),
+            ],
+        })
+        .is_ok());
+    }
+
+    #[test]
+    fn test_validate_protocol_rejects_v2_checkpoint() {
+        let err = validate_protocol(&ProtocolInfo {
+            min_reader_version: 3,
+            reader_features: vec!["v2Checkpoint".to_string()],
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("v2Checkpoint"), "{}", err);
+    }
+
+    #[test]
+    fn test_validate_protocol_rejects_future_reader_version() {
+        assert!(validate_protocol(&ProtocolInfo {
+            min_reader_version: 4,
+            reader_features: vec![],
+        })
+        .is_err());
     }
 
     #[test]
@@ -1146,6 +1594,16 @@ mod tests {
 
         let url = Url::parse("file:///tmp/my_table/").unwrap();
         assert_eq!(delta_log_prefix(&url), "tmp/my_table/_delta_log");
+    }
+
+    #[test]
+    fn test_delta_log_prefix_percent_encoded_path() {
+        // Url::path() percent-encodes; the object key must be the decoded form
+        let url = Url::parse("file:///tmp/my table/").unwrap();
+        assert_eq!(delta_log_prefix(&url), "tmp/my table/_delta_log");
+
+        let url = Url::parse("s3://bucket/path/caf%C3%A9/table/").unwrap();
+        assert_eq!(delta_log_prefix(&url), "path/café/table/_delta_log");
     }
 
     #[test]
@@ -1226,7 +1684,7 @@ mod tests {
         adds: &[(&str, i64, i64, i64)], // (path, size, mod_time, num_records)
     ) {
         use arrow_array::{
-            builder::{StringBuilder, Int64Builder, BooleanBuilder, MapBuilder},
+            builder::{StringBuilder, Int64Builder, MapBuilder},
             StructArray, RecordBatch,
         };
         use arrow_schema::{DataType, Field, Fields, Schema};
@@ -1279,6 +1737,45 @@ mod tests {
                 Arc::new(partition_list_builder.finish()),
             ],
             Some(metadata_nulls),
+        );
+
+        // protocol struct fields — present at row 0 alongside metaData, like a
+        // real checkpoint (both are singleton state rows read via the same
+        // column-projected scan in `read_metadata_from_checkpoint`).
+        let protocol_fields = Fields::from(vec![
+            Field::new("minReaderVersion", DataType::Int64, true),
+            Field::new(
+                "readerFeatures",
+                DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+                true,
+            ),
+        ]);
+
+        let mut min_reader_version_builder = Int64Builder::new();
+        let mut reader_features_builder = arrow_array::builder::ListBuilder::new(StringBuilder::new());
+
+        // Row 0: protocol row (minReaderVersion=1, no reader features)
+        min_reader_version_builder.append_value(1);
+        reader_features_builder.append(true);
+
+        for _ in 0..adds.len() {
+            min_reader_version_builder.append_null();
+            reader_features_builder.append(false);
+        }
+
+        let protocol_nulls = {
+            let mut bools = vec![false; num_rows];
+            bools[0] = true; // only row 0 (protocol) is non-null
+            arrow::buffer::NullBuffer::from(bools.as_slice())
+        };
+
+        let protocol_struct = StructArray::new(
+            protocol_fields,
+            vec![
+                Arc::new(min_reader_version_builder.finish()),
+                Arc::new(reader_features_builder.finish()),
+            ],
+            Some(protocol_nulls),
         );
 
         // add struct fields
@@ -1351,11 +1848,16 @@ mod tests {
             Some(add_nulls),
         );
 
-        // Create the RecordBatch with both columns
+        // Create the RecordBatch with all columns
         let schema = Arc::new(Schema::new(vec![
             Field::new(
                 "metaData",
                 DataType::Struct(metadata_struct.fields().clone()),
+                true,
+            ),
+            Field::new(
+                "protocol",
+                DataType::Struct(protocol_struct.fields().clone()),
                 true,
             ),
             Field::new(
@@ -1369,6 +1871,7 @@ mod tests {
             schema.clone(),
             vec![
                 Arc::new(metadata_struct),
+                Arc::new(protocol_struct),
                 Arc::new(add_struct),
             ],
         )

@@ -16,7 +16,7 @@ use iceberg::TableIdent;
 use crate::debug_println;
 use super::catalog::create_catalog;
 use super::scan::{
-    parse_namespace, format_to_string, content_type_to_string, literal_to_string,
+    parse_namespace, format_to_string, content_type_to_string, literal_to_string_typed,
     IcebergFileEntry,
 };
 
@@ -129,6 +129,7 @@ pub fn get_current_iceberg_snapshot_id(
 pub fn read_iceberg_manifest(
     config: &HashMap<String, String>,
     manifest_path: &str,
+    inherited_snapshot_id: Option<i64>,
 ) -> Result<Vec<IcebergFileEntry>> {
     debug_println!(
         "🔧 ICEBERG_DIST: read_manifest path={}",
@@ -142,16 +143,51 @@ pub fn read_iceberg_manifest(
 
     rt.block_on(async {
         // Build FileIO directly from config properties — no catalog or table load needed.
-        // The config map already contains the storage credential keys (s3.access-key-id,
-        // s3.secret-access-key, s3.region, adls.account-name, etc.) that FileIO needs.
+        // Catalog-style credential keys (aws_access_key_id, region_name, ...) are
+        // translated to the FileIO keys (s3.access-key-id, s3.region, ...) that this
+        // path understands; FileIO-style keys pass through unchanged.
+        //
+        // NOTE: catalogs that vend per-table storage credentials at load_table time
+        // (REST catalogs with credential vending, e.g. Unity Catalog) cannot be
+        // supported by this direct path — use the catalog-based listFiles() instead.
+        let props = translate_to_file_io_props(config);
         let file_io = FileIO::from_path(manifest_path)
             .map_err(|e| anyhow::anyhow!("Failed to create FileIO for {}: {}", manifest_path, e))?
-            .with_props(config.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+            .with_props(props.iter().map(|(k, v)| (k.as_str(), v.as_str())))
             .build()
             .map_err(|e| anyhow::anyhow!("Failed to build FileIO: {}", e))?;
 
-        read_manifest_with_file_io(&file_io, manifest_path).await
+        read_manifest_with_file_io(&file_io, manifest_path, inherited_snapshot_id).await
     })
+}
+
+/// Translate catalog-style config keys to FileIO property keys so executor-side
+/// manifest reads authenticate the same way the driver-side catalog path does.
+///
+/// Keys already in FileIO form (s3.*, adls.*, gcs.*) are passed through
+/// unchanged and take precedence over translated catalog-style keys.
+fn translate_to_file_io_props(config: &HashMap<String, String>) -> HashMap<String, String> {
+    // (catalog-style key, FileIO key)
+    const KEY_MAP: &[(&str, &str)] = &[
+        ("aws_access_key_id", "s3.access-key-id"),
+        ("aws_secret_access_key", "s3.secret-access-key"),
+        ("aws_session_token", "s3.session-token"),
+        ("region_name", "s3.region"),
+        ("s3_endpoint", "s3.endpoint"),
+    ];
+
+    let mut props: HashMap<String, String> = HashMap::new();
+    for (catalog_key, file_io_key) in KEY_MAP {
+        if let Some(v) = config.get(*catalog_key) {
+            props.insert(file_io_key.to_string(), v.clone());
+        }
+    }
+    // Pass-through (and override) with any keys the caller already provided
+    // in FileIO form, plus everything else FileIO might understand.
+    for (k, v) in config {
+        props.insert(k.clone(), v.clone());
+    }
+    props
 }
 
 // ─── Internal async functions ───────────────────────────────────────────────
@@ -181,11 +217,17 @@ pub(crate) async fn get_snapshot_info_with_catalog(
     };
     let actual_snap_id = snapshot.snapshot_id();
 
-    // Get schema JSON
+    // Get schema JSON. A snapshot whose schema_id no longer resolves must NOT
+    // silently fall back to current_schema(): for time-travel reads that could
+    // return a schema that doesn't match the snapshot's data.
     let schema = match snapshot.schema_id() {
-        Some(schema_id) => metadata
-            .schema_by_id(schema_id)
-            .unwrap_or_else(|| metadata.current_schema()),
+        Some(schema_id) => metadata.schema_by_id(schema_id).ok_or_else(|| {
+            anyhow::anyhow!(
+                "Snapshot {} references schema_id {} which does not exist in table metadata",
+                actual_snap_id,
+                schema_id
+            )
+        })?,
         None => metadata.current_schema(),
     };
     let schema_json = serde_json::to_string(schema.as_ref())
@@ -232,9 +274,18 @@ pub(crate) async fn get_snapshot_info_with_catalog(
 }
 
 /// Read one manifest file using a FileIO instance.
+///
+/// `inherited_snapshot_id`, when provided, is used as the Iceberg-spec
+/// "inherited snapshot id" fallback for manifest entries whose own
+/// `snapshot_id` is absent — mirroring `list_files_with_catalog`'s use of
+/// `manifest_file.added_snapshot_id`. Callers with manifest-list context
+/// (e.g. `getChangesSince`, which already has `ManifestFileInfo::added_snapshot_id`
+/// for each manifest it reads) should pass it through so this path resolves
+/// to the same value as the catalog-based listing path instead of `-1`.
 async fn read_manifest_with_file_io(
     file_io: &FileIO,
     manifest_path: &str,
+    inherited_snapshot_id: Option<i64>,
 ) -> Result<Vec<IcebergFileEntry>> {
     let manifest_input = file_io.new_input(manifest_path)
         .map_err(|e| anyhow::anyhow!("Failed to open manifest {}: {}", manifest_path, e))?;
@@ -245,6 +296,9 @@ async fn read_manifest_with_file_io(
         .map_err(|e| anyhow::anyhow!("Failed to parse manifest: {}", e))?;
 
     let manifest_partition_spec = manifest.metadata().partition_spec();
+    let partition_type = manifest_partition_spec
+        .partition_type(manifest.metadata().schema())
+        .ok();
     let mut entries = Vec::new();
 
     for entry in manifest.entries() {
@@ -258,9 +312,13 @@ async fn read_manifest_with_file_io(
         let partition_fields = data_file.partition().fields();
         for (idx, spec_field) in manifest_partition_spec.fields().iter().enumerate() {
             if let Some(Some(literal)) = partition_fields.get(idx) {
+                let field_type = partition_type
+                    .as_ref()
+                    .and_then(|st| st.fields().get(idx))
+                    .map(|f| f.field_type.as_ref());
                 partition_values.insert(
                     spec_field.name.clone(),
-                    literal_to_string(literal),
+                    literal_to_string_typed(literal, field_type),
                 );
             }
         }
@@ -272,7 +330,13 @@ async fn read_manifest_with_file_io(
             file_size_bytes: data_file.file_size_in_bytes() as i64,
             partition_values,
             content_type: content_type_to_string(data_file.content_type()),
-            snapshot_id: entry.snapshot_id().unwrap_or(0),
+            sequence_number: entry.sequence_number().unwrap_or(-1),
+            // Fall back to the caller-supplied inherited snapshot id (the
+            // Iceberg-spec "inherited" resolution used by manifest-list-aware
+            // callers) before defaulting to -1 = unknown. This keeps this
+            // path consistent with `list_files_with_catalog`, which resolves
+            // the same fallback via `manifest_file.added_snapshot_id`.
+            snapshot_id: entry.snapshot_id().or(inherited_snapshot_id).unwrap_or(-1),
         });
     }
 
@@ -289,10 +353,10 @@ async fn read_manifest_with_file_io(
 
 /// Read an Iceberg manifest and export filtered entries via Arrow FFI.
 ///
-/// Builds a flat RecordBatch with 7 columns:
+/// Builds a flat RecordBatch with 8 columns:
 ///   path (Utf8), file_format (Utf8), record_count (Int64),
 ///   file_size_bytes (Int64), partition_values (Utf8/JSON),
-///   content_type (Utf8), snapshot_id (Int64)
+///   content_type (Utf8), snapshot_id (Int64), sequence_number (Int64)
 ///
 /// Returns the number of rows written.
 pub fn read_iceberg_manifest_arrow_ffi(
@@ -301,12 +365,13 @@ pub fn read_iceberg_manifest_arrow_ffi(
     predicate: Option<&crate::common::PartitionPredicate>,
     array_addrs: &[i64],
     schema_addrs: &[i64],
+    inherited_snapshot_id: Option<i64>,
 ) -> Result<usize> {
     use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
     use arrow_array::{StringArray, Int64Array, Array};
     use arrow_schema::{DataType, Field};
 
-    const NUM_COLS: usize = 7;
+    const NUM_COLS: usize = 8;
 
     if array_addrs.len() < NUM_COLS || schema_addrs.len() < NUM_COLS {
         anyhow::bail!(
@@ -316,7 +381,7 @@ pub fn read_iceberg_manifest_arrow_ffi(
     }
 
     // 1. Read manifest → Vec<IcebergFileEntry>
-    let entries = read_iceberg_manifest(config, manifest_path)?;
+    let entries = read_iceberg_manifest(config, manifest_path, inherited_snapshot_id)?;
 
     // 2. Apply partition predicate filter
     let entries: Vec<IcebergFileEntry> = match predicate {
@@ -337,6 +402,7 @@ pub fn read_iceberg_manifest_arrow_ffi(
     let pv_refs: Vec<&str> = pvs.iter().map(|s| s.as_str()).collect();
     let content_types: Vec<&str> = entries.iter().map(|e| e.content_type.as_str()).collect();
     let snap_ids: Vec<i64> = entries.iter().map(|e| e.snapshot_id).collect();
+    let seq_nums: Vec<i64> = entries.iter().map(|e| e.sequence_number).collect();
 
     let arrays: Vec<(Arc<dyn Array>, Field)> = vec![
         (Arc::new(StringArray::from(paths)), Field::new("path", DataType::Utf8, false)),
@@ -346,6 +412,7 @@ pub fn read_iceberg_manifest_arrow_ffi(
         (Arc::new(StringArray::from(pv_refs)), Field::new("partition_values", DataType::Utf8, false)),
         (Arc::new(StringArray::from(content_types)), Field::new("content_type", DataType::Utf8, false)),
         (Arc::new(Int64Array::from(snap_ids)), Field::new("snapshot_id", DataType::Int64, false)),
+        (Arc::new(Int64Array::from(seq_nums)), Field::new("sequence_number", DataType::Int64, false)),
     ];
 
     // 4. Validate ALL addresses upfront before writing anything.

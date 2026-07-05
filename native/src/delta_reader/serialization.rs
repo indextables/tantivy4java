@@ -5,6 +5,7 @@
 // Rust→Java transfer via BatchDocumentReader.parseToMaps().
 
 use super::scan::{DeltaFileEntry, DeltaSchemaField};
+use crate::common::{write_field_header, write_string};
 
 /// Magic number for batch protocol validation ("TANT")
 const MAGIC_NUMBER: u32 = 0x54414E54;
@@ -17,12 +18,14 @@ const FIELD_TYPE_JSON: u8 = 6;
 
 /// Serialize a list of DeltaFileEntry into the TANT byte buffer format.
 ///
-/// Each entry becomes one "document" with either 7 fields (full) or 5 fields (compact):
+/// Each entry becomes one "document" with either 7 fields (full) or 6 fields (compact):
 ///   Full:    path, size, modification_time, num_records, partition_values, has_deletion_vector, table_version
-///   Compact: path, size, modification_time, num_records, table_version
+///   Compact: path, size, modification_time, num_records, has_deletion_vector, table_version
 ///
-/// Compact mode skips partition_values (JSON) and has_deletion_vector (BOOLEAN)
-/// for callers that only need file identity and basic metadata.
+/// Compact mode skips partition_values (JSON) for callers that only need file
+/// identity and basic metadata. has_deletion_vector is correctness-critical
+/// (scanning a DV'd file without it silently includes deleted rows) so it is
+/// kept in both modes.
 pub fn serialize_delta_entries(entries: &[DeltaFileEntry], table_version: u64, compact: bool) -> Vec<u8> {
     let per_entry = if compact { 200 } else { 300 };
     let estimated = 4 + entries.len() * per_entry + entries.len() * 4 + 12;
@@ -35,7 +38,7 @@ pub fn serialize_delta_entries(entries: &[DeltaFileEntry], table_version: u64, c
     let mut offsets = Vec::with_capacity(entries.len());
     for entry in entries {
         offsets.push(buf.len() as u32);
-        serialize_entry(&mut buf, entry, table_version, compact);
+        serialize_entry(&mut buf, entry, table_version as i64, compact);
     }
 
     // Offset table
@@ -52,8 +55,10 @@ pub fn serialize_delta_entries(entries: &[DeltaFileEntry], table_version: u64, c
     buf
 }
 
-fn serialize_entry(buf: &mut Vec<u8>, entry: &DeltaFileEntry, table_version: u64, compact: bool) {
-    let field_count: u16 = if compact { 5 } else { 7 };
+/// `table_version` uses -1 as the "unknown" sentinel (e.g. log-change entries
+/// where the per-entry commit version is not tracked).
+fn serialize_entry(buf: &mut Vec<u8>, entry: &DeltaFileEntry, table_version: i64, compact: bool) {
+    let field_count: u16 = if compact { 6 } else { 7 };
     buf.extend_from_slice(&field_count.to_ne_bytes());
 
     // 1. path (TEXT)
@@ -78,15 +83,17 @@ fn serialize_entry(buf: &mut Vec<u8>, entry: &DeltaFileEntry, table_version: u64
         write_field_header(buf, "partition_values", FIELD_TYPE_JSON, 1);
         let pv_json = serde_json::to_string(&entry.partition_values).unwrap_or_else(|_| "{}".to_string());
         write_string(buf, &pv_json);
-
-        // 6. has_deletion_vector (BOOLEAN) — skipped in compact mode
-        write_field_header(buf, "has_deletion_vector", FIELD_TYPE_BOOLEAN, 1);
-        buf.push(if entry.has_deletion_vector { 1 } else { 0 });
     }
+
+    // has_deletion_vector (BOOLEAN) — always included: without it a consumer
+    // scanning the listed parquet files would silently read logically
+    // deleted rows.
+    write_field_header(buf, "has_deletion_vector", FIELD_TYPE_BOOLEAN, 1);
+    buf.push(if entry.has_deletion_vector { 1 } else { 0 });
 
     // table_version (INTEGER) — always included
     write_field_header(buf, "table_version", FIELD_TYPE_INTEGER, 1);
-    buf.extend_from_slice(&(table_version as i64).to_ne_bytes());
+    buf.extend_from_slice(&table_version.to_ne_bytes());
 }
 
 /// Serialize a list of DeltaSchemaField plus the raw schema JSON into the TANT byte buffer format.
@@ -252,10 +259,12 @@ pub fn serialize_log_changes(changes: &super::distributed::DeltaLogChanges) -> V
         buf.extend_from_slice(&(changes.removed_paths.len() as i64).to_ne_bytes());
     }
 
-    // Documents 1..N: added files (full format, version=0 since it's post-checkpoint)
+    // Documents 1..N: added files (full format). The per-entry commit version
+    // is not tracked during log replay, so use the -1 "unknown" sentinel
+    // rather than a real-looking version of 0.
     for entry in &changes.added_files {
         offsets.push(buf.len() as u32);
-        serialize_entry(&mut buf, entry, 0, false);
+        serialize_entry(&mut buf, entry, -1, false);
     }
 
     // Documents N+1..M: removed paths
@@ -279,20 +288,6 @@ pub fn serialize_log_changes(changes: &super::distributed::DeltaLogChanges) -> V
     buf.extend_from_slice(&MAGIC_NUMBER.to_ne_bytes());
 
     buf
-}
-
-fn write_field_header(buf: &mut Vec<u8>, name: &str, field_type: u8, value_count: u16) {
-    let name_bytes = name.as_bytes();
-    buf.extend_from_slice(&(name_bytes.len() as u16).to_ne_bytes());
-    buf.extend_from_slice(name_bytes);
-    buf.push(field_type);
-    buf.extend_from_slice(&value_count.to_ne_bytes());
-}
-
-fn write_string(buf: &mut Vec<u8>, s: &str) {
-    let bytes = s.as_bytes();
-    buf.extend_from_slice(&(bytes.len() as u32).to_ne_bytes());
-    buf.extend_from_slice(bytes);
 }
 
 #[cfg(test)]
@@ -438,10 +433,11 @@ mod tests {
         let compact_count = u32::from_ne_bytes([compact_buf[clen - 8], compact_buf[clen - 7], compact_buf[clen - 6], compact_buf[clen - 5]]);
         assert_eq!(compact_count, 1);
 
-        // Compact should NOT contain partition_values or has_deletion_vector field names
+        // Compact should NOT contain partition_values, but MUST keep the
+        // correctness-critical has_deletion_vector flag
         let compact_str = String::from_utf8_lossy(&compact_buf);
         assert!(!compact_str.contains("partition_values"));
-        assert!(!compact_str.contains("has_deletion_vector"));
+        assert!(compact_str.contains("has_deletion_vector"));
 
         // But compact SHOULD contain path, size, table_version
         assert!(compact_str.contains("path"));

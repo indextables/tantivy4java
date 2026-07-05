@@ -39,7 +39,7 @@ import java.util.Map;
  * // Specific version
  * List<DeltaFileEntry> files = DeltaTableReader.listFiles("s3://bucket/delta_table", config, 42);
  *
- * // Compact mode — skip partition_values and has_deletion_vector for lightweight listing
+ * // Compact mode — skip partition_values for lightweight listing
  * List<DeltaFileEntry> compact = DeltaTableReader.listFiles("s3://bucket/delta_table", config, true);
  * }</pre>
  */
@@ -97,7 +97,7 @@ public class DeltaTableReader {
      * are omitted, reducing serialization overhead.
      *
      * @param tableUrl table location (local path, file://, s3://, or azure://)
-     * @param compact  if true, skip partition_values and has_deletion_vector fields
+     * @param compact  if true, skip the partition_values field (has_deletion_vector is always included)
      * @return list of active file entries
      * @throws RuntimeException if the table cannot be read
      */
@@ -110,7 +110,7 @@ public class DeltaTableReader {
      *
      * @param tableUrl table location
      * @param config   credential and storage configuration
-     * @param compact  if true, skip partition_values and has_deletion_vector fields
+     * @param compact  if true, skip the partition_values field (has_deletion_vector is always included)
      * @return list of active file entries
      * @throws RuntimeException if the table cannot be read
      */
@@ -124,7 +124,7 @@ public class DeltaTableReader {
      * @param tableUrl table location
      * @param config   credential and storage configuration
      * @param version  snapshot version to read (-1 for latest)
-     * @param compact  if true, skip partition_values and has_deletion_vector fields
+     * @param compact  if true, skip the partition_values field (has_deletion_vector is always included)
      * @return list of active file entries
      * @throws RuntimeException if the table cannot be read
      */
@@ -138,7 +138,7 @@ public class DeltaTableReader {
      * @param tableUrl table location
      * @param config   credential and storage configuration
      * @param version  snapshot version to read (-1 for latest)
-     * @param compact  if true, skip partition_values and has_deletion_vector fields
+     * @param compact  if true, skip the partition_values field (has_deletion_vector is always included)
      * @param filter   partition filter (null for no filtering)
      * @return list of matching file entries
      * @throws RuntimeException if the table cannot be read

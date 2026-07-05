@@ -30,6 +30,11 @@ pub struct IcebergFileEntry {
     pub partition_values: HashMap<String, String>,
     /// Content type: "data", "equality_deletes", "position_deletes"
     pub content_type: String,
+    /// Data sequence number (-1 if unknown). Required to decide which data
+    /// files a position/equality delete applies to: a delete file applies to
+    /// data files with a strictly lower (position) or lower-or-equal
+    /// (equality) sequence number.
+    pub sequence_number: i64,
     /// Snapshot ID that added this file
     pub snapshot_id: i64,
 }
@@ -99,6 +104,11 @@ pub(crate) fn content_type_to_string(ct: DataContentType) -> String {
 }
 
 /// Convert an Iceberg Literal to a string for partition values.
+///
+/// `PrimitiveLiteral` does not carry the logical type (a Date is physically
+/// an `Int` of epoch-days), so this untyped fallback renders temporal and
+/// decimal values as raw integers. Prefer `literal_to_string_typed` with the
+/// partition field's result type whenever available.
 pub(crate) fn literal_to_string(lit: &iceberg::spec::Literal) -> String {
     match lit {
         iceberg::spec::Literal::Primitive(p) => {
@@ -117,6 +127,74 @@ pub(crate) fn literal_to_string(lit: &iceberg::spec::Literal) -> String {
         }
         other => format!("{:?}", other),
     }
+}
+
+/// Convert an Iceberg Literal to a string using the partition field's result
+/// type, rendering dates/timestamps in ISO form and decimals with their scale
+/// applied — matching user expectations and Delta's human-readable partition
+/// values (a `date = '2024-01-01'` predicate would otherwise never match the
+/// raw epoch-day value "19723").
+pub(crate) fn literal_to_string_typed(
+    lit: &iceberg::spec::Literal,
+    result_type: Option<&iceberg::spec::Type>,
+) -> String {
+    use iceberg::spec::{Literal, PrimitiveLiteral, PrimitiveType, Type};
+
+    if let (Literal::Primitive(p), Some(Type::Primitive(pt))) = (lit, result_type) {
+        match (pt, p) {
+            (PrimitiveType::Date, PrimitiveLiteral::Int(days)) => {
+                if let Some(dt) = chrono::DateTime::from_timestamp(*days as i64 * 86_400, 0) {
+                    return dt.date_naive().to_string(); // YYYY-MM-DD
+                }
+            }
+            (
+                PrimitiveType::Timestamp | PrimitiveType::Timestamptz,
+                PrimitiveLiteral::Long(micros),
+            ) => {
+                if let Some(dt) = chrono::DateTime::from_timestamp_micros(*micros) {
+                    return dt.naive_utc().to_string(); // YYYY-MM-DD HH:MM:SS[.ffffff]
+                }
+            }
+            (
+                PrimitiveType::TimestampNs | PrimitiveType::TimestamptzNs,
+                PrimitiveLiteral::Long(nanos),
+            ) => {
+                let dt = chrono::DateTime::from_timestamp_nanos(*nanos);
+                return dt.naive_utc().to_string();
+            }
+            (PrimitiveType::Decimal { scale, .. }, PrimitiveLiteral::Int128(v)) => {
+                return format_decimal(*v, *scale);
+            }
+            _ => {}
+        }
+    }
+    literal_to_string(lit)
+}
+
+/// Format an unscaled i128 decimal value with the given scale,
+/// e.g. (12345, 2) → "123.45".
+fn format_decimal(unscaled: i128, scale: u32) -> String {
+    let negative = unscaled < 0;
+    let digits = unscaled.unsigned_abs().to_string();
+    let scale = scale as usize;
+    let mut s = String::new();
+    if negative {
+        s.push('-');
+    }
+    if scale == 0 {
+        s.push_str(&digits);
+    } else if digits.len() > scale {
+        s.push_str(&digits[..digits.len() - scale]);
+        s.push('.');
+        s.push_str(&digits[digits.len() - scale..]);
+    } else {
+        s.push_str("0.");
+        for _ in 0..(scale - digits.len()) {
+            s.push('0');
+        }
+        s.push_str(&digits);
+    }
+    s
 }
 
 /// Convert an Iceberg Type to a human-readable string.
@@ -154,7 +232,9 @@ pub fn list_iceberg_files(
         namespace, table_name, snapshot_id
     );
 
-    let rt = tokio::runtime::Runtime::new()
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
         .map_err(|e| anyhow::anyhow!("Failed to create Tokio runtime: {}", e))?;
 
     rt.block_on(async {
@@ -218,6 +298,12 @@ pub(crate) async fn list_files_with_catalog(
         // critical for tables that have undergone partition spec evolution.
         let manifest_partition_spec = manifest.metadata().partition_spec();
 
+        // Resolve the partition fields' result types (from the manifest's own
+        // schema) so temporal/decimal values render human-readably.
+        let partition_type = manifest_partition_spec
+            .partition_type(manifest.metadata().schema())
+            .ok();
+
         for entry in manifest.entries() {
             // Skip deleted entries
             if entry.status() == ManifestStatus::Deleted {
@@ -233,9 +319,13 @@ pub(crate) async fn list_files_with_catalog(
             let partition_fields = data_file.partition().fields();
             for (idx, spec_field) in manifest_partition_spec.fields().iter().enumerate() {
                 if let Some(Some(literal)) = partition_fields.get(idx) {
+                    let field_type = partition_type
+                        .as_ref()
+                        .and_then(|st| st.fields().get(idx))
+                        .map(|f| f.field_type.as_ref());
                     partition_values.insert(
                         spec_field.name.clone(),
-                        literal_to_string(literal),
+                        literal_to_string_typed(literal, field_type),
                     );
                 }
             }
@@ -247,6 +337,7 @@ pub(crate) async fn list_files_with_catalog(
                 file_size_bytes: data_file.file_size_in_bytes() as i64,
                 partition_values,
                 content_type: content_type_to_string(data_file.content_type()),
+                sequence_number: entry.sequence_number().unwrap_or(-1),
                 snapshot_id: entry.snapshot_id().unwrap_or(manifest_file.added_snapshot_id),
             });
         }
@@ -278,7 +369,9 @@ pub fn read_iceberg_schema(
         namespace, table_name, snapshot_id
     );
 
-    let rt = tokio::runtime::Runtime::new()
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
         .map_err(|e| anyhow::anyhow!("Failed to create Tokio runtime: {}", e))?;
 
     rt.block_on(async {
@@ -301,13 +394,20 @@ pub(crate) async fn read_schema_with_catalog(
 
     let metadata = table.metadata();
 
-    // Get the schema — use snapshot-specific schema if available, otherwise current
+    // Get the schema — use snapshot-specific schema if available, otherwise current.
+    // A snapshot whose schema_id no longer resolves must NOT silently fall back
+    // to current_schema(): for time-travel reads that could return a schema
+    // that does not match the snapshot's data.
     let schema = if let Some(snap_id) = snapshot_id {
         if let Some(snapshot) = metadata.snapshot_by_id(snap_id) {
-            // Try to get schema for this snapshot's schema_id
             if let Some(schema_id) = snapshot.schema_id() {
-                metadata.schema_by_id(schema_id)
-                    .unwrap_or_else(|| metadata.current_schema())
+                metadata.schema_by_id(schema_id).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Snapshot {} references schema_id {} which does not exist in table metadata",
+                        snap_id,
+                        schema_id
+                    )
+                })?
             } else {
                 metadata.current_schema()
             }
@@ -368,7 +468,9 @@ pub fn list_iceberg_snapshots(
         namespace, table_name
     );
 
-    let rt = tokio::runtime::Runtime::new()
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
         .map_err(|e| anyhow::anyhow!("Failed to create Tokio runtime: {}", e))?;
 
     rt.block_on(async {
@@ -456,6 +558,55 @@ mod tests {
     }
 
     #[test]
+    fn test_literal_to_string_typed_date_iso() {
+        use iceberg::spec::{Literal, PrimitiveLiteral, PrimitiveType, Type};
+        // 2024-01-01 = 19723 days since epoch
+        let lit = Literal::Primitive(PrimitiveLiteral::Int(19723));
+        let ty = Type::Primitive(PrimitiveType::Date);
+        assert_eq!(literal_to_string_typed(&lit, Some(&ty)), "2024-01-01");
+        // Untyped fallback keeps the raw epoch-day rendering
+        assert_eq!(literal_to_string_typed(&lit, None), "19723");
+    }
+
+    #[test]
+    fn test_literal_to_string_typed_timestamp() {
+        use iceberg::spec::{Literal, PrimitiveLiteral, PrimitiveType, Type};
+        // 2024-01-01T00:00:00 UTC in micros
+        let lit = Literal::Primitive(PrimitiveLiteral::Long(1_704_067_200_000_000));
+        let ty = Type::Primitive(PrimitiveType::Timestamp);
+        assert_eq!(
+            literal_to_string_typed(&lit, Some(&ty)),
+            "2024-01-01 00:00:00"
+        );
+    }
+
+    #[test]
+    fn test_literal_to_string_typed_decimal_scale() {
+        use iceberg::spec::{Literal, PrimitiveLiteral, PrimitiveType, Type};
+        let ty = Type::Primitive(PrimitiveType::Decimal { precision: 10, scale: 2 });
+        let lit = Literal::Primitive(PrimitiveLiteral::Int128(12345));
+        assert_eq!(literal_to_string_typed(&lit, Some(&ty)), "123.45");
+        let neg = Literal::Primitive(PrimitiveLiteral::Int128(-7));
+        assert_eq!(literal_to_string_typed(&neg, Some(&ty)), "-0.07");
+    }
+
+    #[test]
+    fn test_literal_to_string_typed_string_passthrough() {
+        use iceberg::spec::{Literal, PrimitiveLiteral, PrimitiveType, Type};
+        let lit = Literal::Primitive(PrimitiveLiteral::String("us-east-1".to_string()));
+        let ty = Type::Primitive(PrimitiveType::String);
+        assert_eq!(literal_to_string_typed(&lit, Some(&ty)), "us-east-1");
+    }
+
+    #[test]
+    fn test_format_decimal() {
+        assert_eq!(format_decimal(0, 2), "0.00");
+        assert_eq!(format_decimal(5, 0), "5");
+        assert_eq!(format_decimal(-12345, 3), "-12.345");
+        assert_eq!(format_decimal(100, 2), "1.00");
+    }
+
+    #[test]
     fn test_iceberg_file_entry_construction() {
         let entry = IcebergFileEntry {
             path: "s3://bucket/data/part-00000.parquet".to_string(),
@@ -464,10 +615,12 @@ mod tests {
             file_size_bytes: 50000,
             partition_values: HashMap::new(),
             content_type: "data".to_string(),
+            sequence_number: 7,
             snapshot_id: 12345,
         };
         assert_eq!(entry.path, "s3://bucket/data/part-00000.parquet");
         assert_eq!(entry.record_count, 1000);
+        assert_eq!(entry.sequence_number, 7);
     }
 
     #[test]

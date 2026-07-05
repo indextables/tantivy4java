@@ -94,6 +94,15 @@ pub fn list_delta_files(
 
     // Defensive column mapping: delta-kernel's ScanFile likely already uses logical
     // names, but apply mapping just in case to handle edge cases.
+    //
+    // NOTE: apply_column_mapping only rewrites keys that appear in the
+    // physical→logical map, so kernel-emitted logical names normally pass
+    // through untouched. The one theoretical hazard is a table where one
+    // column's LOGICAL name equals another column's PHYSICAL name — that key
+    // would be remapped incorrectly. Physical names in column-mapping tables
+    // are conventionally "col-<uuid>", making such a collision practically
+    // impossible; if it is ever observed, remove this defensive pass and
+    // trust the kernel output instead.
     let column_mapping = super::distributed::build_column_mapping(&schema_json);
     if !column_mapping.is_empty() {
         debug_println!(

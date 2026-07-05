@@ -12,6 +12,7 @@ use object_store::path::Path as ObjectPath;
 use object_store::ObjectStore;
 use url::Url;
 
+use crate::common::percent_decode;
 use crate::debug_println;
 use crate::delta_reader::engine::{DeltaStorageConfig, create_object_store};
 use crate::parquet_schema_reader::arrow_schema_to_json;
@@ -32,6 +33,14 @@ pub struct ParquetTableInfo {
     pub root_parquet_files: Vec<ParquetFileEntry>,
     /// Whether the table is partitioned
     pub is_partitioned: bool,
+}
+
+/// Whether a parquet object's filename is a hidden/metadata file that should
+/// be excluded from listings (e.g. `.DS_Store`, `_SUCCESS`, `_delta_log`).
+/// `path_str` is the full object path; only the final path segment is checked.
+fn is_hidden_parquet_file(path_str: &str) -> bool {
+    let filename = path_str.rsplit('/').next().unwrap_or(path_str);
+    filename.starts_with('.') || filename.starts_with('_')
 }
 
 /// A single parquet file entry with metadata.
@@ -122,9 +131,10 @@ async fn get_table_info_async(
             if last_segment.contains('=') {
                 partition_directories.push(dir_name.to_string());
 
-                // Extract partition column name from first directory
+                // Extract the first-level partition column name. Deeper levels
+                // are discovered below by walking down one directory chain,
+                // since list_with_delimiter only returns single-level prefixes.
                 if !partition_columns_found {
-                    // Walk the path to find all partition levels
                     for segment in dir_name.split('/') {
                         if let Some(eq_pos) = segment.find('=') {
                             let key = &segment[..eq_pos];
@@ -139,11 +149,59 @@ async fn get_table_info_async(
         }
     }
 
+    // Discover deeper partition levels by walking down every first-level
+    // partition directory (one LIST per level per directory). Walking only a
+    // single chain would silently under-report partition columns whenever
+    // sibling partitions have a different depth than the first one (schema
+    // drift, partial backfill, incremental repartitioning) — the same class
+    // of bug as reporting partition_columns = ["year"] for a year/month/day
+    // table when list_with_delimiter above only exposes the first level.
+    for first_dir in partition_directories.clone() {
+        let mut current = first_dir;
+        loop {
+            let sub = store
+                .list_with_delimiter(Some(&ObjectPath::from(current.as_str())))
+                .await
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "Failed to list partition directory '{}': {}",
+                        current,
+                        e
+                    )
+                })?;
+
+            let mut next_dir = None;
+            for cp in &sub.common_prefixes {
+                let name = cp.as_ref();
+                if let Some(last_segment) = name.rsplit('/').find(|s| !s.is_empty()) {
+                    if let Some(eq_pos) = last_segment.find('=') {
+                        let key = &last_segment[..eq_pos];
+                        if !partition_columns.contains(&key.to_string()) {
+                            partition_columns.push(key.to_string());
+                        }
+                        if next_dir.is_none() {
+                            next_dir = Some(name.to_string());
+                        }
+                    }
+                }
+            }
+
+            match next_dir {
+                Some(d) => current = d,
+                None => break,
+            }
+        }
+    }
+
     // Collect root .parquet files
     let mut root_parquet_files = Vec::new();
     for obj in &list_result.objects {
         let path_str = obj.location.as_ref();
         if path_str.ends_with(".parquet") || path_str.ends_with(".parq") {
+            // Skip hidden/metadata files (same rule as list_partition_files)
+            if is_hidden_parquet_file(path_str) {
+                continue;
+            }
             root_parquet_files.push(ParquetFileEntry {
                 path: path_str.to_string(),
                 size: obj.size as i64,
@@ -218,8 +276,7 @@ async fn list_partition_files_async(
         }
 
         // Skip hidden files and metadata
-        let filename = path_str.rsplit('/').next().unwrap_or(path_str);
-        if filename.starts_with('.') || filename.starts_with('_') {
+        if is_hidden_parquet_file(path_str) {
             continue;
         }
 
@@ -255,6 +312,10 @@ async fn read_schema_from_first_file(
     for obj in &list_result.objects {
         let path_str = obj.location.as_ref();
         if path_str.ends_with(".parquet") || path_str.ends_with(".parq") {
+            // Skip hidden/metadata files (same rule as list_partition_files)
+            if is_hidden_parquet_file(path_str) {
+                continue;
+            }
             let reader = ParquetObjectReader::new(Arc::clone(store), obj.location.clone())
                 .with_file_size(obj.size as u64);
             let builder =
@@ -279,8 +340,7 @@ async fn read_schema_from_first_file(
         for obj in objects {
             let path_str = obj.location.as_ref();
             if path_str.ends_with(".parquet") || path_str.ends_with(".parq") {
-                let filename = path_str.rsplit('/').next().unwrap_or(path_str);
-                if filename.starts_with('.') || filename.starts_with('_') {
+                if is_hidden_parquet_file(path_str) {
                     continue;
                 }
 
@@ -328,43 +388,6 @@ pub(crate) fn parse_partition_values_from_path(path: &str) -> HashMap<String, St
     values
 }
 
-/// Percent-decoding for partition values, supporting multi-byte UTF-8.
-///
-/// Accumulates percent-encoded bytes and decodes them as a UTF-8 sequence,
-/// correctly handling characters like `%C3%A9` → `é`.
-fn percent_decode(s: &str) -> String {
-    let bytes = s.as_bytes();
-    let mut result = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            // Try to decode the two hex digits after %
-            let hi = bytes[i + 1];
-            let lo = bytes[i + 2];
-            if let (Some(h), Some(l)) = (hex_val(hi), hex_val(lo)) {
-                result.push(h << 4 | l);
-                i += 3;
-                continue;
-            }
-        }
-        result.push(bytes[i]);
-        i += 1;
-    }
-
-    String::from_utf8(result).unwrap_or_else(|_| s.to_string())
-}
-
-/// Convert an ASCII hex digit to its numeric value.
-fn hex_val(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        _ => None,
-    }
-}
-
 /// Normalize a table URL: ensure trailing slash and parse.
 fn normalize_table_url(url_str: &str) -> Result<Url> {
     let mut s = url_str.to_string();
@@ -387,22 +410,23 @@ fn normalize_table_url(url_str: &str) -> Result<Url> {
 }
 
 /// Convert a URL to an ObjectPath for object_store operations.
+///
+/// `Url::path()` is percent-encoded and `ObjectPath::from` does not decode,
+/// so the path must be decoded first or keys containing spaces/unicode
+/// would resolve to the wrong object.
 fn url_to_object_path(url: &Url) -> ObjectPath {
+    let decoded = percent_decode(url.path());
     match url.scheme() {
         "s3" | "s3a" => {
             // For S3, the path starts after the bucket name
-            let path = url.path();
-            let trimmed = path.trim_start_matches('/');
-            ObjectPath::from(trimmed)
+            ObjectPath::from(decoded.trim_start_matches('/'))
         }
         "az" | "azure" | "abfs" | "abfss" => {
-            let path = url.path();
-            let trimmed = path.trim_start_matches('/');
-            ObjectPath::from(trimmed)
+            ObjectPath::from(decoded.trim_start_matches('/'))
         }
         _ => {
             // For file:// and others, use the full path
-            ObjectPath::from(url.path())
+            ObjectPath::from(decoded.as_str())
         }
     }
 }
