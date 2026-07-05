@@ -115,11 +115,24 @@ impl L2DiskCache {
                             }
                         }
 
-                        // For size-based mode: drain bytes and notify waiting senders
+                        // For size-based mode: drain bytes and notify waiting senders.
+                        //
+                        // The mutex MUST be held across the fetch_sub + notify_all. The producer
+                        // (WriteSender::send) holds this same mutex across its check-and-wait, so
+                        // acquiring it here closes the lost-wakeup race: either we decrement before
+                        // the producer's load (it sees room and never waits), or the producer is
+                        // already parked in cvar.wait (which released the mutex) and our notify wakes
+                        // it. Without the lock, a notify issued between the producer's load and its
+                        // wait() would be lost, hanging the producer forever.
                         if let Some((queued_bytes, backpressure)) = sb_state {
-                            let remaining = queued_bytes.fetch_sub(data_len, Ordering::Release) - data_len;
-                            let (_lock, cvar) = &*backpressure;
-                            cvar.notify_all();
+                            let (lock, cvar) = &*backpressure;
+                            let remaining = {
+                                let _guard = lock.lock().unwrap();
+                                let remaining =
+                                    queued_bytes.fetch_sub(data_len, Ordering::Release) - data_len;
+                                cvar.notify_all();
+                                remaining
+                            };
 
                             // When queue fully drains, release overflow memory back to pool
                             if remaining == 0 {

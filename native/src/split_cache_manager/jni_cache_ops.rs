@@ -199,14 +199,12 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_
         None => return,
     };
 
-    // THEN access the cache managers registry
+    // Validate the manager exists. Manager-level preloading is a no-op: real
+    // component prewarming is driven per-split via SplitSearcher.preloadComponents.
     let managers = CACHE_MANAGERS.lock().unwrap();
-    let manager = match managers.get(&cache_name) {
-        Some(manager_arc) => manager_arc,
-        None => return,
-    };
-    // Simulate preloading by updating cache stats
-    manager.current_size.fetch_add(1024, Ordering::Relaxed);
+    if managers.get(&cache_name).is_none() {
+        return;
+    }
 }
 
 #[no_mangle]

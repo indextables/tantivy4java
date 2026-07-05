@@ -134,13 +134,25 @@ impl MmapCache {
         self.lru_order.push_back(path.to_path_buf());
     }
 
-    /// Remove a specific path from the cache (e.g., when file is deleted)
-    #[allow(dead_code)]
+    /// Remove a specific path from the cache (e.g., when a file is deleted or
+    /// about to be overwritten). Dropping the `Arc<Mmap>` here (once all in-flight
+    /// readers release their clones) unmaps the region, so the underlying inode's
+    /// disk space can actually be reclaimed and a subsequent read re-maps fresh
+    /// content instead of a stale mapping of the old file.
     pub fn remove(&mut self, path: &Path) {
         self.maps.remove(path);
         if let Some(pos) = self.lru_order.iter().position(|p| p == path) {
             self.lru_order.remove(pos);
         }
+    }
+
+    /// Remove every cached mapping whose file lives under `dir` (used when a split
+    /// directory is evicted). Without this, evicted splits' files stay mapped —
+    /// pinning the deleted inodes so disk space is not reclaimed, and risking stale
+    /// reads if the same component path is later re-written.
+    pub fn remove_under_dir(&mut self, dir: &Path) {
+        self.maps.retain(|p, _| !p.starts_with(dir));
+        self.lru_order.retain(|p| !p.starts_with(dir));
     }
 
     /// Clear all mappings

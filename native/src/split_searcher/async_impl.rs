@@ -942,8 +942,18 @@ async fn perform_real_quickwit_search(
     // Use cached storage directly (Quickwit lifecycle pattern)
     let storage = cached_storage;
 
-    // CRITICAL FIX: Use shared global context for cache hits but create individual permit provider
-    // This preserves cache efficiency while eliminating SearchPermitProvider permit exhaustion
+    // Use shared global context for cache hits but create individual permit provider
+    // to preserve cache efficiency while avoiding SearchPermitProvider permit exhaustion.
+    //
+    // KNOWN LIMITATIONS (see CACHING_MEMORY_INFRA_REVIEW.md §1.9, §2.6):
+    // - This query path reads the *global* SearcherContext, so its leaf-search/footer
+    //   caches are shared across credential sets, whereas the index-open path keys the
+    //   context by credentials. Split IDs are unguessable UUIDs, which bounds the
+    //   practical exposure; full isolation would require threading the credential key
+    //   (S3 + Azure) into this function and every sibling search/aggregation entry point.
+    // - The per-search permit provider below intentionally bypasses the process-global
+    //   concurrency/warmup budget to avoid a permit-exhaustion deadlock; as a result
+    //   max_concurrent_splits / warmup_memory_budget are not enforced here.
     debug_println!("🔍 PERMIT_FIX: Using global context for cache hits but individual permit provider");
 
     let searcher_context = crate::global_cache::get_global_searcher_context();

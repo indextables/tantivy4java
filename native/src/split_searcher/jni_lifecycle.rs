@@ -475,6 +475,12 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_crea
                         s3_config_for_key.secret_access_key = aws_config.get("secret_key").cloned();
                         s3_config_for_key.session_token = aws_config.get("session_token").cloned();
                         s3_config_for_key.region = aws_config.get("region").cloned();
+                        // Include endpoint and path-style so two different endpoints (or
+                        // path-style settings) with the same access key don't collapse onto
+                        // one credential-scoped SearcherContext.
+                        s3_config_for_key.endpoint = aws_config.get("endpoint").cloned();
+                        s3_config_for_key.force_path_style_access =
+                            aws_config.get("path_style_access").map(|s| s == "true").unwrap_or(false);
                         crate::global_cache::generate_storage_cache_key(Some(&s3_config_for_key), None)
                     } else if azure_config.contains_key("account_name") {
                         let azure_config_for_key = quickwit_config::AzureStorageConfig {

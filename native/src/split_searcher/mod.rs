@@ -3,7 +3,6 @@
 
 // Submodules
 pub mod cache_config;
-pub mod byterange_cache;
 pub mod searcher_cache;
 pub mod types;
 pub mod query_utils;
@@ -35,8 +34,6 @@ pub use async_impl::{
 };
 
 // Cache configuration is now in cache_config.rs submodule
-
-// ByteRange cache merging is now in byterange_cache.rs submodule
 
 // Searcher cache and types are now in searcher_cache.rs and types.rs submodules
 

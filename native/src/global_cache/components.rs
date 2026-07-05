@@ -5,49 +5,46 @@ use std::sync::Arc;
 
 use bytesize::ByteSize;
 use quickwit_config::{CacheConfig, SearcherConfig};
-use quickwit_search::list_fields_cache::ListFieldsCache;
-use quickwit_search::leaf_cache::LeafSearchCache;
-use quickwit_search::search_permit_provider::SearchPermitProvider;
 use quickwit_search::SearcherContext;
-use quickwit_storage::{
-    MemorySizedCache, QuickwitCache, SplitCache, StorageCache, STORAGE_METRICS,
-};
-use tantivy::aggregation::AggregationLimitsGuard;
+use quickwit_storage::SplitCache;
 use tempfile::TempDir;
 
 use crate::memory_pool::{global_pool, MemoryReservation};
 
-use super::cache_debug::{debug_arc_string_cache_identity, debug_cache_summary};
 use crate::debug_println;
 use crate::disk_cache::L2DiskCache;
 
 use super::config::GlobalCacheConfig;
 use super::storage_resolver::GLOBAL_STORAGE_RESOLVER;
 
-/// Global SearcherContext components
-/// These are the shared caches that should be reused across all searcher instances
-/// We use Arc to share these non-clonable types across multiple SearcherContext instances
+/// Global SearcherContext components.
+///
+/// Holds the process-wide split cache, L2 disk cache, and the cache/limit sizing
+/// derived from `GlobalCacheConfig`. Every `SearcherContext` is built by
+/// `SearcherContext::new_without_invoker`, which constructs its *own* fast-field,
+/// footer, leaf-search, list-fields, permit-provider and aggregation-limit
+/// instances from the `SearcherConfig` we hand it — so the way `GlobalCacheConfig`
+/// knobs take effect is by being written into that `SearcherConfig` (see
+/// `build_searcher_config`), NOT by holding separate cache instances here. Sharing
+/// across searchers is achieved by there being a single cached `SearcherContext`
+/// (see `get_global_searcher_context`), plus one per credential set.
 pub struct GlobalSearcherComponents {
-    /// Fast fields cache - shared across all searchers
-    pub fast_fields_cache: Arc<dyn StorageCache>,
-    /// Split footer cache - shared across all searchers (wrapped in Arc for sharing)
-    pub split_footer_cache: Arc<MemorySizedCache<String>>,
-    /// Leaf search cache - shared across all searchers (wrapped in Arc for sharing)
-    pub leaf_search_cache: Arc<LeafSearchCache>,
-    /// List fields cache - shared across all searchers (wrapped in Arc for sharing)
-    pub list_fields_cache: Arc<ListFieldsCache>,
-    /// Search permit provider - manages concurrent searches (wrapped in Arc for sharing)
-    pub search_permit_provider: Arc<SearchPermitProvider>,
-    /// Aggregation limits guard - shared memory tracking
-    pub aggregation_limit: AggregationLimitsGuard,
     /// Split cache - caches entire split files on disk (optional)
     pub split_cache_opt: Option<Arc<SplitCache>>,
-    /// L2 disk cache - tiered persistent disk cache with compression (optional)
+    /// L2 disk cache - tiered persistent disk cache (optional)
     pub disk_cache: Option<Arc<L2DiskCache>>,
     /// Temp directory for split cache (kept alive to prevent cleanup)
     _temp_dir: Option<TempDir>,
-    /// Predicate cache capacity — stored so SearcherContext can be built with the right size
-    pub predicate_cache_capacity: ByteSize,
+    /// Cache/limit sizing written into every `SearcherConfig` we build, so the
+    /// Java-configured `GlobalCacheConfig` knobs actually size the live caches.
+    fast_field_cache_capacity: ByteSize,
+    split_footer_cache_capacity: ByteSize,
+    partial_request_cache_capacity: ByteSize,
+    predicate_cache_capacity: ByteSize,
+    max_concurrent_splits: usize,
+    aggregation_memory_limit: ByteSize,
+    aggregation_bucket_limit: u32,
+    warmup_memory_budget: ByteSize,
     /// Memory reservation for the predicate cache, held for the lifetime of the components
     _predicate_cache_reservation: Option<MemoryReservation>,
 }
@@ -57,37 +54,16 @@ impl GlobalSearcherComponents {
     pub fn new(config: GlobalCacheConfig) -> Self {
         debug_println!("RUST DEBUG: Creating new GlobalSearcherComponents");
 
-        // Create fast field cache
-        let fast_field_cache_config = CacheConfig::default_with_capacity(config.fast_field_cache_capacity);
-        let fast_fields_cache = Arc::new(QuickwitCache::new(&fast_field_cache_config));
-
-        // Create split footer cache (wrapped in Arc for sharing)
-        let split_footer_cache_config = CacheConfig::default_with_capacity(config.split_footer_cache_capacity);
-        let split_footer_cache = Arc::new(MemorySizedCache::from_config(
-            &split_footer_cache_config,
-            &STORAGE_METRICS.split_footer_cache,
-        ));
-        debug_arc_string_cache_identity(&split_footer_cache, "split_footer_cache");
-
-        // Create leaf search cache (wrapped in Arc for sharing)
-        let partial_cache_config = CacheConfig::default_with_capacity(config.partial_request_cache_capacity);
-        let leaf_search_cache = Arc::new(LeafSearchCache::new(&partial_cache_config));
-
-        // Create list fields cache (wrapped in Arc for sharing)
-        let list_fields_cache = Arc::new(ListFieldsCache::new(&partial_cache_config));
-
-        // Create sync search permit provider to avoid async channel conflicts
-        // Using new_sync() method that doesn't use async channels
-        let search_permit_provider = Arc::new(SearchPermitProvider::new_sync(
-            config.max_concurrent_splits,
-            config.warmup_memory_budget,
-        ));
-
-        // Create aggregation limits guard
-        let aggregation_limit = AggregationLimitsGuard::new(
-            Some(config.aggregation_memory_limit.as_u64()),
-            Some(config.aggregation_bucket_limit),
-        );
+        // Capture the cache/limit sizing so build_searcher_config can apply it. The
+        // actual cache instances are created inside each SearcherContext from the
+        // SearcherConfig these values produce.
+        let fast_field_cache_capacity = config.fast_field_cache_capacity;
+        let split_footer_cache_capacity = config.split_footer_cache_capacity;
+        let partial_request_cache_capacity = config.partial_request_cache_capacity;
+        let max_concurrent_splits = config.max_concurrent_splits;
+        let aggregation_memory_limit = config.aggregation_memory_limit;
+        let aggregation_bucket_limit = config.aggregation_bucket_limit;
+        let warmup_memory_budget = config.warmup_memory_budget;
 
         // Create SplitCache if configured
         let (split_cache_opt, temp_dir) = if let Some(limits) = config.split_cache_limits {
@@ -188,35 +164,53 @@ impl GlobalSearcherComponents {
         };
 
         Self {
-            fast_fields_cache,
-            split_footer_cache,
-            leaf_search_cache,
-            list_fields_cache,
-            search_permit_provider,
-            aggregation_limit,
             split_cache_opt,
             disk_cache,
             _temp_dir: temp_dir,
+            fast_field_cache_capacity,
+            split_footer_cache_capacity,
+            partial_request_cache_capacity,
             predicate_cache_capacity,
+            max_concurrent_splits,
+            aggregation_memory_limit,
+            aggregation_bucket_limit,
+            warmup_memory_budget,
             _predicate_cache_reservation: predicate_cache_reservation,
         }
     }
 
-    /// Build a SearcherConfig with the predicate cache capacity stored in this component set.
-    /// Use this for the default/credential contexts so they respect Java-configured cache sizes.
+    /// Configured aggregation limits `(memory_bytes, bucket_limit)` from the
+    /// Java-supplied `GlobalCacheConfig`, for code paths that build their own
+    /// `AggregationLimitsGuard` (which are not fed by the `SearcherContext`).
+    pub fn aggregation_limits(&self) -> (u64, u32) {
+        (self.aggregation_memory_limit.as_u64(), self.aggregation_bucket_limit)
+    }
+
+    /// Build a `SearcherConfig` carrying every cache/limit size from the
+    /// Java-supplied `GlobalCacheConfig`. `SearcherContext::new_without_invoker`
+    /// constructs its fast-field / footer / leaf-search / list-fields caches, its
+    /// concurrency permit provider, and its aggregation-memory guard from these
+    /// values, so this is what makes those knobs actually take effect.
     pub fn build_searcher_config(&self) -> SearcherConfig {
         let mut config = SearcherConfig::default();
+        config.fast_field_cache = CacheConfig::default_with_capacity(self.fast_field_cache_capacity);
+        config.split_footer_cache =
+            CacheConfig::default_with_capacity(self.split_footer_cache_capacity);
+        config.partial_request_cache =
+            CacheConfig::default_with_capacity(self.partial_request_cache_capacity);
         config.predicate_cache = CacheConfig::default_with_capacity(self.predicate_cache_capacity);
+        config.max_num_concurrent_split_searches = self.max_concurrent_splits;
+        config.aggregation_memory_limit = self.aggregation_memory_limit;
+        config.aggregation_bucket_limit = self.aggregation_bucket_limit;
+        config.warmup_memory_budget = self.warmup_memory_budget;
         config
     }
 
-    /// Create a SearcherContext from these global components
-    /// This ensures all SearcherContext instances share the same cache instances
-    /// FIXED: Now properly shares ALL cache instances including split_footer_cache
+    /// Create a SearcherContext sized from `build_searcher_config`. Cache *sharing*
+    /// across searchers comes from there being a single cached context (see
+    /// `get_global_searcher_context`) — each context still owns its cache instances.
     pub fn create_searcher_context(&self, searcher_config: SearcherConfig) -> Arc<SearcherContext> {
-        debug_println!("RUST DEBUG: Creating SearcherContext from SHARED global components");
-        debug_arc_string_cache_identity(&self.split_footer_cache, "split_footer_cache");
-        debug_cache_summary();
+        debug_println!("RUST DEBUG: Creating SearcherContext (sized from GlobalCacheConfig)");
 
         // Use SearcherContext::new_without_invoker which handles all required fields correctly
         Arc::new(SearcherContext::new_without_invoker(

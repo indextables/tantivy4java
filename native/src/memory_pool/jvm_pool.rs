@@ -313,14 +313,25 @@ impl MemoryPool for JvmMemoryPool {
 
         // Check if we need more from JVM
         if self.needs_jvm_acquire(new_used) {
-            let want = std::cmp::max(size, self.config.acquire_increment);
+            // Target the actual deficit (usage above the current grant), not just
+            // this call's `size`. After a denial-then-partial-grant, usage can sit
+            // above the grant; topping up by only `size` would leave it there and
+            // require many incremental acquires to catch up.
+            let deficit = new_used.saturating_sub(self.jvm_granted.load(Relaxed));
+            let want = std::cmp::max(deficit, self.config.acquire_increment);
 
             match self.jni_acquire(want) {
-                Ok(acquired) if acquired >= size => {
+                // Success requires covering the DEFICIT, not this call's `size`: the
+                // existing grant already backs `new_used - deficit`, so acquiring
+                // `deficit` more makes `granted == new_used`. Checking against `size`
+                // here would spuriously deny whenever prior grant already covered part
+                // of the usage (deficit < size). When deficit == 0 (a high-watermark
+                // headroom top-up while still within grant) any result is fine.
+                Ok(acquired) if acquired >= deficit => {
                     self.jvm_granted.fetch_add(acquired, Relaxed);
                 }
                 Ok(acquired) => {
-                    // JVM gave us less than we need — release what we got, undo, fail
+                    // JVM gave us less than the deficit — release what we got, undo, fail
                     if acquired > 0 {
                         let _ = self.jni_release(acquired);
                     }
@@ -368,7 +379,13 @@ impl MemoryPool for JvmMemoryPool {
         // subsequent operations or on pool shutdown.
         if let Some(excess) = self.should_jvm_release() {
             let to_release = excess.min(size);
-            if to_release > 0 {
+            // Skip churny sub-`min_release_amount` JNI releases. The min-release
+            // threshold is meant to bound how often we call into the JVM, but the
+            // `excess.min(size)` cap can shrink an above-threshold `excess` down to a
+            // tiny `to_release`; guard on `to_release` itself. Still release when the
+            // pool has fully drained (used == 0), so the last grant is returned.
+            let fully_drained = self.rust_used.load(Relaxed) == 0;
+            if to_release > 0 && (to_release >= self.config.min_release_amount || fully_drained) {
                 if let Ok(()) = self.jni_release(to_release) {
                     self.jvm_granted.fetch_sub(to_release, Relaxed);
                 }
