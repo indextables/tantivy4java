@@ -37,6 +37,32 @@ pub type MetadataCache = Arc<Mutex<HashMap<std::path::PathBuf, Arc<parquet::file
 
 use crate::debug_println;
 
+/// Ensure every requested parquet column name is present in the file's arrow schema.
+///
+/// Transcoding projects a fixed set of columns out of each parquet file. If a
+/// requested column is silently absent, it is dropped from the projection and
+/// never recorded, yielding a column with fewer values than `num_docs` and
+/// corrupt columnar bytes. This converts that silent corruption into a clear error.
+fn ensure_columns_present(
+    parquet_schema: &arrow_schema::Schema,
+    requested: &[&str],
+    parquet_path: &str,
+) -> Result<()> {
+    let missing: Vec<&str> = requested
+        .iter()
+        .copied()
+        .filter(|name| !parquet_schema.fields().iter().any(|f| f.name() == *name))
+        .collect();
+    if !missing.is_empty() {
+        anyhow::bail!(
+            "Parquet file '{}' is missing required column(s) {:?} during transcode; \
+             the split manifest schema and the parquet file schema have diverged",
+            parquet_path, missing
+        );
+    }
+    Ok(())
+}
+
 /// Source of data for a fast field column
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FieldSource {
@@ -74,8 +100,10 @@ pub struct TranscodeColumn {
     /// Column index in parquet schema
     pub parquet_col_idx: usize,
     /// Fast field tokenizer for text columns (e.g. "raw", "default").
-    /// When set to a non-"raw" tokenizer, transcoding applies tokenization to
-    /// produce individual term entries in the columnar dictionary.
+    /// Transcoding only ever produces raw (untokenized) string columns, so only
+    /// fields with the "raw" tokenizer (or unset) are transcoded — see
+    /// [`columns_to_transcode`], which filters out non-"raw" text fields because a
+    /// parquet raw-string fast field cannot reproduce tantivy's tokenized terms.
     pub fast_field_tokenizer: Option<String>,
 }
 
@@ -215,6 +243,12 @@ async fn transcode_via_columnar_writer(
         let parquet_schema = builder.schema().clone();
         let parquet_file_schema = builder.parquet_schema().clone();
 
+        // A requested column that is silently absent from this file would be
+        // dropped from the projection and never recorded, producing a column with
+        // fewer values than num_docs and corrupt columnar bytes. Surface it as an
+        // error instead of silently corrupting the output.
+        ensure_columns_present(&parquet_schema, &parquet_col_names, parquet_path)?;
+
         let col_indices: Vec<usize> = parquet_col_names
             .iter()
             .filter_map(|name| {
@@ -348,6 +382,12 @@ async fn transcode_str_columns_direct(
 
         let parquet_schema = builder.schema().clone();
         let parquet_file_schema = builder.parquet_schema().clone();
+
+        // A requested column that is silently absent from this file would be
+        // dropped from the projection and its collector would record zero ordinals
+        // with has_nulls=false, producing a Full-cardinality column with a value
+        // count below num_docs — malformed columnar bytes. Error instead.
+        ensure_columns_present(&parquet_schema, &parquet_col_names, parquet_path)?;
 
         let col_indices: Vec<usize> = parquet_col_names
             .iter()
@@ -740,11 +780,15 @@ fn extract_timestamp_micros(array: &dyn Array, row: usize) -> Result<i64> {
     use arrow_array::*;
     use arrow_schema::TimeUnit;
     match array.data_type() {
+        // All conversions use checked arithmetic: extreme values from an untrusted
+        // parquet file would otherwise overflow (panic in debug, wrong date in release).
         DataType::Timestamp(TimeUnit::Second, _) => {
-            Ok(array.as_any().downcast_ref::<TimestampSecondArray>().ok_or_else(|| anyhow::anyhow!("Expected TimestampSecondArray array"))?.value(row) * 1_000_000)
+            array.as_any().downcast_ref::<TimestampSecondArray>().ok_or_else(|| anyhow::anyhow!("Expected TimestampSecondArray array"))?.value(row)
+                .checked_mul(1_000_000).ok_or_else(|| anyhow::anyhow!("Timestamp seconds overflow converting to micros"))
         }
         DataType::Timestamp(TimeUnit::Millisecond, _) => {
-            Ok(array.as_any().downcast_ref::<TimestampMillisecondArray>().ok_or_else(|| anyhow::anyhow!("Expected TimestampMillisecondArray array"))?.value(row) * 1_000)
+            array.as_any().downcast_ref::<TimestampMillisecondArray>().ok_or_else(|| anyhow::anyhow!("Expected TimestampMillisecondArray array"))?.value(row)
+                .checked_mul(1_000).ok_or_else(|| anyhow::anyhow!("Timestamp millis overflow converting to micros"))
         }
         DataType::Timestamp(TimeUnit::Microsecond, _) => {
             Ok(array.as_any().downcast_ref::<TimestampMicrosecondArray>().ok_or_else(|| anyhow::anyhow!("Expected TimestampMicrosecondArray array"))?.value(row))
@@ -753,10 +797,12 @@ fn extract_timestamp_micros(array: &dyn Array, row: usize) -> Result<i64> {
             Ok(array.as_any().downcast_ref::<TimestampNanosecondArray>().ok_or_else(|| anyhow::anyhow!("Expected TimestampNanosecondArray array"))?.value(row) / 1_000)
         }
         DataType::Date32 => {
-            Ok(array.as_any().downcast_ref::<Date32Array>().ok_or_else(|| anyhow::anyhow!("Expected Date32Array array"))?.value(row) as i64 * 86_400_000_000i64)
+            (array.as_any().downcast_ref::<Date32Array>().ok_or_else(|| anyhow::anyhow!("Expected Date32Array array"))?.value(row) as i64)
+                .checked_mul(86_400_000_000i64).ok_or_else(|| anyhow::anyhow!("Date32 overflow converting to micros"))
         }
         DataType::Date64 => {
-            Ok(array.as_any().downcast_ref::<Date64Array>().ok_or_else(|| anyhow::anyhow!("Expected Date64Array array"))?.value(row) * 1_000i64)
+            array.as_any().downcast_ref::<Date64Array>().ok_or_else(|| anyhow::anyhow!("Expected Date64Array array"))?.value(row)
+                .checked_mul(1_000i64).ok_or_else(|| anyhow::anyhow!("Date64 overflow converting to micros"))
         }
         _ => anyhow::bail!("Cannot extract timestamp from {:?}", array.data_type()),
     }
@@ -776,6 +822,18 @@ pub fn columns_to_transcode(
             let source = field_source(&mapping.tantivy_type, mode);
             if source != FieldSource::Parquet {
                 return false;
+            }
+            // Non-"raw" tokenized text fields split text into tokens during native
+            // indexing; a parquet raw-string fast field cannot reproduce those
+            // terms, so transcoding them would diverge from a standard split. Skip
+            // them (matching promote_meta_json_all_fast, which only promotes raw
+            // text fields to fast fields).
+            if mapping.tantivy_type == "Str" {
+                if let Some(tok) = &mapping.fast_field_tokenizer {
+                    if tok != "raw" {
+                        return false;
+                    }
+                }
             }
             // If specific columns requested, filter to those
             if let Some(requested) = requested_columns {

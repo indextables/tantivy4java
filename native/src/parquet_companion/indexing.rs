@@ -44,13 +44,16 @@ pub const PARQUET_FILE_HASH_FIELD: &str = "__pq_file_hash";
 /// Hidden u64 fast field storing the 0-based row index within the parquet file.
 pub const PARQUET_ROW_IN_FILE_FIELD: &str = "__pq_row_in_file";
 
-/// Compute a stable u64 hash for a parquet file's relative path.
-/// Uses FxHash-style mixing for speed; collision probability ~1/2^64 per pair.
+/// Compute a stable u64 hash for a parquet file's relative path using xxHash64.
+///
+/// This value is persisted into split files (the `__pq_file_hash` fast field is
+/// written at index time and must equal the hash recomputed at read time from the
+/// manifest paths in `docid_mapping::build_file_hash_index`). It therefore MUST use
+/// a hash with a stable, versioned algorithm — `std::hash::DefaultHasher` is
+/// explicitly unspecified across toolchain releases and would silently break
+/// doc→parquet resolution for every previously created split.
 pub fn hash_parquet_path(relative_path: &str) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    relative_path.hash(&mut hasher);
-    hasher.finish()
+    xxhash_rust::xxh64::xxh64(relative_path.as_bytes(), 0)
 }
 
 /// Compute a stable 64-bit hash for a string value using xxHash64.
@@ -553,13 +556,18 @@ pub async fn create_split_from_parquet(
             let batch = batch_result.context("Failed to read record batch")?;
             let batch_schema = batch.schema();
 
+            // Resolve column → tantivy field once per batch (batch-invariant work),
+            // instead of re-running name mapping and schema lookups per row.
+            let resolved_columns = resolve_batch_columns(
+                &batch_schema, &tantivy_schema, &name_mapping, &config,
+            );
+
             for row_idx in 0..batch.num_rows() {
                 let mut tantivy_doc = arrow_row_to_tantivy_doc(
                     &batch,
-                    &batch_schema,
+                    &resolved_columns,
                     row_idx,
                     &tantivy_schema,
-                    &name_mapping,
                     &config,
                     &string_hash_fields,
                     &mut accumulators,
@@ -734,12 +742,56 @@ pub async fn create_split_from_parquet(
 }
 
 /// Convert a single Arrow row into a tantivy Document.
-pub(crate) fn arrow_row_to_tantivy_doc(
-    batch: &RecordBatch,
+/// A parquet column resolved to its tantivy field. All fields here are
+/// batch-invariant, so this is computed once per batch (via
+/// [`resolve_batch_columns`]) and reused across every row, instead of re-running
+/// name mapping and `Schema::get_field` (a string-hash lookup) per row.
+pub(crate) struct ResolvedColumn {
+    /// Column index into the RecordBatch.
+    col_idx: usize,
+    /// The resolved tantivy field (Field is a cheap Copy handle).
+    field: Field,
+    /// The tantivy field name (used for statistics accumulator keys and hashing).
+    tantivy_field_name: String,
+}
+
+/// Resolve, once per batch, which columns map to a tantivy field (skip-field
+/// filtering + name mapping + schema lookup). Columns with no tantivy field
+/// (unsupported type or explicitly skipped) are omitted.
+pub(crate) fn resolve_batch_columns(
     batch_schema: &ArrowSchema,
-    row_idx: usize,
     tantivy_schema: &Schema,
     name_mapping: &name_mapping::NameMapping,
+    config: &SchemaDerivationConfig,
+) -> Vec<ResolvedColumn> {
+    let mut cols = Vec::with_capacity(batch_schema.fields().len());
+    for (col_idx, arrow_field) in batch_schema.fields().iter().enumerate() {
+        let parquet_col_name = arrow_field.name();
+        if config.skip_fields.contains(parquet_col_name.as_str()) {
+            continue;
+        }
+        let tantivy_field_name = name_mapping
+            .get(parquet_col_name.as_str())
+            .map(|s| s.as_str())
+            .unwrap_or(parquet_col_name.as_str());
+        let field = match tantivy_schema.get_field(tantivy_field_name) {
+            Ok(f) => f,
+            Err(_) => continue, // Field not in tantivy schema (unsupported type), skip
+        };
+        cols.push(ResolvedColumn {
+            col_idx,
+            field,
+            tantivy_field_name: tantivy_field_name.to_string(),
+        });
+    }
+    cols
+}
+
+pub(crate) fn arrow_row_to_tantivy_doc(
+    batch: &RecordBatch,
+    resolved_columns: &[ResolvedColumn],
+    row_idx: usize,
+    tantivy_schema: &Schema,
     config: &SchemaDerivationConfig,
     string_hash_fields: &HashMap<String, String>,
     accumulators: &mut HashMap<String, StatisticsAccumulator>,
@@ -748,39 +800,20 @@ pub(crate) fn arrow_row_to_tantivy_doc(
 ) -> Result<TantivyDocument> {
     let mut doc = TantivyDocument::new();
 
-    for (col_idx, arrow_field) in batch_schema.fields().iter().enumerate() {
-        let parquet_col_name = arrow_field.name();
-
-        // Skip fields that were excluded from schema derivation
-        if config.skip_fields.contains(parquet_col_name.as_str()) {
-            continue;
-        }
-
-        // Resolve display name via name mapping
-        let tantivy_field_name = name_mapping
-            .get(parquet_col_name.as_str())
-            .map(|s| s.as_str())
-            .unwrap_or(parquet_col_name.as_str());
-
-        // Look up the field in the tantivy schema
-        let field = match tantivy_schema.get_field(tantivy_field_name) {
-            Ok(f) => f,
-            Err(_) => continue, // Field not in tantivy schema (unsupported type), skip
-        };
-
-        let array = batch.column(col_idx);
+    for rc in resolved_columns {
+        let array = batch.column(rc.col_idx);
 
         if array.is_null(row_idx) {
             // Record null for statistics
-            if let Some(acc) = accumulators.get_mut(tantivy_field_name) {
+            if let Some(acc) = accumulators.get_mut(&rc.tantivy_field_name) {
                 acc.observe_null();
             }
             continue; // Skip null values — tantivy handles absent fields natively
         }
 
         add_arrow_value_to_doc(
-            &mut doc, field, array, arrow_field.data_type(), row_idx,
-            tantivy_field_name, config, string_hash_fields, tantivy_schema,
+            &mut doc, rc.field, array, array.data_type(), row_idx,
+            &rc.tantivy_field_name, config, string_hash_fields, tantivy_schema,
             accumulators, string_indexing_modes, compiled_regexes,
         )?;
     }
@@ -926,14 +959,19 @@ pub(crate) fn add_arrow_value_to_doc(
         }
 
         DataType::Timestamp(unit, _tz) => {
+            // Convert to micros with checked arithmetic — extreme values from an
+            // untrusted parquet file would otherwise overflow (panic in debug,
+            // silently wrong date in release).
             let micros = match unit {
                 TimeUnit::Second => {
                     let arr = array.as_any().downcast_ref::<TimestampSecondArray>().ok_or_else(|| anyhow::anyhow!("Expected TimestampSecondArray array"))?;
-                    arr.value(row_idx) * 1_000_000
+                    arr.value(row_idx).checked_mul(1_000_000)
+                        .ok_or_else(|| anyhow::anyhow!("Timestamp seconds overflow converting to micros"))?
                 }
                 TimeUnit::Millisecond => {
                     let arr = array.as_any().downcast_ref::<TimestampMillisecondArray>().ok_or_else(|| anyhow::anyhow!("Expected TimestampMillisecondArray array"))?;
-                    arr.value(row_idx) * 1_000
+                    arr.value(row_idx).checked_mul(1_000)
+                        .ok_or_else(|| anyhow::anyhow!("Timestamp millis overflow converting to micros"))?
                 }
                 TimeUnit::Microsecond => {
                     let arr = array.as_any().downcast_ref::<TimestampMicrosecondArray>().ok_or_else(|| anyhow::anyhow!("Expected TimestampMicrosecondArray array"))?;
@@ -954,7 +992,8 @@ pub(crate) fn add_arrow_value_to_doc(
         DataType::Date32 => {
             let arr = array.as_any().downcast_ref::<Date32Array>().ok_or_else(|| anyhow::anyhow!("Expected Date32Array array"))?;
             let days = arr.value(row_idx) as i64;
-            let micros = days * 86_400 * 1_000_000;
+            let micros = days.checked_mul(86_400 * 1_000_000)
+                .ok_or_else(|| anyhow::anyhow!("Date32 overflow converting to micros"))?;
             let dt = tantivy::DateTime::from_timestamp_micros(micros);
             doc.add_date(field, dt);
             if let Some(acc) = accumulators.get_mut(field_name) {
@@ -964,7 +1003,8 @@ pub(crate) fn add_arrow_value_to_doc(
         DataType::Date64 => {
             let arr = array.as_any().downcast_ref::<Date64Array>().ok_or_else(|| anyhow::anyhow!("Expected Date64Array array"))?;
             let millis = arr.value(row_idx);
-            let micros = millis * 1_000;
+            let micros = millis.checked_mul(1_000)
+                .ok_or_else(|| anyhow::anyhow!("Date64 overflow converting to micros"))?;
             let dt = tantivy::DateTime::from_timestamp_micros(micros);
             doc.add_date(field, dt);
             if let Some(acc) = accumulators.get_mut(field_name) {
@@ -988,8 +1028,11 @@ pub(crate) fn add_arrow_value_to_doc(
             let val = if *scale == 0 {
                 raw.to_string()
             } else {
-                let f: f64 = raw.to_string().parse::<f64>().unwrap_or(0.0)
-                    / 10f64.powi(*scale as i32);
+                // Scale via f64. A parse failure means the i256 exceeded f64 range;
+                // surface it as an error rather than silently producing 0.0.
+                let parsed = raw.to_string().parse::<f64>()
+                    .map_err(|e| anyhow::anyhow!("Failed to parse Decimal256 value '{}' as f64: {}", raw, e))?;
+                let f: f64 = parsed / 10f64.powi(*scale as i32);
                 f.to_string()
             };
             doc.add_text(field, &val);
@@ -1169,107 +1212,10 @@ fn add_json_string_value(
     Ok(())
 }
 
-/// Convert a complex Arrow type (List, Map, Struct) at a given row to a JSON value.
-///
-/// **Deprecated**: Prefer `convert_arrow_to_owned_value` which produces `OwnedValue` directly
-/// without the Arrow → serde_json::Value → String → OwnedValue round-trip.
-/// This function is retained for the TANT binary serialization path where a JSON string
-/// representation is still needed.
-pub(crate) fn convert_complex_to_json(array: &ArrayRef, row_idx: usize) -> Result<serde_json::Value> {
-    use arrow_array::*;
-    use arrow_schema::DataType;
-
-    if array.is_null(row_idx) {
-        return Ok(serde_json::Value::Null);
-    }
-
-    match array.data_type() {
-        DataType::List(_) | DataType::LargeList(_) => {
-            // Try ListArray first, then LargeListArray
-            if let Some(list_arr) = array.as_any().downcast_ref::<ListArray>() {
-                let inner = list_arr.value(row_idx);
-                let mut items = Vec::new();
-                for i in 0..inner.len() {
-                    items.push(convert_complex_to_json(&inner, i)?);
-                }
-                Ok(serde_json::Value::Array(items))
-            } else if let Some(list_arr) = array.as_any().downcast_ref::<LargeListArray>() {
-                let inner = list_arr.value(row_idx);
-                let mut items = Vec::new();
-                for i in 0..inner.len() {
-                    items.push(convert_complex_to_json(&inner, i)?);
-                }
-                Ok(serde_json::Value::Array(items))
-            } else {
-                Ok(serde_json::Value::Null)
-            }
-        }
-
-        DataType::Struct(fields) => {
-            let struct_arr = array.as_any().downcast_ref::<StructArray>().ok_or_else(|| anyhow::anyhow!("Expected StructArray array"))?;
-            let mut map = serde_json::Map::new();
-            for (i, field) in fields.iter().enumerate() {
-                let col = struct_arr.column(i);
-                if !col.is_null(row_idx) {
-                    let val = convert_complex_to_json(col, row_idx)?;
-                    map.insert(field.name().clone(), val);
-                }
-            }
-            Ok(serde_json::Value::Object(map))
-        }
-
-        // Scalar types inside complex types
-        DataType::Boolean => {
-            let arr = array.as_any().downcast_ref::<BooleanArray>().ok_or_else(|| anyhow::anyhow!("Expected BooleanArray array"))?;
-            Ok(serde_json::Value::Bool(arr.value(row_idx)))
-        }
-        DataType::Int32 => {
-            let arr = array.as_any().downcast_ref::<Int32Array>().ok_or_else(|| anyhow::anyhow!("Expected Int32Array array"))?;
-            Ok(serde_json::json!(arr.value(row_idx)))
-        }
-        DataType::Int64 => {
-            let arr = array.as_any().downcast_ref::<Int64Array>().ok_or_else(|| anyhow::anyhow!("Expected Int64Array array"))?;
-            Ok(serde_json::json!(arr.value(row_idx)))
-        }
-        DataType::Float64 => {
-            let arr = array.as_any().downcast_ref::<Float64Array>().ok_or_else(|| anyhow::anyhow!("Expected Float64Array array"))?;
-            Ok(serde_json::json!(arr.value(row_idx)))
-        }
-        DataType::Utf8 => {
-            let arr = array.as_any().downcast_ref::<StringArray>().ok_or_else(|| anyhow::anyhow!("Expected StringArray array"))?;
-            Ok(serde_json::Value::String(arr.value(row_idx).to_string()))
-        }
-        DataType::Decimal128(_, scale) => {
-            let arr = array.as_any().downcast_ref::<Decimal128Array>().ok_or_else(|| anyhow::anyhow!("Expected Decimal128Array array"))?;
-            let raw = arr.value(row_idx) as f64;
-            let val = raw / 10f64.powi(*scale as i32);
-            Ok(serde_json::json!(val))
-        }
-        DataType::Decimal256(_, scale) => {
-            let arr = array.as_any().downcast_ref::<Decimal256Array>().ok_or_else(|| anyhow::anyhow!("Expected Decimal256Array array"))?;
-            let raw = arr.value(row_idx);
-            let val: f64 = raw.to_string().parse::<f64>().unwrap_or(0.0)
-                / 10f64.powi(*scale as i32);
-            Ok(serde_json::json!(val))
-        }
-        DataType::FixedSizeBinary(_) => {
-            let arr = array.as_any().downcast_ref::<FixedSizeBinaryArray>().ok_or_else(|| anyhow::anyhow!("Expected FixedSizeBinaryArray array"))?;
-            Ok(serde_json::Value::String(base64::Engine::encode(
-                &base64::engine::general_purpose::STANDARD,
-                arr.value(row_idx),
-            )))
-        }
-
-        _ => Ok(serde_json::Value::Null),
-    }
-}
-
 /// Convert an Arrow array value directly to tantivy `OwnedValue`, bypassing JSON serialization.
 ///
-/// This is the Arrow-native replacement for the previous pipeline:
-///   `convert_complex_to_json` → `serde_json::to_string` → `serde_json::from_str::<OwnedValue>`
-///
-/// By constructing `OwnedValue` directly from Arrow arrays, we eliminate:
+/// This replaced a previous pipeline that went Arrow → serde_json::Value → String →
+/// OwnedValue. By constructing `OwnedValue` directly from Arrow arrays, we eliminate:
 /// - serde_json::Value tree allocation
 /// - JSON string serialization
 /// - JSON string re-parsing back to OwnedValue
@@ -1439,22 +1385,28 @@ pub(crate) fn convert_arrow_to_owned_value(
             let arr = array.as_any().downcast_ref::<Decimal256Array>()
                 .ok_or_else(|| anyhow::anyhow!("Expected Decimal256Array"))?;
             let raw = arr.value(row_idx);
-            let val: f64 = raw.to_string().parse::<f64>().unwrap_or(0.0)
-                / 10f64.powi(*scale as i32);
+            // A parse failure means the i256 exceeded f64 range; surface it as an
+            // error rather than silently producing 0.0.
+            let parsed = raw.to_string().parse::<f64>()
+                .map_err(|e| anyhow::anyhow!("Failed to parse Decimal256 value '{}' as f64: {}", raw, e))?;
+            let val: f64 = parsed / 10f64.powi(*scale as i32);
             Ok(OwnedValue::F64(val))
         }
 
         DataType::Timestamp(unit, _) => {
+            // Checked conversion to micros — avoid overflow on extreme untrusted input.
             let micros = match unit {
                 TimeUnit::Second => {
                     let arr = array.as_any().downcast_ref::<TimestampSecondArray>()
                         .ok_or_else(|| anyhow::anyhow!("Expected TimestampSecondArray"))?;
-                    arr.value(row_idx) * 1_000_000
+                    arr.value(row_idx).checked_mul(1_000_000)
+                        .ok_or_else(|| anyhow::anyhow!("Timestamp seconds overflow converting to micros"))?
                 }
                 TimeUnit::Millisecond => {
                     let arr = array.as_any().downcast_ref::<TimestampMillisecondArray>()
                         .ok_or_else(|| anyhow::anyhow!("Expected TimestampMillisecondArray"))?;
-                    arr.value(row_idx) * 1_000
+                    arr.value(row_idx).checked_mul(1_000)
+                        .ok_or_else(|| anyhow::anyhow!("Timestamp millis overflow converting to micros"))?
                 }
                 TimeUnit::Microsecond => {
                     let arr = array.as_any().downcast_ref::<TimestampMicrosecondArray>()
@@ -1473,13 +1425,15 @@ pub(crate) fn convert_arrow_to_owned_value(
         DataType::Date32 => {
             let arr = array.as_any().downcast_ref::<Date32Array>()
                 .ok_or_else(|| anyhow::anyhow!("Expected Date32Array"))?;
-            let micros = arr.value(row_idx) as i64 * 86_400 * 1_000_000;
+            let micros = (arr.value(row_idx) as i64).checked_mul(86_400 * 1_000_000)
+                .ok_or_else(|| anyhow::anyhow!("Date32 overflow converting to micros"))?;
             Ok(OwnedValue::Date(tantivy::DateTime::from_timestamp_micros(micros)))
         }
         DataType::Date64 => {
             let arr = array.as_any().downcast_ref::<Date64Array>()
                 .ok_or_else(|| anyhow::anyhow!("Expected Date64Array"))?;
-            let micros = arr.value(row_idx) * 1_000;
+            let micros = arr.value(row_idx).checked_mul(1_000)
+                .ok_or_else(|| anyhow::anyhow!("Date64 overflow converting to micros"))?;
             Ok(OwnedValue::Date(tantivy::DateTime::from_timestamp_micros(micros)))
         }
 

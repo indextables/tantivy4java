@@ -136,6 +136,26 @@ pub fn combine_parquet_manifests(
         cumulative_rows += manifest.total_rows;
     }
 
+    // Reject duplicate relative paths across the merged manifests. Because
+    // table_root is not persisted, two splits built over different tables whose
+    // files share a relative name would collide in `build_file_hash_index` (a
+    // HashMap keyed by path hash keeps only the last entry), silently resolving
+    // documents to the wrong parquet file.
+    {
+        let mut seen = std::collections::HashSet::with_capacity(combined_files.len());
+        for file in &combined_files {
+            if !seen.insert(file.relative_path.as_str()) {
+                anyhow::bail!(
+                    "Cannot merge splits: duplicate parquet file relative path '{}' \
+                     across source manifests. Relative paths must be unique because \
+                     table_root is not persisted and doc→parquet resolution keys on \
+                     the path hash.",
+                    file.relative_path
+                );
+            }
+        }
+    }
+
     // Rebuild segment_row_ranges: merged = single segment covering all rows
     let merged_segment_ranges = vec![SegmentRowRange {
         segment_ord: 0,

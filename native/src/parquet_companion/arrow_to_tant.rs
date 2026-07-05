@@ -164,8 +164,11 @@ fn write_arrow_value_to_tant(
             let s = if *scale == 0 {
                 raw.to_string()
             } else {
-                let val: f64 =
-                    raw.to_string().parse::<f64>().unwrap_or(0.0) / 10f64.powi(*scale as i32);
+                // Scale via f64. A parse failure means the i256 exceeded f64 range;
+                // surface it as an error rather than silently producing 0.0.
+                let parsed = raw.to_string().parse::<f64>()
+                    .map_err(|e| anyhow::anyhow!("Failed to parse Decimal256 value '{}' as f64: {}", raw, e))?;
+                let val: f64 = parsed / 10f64.powi(*scale as i32);
                 val.to_string()
             };
             let bytes = s.as_bytes();
@@ -246,12 +249,20 @@ fn write_arrow_value_to_tant(
         }
         DataType::Date32 => {
             let arr = array.as_any().downcast_ref::<Date32Array>().ok_or_else(|| anyhow::anyhow!("Expected Date32Array array"))?;
-            let nanos = arr.value(row_idx) as i64 * 86_400 * 1_000_000_000;
+            // Days since epoch → nanos. Use checked arithmetic: an extreme Date32
+            // from an untrusted parquet file would otherwise overflow (panic in
+            // debug, silently wrong date in release).
+            let nanos = (arr.value(row_idx) as i64)
+                .checked_mul(86_400 * 1_000_000_000)
+                .ok_or_else(|| anyhow::anyhow!("Date32 overflow converting to nanos"))?;
             buf.extend_from_slice(&nanos.to_ne_bytes());
         }
         DataType::Date64 => {
             let arr = array.as_any().downcast_ref::<Date64Array>().ok_or_else(|| anyhow::anyhow!("Expected Date64Array array"))?;
-            let nanos = arr.value(row_idx) * 1_000_000;
+            // Millis since epoch → nanos, checked to avoid overflow on extreme input.
+            let nanos = arr.value(row_idx)
+                .checked_mul(1_000_000)
+                .ok_or_else(|| anyhow::anyhow!("Date64 overflow converting to nanos"))?;
             buf.extend_from_slice(&nanos.to_ne_bytes());
         }
         DataType::List(_)
@@ -786,11 +797,38 @@ pub async fn batch_parquet_to_tant_buffer_by_groups(
             }
         }
 
-        // Pair rows with original indices
-        let mut drain_iter = collected_rows.drain(..);
-        for (original_idx, _) in &rows {
-            let data = drain_iter.next().unwrap_or_default();
-            doc_buffers[*original_idx] = Some(data);
+        // Pair decoded rows with original indices.
+        //
+        // `rows` is sorted by row_in_file and may contain duplicate rows (the same
+        // parquet row requested by multiple doc addresses in one batch). The
+        // RowSelection selects each physical row exactly once, so `collected_rows`
+        // holds one buffer per DISTINCT requested row, in sorted order. Walk runs
+        // of equal rows, assigning each decoded buffer to every original index in
+        // the run (cloning for all but the last so the common all-distinct case
+        // stays clone-free).
+        let mut buf_iter = collected_rows.into_iter();
+        let mut i = 0usize;
+        while i < rows.len() {
+            let row = rows[i].1;
+            let mut j = i + 1;
+            while j < rows.len() && rows[j].1 == row {
+                j += 1;
+            }
+            let data = buf_iter.next().ok_or_else(|| anyhow::anyhow!(
+                "Parquet decode row-count mismatch: fewer rows decoded than \
+                 requested (doc→row alignment would be corrupted)"
+            ))?;
+            for k in i..j - 1 {
+                doc_buffers[rows[k].0] = Some(data.clone());
+            }
+            doc_buffers[rows[j - 1].0] = Some(data);
+            i = j;
+        }
+        if buf_iter.next().is_some() {
+            anyhow::bail!(
+                "Parquet decode row-count mismatch: more rows decoded than \
+                 distinct rows requested (doc→row alignment would be corrupted)"
+            );
         }
     }
     if crate::ffi_profiler::is_enabled() {

@@ -273,12 +273,22 @@ pub async fn build_hash_resolution_map(
             .extend(hashes.into_iter().filter(|h| hash_to_doc.contains_key(h)));
     }
 
-    let mut all_resolutions: HashMap<u64, String> = HashMap::new();
+    // Phase A: resolve each unique hash → (file_idx, row_in_file, field) synchronously
+    // using the O(1) __pq column cache (with manifest-based fallback). Deduplicate by
+    // hash so each hash triggers at most one parquet read.
+    struct ReadTask {
+        hash_val: u64,
+        field: String,
+        file_idx: usize,
+        row_in_file: u64,
+    }
+    let mut read_tasks: Vec<ReadTask> = Vec::new();
+    let mut resolved_seen: HashSet<u64> = HashSet::new();
 
     for (original_field_name, hashes) in &field_to_hashes {
         for hash_val in hashes {
-            if all_resolutions.contains_key(hash_val) {
-                continue; // already resolved
+            if !resolved_seen.insert(*hash_val) {
+                continue; // already scheduled for this hash
             }
 
             let (seg_ord, doc_id) = match hash_to_doc.get(hash_val) {
@@ -334,11 +344,28 @@ pub async fn build_hash_resolution_map(
                 None => continue,
             };
 
-            let fields_to_read = vec![original_field_name.clone()];
-            match crate::parquet_companion::doc_retrieval::retrieve_document_by_location(
-                manifest,
+            read_tasks.push(ReadTask {
+                hash_val: *hash_val,
+                field: original_field_name.clone(),
                 file_idx,
                 row_in_file,
+            });
+        }
+    }
+
+    // Phase B: run the parquet reads concurrently. The reads are independent, and
+    // the shared metadata / byte-range caches deduplicate overlapping fetches, so
+    // running them with bounded concurrency turns N serial S3/Azure round trips
+    // into ceil(N / CONCURRENCY) waves.
+    use futures::StreamExt;
+    const HASH_TOUCHUP_READ_CONCURRENCY: usize = 16;
+    let resolutions: Vec<Option<(u64, String)>> = futures::stream::iter(
+        read_tasks.into_iter().map(|task| async move {
+            let fields_to_read = vec![task.field.clone()];
+            match crate::parquet_companion::doc_retrieval::retrieve_document_by_location(
+                manifest,
+                task.file_idx,
+                task.row_in_file,
                 Some(&fields_to_read),
                 parquet_storage,
                 Some(parquet_metadata_cache),
@@ -347,18 +374,24 @@ pub async fn build_hash_resolution_map(
             )
             .await
             {
-                Ok(doc_map) => {
-                    if let Some(val) = doc_map.get(original_field_name) {
-                        if let Some(s) = val.as_str() {
-                            all_resolutions.insert(*hash_val, s.to_string());
-                        }
-                    }
-                }
+                Ok(doc_map) => doc_map
+                    .get(&task.field)
+                    .and_then(|v| v.as_str())
+                    .map(|s| (task.hash_val, s.to_string())),
                 Err(e) => {
                     debug_println!("⚠️ HASH_TOUCHUP: Failed to read parquet cell: {}", e);
+                    None
                 }
             }
-        }
+        }),
+    )
+    .buffer_unordered(HASH_TOUCHUP_READ_CONCURRENCY)
+    .collect()
+    .await;
+
+    let mut all_resolutions: HashMap<u64, String> = HashMap::new();
+    for (hash_val, value) in resolutions.into_iter().flatten() {
+        all_resolutions.insert(hash_val, value);
     }
 
     if crate::ffi_profiler::is_enabled() {

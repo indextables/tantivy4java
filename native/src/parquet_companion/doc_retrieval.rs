@@ -624,7 +624,20 @@ pub(crate) fn build_row_selection_for_rows_in_selected_groups(
             selectors.push(RowSelector::select(1));
             current_pos = absolute_pos + 1;
 
+            // Consume this row and any duplicate occurrences of it. A RowSelection
+            // is a forward-only cursor and cannot re-select the same physical row;
+            // emitting a second select(1) for a duplicate would instead select the
+            // adjacent row and return wrong data. Duplicates (same parquet row
+            // requested by multiple doc addresses) are handled by the caller when
+            // pairing decoded rows back to original indices.
             row_iter.next();
+            while let Some(&&next) = row_iter.peek() {
+                if next == file_row {
+                    row_iter.next();
+                } else {
+                    break;
+                }
+            }
         }
     }
 

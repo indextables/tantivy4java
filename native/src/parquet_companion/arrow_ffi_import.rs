@@ -72,6 +72,11 @@ pub(crate) struct ArrowFfiSplitContext {
     /// Column names for which to compute min/max statistics (empty = none).
     /// Populated from the "stats" flag in fieldConfigJson.
     stats_columns: std::collections::HashSet<String>,
+    /// Split config (index_uid/source_id/node_id/tags) applied to every split this
+    /// session produces. Single source of truth so that auto-rolled splits (during
+    /// addArrowBatch), explicitly-rolled splits, and the final splits all share the
+    /// same identity — they must never diverge depending on when a split was rolled.
+    split_config: SplitConfig,
 }
 
 /// Per-partition state: each partition gets its own Index + IndexWriter + temp dir.
@@ -320,6 +325,7 @@ pub(crate) fn begin_split_from_arrow(
         output_dir,
         rolled_splits: Vec::new(),
         stats_columns,
+        split_config: default_split_config("arrow-ffi", "arrow-ffi-source", "arrow-ffi-node"),
     })
 }
 
@@ -550,7 +556,10 @@ impl PrebuiltComplexColumns {
 ///
 /// Returns cumulative total doc count across all partitions.
 pub(crate) async fn add_arrow_batch(ctx: &mut ArrowFfiSplitContext, batch: &RecordBatch) -> Result<u64> {
-    // Validate schema matches
+    // Validate schema matches. Checking only the column count is not enough: a
+    // batch with the same arity but reordered (or renamed) columns of compatible
+    // types would otherwise be indexed under the wrong field names, silently
+    // corrupting the data. Verify each column's name and type positionally.
     let batch_schema = batch.schema();
     if batch_schema.fields().len() != ctx.arrow_schema.fields().len() {
         bail!(
@@ -558,6 +567,24 @@ pub(crate) async fn add_arrow_batch(ctx: &mut ArrowFfiSplitContext, batch: &Reco
             ctx.arrow_schema.fields().len(),
             batch_schema.fields().len()
         );
+    }
+    for (i, (expected, actual)) in ctx.arrow_schema.fields().iter()
+        .zip(batch_schema.fields().iter())
+        .enumerate()
+    {
+        if expected.name() != actual.name() {
+            bail!(
+                "Schema mismatch at column {}: expected field '{}', got '{}' \
+                 (columns must match the schema declared at beginSplitFromArrow)",
+                i, expected.name(), actual.name()
+            );
+        }
+        if expected.data_type() != actual.data_type() {
+            bail!(
+                "Schema mismatch for column '{}': expected type {:?}, got {:?}",
+                expected.name(), expected.data_type(), actual.data_type()
+            );
+        }
     }
 
     // Use the config from context (populated from field_config_json if provided)
@@ -575,7 +602,8 @@ pub(crate) async fn add_arrow_batch(ctx: &mut ArrowFfiSplitContext, batch: &Reco
     let prebuilt = PrebuiltComplexColumns::build(batch, &ctx.field_mapping)?;
 
     let max_docs = ctx.max_docs_per_split;
-    let split_config = default_split_config("arrow-ffi", "arrow-ffi-source", "arrow-ffi-node");
+    // Use the session's single split config so auto-rolled splits match the final ones.
+    let split_config = ctx.split_config.clone();
 
     if ctx.partition_col_indices.is_empty() {
         // Non-partitioned path: add all rows to default writer
@@ -943,8 +971,11 @@ async fn finalize_partition_writer_into_split(
 pub(crate) async fn finish_all_splits(
     mut ctx: ArrowFfiSplitContext,
     output_dir: &str,
-    split_config: &SplitConfig,
 ) -> Result<Vec<PartitionSplitResult>> {
+    // Use the session's single split config (same one applied to auto-rolled splits)
+    // so every split in the session shares one identity.
+    let split_config = ctx.split_config.clone();
+    let split_config = &split_config;
     // Start with any splits that were auto-rolled during addArrowBatch
     let mut results = std::mem::take(&mut ctx.rolled_splits);
 
@@ -988,8 +1019,10 @@ pub(crate) async fn roll_partition_split(
     ctx: &mut ArrowFfiSplitContext,
     partition_key: &str,
     output_dir: &str,
-    split_config: &SplitConfig,
 ) -> Result<PartitionSplitResult> {
+    // Use the session's single split config so rolled splits match the final ones.
+    let split_config = ctx.split_config.clone();
+    let split_config = &split_config;
     // Take the writer out of the context
     let (pw, partition_values) = if partition_key.is_empty() {
         // Non-partitioned: take default_writer
@@ -1176,9 +1209,8 @@ mod tests {
             add_arrow_batch(&mut ctx, &batch).await.unwrap();
 
             let output_dir = tempfile::tempdir().unwrap();
-            let split_config = default_split_config("test-index", "test-source", "test-node");
 
-            let results = finish_all_splits(ctx, output_dir.path().to_str().unwrap(), &split_config).await.unwrap();
+            let results = finish_all_splits(ctx, output_dir.path().to_str().unwrap()).await.unwrap();
 
             assert_eq!(results.len(), 1);
             let result = &results[0];
@@ -1282,9 +1314,8 @@ mod tests {
             add_arrow_batch(&mut ctx, &batch).await.unwrap();
 
             let output_dir = tempfile::tempdir().unwrap();
-            let split_config = default_split_config("test-index", "test-source", "test-node");
 
-            let results = finish_all_splits(ctx, output_dir.path().to_str().unwrap(), &split_config).await.unwrap();
+            let results = finish_all_splits(ctx, output_dir.path().to_str().unwrap()).await.unwrap();
 
             assert_eq!(results.len(), 1);
             assert_eq!(results[0].partition_key, "event_date=2023-01-15");
@@ -1311,9 +1342,8 @@ mod tests {
             add_arrow_batch(&mut ctx, &batch).await.unwrap();
 
             let output_dir = tempfile::tempdir().unwrap();
-            let split_config = default_split_config("test-index", "test-source", "test-node");
 
-            let results = finish_all_splits(ctx, output_dir.path().to_str().unwrap(), &split_config).await.unwrap();
+            let results = finish_all_splits(ctx, output_dir.path().to_str().unwrap()).await.unwrap();
 
             assert_eq!(results.len(), 3);
 
@@ -1357,9 +1387,8 @@ mod tests {
             add_arrow_batch(&mut ctx, &batch3).await.unwrap();
 
             let output_dir = tempfile::tempdir().unwrap();
-            let split_config = default_split_config("test-index", "test-source", "test-node");
 
-            let results = finish_all_splits(ctx, output_dir.path().to_str().unwrap(), &split_config).await.unwrap();
+            let results = finish_all_splits(ctx, output_dir.path().to_str().unwrap()).await.unwrap();
 
             assert_eq!(results.len(), 2);
 
@@ -1426,9 +1455,8 @@ mod tests {
             add_arrow_batch(&mut ctx, &batch).await.unwrap();
 
             let output_dir = tempfile::tempdir().unwrap();
-            let split_config = default_split_config("test-index", "test-source", "test-node");
 
-            let results = finish_all_splits(ctx, output_dir.path().to_str().unwrap(), &split_config).await.unwrap();
+            let results = finish_all_splits(ctx, output_dir.path().to_str().unwrap()).await.unwrap();
 
             // 3 distinct partition combinations
             assert_eq!(results.len(), 3);
@@ -1465,8 +1493,7 @@ mod tests {
             add_arrow_batch(&mut ctx, &batch2).await.unwrap();
 
             let output_dir = tempfile::tempdir().unwrap();
-            let split_config = default_split_config("test", "test-source", "test-node");
-            let results = finish_all_splits(ctx, output_dir.path().to_str().unwrap(), &split_config).await.unwrap();
+            let results = finish_all_splits(ctx, output_dir.path().to_str().unwrap()).await.unwrap();
 
             assert_eq!(results.len(), 1);
             let result = &results[0];
@@ -1503,8 +1530,7 @@ mod tests {
             add_arrow_batch(&mut ctx, &batch).await.unwrap();
 
             let output_dir = tempfile::tempdir().unwrap();
-            let split_config = default_split_config("test", "test-source", "test-node");
-            let results = finish_all_splits(ctx, output_dir.path().to_str().unwrap(), &split_config).await.unwrap();
+            let results = finish_all_splits(ctx, output_dir.path().to_str().unwrap()).await.unwrap();
 
             assert_eq!(results.len(), 1);
             // No statistics when not enabled
@@ -1539,8 +1565,7 @@ mod tests {
             add_arrow_batch(&mut ctx, &batch).await.unwrap();
 
             let output_dir = tempfile::tempdir().unwrap();
-            let split_config = default_split_config("test", "test-source", "test-node");
-            let results = finish_all_splits(ctx, output_dir.path().to_str().unwrap(), &split_config).await.unwrap();
+            let results = finish_all_splits(ctx, output_dir.path().to_str().unwrap()).await.unwrap();
 
             assert_eq!(results.len(), 2);
 

@@ -1800,12 +1800,11 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_merge_QuickwitSpli
             .into_inner()
             .map_err(|e| anyhow!("Failed to unwrap mutex: {}", e))?;
 
-        // Create a default SplitConfig (JNI layer uses defaults; future: accept from Java)
-        let split_config = default_split_config("arrow-ffi", "arrow-ffi-source", "arrow-ffi-node");
-
-        // Run async finish in tokio runtime
+        // The split config is a single source of truth stored in the context at
+        // begin time; finish_all_splits reads it directly so every split in the
+        // session (auto-rolled and final) shares the same identity.
         let results = QuickwitRuntimeManager::global().handle()
-            .block_on(finish_all_splits(ctx, &output_dir_str, &split_config))?;
+            .block_on(finish_all_splits(ctx, &output_dir_str))?;
 
         // Convert results to Java ArrayList<HashMap<String, Object>>
         let array_list_class = env.find_class("java/util/ArrayList")?;
@@ -2005,11 +2004,10 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_merge_QuickwitSpli
         let mut ctx = ctx_arc.lock()
             .map_err(|e| anyhow!("Failed to lock context: {}", e))?;
 
-        let split_config = default_split_config("arrow-ffi", "arrow-ffi-source", "arrow-ffi-node");
-
+        // Split config comes from the context (single source of truth set at begin).
         let result = QuickwitRuntimeManager::global().handle()
             .block_on(roll_partition_split(
-                &mut ctx, &partition_key_str, &output_dir_str, &split_config,
+                &mut ctx, &partition_key_str, &output_dir_str,
             ))?;
 
         // Convert single result to Java HashMap<String, Object>

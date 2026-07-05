@@ -559,6 +559,19 @@ pub(crate) fn write_batch_to_ffi(
             _ => orig_field.as_ref().clone(),
         };
 
+        // Perform the fallible schema conversion BEFORE exporting the array. If it
+        // ran after the array write, a conversion failure (via `?`) would strand an
+        // already-exported FFI_ArrowArray in consumer memory with a live release
+        // callback the consumer never learns to invoke — a leaked Arrow buffer.
+        let ffi_schema = FFI_ArrowSchema::try_from(&export_field).map_err(|e| {
+            anyhow::anyhow!(
+                "FFI_ArrowSchema conversion failed for column {}: {}",
+                i,
+                e
+            )
+        })?;
+        let ffi_array = FFI_ArrowArray::new(&data);
+
         unsafe {
             // Write new FFI data directly — do NOT read+drop previous contents.
             //
@@ -572,17 +585,11 @@ pub(crate) fn write_batch_to_ffi(
             // batch. We just overwrite with new data. The consumer must have
             // already released any previous batch before calling back into this
             // function — failing to do so will leak the previous Arrow arrays.
-            std::ptr::write_unaligned(array_ptr, FFI_ArrowArray::new(&data));
-            std::ptr::write_unaligned(
-                schema_ptr,
-                FFI_ArrowSchema::try_from(&export_field).map_err(|e| {
-                    anyhow::anyhow!(
-                        "FFI_ArrowSchema conversion failed for column {}: {}",
-                        i,
-                        e
-                    )
-                })?,
-            );
+            //
+            // Both writes below are infallible, so a column is never left with its
+            // array exported but its schema missing.
+            std::ptr::write_unaligned(array_ptr, ffi_array);
+            std::ptr::write_unaligned(schema_ptr, ffi_schema);
         }
     }
 
