@@ -467,11 +467,14 @@ async fn transcode_str_columns_direct(
                             collector.non_null_doc_ids.push(doc_id);
                         }
                     }
-                    DataType::Decimal256(_, _) => {
-                        // Decimal256 maps to a tantivy "Str" field (values exceed
-                        // f64 range). Serialize each value to its decimal string so
-                        // the field is served from parquet instead of hard-erroring
-                        // at query time in Hybrid mode (M4).
+                    DataType::Decimal256(_, scale) => {
+                        // Decimal256 maps to a tantivy "Str" field. Serve it from
+                        // parquet instead of hard-erroring in Hybrid (M4). CRITICAL:
+                        // format EXACTLY as the native indexing path (indexing.rs)
+                        // and doc retrieval (doc_retrieval.rs) do — scale 0 → raw
+                        // i256 string, else the lossy f64 form — otherwise the
+                        // transcoded fast-field term would never match the indexed
+                        // term or the retrieved value for the same row.
                         let dec = array.as_any().downcast_ref::<arrow_array::Decimal256Array>()
                             .context("Expected Decimal256Array for Decimal256 column")?;
                         for row in 0..dec.len() {
@@ -480,7 +483,15 @@ async fn transcode_str_columns_direct(
                                 collector.has_nulls = true;
                                 continue;
                             }
-                            let s = dec.value_as_string(row);
+                            let raw = dec.value(row); // i256
+                            let s = if *scale == 0 {
+                                raw.to_string()
+                            } else {
+                                let parsed = raw.to_string().parse::<f64>().map_err(|e| {
+                                    anyhow::anyhow!("Failed to parse Decimal256 value '{}' as f64: {}", raw, e)
+                                })?;
+                                (parsed / 10f64.powi(*scale as i32)).to_string()
+                            };
                             let bytes = s.as_bytes();
                             let ord = if let Some(&existing) = collector.dict.get(bytes) {
                                 existing
