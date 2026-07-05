@@ -73,9 +73,16 @@ fn validate_resolved_field_names(
     config: &SchemaDerivationConfig,
     name_mapping: Option<&HashMap<String, String>>,
 ) -> Result<()> {
-    use super::indexing::{PARQUET_FILE_HASH_FIELD, PARQUET_ROW_IN_FILE_FIELD, PHASH_FIELD_PREFIX};
-    use super::string_indexing::COMPANION_SUFFIX;
+    use super::indexing::{PARQUET_FILE_HASH_FIELD, PARQUET_ROW_IN_FILE_FIELD};
 
+    // Only the two __pq_* row-tracking fields are added *unconditionally* at
+    // index time with no collision guard, so a user column with either exact
+    // name would panic in SchemaBuilder. The `_phash_<field>` and
+    // `<field>__uuids` companion fields are added conditionally and already
+    // handle collisions precisely at their creation site (indexing.rs disables
+    // the fingerprint for the shadowed field; add_field_for_arrow_type bails
+    // with a clean error), so a legitimately-named column like `session__uuids`
+    // or `_phash_temp` must NOT be rejected here.
     let mut seen: HashSet<&str> = HashSet::new();
     for field in arrow_schema.fields() {
         let parquet_name = field.name();
@@ -87,19 +94,13 @@ fn validate_resolved_field_names(
             .map(|s| s.as_str())
             .unwrap_or(parquet_name.as_str());
 
-        if resolved == PARQUET_FILE_HASH_FIELD
-            || resolved == PARQUET_ROW_IN_FILE_FIELD
-            || resolved.starts_with(PHASH_FIELD_PREFIX)
-            || resolved.ends_with(COMPANION_SUFFIX)
-        {
+        if resolved == PARQUET_FILE_HASH_FIELD || resolved == PARQUET_ROW_IN_FILE_FIELD {
             anyhow::bail!(
                 "Parquet column '{}' resolves to reserved tantivy field name '{}'. \
-                 Names equal to '{}'/'{}', starting with '{}', or ending with '{}' are \
-                 reserved for parquet companion internal fields; rename the column or \
-                 add a name mapping.",
+                 '{}' and '{}' are reserved for parquet companion row tracking; \
+                 rename the column or add a name mapping.",
                 parquet_name, resolved,
-                PARQUET_FILE_HASH_FIELD, PARQUET_ROW_IN_FILE_FIELD,
-                PHASH_FIELD_PREFIX, COMPANION_SUFFIX
+                PARQUET_FILE_HASH_FIELD, PARQUET_ROW_IN_FILE_FIELD
             );
         }
 
@@ -1506,14 +1507,28 @@ mod tests {
     }
 
     #[test]
-    fn test_reserved_phash_and_uuids_prefix_errors() {
-        for reserved in ["_phash_x", "trace__uuids", "__pq_row_in_file"] {
+    fn test_reserved_pq_row_field_name_errors() {
+        let arrow = ArrowSchema::new(vec![
+            Field::new("__pq_row_in_file", DataType::Utf8, true),
+        ]);
+        let config = SchemaDerivationConfig::default();
+        let err = derive_tantivy_schema(&arrow, &config).unwrap_err().to_string();
+        assert!(err.contains("reserved"), "got: {}", err);
+    }
+
+    #[test]
+    fn test_phash_and_uuids_named_columns_are_allowed() {
+        // These names are only reserved when a companion field would actually
+        // collide (handled precisely at field-creation time). As standalone
+        // user columns with no matching base field, they must be allowed.
+        for allowed in ["_phash_x", "trace__uuids"] {
             let arrow = ArrowSchema::new(vec![
-                Field::new(reserved, DataType::Utf8, true),
+                Field::new(allowed, DataType::Utf8, true),
             ]);
             let config = SchemaDerivationConfig::default();
-            let err = derive_tantivy_schema(&arrow, &config).unwrap_err().to_string();
-            assert!(err.contains("reserved"), "name {} — got: {}", reserved, err);
+            let schema = derive_tantivy_schema(&arrow, &config)
+                .unwrap_or_else(|e| panic!("name {} should be allowed: {}", allowed, e));
+            assert!(schema.get_field(allowed).is_ok());
         }
     }
 
