@@ -140,12 +140,22 @@ impl StorageWithPersistentCache {
     /// The segments may not cover the full requested range if there are gaps,
     /// but when called from fully_cached path, they should be contiguous.
     fn combine_segments(segments: &[CachedSegment], requested: &Range<u64>) -> OwnedBytes {
+        let total_len = (requested.end - requested.start) as usize;
+
+        // Fast path: a single segment that exactly covers the request (the common
+        // full-hit case). Guard on both start position and length so we never return
+        // a buffer shorter than the requested range.
         if segments.len() == 1 {
-            // Single segment - just return it
-            return segments[0].data.clone();
+            let seg = &segments[0];
+            if seg.range.start == requested.start && seg.data.len() == total_len {
+                return seg.data.clone();
+            }
         }
 
-        let total_len = (requested.end - requested.start) as usize;
+        // General path: assemble into a correctly-sized buffer. This is only reached
+        // on the fully_cached path, where the coalescer guarantees the segments tile
+        // the whole request with no holes; the length-correct buffer is defensive
+        // insurance against any residual coverage gap.
         let mut result = vec![0u8; total_len];
 
         for seg in segments {

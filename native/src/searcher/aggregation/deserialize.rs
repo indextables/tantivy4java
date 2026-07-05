@@ -88,7 +88,8 @@ pub(crate) fn deserialize_aggregation_results(
         postcard::from_bytes(intermediate_agg_bytes)?;
 
     // Step 3: Create aggregation limits (using reasonable defaults like Quickwit)
-    let aggregation_limits = AggregationLimitsGuard::new(Some(50_000_000), Some(65_000));
+    let (agg_mem_limit, agg_bucket_limit) = crate::global_cache::get_configured_aggregation_limits();
+    let aggregation_limits = AggregationLimitsGuard::new(Some(agg_mem_limit), Some(agg_bucket_limit));
 
     // Step 4: Convert to final results using Quickwit's proven method
     let final_results: AggregationResults =
@@ -329,10 +330,8 @@ pub(crate) fn find_specific_aggregation_result(
         };
 
     // Step 3: Create aggregation limits (using reasonable defaults like Quickwit)
-    let aggregation_limits = AggregationLimitsGuard::new(
-        Some(50_000_000), // 50MB memory limit
-        Some(65_000),     // 65k bucket limit
-    );
+    let (agg_mem_limit, agg_bucket_limit) = crate::global_cache::get_configured_aggregation_limits();
+    let aggregation_limits = AggregationLimitsGuard::new(Some(agg_mem_limit), Some(agg_bucket_limit));
 
     // Step 4: Convert to final results using Quickwit's proven method
     let final_results: AggregationResults =

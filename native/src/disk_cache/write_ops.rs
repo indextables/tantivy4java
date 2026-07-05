@@ -4,7 +4,7 @@
 #![allow(dead_code)]
 
 use std::collections::HashMap;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -14,6 +14,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use super::compression::compress_data;
 use super::lru::SplitLruTable;
 use super::manifest::{CacheManifest, SplitEntry, SplitState};
+use super::mmap_cache::MmapCache;
 use super::path_helpers::{cache_dir, component_path, split_dir};
 use super::range_index::CachedRange;
 use super::types::{ComponentEntry, DiskCacheConfig};
@@ -24,6 +25,7 @@ pub fn do_put(
     manifest: &RwLock<CacheManifest>,
     split_states: &RwLock<HashMap<String, SplitState>>,
     lru_table: &Mutex<SplitLruTable>,
+    mmap_cache: &Mutex<MmapCache>,
     total_bytes: &AtomicU64,
     storage_loc: &str,
     split_id: &str,
@@ -31,7 +33,7 @@ pub fn do_put(
     byte_range: Option<Range<u64>>,
     data: &[u8],
 ) -> io::Result<()> {
-    // Compress if appropriate
+    // Compress if appropriate (Cow — borrowed, no copy, on the uncompressed path)
     let (compressed, compression) = compress_data(config, component, data);
 
     // Create split directory
@@ -60,6 +62,14 @@ pub fn do_put(
     }
 
     fs::rename(&temp_path, &final_path)?;
+
+    // Drop any cached mmap of the destination AFTER the rename, so a subsequent read
+    // re-maps the new content rather than a stale mapping of the replaced inode.
+    // (Doing it before the rename would leave a window where a concurrent reader
+    // re-maps the old inode between the eviction and the rename.)
+    if let Ok(mut mc) = mmap_cache.lock() {
+        mc.remove(&final_path);
+    }
 
     // Update manifest
     let split_key = CacheManifest::split_key(storage_loc, split_id);
@@ -170,6 +180,7 @@ pub async fn do_put_async(
     manifest: &RwLock<CacheManifest>,
     split_states: &RwLock<HashMap<String, SplitState>>,
     lru_table: &Mutex<SplitLruTable>,
+    mmap_cache: &Mutex<MmapCache>,
     total_bytes: &AtomicU64,
     storage_loc: &str,
     split_id: &str,
@@ -179,7 +190,7 @@ pub async fn do_put_async(
 ) -> io::Result<()> {
     use tokio::io::AsyncWriteExt;
 
-    // Compress if appropriate (CPU-bound, but fast)
+    // Compress if appropriate (Cow — borrowed, no copy, on the uncompressed path)
     let (compressed, compression) = compress_data(config, component, data);
 
     // Create split directory
@@ -205,6 +216,12 @@ pub async fn do_put_async(
     }
 
     tokio::fs::rename(&temp_path, &final_path).await?;
+
+    // Drop any cached mmap of the destination AFTER the rename (see do_put for why),
+    // so a subsequent read re-maps the new content rather than a stale mapping.
+    if let Ok(mut mc) = mmap_cache.lock() {
+        mc.remove(&final_path);
+    }
 
     // Update manifest (sync - needs locking, but fast)
     let split_key = CacheManifest::split_key(storage_loc, split_id);
@@ -311,6 +328,7 @@ pub fn do_evict(
     manifest: &RwLock<CacheManifest>,
     split_states: &RwLock<HashMap<String, SplitState>>,
     lru_table: &Mutex<SplitLruTable>,
+    mmap_cache: &Mutex<MmapCache>,
     total_bytes: &AtomicU64,
     storage_loc: &str,
     split_id: &str,
@@ -327,6 +345,13 @@ pub fn do_evict(
             .map(|s| s.total_size_bytes)
             .unwrap_or(0)
     };
+
+    // Drop any cached mmaps of this split's files first, so removing the directory
+    // actually reclaims disk space (an open mapping pins the inode) and no stale
+    // mapping survives the eviction.
+    if let Ok(mut mc) = mmap_cache.lock() {
+        mc.remove_under_dir(&split_dir_path);
+    }
 
     // Remove directory
     if split_dir_path.exists() {
@@ -361,6 +386,7 @@ pub async fn do_evict_async(
     manifest: &RwLock<CacheManifest>,
     split_states: &RwLock<HashMap<String, SplitState>>,
     lru_table: &Mutex<SplitLruTable>,
+    mmap_cache: &Mutex<MmapCache>,
     total_bytes: &AtomicU64,
     storage_loc: &str,
     split_id: &str,
@@ -376,6 +402,12 @@ pub async fn do_evict_async(
             .map(|s| s.total_size_bytes)
             .unwrap_or(0)
     };
+
+    // Drop any cached mmaps of this split's files first, so removing the directory
+    // actually reclaims disk space and no stale mapping survives the eviction.
+    if let Ok(mut mc) = mmap_cache.lock() {
+        mc.remove_under_dir(&split_dir_path);
+    }
 
     // Async directory removal
     if tokio::fs::try_exists(&split_dir_path).await.unwrap_or(false) {
@@ -412,16 +444,21 @@ pub fn do_sync_manifest(
     let backup_path = cache_dir_path.join("manifest.json.bak");
     let temp_path = cache_dir_path.join("manifest.json.tmp");
 
-    // Serialize manifest
-    let manifest_data = {
+    // Snapshot the manifest under a brief write lock (just to stamp last_sync and
+    // clone), then serialize outside the lock. Serializing while holding the write
+    // lock would block every cache read/write for the whole (potentially large)
+    // serialization, which runs once a second while dirty. Compact JSON keeps the
+    // on-disk manifest small — it can hold one component entry per cached byte range.
+    let snapshot = {
         let mut manifest_guard = manifest.write().unwrap();
         manifest_guard.last_sync = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        serde_json::to_string_pretty(&*manifest_guard)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
+        manifest_guard.clone()
     };
+    let manifest_data = serde_json::to_string(&snapshot)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
     // Write to temp file
     {

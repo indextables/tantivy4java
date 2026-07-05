@@ -3,6 +3,7 @@
 
 #![allow(dead_code)]
 
+use std::borrow::Cow;
 use std::io;
 use lz4_flex::{compress_prepend_size, decompress_size_prepended};
 use super::types::{CompressionAlgorithm, DiskCacheConfig};
@@ -47,31 +48,31 @@ pub fn should_compress(config: &DiskCacheConfig, component: &str, data_size: usi
     }
 }
 
-/// Compress data if appropriate
-pub fn compress_data(config: &DiskCacheConfig, component: &str, data: &[u8]) -> (Vec<u8>, CompressionAlgorithm) {
+/// Compress data if appropriate.
+///
+/// Returns a `Cow` so the uncompressed path (the current default for every
+/// component — see `should_compress`) is zero-copy: the caller writes the
+/// borrowed slice straight to disk instead of allocating a throwaway `Vec`.
+pub fn compress_data<'a>(
+    config: &DiskCacheConfig,
+    component: &str,
+    data: &'a [u8],
+) -> (Cow<'a, [u8]>, CompressionAlgorithm) {
     if !should_compress(config, component, data.len()) {
-        return (data.to_vec(), CompressionAlgorithm::None);
+        return (Cow::Borrowed(data), CompressionAlgorithm::None);
     }
 
     match config.compression {
-        CompressionAlgorithm::None => (data.to_vec(), CompressionAlgorithm::None),
-        CompressionAlgorithm::Lz4 => {
+        CompressionAlgorithm::None => (Cow::Borrowed(data), CompressionAlgorithm::None),
+        // Zstd is not available as a direct dependency; it falls back to LZ4, which
+        // provides good compression at higher speed.
+        CompressionAlgorithm::Lz4 | CompressionAlgorithm::Zstd => {
             let compressed = compress_prepend_size(data);
-            // Only use compression if it actually saves space
+            // Only use compression if it actually saves space.
             if compressed.len() < data.len() {
-                (compressed, CompressionAlgorithm::Lz4)
+                (Cow::Owned(compressed), CompressionAlgorithm::Lz4)
             } else {
-                (data.to_vec(), CompressionAlgorithm::None)
-            }
-        }
-        CompressionAlgorithm::Zstd => {
-            // Zstd not currently available as direct dependency
-            // Fall back to LZ4 which provides good compression with better speed
-            let compressed = compress_prepend_size(data);
-            if compressed.len() < data.len() {
-                (compressed, CompressionAlgorithm::Lz4)
-            } else {
-                (data.to_vec(), CompressionAlgorithm::None)
+                (Cow::Borrowed(data), CompressionAlgorithm::None)
             }
         }
     }

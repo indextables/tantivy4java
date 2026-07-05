@@ -4,14 +4,13 @@
 #![allow(dead_code)]
 
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use quickwit_config::{AzureStorageConfig, S3StorageConfig};
 
 use crate::debug_println;
-use crate::disk_cache::{CompressionAlgorithm, DiskCacheConfig, L2DiskCache};
+use crate::disk_cache::{DiskCacheConfig, L2DiskCache};
 use crate::global_cache::{get_configured_storage_resolver, get_global_searcher_context};
 use crate::batch_retrieval::simple::{BatchOptimizationMetrics, PrefetchStats};
 
@@ -35,11 +34,10 @@ pub struct GlobalSplitCacheManager {
     // L2 Disk cache for persistent caching
     pub(crate) disk_cache: Option<Arc<L2DiskCache>>,
 
-    // Statistics
-    pub(crate) total_hits: AtomicU64,
-    pub(crate) total_misses: AtomicU64,
+    // Count of flush/eviction operations triggered through this manager.
+    // (Hit/miss/size counters are NOT tracked here — those are process-global and
+    // reported by get_cache_stats() straight from quickwit's STORAGE_METRICS.)
     pub(crate) total_evictions: AtomicU64,
-    pub(crate) current_size: AtomicU64,
 
     // Managed splits
     pub(crate) managed_splits: Mutex<HashMap<String, u64>>, // split_path -> last_access_time
@@ -61,8 +59,19 @@ impl GlobalSplitCacheManager {
         // All async operations should use the shared global runtime via QuickwitRuntimeManager
         debug_println!("🔧 RUNTIME_FIX: Eliminating separate Tokio runtime to prevent deadlocks");
 
-        // Set the L1 cache capacity from Java's CacheConfig.withMaxCacheSize()
-        // This ensures the global shared L1 cache uses the Java-configured size
+        // Set the L1 cache capacity from Java's CacheConfig.withMaxCacheSize().
+        // The L1 cache is a process-global singleton built once (first-wins): a later
+        // manager configured with a different size cannot resize it. Warn so this
+        // process-global-first-wins behavior isn't a silent surprise.
+        let existing_l1_capacity = crate::global_cache::get_global_l1_cache_capacity();
+        if existing_l1_capacity != 0 && existing_l1_capacity != max_cache_size {
+            debug_println!(
+                "⚠️ L1_CACHE_CAPACITY: cache '{}' requested maxCacheSize={} but the process-global \
+                 L1 cache was already sized to {} by an earlier manager (first-wins); the requested \
+                 size is ignored.",
+                cache_name, max_cache_size, existing_l1_capacity
+            );
+        }
         crate::global_cache::set_l1_cache_capacity(max_cache_size);
 
         // Note: We're using the global caches from GLOBAL_SEARCHER_COMPONENTS
@@ -76,10 +85,7 @@ impl GlobalSplitCacheManager {
             s3_config: None,
             azure_config: None,
             disk_cache: None,
-            total_hits: AtomicU64::new(0),
-            total_misses: AtomicU64::new(0),
             total_evictions: AtomicU64::new(0),
-            current_size: AtomicU64::new(0),
             managed_splits: Mutex::new(HashMap::new()),
             file_field_stats: Mutex::new(HashMap::new()),
         }
@@ -93,22 +99,24 @@ impl GlobalSplitCacheManager {
             config.root_path
         );
 
-        match L2DiskCache::new(config) {
-            Ok(cache) => {
+        // Get-or-create keyed by root path so multiple managers configured with the
+        // same cache directory share one L2DiskCache instance (one manifest, one
+        // total_bytes accounting) instead of racing over the same files.
+        match crate::global_cache::get_or_create_disk_cache(config) {
+            Some(cache) => {
                 let stats = cache.stats();
                 debug_println!(
-                    "RUST DEBUG: L2DiskCache created successfully. Max size: {} bytes, {} splits cached",
+                    "RUST DEBUG: L2DiskCache ready. Max size: {} bytes, {} splits cached",
                     stats.max_bytes,
                     stats.split_count
                 );
-                // Also set the global disk cache so StandaloneSearcher can access it
+                // Also set the active global disk cache so StandaloneSearcher can access it
                 crate::global_cache::set_global_disk_cache(cache.clone());
                 self.disk_cache = Some(cache);
             }
-            Err(e) => {
+            None => {
                 debug_println!(
-                    "RUST WARNING: Failed to create L2DiskCache: {}. Continuing without disk cache.",
-                    e
+                    "RUST WARNING: Failed to create L2DiskCache. Continuing without disk cache."
                 );
             }
         }
@@ -165,6 +173,10 @@ impl GlobalSplitCacheManager {
         self.managed_splits.lock().unwrap().len()
     }
 
+    /// Returns cache statistics. NOTE: hits/misses/evictions/current_size are
+    /// **process-global** (aggregated from quickwit's `STORAGE_METRICS`), not
+    /// specific to this manager — only `max_size` is per-manager. In a process with
+    /// multiple managers these fields reflect the whole process.
     pub fn get_cache_stats(&self) -> GlobalCacheStats {
         // 🚀 OPTIMIZATION: Access real Quickwit cache metrics instead of basic counters
         // This provides comprehensive per-cache-type metrics with ByteRangeCache-specific tracking
@@ -284,10 +296,22 @@ impl GlobalSplitCacheManager {
         get_global_searcher_context()
     }
 
+    /// Flush the in-memory query-path caches. Backs the Java `flushAllCaches()` /
+    /// `flushCacheTypes(LEAF_SEARCH | BYTE_RANGE)` APIs.
+    ///
+    /// The leaf-search and split-footer caches live inside the global
+    /// `SearcherContext`; dropping it forces them to be rebuilt empty on the next
+    /// search. The L1 byte-range cache is cleared in place, and per-credential
+    /// contexts are dropped too. These caches don't support partial (target-size)
+    /// eviction, so this is a full clear regardless of `target_size_bytes`. The
+    /// persistent L2 disk cache is intentionally left intact.
     pub fn force_eviction(&self, _target_size_bytes: u64) {
-        // Simulate eviction by incrementing counter
+        crate::global_cache::clear_global_l1_cache();
+        crate::global_cache::clear_global_searcher_context();
+        crate::global_cache::clear_credential_contexts();
+        crate::split_query::clear_split_schema_cache();
+        crate::split_searcher::clear_searcher_cache();
         self.total_evictions.fetch_add(1, Ordering::Relaxed);
-        // In a real implementation, this would evict cache entries
     }
 }
 
@@ -359,14 +383,18 @@ fn clear_all_global_caches() {
     // 4. Clear searcher cache (LRU cache of Arc<Searcher>)
     crate::split_searcher::clear_searcher_cache();
 
-    // 5. Clear global disk cache reference
+    // 5. Clear global disk cache reference and the by-root disk cache registry
     crate::global_cache::clear_global_disk_cache();
+    crate::global_cache::clear_disk_cache_registry();
 
     // 6. Reset L1 cache (clear all entries)
     crate::global_cache::reset_global_l1_cache();
 
     // 7. Reset storage download metrics
     crate::global_cache::reset_storage_download_metrics();
+
+    // 8. Drop cached storage resolvers (releases S3/Azure clients)
+    crate::global_cache::clear_storage_resolvers();
 
     debug_println!("🧹 CLEAR_ALL_GLOBAL_CACHES: Complete");
 }

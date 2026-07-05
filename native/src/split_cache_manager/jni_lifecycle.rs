@@ -7,7 +7,7 @@ use std::sync::Arc;
 use jni::objects::{JClass, JObject, JString};
 use jni::sys::jlong;
 use jni::JNIEnv;
-use quickwit_config::S3StorageConfig;
+use quickwit_config::{AzureStorageConfig, S3StorageConfig};
 
 use crate::debug_println;
 use crate::disk_cache::{CompressionAlgorithm, DiskCacheConfig, WriteQueueMode};
@@ -109,6 +109,52 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitCacheManager_
 
             // Set the S3 config on the manager
             manager.set_aws_config(s3_config);
+        }
+    }
+
+    // Extract Azure configuration from the Java CacheConfig so manager-level storage
+    // operations (e.g. searchAcrossAllSplits via get_storage_resolver) are
+    // authenticated for azure:// splits, not just the per-split search path.
+    if let Ok(azure_config_map) = env.call_method(&config, "getAzureConfig", "()Ljava/util/Map;", &[]) {
+        if let Ok(azure_map_obj) = azure_config_map.l() {
+            if !azure_map_obj.is_null() {
+                let extract = |env: &mut JNIEnv, key: &str| -> Option<String> {
+                    let key_jstring = env.new_string(key).ok()?;
+                    let value = env
+                        .call_method(
+                            &azure_map_obj,
+                            "get",
+                            "(Ljava/lang/Object;)Ljava/lang/Object;",
+                            &[(&key_jstring).into()],
+                        )
+                        .ok()?
+                        .l()
+                        .ok()?;
+                    if value.is_null() {
+                        return None;
+                    }
+                    let value_jstring = JString::from(value);
+                    let value_string = env.get_string(&value_jstring).ok()?;
+                    Some(value_string.to_string_lossy().to_string())
+                };
+
+                let account_name = extract(&mut env, "account_name");
+                let access_key = extract(&mut env, "access_key");
+                let bearer_token = extract(&mut env, "bearer_token");
+
+                if account_name.is_some() && (access_key.is_some() || bearer_token.is_some()) {
+                    debug_println!(
+                        "RUST DEBUG: Configuring Azure storage (account={:?}, auth={})",
+                        account_name,
+                        if bearer_token.is_some() { "bearer_token" } else { "account_key" }
+                    );
+                    manager.set_azure_config(AzureStorageConfig {
+                        account_name,
+                        access_key,
+                        bearer_token,
+                    });
+                }
+            }
         }
     }
 

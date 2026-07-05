@@ -70,44 +70,29 @@ impl RangeIndex {
     }
 
     /// Find all ranges that overlap with [start, end)
-    /// Returns ranges in sorted order by start position
-    /// O(log n + k) where k is the number of overlapping ranges
+    /// Returns ranges in sorted order by start position.
+    ///
+    /// Ranges are sorted by `start`, so we can stop as soon as `range.start >= end`
+    /// (no later range can begin before `end`). We must, however, examine every range
+    /// with `range.start < end`, because cached ranges may nest/overlap arbitrarily
+    /// (e.g. a full-file prewarm `[0, len)` alongside small query sub-ranges). A
+    /// "stop at first predecessor whose end <= start" backward scan — as used
+    /// previously — silently skips an earlier low-`start`/high-`end` range that still
+    /// overlaps, producing false gaps and, worse, dropping cached data from the result.
+    /// This linear prefix scan is O(k) in the number of ranges beginning before `end`,
+    /// which is bounded by the (typically small) number of distinct cached ranges per
+    /// component; correctness with nesting is worth more than the log-n prefix skip.
     pub fn find_overlapping(&self, start: u64, end: u64) -> Vec<&CachedRange> {
-        if self.ranges.is_empty() {
-            return Vec::new();
-        }
-
-        // Binary search to find first range that might overlap
-        // A range overlaps if: range.start < end && start < range.end
-        // First candidate: last range where range.start < end
-        let first_idx = match self.ranges.binary_search_by(|r| {
-            if r.start >= end {
-                std::cmp::Ordering::Greater
-            } else {
-                std::cmp::Ordering::Less
-            }
-        }) {
-            Ok(i) | Err(i) => i.saturating_sub(1),
-        };
-
-        // Scan backwards to find first actually overlapping range
-        // (needed because binary search found last range with start < end)
-        let mut scan_start = first_idx;
-        while scan_start > 0 && self.ranges[scan_start - 1].end > start {
-            scan_start -= 1;
-        }
-
-        // Collect all overlapping ranges
         let mut result = Vec::new();
-        for range in &self.ranges[scan_start..] {
+        for range in &self.ranges {
             if range.start >= end {
-                break; // No more overlaps possible
+                break; // Sorted by start: no later range can overlap.
             }
-            if range.overlaps(start, end) {
+            // range.start < end already holds; overlap iff range.end > start.
+            if range.end > start {
                 result.push(range);
             }
         }
-
         result
     }
 

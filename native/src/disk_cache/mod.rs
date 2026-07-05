@@ -49,7 +49,6 @@ use std::io::{self, Read};
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
-use std::time::Duration;
 
 use crate::debug_println;
 use crate::memory_pool::{self, DiskCacheMemoryBudget};
@@ -106,26 +105,12 @@ impl WriteSender {
         }
     }
 
-    /// Try to send without blocking (used in Drop/shutdown paths).
-    ///
-    /// In Fragment mode, uses the bounded channel's `try_send` (may fail if full).
-    /// In SizeBased mode, unconditionally enqueues — the unbounded channel only fails
-    /// if the receiver is disconnected (shutdown). Bytes are tracked optimistically;
-    /// if `tx.send()` fails during shutdown, the counter drifts but is harmless since
-    /// no further reads will occur.
-    fn try_send(&self, req: WriteRequest) -> Result<(), ()> {
+    /// Bytes currently enqueued but not yet written to disk (size-based mode only).
+    /// Fragment mode has no byte counter, so this returns 0 there.
+    fn pending_bytes(&self) -> u64 {
         match self {
-            WriteSender::Fragment(tx) => tx.try_send(req).map_err(|_| ()),
-            WriteSender::SizeBased { tx, queued_bytes, .. } => {
-                let data_len = match &req {
-                    WriteRequest::Put { data, .. } => data.len() as u64,
-                    _ => 0,
-                };
-                if data_len > 0 {
-                    queued_bytes.fetch_add(data_len, Ordering::Release);
-                }
-                tx.send(req).map_err(|_| ())
-            }
+            WriteSender::SizeBased { queued_bytes, .. } => queued_bytes.load(Ordering::Acquire),
+            WriteSender::Fragment(_) => 0,
         }
     }
 
@@ -180,8 +165,6 @@ pub struct L2DiskCache {
     max_bytes: u64,
     /// Shutdown flag for background threads
     shutdown_flag: Arc<std::sync::atomic::AtomicBool>,
-    /// Thread handles for cleanup
-    thread_handles: Mutex<Vec<std::thread::JoinHandle<()>>>,
     /// Dirty flag - set when manifest has uncommitted changes
     manifest_dirty: Arc<std::sync::atomic::AtomicBool>,
     /// Memory budget for write queue (staircase-up/cliff-down pattern)
@@ -211,6 +194,16 @@ impl L2DiskCache {
         let mut split_states = HashMap::new();
         for (split_key, split_entry) in &manifest.splits {
             split_states.insert(split_key.clone(), SplitState::from_entry(split_entry));
+        }
+
+        // Seed the LRU table from the persisted manifest so splits restored from a
+        // previous process are immediately visible to eviction (using their recorded
+        // last_accessed time). Without this, a full-at-startup cache would keep its
+        // cold splits pinned above the eviction threshold forever, since the LRU only
+        // learned about splits that happened to be touched in the current process.
+        let mut seeded_lru = SplitLruTable::new();
+        for (split_key, split_entry) in &manifest.splits {
+            seeded_lru.seed(split_key, split_entry.total_size_bytes, split_entry.last_accessed);
         }
 
         // Create background writer channel based on configured mode.
@@ -280,26 +273,23 @@ impl L2DiskCache {
             config: config.clone(),
             manifest: RwLock::new(manifest),
             split_states: RwLock::new(split_states),
-            lru_table: Mutex::new(SplitLruTable::new()),
+            lru_table: Mutex::new(seeded_lru),
             mmap_cache: Mutex::new(MmapCache::new(mmap_size)),
             write_tx,
             total_bytes: AtomicU64::new(total_bytes),
             max_bytes,
             shutdown_flag: Arc::clone(&shutdown_flag),
-            thread_handles: Mutex::new(Vec::new()),
             manifest_dirty: Arc::clone(&manifest_dirty),
             memory_budget,
         });
 
-        // Start background writer (uses Weak reference - doesn't prevent Drop)
+        // Start background writer (uses Weak reference - doesn't prevent Drop).
+        // Detached on purpose: these threads transiently upgrade the Weak, so Drop
+        // can run on them; joining from Drop would deadlock (see Drop impl).
         let cache_weak = Arc::downgrade(&cache);
-        let writer_handle = std::thread::spawn(move || {
+        std::thread::spawn(move || {
             Self::background_writer_static(write_rx, cache_weak, size_based_state);
         });
-
-        if let Ok(mut handles) = cache.thread_handles.lock() {
-            handles.push(writer_handle);
-        }
 
         // Start manifest sync timer - checks every second, syncs if dirty
         {
@@ -307,13 +297,9 @@ impl L2DiskCache {
             let cache_weak = Arc::downgrade(&cache);
             let dirty_flag = Arc::clone(&manifest_dirty);
 
-            let timer_handle = std::thread::spawn(move || {
+            std::thread::spawn(move || {
                 Self::manifest_sync_timer_static(cache_weak, shutdown_flag_clone, dirty_flag);
             });
-
-            if let Ok(mut handles) = cache.thread_handles.lock() {
-                handles.push(timer_handle);
-            }
         }
 
         Ok(cache)
@@ -472,8 +458,10 @@ impl L2DiskCache {
         byte_range: Option<Range<u64>>,
         data: &[u8],
     ) {
-        // Check if we need to evict before adding
-        let current = self.total_bytes.load(Ordering::Relaxed);
+        // Check if we need to evict before adding. Count bytes already queued but not
+        // yet written so a burst doesn't overshoot the high-water mark before the
+        // background writer has flushed (and accounted) the in-flight fragments.
+        let current = self.total_bytes.load(Ordering::Relaxed) + self.write_tx.pending_bytes();
         let new_size = data.len() as u64;
 
         // Trigger eviction if we'd exceed 95% capacity
@@ -514,7 +502,7 @@ impl L2DiskCache {
         byte_range: Option<Range<u64>>,
         data: &[u8],
     ) -> bool {
-        let current = self.total_bytes.load(Ordering::Relaxed);
+        let current = self.total_bytes.load(Ordering::Relaxed) + self.write_tx.pending_bytes();
         let new_size = data.len() as u64;
 
         if current + new_size > (self.max_bytes * 95) / 100 {
@@ -640,6 +628,7 @@ impl L2DiskCache {
             &self.manifest,
             &self.split_states,
             &self.lru_table,
+            &self.mmap_cache,
             &self.total_bytes,
             storage_loc,
             split_id,
@@ -656,6 +645,7 @@ impl L2DiskCache {
             &self.manifest,
             &self.split_states,
             &self.lru_table,
+            &self.mmap_cache,
             &self.total_bytes,
             storage_loc,
             split_id,
@@ -676,6 +666,7 @@ impl L2DiskCache {
             &self.manifest,
             &self.split_states,
             &self.lru_table,
+            &self.mmap_cache,
             &self.total_bytes,
             storage_loc,
             split_id,
@@ -693,6 +684,7 @@ impl L2DiskCache {
             &self.manifest,
             &self.split_states,
             &self.lru_table,
+            &self.mmap_cache,
             &self.total_bytes,
             storage_loc,
             split_id,
@@ -738,15 +730,29 @@ impl Drop for L2DiskCache {
     fn drop(&mut self) {
         debug_println!("🔄 L2DiskCache::drop() - Starting cleanup");
 
-        // Signal shutdown to timer thread
+        // NOTE: no flush here. Inside Drop the Arc<L2DiskCache> strong count is already
+        // zero, so the background writer's `cache_weak.upgrade()` returns None and it
+        // cannot process a flush. Durable manifest sync is done by the live JNI close
+        // path via `flush_blocking()` before it releases its Arc.
+
+        // Signal the timer thread to stop (it polls the flag every 100ms).
         self.shutdown_flag.store(true, Ordering::SeqCst);
 
-        // Signal shutdown to writer thread and sync manifest first.
-        let _ = self.write_tx.try_send(WriteRequest::SyncManifest);
-        let _ = self.write_tx.try_send(WriteRequest::Shutdown);
+        // Best-effort, NON-BLOCKING wake for a writer idling in recv(), so it observes
+        // the dropped Arc (upgrade() == None) and exits promptly. Using send_or_drop
+        // (never blocks) is essential: this Drop can itself be running on the writer
+        // thread — both background threads transiently upgrade the Weak they hold — and
+        // a blocking send on a full queue with no other receiver would deadlock. If the
+        // wake is dropped, the writer still exits when the write channel's sender (a
+        // field of self) is dropped as this cache is freed.
+        let _ = self.write_tx.send_or_drop(WriteRequest::Shutdown);
 
-        // Wait for background threads to process shutdown
-        std::thread::sleep(Duration::from_millis(250));
+        // We deliberately do NOT join the background threads. They transiently upgrade
+        // the Weak<Self>, so this Drop can run *on* the writer/timer thread (or on a
+        // tokio worker owned by the writer's runtime); joining from there would
+        // self-deadlock, or panic by dropping the runtime from its own worker. The
+        // threads terminate on their own — the timer on `shutdown_flag`, the writer
+        // when the write channel closes as `self` is freed.
 
         debug_println!("🔄 L2DiskCache::drop() - Cleanup complete");
     }

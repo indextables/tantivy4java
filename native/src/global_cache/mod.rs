@@ -34,8 +34,8 @@ pub use metrics::{
 
 // Re-export from storage_resolver
 pub use storage_resolver::{
-    generate_storage_cache_key, get_configured_storage_resolver, get_configured_storage_resolver_async,
-    tracked_storage_resolve, GLOBAL_STORAGE_RESOLVER,
+    clear_storage_resolvers, generate_storage_cache_key, get_configured_storage_resolver,
+    get_configured_storage_resolver_async, tracked_storage_resolve, GLOBAL_STORAGE_RESOLVER,
 };
 
 // =====================================================================
@@ -97,6 +97,61 @@ static GLOBAL_DISK_CACHE: OnceLock<std::sync::RwLock<Option<Arc<L2DiskCache>>>> 
 
 fn get_disk_cache_holder() -> &'static std::sync::RwLock<Option<Arc<L2DiskCache>>> {
     GLOBAL_DISK_CACHE.get_or_init(|| std::sync::RwLock::new(None))
+}
+
+/// Process-global registry of L2 disk caches keyed by root path. A disk cache is a
+/// heavy singleton (background writer + timer threads, its own `manifest.json`,
+/// `total_bytes` accounting). Two managers pointing at the same root must share one
+/// instance, otherwise they fight over the manifest (last-syncer-wins) and each only
+/// counts its own writes — so combined usage can blow past the configured limit
+/// before either evicts. This get-or-create keyed by root path guarantees one
+/// instance per path, mirroring how the L1 cache is a process singleton.
+static DISK_CACHES_BY_ROOT: OnceLock<
+    std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, Arc<L2DiskCache>>>,
+> = OnceLock::new();
+
+fn get_disk_caches_by_root() -> &'static std::sync::Mutex<
+    std::collections::HashMap<std::path::PathBuf, Arc<L2DiskCache>>,
+> {
+    DISK_CACHES_BY_ROOT.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Get-or-create the process-global L2 disk cache for a given root path. Returns the
+/// existing instance if one is already registered for `config.root_path`, otherwise
+/// constructs it. Returns `None` if construction fails.
+pub fn get_or_create_disk_cache(
+    config: crate::disk_cache::DiskCacheConfig,
+) -> Option<Arc<L2DiskCache>> {
+    let key = config.root_path.clone();
+    let mut map = get_disk_caches_by_root().lock().unwrap();
+    if let Some(existing) = map.get(&key) {
+        debug_println!(
+            "🟢 DISK_CACHE_REGISTRY: Reusing existing L2 disk cache for root {:?}",
+            key
+        );
+        return Some(existing.clone());
+    }
+    match L2DiskCache::new(config) {
+        Ok(cache) => {
+            map.insert(key, cache.clone());
+            Some(cache)
+        }
+        Err(e) => {
+            debug_println!("🔴 DISK_CACHE_REGISTRY: Failed to create L2 disk cache: {}", e);
+            None
+        }
+    }
+}
+
+/// Drop all entries from the by-root disk cache registry. Called from the
+/// last-manager-close cleanup so the disk caches (and their background threads) are
+/// released for test isolation.
+pub fn clear_disk_cache_registry() {
+    let mut map = get_disk_caches_by_root().lock().unwrap();
+    if !map.is_empty() {
+        debug_println!("🔴 DISK_CACHE_REGISTRY: Clearing {} disk cache(s)", map.len());
+        map.clear();
+    }
 }
 
 /// Set the global L2 disk cache (called by SplitCacheManager when TieredCacheConfig is provided)
@@ -286,6 +341,14 @@ pub fn get_credential_searcher_context(credential_key: &str) -> Arc<SearcherCont
     }
 
     context
+}
+
+/// Configured aggregation limits `(memory_bytes, bucket_limit)` from the global
+/// cache config. Used by aggregation code paths that build their own
+/// `AggregationLimitsGuard` so the Java-configured limits actually apply instead of
+/// a hardcoded default.
+pub fn get_configured_aggregation_limits() -> (u64, u32) {
+    get_global_components().aggregation_limits()
 }
 
 /// Get a SearcherContext with custom configuration but using global caches

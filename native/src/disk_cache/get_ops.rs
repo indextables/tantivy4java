@@ -277,7 +277,19 @@ pub fn get_coalesced(
         }
 
         // Overlap with this cached range
-        if let Some(overlap) = cached_range.overlap_with(requested_range.start, requested_range.end) {
+        if let Some(raw_overlap) = cached_range.overlap_with(requested_range.start, requested_range.end) {
+            // Clip the overlap to the current cursor. Cached ranges may nest/overlap
+            // (see RangeIndex::find_overlapping), so a later range can re-cover bytes
+            // an earlier segment already emitted. Clipping to `cursor` prevents emitting
+            // overlapping segments (which would make cached_bytes exceed the request and
+            // let combine_segments copy one segment over another).
+            let overlap = max(raw_overlap.start, cursor)..raw_overlap.end;
+            if overlap.start >= overlap.end {
+                // Fully behind the cursor — already covered by an earlier segment.
+                cursor = max(cursor, raw_overlap.end);
+                continue;
+            }
+
             // Use fast sub-range extraction via mmap (avoids loading entire file)
             if let Some(data) = get_subrange(
                 config,
@@ -294,6 +306,16 @@ pub fn get_coalesced(
                     data,
                 });
                 cached_bytes += (overlap.end - overlap.start) as u64;
+            } else {
+                // The cached file for this range could not be read — it was likely
+                // evicted between the range-index snapshot and this read (do_evict
+                // deletes the directory before updating the manifest). Treat the
+                // sub-range as a gap so it is refetched from L3, rather than advancing
+                // the cursor past it and silently reporting the request as fully
+                // cached (which combine_segments would then serve as zero-filled or
+                // truncated bytes).
+                gaps.push(overlap.clone());
+                gap_bytes += overlap.end - overlap.start;
             }
 
             cursor = max(cursor, overlap.end);

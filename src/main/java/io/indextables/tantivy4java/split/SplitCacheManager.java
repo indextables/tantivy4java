@@ -98,6 +98,14 @@ public class SplitCacheManager implements AutoCloseable {
     private final String cacheName;
     private final String cacheKey; // Full cache key used for storage/retrieval
     private final long maxCacheSize;
+    // Number of getInstance() callers currently sharing this singleton. The native
+    // manager is torn down only when this reaches zero, so one holder's close()
+    // cannot pull the shared instance out from under the others.
+    private final java.util.concurrent.atomic.AtomicInteger refCount =
+            new java.util.concurrent.atomic.AtomicInteger(1);
+    // Set once the instance has been fully torn down; guards against double-close
+    // and use-after-close.
+    private volatile boolean closed = false;
     private final Map<String, SplitSearcher> managedSearchers;
     private final AtomicLong totalCacheSize;
     private final long nativePtr;
@@ -389,14 +397,12 @@ public class SplitCacheManager implements AutoCloseable {
          *     .withMaxCacheSize(500_000_000)  // 500MB L1 memory cache
          *     .withTieredCache(new TieredCacheConfig()
          *         .withDiskCachePath("/mnt/nvme/cache")
-         *         .withMaxDiskSize(100_000_000_000L)  // 100GB disk cache
-         *         .withCompression(CompressionAlgorithm.LZ4));  // Fast compression
+         *         .withMaxDiskSize(100_000_000_000L));  // 100GB disk cache
          * }</pre>
          *
          * @param tieredCacheConfig the tiered cache configuration
          * @return this CacheConfig for method chaining
          * @see TieredCacheConfig
-         * @see CompressionAlgorithm
          */
         public CacheConfig withTieredCache(TieredCacheConfig tieredCacheConfig) {
             this.tieredCacheConfig = tieredCacheConfig;
@@ -424,84 +430,104 @@ public class SplitCacheManager implements AutoCloseable {
             keyBuilder.append(",maxSize=").append(maxCacheSize);
             keyBuilder.append(",maxLoads=").append(maxConcurrentLoads);
             keyBuilder.append(",queryCache=").append(enableQueryCache);
-            
-            // Add AWS config to key (sorted for consistency)
-            if (!awsConfig.isEmpty()) {
-                keyBuilder.append(",aws={");
-                awsConfig.entrySet().stream()
-                    .sorted(Map.Entry.comparingByKey())
-                    .forEach(entry -> keyBuilder.append(entry.getKey()).append("=").append(entry.getValue()).append(","));
-                keyBuilder.setLength(keyBuilder.length() - 1); // Remove last comma
-                keyBuilder.append("}");
-            }
-            
-            // Add Azure config to key (sorted for consistency)
-            if (!azureConfig.isEmpty()) {
-                keyBuilder.append(",azure={");
-                azureConfig.entrySet().stream()
-                    .sorted(Map.Entry.comparingByKey())
-                    .forEach(entry -> keyBuilder.append(entry.getKey()).append("=").append(entry.getValue()).append(","));
-                keyBuilder.setLength(keyBuilder.length() - 1); // Remove last comma
-                keyBuilder.append("}");
-            }
-            
+
+            appendConfigToKey(keyBuilder, "aws", awsConfig);
+            appendConfigToKey(keyBuilder, "azure", azureConfig);
+
             // Note: parquetTableRoot and parquetStorageConfig are intentionally excluded
             // from the cache key. They are per-split parameters passed to createSplitSearcher()
             // and do not affect the identity of the shared cache manager instance.
 
-            // Add GCP config to key (sorted for consistency)
-            if (!gcpConfig.isEmpty()) {
-                keyBuilder.append(",gcp={");
-                gcpConfig.entrySet().stream()
-                    .sorted(Map.Entry.comparingByKey())
-                    .forEach(entry -> keyBuilder.append(entry.getKey()).append("=").append(entry.getValue()).append(","));
-                keyBuilder.setLength(keyBuilder.length() - 1); // Remove last comma
-                keyBuilder.append("}");
-            }
-            
+            appendConfigToKey(keyBuilder, "gcp", gcpConfig);
+
             return keyBuilder.toString();
+        }
+
+        /** Credential map keys whose values are secrets and must be hashed, never
+         *  embedded verbatim, in the (long-lived, map-keying) cache key. */
+        private static final Set<String> SENSITIVE_CONFIG_KEYS = new HashSet<>(Arrays.asList(
+            "access_key", "secret_key", "session_token", "bearer_token", "connection_string"));
+
+        /**
+         * Append a credential config map to the cache key, hashing sensitive values so
+         * that plaintext secrets/session tokens/bearer tokens never live inside a
+         * long-lived map key (one debug log or toString() away from leaking). Hashing
+         * still uniquely distinguishes credential sets.
+         */
+        private static void appendConfigToKey(StringBuilder keyBuilder, String label, Map<String, String> config) {
+            if (config == null || config.isEmpty()) {
+                return;
+            }
+            keyBuilder.append(",").append(label).append("={");
+            config.entrySet().stream()
+                .sorted(Map.Entry.comparingByKey())
+                .forEach(entry -> {
+                    String value = entry.getValue();
+                    if (value != null && SENSITIVE_CONFIG_KEYS.contains(entry.getKey())) {
+                        value = "sha256:" + sha256Hex(value);
+                    }
+                    keyBuilder.append(entry.getKey()).append("=").append(value).append(",");
+                });
+            keyBuilder.setLength(keyBuilder.length() - 1); // Remove last comma
+            keyBuilder.append("}");
+        }
+
+        private static String sha256Hex(String input) {
+            try {
+                java.security.MessageDigest md = java.security.MessageDigest.getInstance("SHA-256");
+                byte[] digest = md.digest(input.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                StringBuilder sb = new StringBuilder(digest.length * 2);
+                for (byte b : digest) {
+                    sb.append(Character.forDigit((b >> 4) & 0xF, 16));
+                    sb.append(Character.forDigit(b & 0xF, 16));
+                }
+                return sb.toString();
+            } catch (java.security.NoSuchAlgorithmException e) {
+                // SHA-256 is guaranteed present on every JVM; fall back to a non-plaintext
+                // representation just in case so a secret is never embedded verbatim.
+                return Integer.toHexString(input.hashCode());
+            }
         }
     }
     
     /**
-     * Compression algorithm for L2 disk cache.
+     * Compression algorithm for the L2 disk cache.
      *
-     * <p>Determines how cached data is compressed on disk:
-     * <ul>
-     *   <li>{@link #NONE} - No compression, fastest I/O but largest disk usage</li>
-     *   <li>{@link #LZ4} - Fast compression (~400 MB/s), good compression ratio (default)</li>
-     *   <li>{@link #ZSTD} - Better compression, slower (falls back to LZ4 currently)</li>
-     * </ul>
+     * <p><b>Currently a no-op.</b> The disk cache stores every component
+     * <em>uncompressed</em> regardless of the value selected here. Index components
+     * are accessed as small sub-ranges (postings in 128-doc blocks, fast fields by
+     * doc id, sstable/store blocks that Tantivy already compresses), so whole-file
+     * decompression would badly hurt read latency without a meaningful space win.
+     * This enum is retained for source/binary compatibility; the setting is ignored.
      *
-     * <p>The cache uses intelligent compression decisions based on component type:
-     * <ul>
-     *   <li>Small data (&lt;4KB): Never compressed (overhead exceeds benefit)</li>
-     *   <li>Hot data (footer, metadata): Never compressed (CPU cost not worth it)</li>
-     *   <li>Large components (.term, .idx, .pos): Always compressed (50-70% savings)</li>
-     * </ul>
+     * @deprecated Compression is not applied by the disk cache. The value is accepted
+     *     but has no effect; all cached data is stored uncompressed.
      */
+    @Deprecated
     public enum CompressionAlgorithm {
-        /** No compression - use for already-compressed or small data */
+        /** No compression (this is the effective behavior for all values). */
         NONE,
-        /** LZ4 compression - fast, good for index data (default) */
+        /** Ignored — data is stored uncompressed. Retained for compatibility. */
         LZ4,
-        /** Zstd compression - better ratio, slower (currently falls back to LZ4) */
+        /** Ignored — data is stored uncompressed. Retained for compatibility. */
         ZSTD
     }
 
     /**
      * Configuration for L2 tiered disk cache.
      *
-     * <p>Provides persistent disk caching with intelligent compression for Quickwit split
-     * components. The disk cache sits between the L1 memory cache and remote storage (S3/Azure).
+     * <p>Provides persistent disk caching for Quickwit split components. The disk cache
+     * sits between the L1 memory cache and remote storage (S3/Azure).
      *
      * <p><b>Features:</b>
      * <ul>
      *   <li>Persistent across restarts - survives JVM shutdown</li>
-     *   <li>Intelligent compression - LZ4 for large components, skips small/hot data</li>
      *   <li>Split-level LRU eviction - removes entire splits when disk space is needed</li>
      *   <li>Crash-safe manifest - periodic sync with backup for recovery</li>
      * </ul>
+     *
+     * <p><b>Note:</b> Components are stored uncompressed; the compression settings on
+     * this config are accepted but ignored (see {@link CompressionAlgorithm}).
      *
      * <p><b>Directory Structure:</b>
      * <pre>
@@ -518,9 +544,7 @@ public class SplitCacheManager implements AutoCloseable {
      * <pre>{@code
      * TieredCacheConfig tieredConfig = new TieredCacheConfig()
      *     .withDiskCachePath("/mnt/nvme/tantivy_cache")
-     *     .withMaxDiskSize(100_000_000_000L)  // 100GB
-     *     .withCompression(CompressionAlgorithm.LZ4)
-     *     .withMinCompressSize(4096);  // Don't compress data < 4KB
+     *     .withMaxDiskSize(100_000_000_000L);  // 100GB
      *
      * CacheConfig config = new CacheConfig("prod-cache")
      *     .withMaxCacheSize(500_000_000)  // 500MB L1
@@ -580,16 +604,14 @@ public class SplitCacheManager implements AutoCloseable {
         /**
          * Set the compression algorithm for cached data.
          *
-         * <p>The default is {@link CompressionAlgorithm#LZ4} which provides fast
-         * compression (~400 MB/s) with good ratios (50-70% for index data).
+         * <p><b>No effect.</b> The disk cache stores all components uncompressed
+         * (see {@link CompressionAlgorithm}); this value is accepted but ignored.
          *
-         * <p>Note: Compression is only applied to components where it provides benefit.
-         * Small data (&lt;4KB), hot data (footer), and already-compact data (numeric fast fields)
-         * are not compressed regardless of this setting.
-         *
-         * @param compression compression algorithm to use
+         * @param compression compression algorithm (ignored)
          * @return this TieredCacheConfig for method chaining
+         * @deprecated Compression is not applied by the disk cache.
          */
+        @Deprecated
         public TieredCacheConfig withCompression(CompressionAlgorithm compression) {
             this.compression = compression;
             return this;
@@ -598,7 +620,8 @@ public class SplitCacheManager implements AutoCloseable {
         /**
          * Disable compression entirely.
          *
-         * <p>Use this if CPU is limited or if the data is already compressed.
+         * <p>This is already the effective behavior for every configuration — the
+         * disk cache never compresses. Retained for compatibility.
          *
          * @return this TieredCacheConfig for method chaining
          */
@@ -610,12 +633,14 @@ public class SplitCacheManager implements AutoCloseable {
         /**
          * Set minimum data size for compression.
          *
-         * <p>Data smaller than this threshold will not be compressed, as the
-         * CPU overhead exceeds the I/O savings. Default is 4KB.
+         * <p><b>No effect.</b> The disk cache does not compress data (see
+         * {@link CompressionAlgorithm}); this threshold is accepted but ignored.
          *
-         * @param bytes minimum size in bytes to consider for compression
+         * @param bytes minimum size in bytes (ignored)
          * @return this TieredCacheConfig for method chaining
+         * @deprecated Compression is not applied by the disk cache.
          */
+        @Deprecated
         public TieredCacheConfig withMinCompressSize(int bytes) {
             this.minCompressSizeBytes = bytes;
             return this;
@@ -927,6 +952,7 @@ public class SplitCacheManager implements AutoCloseable {
         try {
             SplitCacheManager existing = instances.get(cacheKey);
             if (existing != null) {
+                existing.refCount.incrementAndGet();
                 return existing;
             }
         } finally {
@@ -939,7 +965,23 @@ public class SplitCacheManager implements AutoCloseable {
             // Double-check pattern - another thread might have created it while we were waiting
             SplitCacheManager existing = instances.get(cacheKey);
             if (existing != null) {
+                existing.refCount.incrementAndGet();
                 return existing;
+            }
+
+            // Enforce name uniqueness. The native cache-manager registry is keyed by
+            // cache NAME only, so two managers sharing a name but differing in size or
+            // credentials would silently clobber each other natively (the second
+            // create overwrites the first, orphaning its per-manager state). Reject the
+            // conflicting config with a clear message instead of allowing that.
+            for (SplitCacheManager other : instances.values()) {
+                if (other.cacheName.equals(config.getCacheName())) {
+                    throw new IllegalStateException(
+                        "A SplitCacheManager named '" + config.getCacheName() + "' already exists " +
+                        "with a different configuration. Cache names must be unique per configuration " +
+                        "(the native cache registry is keyed by name). Use a distinct name or reuse the " +
+                        "identical config to share the existing instance.");
+                }
             }
 
             // Create new instance with validation
@@ -963,10 +1005,25 @@ public class SplitCacheManager implements AutoCloseable {
     public static SplitCacheManager getGlobalInstance() {
         SplitCacheManager existing = GLOBAL_INSTANCE.get();
         if (existing != null) {
-            return existing;
+            // Bump the refcount before handing the shared instance back — like
+            // getInstance() does. Returning it without incrementing would let a later
+            // close() by any one holder tear down the native manager while other
+            // getGlobalInstance() callers still believe it is alive (use-after-close).
+            // Re-check under the read lock that it is still registered (not closed
+            // concurrently); if it has been removed, fall through and create a default.
+            instancesLock.readLock().lock();
+            try {
+                SplitCacheManager current = instances.get(existing.cacheKey);
+                if (current != null) {
+                    current.refCount.incrementAndGet();
+                    return current;
+                }
+            } finally {
+                instancesLock.readLock().unlock();
+            }
         }
 
-        // Create default instance if none exists
+        // Create default instance if none exists (getInstance handles refcounting)
         CacheConfig defaultConfig = new CacheConfig("global-default")
             .withMaxCacheSize(500_000_000); // 500MB default
         return getInstance(defaultConfig);
@@ -1439,9 +1496,12 @@ public class SplitCacheManager implements AutoCloseable {
             this.beforeStats = beforeStats;
             this.afterStats = afterStats;
             this.splitsAffected = splitsAffected;
-            this.bytesFreedTotal = beforeStats.getCurrentSize() - afterStats.getCurrentSize();
-            this.itemsEvicted = (beforeStats.getTotalHits() + beforeStats.getTotalMisses()) - 
-                               (afterStats.getTotalHits() + afterStats.getTotalMisses());
+            this.bytesFreedTotal = Math.max(0, beforeStats.getCurrentSize() - afterStats.getCurrentSize());
+            // Number of entries evicted during the flush = growth in the (monotonic)
+            // eviction counter. The previous formula used the hits+misses delta, which
+            // is also monotonic and unrelated to eviction, so it could only ever be
+            // <= 0 — a meaningless metric.
+            this.itemsEvicted = Math.max(0, afterStats.getTotalEvictions() - beforeStats.getTotalEvictions());
         }
         
         public long getBytesFreed() { return bytesFreedTotal; }
@@ -1473,7 +1533,39 @@ public class SplitCacheManager implements AutoCloseable {
     
     @Override
     public void close() {
-        // Close all managed searchers
+        // Reference-counted: getInstance() hands the same singleton to multiple
+        // callers, so only the last close() actually tears the manager down. This
+        // prevents one holder from releasing the native handle (and clearing global
+        // caches) out from under the others.
+        //
+        // The refCount decrement, the "am I the last?" decision, and the registry
+        // removal all happen under the write lock, which is mutually exclusive with
+        // getInstance()'s get()+incrementAndGet() under the read lock. That ordering
+        // closes the resurrection race where a concurrent getInstance() could revive
+        // this instance (refCount 0 -> 1) after we decided to tear it down.
+        if (closed) {
+            return;
+        }
+        instancesLock.writeLock().lock();
+        try {
+            if (closed) {
+                return;
+            }
+            if (refCount.decrementAndGet() > 0) {
+                return; // Other holders still active.
+            }
+            closed = true;
+            // Remove from the registry while holding the lock so no new getInstance()
+            // can hand this instance out after this point.
+            instances.remove(cacheKey);
+            GLOBAL_INSTANCE.compareAndSet(this, null);
+        } finally {
+            instancesLock.writeLock().unlock();
+        }
+
+        // Actual teardown runs OUTSIDE the registry lock — closing searchers and the
+        // native manager can be slow and must not block getInstance() for other
+        // (differently-named) caches, nor risk a callback deadlock.
         for (SplitSearcher searcher : managedSearchers.values()) {
             try {
                 searcher.close();
@@ -1482,14 +1574,10 @@ public class SplitCacheManager implements AutoCloseable {
             }
         }
         managedSearchers.clear();
-        
-        // Close native cache manager
+
         if (nativePtr != 0) {
             closeNativeCacheManager(nativePtr);
         }
-        
-        // Remove from instances using the cache key
-        instances.remove(cacheKey);
     }
     
     /**
