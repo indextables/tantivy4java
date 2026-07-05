@@ -32,6 +32,10 @@ public class ColumnStatistics {
     // Null count
     private long nullCount;
 
+    // NaN count (float columns) — tracked separately from nullCount so an
+    // all-NaN column is distinguishable from an empty/all-null one.
+    private long nanCount;
+
     public ColumnStatistics(String fieldName, String fieldType) {
         this.fieldName = fieldName;
         this.fieldType = fieldType;
@@ -50,6 +54,7 @@ public class ColumnStatistics {
     public Boolean getMinBool() { return minBool; }
     public Boolean getMaxBool() { return maxBool; }
     public long getNullCount() { return nullCount; }
+    public long getNanCount() { return nanCount; }
 
     // Setters for JNI construction
     void setMinLong(long v) { this.minLong = v; }
@@ -63,6 +68,7 @@ public class ColumnStatistics {
     void setMinBool(boolean v) { this.minBool = v; }
     void setMaxBool(boolean v) { this.maxBool = v; }
     void setNullCount(long v) { this.nullCount = v; }
+    void setNanCount(long v) { this.nanCount = v; }
 
     /**
      * Check if a long range overlaps with this column's statistics.

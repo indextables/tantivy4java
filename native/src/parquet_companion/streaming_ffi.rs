@@ -127,8 +127,16 @@ pub fn start_streaming_retrieval(
         projected_fields.map(|f| f.into());
 
     let handle = tokio::spawn(async move {
+        use futures::FutureExt;
         let tx_err = tx.clone();
-        let result = produce_batches(
+        // Catch producer panics (arrow compute kernels, concat_batches, …) and
+        // funnel them onto the channel as an Err. Without this, a panic drops
+        // `tx` during unwind, the consumer's blocking_recv() returns None, and
+        // nativeNextBatch maps that to a clean EOF — silently truncating the
+        // result set (F7). AssertUnwindSafe is sound here: on panic we only
+        // send an error string and never touch the partially-mutated producer
+        // state again.
+        let produce_fut = produce_batches(
             tx,
             groups,
             projected_fields_arc,
@@ -137,11 +145,26 @@ pub fn start_streaming_retrieval(
             metadata_cache.as_ref(),
             byte_cache.as_ref(),
             coalesce_config,
-        )
-        .await;
+        );
 
-        if let Err(e) = result {
-            let _ = tx_err.send(Err(e)).await;
+        match std::panic::AssertUnwindSafe(produce_fut).catch_unwind().await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                let _ = tx_err.send(Err(e)).await;
+            }
+            Err(panic) => {
+                let msg = panic
+                    .downcast_ref::<&str>()
+                    .map(|s| s.to_string())
+                    .or_else(|| panic.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "unknown panic".to_string());
+                let _ = tx_err
+                    .send(Err(anyhow::anyhow!(
+                        "Parquet streaming producer panicked: {}",
+                        msg
+                    )))
+                    .await;
+            }
         }
     });
 
@@ -254,37 +277,47 @@ async fn produce_batches(
             0,
         );
 
-        // Feed batches through the accumulator → emit TARGET_BATCH_SIZE chunks
+        // Feed batches through the accumulator → emit TARGET_BATCH_SIZE chunks.
+        //
+        // M18: normalize timestamps to microseconds BEFORE accumulation. The accumulator
+        // concatenates pending batches against `batches[0].schema()`, so if one file reads
+        // as Timestamp(ms) and another as Timestamp(µs), an un-normalized accumulation
+        // window would fail `concat_batches` even though each file reads fine on its own.
+        // Normalizing on arrival guarantees the accumulator only ever holds a single,
+        // consistent timestamp unit.
         for batch in batches {
-            let emitted = accumulator.push(batch)?;
+            let normalized = normalize_timestamps(batch)?;
+            let emitted = accumulator.push(normalized)?;
             for emit_batch in emitted {
                 let renamed = rename_columns_to_tantivy(&emit_batch, &manifest.column_mapping)?;
-                let normalized = normalize_timestamps(renamed)?;
-                rows_emitted += normalized.num_rows();
-                if tx.send(Ok(normalized)).await.is_err() {
-                    if rows_emitted == 0 {
-                        return Err(anyhow::anyhow!(
-                            "Consumer dropped before any data was sent — possible consumer error"
-                        ));
-                    }
+                let n = renamed.num_rows();
+                if tx.send(Ok(renamed)).await.is_err() {
+                    // L14: a closed receiver means the consumer stopped early (Java closed
+                    // the stream, a LIMIT was satisfied, or the consumer itself errored).
+                    // This is a normal terminal condition — the channel is closed, so we
+                    // cannot report anything further to a gone consumer — and we stop
+                    // cleanly. (The former "consumer dropped before any data" error was
+                    // dead code: `rows_emitted` was incremented before the send, and an Err
+                    // could never reach a dropped receiver anyway.)
                     perf_println!(
                         "⏱️ STREAMING: consumer dropped after {} rows — stopping producer",
                         rows_emitted
                     );
                     return Ok(());
                 }
+                rows_emitted += n;
             }
         }
 
         files_processed += 1;
     }
 
-    // Flush remaining rows
+    // Flush remaining rows. Batches were normalized on arrival (M18), so the accumulator's
+    // output is already microsecond-normalized — only renaming remains.
     if let Some(final_batch) = accumulator.flush()? {
         let renamed = rename_columns_to_tantivy(&final_batch, &manifest.column_mapping)?;
-        let normalized = normalize_timestamps(renamed)?;
-        rows_emitted += normalized.num_rows();
-        let _ = tx.send(Ok(normalized)).await;
+        rows_emitted += renamed.num_rows();
+        let _ = tx.send(Ok(renamed)).await;
     }
 
     perf_println!(
@@ -476,11 +509,16 @@ fn parquet_type_to_arrow_type(parquet_type: &str, tantivy_type: &str) -> DataTyp
 /// Write a RecordBatch to pre-allocated FFI addresses.
 /// Same pattern as arrow_ffi_export.rs but operates on a single batch.
 ///
-/// IMPORTANT: If the FFI addresses have been written to before (e.g., in a
-/// streaming loop), the previous `FFI_ArrowArray`/`FFI_ArrowSchema` values are
-/// read and dropped first to release their Arrow buffer memory via the `release`
-/// callback. Callers that allocate fresh zeroed memory for each call are also safe
-/// (a zeroed `FFI_ArrowArray` has `release = null`, which means no-op on drop).
+/// IMPORTANT — ownership protocol (L15): this function writes the new
+/// `FFI_ArrowArray`/`FFI_ArrowSchema` values DIRECTLY into the target addresses and does
+/// NOT read+drop whatever was there before. Reading+dropping stale or uninitialized memory
+/// would invoke a garbage `release` function pointer and previously caused SIGBUS crashes
+/// (`Unsafe.allocateMemory` does not zero its allocations). Per the Arrow C Data Interface
+/// spec, the CONSUMER (Java/Spark) owns the exported structures and must invoke each
+/// `release` callback after importing a batch. When addresses are reused across a streaming
+/// loop, the caller MUST have already released the previous batch before calling back in;
+/// failing to do so leaks the previous Arrow buffers (a leak, not a crash). See the safety
+/// comment at the write site below for the full rationale.
 ///
 /// Timestamps are normalized to microseconds for Spark compatibility. The
 /// streaming path's `produce_batches` already normalizes, so the check here
@@ -559,6 +597,19 @@ pub(crate) fn write_batch_to_ffi(
             _ => orig_field.as_ref().clone(),
         };
 
+        // Perform the fallible schema conversion BEFORE exporting the array. If it
+        // ran after the array write, a conversion failure (via `?`) would strand an
+        // already-exported FFI_ArrowArray in consumer memory with a live release
+        // callback the consumer never learns to invoke — a leaked Arrow buffer.
+        let ffi_schema = FFI_ArrowSchema::try_from(&export_field).map_err(|e| {
+            anyhow::anyhow!(
+                "FFI_ArrowSchema conversion failed for column {}: {}",
+                i,
+                e
+            )
+        })?;
+        let ffi_array = FFI_ArrowArray::new(&data);
+
         unsafe {
             // Write new FFI data directly — do NOT read+drop previous contents.
             //
@@ -572,17 +623,11 @@ pub(crate) fn write_batch_to_ffi(
             // batch. We just overwrite with new data. The consumer must have
             // already released any previous batch before calling back into this
             // function — failing to do so will leak the previous Arrow arrays.
-            std::ptr::write_unaligned(array_ptr, FFI_ArrowArray::new(&data));
-            std::ptr::write_unaligned(
-                schema_ptr,
-                FFI_ArrowSchema::try_from(&export_field).map_err(|e| {
-                    anyhow::anyhow!(
-                        "FFI_ArrowSchema conversion failed for column {}: {}",
-                        i,
-                        e
-                    )
-                })?,
-            );
+            //
+            // Both writes below are infallible, so a column is never left with its
+            // array exported but its schema missing.
+            std::ptr::write_unaligned(array_ptr, ffi_array);
+            std::ptr::write_unaligned(schema_ptr, ffi_schema);
         }
     }
 
@@ -702,5 +747,61 @@ mod tests {
             parquet_type_to_arrow_type("INT64", "Date"),
             DataType::Timestamp(TimeUnit::Microsecond, None)
         );
+    }
+
+    /// M18: two files delivering different timestamp units within one accumulation window
+    /// must accumulate cleanly once each batch is normalized on arrival. Without the
+    /// normalize-before-push fix, `concat_batches` fails on the mismatched schemas.
+    #[test]
+    fn test_normalize_before_accumulate_mixed_timestamp_units() {
+        let ms_schema = Arc::new(Schema::new(vec![Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Millisecond, None),
+            false,
+        )]));
+        let us_schema = Arc::new(Schema::new(vec![Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            false,
+        )]));
+
+        let ms_batch = RecordBatch::try_new(
+            ms_schema,
+            vec![Arc::new(TimestampMillisecondArray::from(vec![1_000i64, 2_000i64]))],
+        )
+        .unwrap();
+        let us_batch = RecordBatch::try_new(
+            us_schema,
+            vec![Arc::new(TimestampMicrosecondArray::from(vec![3_000_000i64]))],
+        )
+        .unwrap();
+
+        // Pre-normalization the two schemas differ, so a naive accumulation would fail.
+        assert_ne!(ms_batch.schema(), us_batch.schema());
+
+        // Normalize each batch as it "arrives" (mirrors produce_batches), then accumulate.
+        let n1 = normalize_timestamps(ms_batch).unwrap();
+        let n2 = normalize_timestamps(us_batch).unwrap();
+        assert_eq!(n1.schema(), n2.schema(), "normalized schemas must match");
+
+        let mut acc = BatchAccumulator::new(1000);
+        assert!(acc.push(n1).unwrap().is_empty());
+        assert!(acc.push(n2).unwrap().is_empty());
+
+        // Flush concatenates the two normalized batches without a schema-mismatch error.
+        let flushed = acc.flush().unwrap().expect("expected a flushed batch");
+        assert_eq!(flushed.num_rows(), 3);
+        assert_eq!(
+            *flushed.schema().field(0).data_type(),
+            DataType::Timestamp(TimeUnit::Microsecond, None)
+        );
+        let col = flushed
+            .column(0)
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+        assert_eq!(col.value(0), 1_000_000); // 1000 ms → µs
+        assert_eq!(col.value(1), 2_000_000);
+        assert_eq!(col.value(2), 3_000_000); // already µs
     }
 }

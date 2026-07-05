@@ -633,6 +633,7 @@ fn create_java_column_statistics_map<'a>(
             env.call_method(&stat_obj, "setMaxBool", "(Z)V", &[JValue::Bool(v as u8)])?;
         }
         env.call_method(&stat_obj, "setNullCount", "(J)V", &[JValue::Long(stat.null_count as i64)])?;
+        env.call_method(&stat_obj, "setNanCount", "(J)V", &[JValue::Long(stat.nan_count as i64)])?;
 
         // Put into map
         let key_jstr = string_to_jstring(env, &stat.field_name)?;
@@ -1789,10 +1790,41 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_merge_QuickwitSpli
     convert_throwable(&mut env, |env| {
         let output_dir_str = jstring_to_string(env, &output_dir)?;
 
-        // Retrieve context clone from registry, then release the registry entry
+        // Retrieve context clone from registry.
         let ctx_arc = crate::utils::jlong_to_arc::<Mutex<ArrowFfiSplitContext>>(ctx_handle)
             .ok_or_else(|| anyhow!("Invalid context handle for finishAllSplits"))?;
-        release_arc(ctx_handle); // Remove from registry; ctx_arc is now the sole owner
+
+        // We now hold one clone and the registry holds one, so strong_count == 2
+        // in the normal case. A higher count means another thread (e.g. an
+        // in-flight addArrowBatch) still references the context. If we released
+        // the registry entry first and THEN try_unwrap failed, the session would
+        // be gone yet unrecoverable (M17). Guard against that by checking the
+        // count before releasing and again immediately before the release call.
+        //
+        // The documented usage model is a single caller driving begin → addBatch
+        // → finish sequentially, so this reliably rejects the misuse case. A
+        // concurrent addArrowBatch racing in the tiny window between the second
+        // check and release_arc remains theoretically possible (fully closing it
+        // would require re-inserting the Arc on a failed try_unwrap); this guard
+        // makes that window negligibly small rather than eliminating it.
+        if Arc::strong_count(&ctx_arc) > 2 {
+            anyhow::bail!(
+                "Cannot finish splits: the Arrow split context is still in use by \
+                 another operation (an addArrowBatch call has not returned). Ensure \
+                 all batches are submitted before finishAllSplits; the session is \
+                 left intact so you can retry."
+            );
+        }
+
+        // Re-check right before tearing down to minimize the race window, then
+        // release the registry entry so ctx_arc is the sole owner.
+        if Arc::strong_count(&ctx_arc) > 2 {
+            anyhow::bail!(
+                "Cannot finish splits: the Arrow split context became in-use by \
+                 another operation; the session is left intact so you can retry."
+            );
+        }
+        release_arc(ctx_handle);
 
         // Extract the context from Arc<Mutex<>>
         let ctx = Arc::try_unwrap(ctx_arc)
@@ -1800,12 +1832,11 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_merge_QuickwitSpli
             .into_inner()
             .map_err(|e| anyhow!("Failed to unwrap mutex: {}", e))?;
 
-        // Create a default SplitConfig (JNI layer uses defaults; future: accept from Java)
-        let split_config = default_split_config("arrow-ffi", "arrow-ffi-source", "arrow-ffi-node");
-
-        // Run async finish in tokio runtime
+        // The split config is a single source of truth stored in the context at
+        // begin time; finish_all_splits reads it directly so every split in the
+        // session (auto-rolled and final) shares the same identity.
         let results = QuickwitRuntimeManager::global().handle()
-            .block_on(finish_all_splits(ctx, &output_dir_str, &split_config))?;
+            .block_on(finish_all_splits(ctx, &output_dir_str))?;
 
         // Convert results to Java ArrayList<HashMap<String, Object>>
         let array_list_class = env.find_class("java/util/ArrayList")?;
@@ -2005,11 +2036,10 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_merge_QuickwitSpli
         let mut ctx = ctx_arc.lock()
             .map_err(|e| anyhow!("Failed to lock context: {}", e))?;
 
-        let split_config = default_split_config("arrow-ffi", "arrow-ffi-source", "arrow-ffi-node");
-
+        // Split config comes from the context (single source of truth set at begin).
         let result = QuickwitRuntimeManager::global().handle()
             .block_on(roll_partition_split(
-                &mut ctx, &partition_key_str, &output_dir_str, &split_config,
+                &mut ctx, &partition_key_str, &output_dir_str,
             ))?;
 
         // Convert single result to Java HashMap<String, Object>

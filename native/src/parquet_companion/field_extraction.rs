@@ -70,6 +70,10 @@ const AGG_TYPE_KEYS: &[&str] = &[
     "terms", "histogram", "date_histogram", "stats",
     "min", "max", "avg", "sum", "value_count",
     "percentiles", "cardinality",
+    // Bucket/metric aggregations that also name their target column via "field".
+    // Omitting these meant a range aggregation on a parquet-sourced fast field
+    // never triggered lazy transcoding → "field is not fast" at query time.
+    "range", "date_range", "extended_stats", "percentile_ranks",
 ];
 
 fn extract_fields_from_agg_value(value: &serde_json::Value, fields: &mut HashSet<String>) {
@@ -106,12 +110,6 @@ fn extract_fields_from_query_value(value: &serde_json::Value, fields: &mut HashS
                     if let Some(field_name) = map.get("field").and_then(|f| f.as_str()) {
                         fields.insert(field_name.to_string());
                     }
-                }
-            }
-            // Also check Elasticsearch-style: { "range": { "field": "..." } }
-            if let Some(range_obj) = map.get("range") {
-                if let Some(field_name) = range_obj.get("field").and_then(|f| f.as_str()) {
-                    fields.insert(field_name.to_string());
                 }
             }
             // Recurse into all nested objects (bool must/should/must_not, etc.)
@@ -180,6 +178,29 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_range_agg_field() {
+        // Range aggregation names its column via "field" like other aggs.
+        let json = r#"{"price_ranges": {"range": {"field": "price", "ranges": [{"to": 10.0}, {"from": 10.0, "to": 100.0}]}}}"#;
+        let fields = extract_aggregation_fields(json);
+        assert_eq!(fields, HashSet::from(["price".to_string()]));
+    }
+
+    #[test]
+    fn test_extract_date_range_and_extended_stats_and_percentile_ranks_fields() {
+        let json = r#"{
+            "dr": {"date_range": {"field": "created_at", "ranges": [{"to": "now-1d"}]}},
+            "es": {"extended_stats": {"field": "latency"}},
+            "pr": {"percentile_ranks": {"field": "duration", "values": [95.0, 99.0]}}
+        }"#;
+        let fields = extract_aggregation_fields(json);
+        assert_eq!(fields, HashSet::from([
+            "created_at".to_string(),
+            "latency".to_string(),
+            "duration".to_string(),
+        ]));
+    }
+
+    #[test]
     fn test_extract_multiple_top_level_aggs() {
         let json = r#"{
             "agg1": {"terms": {"field": "status"}},
@@ -197,13 +218,6 @@ mod tests {
         let json = r#"{"type": "range", "field": "id", "lower_bound": {"included": "5"}, "upper_bound": {"included": "10"}}"#;
         let fields = extract_range_query_fields(json);
         assert_eq!(fields, HashSet::from(["id".to_string()]));
-    }
-
-    #[test]
-    fn test_extract_range_query_es_style() {
-        let json = r#"{"range": {"field": "price", "gte": "10", "lte": "100"}}"#;
-        let fields = extract_range_query_fields(json);
-        assert_eq!(fields, HashSet::from(["price".to_string()]));
     }
 
     #[test]

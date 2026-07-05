@@ -24,13 +24,18 @@ pub fn resolve_name_mapping(
     explicit_mapping: &HashMap<String, String>,
     auto_detect: bool,
 ) -> Result<NameMapping> {
-    let schema = parquet_metadata.file_metadata().schema_descr();
     let mut mapping = NameMapping::new();
 
-    // Start with identity mapping for all columns
-    for i in 0..schema.num_columns() {
-        let col = schema.column(i);
-        mapping.insert(col.name().to_string(), col.name().to_string());
+    // Start with an identity mapping for every top-level field.
+    //
+    // We deliberately enumerate the root group's direct children rather than
+    // parquet *leaf* columns: the top-level fields are exactly what become
+    // tantivy fields (see `derive_tantivy_schema_with_mapping`). For nested
+    // types (struct/list/map) the leaf enumeration explodes a single top-level
+    // column into multiple leaves — and, critically for Iceberg, hangs the
+    // field-id off the *group* node, which never appears in the leaf list.
+    for field_name in top_level_field_names(parquet_metadata) {
+        mapping.insert(field_name.clone(), field_name);
     }
 
     // Layer 2: Auto-detect Iceberg mapping if requested
@@ -54,11 +59,32 @@ pub fn resolve_name_mapping(
     Ok(mapping)
 }
 
+/// Enumerate the top-level (root) schema field names.
+///
+/// These are the columns that become tantivy fields. We intentionally use the
+/// root group's direct children rather than parquet leaf columns — for nested
+/// types (struct/list/map) a single top-level column expands into multiple
+/// leaves, and Iceberg attaches the field-id to the *group* node, which never
+/// appears in the leaf enumeration.
+fn top_level_field_names(
+    metadata: &parquet::file::metadata::ParquetMetaData,
+) -> Vec<String> {
+    metadata
+        .file_metadata()
+        .schema_descr()
+        .root_schema()
+        .get_fields()
+        .iter()
+        .map(|field| field.name().to_string())
+        .collect()
+}
+
 /// Auto-detect field ID → name mapping from Iceberg schema metadata.
 ///
 /// Iceberg stores schema as JSON in the parquet file's key-value metadata
-/// under the key "iceberg.schema". This contains field IDs that map to
-/// physical column ordinals.
+/// under the key "iceberg.schema". This contains field IDs that map to the
+/// parquet field-ids carried on each top-level schema node (including group
+/// nodes for nested types).
 fn auto_detect_iceberg_mapping(
     metadata: &parquet::file::metadata::ParquetMetaData,
 ) -> Option<NameMapping> {
@@ -74,8 +100,26 @@ fn auto_detect_iceberg_mapping(
     let iceberg_schema: serde_json::Value = serde_json::from_str(iceberg_schema_json).ok()?;
 
     let fields = iceberg_schema.get("fields")?.as_array()?;
-    let mut mapping = NameMapping::new();
 
+    // Build a one-pass index of field_id → physical column name over the
+    // top-level schema nodes. Iceberg attaches the field-id to the top-level
+    // node (group nodes included), which is the granularity that becomes a
+    // tantivy field. This avoids the previous O(fields × leaf-columns) scan and
+    // — unlike leaf enumeration — resolves field-ids on nested/group columns.
+    let mut id_to_column: HashMap<i32, String> = HashMap::new();
+    for field in metadata
+        .file_metadata()
+        .schema_descr()
+        .root_schema()
+        .get_fields()
+    {
+        let info = field.get_basic_info();
+        if info.has_id() {
+            id_to_column.insert(info.id(), field.name().to_string());
+        }
+    }
+
+    let mut mapping = NameMapping::new();
     for field in fields {
         let id = match field.get("id").and_then(|v| v.as_i64()) {
             Some(id) => id,
@@ -86,15 +130,9 @@ fn auto_detect_iceberg_mapping(
             None => continue, // Skip fields with missing/invalid name
         };
 
-        // In Iceberg, the field ID corresponds to the parquet column's field_id
-        // We need to find which parquet column has this field_id
-        let schema_descr = metadata.file_metadata().schema_descr();
-        for i in 0..schema_descr.num_columns() {
-            let col = schema_descr.column(i);
-            if col.self_type().get_basic_info().id() == id as i32 {
-                mapping.insert(col.name().to_string(), name.to_string());
-                break;
-            }
+        // Look up the physical column carrying this field-id (if any).
+        if let Some(col_name) = id_to_column.get(&(id as i32)) {
+            mapping.insert(col_name.clone(), name.to_string());
         }
     }
 
@@ -105,27 +143,57 @@ fn auto_detect_iceberg_mapping(
     }
 }
 
-/// Validate that all parquet columns have a name mapping
+/// Validate the resolved name mapping against the parquet schema.
+///
+/// Both invariants are checked against the set of *top-level* fields (the
+/// columns that become tantivy fields), not parquet leaf columns:
+///
+/// 1. **Completeness** — every top-level field has a mapping entry.
+/// 2. **No dangling keys** — every mapping key names a real top-level field.
+///    This makes the check non-vacuous: it catches typo'd explicit-mapping
+///    keys (which are otherwise silent no-ops) and any mapping key that
+///    resolves to no real column.
+///
+/// # Limitation
+/// Mapping is performed at top-level field granularity. Renaming a sub-field
+/// *inside* a nested struct/list/map is not modeled here — only the top-level
+/// column (which is what tantivy indexes) is validated.
 pub fn validate_name_mapping_completeness(
     mapping: &NameMapping,
     parquet_metadata: &parquet::file::metadata::ParquetMetaData,
 ) -> Result<()> {
-    let schema = parquet_metadata.file_metadata().schema_descr();
-    let mut unmapped = Vec::new();
+    use std::collections::HashSet;
 
-    for i in 0..schema.num_columns() {
-        let col = schema.column(i);
-        let col_name = col.name();
-        if !mapping.contains_key(col_name) {
-            unmapped.push(col_name.to_string());
-        }
-    }
+    let field_names: HashSet<String> = top_level_field_names(parquet_metadata)
+        .into_iter()
+        .collect();
 
-    if !unmapped.is_empty() {
+    // (1) Every real top-level field must be mapped.
+    let mut unmapped: Vec<String> = field_names
+        .iter()
+        .filter(|name| !mapping.contains_key(*name))
+        .cloned()
+        .collect();
+    unmapped.sort();
+
+    // (2) Every mapping key must correspond to a real top-level field. This is
+    //     where typo'd explicit-mapping keys surface instead of being silently
+    //     dropped.
+    let mut unknown: Vec<String> = mapping
+        .keys()
+        .filter(|key| !field_names.contains(*key))
+        .cloned()
+        .collect();
+    unknown.sort();
+
+    if !unmapped.is_empty() || !unknown.is_empty() {
         anyhow::bail!(
-            "Incomplete name mapping: {} columns unmapped: {:?}",
+            "Invalid name mapping: {} unmapped column(s): {:?}; \
+             {} mapping key(s) matching no column: {:?}",
             unmapped.len(),
-            unmapped
+            unmapped,
+            unknown.len(),
+            unknown
         );
     }
 
@@ -160,6 +228,155 @@ pub fn validate_consistent_mapping_across_files(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use parquet::file::metadata::{FileMetaData, KeyValue, ParquetMetaData};
+    use parquet::schema::types::{SchemaDescriptor, Type, TypePtr};
+    use std::sync::Arc;
+
+    /// A test schema field: a primitive top-level column with an optional
+    /// Iceberg field-id.
+    fn primitive_field(name: &str, field_id: Option<i32>) -> TypePtr {
+        Arc::new(
+            Type::primitive_type_builder(name, parquet::basic::Type::INT64)
+                .with_repetition(parquet::basic::Repetition::OPTIONAL)
+                .with_id(field_id)
+                .build()
+                .unwrap(),
+        )
+    }
+
+    /// A test schema field: a top-level *group* (nested) column carrying an
+    /// optional Iceberg field-id on the group node itself. Exercises the M5
+    /// case where the field-id lives on a group node, not a leaf.
+    fn group_field(name: &str, field_id: Option<i32>, child: &str) -> TypePtr {
+        Arc::new(
+            Type::group_type_builder(name)
+                .with_repetition(parquet::basic::Repetition::OPTIONAL)
+                .with_id(field_id)
+                .with_fields(vec![primitive_field(child, None)])
+                .build()
+                .unwrap(),
+        )
+    }
+
+    /// Build test parquet metadata from a set of top-level fields and an
+    /// optional `iceberg.schema` JSON payload.
+    fn make_metadata(fields: Vec<TypePtr>, iceberg_schema: Option<&str>) -> ParquetMetaData {
+        let schema = SchemaDescriptor::new(Arc::new(
+            Type::group_type_builder("test_schema")
+                .with_fields(fields)
+                .build()
+                .unwrap(),
+        ));
+        let kv = iceberg_schema.map(|json| {
+            vec![KeyValue::new(
+                "iceberg.schema".to_string(),
+                Some(json.to_string()),
+            )]
+        });
+        let file_metadata = FileMetaData::new(1, 0, None, kv, Arc::new(schema), None);
+        ParquetMetaData::new(file_metadata, vec![])
+    }
+
+    #[test]
+    fn test_resolve_identity_mapping_top_level_fields() {
+        let meta = make_metadata(
+            vec![primitive_field("col_a", None), primitive_field("col_b", None)],
+            None,
+        );
+        let mapping = resolve_name_mapping(&meta, &HashMap::new(), false).unwrap();
+        assert_eq!(mapping.get("col_a"), Some(&"col_a".to_string()));
+        assert_eq!(mapping.get("col_b"), Some(&"col_b".to_string()));
+        assert_eq!(mapping.len(), 2);
+    }
+
+    #[test]
+    fn test_resolve_identity_uses_group_node_not_leaf() {
+        // A nested group column has a child leaf named "child"; the top-level
+        // field is "nested". The mapping must key on the top-level field.
+        let meta = make_metadata(vec![group_field("nested", None, "child")], None);
+        let mapping = resolve_name_mapping(&meta, &HashMap::new(), false).unwrap();
+        assert!(mapping.contains_key("nested"), "top-level group must be mapped");
+        assert!(!mapping.contains_key("child"), "leaf child must not appear");
+    }
+
+    #[test]
+    fn test_explicit_mapping_overrides() {
+        let meta = make_metadata(vec![primitive_field("col_a", None)], None);
+        let mut explicit = HashMap::new();
+        explicit.insert("col_a".to_string(), "renamed_a".to_string());
+        let mapping = resolve_name_mapping(&meta, &explicit, false).unwrap();
+        assert_eq!(mapping.get("col_a"), Some(&"renamed_a".to_string()));
+    }
+
+    #[test]
+    fn test_auto_detect_iceberg_primitive() {
+        let iceberg = r#"{"fields":[{"id":1,"name":"user_name"},{"id":2,"name":"user_age"}]}"#;
+        let meta = make_metadata(
+            vec![
+                primitive_field("col1", Some(1)),
+                primitive_field("col2", Some(2)),
+            ],
+            Some(iceberg),
+        );
+        let mapping = resolve_name_mapping(&meta, &HashMap::new(), true).unwrap();
+        assert_eq!(mapping.get("col1"), Some(&"user_name".to_string()));
+        assert_eq!(mapping.get("col2"), Some(&"user_age".to_string()));
+    }
+
+    #[test]
+    fn test_auto_detect_iceberg_matches_group_node_field_id() {
+        // M5 regression: the field-id lives on the top-level group node, which
+        // the old leaf-column scan could never match.
+        let iceberg = r#"{"fields":[{"id":7,"name":"address"}]}"#;
+        let meta = make_metadata(vec![group_field("addr_struct", Some(7), "city")], Some(iceberg));
+        let mapping = resolve_name_mapping(&meta, &HashMap::new(), true).unwrap();
+        assert_eq!(
+            mapping.get("addr_struct"),
+            Some(&"address".to_string()),
+            "renaming a nested/group column via field-id must work"
+        );
+    }
+
+    #[test]
+    fn test_validate_completeness_ok() {
+        let meta = make_metadata(
+            vec![primitive_field("col_a", None), primitive_field("col_b", None)],
+            None,
+        );
+        let mapping = resolve_name_mapping(&meta, &HashMap::new(), false).unwrap();
+        assert!(validate_name_mapping_completeness(&mapping, &meta).is_ok());
+    }
+
+    #[test]
+    fn test_validate_detects_unmapped_column() {
+        let meta = make_metadata(
+            vec![primitive_field("col_a", None), primitive_field("col_b", None)],
+            None,
+        );
+        // Mapping is missing col_b.
+        let mut mapping = NameMapping::new();
+        mapping.insert("col_a".to_string(), "col_a".to_string());
+        let err = validate_name_mapping_completeness(&mapping, &meta).unwrap_err();
+        assert!(err.to_string().contains("unmapped"), "got: {}", err);
+        assert!(err.to_string().contains("col_b"), "got: {}", err);
+    }
+
+    #[test]
+    fn test_validate_detects_typoed_explicit_key() {
+        // L13 regression: an explicit-mapping key naming a non-existent column
+        // must be reported, not silently dropped.
+        let meta = make_metadata(vec![primitive_field("col_a", None)], None);
+        let mut explicit = HashMap::new();
+        explicit.insert("col_typo".to_string(), "renamed".to_string());
+        let mapping = resolve_name_mapping(&meta, &explicit, false).unwrap();
+        let err = validate_name_mapping_completeness(&mapping, &meta).unwrap_err();
+        assert!(
+            err.to_string().contains("matching no column"),
+            "got: {}",
+            err
+        );
+        assert!(err.to_string().contains("col_typo"), "got: {}", err);
+    }
 
     #[test]
     fn test_consistent_mapping_ok() {

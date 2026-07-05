@@ -18,13 +18,19 @@ use crate::debug_println;
 /// - All or no splits must have manifests (mixing is not allowed)
 /// - No deletions in any source (identity mapping requirement)
 /// - Same fast_field_mode across all sources
-/// - Row offsets are adjusted based on cumulative row count
+/// - Row offsets are adjusted based on cumulative row count, following the
+///   same segment ordering quickwit's `combine_index_meta` produces for the
+///   merged index (the LAST source split's docs come first).
 /// - Segment row ranges are rebuilt for the merged single segment
+///
+/// `expected_merged_docs`, when provided, is asserted to equal the combined
+/// row count as a backstop against ordering/deletion bugs (F1/F2/M7).
 ///
 /// Returns None if no splits have manifests.
 pub fn combine_parquet_manifests(
     source_dirs: &[&Path],
     output_dir: &Path,
+    expected_merged_docs: Option<u64>,
 ) -> Result<Option<()>> {
     // Read manifests from source directories
     let mut manifests: Vec<Option<ParquetManifest>> = Vec::new();
@@ -75,12 +81,15 @@ pub fn combine_parquet_manifests(
     for (i, dir) in source_dirs.iter().enumerate() {
         let meta_path = dir.join("meta.json");
         if !meta_path.exists() {
-            crate::debug_println!(
-                "⚠️ PARQUET_MERGE: Missing meta.json in source split[{}] ({:?}), \
-                 skipping deletion check",
+            // A companion split always carries a meta.json; its absence means
+            // the extracted split is corrupt. Skipping the deletion check here
+            // could let a split with deletions through and corrupt doc→row
+            // mapping, so fail instead of silently continuing (L11).
+            anyhow::bail!(
+                "Cannot merge: source split[{}] ({:?}) is missing meta.json; \
+                 unable to verify it has no deletions.",
                 i, dir
             );
-            continue;
         }
         let meta_bytes = std::fs::read(&meta_path)
             .with_context(|| format!("Failed to read meta.json from {:?}", meta_path))?;
@@ -91,7 +100,12 @@ pub fn combine_parquet_manifests(
 
         if let Some(segments) = meta.get("segments").and_then(|s| s.as_array()) {
             for seg in segments {
-                let num_deleted = seg.get("num_deleted_docs")
+                // Tantivy nests deletions under `deletes: Option<DeleteMeta>`
+                // (InnerSegmentMeta, no serde flatten). The real shape is
+                // {"segment_id":…,"max_doc":100,"deletes":{"num_deleted_docs":5,…}},
+                // so a top-level `num_deleted_docs` lookup would always miss.
+                let num_deleted = seg.get("deletes")
+                    .and_then(|d| d.get("num_deleted_docs"))
                     .and_then(|n| n.as_u64())
                     .unwrap_or(0);
                 if num_deleted > 0 {
@@ -123,17 +137,85 @@ pub fn combine_parquet_manifests(
         }
     }
 
-    // Build combined manifest
+    // Validate: all manifests share the same storage_config (M8).
+    // The combined manifest keeps only split[0]'s storage_config; if split[1]
+    // was built over a different bucket/endpoint, its relative paths would then
+    // resolve against the wrong storage after merge (wrong rows if a same-named
+    // file exists there). Reject the merge rather than silently mis-resolve.
+    if manifests.len() > 1 {
+        let base_storage = &manifests[0].storage_config;
+        for (i, manifest) in manifests.iter().enumerate().skip(1) {
+            if manifest.storage_config != *base_storage {
+                anyhow::bail!(
+                    "Cannot merge splits with incompatible storage_config: split[0] \
+                     and split[{}] were built over different storage backends. Only \
+                     split[0]'s storage_config is retained after merge, so relative \
+                     paths from other splits would resolve against the wrong backend.",
+                    i
+                );
+            }
+        }
+    }
+
+    // Build combined manifest.
+    //
+    // CRITICAL: the merged doc order is NOT the input order. Quickwit's
+    // `combine_index_meta` pops the LAST index_meta as the base then extends
+    // with the rest in order, so the merged segment/doc order is
+    // `[n-1, 0, 1, …, n-2]`. Positional consumers of the manifest (transcode
+    // assigning doc_id = global_row + row, legacy positional retrieval, hash
+    // touch-up fallback) require row_offsets that match that merged order, so
+    // we concatenate manifests in the same order rather than input order.
+    let n = manifests.len();
+    let merge_order: Vec<usize> = std::iter::once(n - 1).chain(0..n - 1).collect();
+
     let mut combined_files: Vec<ParquetFileEntry> = Vec::new();
     let mut cumulative_rows: u64 = 0;
 
-    for manifest in &manifests {
+    for &idx in &merge_order {
+        let manifest = &manifests[idx];
         for file in &manifest.parquet_files {
             let mut adjusted_file = file.clone();
             adjusted_file.row_offset = cumulative_rows + file.row_offset;
             combined_files.push(adjusted_file);
         }
         cumulative_rows += manifest.total_rows;
+    }
+
+    // Backstop (M7): the combined row count must equal the actual merged doc
+    // count. A mismatch means an ordering bug, an unguarded deletion, or a
+    // manifest whose total_rows drifted from its file rows — all of which would
+    // silently map doc_ids to wrong parquet rows.
+    if let Some(merged_docs) = expected_merged_docs {
+        if cumulative_rows != merged_docs {
+            anyhow::bail!(
+                "Combined parquet manifest row count ({}) does not match merged \
+                 document count ({}). This indicates deletions, an ordering bug, \
+                 or corrupt manifest metadata; refusing to produce a split that \
+                 would map documents to wrong parquet rows.",
+                cumulative_rows, merged_docs
+            );
+        }
+    }
+
+    // Reject duplicate relative paths across the merged manifests. Because
+    // table_root is not persisted, two splits built over different tables whose
+    // files share a relative name would collide in `build_file_hash_index` (a
+    // HashMap keyed by path hash keeps only the last entry), silently resolving
+    // documents to the wrong parquet file.
+    {
+        let mut seen = std::collections::HashSet::with_capacity(combined_files.len());
+        for file in &combined_files {
+            if !seen.insert(file.relative_path.as_str()) {
+                anyhow::bail!(
+                    "Cannot merge splits: duplicate parquet file relative path '{}' \
+                     across source manifests. Relative paths must be unique because \
+                     table_root is not persisted and doc→parquet resolution keys on \
+                     the path hash.",
+                    file.relative_path
+                );
+            }
+        }
     }
 
     // Rebuild segment_row_ranges: merged = single segment covering all rows
@@ -143,22 +225,23 @@ pub fn combine_parquet_manifests(
         num_rows: cumulative_rows,
     }];
 
-    // Union string_hash_fields from all manifests (they should be identical for same-schema splits).
+    // Union string_hash_fields from all manifests. A hash-field-name mismatch for
+    // the same tantivy field means the splits hash that field differently, which
+    // would corrupt hash-based aggregation reads on the merged split — reject it
+    // with a hard error rather than a release-mode no-op debug_assert (D3).
     let mut combined_hash_fields = manifests[0].string_hash_fields.clone();
     for (i, manifest) in manifests.iter().enumerate().skip(1) {
         for (k, v) in &manifest.string_hash_fields {
             if let Some(existing) = combined_hash_fields.get(k) {
-                debug_assert_eq!(existing, v,
-                    "string_hash_fields mismatch during merge for field {}", k);
+                if existing != v {
+                    anyhow::bail!(
+                        "Cannot merge: string_hash_fields mismatch for field '{}' \
+                         between split[0] ({}) and split[{}] ({})",
+                        k, existing, i, v
+                    );
+                }
             }
             combined_hash_fields.insert(k.clone(), v.clone());
-        }
-        if manifest.string_hash_fields != manifests[0].string_hash_fields {
-            debug_println!(
-                "⚠️ MERGE_MANIFEST: string_hash_fields differ between split[0] and split[{}]; \
-                 using union (this may indicate schema inconsistency)",
-                i
-            );
         }
     }
 
@@ -235,6 +318,16 @@ pub fn combine_parquet_manifests(
 mod tests {
     use super::*;
 
+    /// Write a minimal no-deletion meta.json into a source split dir, matching
+    /// what a real extracted companion split always carries. Required because
+    /// combine_parquet_manifests now hard-fails on a missing meta.json (L11).
+    fn write_no_deletion_meta(dir: &Path) {
+        let meta = serde_json::json!({
+            "segments": [{ "segment_id": "seg", "max_doc": 1, "deletes": serde_json::Value::Null }]
+        });
+        std::fs::write(dir.join("meta.json"), serde_json::to_string(&meta).unwrap()).unwrap();
+    }
+
     fn make_test_manifest(table_root: &str, files: Vec<(&str, u64, u64)>) -> ParquetManifest {
         let mut parquet_files = Vec::new();
         let mut offset = 0u64;
@@ -282,6 +375,7 @@ mod tests {
         let result = combine_parquet_manifests(
             &[dir1.path(), dir2.path()],
             output.path(),
+        None,
         ).unwrap();
 
         assert!(result.is_none());
@@ -297,10 +391,12 @@ mod tests {
         let m = make_test_manifest("s3://bucket/table", vec![("part1.parquet", 100, 1024)]);
         let serialized = serialize_manifest(&m).unwrap();
         std::fs::write(dir1.path().join(MANIFEST_FILENAME), &serialized).unwrap();
+        write_no_deletion_meta(dir1.path());
 
         let result = combine_parquet_manifests(
             &[dir1.path(), dir2.path()],
             output.path(),
+        None,
         );
 
         assert!(result.is_err());
@@ -319,11 +415,14 @@ mod tests {
         m2.fast_field_mode = FastFieldMode::Hybrid;
 
         std::fs::write(dir1.path().join(MANIFEST_FILENAME), serialize_manifest(&m1).unwrap()).unwrap();
+        write_no_deletion_meta(dir1.path());
         std::fs::write(dir2.path().join(MANIFEST_FILENAME), serialize_manifest(&m2).unwrap()).unwrap();
+        write_no_deletion_meta(dir2.path());
 
         let result = combine_parquet_manifests(
             &[dir1.path(), dir2.path()],
             output.path(),
+        None,
         );
 
         assert!(result.is_err());
@@ -340,11 +439,14 @@ mod tests {
         let m2 = make_test_manifest("s3://bucket", vec![("p2.parquet", 200, 2048)]);
 
         std::fs::write(dir1.path().join(MANIFEST_FILENAME), serialize_manifest(&m1).unwrap()).unwrap();
+        write_no_deletion_meta(dir1.path());
         std::fs::write(dir2.path().join(MANIFEST_FILENAME), serialize_manifest(&m2).unwrap()).unwrap();
+        write_no_deletion_meta(dir2.path());
 
         let result = combine_parquet_manifests(
             &[dir1.path(), dir2.path()],
             output.path(),
+        None,
         ).unwrap();
 
         assert!(result.is_some());
@@ -353,10 +455,14 @@ mod tests {
         let combined_data = std::fs::read(output.path().join(MANIFEST_FILENAME)).unwrap();
         let combined = deserialize_manifest(&combined_data).unwrap();
 
+        // Merged doc order mirrors quickwit's combine_index_meta: the LAST
+        // split (m2) comes first, so p2 is at offset 0 and p1 follows at 200.
         assert_eq!(combined.total_rows, 300);
         assert_eq!(combined.parquet_files.len(), 2);
+        assert_eq!(combined.parquet_files[0].relative_path, "p2.parquet");
         assert_eq!(combined.parquet_files[0].row_offset, 0);
-        assert_eq!(combined.parquet_files[1].row_offset, 100);
+        assert_eq!(combined.parquet_files[1].relative_path, "p1.parquet");
+        assert_eq!(combined.parquet_files[1].row_offset, 200);
         assert_eq!(combined.segment_row_ranges.len(), 1);
         assert_eq!(combined.segment_row_ranges[0].num_rows, 300);
     }
@@ -373,12 +479,16 @@ mod tests {
         let m3 = make_test_manifest("s3://b", vec![("d.parquet", 100, 1024)]);
 
         std::fs::write(dir1.path().join(MANIFEST_FILENAME), serialize_manifest(&m1).unwrap()).unwrap();
+        write_no_deletion_meta(dir1.path());
         std::fs::write(dir2.path().join(MANIFEST_FILENAME), serialize_manifest(&m2).unwrap()).unwrap();
+        write_no_deletion_meta(dir2.path());
         std::fs::write(dir3.path().join(MANIFEST_FILENAME), serialize_manifest(&m3).unwrap()).unwrap();
+        write_no_deletion_meta(dir3.path());
 
         let result = combine_parquet_manifests(
             &[dir1.path(), dir2.path(), dir3.path()],
             output.path(),
+        None,
         ).unwrap();
 
         assert!(result.is_some());
@@ -386,20 +496,22 @@ mod tests {
         let combined_data = std::fs::read(output.path().join(MANIFEST_FILENAME)).unwrap();
         let combined = deserialize_manifest(&combined_data).unwrap();
 
+        // Merged order mirrors combine_index_meta: [m3, m1, m2] (last split
+        // first). So: d (m3, 100 rows) → a (m1, 50) → b,c (m2, 30+20).
         assert_eq!(combined.total_rows, 200);
         assert_eq!(combined.parquet_files.len(), 4);
-        // m1: file a at offset 0
-        assert_eq!(combined.parquet_files[0].relative_path, "a.parquet");
+        // m3: file d at offset 0 (last split becomes the base)
+        assert_eq!(combined.parquet_files[0].relative_path, "d.parquet");
         assert_eq!(combined.parquet_files[0].row_offset, 0);
-        // m2: file b at offset 50 (after m1's 50 rows)
-        assert_eq!(combined.parquet_files[1].relative_path, "b.parquet");
-        assert_eq!(combined.parquet_files[1].row_offset, 50);
-        // m2: file c at offset 80 (50 + 30)
-        assert_eq!(combined.parquet_files[2].relative_path, "c.parquet");
-        assert_eq!(combined.parquet_files[2].row_offset, 80);
-        // m3: file d at offset 100 (50 + 50)
-        assert_eq!(combined.parquet_files[3].relative_path, "d.parquet");
-        assert_eq!(combined.parquet_files[3].row_offset, 100);
+        // m1: file a at offset 100 (after m3's 100 rows)
+        assert_eq!(combined.parquet_files[1].relative_path, "a.parquet");
+        assert_eq!(combined.parquet_files[1].row_offset, 100);
+        // m2: file b at offset 150 (100 + 50)
+        assert_eq!(combined.parquet_files[2].relative_path, "b.parquet");
+        assert_eq!(combined.parquet_files[2].row_offset, 150);
+        // m2: file c at offset 180 (150 + 30)
+        assert_eq!(combined.parquet_files[3].relative_path, "c.parquet");
+        assert_eq!(combined.parquet_files[3].row_offset, 180);
     }
 
     #[test]
@@ -412,14 +524,17 @@ mod tests {
         let m2 = make_test_manifest("s3://bucket", vec![("p2.parquet", 200, 2048)]);
 
         std::fs::write(dir1.path().join(MANIFEST_FILENAME), serialize_manifest(&m1).unwrap()).unwrap();
+        write_no_deletion_meta(dir1.path());
         std::fs::write(dir2.path().join(MANIFEST_FILENAME), serialize_manifest(&m2).unwrap()).unwrap();
+        write_no_deletion_meta(dir2.path());
 
-        // Write a meta.json with deletions in dir2
+        // Write a meta.json with deletions in dir2, using tantivy's real shape:
+        // deletions are nested under `deletes: {num_deleted_docs, opstamp}`.
         let meta_with_deletions = serde_json::json!({
             "segments": [{
                 "segment_id": "abc123",
                 "max_doc": 200,
-                "num_deleted_docs": 5
+                "deletes": { "num_deleted_docs": 5, "opstamp": 7 }
             }]
         });
         std::fs::write(
@@ -430,6 +545,7 @@ mod tests {
         let result = combine_parquet_manifests(
             &[dir1.path(), dir2.path()],
             output.path(),
+        None,
         );
 
         assert!(result.is_err());
@@ -448,7 +564,9 @@ mod tests {
         let m2 = make_test_manifest("s3://bucket", vec![("p2.parquet", 200, 2048)]);
 
         std::fs::write(dir1.path().join(MANIFEST_FILENAME), serialize_manifest(&m1).unwrap()).unwrap();
+        write_no_deletion_meta(dir1.path());
         std::fs::write(dir2.path().join(MANIFEST_FILENAME), serialize_manifest(&m2).unwrap()).unwrap();
+        write_no_deletion_meta(dir2.path());
 
         // Write meta.json with zero deletions — should pass
         let meta_no_deletions = serde_json::json!({
@@ -470,6 +588,7 @@ mod tests {
         let result = combine_parquet_manifests(
             &[dir1.path(), dir2.path()],
             output.path(),
+        None,
         );
 
         assert!(result.is_ok());
@@ -505,11 +624,14 @@ mod tests {
         }];
 
         std::fs::write(dir1.path().join(MANIFEST_FILENAME), serialize_manifest(&m1).unwrap()).unwrap();
+        write_no_deletion_meta(dir1.path());
         std::fs::write(dir2.path().join(MANIFEST_FILENAME), serialize_manifest(&m2).unwrap()).unwrap();
+        write_no_deletion_meta(dir2.path());
 
         let result = combine_parquet_manifests(
             &[dir1.path(), dir2.path()],
             output.path(),
+        None,
         );
 
         assert!(result.is_err());
@@ -542,11 +664,14 @@ mod tests {
         });
 
         std::fs::write(dir1.path().join(MANIFEST_FILENAME), serialize_manifest(&m1).unwrap()).unwrap();
+        write_no_deletion_meta(dir1.path());
         std::fs::write(dir2.path().join(MANIFEST_FILENAME), serialize_manifest(&m2).unwrap()).unwrap();
+        write_no_deletion_meta(dir2.path());
 
         let result = combine_parquet_manifests(
             &[dir1.path(), dir2.path()],
             output.path(),
+        None,
         ).unwrap();
         assert!(result.is_some());
 
@@ -574,11 +699,14 @@ mod tests {
         m2.string_indexing_modes.insert("field_a".to_string(), StringIndexingMode::TextUuidStrip);
 
         std::fs::write(dir1.path().join(MANIFEST_FILENAME), serialize_manifest(&m1).unwrap()).unwrap();
+        write_no_deletion_meta(dir1.path());
         std::fs::write(dir2.path().join(MANIFEST_FILENAME), serialize_manifest(&m2).unwrap()).unwrap();
+        write_no_deletion_meta(dir2.path());
 
         let result = combine_parquet_manifests(
             &[dir1.path(), dir2.path()],
             output.path(),
+        None,
         );
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("string_indexing_modes mismatch"));
@@ -606,11 +734,14 @@ mod tests {
         m2.column_mapping = mapping;
 
         std::fs::write(dir1.path().join(MANIFEST_FILENAME), serialize_manifest(&m1).unwrap()).unwrap();
+        write_no_deletion_meta(dir1.path());
         std::fs::write(dir2.path().join(MANIFEST_FILENAME), serialize_manifest(&m2).unwrap()).unwrap();
+        write_no_deletion_meta(dir2.path());
 
         let result = combine_parquet_manifests(
             &[dir1.path(), dir2.path()],
             output.path(),
+        None,
         );
 
         assert!(result.is_ok());

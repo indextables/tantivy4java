@@ -33,6 +33,7 @@ pub(crate) fn create_terms_result_object(
     exclude_filter: Option<&std::collections::HashSet<String>>,
     missing_value: Option<&str>,
     needs_resort: bool,
+    result_size: Option<usize>,
 ) -> anyhow::Result<jobject> {
     debug_println!(
         "RUST DEBUG: Creating TermsResult for '{}' with {} buckets",
@@ -92,6 +93,15 @@ pub(crate) fn create_terms_result_object(
     // Tantivy sorted by U64 hash value which doesn't match string ordering.
     if needs_resort {
         resolved_buckets.sort_by(|(a, _), (b, _)| a.cmp(b));
+    }
+
+    // Phase 2b: When an include/exclude filter was applied, Tantivy was asked for an
+    // enlarged `size` so the filter had enough candidate buckets. Truncate back to the
+    // originally-requested size now that filtering (and any resort) is done. The
+    // ordering here is either doc_count-desc (preserved from Tantivy) or string-key
+    // order (from the resort above), so truncation keeps the correct top-`size`.
+    if let Some(size) = result_size {
+        resolved_buckets.truncate(size);
     }
 
     // Phase 3: Create Java objects from the resolved, filtered, sorted list.

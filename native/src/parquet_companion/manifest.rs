@@ -33,7 +33,17 @@ fn pack_page_locations(locations: &[PageLocationEntry]) -> Vec<u8> {
 }
 
 /// Unpack page locations from compact binary (20 bytes per entry, little-endian).
-fn unpack_page_locations(bytes: &[u8]) -> Vec<PageLocationEntry> {
+///
+/// Returns an error if the byte length is not an exact multiple of the 20-byte
+/// record size, which indicates corrupt/truncated input. (Previously trailing
+/// `len % 20` bytes were silently dropped.)
+fn unpack_page_locations(bytes: &[u8]) -> Result<Vec<PageLocationEntry>, String> {
+    if bytes.len() % 20 != 0 {
+        return Err(format!(
+            "Corrupt page location data: {} bytes is not a multiple of the 20-byte record size",
+            bytes.len()
+        ));
+    }
     let mut locations = Vec::with_capacity(bytes.len() / 20);
     let mut i = 0;
     while i + 20 <= bytes.len() {
@@ -44,7 +54,7 @@ fn unpack_page_locations(bytes: &[u8]) -> Vec<PageLocationEntry> {
         });
         i += 20;
     }
-    locations
+    Ok(locations)
 }
 
 fn serialize_page_locations<S: serde::Serializer>(
@@ -65,7 +75,7 @@ fn deserialize_page_locations<'de, D: serde::Deserializer<'de>>(
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(&b64)
         .map_err(serde::de::Error::custom)?;
-    Ok(unpack_page_locations(&bytes))
+    unpack_page_locations(&bytes).map_err(serde::de::Error::custom)
 }
 
 /// Current manifest format version
@@ -179,7 +189,7 @@ pub struct ColumnMapping {
 
 /// Storage configuration metadata embedded in the manifest
 /// (describes how to access the parquet files, without actual credentials)
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ParquetStorageConfigMeta {
     /// Storage protocol: "local", "s3", "azure"
     pub protocol: String,
@@ -274,6 +284,18 @@ impl ParquetManifest {
             ));
         }
 
+        // The first parquet file must start at global row 0, otherwise the
+        // monotonicity loop below (which starts at i=1) would validate a
+        // manifest whose rows begin at a nonzero offset.
+        if let Some(first) = self.parquet_files.first() {
+            if first.row_offset != 0 {
+                return Err(format!(
+                    "First parquet file must start at row_offset 0, but starts at {}",
+                    first.row_offset
+                ));
+            }
+        }
+
         // Verify row_offset monotonicity for files
         for i in 1..self.parquet_files.len() {
             let prev = &self.parquet_files[i - 1];
@@ -283,6 +305,33 @@ impl ParquetManifest {
                 return Err(format!(
                     "File row_offset gap: file[{}] ends at {} but file[{}] starts at {}",
                     i - 1, expected_offset, i, curr.row_offset
+                ));
+            }
+        }
+
+        // Verify segment_row_ranges form a contiguous, non-overlapping cover of
+        // [0, total_rows). Overlapping ranges would silently map two doc_ids to
+        // the same global row. Sort by row_offset first since segments need not
+        // be stored in row order. Runs after the file checks so a nonzero
+        // first-file offset surfaces its own (more specific) error first.
+        {
+            let mut ranges: Vec<&SegmentRowRange> = self.segment_row_ranges.iter().collect();
+            ranges.sort_by_key(|r| r.row_offset);
+            let mut expected_offset: u64 = 0;
+            for r in &ranges {
+                if r.row_offset != expected_offset {
+                    return Err(format!(
+                        "Segment row ranges are not contiguous: segment {} starts at row_offset {} \
+                         but expected {} (overlap or gap)",
+                        r.segment_ord, r.row_offset, expected_offset
+                    ));
+                }
+                expected_offset += r.num_rows;
+            }
+            if expected_offset != self.total_rows {
+                return Err(format!(
+                    "Segment row ranges cover {} rows but total_rows={}",
+                    expected_offset, self.total_rows
                 ));
             }
         }
@@ -354,6 +403,68 @@ mod tests {
     }
 
     #[test]
+    fn test_manifest_validation_first_file_nonzero_offset() {
+        let mut manifest = make_test_manifest();
+        // Shift the only file (and its segment) to start at a nonzero offset.
+        manifest.parquet_files[0].row_offset = 100;
+        manifest.segment_row_ranges[0].row_offset = 100;
+        let err = manifest.validate().unwrap_err();
+        assert!(
+            err.contains("First parquet file must start at row_offset 0"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_manifest_validation_segment_gap() {
+        let mut manifest = make_test_manifest();
+        // Two segments with a gap: [0,400) then [500,1000) — 100 rows uncovered.
+        manifest.segment_row_ranges = vec![
+            SegmentRowRange { segment_ord: 0, row_offset: 0, num_rows: 400 },
+            SegmentRowRange { segment_ord: 1, row_offset: 500, num_rows: 600 },
+        ];
+        let err = manifest.validate().unwrap_err();
+        assert!(
+            err.contains("not contiguous"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_manifest_validation_segment_overlap() {
+        let mut manifest = make_test_manifest();
+        // Two overlapping segments: [0,600) and [500,1100) both map row 500.
+        manifest.segment_row_ranges = vec![
+            SegmentRowRange { segment_ord: 0, row_offset: 0, num_rows: 600 },
+            SegmentRowRange { segment_ord: 1, row_offset: 500, num_rows: 600 },
+        ];
+        // total_rows stays 1000; segment sum (1200) mismatches, but even with a
+        // matching sum the contiguity check must reject the overlap.
+        manifest.total_rows = 1200;
+        manifest.parquet_files[0].num_rows = 1200;
+        let err = manifest.validate().unwrap_err();
+        assert!(
+            err.contains("not contiguous"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_manifest_validation_segment_not_starting_at_zero() {
+        let mut manifest = make_test_manifest();
+        manifest.segment_row_ranges[0].row_offset = 10;
+        let err = manifest.validate().unwrap_err();
+        assert!(
+            err.contains("not contiguous"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
     fn test_resolve_path_relative() {
         let manifest = make_test_manifest();
         assert_eq!(
@@ -419,13 +530,28 @@ mod tests {
         ];
         let packed = pack_page_locations(&locations);
         assert_eq!(packed.len(), 60); // 3 * 20 bytes
-        let unpacked = unpack_page_locations(&packed);
+        let unpacked = unpack_page_locations(&packed).unwrap();
         assert_eq!(unpacked.len(), 3);
         assert_eq!(unpacked[0].offset, 1000);
         assert_eq!(unpacked[0].compressed_page_size, 500);
         assert_eq!(unpacked[0].first_row_index, 0);
         assert_eq!(unpacked[2].offset, 1800);
         assert_eq!(unpacked[2].first_row_index, 200);
+    }
+
+    #[test]
+    fn test_unpack_page_locations_rejects_non_multiple_length() {
+        // A byte buffer whose length is not a multiple of the 20-byte record
+        // size indicates corruption and must error, not silently truncate.
+        let corrupt = vec![0u8; 25]; // 20 + 5 trailing bytes
+        assert!(unpack_page_locations(&corrupt).is_err());
+
+        // Empty is valid (zero records).
+        assert!(unpack_page_locations(&[]).unwrap().is_empty());
+
+        // Exact multiples still decode.
+        let ok = vec![0u8; 40];
+        assert_eq!(unpack_page_locations(&ok).unwrap().len(), 2);
     }
 
     #[test]

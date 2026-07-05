@@ -65,6 +65,57 @@ pub fn derive_tantivy_schema(
     derive_tantivy_schema_with_mapping(arrow_schema, config, None)
 }
 
+/// Validate that resolved tantivy field names are unique and do not collide
+/// with reserved parquet-companion internal field names. Returns a clean error
+/// rather than letting `SchemaBuilder::add_field` panic across JNI (F8).
+fn validate_resolved_field_names(
+    arrow_schema: &ArrowSchema,
+    config: &SchemaDerivationConfig,
+    name_mapping: Option<&HashMap<String, String>>,
+) -> Result<()> {
+    use super::indexing::{PARQUET_FILE_HASH_FIELD, PARQUET_ROW_IN_FILE_FIELD};
+
+    // Only the two __pq_* row-tracking fields are added *unconditionally* at
+    // index time with no collision guard, so a user column with either exact
+    // name would panic in SchemaBuilder. The `_phash_<field>` and
+    // `<field>__uuids` companion fields are added conditionally and already
+    // handle collisions precisely at their creation site (indexing.rs disables
+    // the fingerprint for the shadowed field; add_field_for_arrow_type bails
+    // with a clean error), so a legitimately-named column like `session__uuids`
+    // or `_phash_temp` must NOT be rejected here.
+    let mut seen: HashSet<&str> = HashSet::new();
+    for field in arrow_schema.fields() {
+        let parquet_name = field.name();
+        if config.skip_fields.contains(parquet_name.as_str()) {
+            continue;
+        }
+        let resolved = name_mapping
+            .and_then(|m| m.get(parquet_name.as_str()))
+            .map(|s| s.as_str())
+            .unwrap_or(parquet_name.as_str());
+
+        if resolved == PARQUET_FILE_HASH_FIELD || resolved == PARQUET_ROW_IN_FILE_FIELD {
+            anyhow::bail!(
+                "Parquet column '{}' resolves to reserved tantivy field name '{}'. \
+                 '{}' and '{}' are reserved for parquet companion row tracking; \
+                 rename the column or add a name mapping.",
+                parquet_name, resolved,
+                PARQUET_FILE_HASH_FIELD, PARQUET_ROW_IN_FILE_FIELD
+            );
+        }
+
+        if !seen.insert(resolved) {
+            anyhow::bail!(
+                "Duplicate tantivy field name '{}' after applying name mapping: two \
+                 parquet columns resolve to the same name. Tantivy field names must be \
+                 unique; adjust the name mapping so each column maps to a distinct name.",
+                resolved
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Derive tantivy schema with optional name mapping (parquet_col → tantivy_field).
 /// When a name mapping is provided, the tantivy field will use the mapped display name.
 pub fn derive_tantivy_schema_with_mapping(
@@ -72,6 +123,15 @@ pub fn derive_tantivy_schema_with_mapping(
     config: &SchemaDerivationConfig,
     name_mapping: Option<&HashMap<String, String>>,
 ) -> Result<Schema> {
+    // Validate resolved tantivy field names before touching SchemaBuilder (F8).
+    // tantivy's SchemaBuilder::add_field PANICS on a duplicate name, which would
+    // unwind across the JNI boundary. Detect (a) two columns resolving to the
+    // same tantivy name (explicit or Iceberg mapping collision) and (b) columns
+    // colliding with reserved companion field names (__pq_file_hash /
+    // __pq_row_in_file added unconditionally at index time, _phash_* and
+    // *__uuids added for string modes) here, and return a clean error instead.
+    validate_resolved_field_names(arrow_schema, config, name_mapping)?;
+
     let mut builder = SchemaBuilder::new();
 
     // Collect all tantivy field names for collision detection with companion fields.
@@ -322,11 +382,17 @@ fn add_field_for_arrow_type(
         }
 
         DataType::Binary | DataType::LargeBinary | DataType::FixedSizeBinary(_) => {
+            // Bytes must consult should_add_fast so the Disabled "fast for ALL"
+            // contract holds and meta.json fast promotion is backed by real
+            // native data (bytes are not transcode-serviceable from parquet) — M4.
+            let mut opts = BytesOptions::default().set_indexed();
             if config.store_fields {
-                builder.add_bytes_field(name, INDEXED | STORED);
-            } else {
-                builder.add_bytes_field(name, INDEXED);
+                opts = opts.set_stored();
             }
+            if should_add_fast(config, name, data_type) {
+                opts = opts.set_fast();
+            }
+            builder.add_bytes_field(name, opts);
         }
 
         DataType::Timestamp(_, _) | DataType::Date32 | DataType::Date64 => {
@@ -360,6 +426,14 @@ fn add_field_for_arrow_type(
             builder.add_json_field(name, opts);
         }
 
+        DataType::Dictionary(_, value_type) => {
+            // Dictionary-encoded (pandas/pyarrow categorical) columns: derive the
+            // field by the DECODED value type so they are searchable instead of
+            // being silently dropped as an "Unknown" column (M3). Batches are
+            // decoded to the value type before indexing/retrieval.
+            return add_field_for_arrow_type(builder, name, value_type, config, all_field_names);
+        }
+
         _ => {
             debug_println!(
                 "⚠️ SCHEMA_DERIVE: Unsupported type {:?} for field '{}', skipping",
@@ -386,12 +460,13 @@ fn should_add_fast(config: &SchemaDerivationConfig, field_name: &str, data_type:
         FastFieldMode::Disabled => true, // All native fast fields
         FastFieldMode::Hybrid => {
             // IP address fields are treated as native fast fields in hybrid mode,
-            // even though they come from Utf8 Arrow columns.
+            // even though they come from Utf8 Arrow columns. In ParquetOnly they
+            // are transcoded from parquet (see transcode.rs record_arrow_value).
             if config.ip_address_fields.contains(field_name) {
                 return true;
             }
-            // Only numeric/bool/date get native fast fields in hybrid mode
-            // Text fields are served from parquet at read time
+            // Numeric/bool/date get native fast fields in hybrid mode; raw text,
+            // bytes, decimal256 and IP are served from parquet at read time.
             matches!(data_type,
                 DataType::Boolean
                 | DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
@@ -401,7 +476,7 @@ fn should_add_fast(config: &SchemaDerivationConfig, field_name: &str, data_type:
                 | DataType::Timestamp(_, _) | DataType::Date32 | DataType::Date64
             )
         }
-        FastFieldMode::ParquetOnly => false, // No native fast fields
+        FastFieldMode::ParquetOnly => false, // Everything served from parquet at read time
     }
 }
 
@@ -487,12 +562,19 @@ pub fn arrow_type_to_tantivy_type(data_type: &DataType) -> &'static str {
         DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => "I64",
         DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 => "U64",
         DataType::Float32 | DataType::Float64 => "F64",
+        // Decimal128 → F64 is a deliberate, lossy design point: values above 2^53
+        // or with non-zero scale lose precision, but index and retrieval share the
+        // same f64 round-trip so they stay mutually consistent (L10). Decimal256
+        // is kept as text to avoid exceeding f64 range entirely.
         DataType::Decimal128(_, _) => "F64",
         DataType::Decimal256(_, _) => "Str",
         DataType::Utf8 | DataType::LargeUtf8 => "Str",
         DataType::Binary | DataType::LargeBinary | DataType::FixedSizeBinary(_) => "Bytes",
         DataType::Timestamp(_, _) | DataType::Date32 | DataType::Date64 => "Date",
-        DataType::List(_) | DataType::LargeList(_) | DataType::Map(_, _) | DataType::Struct(_) => "Json",
+        DataType::List(_) | DataType::LargeList(_) | DataType::FixedSizeList(_, _)
+            | DataType::Map(_, _) | DataType::Struct(_) => "Json",
+        // Dictionary-encoded columns map by their decoded value type (M3).
+        DataType::Dictionary(_, value_type) => arrow_type_to_tantivy_type(value_type),
         _ => "Unknown",
     }
 }
@@ -514,6 +596,8 @@ pub fn arrow_type_to_parquet_type(data_type: &DataType) -> &'static str {
         DataType::Timestamp(_, _) => "INT64",
         DataType::Date32 => "INT32",
         DataType::Date64 => "INT64",
+        // Dictionary-encoded columns map by their decoded value type (M3).
+        DataType::Dictionary(_, value_type) => arrow_type_to_parquet_type(value_type),
         _ => "BYTE_ARRAY",
     }
 }
@@ -816,9 +900,11 @@ mod tests {
 
         let schema = derive_tantivy_schema(&arrow, &config).unwrap();
 
+        // In ParquetOnly IP fields are served from parquet at read time (the
+        // transcode path has an IpAddr arm — M4), so they are NOT native fast.
         let src_ip_field = schema.get_field("src_ip").unwrap();
         let src_ip_entry = schema.get_field_entry(src_ip_field);
-        assert!(!src_ip_entry.is_fast(), "IP fields should NOT be fast in ParquetOnly mode");
+        assert!(!src_ip_entry.is_fast(), "IP fields are parquet-served (not native fast) in ParquetOnly");
     }
 
     #[test]
@@ -1393,6 +1479,100 @@ mod tests {
 
         assert!(schema.get_field("log_line").is_ok());
         assert!(schema.get_field("log_line__uuids").is_err());
+    }
+
+    // ── F8: reserved-name / uniqueness validation ────────────────────────
+
+    #[test]
+    fn test_name_mapping_collision_errors() {
+        // Two columns mapped to the same tantivy name would panic in
+        // SchemaBuilder::add_field; we must reject it with a clean error.
+        let arrow = ArrowSchema::new(vec![
+            Field::new("col_a", DataType::Utf8, true),
+            Field::new("col_b", DataType::Utf8, true),
+        ]);
+        let mut mapping = HashMap::new();
+        mapping.insert("col_a".to_string(), "name".to_string());
+        mapping.insert("col_b".to_string(), "name".to_string());
+        let config = SchemaDerivationConfig::default();
+
+        let err = derive_tantivy_schema_with_mapping(&arrow, &config, Some(&mapping))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Duplicate tantivy field name"), "got: {}", err);
+    }
+
+    #[test]
+    fn test_mapping_collides_with_identity_name_errors() {
+        // Mapping col_a → "name" collides with a physical "name" column.
+        let arrow = ArrowSchema::new(vec![
+            Field::new("col_a", DataType::Utf8, true),
+            Field::new("name", DataType::Utf8, true),
+        ]);
+        let mut mapping = HashMap::new();
+        mapping.insert("col_a".to_string(), "name".to_string());
+        let config = SchemaDerivationConfig::default();
+
+        let err = derive_tantivy_schema_with_mapping(&arrow, &config, Some(&mapping))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Duplicate tantivy field name"), "got: {}", err);
+    }
+
+    #[test]
+    fn test_reserved_pq_field_name_errors() {
+        // A user column named __pq_file_hash collides with the hidden field
+        // added unconditionally at index time.
+        let arrow = ArrowSchema::new(vec![
+            Field::new("__pq_file_hash", DataType::Int64, true),
+        ]);
+        let config = SchemaDerivationConfig::default();
+
+        let err = derive_tantivy_schema(&arrow, &config).unwrap_err().to_string();
+        assert!(err.contains("reserved"), "got: {}", err);
+    }
+
+    #[test]
+    fn test_reserved_pq_row_field_name_errors() {
+        let arrow = ArrowSchema::new(vec![
+            Field::new("__pq_row_in_file", DataType::Utf8, true),
+        ]);
+        let config = SchemaDerivationConfig::default();
+        let err = derive_tantivy_schema(&arrow, &config).unwrap_err().to_string();
+        assert!(err.contains("reserved"), "got: {}", err);
+    }
+
+    #[test]
+    fn test_phash_and_uuids_named_columns_are_allowed() {
+        // These names are only reserved when a companion field would actually
+        // collide (handled precisely at field-creation time). As standalone
+        // user columns with no matching base field, they must be allowed.
+        for allowed in ["_phash_x", "trace__uuids"] {
+            let arrow = ArrowSchema::new(vec![
+                Field::new(allowed, DataType::Utf8, true),
+            ]);
+            let config = SchemaDerivationConfig::default();
+            let schema = derive_tantivy_schema(&arrow, &config)
+                .unwrap_or_else(|e| panic!("name {} should be allowed: {}", allowed, e));
+            assert!(schema.get_field(allowed).is_ok());
+        }
+    }
+
+    #[test]
+    fn test_skipped_column_does_not_trigger_collision() {
+        // A skipped column sharing a resolved name must not count as a collision.
+        let arrow = ArrowSchema::new(vec![
+            Field::new("dup", DataType::Utf8, true),
+            Field::new("keep", DataType::Utf8, true),
+        ]);
+        let mut mapping = HashMap::new();
+        mapping.insert("keep".to_string(), "dup".to_string());
+        let mut config = SchemaDerivationConfig::default();
+        config.skip_fields.insert("dup".to_string());
+
+        // "dup" column is skipped, so mapping "keep" → "dup" is unique overall.
+        let schema = derive_tantivy_schema_with_mapping(&arrow, &config, Some(&mapping)).unwrap();
+        assert!(schema.get_field("dup").is_ok());
     }
 }
 

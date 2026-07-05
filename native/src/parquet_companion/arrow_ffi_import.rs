@@ -35,6 +35,18 @@ use crate::quickwit_split::{
 };
 use crate::quickwit_split::json_discovery::{extract_doc_mapping_from_index, write_doc_mapping_to_dir};
 
+/// Maximum number of concurrent per-partition writers a single session may hold.
+///
+/// Every distinct partition key allocates a tempdir + tantivy `Index` + `IndexWriter`
+/// + heap `MemoryReservation`. Left unbounded, a mis-declared high-cardinality
+/// partition column would spawn one writer per distinct value and exhaust memory
+/// and file descriptors deep inside a batch (L16/D5). `add_arrow_batch` checks the
+/// projected writer count up front and rejects the batch with a clear error before
+/// creating any new writer or ingesting any row. Sized generously (a few thousand);
+/// partitioned tables with more concurrent partitions than this in flight should
+/// repartition upstream or lower partition cardinality.
+const MAX_PARTITION_WRITERS: usize = 4096;
+
 /// Context for streaming Arrow FFI split creation.
 /// Wrapped in Arc<Mutex<>> at the JNI layer (IndexWriter is !Sync).
 ///
@@ -72,6 +84,11 @@ pub(crate) struct ArrowFfiSplitContext {
     /// Column names for which to compute min/max statistics (empty = none).
     /// Populated from the "stats" flag in fieldConfigJson.
     stats_columns: std::collections::HashSet<String>,
+    /// Split config (index_uid/source_id/node_id/tags) applied to every split this
+    /// session produces. Single source of truth so that auto-rolled splits (during
+    /// addArrowBatch), explicitly-rolled splits, and the final splits all share the
+    /// same identity — they must never diverge depending on when a split was rolled.
+    split_config: SplitConfig,
 }
 
 /// Per-partition state: each partition gets its own Index + IndexWriter + temp dir.
@@ -320,6 +337,7 @@ pub(crate) fn begin_split_from_arrow(
         output_dir,
         rolled_splits: Vec::new(),
         stats_columns,
+        split_config: default_split_config("arrow-ffi", "arrow-ffi-source", "arrow-ffi-node"),
     })
 }
 
@@ -370,7 +388,14 @@ fn create_partition_writer(
                     DataType::Float32 | DataType::Float64 => "f64",
                     DataType::Boolean => "bool",
                     DataType::Utf8 | DataType::LargeUtf8 => "text",
-                    DataType::Date32 => "datetime",
+                    // M19: Date32 is a calendar date, not a wall-clock timestamp. It must
+                    // use "Date" (not "datetime") so finalize_statistics_to_string_maps
+                    // takes the `== "Date"` branch and emits ISO date strings
+                    // ("2023-02-15") — matching the Scala StatisticsCalculator. Tagging it
+                    // "datetime" made that branch unreachable and emitted raw epoch micros,
+                    // so data-skipping comparisons against ISO date strings never matched.
+                    DataType::Date32 => "Date",
+                    // Timestamps stay "datetime": stored/compared as raw epoch micros.
                     DataType::Timestamp(_, _) => "datetime",
                     _ => continue, // Skip non-eligible types
                 };
@@ -548,9 +573,16 @@ impl PrebuiltComplexColumns {
 /// Complex Arrow types (Struct, List, Map) are pre-processed once per batch column via
 /// `PrebuiltComplexColumns`, eliminating redundant per-row downcast and recursive conversion.
 ///
+/// The batch is applied atomically (M16): every document is built and validated before any
+/// is committed, so a batch that fails on some row leaves `total_doc_count` and all writers
+/// unchanged and is safe to retry. See the inline notes for the statistics-accumulator caveat.
+///
 /// Returns cumulative total doc count across all partitions.
 pub(crate) async fn add_arrow_batch(ctx: &mut ArrowFfiSplitContext, batch: &RecordBatch) -> Result<u64> {
-    // Validate schema matches
+    // Validate schema matches. Checking only the column count is not enough: a
+    // batch with the same arity but reordered (or renamed) columns of compatible
+    // types would otherwise be indexed under the wrong field names, silently
+    // corrupting the data. Verify each column's name and type positionally.
     let batch_schema = batch.schema();
     if batch_schema.fields().len() != ctx.arrow_schema.fields().len() {
         bail!(
@@ -558,6 +590,24 @@ pub(crate) async fn add_arrow_batch(ctx: &mut ArrowFfiSplitContext, batch: &Reco
             ctx.arrow_schema.fields().len(),
             batch_schema.fields().len()
         );
+    }
+    for (i, (expected, actual)) in ctx.arrow_schema.fields().iter()
+        .zip(batch_schema.fields().iter())
+        .enumerate()
+    {
+        if expected.name() != actual.name() {
+            bail!(
+                "Schema mismatch at column {}: expected field '{}', got '{}' \
+                 (columns must match the schema declared at beginSplitFromArrow)",
+                i, expected.name(), actual.name()
+            );
+        }
+        if expected.data_type() != actual.data_type() {
+            bail!(
+                "Schema mismatch for column '{}': expected type {:?}, got {:?}",
+                expected.name(), expected.data_type(), actual.data_type()
+            );
+        }
     }
 
     // Use the config from context (populated from field_config_json if provided)
@@ -575,27 +625,56 @@ pub(crate) async fn add_arrow_batch(ctx: &mut ArrowFfiSplitContext, batch: &Reco
     let prebuilt = PrebuiltComplexColumns::build(batch, &ctx.field_mapping)?;
 
     let max_docs = ctx.max_docs_per_split;
-    let split_config = default_split_config("arrow-ffi", "arrow-ffi-source", "arrow-ffi-node");
+    // Use the session's single split config so auto-rolled splits match the final ones.
+    let split_config = ctx.split_config.clone();
+
+    // Batch atomicity (M16): a batch is ingested in full or rejected without adding any
+    // documents. We BUILD every row's TantivyDocument up front (Phase 1) — this is where
+    // per-row failures surface: array downcast mismatches, timestamp/decimal/date
+    // overflow, invalid IP/JSON values, and unroutable partition-key extraction. Only
+    // after the ENTIRE batch has been built successfully do we hand documents to the
+    // writers and advance the counts (Phase 2). A rejected batch therefore leaves
+    // `total_doc_count`, `total_batch_count`, and every writer's committed document set
+    // unchanged, so a Spark task retry against the same context cannot duplicate rows.
+    //
+    // Statistics caveat: statistics accumulators are observed during the Phase 1 build,
+    // so a rejected batch may leave a writer's min/max advanced (idempotent under retry)
+    // and its null/nan counts marginally inflated — but this never affects query
+    // correctness: over-wide min/max only make data-skipping more conservative (never
+    // drops a matching row). The documented recovery for a failed batch is to cancel the
+    // session (see M17), which discards those accumulators entirely.
 
     if ctx.partition_col_indices.is_empty() {
-        // Non-partitioned path: add all rows to default writer
-        for row_idx in 0..num_rows {
+        // ---- Non-partitioned path ----
+        // Phase 1: build & validate every document. No add_document, no count change.
+        let mut built: Vec<TantivyDocument> = Vec::with_capacity(num_rows);
+        {
             let pw = ctx.default_writer.as_mut()
                 .ok_or_else(|| anyhow::anyhow!("No default writer for non-partitioned context"))?;
+            for row_idx in 0..num_rows {
+                let doc = build_doc_from_arrow_row(
+                    batch,
+                    row_idx,
+                    &ctx.field_mapping,
+                    &ctx.tantivy_schema,
+                    &name_mapping,
+                    schema_derivation_config,
+                    &string_hash_fields,
+                    &mut pw.accumulators,
+                    &string_indexing_modes,
+                    &compiled_regexes,
+                    &prebuilt,
+                )?;
+                built.push(doc);
+            }
+        }
 
-            let doc = build_doc_from_arrow_row(
-                batch,
-                row_idx,
-                &ctx.field_mapping,
-                &ctx.tantivy_schema,
-                &name_mapping,
-                schema_derivation_config,
-                &string_hash_fields,
-                &mut pw.accumulators,
-                &string_indexing_modes,
-                &compiled_regexes,
-                &prebuilt,
-            )?;
+        // Phase 2: commit. Per-row conversions were already validated in Phase 1, so this
+        // pass only performs the (effectively infallible) add_document plus threshold
+        // bookkeeping and auto-rolling.
+        for doc in built {
+            let pw = ctx.default_writer.as_mut()
+                .ok_or_else(|| anyhow::anyhow!("No default writer for non-partitioned context"))?;
             pw.writer.add_document(doc)?;
             pw.doc_count += 1;
 
@@ -620,58 +699,111 @@ pub(crate) async fn add_arrow_batch(ctx: &mut ArrowFfiSplitContext, batch: &Reco
             }
         }
     } else {
-        // Partitioned path: route each row to correct partition writer
+        // ---- Partitioned path ----
+        // Phase 1a: resolve each row's partition key. Validates partition-column
+        // downcasts/values up front. E6: cache the last (values → key) pair so
+        // sorted/clustered data reuses it instead of re-formatting the key and rebuilding
+        // the partition-values map on every row (the fast path; unsorted data simply
+        // misses the cache and falls back to the full build below).
+        let mut row_keys: Vec<String> = Vec::with_capacity(num_rows);
+        let mut new_partitions: HashMap<String, HashMap<String, String>> = HashMap::new();
+        let mut last: Option<(Vec<String>, String)> = None;
         for row_idx in 0..num_rows {
-            // Extract partition column values
-            let mut partition_values_vec = Vec::with_capacity(ctx.partition_col_indices.len());
+            let mut vals = Vec::with_capacity(ctx.partition_col_indices.len());
             for &col_idx in &ctx.partition_col_indices {
-                partition_values_vec.push(extract_partition_value(batch, col_idx, row_idx)?);
+                vals.push(extract_partition_value(batch, col_idx, row_idx)?);
             }
-            let partition_key = build_partition_key(&ctx.partition_col_names, &partition_values_vec);
-
-            // Get or lazily create partition writer
-            if !ctx.partition_writers.contains_key(&partition_key) {
+            // Fast path: reuse the previous row's key if its partition values are
+            // identical (evaluated in a scope that releases the `&last` borrow before we
+            // may reassign `last` below).
+            let cached = match &last {
+                Some((last_vals, last_key)) if *last_vals == vals => Some(last_key.clone()),
+                _ => None,
+            };
+            let partition_key = match cached {
+                Some(k) => k,
+                None => {
+                    let k = build_partition_key(&ctx.partition_col_names, &vals);
+                    last = Some((vals.clone(), k.clone()));
+                    k
+                }
+            };
+            if !ctx.partition_writers.contains_key(&partition_key)
+                && !new_partitions.contains_key(&partition_key)
+            {
                 let mut partition_values_map = HashMap::new();
-                for (name, value) in ctx.partition_col_names.iter().zip(partition_values_vec.iter()) {
+                for (name, value) in ctx.partition_col_names.iter().zip(vals.iter()) {
                     partition_values_map.insert(name.clone(), value.clone());
                 }
-                let pw = create_partition_writer(&ctx.tantivy_schema, ctx.heap_size, partition_values_map,
-                    &ctx.stats_columns, &ctx.field_mapping)?;
-                ctx.partition_writers.insert(partition_key.clone(), pw);
-                debug_println!("ARROW_FFI_IMPORT: Created new partition writer for '{}'", partition_key);
+                new_partitions.insert(partition_key.clone(), partition_values_map);
             }
+            row_keys.push(partition_key);
+        }
 
+        // Phase 1b: enforce the partition-writer bound up front (L16/D5) — reject a
+        // high-cardinality partition column before creating any writer or ingesting rows.
+        let projected_writers = ctx.partition_writers.len() + new_partitions.len();
+        if projected_writers > MAX_PARTITION_WRITERS {
+            bail!(
+                "Too many partitions: this batch would require {} concurrent partition \
+                 writers, exceeding the limit of {}. A high-cardinality column is likely \
+                 mis-declared as a partition column; reduce partition cardinality or \
+                 repartition upstream.",
+                projected_writers, MAX_PARTITION_WRITERS
+            );
+        }
+
+        // Phase 1c: create writers for newly-seen partition keys (bounded above).
+        for (partition_key, partition_values_map) in new_partitions {
+            let pw = create_partition_writer(&ctx.tantivy_schema, ctx.heap_size,
+                partition_values_map, &ctx.stats_columns, &ctx.field_mapping)?;
+            debug_println!("ARROW_FFI_IMPORT: Created new partition writer for '{}'", partition_key);
+            ctx.partition_writers.insert(partition_key, pw);
+        }
+
+        // Phase 1d: build & validate every document, observing statistics into the
+        // resolved writer's accumulators. No documents are committed yet.
+        let mut built: Vec<TantivyDocument> = Vec::with_capacity(num_rows);
+        for (row_idx, partition_key) in row_keys.iter().enumerate() {
+            let pw = ctx.partition_writers.get_mut(partition_key)
+                .expect("partition writer created in Phase 1c must exist");
+            let doc = build_doc_from_arrow_row(
+                batch,
+                row_idx,
+                &ctx.field_mapping,
+                &ctx.tantivy_schema,
+                &name_mapping,
+                schema_derivation_config,
+                &string_hash_fields,
+                &mut pw.accumulators,
+                &string_indexing_modes,
+                &compiled_regexes,
+                &prebuilt,
+            )?;
+            built.push(doc);
+        }
+
+        // Phase 2: commit each built document to its writer, then auto-roll if needed.
+        for (doc, partition_key) in built.into_iter().zip(row_keys.iter()) {
             {
-                let pw = ctx.partition_writers.get_mut(&partition_key).unwrap();
-                let doc = build_doc_from_arrow_row(
-                    batch,
-                    row_idx,
-                    &ctx.field_mapping,
-                    &ctx.tantivy_schema,
-                    &name_mapping,
-                    schema_derivation_config,
-                    &string_hash_fields,
-                    &mut pw.accumulators,
-                    &string_indexing_modes,
-                    &compiled_regexes,
-                    &prebuilt,
-                )?;
+                let pw = ctx.partition_writers.get_mut(partition_key)
+                    .expect("partition writer must exist during commit");
                 pw.writer.add_document(doc)?;
                 pw.doc_count += 1;
             }
 
             // Auto-roll if threshold reached (borrow of pw is dropped above)
             if max_docs > 0 {
-                let should_roll = ctx.partition_writers.get(&partition_key)
+                let should_roll = ctx.partition_writers.get(partition_key)
                     .map(|pw| pw.doc_count >= max_docs)
                     .unwrap_or(false);
                 if should_roll {
                     if let Some(output_dir) = ctx.output_dir.as_ref() {
                         let output_dir = output_dir.clone();
-                        let rolled_pw = ctx.partition_writers.remove(&partition_key).unwrap();
+                        let rolled_pw = ctx.partition_writers.remove(partition_key).unwrap();
                         let partition_values = rolled_pw.partition_values.clone();
                         let result = finalize_partition_writer_into_split(
-                            rolled_pw, &partition_key, partition_values.clone(),
+                            rolled_pw, partition_key, partition_values.clone(),
                             &output_dir, &split_config,
                         ).await?;
                         debug_println!(
@@ -943,8 +1075,11 @@ async fn finalize_partition_writer_into_split(
 pub(crate) async fn finish_all_splits(
     mut ctx: ArrowFfiSplitContext,
     output_dir: &str,
-    split_config: &SplitConfig,
 ) -> Result<Vec<PartitionSplitResult>> {
+    // Use the session's single split config (same one applied to auto-rolled splits)
+    // so every split in the session shares one identity.
+    let split_config = ctx.split_config.clone();
+    let split_config = &split_config;
     // Start with any splits that were auto-rolled during addArrowBatch
     let mut results = std::mem::take(&mut ctx.rolled_splits);
 
@@ -960,6 +1095,19 @@ pub(crate) async fn finish_all_splits(
             .collect()
     };
 
+    // M17: finalize EVERY partition before deciding success/failure. Previously the first
+    // finalize error aborted the loop via `?`, which (a) discarded the metadata for all
+    // partitions already finalized and written to disk — leaving orphaned part-*.split
+    // files the caller never learned about — and (b) skipped every not-yet-finalized
+    // partition entirely. We now attempt all partitions, accumulate the failures, and only
+    // then fail — reporting which partitions failed and listing the split paths that were
+    // written successfully so an operator (or the caller's cleanup) can locate and reclaim
+    // them. Successful split files are intentionally left on disk rather than deleted.
+    //
+    // (Fully returning the successful `PartitionSplitResult`s to Java on the error path
+    // would require changing this function's `Result<Vec<..>>` signature and its JNI
+    // caller in quickwit_split/jni_functions.rs, which is out of scope here.)
+    let mut errors: Vec<String> = Vec::new();
     for (partition_key, partition_values, pw) in writers {
         // Skip empty partition writers that were created by auto-roll
         // (a new writer was started after roll but no rows were added).
@@ -968,10 +1116,27 @@ pub(crate) async fn finish_all_splits(
         if pw.doc_count == 0 && !partition_key.is_empty() {
             continue;
         }
-        let result = finalize_partition_writer_into_split(
+        match finalize_partition_writer_into_split(
             pw, &partition_key, partition_values, output_dir, split_config,
-        ).await?;
-        results.push(result);
+        ).await {
+            Ok(result) => results.push(result),
+            Err(e) => {
+                let label = if partition_key.is_empty() { "<default>" } else { partition_key.as_str() };
+                errors.push(format!("partition '{}': {}", label, e));
+            }
+        }
+    }
+
+    if !errors.is_empty() {
+        let written: Vec<&str> = results.iter().map(|r| r.split_path.as_str()).collect();
+        bail!(
+            "finish_all_splits failed to finalize {} partition(s): [{}]. \
+             {} split(s) were finalized successfully and remain on disk: [{}].",
+            errors.len(),
+            errors.join("; "),
+            written.len(),
+            written.join(", ")
+        );
     }
 
     Ok(results)
@@ -988,8 +1153,10 @@ pub(crate) async fn roll_partition_split(
     ctx: &mut ArrowFfiSplitContext,
     partition_key: &str,
     output_dir: &str,
-    split_config: &SplitConfig,
 ) -> Result<PartitionSplitResult> {
+    // Use the session's single split config so rolled splits match the final ones.
+    let split_config = ctx.split_config.clone();
+    let split_config = &split_config;
     // Take the writer out of the context
     let (pw, partition_values) = if partition_key.is_empty() {
         // Non-partitioned: take default_writer
@@ -1176,9 +1343,8 @@ mod tests {
             add_arrow_batch(&mut ctx, &batch).await.unwrap();
 
             let output_dir = tempfile::tempdir().unwrap();
-            let split_config = default_split_config("test-index", "test-source", "test-node");
 
-            let results = finish_all_splits(ctx, output_dir.path().to_str().unwrap(), &split_config).await.unwrap();
+            let results = finish_all_splits(ctx, output_dir.path().to_str().unwrap()).await.unwrap();
 
             assert_eq!(results.len(), 1);
             let result = &results[0];
@@ -1282,9 +1448,8 @@ mod tests {
             add_arrow_batch(&mut ctx, &batch).await.unwrap();
 
             let output_dir = tempfile::tempdir().unwrap();
-            let split_config = default_split_config("test-index", "test-source", "test-node");
 
-            let results = finish_all_splits(ctx, output_dir.path().to_str().unwrap(), &split_config).await.unwrap();
+            let results = finish_all_splits(ctx, output_dir.path().to_str().unwrap()).await.unwrap();
 
             assert_eq!(results.len(), 1);
             assert_eq!(results[0].partition_key, "event_date=2023-01-15");
@@ -1311,9 +1476,8 @@ mod tests {
             add_arrow_batch(&mut ctx, &batch).await.unwrap();
 
             let output_dir = tempfile::tempdir().unwrap();
-            let split_config = default_split_config("test-index", "test-source", "test-node");
 
-            let results = finish_all_splits(ctx, output_dir.path().to_str().unwrap(), &split_config).await.unwrap();
+            let results = finish_all_splits(ctx, output_dir.path().to_str().unwrap()).await.unwrap();
 
             assert_eq!(results.len(), 3);
 
@@ -1357,9 +1521,8 @@ mod tests {
             add_arrow_batch(&mut ctx, &batch3).await.unwrap();
 
             let output_dir = tempfile::tempdir().unwrap();
-            let split_config = default_split_config("test-index", "test-source", "test-node");
 
-            let results = finish_all_splits(ctx, output_dir.path().to_str().unwrap(), &split_config).await.unwrap();
+            let results = finish_all_splits(ctx, output_dir.path().to_str().unwrap()).await.unwrap();
 
             assert_eq!(results.len(), 2);
 
@@ -1426,9 +1589,8 @@ mod tests {
             add_arrow_batch(&mut ctx, &batch).await.unwrap();
 
             let output_dir = tempfile::tempdir().unwrap();
-            let split_config = default_split_config("test-index", "test-source", "test-node");
 
-            let results = finish_all_splits(ctx, output_dir.path().to_str().unwrap(), &split_config).await.unwrap();
+            let results = finish_all_splits(ctx, output_dir.path().to_str().unwrap()).await.unwrap();
 
             // 3 distinct partition combinations
             assert_eq!(results.len(), 3);
@@ -1465,8 +1627,7 @@ mod tests {
             add_arrow_batch(&mut ctx, &batch2).await.unwrap();
 
             let output_dir = tempfile::tempdir().unwrap();
-            let split_config = default_split_config("test", "test-source", "test-node");
-            let results = finish_all_splits(ctx, output_dir.path().to_str().unwrap(), &split_config).await.unwrap();
+            let results = finish_all_splits(ctx, output_dir.path().to_str().unwrap()).await.unwrap();
 
             assert_eq!(results.len(), 1);
             let result = &results[0];
@@ -1503,8 +1664,7 @@ mod tests {
             add_arrow_batch(&mut ctx, &batch).await.unwrap();
 
             let output_dir = tempfile::tempdir().unwrap();
-            let split_config = default_split_config("test", "test-source", "test-node");
-            let results = finish_all_splits(ctx, output_dir.path().to_str().unwrap(), &split_config).await.unwrap();
+            let results = finish_all_splits(ctx, output_dir.path().to_str().unwrap()).await.unwrap();
 
             assert_eq!(results.len(), 1);
             // No statistics when not enabled
@@ -1539,8 +1699,7 @@ mod tests {
             add_arrow_batch(&mut ctx, &batch).await.unwrap();
 
             let output_dir = tempfile::tempdir().unwrap();
-            let split_config = default_split_config("test", "test-source", "test-node");
-            let results = finish_all_splits(ctx, output_dir.path().to_str().unwrap(), &split_config).await.unwrap();
+            let results = finish_all_splits(ctx, output_dir.path().to_str().unwrap()).await.unwrap();
 
             assert_eq!(results.len(), 2);
 
@@ -1563,6 +1722,97 @@ mod tests {
             let p2 = results.iter().find(|r| r.partition_key == "event_date=2023-01-16").unwrap();
             assert_eq!(p2.min_values.get("id"), Some(&"3".to_string()));
             assert_eq!(p2.max_values.get("id"), Some(&"4".to_string()));
+        });
+    }
+
+    // --- Atomicity / bounds tests ---
+
+    /// M16: a batch that fails on some row must not partially ingest — the doc count and
+    /// writer state must be exactly what they were before the failed call.
+    #[test]
+    fn test_batch_failure_is_atomic_doc_count_unchanged() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            // "addr" is declared as an IP field, so a non-parsable value fails mid-batch.
+            let arrow_schema = ArrowSchema::new(vec![
+                ArrowField::new("id", DataType::Int64, false),
+                ArrowField::new("addr", DataType::Utf8, false),
+            ]);
+            let field_config = r#"[{"name":"addr","type":"ip"}]"#;
+            let mut ctx = begin_split_from_arrow(
+                arrow_schema, &[], 50_000_000, Some(field_config), 0, None,
+            ).unwrap();
+
+            let make_batch = |ids: Vec<i64>, addrs: Vec<&str>| {
+                RecordBatch::try_new(
+                    Arc::new(ArrowSchema::new(vec![
+                        ArrowField::new("id", DataType::Int64, false),
+                        ArrowField::new("addr", DataType::Utf8, false),
+                    ])),
+                    vec![
+                        Arc::new(Int64Array::from(ids)),
+                        Arc::new(StringArray::from(addrs)),
+                    ],
+                ).unwrap()
+            };
+
+            // Good batch of 3 rows.
+            let good = make_batch(vec![1, 2, 3], vec!["1.1.1.1", "2.2.2.2", "3.3.3.3"]);
+            let count = add_arrow_batch(&mut ctx, &good).await.unwrap();
+            assert_eq!(count, 3);
+            assert_eq!(ctx.total_doc_count, 3);
+            assert_eq!(ctx.default_writer.as_ref().unwrap().doc_count, 3);
+
+            // Bad batch: row 1 (0-indexed) has an invalid IP → build fails mid-batch.
+            let bad = make_batch(vec![4, 5, 6], vec!["4.4.4.4", "not-an-ip", "6.6.6.6"]);
+            let res = add_arrow_batch(&mut ctx, &bad).await;
+            assert!(res.is_err(), "batch with an invalid IP value must be rejected");
+
+            // Atomicity: nothing from the rejected batch was ingested.
+            assert_eq!(ctx.total_doc_count, 3, "total_doc_count must be unchanged");
+            assert_eq!(ctx.total_batch_count, 1, "total_batch_count must be unchanged");
+            assert_eq!(
+                ctx.default_writer.as_ref().unwrap().doc_count, 3,
+                "writer doc_count must be unchanged after a rejected batch"
+            );
+
+            cancel_split(ctx);
+        });
+    }
+
+    /// L16/D5: a batch that would exceed the concurrent partition-writer bound is rejected
+    /// up front rather than failing deep inside ingestion.
+    #[test]
+    fn test_partition_writer_bound_rejected_up_front() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let schema = partitioned_schema();
+            let partition_cols = vec!["event_date".to_string()];
+            let mut ctx = begin_split_from_arrow(
+                schema, &partition_cols, 50_000_000, None, 0, None,
+            ).unwrap();
+
+            // MAX_PARTITION_WRITERS + 1 distinct partition keys in a single batch.
+            let n = MAX_PARTITION_WRITERS + 1;
+            let ids: Vec<i64> = (0..n as i64).collect();
+            let names: Vec<String> = (0..n).map(|i| format!("n{}", i)).collect();
+            let dates: Vec<String> = (0..n).map(|i| format!("d{}", i)).collect();
+            let batch = partitioned_batch(
+                ids,
+                names.iter().map(|s| s.as_str()).collect(),
+                dates.iter().map(|s| s.as_str()).collect(),
+            );
+
+            let res = add_arrow_batch(&mut ctx, &batch).await;
+            assert!(res.is_err(), "exceeding the partition-writer bound must be an error");
+            let msg = res.unwrap_err().to_string();
+            assert!(msg.contains("Too many partitions"), "unexpected error: {}", msg);
+
+            // Rejected up front: no writers were created, no rows ingested.
+            assert!(ctx.partition_writers.is_empty(), "no partition writers should be created");
+            assert_eq!(ctx.total_doc_count, 0);
+
+            cancel_split(ctx);
         });
     }
 }

@@ -121,6 +121,7 @@ pub(crate) fn deserialize_aggregation_results(
             None,  // exclude_filter: not available in this deserialization path
             None,  // missing_value
             false, // needs_resort
+            None,  // result_size
         ) {
             Ok(java_obj) => {
                 if !java_obj.is_null() {
@@ -373,6 +374,7 @@ pub(crate) fn find_specific_aggregation_result(
         let exclude_filter = touchup.and_then(|t| t.exclude_strings.as_ref());
         let missing_value = touchup.and_then(|t| t.missing_value.as_deref());
         let needs_resort = touchup.map(|t| t.needs_resort).unwrap_or(false);
+        let result_size = touchup.and_then(|t| t.result_size);
 
         return create_java_aggregation_from_final_result(
             env,
@@ -385,6 +387,7 @@ pub(crate) fn find_specific_aggregation_result(
             exclude_filter,
             missing_value,
             needs_resort,
+            result_size,
         );
     } else {
         debug_println!(

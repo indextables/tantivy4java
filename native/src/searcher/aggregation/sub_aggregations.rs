@@ -48,7 +48,7 @@ pub(crate) fn create_sub_aggregations_map(
         // Convert aggregation result to Java object, passing through hash resolution context.
         // Sub-aggregations don't carry per-name include/exclude/missing/resort info.
         let java_agg_result = create_java_aggregation_from_final_result(
-            env, agg_name, agg_result, false, resolution_map, redirected_names, None, None, None, false,
+            env, agg_name, agg_result, false, resolution_map, redirected_names, None, None, None, false, None,
         )?;
 
         if !java_agg_result.is_null() {
@@ -91,6 +91,7 @@ pub(crate) fn create_java_aggregation_from_final_result(
     exclude_filter: Option<&std::collections::HashSet<String>>,
     missing_value: Option<&str>,
     needs_resort: bool,
+    result_size: Option<usize>,
 ) -> anyhow::Result<jobject> {
     debug_println!(
         "RUST DEBUG: Creating Java aggregation for '{}', type: {:?}, date_histogram_hint: {}",
@@ -207,7 +208,7 @@ pub(crate) fn create_java_aggregation_from_final_result(
                     } else {
                         None
                     };
-                    create_terms_result_object(env, aggregation_name, buckets, effective_map, redirected_names, include_filter, exclude_filter, missing_value, needs_resort)
+                    create_terms_result_object(env, aggregation_name, buckets, effective_map, redirected_names, include_filter, exclude_filter, missing_value, needs_resort, result_size)
                 }
                 BucketResult::Range { buckets } => {
                     debug_println!("RUST DEBUG: Creating RangeResult");

@@ -44,6 +44,12 @@ pub struct HashFieldTouchupInfo {
     pub include_strings: Option<std::collections::HashSet<String>>,
     /// Original exclude filter string values (before hashing).
     pub exclude_strings: Option<std::collections::HashSet<String>>,
+    /// The originally-requested `size` (number of buckets to return). When an
+    /// include/exclude filter is present we enlarge the `size` sent to Tantivy so
+    /// the post-filter (in `create_terms_result_object`) has enough candidate
+    /// buckets to choose from, then truncate the filtered result back to this size.
+    /// `None` when no filter was applied (Tantivy already truncated to the size).
+    pub result_size: Option<usize>,
 }
 
 /// Output of the aggregation rewriter.
@@ -155,6 +161,13 @@ fn rewrite_agg_def(
                             .and_then(|m| m.as_str())
                             .map(|s| s.to_string());
 
+                        // Capture the originally-requested size before we enlarge it.
+                        // Tantivy/Elasticsearch default is 10.
+                        let original_size = terms_map
+                            .get("size")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(10) as usize;
+
                         // Capture include filter strings for post-processing.
                         // Tantivy ignores numeric include arrays for U64 fields, so we
                         // record the original strings and apply the filter ourselves in
@@ -200,6 +213,37 @@ fn rewrite_agg_def(
                             terms_map.remove("exclude");
                         }
 
+                        // When we strip an include/exclude filter, Tantivy computes the
+                        // top-`size` buckets over ALL hash values and only then do we
+                        // post-filter by the original strings. A rare included term is
+                        // unlikely to appear in an unfiltered top-`size`, so we must
+                        // enlarge the `size`/`segment_size` sent to Tantivy and truncate
+                        // the filtered result back to `original_size` afterwards.
+                        //
+                        // - include: the filtered result is bounded by include.len() but the
+                        //   included terms can have any count-rank, so we must request all
+                        //   buckets (a large ceiling; capped by the aggregation bucket limit).
+                        // - exclude only: removing at most exclude.len() buckets from the top
+                        //   `original_size + exclude.len()` guarantees `original_size` remain.
+                        let result_size = if include_strings.is_some() {
+                            // Request effectively all distinct buckets. Set size and
+                            // segment_size explicitly (equal) to avoid the `size * 10`
+                            // overflow in TermsAggregationInternal::from_req.
+                            const INCLUDE_ALL_CEILING: u64 = 1_000_000;
+                            terms_map.insert("size".to_string(), json!(INCLUDE_ALL_CEILING));
+                            terms_map.insert("segment_size".to_string(), json!(INCLUDE_ALL_CEILING));
+                            Some(original_size)
+                        } else if exclude_strings.is_some() {
+                            let enlarged = (original_size as u64)
+                                .saturating_add(exclude_strings.as_ref().unwrap().len() as u64)
+                                .min(u32::MAX as u64);
+                            terms_map.insert("size".to_string(), json!(enlarged));
+                            terms_map.insert("segment_size".to_string(), json!(enlarged));
+                            Some(original_size)
+                        } else {
+                            None
+                        };
+
                         // Map missing string → 0 (null sentinel for hash field)
                         if missing_value.is_some() {
                             terms_map.insert("missing".to_string(), json!(0u64));
@@ -217,6 +261,7 @@ fn rewrite_agg_def(
                             missing_value,
                             include_strings,
                             exclude_strings,
+                            result_size,
                         });
                     }
                 } else {
@@ -775,6 +820,47 @@ mod tests {
         assert!(exclude_strings.contains("deleted"));
         // include should be None
         assert!(out.touchup_infos[0].include_strings.is_none());
+    }
+
+    #[test]
+    fn test_rewrite_terms_include_enlarges_size() {
+        // When an include filter is stripped, Tantivy computes top-`size` over ALL
+        // hash values before we post-filter. A rare included term would be lost from
+        // an unfiltered top-10, so the rewriter must enlarge the requested size (and
+        // segment_size) and record the original size for later truncation.
+        let agg_json = r#"{"by_status": {"terms": {"field": "status", "size": 10, "include": ["rare_a", "rare_b"]}}}"#;
+        let out = rewrite_aggs_for_hash_fields(agg_json, &make_hash_fields()).unwrap();
+        let v: Value = serde_json::from_str(&out.rewritten_json).unwrap();
+        let enlarged = v["by_status"]["terms"]["size"].as_u64().unwrap();
+        assert!(enlarged > 10, "size should be enlarged well beyond the requested 10, got {}", enlarged);
+        // segment_size must be set explicitly (equal to size) to avoid the size*10 overflow
+        assert_eq!(v["by_status"]["terms"]["segment_size"].as_u64().unwrap(), enlarged);
+        // Original size retained for post-filter truncation.
+        assert_eq!(out.touchup_infos[0].result_size, Some(10));
+    }
+
+    #[test]
+    fn test_rewrite_terms_exclude_enlarges_size_by_exclude_count() {
+        // Excluding N terms from the top `size + N` guarantees `size` remain after
+        // post-filtering, so the rewriter enlarges size by exactly exclude.len().
+        let agg_json = r#"{"by_status": {"terms": {"field": "status", "size": 5, "exclude": ["inactive", "deleted"]}}}"#;
+        let out = rewrite_aggs_for_hash_fields(agg_json, &make_hash_fields()).unwrap();
+        let v: Value = serde_json::from_str(&out.rewritten_json).unwrap();
+        // 5 requested + 2 excluded = 7
+        assert_eq!(v["by_status"]["terms"]["size"].as_u64().unwrap(), 7);
+        assert_eq!(out.touchup_infos[0].result_size, Some(5));
+    }
+
+    #[test]
+    fn test_rewrite_terms_no_filter_leaves_size_and_result_size_unset() {
+        // Without include/exclude, Tantivy already truncates to `size`; the rewriter
+        // must not enlarge it or set result_size (which would trigger truncation).
+        let agg_json = r#"{"by_status": {"terms": {"field": "status", "size": 10}}}"#;
+        let out = rewrite_aggs_for_hash_fields(agg_json, &make_hash_fields()).unwrap();
+        let v: Value = serde_json::from_str(&out.rewritten_json).unwrap();
+        assert_eq!(v["by_status"]["terms"]["size"].as_u64().unwrap(), 10);
+        assert!(v["by_status"]["terms"]["segment_size"].is_null());
+        assert_eq!(out.touchup_infos[0].result_size, None);
     }
 
     #[test]

@@ -44,13 +44,16 @@ pub const PARQUET_FILE_HASH_FIELD: &str = "__pq_file_hash";
 /// Hidden u64 fast field storing the 0-based row index within the parquet file.
 pub const PARQUET_ROW_IN_FILE_FIELD: &str = "__pq_row_in_file";
 
-/// Compute a stable u64 hash for a parquet file's relative path.
-/// Uses FxHash-style mixing for speed; collision probability ~1/2^64 per pair.
+/// Compute a stable u64 hash for a parquet file's relative path using xxHash64.
+///
+/// This value is persisted into split files (the `__pq_file_hash` fast field is
+/// written at index time and must equal the hash recomputed at read time from the
+/// manifest paths in `docid_mapping::build_file_hash_index`). It therefore MUST use
+/// a hash with a stable, versioned algorithm — `std::hash::DefaultHasher` is
+/// explicitly unspecified across toolchain releases and would silently break
+/// doc→parquet resolution for every previously created split.
 pub fn hash_parquet_path(relative_path: &str) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    relative_path.hash(&mut hasher);
-    hasher.finish()
+    xxhash_rust::xxh64::xxh64(relative_path.as_bytes(), 0)
 }
 
 /// Compute a stable 64-bit hash for a string value using xxHash64.
@@ -198,12 +201,30 @@ pub async fn create_split_from_parquet(
     )?;
 
     // ── Step 4: Derive tantivy schema ───────────────────────────────────
+    // Config-key convention (M1): users declare all field-scoped config
+    // (tokenizer_overrides, ip_address_fields, json_fields) by *parquet column
+    // name* — that's what they see in the file. Internally, schema derivation
+    // and the indexing loop both work with *tantivy field names*, so translate
+    // these keys through the name mapping exactly once here to a single tantivy-
+    // keyed convention. Keys with no mapping pass through unchanged, and a key
+    // already given as the tantivy name (mapping miss) also passes through, so
+    // both conventions resolve identically. `skip_fields` stays parquet-keyed
+    // because it is applied to parquet columns *before* mapping.
+    let map_to_tantivy = |k: &str| -> String {
+        name_mapping.get(k).cloned().unwrap_or_else(|| k.to_string())
+    };
     let config = SchemaDerivationConfig {
         fast_field_mode: parquet_config.fast_field_mode,
         skip_fields: parquet_config.schema_config.skip_fields.clone(),
-        tokenizer_overrides: parquet_config.schema_config.tokenizer_overrides.clone(),
-        ip_address_fields: parquet_config.schema_config.ip_address_fields.clone(),
-        json_fields: parquet_config.schema_config.json_fields.clone(),
+        tokenizer_overrides: parquet_config.schema_config.tokenizer_overrides.iter()
+            .map(|(k, v)| (map_to_tantivy(k), v.clone()))
+            .collect(),
+        ip_address_fields: parquet_config.schema_config.ip_address_fields.iter()
+            .map(|k| map_to_tantivy(k))
+            .collect(),
+        json_fields: parquet_config.schema_config.json_fields.iter()
+            .map(|k| map_to_tantivy(k))
+            .collect(),
         fieldnorms_enabled: parquet_config.schema_config.fieldnorms_enabled,
         store_fields: false, // Companion mode: parquet is the store
     };
@@ -252,29 +273,50 @@ pub async fn create_split_from_parquet(
     let mut string_indexing_modes: HashMap<String, StringIndexingMode> = HashMap::new();
     let mut companion_hash_fields_map: HashMap<String, CompanionFieldInfo> = HashMap::new();
 
-    for (field_name, tokenizer_value) in &config.tokenizer_overrides {
-        // Resolve the tantivy field name via name mapping
-        let tantivy_name = name_mapping
-            .get(field_name.as_str())
-            .map(|s| s.as_str())
-            .unwrap_or(field_name.as_str());
+    // Arrow type per parquet column, for validating string-only overrides (M2).
+    let arrow_type_by_name: HashMap<&str, &DataType> = arrow_schema.fields().iter()
+        .map(|f| (f.name().as_str(), f.data_type()))
+        .collect();
 
+    // Iterate the user's original parquet-keyed overrides so we still have the
+    // parquet column name for arrow-type validation; map to the tantivy name
+    // for registration (consistent with the derivation config above — M1).
+    for (parquet_name, tokenizer_value) in &parquet_config.schema_config.tokenizer_overrides {
         if let Some(mode) = string_indexing::parse_tokenizer_override(tokenizer_value) {
+            // M2: compact string-indexing modes (exact_only, text_uuid_*, …) only
+            // make sense on a string column. Derivation applies them only in the
+            // Utf8/LargeUtf8 arm, so an override on a numeric column would create
+            // a numeric field here yet register ExactOnly and rewrite the manifest
+            // type to U64 — corrupting hash-rewrite reads. Reject it up front.
+            match arrow_type_by_name.get(parquet_name.as_str()) {
+                Some(DataType::Utf8) | Some(DataType::LargeUtf8) => {}
+                Some(other) => anyhow::bail!(
+                    "Tokenizer override '{}' on column '{}' requires a string (Utf8) \
+                     column, but it has arrow type {:?}.",
+                    tokenizer_value, parquet_name, other
+                ),
+                None => anyhow::bail!(
+                    "Tokenizer override references unknown parquet column '{}'.",
+                    parquet_name
+                ),
+            }
+
+            let tantivy_name = map_to_tantivy(parquet_name);
             // Build companion field info for *_exactonly modes
             if string_indexing::needs_companion_field(&mode) {
-                let companion_name = string_indexing::companion_field_name(tantivy_name);
+                let companion_name = string_indexing::companion_field_name(&tantivy_name);
                 let pattern = string_indexing::regex_pattern(&mode)
                     .unwrap_or("")
                     .to_string();
                 companion_hash_fields_map.insert(
                     companion_name.clone(),
                     CompanionFieldInfo {
-                        original_field_name: tantivy_name.to_string(),
+                        original_field_name: tantivy_name.clone(),
                         regex_pattern: pattern,
                     },
                 );
             }
-            string_indexing_modes.insert(tantivy_name.to_string(), mode);
+            string_indexing_modes.insert(tantivy_name, mode);
         }
     }
 
@@ -396,10 +438,17 @@ pub async fn create_split_from_parquet(
     })?;
 
     // Single-threaded writer ensures docs within each segment are in insertion order.
-    // Merges are allowed (default LogMergePolicy) — the __pq_file_hash and
-    // __pq_row_in_file fast fields make doc→parquet resolution merge-safe.
+    //
+    // NoMergePolicy is critical (F5): fast-field transcoding assigns
+    // `doc_id = global_parquet_row` while walking the manifest files in order,
+    // which is only valid for a single segment whose doc_ids equal insertion
+    // order. A background LogMergePolicy merge would reorder docs (breaking
+    // transcoded aggregations/sorting) and could also GC segment files out from
+    // under `create_quickwit_split` while it bundles the temp dir. Disabling
+    // merges keeps doc_id == insertion order and removes the bundling race.
     let mut writer = index.writer_with_num_threads(1, parquet_config.writer_heap_size)
         .context("Failed to create index writer")?;
+    writer.set_merge_policy(Box::new(tantivy::indexer::NoMergePolicy));
 
     // ── Step 8: Initialize statistics accumulators ───────────────────────
     let mut accumulators: HashMap<String, StatisticsAccumulator> = HashMap::new();
@@ -416,6 +465,36 @@ pub async fn create_split_from_parquet(
     let mut parquet_file_entries: Vec<ParquetFileEntry> = Vec::new();
     let mut cumulative_row_offset: u64 = 0;
     let mut total_rows: u64 = 0;
+
+    // Column projection (E1): only the columns we actually index. Reading,
+    // decompressing and Arrow-decoding all N columns of a wide table when we
+    // index only a handful is ~95% wasted I/O/CPU. A column is indexed iff it is
+    // not skipped AND its mapped tantivy name is a real field in the derived
+    // schema (unsupported types were dropped during derivation). NB:
+    // build_column_mapping deliberately maps EVERY arrow column (for doc
+    // retrieval of non-indexed columns), so it is NOT the right source here.
+    // Compute the arrow top-level field indices to keep once (schema is validated
+    // consistent across files) and apply ProjectionMask::roots per file below.
+    let projection_indices: Vec<usize> = arrow_schema.fields().iter().enumerate()
+        .filter_map(|(i, f)| {
+            let pname = f.name();
+            if config.skip_fields.contains(pname.as_str()) {
+                return None;
+            }
+            let tname = map_to_tantivy(pname);
+            if tantivy_schema.get_field(&tname).is_ok() { Some(i) } else { None }
+        })
+        .collect();
+    // Only project when it is a proper, non-empty subset — a full or empty mask
+    // gains nothing and the empty case is a degenerate no-columns read.
+    let apply_projection =
+        !projection_indices.is_empty() && projection_indices.len() < arrow_schema.fields().len();
+    if apply_projection {
+        debug_println!(
+            "🏗️ CREATE_FROM_PARQUET: projecting {} of {} parquet columns during indexing",
+            projection_indices.len(), arrow_schema.fields().len()
+        );
+    }
 
     for file_path in parquet_files {
         let file = std::fs::File::open(file_path)
@@ -438,11 +517,16 @@ pub async fn create_split_from_parquet(
         // Files WITH a native offset index don't need page locations stored in the
         // manifest — the CachedParquetReader will load the offset index directly
         // from the footer at read time via PageIndexPolicy::Optional.
-        let has_native_offset_index = pq_metadata.row_groups().first()
-            .map(|rg| rg.columns().first()
-                .map(|col| col.offset_index_offset().is_some())
-                .unwrap_or(false))
-            .unwrap_or(false);
+        //
+        // Per-column offset-index presence is legal per the parquet spec, so
+        // require EVERY column of EVERY row group to carry an offset index before
+        // treating the file as natively indexed; otherwise a column without one
+        // would be unreadable at page granularity (L4).
+        let has_native_offset_index = !pq_metadata.row_groups().is_empty()
+            && pq_metadata.row_groups().iter().all(|rg| {
+                !rg.columns().is_empty()
+                    && rg.columns().iter().all(|col| col.offset_index_offset().is_some())
+            });
 
         // Open a separate file handle for page location scanning (only needed
         // for files that lack a native offset index in their footer).
@@ -543,23 +627,40 @@ pub async fn create_split_from_parquet(
 
         // Reuse the reader_builder (which already holds the file handle) instead
         // of re-reading the file from disk.
-        let reader = reader_builder
-            .with_batch_size(parquet_config.reader_batch_size)
+        let mut builder = reader_builder.with_batch_size(parquet_config.reader_batch_size);
+        if apply_projection {
+            // Root-level indices: arrow top-level field position == parquet root
+            // field index (nested types stay whole). Matches build_column_projection.
+            let mask = parquet::arrow::ProjectionMask::roots(
+                pq_metadata.file_metadata().schema_descr(),
+                projection_indices.iter().cloned(),
+            );
+            builder = builder.with_projection(mask);
+        }
+        let reader = builder
             .build()
             .context("Failed to build parquet reader")?;
 
         let mut row_in_file: u64 = 0;
         for batch_result in reader {
             let batch = batch_result.context("Failed to read record batch")?;
+            // Decode Dictionary-encoded columns to their value type so the
+            // per-type extraction below downcasts to a concrete array (M3).
+            let batch = decode_dictionary_columns(batch)?;
             let batch_schema = batch.schema();
+
+            // Resolve column → tantivy field once per batch (batch-invariant work),
+            // instead of re-running name mapping and schema lookups per row.
+            let resolved_columns = resolve_batch_columns(
+                &batch_schema, &tantivy_schema, &name_mapping, &config,
+            );
 
             for row_idx in 0..batch.num_rows() {
                 let mut tantivy_doc = arrow_row_to_tantivy_doc(
                     &batch,
-                    &batch_schema,
+                    &resolved_columns,
                     row_idx,
                     &tantivy_schema,
-                    &name_mapping,
                     &config,
                     &string_hash_fields,
                     &mut accumulators,
@@ -587,6 +688,9 @@ pub async fn create_split_from_parquet(
     }
 
     writer.commit().context("Failed to commit tantivy index")?;
+    // Ensure no merge threads are still running before we inspect segments and
+    // bundle the temp dir (belt-and-suspenders alongside NoMergePolicy — F5).
+    writer.wait_merging_threads().context("Failed to wait for merge threads")?;
 
     // ── Step 10: Build segment_row_ranges from whatever segments exist ──
     // With __pq_file_hash and __pq_row_in_file fast fields, doc→parquet
@@ -608,6 +712,22 @@ pub async fn create_split_from_parquet(
         anyhow::bail!(
             "Segment row count mismatch: segments have {} rows but indexed {} rows",
             docs_in_segments, total_rows
+        );
+    }
+
+    // Single-segment guard (F5): when fast fields are served from parquet
+    // (Hybrid/ParquetOnly), transcoding assumes doc_id == global parquet row,
+    // which only holds for a single segment in insertion order. A multi-segment
+    // index (writer heap flushed mid-file) would silently transcode wrong values
+    // for parquet-served fast fields. NoMergePolicy prevents merges but not
+    // multi-segment flushes, so reject that combination rather than corrupt data.
+    if parquet_config.fast_field_mode != FastFieldMode::Disabled && segment_metas.len() > 1 {
+        anyhow::bail!(
+            "Parquet companion fast-field mode {:?} produced {} segments ({} rows). \
+             Parquet-served fast fields require a single segment (doc_id == parquet \
+             row); increase writer_heap_size so the input fits in one segment, or use \
+             FastFieldMode::Disabled.",
+            parquet_config.fast_field_mode, segment_metas.len(), total_rows
         );
     }
 
@@ -734,12 +854,56 @@ pub async fn create_split_from_parquet(
 }
 
 /// Convert a single Arrow row into a tantivy Document.
-pub(crate) fn arrow_row_to_tantivy_doc(
-    batch: &RecordBatch,
+/// A parquet column resolved to its tantivy field. All fields here are
+/// batch-invariant, so this is computed once per batch (via
+/// [`resolve_batch_columns`]) and reused across every row, instead of re-running
+/// name mapping and `Schema::get_field` (a string-hash lookup) per row.
+pub(crate) struct ResolvedColumn {
+    /// Column index into the RecordBatch.
+    col_idx: usize,
+    /// The resolved tantivy field (Field is a cheap Copy handle).
+    field: Field,
+    /// The tantivy field name (used for statistics accumulator keys and hashing).
+    tantivy_field_name: String,
+}
+
+/// Resolve, once per batch, which columns map to a tantivy field (skip-field
+/// filtering + name mapping + schema lookup). Columns with no tantivy field
+/// (unsupported type or explicitly skipped) are omitted.
+pub(crate) fn resolve_batch_columns(
     batch_schema: &ArrowSchema,
-    row_idx: usize,
     tantivy_schema: &Schema,
     name_mapping: &name_mapping::NameMapping,
+    config: &SchemaDerivationConfig,
+) -> Vec<ResolvedColumn> {
+    let mut cols = Vec::with_capacity(batch_schema.fields().len());
+    for (col_idx, arrow_field) in batch_schema.fields().iter().enumerate() {
+        let parquet_col_name = arrow_field.name();
+        if config.skip_fields.contains(parquet_col_name.as_str()) {
+            continue;
+        }
+        let tantivy_field_name = name_mapping
+            .get(parquet_col_name.as_str())
+            .map(|s| s.as_str())
+            .unwrap_or(parquet_col_name.as_str());
+        let field = match tantivy_schema.get_field(tantivy_field_name) {
+            Ok(f) => f,
+            Err(_) => continue, // Field not in tantivy schema (unsupported type), skip
+        };
+        cols.push(ResolvedColumn {
+            col_idx,
+            field,
+            tantivy_field_name: tantivy_field_name.to_string(),
+        });
+    }
+    cols
+}
+
+pub(crate) fn arrow_row_to_tantivy_doc(
+    batch: &RecordBatch,
+    resolved_columns: &[ResolvedColumn],
+    row_idx: usize,
+    tantivy_schema: &Schema,
     config: &SchemaDerivationConfig,
     string_hash_fields: &HashMap<String, String>,
     accumulators: &mut HashMap<String, StatisticsAccumulator>,
@@ -748,39 +912,20 @@ pub(crate) fn arrow_row_to_tantivy_doc(
 ) -> Result<TantivyDocument> {
     let mut doc = TantivyDocument::new();
 
-    for (col_idx, arrow_field) in batch_schema.fields().iter().enumerate() {
-        let parquet_col_name = arrow_field.name();
-
-        // Skip fields that were excluded from schema derivation
-        if config.skip_fields.contains(parquet_col_name.as_str()) {
-            continue;
-        }
-
-        // Resolve display name via name mapping
-        let tantivy_field_name = name_mapping
-            .get(parquet_col_name.as_str())
-            .map(|s| s.as_str())
-            .unwrap_or(parquet_col_name.as_str());
-
-        // Look up the field in the tantivy schema
-        let field = match tantivy_schema.get_field(tantivy_field_name) {
-            Ok(f) => f,
-            Err(_) => continue, // Field not in tantivy schema (unsupported type), skip
-        };
-
-        let array = batch.column(col_idx);
+    for rc in resolved_columns {
+        let array = batch.column(rc.col_idx);
 
         if array.is_null(row_idx) {
             // Record null for statistics
-            if let Some(acc) = accumulators.get_mut(tantivy_field_name) {
+            if let Some(acc) = accumulators.get_mut(&rc.tantivy_field_name) {
                 acc.observe_null();
             }
             continue; // Skip null values — tantivy handles absent fields natively
         }
 
         add_arrow_value_to_doc(
-            &mut doc, field, array, arrow_field.data_type(), row_idx,
-            tantivy_field_name, config, string_hash_fields, tantivy_schema,
+            &mut doc, rc.field, array, array.data_type(), row_idx,
+            &rc.tantivy_field_name, config, string_hash_fields, tantivy_schema,
             accumulators, string_indexing_modes, compiled_regexes,
         )?;
     }
@@ -878,7 +1023,11 @@ pub(crate) fn add_arrow_value_to_doc(
             let val = arr.value(row_idx);
             doc.add_u64(field, val);
             if let Some(acc) = accumulators.get_mut(field_name) {
-                acc.observe_i64(val as i64);
+                // Saturate rather than `as i64` (which wraps u64 > i64::MAX to a
+                // negative min/max — L1). Query bounds are i64, so a saturated
+                // max of i64::MAX is safe (no i64 query can exceed it), and small
+                // values still set an accurate min.
+                acc.observe_i64(i64::try_from(val).unwrap_or(i64::MAX));
             }
         }
 
@@ -926,14 +1075,19 @@ pub(crate) fn add_arrow_value_to_doc(
         }
 
         DataType::Timestamp(unit, _tz) => {
+            // Convert to micros with checked arithmetic — extreme values from an
+            // untrusted parquet file would otherwise overflow (panic in debug,
+            // silently wrong date in release).
             let micros = match unit {
                 TimeUnit::Second => {
                     let arr = array.as_any().downcast_ref::<TimestampSecondArray>().ok_or_else(|| anyhow::anyhow!("Expected TimestampSecondArray array"))?;
-                    arr.value(row_idx) * 1_000_000
+                    arr.value(row_idx).checked_mul(1_000_000)
+                        .ok_or_else(|| anyhow::anyhow!("Timestamp seconds overflow converting to micros"))?
                 }
                 TimeUnit::Millisecond => {
                     let arr = array.as_any().downcast_ref::<TimestampMillisecondArray>().ok_or_else(|| anyhow::anyhow!("Expected TimestampMillisecondArray array"))?;
-                    arr.value(row_idx) * 1_000
+                    arr.value(row_idx).checked_mul(1_000)
+                        .ok_or_else(|| anyhow::anyhow!("Timestamp millis overflow converting to micros"))?
                 }
                 TimeUnit::Microsecond => {
                     let arr = array.as_any().downcast_ref::<TimestampMicrosecondArray>().ok_or_else(|| anyhow::anyhow!("Expected TimestampMicrosecondArray array"))?;
@@ -954,7 +1108,8 @@ pub(crate) fn add_arrow_value_to_doc(
         DataType::Date32 => {
             let arr = array.as_any().downcast_ref::<Date32Array>().ok_or_else(|| anyhow::anyhow!("Expected Date32Array array"))?;
             let days = arr.value(row_idx) as i64;
-            let micros = days * 86_400 * 1_000_000;
+            let micros = days.checked_mul(86_400 * 1_000_000)
+                .ok_or_else(|| anyhow::anyhow!("Date32 overflow converting to micros"))?;
             let dt = tantivy::DateTime::from_timestamp_micros(micros);
             doc.add_date(field, dt);
             if let Some(acc) = accumulators.get_mut(field_name) {
@@ -964,7 +1119,8 @@ pub(crate) fn add_arrow_value_to_doc(
         DataType::Date64 => {
             let arr = array.as_any().downcast_ref::<Date64Array>().ok_or_else(|| anyhow::anyhow!("Expected Date64Array array"))?;
             let millis = arr.value(row_idx);
-            let micros = millis * 1_000;
+            let micros = millis.checked_mul(1_000)
+                .ok_or_else(|| anyhow::anyhow!("Date64 overflow converting to micros"))?;
             let dt = tantivy::DateTime::from_timestamp_micros(micros);
             doc.add_date(field, dt);
             if let Some(acc) = accumulators.get_mut(field_name) {
@@ -988,8 +1144,11 @@ pub(crate) fn add_arrow_value_to_doc(
             let val = if *scale == 0 {
                 raw.to_string()
             } else {
-                let f: f64 = raw.to_string().parse::<f64>().unwrap_or(0.0)
-                    / 10f64.powi(*scale as i32);
+                // Scale via f64. A parse failure means the i256 exceeded f64 range;
+                // surface it as an error rather than silently producing 0.0.
+                let parsed = raw.to_string().parse::<f64>()
+                    .map_err(|e| anyhow::anyhow!("Failed to parse Decimal256 value '{}' as f64: {}", raw, e))?;
+                let f: f64 = parsed / 10f64.powi(*scale as i32);
                 f.to_string()
             };
             doc.add_text(field, &val);
@@ -1143,133 +1302,40 @@ fn add_json_string_value(
     json_str: &str,
     field_name: &str,
 ) -> Result<()> {
-    let parsed: serde_json::Value = serde_json::from_str(json_str)
+    // Char-safe preview for error messages — slicing `&json_str[..100]` panics
+    // when byte 100 lands inside a multi-byte UTF-8 character (L2).
+    let preview = |s: &str| -> String { s.chars().take(100).collect() };
+
+    // Parse once directly into OwnedValue rather than parsing to serde_json::Value
+    // and then re-parsing (E8): an object becomes OwnedValue::Object, anything
+    // else is rejected below.
+    let owned: tantivy::schema::OwnedValue = serde_json::from_str(json_str)
         .with_context(|| format!(
             "Failed to parse JSON string for field '{}': '{}'",
             field_name,
-            if json_str.len() > 100 { &json_str[..100] } else { json_str }
+            preview(json_str)
         ))?;
-    match parsed {
-        serde_json::Value::Object(_) => {
-            let owned: tantivy::schema::OwnedValue = serde_json::from_str(json_str)?;
-            if let tantivy::schema::OwnedValue::Object(obj) = owned {
-                let json_map: std::collections::BTreeMap<String, tantivy::schema::OwnedValue> =
-                    obj.into_iter().collect();
-                doc.add_object(field, json_map);
-            }
+    match owned {
+        tantivy::schema::OwnedValue::Object(obj) => {
+            let json_map: std::collections::BTreeMap<String, tantivy::schema::OwnedValue> =
+                obj.into_iter().collect();
+            doc.add_object(field, json_map);
         }
         _ => {
             anyhow::bail!(
                 "JSON field '{}' contains non-object value. JSON fields must contain JSON objects, got: {}",
                 field_name,
-                if json_str.len() > 100 { &json_str[..100] } else { json_str }
+                preview(json_str)
             );
         }
     }
     Ok(())
 }
 
-/// Convert a complex Arrow type (List, Map, Struct) at a given row to a JSON value.
-///
-/// **Deprecated**: Prefer `convert_arrow_to_owned_value` which produces `OwnedValue` directly
-/// without the Arrow → serde_json::Value → String → OwnedValue round-trip.
-/// This function is retained for the TANT binary serialization path where a JSON string
-/// representation is still needed.
-pub(crate) fn convert_complex_to_json(array: &ArrayRef, row_idx: usize) -> Result<serde_json::Value> {
-    use arrow_array::*;
-    use arrow_schema::DataType;
-
-    if array.is_null(row_idx) {
-        return Ok(serde_json::Value::Null);
-    }
-
-    match array.data_type() {
-        DataType::List(_) | DataType::LargeList(_) => {
-            // Try ListArray first, then LargeListArray
-            if let Some(list_arr) = array.as_any().downcast_ref::<ListArray>() {
-                let inner = list_arr.value(row_idx);
-                let mut items = Vec::new();
-                for i in 0..inner.len() {
-                    items.push(convert_complex_to_json(&inner, i)?);
-                }
-                Ok(serde_json::Value::Array(items))
-            } else if let Some(list_arr) = array.as_any().downcast_ref::<LargeListArray>() {
-                let inner = list_arr.value(row_idx);
-                let mut items = Vec::new();
-                for i in 0..inner.len() {
-                    items.push(convert_complex_to_json(&inner, i)?);
-                }
-                Ok(serde_json::Value::Array(items))
-            } else {
-                Ok(serde_json::Value::Null)
-            }
-        }
-
-        DataType::Struct(fields) => {
-            let struct_arr = array.as_any().downcast_ref::<StructArray>().ok_or_else(|| anyhow::anyhow!("Expected StructArray array"))?;
-            let mut map = serde_json::Map::new();
-            for (i, field) in fields.iter().enumerate() {
-                let col = struct_arr.column(i);
-                if !col.is_null(row_idx) {
-                    let val = convert_complex_to_json(col, row_idx)?;
-                    map.insert(field.name().clone(), val);
-                }
-            }
-            Ok(serde_json::Value::Object(map))
-        }
-
-        // Scalar types inside complex types
-        DataType::Boolean => {
-            let arr = array.as_any().downcast_ref::<BooleanArray>().ok_or_else(|| anyhow::anyhow!("Expected BooleanArray array"))?;
-            Ok(serde_json::Value::Bool(arr.value(row_idx)))
-        }
-        DataType::Int32 => {
-            let arr = array.as_any().downcast_ref::<Int32Array>().ok_or_else(|| anyhow::anyhow!("Expected Int32Array array"))?;
-            Ok(serde_json::json!(arr.value(row_idx)))
-        }
-        DataType::Int64 => {
-            let arr = array.as_any().downcast_ref::<Int64Array>().ok_or_else(|| anyhow::anyhow!("Expected Int64Array array"))?;
-            Ok(serde_json::json!(arr.value(row_idx)))
-        }
-        DataType::Float64 => {
-            let arr = array.as_any().downcast_ref::<Float64Array>().ok_or_else(|| anyhow::anyhow!("Expected Float64Array array"))?;
-            Ok(serde_json::json!(arr.value(row_idx)))
-        }
-        DataType::Utf8 => {
-            let arr = array.as_any().downcast_ref::<StringArray>().ok_or_else(|| anyhow::anyhow!("Expected StringArray array"))?;
-            Ok(serde_json::Value::String(arr.value(row_idx).to_string()))
-        }
-        DataType::Decimal128(_, scale) => {
-            let arr = array.as_any().downcast_ref::<Decimal128Array>().ok_or_else(|| anyhow::anyhow!("Expected Decimal128Array array"))?;
-            let raw = arr.value(row_idx) as f64;
-            let val = raw / 10f64.powi(*scale as i32);
-            Ok(serde_json::json!(val))
-        }
-        DataType::Decimal256(_, scale) => {
-            let arr = array.as_any().downcast_ref::<Decimal256Array>().ok_or_else(|| anyhow::anyhow!("Expected Decimal256Array array"))?;
-            let raw = arr.value(row_idx);
-            let val: f64 = raw.to_string().parse::<f64>().unwrap_or(0.0)
-                / 10f64.powi(*scale as i32);
-            Ok(serde_json::json!(val))
-        }
-        DataType::FixedSizeBinary(_) => {
-            let arr = array.as_any().downcast_ref::<FixedSizeBinaryArray>().ok_or_else(|| anyhow::anyhow!("Expected FixedSizeBinaryArray array"))?;
-            Ok(serde_json::Value::String(base64::Engine::encode(
-                &base64::engine::general_purpose::STANDARD,
-                arr.value(row_idx),
-            )))
-        }
-
-        _ => Ok(serde_json::Value::Null),
-    }
-}
-
 /// Convert an Arrow array value directly to tantivy `OwnedValue`, bypassing JSON serialization.
 ///
-/// This is the Arrow-native replacement for the previous pipeline:
-///   `convert_complex_to_json` → `serde_json::to_string` → `serde_json::from_str::<OwnedValue>`
-///
-/// By constructing `OwnedValue` directly from Arrow arrays, we eliminate:
+/// This replaced a previous pipeline that went Arrow → serde_json::Value → String →
+/// OwnedValue. By constructing `OwnedValue` directly from Arrow arrays, we eliminate:
 /// - serde_json::Value tree allocation
 /// - JSON string serialization
 /// - JSON string re-parsing back to OwnedValue
@@ -1439,22 +1505,28 @@ pub(crate) fn convert_arrow_to_owned_value(
             let arr = array.as_any().downcast_ref::<Decimal256Array>()
                 .ok_or_else(|| anyhow::anyhow!("Expected Decimal256Array"))?;
             let raw = arr.value(row_idx);
-            let val: f64 = raw.to_string().parse::<f64>().unwrap_or(0.0)
-                / 10f64.powi(*scale as i32);
+            // A parse failure means the i256 exceeded f64 range; surface it as an
+            // error rather than silently producing 0.0.
+            let parsed = raw.to_string().parse::<f64>()
+                .map_err(|e| anyhow::anyhow!("Failed to parse Decimal256 value '{}' as f64: {}", raw, e))?;
+            let val: f64 = parsed / 10f64.powi(*scale as i32);
             Ok(OwnedValue::F64(val))
         }
 
         DataType::Timestamp(unit, _) => {
+            // Checked conversion to micros — avoid overflow on extreme untrusted input.
             let micros = match unit {
                 TimeUnit::Second => {
                     let arr = array.as_any().downcast_ref::<TimestampSecondArray>()
                         .ok_or_else(|| anyhow::anyhow!("Expected TimestampSecondArray"))?;
-                    arr.value(row_idx) * 1_000_000
+                    arr.value(row_idx).checked_mul(1_000_000)
+                        .ok_or_else(|| anyhow::anyhow!("Timestamp seconds overflow converting to micros"))?
                 }
                 TimeUnit::Millisecond => {
                     let arr = array.as_any().downcast_ref::<TimestampMillisecondArray>()
                         .ok_or_else(|| anyhow::anyhow!("Expected TimestampMillisecondArray"))?;
-                    arr.value(row_idx) * 1_000
+                    arr.value(row_idx).checked_mul(1_000)
+                        .ok_or_else(|| anyhow::anyhow!("Timestamp millis overflow converting to micros"))?
                 }
                 TimeUnit::Microsecond => {
                     let arr = array.as_any().downcast_ref::<TimestampMicrosecondArray>()
@@ -1473,13 +1545,15 @@ pub(crate) fn convert_arrow_to_owned_value(
         DataType::Date32 => {
             let arr = array.as_any().downcast_ref::<Date32Array>()
                 .ok_or_else(|| anyhow::anyhow!("Expected Date32Array"))?;
-            let micros = arr.value(row_idx) as i64 * 86_400 * 1_000_000;
+            let micros = (arr.value(row_idx) as i64).checked_mul(86_400 * 1_000_000)
+                .ok_or_else(|| anyhow::anyhow!("Date32 overflow converting to micros"))?;
             Ok(OwnedValue::Date(tantivy::DateTime::from_timestamp_micros(micros)))
         }
         DataType::Date64 => {
             let arr = array.as_any().downcast_ref::<Date64Array>()
                 .ok_or_else(|| anyhow::anyhow!("Expected Date64Array"))?;
-            let micros = arr.value(row_idx) * 1_000;
+            let micros = arr.value(row_idx).checked_mul(1_000)
+                .ok_or_else(|| anyhow::anyhow!("Date64 overflow converting to micros"))?;
             Ok(OwnedValue::Date(tantivy::DateTime::from_timestamp_micros(micros)))
         }
 
@@ -1615,6 +1689,42 @@ fn build_column_mapping(
     mappings
 }
 
+/// Decode any Dictionary-encoded columns in a batch to their value type.
+///
+/// Non-dictionary columns are returned unchanged; when the batch has no
+/// dictionary columns the input is returned as-is (no allocation). This lets the
+/// per-type value extraction (which downcasts to concrete arrays like
+/// `StringArray`) handle pandas/pyarrow categorical columns instead of silently
+/// dropping them (M3).
+pub(crate) fn decode_dictionary_columns(batch: RecordBatch) -> Result<RecordBatch> {
+    let has_dict = batch.schema().fields().iter()
+        .any(|f| matches!(f.data_type(), DataType::Dictionary(_, _)));
+    if !has_dict {
+        return Ok(batch);
+    }
+
+    let schema = batch.schema();
+    let mut new_fields: Vec<Arc<arrow_schema::Field>> = Vec::with_capacity(batch.num_columns());
+    let mut new_cols: Vec<ArrayRef> = Vec::with_capacity(batch.num_columns());
+    for (i, field) in schema.fields().iter().enumerate() {
+        let col = batch.column(i);
+        if let DataType::Dictionary(_, value_type) = field.data_type() {
+            let decoded = arrow::compute::cast(col.as_ref(), value_type)
+                .with_context(|| format!("Failed to decode dictionary column '{}'", field.name()))?;
+            new_fields.push(Arc::new(arrow_schema::Field::new(
+                field.name(), value_type.as_ref().clone(), field.is_nullable(),
+            )));
+            new_cols.push(decoded);
+        } else {
+            new_fields.push(field.clone());
+            new_cols.push(col.clone());
+        }
+    }
+    let new_schema = Arc::new(ArrowSchema::new(new_fields));
+    RecordBatch::try_new(new_schema, new_cols)
+        .context("Failed to rebuild record batch after dictionary decode")
+}
+
 /// Compute relative path from table_root.
 fn compute_relative_path(file_path: &str, table_root: &str) -> String {
     if table_root.is_empty() {
@@ -1622,12 +1732,15 @@ fn compute_relative_path(file_path: &str, table_root: &str) -> String {
     }
 
     let root = table_root.trim_end_matches('/');
-    if file_path.starts_with(root) {
-        let relative = &file_path[root.len()..];
-        relative.trim_start_matches('/').to_string()
-    } else {
-        file_path.to_string()
+    // Only strip when `root` is a full path-segment prefix: the remainder must be
+    // empty or begin with '/'. Otherwise `/data/tablex/...` would be wrongly
+    // treated as living under root `/data/table` (L3).
+    if let Some(rest) = file_path.strip_prefix(root) {
+        if rest.is_empty() || rest.starts_with('/') {
+            return rest.trim_start_matches('/').to_string();
+        }
     }
+    file_path.to_string()
 }
 
 #[cfg(test)]
@@ -1652,6 +1765,17 @@ mod tests {
         assert_eq!(
             compute_relative_path("file.parquet", ""),
             "file.parquet"
+        );
+        // L3: a sibling directory sharing the root as a string prefix but not a
+        // path-segment prefix must NOT be stripped.
+        assert_eq!(
+            compute_relative_path("/data/tablex/part.parquet", "/data/table"),
+            "/data/tablex/part.parquet"
+        );
+        // Exact match → empty relative path.
+        assert_eq!(
+            compute_relative_path("/data/table", "/data/table"),
+            ""
         );
     }
 
