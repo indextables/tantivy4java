@@ -18,13 +18,19 @@ use crate::debug_println;
 /// - All or no splits must have manifests (mixing is not allowed)
 /// - No deletions in any source (identity mapping requirement)
 /// - Same fast_field_mode across all sources
-/// - Row offsets are adjusted based on cumulative row count
+/// - Row offsets are adjusted based on cumulative row count, following the
+///   same segment ordering quickwit's `combine_index_meta` produces for the
+///   merged index (the LAST source split's docs come first).
 /// - Segment row ranges are rebuilt for the merged single segment
+///
+/// `expected_merged_docs`, when provided, is asserted to equal the combined
+/// row count as a backstop against ordering/deletion bugs (F1/F2/M7).
 ///
 /// Returns None if no splits have manifests.
 pub fn combine_parquet_manifests(
     source_dirs: &[&Path],
     output_dir: &Path,
+    expected_merged_docs: Option<u64>,
 ) -> Result<Option<()>> {
     // Read manifests from source directories
     let mut manifests: Vec<Option<ParquetManifest>> = Vec::new();
@@ -91,7 +97,12 @@ pub fn combine_parquet_manifests(
 
         if let Some(segments) = meta.get("segments").and_then(|s| s.as_array()) {
             for seg in segments {
-                let num_deleted = seg.get("num_deleted_docs")
+                // Tantivy nests deletions under `deletes: Option<DeleteMeta>`
+                // (InnerSegmentMeta, no serde flatten). The real shape is
+                // {"segment_id":…,"max_doc":100,"deletes":{"num_deleted_docs":5,…}},
+                // so a top-level `num_deleted_docs` lookup would always miss.
+                let num_deleted = seg.get("deletes")
+                    .and_then(|d| d.get("num_deleted_docs"))
                     .and_then(|n| n.as_u64())
                     .unwrap_or(0);
                 if num_deleted > 0 {
@@ -123,17 +134,45 @@ pub fn combine_parquet_manifests(
         }
     }
 
-    // Build combined manifest
+    // Build combined manifest.
+    //
+    // CRITICAL: the merged doc order is NOT the input order. Quickwit's
+    // `combine_index_meta` pops the LAST index_meta as the base then extends
+    // with the rest in order, so the merged segment/doc order is
+    // `[n-1, 0, 1, …, n-2]`. Positional consumers of the manifest (transcode
+    // assigning doc_id = global_row + row, legacy positional retrieval, hash
+    // touch-up fallback) require row_offsets that match that merged order, so
+    // we concatenate manifests in the same order rather than input order.
+    let n = manifests.len();
+    let merge_order: Vec<usize> = std::iter::once(n - 1).chain(0..n - 1).collect();
+
     let mut combined_files: Vec<ParquetFileEntry> = Vec::new();
     let mut cumulative_rows: u64 = 0;
 
-    for manifest in &manifests {
+    for &idx in &merge_order {
+        let manifest = &manifests[idx];
         for file in &manifest.parquet_files {
             let mut adjusted_file = file.clone();
             adjusted_file.row_offset = cumulative_rows + file.row_offset;
             combined_files.push(adjusted_file);
         }
         cumulative_rows += manifest.total_rows;
+    }
+
+    // Backstop (M7): the combined row count must equal the actual merged doc
+    // count. A mismatch means an ordering bug, an unguarded deletion, or a
+    // manifest whose total_rows drifted from its file rows — all of which would
+    // silently map doc_ids to wrong parquet rows.
+    if let Some(merged_docs) = expected_merged_docs {
+        if cumulative_rows != merged_docs {
+            anyhow::bail!(
+                "Combined parquet manifest row count ({}) does not match merged \
+                 document count ({}). This indicates deletions, an ordering bug, \
+                 or corrupt manifest metadata; refusing to produce a split that \
+                 would map documents to wrong parquet rows.",
+                cumulative_rows, merged_docs
+            );
+        }
     }
 
     // Reject duplicate relative paths across the merged manifests. Because
@@ -302,6 +341,7 @@ mod tests {
         let result = combine_parquet_manifests(
             &[dir1.path(), dir2.path()],
             output.path(),
+        None,
         ).unwrap();
 
         assert!(result.is_none());
@@ -321,6 +361,7 @@ mod tests {
         let result = combine_parquet_manifests(
             &[dir1.path(), dir2.path()],
             output.path(),
+        None,
         );
 
         assert!(result.is_err());
@@ -344,6 +385,7 @@ mod tests {
         let result = combine_parquet_manifests(
             &[dir1.path(), dir2.path()],
             output.path(),
+        None,
         );
 
         assert!(result.is_err());
@@ -365,6 +407,7 @@ mod tests {
         let result = combine_parquet_manifests(
             &[dir1.path(), dir2.path()],
             output.path(),
+        None,
         ).unwrap();
 
         assert!(result.is_some());
@@ -373,10 +416,14 @@ mod tests {
         let combined_data = std::fs::read(output.path().join(MANIFEST_FILENAME)).unwrap();
         let combined = deserialize_manifest(&combined_data).unwrap();
 
+        // Merged doc order mirrors quickwit's combine_index_meta: the LAST
+        // split (m2) comes first, so p2 is at offset 0 and p1 follows at 200.
         assert_eq!(combined.total_rows, 300);
         assert_eq!(combined.parquet_files.len(), 2);
+        assert_eq!(combined.parquet_files[0].relative_path, "p2.parquet");
         assert_eq!(combined.parquet_files[0].row_offset, 0);
-        assert_eq!(combined.parquet_files[1].row_offset, 100);
+        assert_eq!(combined.parquet_files[1].relative_path, "p1.parquet");
+        assert_eq!(combined.parquet_files[1].row_offset, 200);
         assert_eq!(combined.segment_row_ranges.len(), 1);
         assert_eq!(combined.segment_row_ranges[0].num_rows, 300);
     }
@@ -399,6 +446,7 @@ mod tests {
         let result = combine_parquet_manifests(
             &[dir1.path(), dir2.path(), dir3.path()],
             output.path(),
+        None,
         ).unwrap();
 
         assert!(result.is_some());
@@ -406,20 +454,22 @@ mod tests {
         let combined_data = std::fs::read(output.path().join(MANIFEST_FILENAME)).unwrap();
         let combined = deserialize_manifest(&combined_data).unwrap();
 
+        // Merged order mirrors combine_index_meta: [m3, m1, m2] (last split
+        // first). So: d (m3, 100 rows) → a (m1, 50) → b,c (m2, 30+20).
         assert_eq!(combined.total_rows, 200);
         assert_eq!(combined.parquet_files.len(), 4);
-        // m1: file a at offset 0
-        assert_eq!(combined.parquet_files[0].relative_path, "a.parquet");
+        // m3: file d at offset 0 (last split becomes the base)
+        assert_eq!(combined.parquet_files[0].relative_path, "d.parquet");
         assert_eq!(combined.parquet_files[0].row_offset, 0);
-        // m2: file b at offset 50 (after m1's 50 rows)
-        assert_eq!(combined.parquet_files[1].relative_path, "b.parquet");
-        assert_eq!(combined.parquet_files[1].row_offset, 50);
-        // m2: file c at offset 80 (50 + 30)
-        assert_eq!(combined.parquet_files[2].relative_path, "c.parquet");
-        assert_eq!(combined.parquet_files[2].row_offset, 80);
-        // m3: file d at offset 100 (50 + 50)
-        assert_eq!(combined.parquet_files[3].relative_path, "d.parquet");
-        assert_eq!(combined.parquet_files[3].row_offset, 100);
+        // m1: file a at offset 100 (after m3's 100 rows)
+        assert_eq!(combined.parquet_files[1].relative_path, "a.parquet");
+        assert_eq!(combined.parquet_files[1].row_offset, 100);
+        // m2: file b at offset 150 (100 + 50)
+        assert_eq!(combined.parquet_files[2].relative_path, "b.parquet");
+        assert_eq!(combined.parquet_files[2].row_offset, 150);
+        // m2: file c at offset 180 (150 + 30)
+        assert_eq!(combined.parquet_files[3].relative_path, "c.parquet");
+        assert_eq!(combined.parquet_files[3].row_offset, 180);
     }
 
     #[test]
@@ -434,12 +484,13 @@ mod tests {
         std::fs::write(dir1.path().join(MANIFEST_FILENAME), serialize_manifest(&m1).unwrap()).unwrap();
         std::fs::write(dir2.path().join(MANIFEST_FILENAME), serialize_manifest(&m2).unwrap()).unwrap();
 
-        // Write a meta.json with deletions in dir2
+        // Write a meta.json with deletions in dir2, using tantivy's real shape:
+        // deletions are nested under `deletes: {num_deleted_docs, opstamp}`.
         let meta_with_deletions = serde_json::json!({
             "segments": [{
                 "segment_id": "abc123",
                 "max_doc": 200,
-                "num_deleted_docs": 5
+                "deletes": { "num_deleted_docs": 5, "opstamp": 7 }
             }]
         });
         std::fs::write(
@@ -450,6 +501,7 @@ mod tests {
         let result = combine_parquet_manifests(
             &[dir1.path(), dir2.path()],
             output.path(),
+        None,
         );
 
         assert!(result.is_err());
@@ -490,6 +542,7 @@ mod tests {
         let result = combine_parquet_manifests(
             &[dir1.path(), dir2.path()],
             output.path(),
+        None,
         );
 
         assert!(result.is_ok());
@@ -530,6 +583,7 @@ mod tests {
         let result = combine_parquet_manifests(
             &[dir1.path(), dir2.path()],
             output.path(),
+        None,
         );
 
         assert!(result.is_err());
@@ -567,6 +621,7 @@ mod tests {
         let result = combine_parquet_manifests(
             &[dir1.path(), dir2.path()],
             output.path(),
+        None,
         ).unwrap();
         assert!(result.is_some());
 
@@ -599,6 +654,7 @@ mod tests {
         let result = combine_parquet_manifests(
             &[dir1.path(), dir2.path()],
             output.path(),
+        None,
         );
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("string_indexing_modes mismatch"));
@@ -631,6 +687,7 @@ mod tests {
         let result = combine_parquet_manifests(
             &[dir1.path(), dir2.path()],
             output.path(),
+        None,
         );
 
         assert!(result.is_ok());

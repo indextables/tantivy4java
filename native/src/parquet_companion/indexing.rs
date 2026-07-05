@@ -399,10 +399,17 @@ pub async fn create_split_from_parquet(
     })?;
 
     // Single-threaded writer ensures docs within each segment are in insertion order.
-    // Merges are allowed (default LogMergePolicy) — the __pq_file_hash and
-    // __pq_row_in_file fast fields make doc→parquet resolution merge-safe.
+    //
+    // NoMergePolicy is critical (F5): fast-field transcoding assigns
+    // `doc_id = global_parquet_row` while walking the manifest files in order,
+    // which is only valid for a single segment whose doc_ids equal insertion
+    // order. A background LogMergePolicy merge would reorder docs (breaking
+    // transcoded aggregations/sorting) and could also GC segment files out from
+    // under `create_quickwit_split` while it bundles the temp dir. Disabling
+    // merges keeps doc_id == insertion order and removes the bundling race.
     let mut writer = index.writer_with_num_threads(1, parquet_config.writer_heap_size)
         .context("Failed to create index writer")?;
+    writer.set_merge_policy(Box::new(tantivy::indexer::NoMergePolicy));
 
     // ── Step 8: Initialize statistics accumulators ───────────────────────
     let mut accumulators: HashMap<String, StatisticsAccumulator> = HashMap::new();
@@ -595,6 +602,9 @@ pub async fn create_split_from_parquet(
     }
 
     writer.commit().context("Failed to commit tantivy index")?;
+    // Ensure no merge threads are still running before we inspect segments and
+    // bundle the temp dir (belt-and-suspenders alongside NoMergePolicy — F5).
+    writer.wait_merging_threads().context("Failed to wait for merge threads")?;
 
     // ── Step 10: Build segment_row_ranges from whatever segments exist ──
     // With __pq_file_hash and __pq_row_in_file fast fields, doc→parquet
@@ -616,6 +626,22 @@ pub async fn create_split_from_parquet(
         anyhow::bail!(
             "Segment row count mismatch: segments have {} rows but indexed {} rows",
             docs_in_segments, total_rows
+        );
+    }
+
+    // Single-segment guard (F5): when fast fields are served from parquet
+    // (Hybrid/ParquetOnly), transcoding assumes doc_id == global parquet row,
+    // which only holds for a single segment in insertion order. A multi-segment
+    // index (writer heap flushed mid-file) would silently transcode wrong values
+    // for parquet-served fast fields. NoMergePolicy prevents merges but not
+    // multi-segment flushes, so reject that combination rather than corrupt data.
+    if parquet_config.fast_field_mode != FastFieldMode::Disabled && segment_metas.len() > 1 {
+        anyhow::bail!(
+            "Parquet companion fast-field mode {:?} produced {} segments ({} rows). \
+             Parquet-served fast fields require a single segment (doc_id == parquet \
+             row); increase writer_heap_size so the input fits in one segment, or use \
+             FastFieldMode::Disabled.",
+            parquet_config.fast_field_mode, segment_metas.len(), total_rows
         );
     }
 

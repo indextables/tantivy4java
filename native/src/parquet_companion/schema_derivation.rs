@@ -65,6 +65,56 @@ pub fn derive_tantivy_schema(
     derive_tantivy_schema_with_mapping(arrow_schema, config, None)
 }
 
+/// Validate that resolved tantivy field names are unique and do not collide
+/// with reserved parquet-companion internal field names. Returns a clean error
+/// rather than letting `SchemaBuilder::add_field` panic across JNI (F8).
+fn validate_resolved_field_names(
+    arrow_schema: &ArrowSchema,
+    config: &SchemaDerivationConfig,
+    name_mapping: Option<&HashMap<String, String>>,
+) -> Result<()> {
+    use super::indexing::{PARQUET_FILE_HASH_FIELD, PARQUET_ROW_IN_FILE_FIELD, PHASH_FIELD_PREFIX};
+    use super::string_indexing::COMPANION_SUFFIX;
+
+    let mut seen: HashSet<&str> = HashSet::new();
+    for field in arrow_schema.fields() {
+        let parquet_name = field.name();
+        if config.skip_fields.contains(parquet_name.as_str()) {
+            continue;
+        }
+        let resolved = name_mapping
+            .and_then(|m| m.get(parquet_name.as_str()))
+            .map(|s| s.as_str())
+            .unwrap_or(parquet_name.as_str());
+
+        if resolved == PARQUET_FILE_HASH_FIELD
+            || resolved == PARQUET_ROW_IN_FILE_FIELD
+            || resolved.starts_with(PHASH_FIELD_PREFIX)
+            || resolved.ends_with(COMPANION_SUFFIX)
+        {
+            anyhow::bail!(
+                "Parquet column '{}' resolves to reserved tantivy field name '{}'. \
+                 Names equal to '{}'/'{}', starting with '{}', or ending with '{}' are \
+                 reserved for parquet companion internal fields; rename the column or \
+                 add a name mapping.",
+                parquet_name, resolved,
+                PARQUET_FILE_HASH_FIELD, PARQUET_ROW_IN_FILE_FIELD,
+                PHASH_FIELD_PREFIX, COMPANION_SUFFIX
+            );
+        }
+
+        if !seen.insert(resolved) {
+            anyhow::bail!(
+                "Duplicate tantivy field name '{}' after applying name mapping: two \
+                 parquet columns resolve to the same name. Tantivy field names must be \
+                 unique; adjust the name mapping so each column maps to a distinct name.",
+                resolved
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Derive tantivy schema with optional name mapping (parquet_col → tantivy_field).
 /// When a name mapping is provided, the tantivy field will use the mapped display name.
 pub fn derive_tantivy_schema_with_mapping(
@@ -72,6 +122,15 @@ pub fn derive_tantivy_schema_with_mapping(
     config: &SchemaDerivationConfig,
     name_mapping: Option<&HashMap<String, String>>,
 ) -> Result<Schema> {
+    // Validate resolved tantivy field names before touching SchemaBuilder (F8).
+    // tantivy's SchemaBuilder::add_field PANICS on a duplicate name, which would
+    // unwind across the JNI boundary. Detect (a) two columns resolving to the
+    // same tantivy name (explicit or Iceberg mapping collision) and (b) columns
+    // colliding with reserved companion field names (__pq_file_hash /
+    // __pq_row_in_file added unconditionally at index time, _phash_* and
+    // *__uuids added for string modes) here, and return a clean error instead.
+    validate_resolved_field_names(arrow_schema, config, name_mapping)?;
+
     let mut builder = SchemaBuilder::new();
 
     // Collect all tantivy field names for collision detection with companion fields.
@@ -1393,6 +1452,86 @@ mod tests {
 
         assert!(schema.get_field("log_line").is_ok());
         assert!(schema.get_field("log_line__uuids").is_err());
+    }
+
+    // ── F8: reserved-name / uniqueness validation ────────────────────────
+
+    #[test]
+    fn test_name_mapping_collision_errors() {
+        // Two columns mapped to the same tantivy name would panic in
+        // SchemaBuilder::add_field; we must reject it with a clean error.
+        let arrow = ArrowSchema::new(vec![
+            Field::new("col_a", DataType::Utf8, true),
+            Field::new("col_b", DataType::Utf8, true),
+        ]);
+        let mut mapping = HashMap::new();
+        mapping.insert("col_a".to_string(), "name".to_string());
+        mapping.insert("col_b".to_string(), "name".to_string());
+        let config = SchemaDerivationConfig::default();
+
+        let err = derive_tantivy_schema_with_mapping(&arrow, &config, Some(&mapping))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Duplicate tantivy field name"), "got: {}", err);
+    }
+
+    #[test]
+    fn test_mapping_collides_with_identity_name_errors() {
+        // Mapping col_a → "name" collides with a physical "name" column.
+        let arrow = ArrowSchema::new(vec![
+            Field::new("col_a", DataType::Utf8, true),
+            Field::new("name", DataType::Utf8, true),
+        ]);
+        let mut mapping = HashMap::new();
+        mapping.insert("col_a".to_string(), "name".to_string());
+        let config = SchemaDerivationConfig::default();
+
+        let err = derive_tantivy_schema_with_mapping(&arrow, &config, Some(&mapping))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Duplicate tantivy field name"), "got: {}", err);
+    }
+
+    #[test]
+    fn test_reserved_pq_field_name_errors() {
+        // A user column named __pq_file_hash collides with the hidden field
+        // added unconditionally at index time.
+        let arrow = ArrowSchema::new(vec![
+            Field::new("__pq_file_hash", DataType::Int64, true),
+        ]);
+        let config = SchemaDerivationConfig::default();
+
+        let err = derive_tantivy_schema(&arrow, &config).unwrap_err().to_string();
+        assert!(err.contains("reserved"), "got: {}", err);
+    }
+
+    #[test]
+    fn test_reserved_phash_and_uuids_prefix_errors() {
+        for reserved in ["_phash_x", "trace__uuids", "__pq_row_in_file"] {
+            let arrow = ArrowSchema::new(vec![
+                Field::new(reserved, DataType::Utf8, true),
+            ]);
+            let config = SchemaDerivationConfig::default();
+            let err = derive_tantivy_schema(&arrow, &config).unwrap_err().to_string();
+            assert!(err.contains("reserved"), "name {} — got: {}", reserved, err);
+        }
+    }
+
+    #[test]
+    fn test_skipped_column_does_not_trigger_collision() {
+        // A skipped column sharing a resolved name must not count as a collision.
+        let arrow = ArrowSchema::new(vec![
+            Field::new("dup", DataType::Utf8, true),
+            Field::new("keep", DataType::Utf8, true),
+        ]);
+        let mut mapping = HashMap::new();
+        mapping.insert("keep".to_string(), "dup".to_string());
+        let mut config = SchemaDerivationConfig::default();
+        config.skip_fields.insert("dup".to_string());
+
+        // "dup" column is skipped, so mapping "keep" → "dup" is unique overall.
+        let schema = derive_tantivy_schema_with_mapping(&arrow, &config, Some(&mapping)).unwrap();
+        assert!(schema.get_field("dup").is_ok());
     }
 }
 

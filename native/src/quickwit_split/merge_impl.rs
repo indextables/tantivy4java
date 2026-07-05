@@ -349,7 +349,7 @@ pub fn merge_splits_impl(split_urls: &[String], output_path: &str, config: &Inte
         let source_refs: Vec<&std::path::Path> = source_paths.iter()
             .map(|p| p.as_path())
             .collect();
-        match crate::parquet_companion::merge::combine_parquet_manifests(&source_refs, &output_temp_dir) {
+        match crate::parquet_companion::merge::combine_parquet_manifests(&source_refs, &output_temp_dir, Some(merged_docs as u64)) {
             Ok(Some(())) => {
                 debug_log!("📦 PARQUET_COMPANION: Combined parquet manifests from {} source splits into merged output", source_refs.len());
                 true
@@ -359,8 +359,16 @@ pub fn merge_splits_impl(split_urls: &[String], output_path: &str, config: &Inte
                 false
             }
             Err(e) => {
-                debug_log!("⚠️ PARQUET_COMPANION: Failed to combine parquet manifests: {} (continuing without manifest)", e);
-                false
+                // Do NOT swallow this: if any source split had a parquet manifest,
+                // combining is mandatory. A merged companion split without a manifest
+                // has searchable postings but no stored fields — every subsequent
+                // document retrieval fails, silently, unless debug logging is on.
+                // Fail the merge so the corruption surfaces at merge time (F3).
+                return Err(anyhow!(
+                    "Failed to combine parquet companion manifests during merge: {}. \
+                     Refusing to produce a merged split without a valid parquet manifest.",
+                    e
+                ));
             }
         }
     };

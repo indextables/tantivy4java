@@ -127,8 +127,16 @@ pub fn start_streaming_retrieval(
         projected_fields.map(|f| f.into());
 
     let handle = tokio::spawn(async move {
+        use futures::FutureExt;
         let tx_err = tx.clone();
-        let result = produce_batches(
+        // Catch producer panics (arrow compute kernels, concat_batches, …) and
+        // funnel them onto the channel as an Err. Without this, a panic drops
+        // `tx` during unwind, the consumer's blocking_recv() returns None, and
+        // nativeNextBatch maps that to a clean EOF — silently truncating the
+        // result set (F7). AssertUnwindSafe is sound here: on panic we only
+        // send an error string and never touch the partially-mutated producer
+        // state again.
+        let produce_fut = produce_batches(
             tx,
             groups,
             projected_fields_arc,
@@ -137,11 +145,26 @@ pub fn start_streaming_retrieval(
             metadata_cache.as_ref(),
             byte_cache.as_ref(),
             coalesce_config,
-        )
-        .await;
+        );
 
-        if let Err(e) = result {
-            let _ = tx_err.send(Err(e)).await;
+        match std::panic::AssertUnwindSafe(produce_fut).catch_unwind().await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                let _ = tx_err.send(Err(e)).await;
+            }
+            Err(panic) => {
+                let msg = panic
+                    .downcast_ref::<&str>()
+                    .map(|s| s.to_string())
+                    .or_else(|| panic.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "unknown panic".to_string());
+                let _ = tx_err
+                    .send(Err(anyhow::anyhow!(
+                        "Parquet streaming producer panicked: {}",
+                        msg
+                    )))
+                    .await;
+            }
         }
     });
 
