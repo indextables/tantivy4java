@@ -313,8 +313,9 @@ fn parse_file_url(url_str: &str) -> Result<(Url, ObjectPath)> {
     if url_str.starts_with("s3://") || url_str.starts_with("s3a://") {
         let url = Url::parse(url_str)
             .map_err(|e| anyhow::anyhow!("Invalid S3 URL '{}': {}", url_str, e))?;
-        let path = url.path().trim_start_matches('/');
-        let object_path = ObjectPath::from(path);
+        // Url::path() is percent-encoded; ObjectPath does not decode
+        let path = crate::common::percent_decode(url.path());
+        let object_path = ObjectPath::from(path.trim_start_matches('/'));
         // Base URL is just scheme://bucket/
         let base = Url::parse(&format!("{}://{}/", url.scheme(), url.host_str().unwrap_or("")))
             .map_err(|e| anyhow::anyhow!("Failed to construct base URL: {}", e))?;
@@ -326,10 +327,23 @@ fn parse_file_url(url_str: &str) -> Result<(Url, ObjectPath)> {
     {
         let url = Url::parse(url_str)
             .map_err(|e| anyhow::anyhow!("Invalid Azure URL '{}': {}", url_str, e))?;
-        let path = url.path().trim_start_matches('/');
-        let object_path = ObjectPath::from(path);
-        let base = Url::parse(&format!("{}://{}/", url.scheme(), url.host_str().unwrap_or("")))
-            .map_err(|e| anyhow::anyhow!("Failed to construct base URL: {}", e))?;
+        // Url::path() is percent-encoded; ObjectPath does not decode
+        let path = crate::common::percent_decode(url.path());
+        let object_path = ObjectPath::from(path.trim_start_matches('/'));
+        // Preserve the userinfo component: for abfss://container@account.../
+        // the container name lives in the username, not the host
+        let userinfo = if url.username().is_empty() {
+            String::new()
+        } else {
+            format!("{}@", url.username())
+        };
+        let base = Url::parse(&format!(
+            "{}://{}{}/",
+            url.scheme(),
+            userinfo,
+            url.host_str().unwrap_or("")
+        ))
+        .map_err(|e| anyhow::anyhow!("Failed to construct base URL: {}", e))?;
         Ok((base, object_path))
     } else if url_str.starts_with("file://") {
         let url = Url::parse(url_str)

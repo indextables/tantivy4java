@@ -46,7 +46,10 @@ pub fn create_object_store(url: &Url, config: &DeltaStorageConfig) -> Result<Arc
 
     let store: Arc<dyn ObjectStore> = match scheme {
         "s3" | "s3a" => {
-            let mut builder = AmazonS3Builder::new()
+            // from_env() picks up AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY /
+            // AWS_SESSION_TOKEN / AWS_REGION etc., so deployments relying on
+            // env-var credentials work; explicit config below overrides.
+            let mut builder = AmazonS3Builder::from_env()
                 .with_bucket_name(
                     url
                         .host_str()
@@ -75,16 +78,35 @@ pub fn create_object_store(url: &Url, config: &DeltaStorageConfig) -> Result<Arc
             Arc::new(builder.build()?)
         }
         "az" | "azure" | "abfs" | "abfss" => {
-            let mut builder = MicrosoftAzureBuilder::new()
-                .with_container_name(
-                    url
+            // Canonical ABFS URLs are abfss://<container>@<account>.dfs.core.windows.net/path:
+            // the container is the USERNAME component and the host is the account
+            // endpoint. For az://container/path the host is the container.
+            let (container, account_from_url) = match scheme {
+                "abfs" | "abfss" if !url.username().is_empty() => {
+                    let account = url
                         .host_str()
+                        .and_then(|h| h.split('.').next())
+                        .map(|s| s.to_string());
+                    (url.username().to_string(), account)
+                }
+                _ => (
+                    url.host_str()
                         .ok_or_else(|| {
                             anyhow::anyhow!("Azure URL missing container: {}", url)
-                        })?,
-                );
+                        })?
+                        .to_string(),
+                    None,
+                ),
+            };
+
+            // from_env() picks up AZURE_STORAGE_ACCOUNT_NAME / _KEY etc.;
+            // explicit config below overrides.
+            let mut builder = MicrosoftAzureBuilder::from_env()
+                .with_container_name(&container);
 
             if let Some(ref account) = config.azure_account_name {
+                builder = builder.with_account(account);
+            } else if let Some(account) = account_from_url {
                 builder = builder.with_account(account);
             }
             if let Some(ref key) = config.azure_access_key {

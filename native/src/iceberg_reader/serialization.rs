@@ -5,6 +5,7 @@
 // BatchDocumentReader.parseToMaps().
 
 use super::scan::{IcebergFileEntry, IcebergSchemaField, IcebergSnapshot};
+use crate::common::{write_field_header, write_string};
 
 /// Magic number for batch protocol validation ("TANT")
 const MAGIC_NUMBER: u32 = 0x54414E54;
@@ -17,15 +18,24 @@ const FIELD_TYPE_JSON: u8 = 6;
 
 /// Serialize a list of IcebergFileEntry into the TANT byte buffer format.
 ///
-/// Each entry becomes one document with either 7 fields (full) or 5 fields (compact):
-///   Full:    path, file_format, record_count, file_size_bytes, partition_values, content_type, snapshot_id
-///   Compact: path, file_format, record_count, file_size_bytes, snapshot_id
+/// Each entry becomes one document with either 9 fields (full) or 7 fields (compact):
+///   Full:    path, file_format, record_count, file_size_bytes, partition_values,
+///            content_type, sequence_number, snapshot_id, resolved_snapshot_id
+///   Compact: path, file_format, record_count, file_size_bytes, content_type,
+///            snapshot_id, resolved_snapshot_id
+///
+/// content_type is correctness-critical (position/equality-delete files must be
+/// distinguishable from data files) so it is kept in both modes.
+/// `actual_snapshot_id` is the snapshot that was actually read (as opposed to
+/// the per-entry snapshot_id, which is the snapshot that *added* each file);
+/// it is embedded as `resolved_snapshot_id` so "list latest" callers can learn
+/// which snapshot they saw. Pass -1 when unknown.
 pub fn serialize_iceberg_entries(
     entries: &[IcebergFileEntry],
-    _actual_snapshot_id: i64,
+    actual_snapshot_id: i64,
     compact: bool,
 ) -> Vec<u8> {
-    let per_entry = if compact { 200 } else { 350 };
+    let per_entry = if compact { 250 } else { 400 };
     let estimated = 4 + entries.len() * per_entry + entries.len() * 4 + 12;
     let mut buf = Vec::with_capacity(estimated);
 
@@ -35,7 +45,7 @@ pub fn serialize_iceberg_entries(
     let mut offsets = Vec::with_capacity(entries.len());
     for entry in entries {
         offsets.push(buf.len() as u32);
-        serialize_file_entry(&mut buf, entry, compact);
+        serialize_file_entry(&mut buf, entry, actual_snapshot_id, compact);
     }
 
     // Offset table
@@ -52,8 +62,13 @@ pub fn serialize_iceberg_entries(
     buf
 }
 
-fn serialize_file_entry(buf: &mut Vec<u8>, entry: &IcebergFileEntry, compact: bool) {
-    let field_count: u16 = if compact { 5 } else { 7 };
+fn serialize_file_entry(
+    buf: &mut Vec<u8>,
+    entry: &IcebergFileEntry,
+    actual_snapshot_id: i64,
+    compact: bool,
+) {
+    let field_count: u16 = if compact { 7 } else { 9 };
     buf.extend_from_slice(&field_count.to_ne_bytes());
 
     // 1. path (TEXT)
@@ -73,20 +88,30 @@ fn serialize_file_entry(buf: &mut Vec<u8>, entry: &IcebergFileEntry, compact: bo
     buf.extend_from_slice(&entry.file_size_bytes.to_ne_bytes());
 
     if !compact {
-        // 5. partition_values (JSON)
+        // partition_values (JSON)
         write_field_header(buf, "partition_values", FIELD_TYPE_JSON, 1);
         let pv_json = serde_json::to_string(&entry.partition_values)
             .unwrap_or_else(|_| "{}".to_string());
         write_string(buf, &pv_json);
 
-        // 6. content_type (TEXT)
-        write_field_header(buf, "content_type", FIELD_TYPE_TEXT, 1);
-        write_string(buf, &entry.content_type);
+        // sequence_number (INTEGER, -1 if unknown) — needed to decide which
+        // data files a position/equality delete applies to
+        write_field_header(buf, "sequence_number", FIELD_TYPE_INTEGER, 1);
+        buf.extend_from_slice(&entry.sequence_number.to_ne_bytes());
     }
 
-    // 7/5. snapshot_id (INTEGER)
+    // content_type (TEXT) — always included: without it delete files are
+    // indistinguishable from data files and would be read as data
+    write_field_header(buf, "content_type", FIELD_TYPE_TEXT, 1);
+    write_string(buf, &entry.content_type);
+
+    // snapshot_id (INTEGER) — the snapshot that ADDED this file
     write_field_header(buf, "snapshot_id", FIELD_TYPE_INTEGER, 1);
     buf.extend_from_slice(&entry.snapshot_id.to_ne_bytes());
+
+    // resolved_snapshot_id (INTEGER) — the snapshot that was actually read
+    write_field_header(buf, "resolved_snapshot_id", FIELD_TYPE_INTEGER, 1);
+    buf.extend_from_slice(&actual_snapshot_id.to_ne_bytes());
 }
 
 /// Serialize a list of IcebergSchemaField plus the raw schema JSON into TANT format.
@@ -226,20 +251,6 @@ fn serialize_snapshot(buf: &mut Vec<u8>, snapshot: &IcebergSnapshot) {
     write_string(buf, &summary_json);
 }
 
-fn write_field_header(buf: &mut Vec<u8>, name: &str, field_type: u8, value_count: u16) {
-    let name_bytes = name.as_bytes();
-    buf.extend_from_slice(&(name_bytes.len() as u16).to_ne_bytes());
-    buf.extend_from_slice(name_bytes);
-    buf.push(field_type);
-    buf.extend_from_slice(&value_count.to_ne_bytes());
-}
-
-fn write_string(buf: &mut Vec<u8>, s: &str) {
-    let bytes = s.as_bytes();
-    buf.extend_from_slice(&(bytes.len() as u32).to_ne_bytes());
-    buf.extend_from_slice(bytes);
-}
-
 /// Serialize an IcebergSnapshotInfo into the TANT byte buffer format.
 ///
 /// Document 0: header with snapshot_id, schema_json, partition_spec_json, manifest_count
@@ -336,6 +347,7 @@ mod tests {
             file_size_bytes: 50000,
             partition_values: HashMap::new(),
             content_type: "data".to_string(),
+            sequence_number: 3,
             snapshot_id: 12345,
         };
         let buf = serialize_iceberg_entries(&[entry], 12345, false);
@@ -363,6 +375,7 @@ mod tests {
             file_size_bytes: 50000,
             partition_values: pv,
             content_type: "data".to_string(),
+            sequence_number: 3,
             snapshot_id: 12345,
         };
 
@@ -378,7 +391,11 @@ mod tests {
 
         let compact_str = String::from_utf8_lossy(&compact_buf);
         assert!(!compact_str.contains("partition_values"));
-        assert!(!compact_str.contains("content_type"));
+        assert!(!compact_str.contains("sequence_number"));
+        // content_type is correctness-critical (delete files vs data files)
+        // and must survive compact mode
+        assert!(compact_str.contains("content_type"));
+        assert!(compact_str.contains("resolved_snapshot_id"));
         assert!(compact_str.contains("path"));
     }
 

@@ -140,7 +140,7 @@ public class IcebergTableReader {
      * @param namespace   Iceberg namespace
      * @param tableName   table name
      * @param config      catalog and storage configuration
-     * @param compact     if true, skip partition_values and content_type
+     * @param compact     if true, skip partition_values and sequence_number (content_type is always included)
      * @return list of active data file entries
      */
     public static List<IcebergFileEntry> listFiles(
@@ -157,7 +157,7 @@ public class IcebergTableReader {
      * @param tableName   table name
      * @param config      catalog and storage configuration
      * @param snapshotId  snapshot ID (-1 for current)
-     * @param compact     if true, skip partition_values and content_type
+     * @param compact     if true, skip partition_values and sequence_number (content_type is always included)
      * @return list of active data file entries
      */
     public static List<IcebergFileEntry> listFiles(
@@ -174,7 +174,7 @@ public class IcebergTableReader {
      * @param tableName   table name
      * @param config      catalog and storage configuration
      * @param snapshotId  snapshot ID (-1 for current)
-     * @param compact     if true, skip partition_values and content_type
+     * @param compact     if true, skip partition_values and sequence_number (content_type is always included)
      * @param filter      partition filter (null for no filtering)
      * @return list of matching data file entries
      */
@@ -426,7 +426,7 @@ public class IcebergTableReader {
      * @param tableName    table name
      * @param config       catalog and storage configuration
      * @param manifestPath full path to the manifest avro file
-     * @param compact      if true, skip partition_values and content_type
+     * @param compact      if true, skip partition_values and sequence_number (content_type is always included)
      * @return list of file entries from this manifest
      */
     public static List<IcebergFileEntry> readManifestFile(
@@ -443,7 +443,7 @@ public class IcebergTableReader {
      * @param tableName    table name
      * @param config       catalog and storage configuration
      * @param manifestPath full path to the manifest avro file
-     * @param compact      if true, skip partition_values and content_type
+     * @param compact      if true, skip partition_values and sequence_number (content_type is always included)
      * @param filter       partition filter (null for no filtering)
      * @return list of matching file entries from this manifest
      */
@@ -482,10 +482,10 @@ public class IcebergTableReader {
     /**
      * Read an Iceberg manifest file and export entries via Arrow FFI.
      *
-     * <p>Builds a flat RecordBatch with 7 columns:
+     * <p>Builds a flat RecordBatch with 8 columns:
      * path (Utf8), file_format (Utf8), record_count (Int64),
      * file_size_bytes (Int64), partition_values (Utf8/JSON),
-     * content_type (Utf8), snapshot_id (Int64).
+     * content_type (Utf8), snapshot_id (Int64), sequence_number (Int64).
      *
      * <p>The caller must pre-allocate FFI_ArrowArray and FFI_ArrowSchema structs
      * for each column and pass their memory addresses.
@@ -496,8 +496,8 @@ public class IcebergTableReader {
      * @param config       catalog and storage configuration
      * @param manifestPath full path to the manifest avro file
      * @param filter       partition filter (null for no filtering)
-     * @param arrayAddrs   pre-allocated FFI_ArrowArray addresses (7 columns)
-     * @param schemaAddrs  pre-allocated FFI_ArrowSchema addresses (7 columns)
+     * @param arrayAddrs   pre-allocated FFI_ArrowArray addresses (8 columns)
+     * @param schemaAddrs  pre-allocated FFI_ArrowSchema addresses (8 columns)
      * @return number of rows written, or -1 on error
      */
     public static int readManifestFileArrowFfi(
@@ -508,11 +508,11 @@ public class IcebergTableReader {
         if (manifestPath == null || manifestPath.isEmpty()) {
             throw new IllegalArgumentException("manifestPath must not be null or empty");
         }
-        if (arrayAddrs == null || arrayAddrs.length < 7) {
-            throw new IllegalArgumentException("arrayAddrs must have at least 7 elements");
+        if (arrayAddrs == null || arrayAddrs.length < 8) {
+            throw new IllegalArgumentException("arrayAddrs must have at least 8 elements");
         }
-        if (schemaAddrs == null || schemaAddrs.length < 7) {
-            throw new IllegalArgumentException("schemaAddrs must have at least 7 elements");
+        if (schemaAddrs == null || schemaAddrs.length < 8) {
+            throw new IllegalArgumentException("schemaAddrs must have at least 8 elements");
         }
 
         String predicateJson = filter != null ? filter.toJson() : null;

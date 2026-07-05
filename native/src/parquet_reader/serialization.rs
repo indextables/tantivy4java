@@ -4,6 +4,7 @@
 // for efficient Rust→Java transfer via BatchDocumentReader.parseToMaps().
 
 use super::distributed::{ParquetTableInfo, ParquetFileEntry};
+use crate::common::{write_field_header, write_string};
 
 /// Magic number for batch protocol validation ("TANT")
 const MAGIC_NUMBER: u32 = 0x54414E54;
@@ -142,20 +143,6 @@ fn serialize_file_entry(buf: &mut Vec<u8>, entry: &ParquetFileEntry) {
 }
 
 // ─── TANT protocol helpers ──────────────────────────────────────────────────
-
-fn write_field_header(buf: &mut Vec<u8>, name: &str, field_type: u8, value_count: u16) {
-    let name_bytes = name.as_bytes();
-    buf.extend_from_slice(&(name_bytes.len() as u16).to_ne_bytes());
-    buf.extend_from_slice(name_bytes);
-    buf.push(field_type);
-    buf.extend_from_slice(&value_count.to_ne_bytes());
-}
-
-fn write_string(buf: &mut Vec<u8>, s: &str) {
-    let bytes = s.as_bytes();
-    buf.extend_from_slice(&(bytes.len() as u32).to_ne_bytes());
-    buf.extend_from_slice(bytes);
-}
 
 #[cfg(test)]
 mod tests {

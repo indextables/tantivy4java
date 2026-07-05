@@ -44,7 +44,7 @@ public class DeltaFileEntry implements Serializable {
     /** @return parquet file path relative to the table root */
     public String getPath() { return path; }
 
-    /** @return file size in bytes */
+    /** @return file size in bytes, or -1 if unknown */
     public long getSize() { return size; }
 
     /** @return epoch milliseconds when the file was created */
@@ -62,7 +62,11 @@ public class DeltaFileEntry implements Serializable {
     /** @return true if this file has an associated deletion vector */
     public boolean hasDeletionVector() { return hasDeletionVector; }
 
-    /** @return the Delta table snapshot version this file listing was read from */
+    /**
+     * @return the Delta table snapshot version this file listing was read from,
+     *         or -1 if unknown (entries from log-change reads, where the
+     *         per-entry commit version is not tracked)
+     */
     public long getTableVersion() { return tableVersion; }
 
     @Override

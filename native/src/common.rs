@@ -47,7 +47,10 @@ pub fn buffer_to_jbytearray(env: &mut JNIEnv, buffer: &[u8]) -> jbyteArray {
         to_java_exception(
             env,
             &anyhow::anyhow!(
-                "Buffer too large for Java byte array: {} bytes exceeds i32::MAX",
+                "Buffer too large for Java byte array: {} bytes exceeds i32::MAX (2 GiB). \
+                 For very large table file listings, use the distributed APIs \
+                 (getSnapshotInfo + readCheckpointPart / listPartitionFiles) instead of \
+                 materializing the whole listing in one call.",
                 buffer.len()
             ),
         );
@@ -202,6 +205,91 @@ pub fn build_storage_config(env: &mut JNIEnv, config_map: &JObject) -> DeltaStor
         azure_account_name: extract_string(env, config_map, "azure_account_name"),
         azure_access_key: extract_string(env, config_map, "azure_access_key"),
         azure_bearer_token: extract_string(env, config_map, "azure_bearer_token"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TANT batch protocol helpers (shared by the table-format serializers)
+// ---------------------------------------------------------------------------
+
+/// Write a TANT field header: name length (u16) + name bytes + type code (u8)
+/// + value count (u16). Matches BatchDocumentReader on the Java side.
+pub fn write_field_header(buf: &mut Vec<u8>, name: &str, field_type: u8, value_count: u16) {
+    let name_bytes = name.as_bytes();
+    buf.extend_from_slice(&(name_bytes.len() as u16).to_ne_bytes());
+    buf.extend_from_slice(name_bytes);
+    buf.push(field_type);
+    buf.extend_from_slice(&value_count.to_ne_bytes());
+}
+
+/// Write a length-prefixed (u32) UTF-8 string into a TANT buffer.
+pub fn write_string(buf: &mut Vec<u8>, s: &str) {
+    let bytes = s.as_bytes();
+    // TANT offsets/lengths are u32; buffer_to_jbytearray rejects buffers over
+    // i32::MAX so this cannot truncate in practice — assert the invariant locally
+    debug_assert!(bytes.len() <= u32::MAX as usize);
+    buf.extend_from_slice(&(bytes.len() as u32).to_ne_bytes());
+    buf.extend_from_slice(bytes);
+}
+
+/// Extract a Java long[] into a Vec<i64>.
+pub fn extract_jlong_array(
+    env: &mut JNIEnv,
+    arr: &jni::sys::jlongArray,
+) -> Result<Vec<i64>, anyhow::Error> {
+    let safe_arr = unsafe { jni::objects::JLongArray::from_raw(*arr) };
+    let len = env.get_array_length(&safe_arr)
+        .map_err(|e| anyhow::anyhow!("Failed to get array length: {}", e))? as usize;
+    let mut buf = vec![0i64; len];
+    env.get_long_array_region(&safe_arr, 0, &mut buf)
+        .map_err(|e| anyhow::anyhow!("Failed to read long array: {}", e))?;
+    // Dropping the borrowed JLongArray wrapper does not delete the reference
+    // in jni 0.21, but forget() keeps the borrow semantics explicit.
+    std::mem::forget(safe_arr);
+    Ok(buf)
+}
+
+// ---------------------------------------------------------------------------
+// Percent-decoding
+// ---------------------------------------------------------------------------
+
+/// Percent-decoding for URL paths and partition values, supporting multi-byte
+/// UTF-8. Accumulates percent-encoded bytes and decodes them as a UTF-8
+/// sequence, correctly handling characters like `%C3%A9` → `é`.
+///
+/// Needed because `Url::path()` returns the percent-encoded form and
+/// `object_store::path::Path::from` does NOT decode — passing the encoded
+/// form through would target the wrong object key for paths containing
+/// spaces, `+`, unicode, etc.
+pub fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut result = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = bytes[i + 1];
+            let lo = bytes[i + 2];
+            if let (Some(h), Some(l)) = (hex_val(hi), hex_val(lo)) {
+                result.push(h << 4 | l);
+                i += 3;
+                continue;
+            }
+        }
+        result.push(bytes[i]);
+        i += 1;
+    }
+
+    String::from_utf8(result).unwrap_or_else(|_| s.to_string())
+}
+
+/// Convert an ASCII hex digit to its numeric value.
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
     }
 }
 
@@ -400,6 +488,77 @@ impl PartitionPredicate {
             }
         }
     }
+
+    /// Evaluate this predicate against a *partial* set of partition values,
+    /// e.g. only the first level of a multi-level Hive partition path.
+    ///
+    /// Unlike `evaluate`, a column that is absent from `partition_values` is
+    /// treated as *unknown* (`None`) rather than excluded, because the value
+    /// may be bound at a deeper partition level. `And`/`Or`/`Not` combine
+    /// unknowns with Kleene three-valued logic. Callers should keep entries
+    /// whose result is `None` (indeterminate at this level).
+    pub fn evaluate_partial(
+        &self,
+        partition_values: &HashMap<String, String>,
+    ) -> Option<bool> {
+        match self {
+            PartitionPredicate::Eq { column, value } => partition_values
+                .get(column)
+                .map(|v| v == value),
+            PartitionPredicate::Neq { column, value } => partition_values
+                .get(column)
+                .map(|v| v != value),
+            PartitionPredicate::Gt { column, value, r#type } => partition_values
+                .get(column)
+                .map(|v| compare(v, value, r#type) == std::cmp::Ordering::Greater),
+            PartitionPredicate::Gte { column, value, r#type } => partition_values
+                .get(column)
+                .map(|v| compare(v, value, r#type) != std::cmp::Ordering::Less),
+            PartitionPredicate::Lt { column, value, r#type } => partition_values
+                .get(column)
+                .map(|v| compare(v, value, r#type) == std::cmp::Ordering::Less),
+            PartitionPredicate::Lte { column, value, r#type } => partition_values
+                .get(column)
+                .map(|v| compare(v, value, r#type) != std::cmp::Ordering::Greater),
+            PartitionPredicate::In { column, values } => partition_values
+                .get(column)
+                .map(|v| values.contains(v)),
+            // A column missing at this level may still appear deeper, so
+            // null-ness cannot be decided from a partial path.
+            PartitionPredicate::IsNull { column } | PartitionPredicate::IsNotNull { column } => {
+                if partition_values.contains_key(column) {
+                    Some(matches!(self, PartitionPredicate::IsNotNull { .. }))
+                } else {
+                    None
+                }
+            }
+            PartitionPredicate::And { filters } => {
+                let mut all_true = true;
+                for f in filters {
+                    match f.evaluate_partial(partition_values) {
+                        Some(false) => return Some(false),
+                        Some(true) => {}
+                        None => all_true = false,
+                    }
+                }
+                if all_true { Some(true) } else { None }
+            }
+            PartitionPredicate::Or { filters } => {
+                let mut all_false = true;
+                for f in filters {
+                    match f.evaluate_partial(partition_values) {
+                        Some(true) => return Some(true),
+                        Some(false) => {}
+                        None => all_false = false,
+                    }
+                }
+                if all_false { Some(false) } else { None }
+            }
+            PartitionPredicate::Not { filter } => {
+                filter.evaluate_partial(partition_values).map(|b| !b)
+            }
+        }
+    }
 }
 
 /// Parse an optional predicate JSON string into a PartitionPredicate.
@@ -460,6 +619,90 @@ mod tests {
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect()
+    }
+
+    // -- Partial (three-valued) evaluation tests --
+
+    fn parse(json: &str) -> PartitionPredicate {
+        serde_json::from_str(json).unwrap()
+    }
+
+    #[test]
+    fn test_partial_eq_known_and_unknown() {
+        let pred = parse(r#"{"op": "eq", "column": "month", "value": "01"}"#);
+        // Column bound at this level → decidable
+        assert_eq!(pred.evaluate_partial(&pv(&[("month", "01")])), Some(true));
+        assert_eq!(pred.evaluate_partial(&pv(&[("month", "02")])), Some(false));
+        // Column not bound at this level (deeper partition) → unknown
+        assert_eq!(pred.evaluate_partial(&pv(&[("year", "2024")])), None);
+    }
+
+    #[test]
+    fn test_partial_and_deeper_column_keeps_matching_prefix() {
+        // The H1 scenario: table partitioned by year/month, first-level
+        // listing only binds `year`. AND(year=2024, month=01) must not
+        // prune year=2024/ (month unknown) but must prune year=2023/.
+        let pred = parse(
+            r#"{"op": "and", "filters": [
+                {"op": "eq", "column": "year", "value": "2024"},
+                {"op": "eq", "column": "month", "value": "01"}
+            ]}"#,
+        );
+        assert_eq!(pred.evaluate_partial(&pv(&[("year", "2024")])), None);
+        assert_eq!(pred.evaluate_partial(&pv(&[("year", "2023")])), Some(false));
+        // Full values → decidable both ways
+        assert_eq!(
+            pred.evaluate_partial(&pv(&[("year", "2024"), ("month", "01")])),
+            Some(true)
+        );
+        assert_eq!(
+            pred.evaluate_partial(&pv(&[("year", "2024"), ("month", "02")])),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn test_partial_or_kleene() {
+        let pred = parse(
+            r#"{"op": "or", "filters": [
+                {"op": "eq", "column": "year", "value": "2024"},
+                {"op": "eq", "column": "month", "value": "01"}
+            ]}"#,
+        );
+        // year matches → true regardless of unknown month
+        assert_eq!(pred.evaluate_partial(&pv(&[("year", "2024")])), Some(true));
+        // year doesn't match, month unknown → unknown
+        assert_eq!(pred.evaluate_partial(&pv(&[("year", "2023")])), None);
+    }
+
+    #[test]
+    fn test_partial_not_propagates_unknown() {
+        let pred = parse(
+            r#"{"op": "not", "filter": {"op": "eq", "column": "month", "value": "01"}}"#,
+        );
+        assert_eq!(pred.evaluate_partial(&pv(&[("year", "2024")])), None);
+        assert_eq!(pred.evaluate_partial(&pv(&[("month", "01")])), Some(false));
+        assert_eq!(pred.evaluate_partial(&pv(&[("month", "02")])), Some(true));
+    }
+
+    #[test]
+    fn test_partial_null_checks_unknown_when_missing() {
+        let is_null = parse(r#"{"op": "is_null", "column": "month"}"#);
+        let is_not_null = parse(r#"{"op": "is_not_null", "column": "month"}"#);
+        // Missing at this level: may exist deeper → indeterminate
+        assert_eq!(is_null.evaluate_partial(&pv(&[("year", "2024")])), None);
+        assert_eq!(is_not_null.evaluate_partial(&pv(&[("year", "2024")])), None);
+        // Present → decidable
+        assert_eq!(is_null.evaluate_partial(&pv(&[("month", "01")])), Some(false));
+        assert_eq!(is_not_null.evaluate_partial(&pv(&[("month", "01")])), Some(true));
+    }
+
+    #[test]
+    fn test_partial_numeric_compare() {
+        let pred = parse(r#"{"op": "gt", "column": "year", "value": "2022", "type": "long"}"#);
+        assert_eq!(pred.evaluate_partial(&pv(&[("year", "2024")])), Some(true));
+        assert_eq!(pred.evaluate_partial(&pv(&[("year", "2020")])), Some(false));
+        assert_eq!(pred.evaluate_partial(&pv(&[("month", "01")])), None);
     }
 
     // -- Deserialization tests --

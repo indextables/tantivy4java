@@ -58,11 +58,15 @@ pub extern "system" fn Java_io_indextables_tantivy4java_parquet_ParquetTableRead
     match get_parquet_table_info(&url_str, &config) {
         Ok(mut info) => {
             // Prune partition directories by parsing partition values from path
-            // and testing against predicate — biggest win for Hive tables
+            // and testing against predicate — biggest win for Hive tables.
+            // Directories are FIRST-LEVEL only (list_with_delimiter), so deeper
+            // partition columns are not bound yet: use partial evaluation and
+            // keep directories whose result is indeterminate at this level.
+            // Executors re-apply the full predicate once all levels are known.
             if let Some(ref pred) = predicate {
                 info.partition_directories.retain(|dir| {
                     let values = parse_partition_values_from_path(dir);
-                    pred.evaluate(&values)
+                    pred.evaluate_partial(&values).unwrap_or(true)
                 });
                 info.root_parquet_files = filter_by_predicate(
                     info.root_parquet_files, &predicate, |e| &e.partition_values,

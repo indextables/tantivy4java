@@ -10,6 +10,7 @@ use jni::JNIEnv;
 use crate::common::{
     to_java_exception, extract_hashmap, buffer_to_jbytearray,
     extract_optional_jstring, parse_optional_predicate, filter_by_predicate,
+    extract_jlong_array,
 };
 use crate::debug_println;
 
@@ -220,7 +221,10 @@ pub extern "system" fn Java_io_indextables_tantivy4java_iceberg_IcebergTableRead
     };
     let config = match extract_hashmap(&mut env, &config_map) {
         Ok(m) => m,
-        Err(_) => return -1,
+        Err(e) => {
+            to_java_exception(&mut env, &anyhow::anyhow!("Failed to extract config map: {}", e));
+            return -1;
+        }
     };
 
     match get_current_iceberg_snapshot_id(&catalog_str, &config, &namespace_str, &table_str) {
@@ -339,7 +343,9 @@ pub extern "system" fn Java_io_indextables_tantivy4java_iceberg_IcebergTableRead
                 "🔧 ICEBERG_JNI: Read {} entries from manifest (after filtering)",
                 entries.len()
             );
-            let buffer = serialize_iceberg_entries(&entries, 0, compact != 0);
+            // -1 = resolved snapshot unknown: reading a single manifest has no
+            // snapshot-resolution context (contrast with nativeListFiles)
+            let buffer = serialize_iceberg_entries(&entries, -1, compact != 0);
             buffer_to_jbytearray(&mut env, &buffer)
         }
         Err(e) => {
@@ -429,18 +435,4 @@ pub extern "system" fn Java_io_indextables_tantivy4java_iceberg_IcebergTableRead
             -1
         }
     }
-}
-
-/// Extract a Java long[] into a Vec<i64>.
-fn extract_jlong_array(env: &mut JNIEnv, arr: &jlongArray) -> anyhow::Result<Vec<i64>> {
-    let safe_arr = unsafe { jni::objects::JLongArray::from_raw(*arr) };
-    let len = env
-        .get_array_length(&safe_arr)
-        .map_err(|e| anyhow::anyhow!("Failed to get array length: {}", e))?;
-    let mut buf = vec![0i64; len as usize];
-    env.get_long_array_region(&safe_arr, 0, &mut buf)
-        .map_err(|e| anyhow::anyhow!("Failed to read long array: {}", e))?;
-    // Prevent the safe wrapper from freeing the original Java array reference
-    std::mem::forget(safe_arr);
-    Ok(buf)
 }

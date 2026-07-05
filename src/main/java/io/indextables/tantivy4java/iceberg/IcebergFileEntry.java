@@ -28,10 +28,18 @@ public class IcebergFileEntry implements Serializable {
     private final long fileSizeBytes;
     private final Map<String, String> partitionValues;
     private final String contentType;
+    private final long sequenceNumber;
     private final long snapshotId;
+    private final long resolvedSnapshotId;
 
     public IcebergFileEntry(String path, String fileFormat, long recordCount, long fileSizeBytes,
                             Map<String, String> partitionValues, String contentType, long snapshotId) {
+        this(path, fileFormat, recordCount, fileSizeBytes, partitionValues, contentType, -1, snapshotId, -1);
+    }
+
+    public IcebergFileEntry(String path, String fileFormat, long recordCount, long fileSizeBytes,
+                            Map<String, String> partitionValues, String contentType,
+                            long sequenceNumber, long snapshotId, long resolvedSnapshotId) {
         this.path = path;
         this.fileFormat = fileFormat;
         this.recordCount = recordCount;
@@ -40,7 +48,9 @@ public class IcebergFileEntry implements Serializable {
                 ? Collections.unmodifiableMap(partitionValues)
                 : Collections.emptyMap();
         this.contentType = contentType;
+        this.sequenceNumber = sequenceNumber;
         this.snapshotId = snapshotId;
+        this.resolvedSnapshotId = resolvedSnapshotId;
     }
 
     /**
@@ -86,10 +96,27 @@ public class IcebergFileEntry implements Serializable {
     }
 
     /**
+     * @return data sequence number, or -1 if unknown. Needed to decide which
+     *         data files a position/equality delete file applies to.
+     */
+    public long getSequenceNumber() {
+        return sequenceNumber;
+    }
+
+    /**
      * @return snapshot ID that added this file
      */
     public long getSnapshotId() {
         return snapshotId;
+    }
+
+    /**
+     * @return the snapshot ID that was actually read to produce this listing
+     *         (useful when listing "latest" to learn which snapshot was
+     *         resolved), or -1 if unknown
+     */
+    public long getResolvedSnapshotId() {
+        return resolvedSnapshotId;
     }
 
     @Override
@@ -111,12 +138,14 @@ public class IcebergFileEntry implements Serializable {
         long recordCount = toLong(map.get("record_count"));
         long fileSizeBytes = toLong(map.get("file_size_bytes"));
         String contentType = (String) map.getOrDefault("content_type", "data");
+        long sequenceNumber = toLong(map.get("sequence_number"));
         long snapshotId = toLong(map.get("snapshot_id"));
+        long resolvedSnapshotId = toLong(map.get("resolved_snapshot_id"));
 
         Map<String, String> partitionValues = parsePartitionValues(map.get("partition_values"));
 
         return new IcebergFileEntry(path, fileFormat, recordCount, fileSizeBytes,
-                partitionValues, contentType, snapshotId);
+                partitionValues, contentType, sequenceNumber, snapshotId, resolvedSnapshotId);
     }
 
     static long toLong(Object value) {
