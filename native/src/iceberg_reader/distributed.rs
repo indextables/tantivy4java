@@ -129,6 +129,7 @@ pub fn get_current_iceberg_snapshot_id(
 pub fn read_iceberg_manifest(
     config: &HashMap<String, String>,
     manifest_path: &str,
+    inherited_snapshot_id: Option<i64>,
 ) -> Result<Vec<IcebergFileEntry>> {
     debug_println!(
         "🔧 ICEBERG_DIST: read_manifest path={}",
@@ -156,7 +157,7 @@ pub fn read_iceberg_manifest(
             .build()
             .map_err(|e| anyhow::anyhow!("Failed to build FileIO: {}", e))?;
 
-        read_manifest_with_file_io(&file_io, manifest_path).await
+        read_manifest_with_file_io(&file_io, manifest_path, inherited_snapshot_id).await
     })
 }
 
@@ -273,9 +274,18 @@ pub(crate) async fn get_snapshot_info_with_catalog(
 }
 
 /// Read one manifest file using a FileIO instance.
+///
+/// `inherited_snapshot_id`, when provided, is used as the Iceberg-spec
+/// "inherited snapshot id" fallback for manifest entries whose own
+/// `snapshot_id` is absent — mirroring `list_files_with_catalog`'s use of
+/// `manifest_file.added_snapshot_id`. Callers with manifest-list context
+/// (e.g. `getChangesSince`, which already has `ManifestFileInfo::added_snapshot_id`
+/// for each manifest it reads) should pass it through so this path resolves
+/// to the same value as the catalog-based listing path instead of `-1`.
 async fn read_manifest_with_file_io(
     file_io: &FileIO,
     manifest_path: &str,
+    inherited_snapshot_id: Option<i64>,
 ) -> Result<Vec<IcebergFileEntry>> {
     let manifest_input = file_io.new_input(manifest_path)
         .map_err(|e| anyhow::anyhow!("Failed to open manifest {}: {}", manifest_path, e))?;
@@ -321,10 +331,12 @@ async fn read_manifest_with_file_io(
             partition_values,
             content_type: content_type_to_string(data_file.content_type()),
             sequence_number: entry.sequence_number().unwrap_or(-1),
-            // The manifest-list context (added_snapshot_id) is not available
-            // when reading a single manifest file; -1 = unknown (matches the
-            // sentinel convention elsewhere, instead of a real-looking 0)
-            snapshot_id: entry.snapshot_id().unwrap_or(-1),
+            // Fall back to the caller-supplied inherited snapshot id (the
+            // Iceberg-spec "inherited" resolution used by manifest-list-aware
+            // callers) before defaulting to -1 = unknown. This keeps this
+            // path consistent with `list_files_with_catalog`, which resolves
+            // the same fallback via `manifest_file.added_snapshot_id`.
+            snapshot_id: entry.snapshot_id().or(inherited_snapshot_id).unwrap_or(-1),
         });
     }
 
@@ -353,6 +365,7 @@ pub fn read_iceberg_manifest_arrow_ffi(
     predicate: Option<&crate::common::PartitionPredicate>,
     array_addrs: &[i64],
     schema_addrs: &[i64],
+    inherited_snapshot_id: Option<i64>,
 ) -> Result<usize> {
     use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
     use arrow_array::{StringArray, Int64Array, Array};
@@ -368,7 +381,7 @@ pub fn read_iceberg_manifest_arrow_ffi(
     }
 
     // 1. Read manifest → Vec<IcebergFileEntry>
-    let entries = read_iceberg_manifest(config, manifest_path)?;
+    let entries = read_iceberg_manifest(config, manifest_path, inherited_snapshot_id)?;
 
     // 2. Apply partition predicate filter
     let entries: Vec<IcebergFileEntry> = match predicate {

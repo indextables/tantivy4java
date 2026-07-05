@@ -451,6 +451,35 @@ public class IcebergTableReader {
             String catalogName, String namespace, String tableName,
             Map<String, String> config, String manifestPath, boolean compact,
             PartitionFilter filter) {
+        return readManifestFile(catalogName, namespace, tableName, config, manifestPath,
+                compact, filter, -1L);
+    }
+
+    /**
+     * Read one manifest file with partition predicate filtering and an inherited
+     * snapshot id fallback.
+     *
+     * <p>Per the Iceberg spec, a manifest entry's {@code snapshot_id} may be absent
+     * ("inherited"), in which case it resolves to the snapshot that added the
+     * containing manifest. Callers that already know this (e.g. {@link #getChangesSince}
+     * iterating {@link IcebergSnapshotInfo.ManifestFileInfo}) should pass
+     * {@code inheritedSnapshotId} so the resolved value matches {@link #listFiles}
+     * for the same underlying data; otherwise absent entries resolve to {@code -1}.
+     *
+     * @param catalogName  catalog identifier
+     * @param namespace    Iceberg namespace
+     * @param tableName    table name
+     * @param config       catalog and storage configuration
+     * @param manifestPath full path to the manifest avro file
+     * @param compact      if true, skip partition_values and sequence_number (content_type is always included)
+     * @param filter       partition filter (null for no filtering)
+     * @param inheritedSnapshotId fallback snapshot id for entries with no own snapshot_id (-1 if unknown)
+     * @return list of matching file entries from this manifest
+     */
+    public static List<IcebergFileEntry> readManifestFile(
+            String catalogName, String namespace, String tableName,
+            Map<String, String> config, String manifestPath, boolean compact,
+            PartitionFilter filter, long inheritedSnapshotId) {
         validateParams(catalogName, namespace, tableName, config);
         if (manifestPath == null || manifestPath.isEmpty()) {
             throw new IllegalArgumentException("manifestPath must not be null or empty");
@@ -458,7 +487,8 @@ public class IcebergTableReader {
 
         String predicateJson = filter != null ? filter.toJson() : null;
         byte[] bytes = nativeReadManifestFile(catalogName, namespace, tableName, manifestPath,
-                config != null ? config : Collections.emptyMap(), compact, predicateJson);
+                config != null ? config : Collections.emptyMap(), compact, predicateJson,
+                inheritedSnapshotId);
 
         if (bytes == null) {
             throw new RuntimeException("Native readManifestFile returned null (check preceding exception)");
@@ -504,6 +534,25 @@ public class IcebergTableReader {
             String catalogName, String namespace, String tableName,
             Map<String, String> config, String manifestPath,
             PartitionFilter filter, long[] arrayAddrs, long[] schemaAddrs) {
+        return readManifestFileArrowFfi(catalogName, namespace, tableName, config, manifestPath,
+                filter, arrayAddrs, schemaAddrs, -1L);
+    }
+
+    /**
+     * Read an Iceberg manifest file and export entries via Arrow FFI, with an
+     * inherited snapshot id fallback.
+     *
+     * <p>See {@link #readManifestFile(String, String, String, Map, String, boolean, PartitionFilter, long)}
+     * for the semantics of {@code inheritedSnapshotId}.
+     *
+     * @param inheritedSnapshotId fallback snapshot id for entries with no own snapshot_id (-1 if unknown)
+     * @return number of rows written, or -1 on error
+     */
+    public static int readManifestFileArrowFfi(
+            String catalogName, String namespace, String tableName,
+            Map<String, String> config, String manifestPath,
+            PartitionFilter filter, long[] arrayAddrs, long[] schemaAddrs,
+            long inheritedSnapshotId) {
         validateParams(catalogName, namespace, tableName, config);
         if (manifestPath == null || manifestPath.isEmpty()) {
             throw new IllegalArgumentException("manifestPath must not be null or empty");
@@ -518,7 +567,7 @@ public class IcebergTableReader {
         String predicateJson = filter != null ? filter.toJson() : null;
         return nativeReadManifestFileArrowFfi(catalogName, namespace, tableName,
                 manifestPath, config != null ? config : Collections.emptyMap(),
-                predicateJson, arrayAddrs, schemaAddrs);
+                predicateJson, arrayAddrs, schemaAddrs, inheritedSnapshotId);
     }
 
     // ── Streaming / incremental snapshot methods ──────────────────────────────
@@ -559,8 +608,12 @@ public class IcebergTableReader {
 
         List<IcebergFileEntry> result = new ArrayList<>();
         for (IcebergSnapshotInfo.ManifestFileInfo mf : newManifests) {
+            // Pass the manifest's known added_snapshot_id so entries with no
+            // own snapshot_id resolve the same "inherited" value here as they
+            // would via listFiles(), instead of falling back to -1.
             List<IcebergFileEntry> entries = readManifestFile(
-                    catalogName, namespace, tableName, config, mf.getManifestPath());
+                    catalogName, namespace, tableName, config, mf.getManifestPath(),
+                    false, null, mf.getAddedSnapshotId());
             result.addAll(entries);
         }
         return result;
@@ -588,12 +641,13 @@ public class IcebergTableReader {
     private static native byte[] nativeReadManifestFile(
             String catalogName, String namespace, String tableName,
             String manifestPath, Map<String, String> config, boolean compact,
-            String predicateJson);
+            String predicateJson, long inheritedSnapshotId);
 
     private static native int nativeReadManifestFileArrowFfi(
             String catalogName, String namespace, String tableName,
             String manifestPath, Map<String, String> config,
-            String predicateJson, long[] arrayAddrs, long[] schemaAddrs);
+            String predicateJson, long[] arrayAddrs, long[] schemaAddrs,
+            long inheritedSnapshotId);
 
     private static native long nativeGetCurrentSnapshotId(
             String catalogName, String namespace, String tableName,

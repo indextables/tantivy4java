@@ -35,6 +35,14 @@ pub struct ParquetTableInfo {
     pub is_partitioned: bool,
 }
 
+/// Whether a parquet object's filename is a hidden/metadata file that should
+/// be excluded from listings (e.g. `.DS_Store`, `_SUCCESS`, `_delta_log`).
+/// `path_str` is the full object path; only the final path segment is checked.
+fn is_hidden_parquet_file(path_str: &str) -> bool {
+    let filename = path_str.rsplit('/').next().unwrap_or(path_str);
+    filename.starts_with('.') || filename.starts_with('_')
+}
+
 /// A single parquet file entry with metadata.
 #[derive(Debug, Clone)]
 pub struct ParquetFileEntry {
@@ -141,11 +149,14 @@ async fn get_table_info_async(
         }
     }
 
-    // Discover deeper partition levels by walking down the first partition
-    // directory chain (one LIST per level). list_with_delimiter above only
-    // exposes the first level, so a year/month/day table would otherwise
-    // report partition_columns = ["year"].
-    if let Some(first_dir) = partition_directories.first().cloned() {
+    // Discover deeper partition levels by walking down every first-level
+    // partition directory (one LIST per level per directory). Walking only a
+    // single chain would silently under-report partition columns whenever
+    // sibling partitions have a different depth than the first one (schema
+    // drift, partial backfill, incremental repartitioning) — the same class
+    // of bug as reporting partition_columns = ["year"] for a year/month/day
+    // table when list_with_delimiter above only exposes the first level.
+    for first_dir in partition_directories.clone() {
         let mut current = first_dir;
         loop {
             let sub = store
@@ -188,8 +199,7 @@ async fn get_table_info_async(
         let path_str = obj.location.as_ref();
         if path_str.ends_with(".parquet") || path_str.ends_with(".parq") {
             // Skip hidden/metadata files (same rule as list_partition_files)
-            let filename = path_str.rsplit('/').next().unwrap_or(path_str);
-            if filename.starts_with('.') || filename.starts_with('_') {
+            if is_hidden_parquet_file(path_str) {
                 continue;
             }
             root_parquet_files.push(ParquetFileEntry {
@@ -266,8 +276,7 @@ async fn list_partition_files_async(
         }
 
         // Skip hidden files and metadata
-        let filename = path_str.rsplit('/').next().unwrap_or(path_str);
-        if filename.starts_with('.') || filename.starts_with('_') {
+        if is_hidden_parquet_file(path_str) {
             continue;
         }
 
@@ -304,8 +313,7 @@ async fn read_schema_from_first_file(
         let path_str = obj.location.as_ref();
         if path_str.ends_with(".parquet") || path_str.ends_with(".parq") {
             // Skip hidden/metadata files (same rule as list_partition_files)
-            let filename = path_str.rsplit('/').next().unwrap_or(path_str);
-            if filename.starts_with('.') || filename.starts_with('_') {
+            if is_hidden_parquet_file(path_str) {
                 continue;
             }
             let reader = ParquetObjectReader::new(Arc::clone(store), obj.location.clone())
@@ -332,8 +340,7 @@ async fn read_schema_from_first_file(
         for obj in objects {
             let path_str = obj.location.as_ref();
             if path_str.ends_with(".parquet") || path_str.ends_with(".parq") {
-                let filename = path_str.rsplit('/').next().unwrap_or(path_str);
-                if filename.starts_with('.') || filename.starts_with('_') {
+                if is_hidden_parquet_file(path_str) {
                     continue;
                 }
 

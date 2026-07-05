@@ -128,6 +128,24 @@ pub fn get_snapshot_info(
             checkpoint_part_paths = newer_cp_files;
             commit_file_paths =
                 list_commit_files_after(&store, &log_prefix, checkpoint_version).await?;
+
+            // The same staleness scan may also have observed a commit JSON
+            // version beyond what the sequential probe from the newly-adopted
+            // checkpoint reached — i.e. a second, deeper gap. Don't silently
+            // drop that information; fail loudly instead of returning a
+            // snapshot that is still stale.
+            let reached_version = checkpoint_version + commit_file_paths.len() as u64;
+            if let Some(max_commit) = markers.max_commit_version {
+                if max_commit > reached_version {
+                    anyhow::bail!(
+                        "Delta log is not contiguous: commit version {} exists but versions after {} \
+                         are missing, and the newest checkpoint found ({}) does not cover the gap",
+                        max_commit,
+                        reached_version,
+                        newer_cp_version
+                    );
+                }
+            }
         } else if let Some(max_commit) = markers.max_commit_version {
             // Commits exist beyond a gap with no covering checkpoint — the
             // contiguous chain is broken (cleanup/corruption); fail loudly
@@ -176,14 +194,23 @@ pub fn get_snapshot_info(
         // not implement (v2 checkpoints, unknown future features, id-mode
         // column mapping) instead of failing confusingly or returning wrong
         // results later.
-        if let Some(ref proto) = protocol {
-            validate_protocol(proto)?;
-        } else {
-            debug_println!(
-                "🔧 DELTA_DIST: WARNING: no protocol row found in checkpoint {} — skipping reader feature validation",
-                checkpoint_version
-            );
-        }
+        //
+        // A checkpoint is a full state snapshot, so — like `metaData` — the
+        // `protocol` action must be present in every checkpoint (it is a
+        // Delta protocol requirement, not optional). Treat a missing row as
+        // a hard error rather than silently skipping reader-feature
+        // validation: doing so would defeat H4 for exactly the malformed or
+        // unsupported checkpoints it exists to catch, with no error and no
+        // visible warning in production (debug_println! is a no-op unless
+        // TANTIVY4JAVA_DEBUG=1 is set).
+        let protocol = protocol.ok_or_else(|| {
+            anyhow::anyhow!(
+                "No protocol row found in any part of checkpoint version {} for table {}",
+                checkpoint_version,
+                url_str
+            )
+        })?;
+        validate_protocol(&protocol)?;
         let column_mapping_mode = metadata
             .configuration
             .get("delta.columnMapping.mode")
@@ -361,6 +388,21 @@ pub fn get_current_version(
                 current_version, newer_cp_version
             );
             current_version = newer_cp_version + newer_commits.len() as u64;
+
+            // Guard against a second, deeper gap: the same staleness scan may
+            // have observed a commit JSON version beyond what the sequential
+            // probe from the newly-adopted checkpoint reached.
+            if let Some(max_commit) = markers.max_commit_version {
+                if max_commit > current_version {
+                    anyhow::bail!(
+                        "Delta log is not contiguous: commit version {} exists but versions after {} \
+                         are missing, and the newest checkpoint found ({}) does not cover the gap",
+                        max_commit,
+                        current_version,
+                        newer_cp_version
+                    );
+                }
+            }
         } else if let Some(max_commit) = markers.max_commit_version {
             anyhow::bail!(
                 "Delta log is not contiguous: commit version {} exists but versions after {} \
@@ -694,10 +736,16 @@ async fn read_metadata_from_checkpoint(
         .iter()
         .position(|f| f.name() == "protocol");
 
-    let projected: Vec<usize> = [metadata_idx, protocol_idx].iter().flatten().copied().collect();
+    let mut projected: Vec<usize> = [metadata_idx, protocol_idx].iter().flatten().copied().collect();
     if projected.is_empty() {
         return Ok((None, None));
     }
+    // ProjectionMask::roots() returns columns in ascending physical schema
+    // order regardless of the order indices are passed in, so the projected
+    // batch's column order must be derived from `projected` sorted ascending
+    // (NOT assumed to be metaData-then-protocol — the Delta spec does not
+    // guarantee action-column ordering in a checkpoint part's schema).
+    projected.sort_unstable();
 
     let mask = parquet::arrow::ProjectionMask::roots(
         builder.parquet_schema(),
@@ -712,15 +760,18 @@ async fn read_metadata_from_checkpoint(
     while let Some(batch_result) = stream.next().await {
         let batch = batch_result?;
 
-        // Projected batch columns keep schema order: metaData (if present)
-        // comes before protocol
-        let mut batch_col = 0;
-        let meta_col = metadata_idx.map(|_| {
-            let c = batch.column(batch_col).clone();
-            batch_col += 1;
-            c
+        let meta_col = metadata_idx.and_then(|idx| {
+            projected
+                .iter()
+                .position(|&p| p == idx)
+                .map(|pos| batch.column(pos).clone())
         });
-        let proto_col = protocol_idx.map(|_| batch.column(batch_col).clone());
+        let proto_col = protocol_idx.and_then(|idx| {
+            projected
+                .iter()
+                .position(|&p| p == idx)
+                .map(|pos| batch.column(pos).clone())
+        });
 
         if let (None, Some(col)) = (&found_meta, &meta_col) {
             let struct_array = col.as_struct();
@@ -1688,6 +1739,45 @@ mod tests {
             Some(metadata_nulls),
         );
 
+        // protocol struct fields — present at row 0 alongside metaData, like a
+        // real checkpoint (both are singleton state rows read via the same
+        // column-projected scan in `read_metadata_from_checkpoint`).
+        let protocol_fields = Fields::from(vec![
+            Field::new("minReaderVersion", DataType::Int64, true),
+            Field::new(
+                "readerFeatures",
+                DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+                true,
+            ),
+        ]);
+
+        let mut min_reader_version_builder = Int64Builder::new();
+        let mut reader_features_builder = arrow_array::builder::ListBuilder::new(StringBuilder::new());
+
+        // Row 0: protocol row (minReaderVersion=1, no reader features)
+        min_reader_version_builder.append_value(1);
+        reader_features_builder.append(true);
+
+        for _ in 0..adds.len() {
+            min_reader_version_builder.append_null();
+            reader_features_builder.append(false);
+        }
+
+        let protocol_nulls = {
+            let mut bools = vec![false; num_rows];
+            bools[0] = true; // only row 0 (protocol) is non-null
+            arrow::buffer::NullBuffer::from(bools.as_slice())
+        };
+
+        let protocol_struct = StructArray::new(
+            protocol_fields,
+            vec![
+                Arc::new(min_reader_version_builder.finish()),
+                Arc::new(reader_features_builder.finish()),
+            ],
+            Some(protocol_nulls),
+        );
+
         // add struct fields
         let add_fields = Fields::from(vec![
             Field::new("path", DataType::Utf8, true),
@@ -1758,11 +1848,16 @@ mod tests {
             Some(add_nulls),
         );
 
-        // Create the RecordBatch with both columns
+        // Create the RecordBatch with all columns
         let schema = Arc::new(Schema::new(vec![
             Field::new(
                 "metaData",
                 DataType::Struct(metadata_struct.fields().clone()),
+                true,
+            ),
+            Field::new(
+                "protocol",
+                DataType::Struct(protocol_struct.fields().clone()),
                 true,
             ),
             Field::new(
@@ -1776,6 +1871,7 @@ mod tests {
             schema.clone(),
             vec![
                 Arc::new(metadata_struct),
+                Arc::new(protocol_struct),
                 Arc::new(add_struct),
             ],
         )

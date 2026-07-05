@@ -300,6 +300,7 @@ pub extern "system" fn Java_io_indextables_tantivy4java_iceberg_IcebergTableRead
     config_map: JObject,
     compact: jboolean,
     predicate_json: JString,
+    inherited_snapshot_id: jlong,
 ) -> jbyteArray {
     debug_println!("🔧 ICEBERG_JNI: nativeReadManifestFile called");
 
@@ -336,7 +337,17 @@ pub extern "system" fn Java_io_indextables_tantivy4java_iceberg_IcebergTableRead
         }
     };
 
-    match read_iceberg_manifest(&config, &manifest_str) {
+    // Negative sentinel = no manifest-list context available; snapshot_id
+    // falls back to -1 (unknown) per entry. Callers that already know the
+    // manifest's added_snapshot_id (e.g. getChangesSince) pass it here so
+    // this path resolves the same fallback as nativeListFiles.
+    let inherited_snapshot_id_opt = if inherited_snapshot_id < 0 {
+        None
+    } else {
+        Some(inherited_snapshot_id)
+    };
+
+    match read_iceberg_manifest(&config, &manifest_str, inherited_snapshot_id_opt) {
         Ok(entries) => {
             let entries = filter_by_predicate(entries, &predicate, |e| &e.partition_values);
             debug_println!(
@@ -369,6 +380,7 @@ pub extern "system" fn Java_io_indextables_tantivy4java_iceberg_IcebergTableRead
     predicate_json: JString,
     array_addrs: jlongArray,
     schema_addrs: jlongArray,
+    inherited_snapshot_id: jlong,
 ) -> jint {
     debug_println!("🔧 ICEBERG_JNI: nativeReadManifestFileArrowFfi called");
 
@@ -419,12 +431,19 @@ pub extern "system" fn Java_io_indextables_tantivy4java_iceberg_IcebergTableRead
         }
     };
 
+    let inherited_snapshot_id_opt = if inherited_snapshot_id < 0 {
+        None
+    } else {
+        Some(inherited_snapshot_id)
+    };
+
     match read_iceberg_manifest_arrow_ffi(
         &config,
         &manifest_str,
         predicate.as_ref(),
         &arr_addrs,
         &sch_addrs,
+        inherited_snapshot_id_opt,
     ) {
         Ok(num_rows) => {
             debug_println!("🔧 ICEBERG_JNI: Arrow FFI exported {} rows", num_rows);
