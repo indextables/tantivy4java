@@ -456,26 +456,17 @@ fn add_field_for_arrow_type(
 /// so the reader sees all fields as fast. The ParquetAugmentedDirectory then intercepts
 /// .fast file reads for fields that have no native data and serves from parquet.
 fn should_add_fast(config: &SchemaDerivationConfig, field_name: &str, data_type: &DataType) -> bool {
-    // Types the transcode path cannot reconstruct from the parquet column (it has
-    // no IpAddr/Bytes/Decimal256 arm) must ALWAYS get native fast data, in every
-    // mode — otherwise meta.json promotes them to fast but reads find no native
-    // data and no parquet fallback, so aggregations silently return empty (IP in
-    // ParquetOnly) or hard-error at query time (Decimal256/FixedSizeBinary in
-    // Hybrid) — M4. IP fields arrive as Utf8 columns declared via config.
-    let non_parquet_serviceable = config.ip_address_fields.contains(field_name)
-        || matches!(data_type,
-            DataType::Binary | DataType::LargeBinary | DataType::FixedSizeBinary(_)
-            | DataType::Decimal256(_, _)
-        );
-
     match config.fast_field_mode {
         FastFieldMode::Disabled => true, // All native fast fields
         FastFieldMode::Hybrid => {
-            if non_parquet_serviceable {
+            // IP address fields are treated as native fast fields in hybrid mode,
+            // even though they come from Utf8 Arrow columns. In ParquetOnly they
+            // are transcoded from parquet (see transcode.rs record_arrow_value).
+            if config.ip_address_fields.contains(field_name) {
                 return true;
             }
-            // Numeric/bool/date get native fast fields in hybrid mode; raw text
-            // fields are served from parquet at read time (transcode-serviceable).
+            // Numeric/bool/date get native fast fields in hybrid mode; raw text,
+            // bytes, decimal256 and IP are served from parquet at read time.
             matches!(data_type,
                 DataType::Boolean
                 | DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
@@ -485,9 +476,7 @@ fn should_add_fast(config: &SchemaDerivationConfig, field_name: &str, data_type:
                 | DataType::Timestamp(_, _) | DataType::Date32 | DataType::Date64
             )
         }
-        // ParquetOnly serves everything from parquet EXCEPT the non-serviceable
-        // types, which still need native fast data.
-        FastFieldMode::ParquetOnly => non_parquet_serviceable,
+        FastFieldMode::ParquetOnly => false, // Everything served from parquet at read time
     }
 }
 
@@ -901,7 +890,7 @@ mod tests {
     }
 
     #[test]
-    fn test_ip_address_field_parquet_only_is_fast() {
+    fn test_ip_address_field_parquet_only_not_fast() {
         let arrow = ArrowSchema::new(vec![
             Field::new("src_ip", DataType::Utf8, true),
         ]);
@@ -911,11 +900,11 @@ mod tests {
 
         let schema = derive_tantivy_schema(&arrow, &config).unwrap();
 
-        // IP fields have no parquet transcode arm, so they must be NATIVE fast
-        // even in ParquetOnly — otherwise IP aggregations silently return empty (M4).
+        // In ParquetOnly IP fields are served from parquet at read time (the
+        // transcode path has an IpAddr arm — M4), so they are NOT native fast.
         let src_ip_field = schema.get_field("src_ip").unwrap();
         let src_ip_entry = schema.get_field_entry(src_ip_field);
-        assert!(src_ip_entry.is_fast(), "IP fields must be fast even in ParquetOnly mode");
+        assert!(!src_ip_entry.is_fast(), "IP fields are parquet-served (not native fast) in ParquetOnly");
     }
 
     #[test]

@@ -467,6 +467,32 @@ async fn transcode_str_columns_direct(
                             collector.non_null_doc_ids.push(doc_id);
                         }
                     }
+                    DataType::Decimal256(_, _) => {
+                        // Decimal256 maps to a tantivy "Str" field (values exceed
+                        // f64 range). Serialize each value to its decimal string so
+                        // the field is served from parquet instead of hard-erroring
+                        // at query time in Hybrid mode (M4).
+                        let dec = array.as_any().downcast_ref::<arrow_array::Decimal256Array>()
+                            .context("Expected Decimal256Array for Decimal256 column")?;
+                        for row in 0..dec.len() {
+                            let doc_id = global_row + row as u32;
+                            if dec.is_null(row) {
+                                collector.has_nulls = true;
+                                continue;
+                            }
+                            let s = dec.value_as_string(row);
+                            let bytes = s.as_bytes();
+                            let ord = if let Some(&existing) = collector.dict.get(bytes) {
+                                existing
+                            } else {
+                                let next_id = collector.dict.len() as u32;
+                                collector.dict.insert(bytes.to_vec(), next_id);
+                                next_id
+                            };
+                            collector.ordinals.push(ord as u64);
+                            collector.non_null_doc_ids.push(doc_id);
+                        }
+                    }
                     other => {
                         anyhow::bail!(
                             "Unexpected data type {:?} for Str column '{}'",
@@ -700,6 +726,19 @@ fn record_arrow_value(
             let val = extract_bytes(array, row)?;
             writer.record_bytes(doc_id, column_name, &val);
         }
+        "IpAddr" => {
+            // IP fields are stored in parquet as their string form; parse and
+            // record so IP columns can be served from parquet in ParquetOnly mode
+            // (Hybrid keeps them native) — M4.
+            let s = extract_string(array, row)?;
+            let ip: std::net::IpAddr = s.parse()
+                .with_context(|| format!("Failed to parse IP '{}' for column '{}'", s, column_name))?;
+            let ipv6 = match ip {
+                std::net::IpAddr::V4(v4) => v4.to_ipv6_mapped(),
+                std::net::IpAddr::V6(v6) => v6,
+            };
+            writer.record_ip_addr(doc_id, column_name, ipv6);
+        }
         "Date" => {
             let micros = extract_timestamp_micros(array, row)?;
             // Tantivy DateTime uses nanoseconds internally
@@ -765,12 +804,15 @@ fn extract_string(array: &dyn Array, row: usize) -> Result<String> {
     }
 }
 
-/// Extract bytes from Binary/LargeBinary arrays.
+/// Extract bytes from Binary/LargeBinary/FixedSizeBinary arrays.
 fn extract_bytes(array: &dyn Array, row: usize) -> Result<Vec<u8>> {
     use arrow_array::*;
     match array.data_type() {
         DataType::Binary => Ok(array.as_any().downcast_ref::<BinaryArray>().ok_or_else(|| anyhow::anyhow!("Expected BinaryArray array"))?.value(row).to_vec()),
         DataType::LargeBinary => Ok(array.as_any().downcast_ref::<LargeBinaryArray>().ok_or_else(|| anyhow::anyhow!("Expected LargeBinaryArray array"))?.value(row).to_vec()),
+        // FixedSizeBinary → Bytes tantivy type: without this arm a Hybrid/ParquetOnly
+        // query on such a field hard-errors at transcode time (M4).
+        DataType::FixedSizeBinary(_) => Ok(array.as_any().downcast_ref::<FixedSizeBinaryArray>().ok_or_else(|| anyhow::anyhow!("Expected FixedSizeBinaryArray array"))?.value(row).to_vec()),
         _ => anyhow::bail!("Cannot extract bytes from {:?}", array.data_type()),
     }
 }

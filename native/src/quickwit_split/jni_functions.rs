@@ -1798,8 +1798,15 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_merge_QuickwitSpli
         // in the normal case. A higher count means another thread (e.g. an
         // in-flight addArrowBatch) still references the context. If we released
         // the registry entry first and THEN try_unwrap failed, the session would
-        // be gone yet unrecoverable (M17). Detect that up front and fail without
-        // deregistering, so the caller can retry after its batch completes.
+        // be gone yet unrecoverable (M17). Guard against that by checking the
+        // count before releasing and again immediately before the release call.
+        //
+        // The documented usage model is a single caller driving begin → addBatch
+        // → finish sequentially, so this reliably rejects the misuse case. A
+        // concurrent addArrowBatch racing in the tiny window between the second
+        // check and release_arc remains theoretically possible (fully closing it
+        // would require re-inserting the Arc on a failed try_unwrap); this guard
+        // makes that window negligibly small rather than eliminating it.
         if Arc::strong_count(&ctx_arc) > 2 {
             anyhow::bail!(
                 "Cannot finish splits: the Arrow split context is still in use by \
@@ -1809,7 +1816,14 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_merge_QuickwitSpli
             );
         }
 
-        // Safe to tear down: release the registry entry so ctx_arc is sole owner.
+        // Re-check right before tearing down to minimize the race window, then
+        // release the registry entry so ctx_arc is the sole owner.
+        if Arc::strong_count(&ctx_arc) > 2 {
+            anyhow::bail!(
+                "Cannot finish splits: the Arrow split context became in-use by \
+                 another operation; the session is left intact so you can retry."
+            );
+        }
         release_arc(ctx_handle);
 
         // Extract the context from Arc<Mutex<>>

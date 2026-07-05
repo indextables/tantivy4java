@@ -466,18 +466,23 @@ pub async fn create_split_from_parquet(
     let mut cumulative_row_offset: u64 = 0;
     let mut total_rows: u64 = 0;
 
-    // Column projection (E1): only the columns we actually index (present in
-    // column_mapping — every skipped or unsupported-type column is excluded).
-    // Reading, decompressing and Arrow-decoding all N columns of a wide table
-    // when we index only a handful is ~95% wasted I/O/CPU. Compute the arrow
-    // top-level field indices to keep once (schema is validated consistent
-    // across files) and apply ProjectionMask::roots per file below.
-    let indexed_parquet_cols: std::collections::HashSet<&str> = column_mapping.iter()
-        .map(|m| m.parquet_column_name.as_str())
-        .collect();
+    // Column projection (E1): only the columns we actually index. Reading,
+    // decompressing and Arrow-decoding all N columns of a wide table when we
+    // index only a handful is ~95% wasted I/O/CPU. A column is indexed iff it is
+    // not skipped AND its mapped tantivy name is a real field in the derived
+    // schema (unsupported types were dropped during derivation). NB:
+    // build_column_mapping deliberately maps EVERY arrow column (for doc
+    // retrieval of non-indexed columns), so it is NOT the right source here.
+    // Compute the arrow top-level field indices to keep once (schema is validated
+    // consistent across files) and apply ProjectionMask::roots per file below.
     let projection_indices: Vec<usize> = arrow_schema.fields().iter().enumerate()
         .filter_map(|(i, f)| {
-            if indexed_parquet_cols.contains(f.name().as_str()) { Some(i) } else { None }
+            let pname = f.name();
+            if config.skip_fields.contains(pname.as_str()) {
+                return None;
+            }
+            let tname = map_to_tantivy(pname);
+            if tantivy_schema.get_field(&tname).is_ok() { Some(i) } else { None }
         })
         .collect();
     // Only project when it is a proper, non-empty subset — a full or empty mask
