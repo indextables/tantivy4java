@@ -633,6 +633,7 @@ fn create_java_column_statistics_map<'a>(
             env.call_method(&stat_obj, "setMaxBool", "(Z)V", &[JValue::Bool(v as u8)])?;
         }
         env.call_method(&stat_obj, "setNullCount", "(J)V", &[JValue::Long(stat.null_count as i64)])?;
+        env.call_method(&stat_obj, "setNanCount", "(J)V", &[JValue::Long(stat.nan_count as i64)])?;
 
         // Put into map
         let key_jstr = string_to_jstring(env, &stat.field_name)?;
@@ -1789,10 +1790,27 @@ pub extern "system" fn Java_io_indextables_tantivy4java_split_merge_QuickwitSpli
     convert_throwable(&mut env, |env| {
         let output_dir_str = jstring_to_string(env, &output_dir)?;
 
-        // Retrieve context clone from registry, then release the registry entry
+        // Retrieve context clone from registry.
         let ctx_arc = crate::utils::jlong_to_arc::<Mutex<ArrowFfiSplitContext>>(ctx_handle)
             .ok_or_else(|| anyhow!("Invalid context handle for finishAllSplits"))?;
-        release_arc(ctx_handle); // Remove from registry; ctx_arc is now the sole owner
+
+        // We now hold one clone and the registry holds one, so strong_count == 2
+        // in the normal case. A higher count means another thread (e.g. an
+        // in-flight addArrowBatch) still references the context. If we released
+        // the registry entry first and THEN try_unwrap failed, the session would
+        // be gone yet unrecoverable (M17). Detect that up front and fail without
+        // deregistering, so the caller can retry after its batch completes.
+        if Arc::strong_count(&ctx_arc) > 2 {
+            anyhow::bail!(
+                "Cannot finish splits: the Arrow split context is still in use by \
+                 another operation (an addArrowBatch call has not returned). Ensure \
+                 all batches are submitted before finishAllSplits; the session is \
+                 left intact so you can retry."
+            );
+        }
+
+        // Safe to tear down: release the registry entry so ctx_arc is sole owner.
+        release_arc(ctx_handle);
 
         // Extract the context from Arc<Mutex<>>
         let ctx = Arc::try_unwrap(ctx_arc)

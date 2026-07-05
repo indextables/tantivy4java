@@ -21,6 +21,12 @@ pub struct ColumnStatisticsResult {
     pub min_bool: Option<bool>,
     pub max_bool: Option<bool>,
     pub null_count: u64,
+    /// Count of NaN float values, tracked separately from null_count so an
+    /// all-NaN column (min/max None, null_count 0, nan_count > 0) is
+    /// distinguishable from an empty/all-null column and a pruning consumer
+    /// does not treat it as "no data". Defaulted for manifest back-compat.
+    #[serde(default)]
+    pub nan_count: u64,
 }
 
 /// Accumulator for computing column statistics during indexing
@@ -38,6 +44,11 @@ pub struct StatisticsAccumulator {
     min_bool: Option<bool>,
     max_bool: Option<bool>,
     null_count: u64,
+    nan_count: u64,
+    /// Set when a truncated string value has no representable ceiling (all
+    /// prefix chars are char::MAX). Once set, max_string is reported as None so
+    /// pruning never uses a too-low upper bound (L6).
+    max_string_unbounded: bool,
     truncate_length: usize,
 }
 
@@ -57,6 +68,8 @@ impl StatisticsAccumulator {
             min_bool: None,
             max_bool: None,
             null_count: 0,
+            nan_count: 0,
+            max_string_unbounded: false,
             truncate_length,
         }
     }
@@ -71,8 +84,10 @@ impl StatisticsAccumulator {
     }
 
     pub fn observe_f64(&mut self, value: f64) {
-        // Exclude NaN from statistics
+        // NaN has no ordering and can't participate in min/max; count it
+        // separately so an all-NaN column is distinguishable from empty (M10).
         if value.is_nan() {
+            self.nan_count += 1;
             return;
         }
         self.min_double = Some(self.min_double.map_or(value, |m| m.min(value)));
@@ -80,32 +95,46 @@ impl StatisticsAccumulator {
     }
 
     pub fn observe_string(&mut self, value: &str) {
-        let truncated_min = if self.truncate_length > 0 && value.len() > self.truncate_length {
-            safe_truncate(value, self.truncate_length).to_string()
-        } else {
-            value.to_string()
-        };
+        // Borrow the truncated prefix; allocate only when it becomes a new
+        // extreme, and never clone the retained value on the no-change path (E4).
+        let truncated_min: &str =
+            if self.truncate_length > 0 && value.len() > self.truncate_length {
+                safe_truncate(value, self.truncate_length)
+            } else {
+                value
+            };
 
-        let truncated_max = if self.truncate_length > 0 && value.len() > self.truncate_length {
-            truncate_ceiling(safe_truncate(value, self.truncate_length))
-        } else {
-            value.to_string()
-        };
+        match self.min_string {
+            Some(ref m) if truncated_min >= m.as_str() => {} // unchanged, no alloc
+            _ => self.min_string = Some(truncated_min.to_string()),
+        }
 
-        self.min_string = Some(
-            self.min_string
-                .as_ref()
-                .map_or(truncated_min.clone(), |m| {
-                    if truncated_min < *m { truncated_min.clone() } else { m.clone() }
-                }),
-        );
-        self.max_string = Some(
-            self.max_string
-                .as_ref()
-                .map_or(truncated_max.clone(), |m| {
-                    if truncated_max > *m { truncated_max.clone() } else { m.clone() }
-                }),
-        );
+        // Ceiling for the max bound. truncate_ceiling returns None when the
+        // truncated prefix has no representable ceiling (all chars char::MAX);
+        // in that case the column's max is unbounded and must report None so
+        // pruning never uses a too-low upper bound (L6).
+        if !self.max_string_unbounded {
+            let truncated_max: Option<String> =
+                if self.truncate_length > 0 && value.len() > self.truncate_length {
+                    match truncate_ceiling(safe_truncate(value, self.truncate_length)) {
+                        Some(c) => Some(c),
+                        None => {
+                            self.max_string_unbounded = true;
+                            self.max_string = None;
+                            None
+                        }
+                    }
+                } else {
+                    Some(value.to_string())
+                };
+
+            if let Some(tmax) = truncated_max {
+                match self.max_string {
+                    Some(ref m) if tmax <= *m => {} // unchanged, no alloc
+                    _ => self.max_string = Some(tmax),
+                }
+            }
+        }
     }
 
     pub fn observe_timestamp_micros(&mut self, micros: i64) {
@@ -133,6 +162,7 @@ impl StatisticsAccumulator {
             min_bool: self.min_bool,
             max_bool: self.max_bool,
             null_count: self.null_count,
+            nan_count: self.nan_count,
         }
     }
 }
@@ -154,33 +184,58 @@ fn safe_truncate(s: &str, max_bytes: usize) -> &str {
 /// Truncate a string and adjust the last character up by 1 to create a ceiling value.
 /// This ensures pruning correctness: any string that starts with the original prefix
 /// is guaranteed to be <= the ceiling.
-fn truncate_ceiling(s: &str) -> String {
+///
+/// Returns `None` when no valid ceiling exists (every character is `char::MAX`),
+/// so callers can mark the upper bound as unbounded rather than emit a floor that
+/// would wrongly prune values above the prefix (L6).
+fn truncate_ceiling(s: &str) -> Option<String> {
     let mut chars: Vec<char> = s.chars().collect();
-    // Walk backwards to find a character we can increment
-    while let Some(last) = chars.last_mut() {
-        if *last < char::MAX {
-            *last = char::from_u32(*last as u32 + 1).unwrap_or(char::MAX);
-            return chars.into_iter().collect();
+    // Walk backwards to find a character we can increment.
+    while let Some(&last) = chars.last() {
+        if last < char::MAX {
+            let mut next_u = last as u32 + 1;
+            // Skip the UTF-16 surrogate gap (0xD800..=0xDFFF), which is not a
+            // valid Unicode scalar value; the next scalar after 0xD7FF is 0xE000.
+            if (0xD800..=0xDFFF).contains(&next_u) {
+                next_u = 0xE000;
+            }
+            if let Some(next) = char::from_u32(next_u) {
+                *chars.last_mut().unwrap() = next;
+                return Some(chars.into_iter().collect());
+            }
         }
         chars.pop();
     }
-    // All chars were MAX - return the original
-    s.to_string()
+    // All chars were char::MAX — no representable ceiling.
+    None
 }
 
-/// Validate that statistics fields don't include unsupported types (Json, Bytes)
+/// Validate that requested statistics fields exist and have a supported type.
+///
+/// `field_types` maps every indexed (non-skipped, mapped) tantivy field to its
+/// type. A requested field absent from this map was skipped or does not exist,
+/// which would otherwise silently produce all-`None` statistics (L5) — reject it
+/// so the misconfiguration surfaces instead of yielding empty stats.
 pub fn validate_statistics_fields(
     fields: &[String],
     field_types: &std::collections::HashMap<String, String>,
 ) -> Result<(), String> {
     for field in fields {
-        if let Some(field_type) = field_types.get(field) {
-            if field_type == "Json" || field_type == "Bytes" {
+        match field_types.get(field) {
+            None => {
+                return Err(format!(
+                    "Statistics requested for field '{}', but it is not an indexed \
+                     column (it was skipped or does not exist in the parquet schema)",
+                    field
+                ));
+            }
+            Some(field_type) if field_type == "Json" || field_type == "Bytes" => {
                 return Err(format!(
                     "Field '{}' has type '{}' which does not support statistics",
                     field, field_type
                 ));
             }
+            Some(_) => {}
         }
     }
     Ok(())
@@ -236,8 +291,20 @@ mod tests {
 
     #[test]
     fn test_truncate_ceiling() {
-        assert_eq!(truncate_ceiling("abc"), "abd");
-        assert_eq!(truncate_ceiling("a"), "b");
+        assert_eq!(truncate_ceiling("abc").as_deref(), Some("abd"));
+        assert_eq!(truncate_ceiling("a").as_deref(), Some("b"));
+        // All-char::MAX prefix has no representable ceiling → None (L6).
+        let all_max: String = std::iter::repeat(char::MAX).take(3).collect();
+        assert_eq!(truncate_ceiling(&all_max), None);
+    }
+
+    #[test]
+    fn test_truncate_ceiling_surrogate_boundary() {
+        // A char just below the UTF-16 surrogate gap must increment to 0xE000,
+        // not loop forever or produce an invalid scalar.
+        let c = char::from_u32(0xD7FF).unwrap();
+        let ceiling = truncate_ceiling(&c.to_string()).unwrap();
+        assert_eq!(ceiling.chars().next().unwrap(), char::from_u32(0xE000).unwrap());
     }
 
     #[test]
@@ -314,11 +381,13 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_statistics_fields_unknown_field_passes() {
-        // Unknown fields (not in types map) should pass — validation only rejects known bad types
+    fn test_validate_statistics_fields_unknown_field_rejected() {
+        // Unknown fields (skipped or nonexistent) must be rejected rather than
+        // silently yielding all-None statistics (L5).
         let types = std::collections::HashMap::new();
         let result = validate_statistics_fields(&["mystery".to_string()], &types);
-        assert!(result.is_ok());
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("not an indexed column"));
     }
 
     #[test]
@@ -407,8 +476,23 @@ mod tests {
         acc.observe_f64(f64::NAN);
         acc.observe_f64(f64::NAN);
         let result = acc.finalize();
-        // All NaN → no min/max
+        // All NaN → no min/max, but nan_count distinguishes it from empty (M10).
         assert_eq!(result.min_double, None);
         assert_eq!(result.max_double, None);
+        assert_eq!(result.nan_count, 2);
+        assert_eq!(result.null_count, 0);
+    }
+
+    #[test]
+    fn test_string_max_ceiling_unbounded_reports_none() {
+        // A truncated value whose prefix is all char::MAX has no ceiling, so the
+        // max bound must report None rather than a too-low floor (L6).
+        let all_max: String = std::iter::repeat(char::MAX).take(8).collect();
+        let mut acc = StatisticsAccumulator::new("s", "Str", 4);
+        acc.observe_string(&all_max);
+        let result = acc.finalize();
+        assert_eq!(result.max_string, None);
+        // min still records the truncated prefix.
+        assert!(result.min_string.is_some());
     }
 }

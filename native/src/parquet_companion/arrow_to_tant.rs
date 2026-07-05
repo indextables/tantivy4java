@@ -267,9 +267,12 @@ fn write_arrow_value_to_tant(
         }
         DataType::List(_)
         | DataType::LargeList(_)
+        | DataType::FixedSizeList(_, _)
         | DataType::Map(_, _)
         | DataType::Struct(_) => {
-            // Complex types: serialize via arrow_json_value, then length-prefixed string
+            // Complex types (incl. FixedSizeList, e.g. embeddings — schema
+            // derivation maps these to JSON, so retrieval must serialize them
+            // as JSON, not an empty string — M12): length-prefixed JSON string.
             let slice = array.slice(row_idx, 1);
             let json_value = arrow_json_value(&slice, 0);
             let json_str =
@@ -279,8 +282,18 @@ fn write_arrow_value_to_tant(
             buf.extend_from_slice(bytes);
         }
         _ => {
-            // Fallback: write as empty text
-            buf.extend_from_slice(&0u32.to_ne_bytes());
+            // Unknown/unsupported type (Dictionary, Time, Duration, …): write a
+            // best-effort JSON representation rather than a silent empty string,
+            // which would masquerade as real data on retrieval (M12). Types
+            // arrow_json_value can't represent become JSON null — still clearly
+            // distinguishable from a wrong "".
+            let slice = array.slice(row_idx, 1);
+            let json_value = arrow_json_value(&slice, 0);
+            let json_str =
+                serde_json::to_string(&json_value).unwrap_or_else(|_| "null".to_string());
+            let bytes = json_str.as_bytes();
+            buf.extend_from_slice(&(bytes.len() as u32).to_ne_bytes());
+            buf.extend_from_slice(bytes);
         }
     }
 
@@ -342,9 +355,18 @@ fn assemble_tant_buffer(doc_buffers: Vec<Option<Vec<u8>>>) -> Result<Vec<u8>> {
     // Header magic
     buffer.extend_from_slice(&MAGIC_NUMBER.to_ne_bytes());
 
-    // Write documents and collect offsets
+    // Write documents and collect offsets. Offsets are u32, so the whole buffer
+    // (documents + offset table) must stay under 4 GiB; otherwise `as u32` would
+    // silently wrap and the Java parser would read garbage. Guard it (L9).
     let mut offsets = Vec::with_capacity(doc_buffers.len());
     for doc_opt in &doc_buffers {
+        if buffer.len() > u32::MAX as usize {
+            anyhow::bail!(
+                "TANT batch buffer exceeds 4 GiB ({} bytes); u32 document offsets \
+                 would overflow. Reduce the batch size / number of documents per call.",
+                buffer.len()
+            );
+        }
         offsets.push(buffer.len() as u32);
         match doc_opt {
             Some(doc_bytes) => buffer.extend_from_slice(doc_bytes),
@@ -356,6 +378,13 @@ fn assemble_tant_buffer(doc_buffers: Vec<Option<Vec<u8>>>) -> Result<Vec<u8>> {
     }
 
     // Offset table
+    if buffer.len() > u32::MAX as usize {
+        anyhow::bail!(
+            "TANT batch buffer exceeds 4 GiB ({} bytes) at the offset table; \
+             u32 offsets would overflow.",
+            buffer.len()
+        );
+    }
     let offset_table_start = buffer.len() as u32;
     for offset in &offsets {
         buffer.extend_from_slice(&offset.to_ne_bytes());
@@ -693,6 +722,13 @@ pub async fn read_parquet_batches_for_file(
         t_file.elapsed().as_millis()
     );
 
+    // Decode Dictionary-encoded columns so downstream value extraction downcasts
+    // to concrete arrays rather than yielding empty/null for categoricals (M3).
+    let collected_batches = collected_batches
+        .into_iter()
+        .map(super::indexing::decode_dictionary_columns)
+        .collect::<Result<Vec<_>>>()?;
+
     Ok(collected_batches)
 }
 
@@ -716,11 +752,17 @@ pub async fn read_parquet_batches_by_groups(
     let projected_fields_shared: Option<Arc<[String]>> =
         projected_fields.map(|f| f.into());
 
+    // Share the manifest via a single Arc rather than deep-cloning it into every
+    // per-file task. The manifest packs page-location arrays for ALL files and
+    // can be multi-MB; with 200 touched files that was 200 full clones per
+    // docBatch call (E3). One clone into the Arc, then cheap Arc clones per task.
+    let manifest_shared: Arc<ParquetManifest> = Arc::new(manifest.clone());
+
     let file_futures: Vec<_> = groups
         .into_iter()
         .map(|(file_idx, rows)| {
             let storage = storage.clone();
-            let manifest = manifest.clone();
+            let manifest = manifest_shared.clone();
             let projected_fields_owned = projected_fields_shared.clone();
             let metadata_cache = metadata_cache.cloned();
             let byte_cache = byte_cache.cloned();

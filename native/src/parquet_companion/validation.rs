@@ -1,4 +1,14 @@
 // validation.rs - Staleness and missing file checks for parquet companion mode
+//
+// STATUS: Currently UNUSED / not wired into any read path.
+//
+// `FileValidator` and `MissingFilePolicy` are only re-exported from `mod.rs`; no
+// retrieval or transcode path constructs a `FileValidator`, so the staleness /
+// missing-file protection it implements is not yet enforced at query time. The
+// module is retained (rather than deleted) because it is intended to be wired
+// into the read path in the future. If you are extending the read path, this is
+// the place that should be invoked before serving parquet-backed rows. Until
+// then, treat this module as scaffolding.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -10,7 +20,16 @@ use super::manifest::ParquetManifest;
 pub enum MissingFilePolicy {
     /// Fail the query immediately if any referenced file is missing or stale
     Fail,
-    /// Log a warning and return empty/null values for documents in missing files
+    /// Log a warning and continue as if the file were valid.
+    ///
+    /// NOTE: Despite the name, this does NOT substitute empty/null values for the
+    /// documents in a missing/stale file. `evaluate_result` returns `Result<(),
+    /// String>`, which can only express "ok" or "error" — there is no third
+    /// outcome to signal "present-but-substitute-empties". So `Warn` collapses to
+    /// a logged no-op: the validation is skipped and the query proceeds, with any
+    /// subsequent read of the actually-missing file failing on its own. Delivering
+    /// true empty/null substitution would require a richer return type
+    /// (e.g. an enum of Present/Substitute/Error) and cooperation from the reader.
     Warn,
 }
 
@@ -73,13 +92,27 @@ impl FileValidator {
                 actual_size: Some(actual_size),
                 expected_size,
             },
-            Err(_) => FileValidationResult {
-                path: resolved_path.to_string(),
-                exists: false,
-                size_matches: false,
-                actual_size: None,
-                expected_size,
-            },
+            // Only a definitive "not found" is a cacheable absence. Transient
+            // storage failures (S3 503, timeouts, throttling, auth, I/O) must NOT
+            // be cached as `exists: false` — doing so would poison the cache
+            // forever (there is no TTL), permanently failing a file that was only
+            // temporarily unreachable. Surface the error to the caller instead so
+            // a later call can retry.
+            Err(err) if err.kind() == quickwit_storage::StorageErrorKind::NotFound => {
+                FileValidationResult {
+                    path: resolved_path.to_string(),
+                    exists: false,
+                    size_matches: false,
+                    actual_size: None,
+                    expected_size,
+                }
+            }
+            Err(err) => {
+                return Err(format!(
+                    "Transient storage error validating '{}': {} (not cached; retry)",
+                    resolved_path, err
+                ));
+            }
         };
 
         let eval = self.evaluate_result(&result);

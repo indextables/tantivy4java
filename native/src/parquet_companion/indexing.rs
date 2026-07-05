@@ -201,12 +201,30 @@ pub async fn create_split_from_parquet(
     )?;
 
     // ── Step 4: Derive tantivy schema ───────────────────────────────────
+    // Config-key convention (M1): users declare all field-scoped config
+    // (tokenizer_overrides, ip_address_fields, json_fields) by *parquet column
+    // name* — that's what they see in the file. Internally, schema derivation
+    // and the indexing loop both work with *tantivy field names*, so translate
+    // these keys through the name mapping exactly once here to a single tantivy-
+    // keyed convention. Keys with no mapping pass through unchanged, and a key
+    // already given as the tantivy name (mapping miss) also passes through, so
+    // both conventions resolve identically. `skip_fields` stays parquet-keyed
+    // because it is applied to parquet columns *before* mapping.
+    let map_to_tantivy = |k: &str| -> String {
+        name_mapping.get(k).cloned().unwrap_or_else(|| k.to_string())
+    };
     let config = SchemaDerivationConfig {
         fast_field_mode: parquet_config.fast_field_mode,
         skip_fields: parquet_config.schema_config.skip_fields.clone(),
-        tokenizer_overrides: parquet_config.schema_config.tokenizer_overrides.clone(),
-        ip_address_fields: parquet_config.schema_config.ip_address_fields.clone(),
-        json_fields: parquet_config.schema_config.json_fields.clone(),
+        tokenizer_overrides: parquet_config.schema_config.tokenizer_overrides.iter()
+            .map(|(k, v)| (map_to_tantivy(k), v.clone()))
+            .collect(),
+        ip_address_fields: parquet_config.schema_config.ip_address_fields.iter()
+            .map(|k| map_to_tantivy(k))
+            .collect(),
+        json_fields: parquet_config.schema_config.json_fields.iter()
+            .map(|k| map_to_tantivy(k))
+            .collect(),
         fieldnorms_enabled: parquet_config.schema_config.fieldnorms_enabled,
         store_fields: false, // Companion mode: parquet is the store
     };
@@ -255,29 +273,50 @@ pub async fn create_split_from_parquet(
     let mut string_indexing_modes: HashMap<String, StringIndexingMode> = HashMap::new();
     let mut companion_hash_fields_map: HashMap<String, CompanionFieldInfo> = HashMap::new();
 
-    for (field_name, tokenizer_value) in &config.tokenizer_overrides {
-        // Resolve the tantivy field name via name mapping
-        let tantivy_name = name_mapping
-            .get(field_name.as_str())
-            .map(|s| s.as_str())
-            .unwrap_or(field_name.as_str());
+    // Arrow type per parquet column, for validating string-only overrides (M2).
+    let arrow_type_by_name: HashMap<&str, &DataType> = arrow_schema.fields().iter()
+        .map(|f| (f.name().as_str(), f.data_type()))
+        .collect();
 
+    // Iterate the user's original parquet-keyed overrides so we still have the
+    // parquet column name for arrow-type validation; map to the tantivy name
+    // for registration (consistent with the derivation config above — M1).
+    for (parquet_name, tokenizer_value) in &parquet_config.schema_config.tokenizer_overrides {
         if let Some(mode) = string_indexing::parse_tokenizer_override(tokenizer_value) {
+            // M2: compact string-indexing modes (exact_only, text_uuid_*, …) only
+            // make sense on a string column. Derivation applies them only in the
+            // Utf8/LargeUtf8 arm, so an override on a numeric column would create
+            // a numeric field here yet register ExactOnly and rewrite the manifest
+            // type to U64 — corrupting hash-rewrite reads. Reject it up front.
+            match arrow_type_by_name.get(parquet_name.as_str()) {
+                Some(DataType::Utf8) | Some(DataType::LargeUtf8) => {}
+                Some(other) => anyhow::bail!(
+                    "Tokenizer override '{}' on column '{}' requires a string (Utf8) \
+                     column, but it has arrow type {:?}.",
+                    tokenizer_value, parquet_name, other
+                ),
+                None => anyhow::bail!(
+                    "Tokenizer override references unknown parquet column '{}'.",
+                    parquet_name
+                ),
+            }
+
+            let tantivy_name = map_to_tantivy(parquet_name);
             // Build companion field info for *_exactonly modes
             if string_indexing::needs_companion_field(&mode) {
-                let companion_name = string_indexing::companion_field_name(tantivy_name);
+                let companion_name = string_indexing::companion_field_name(&tantivy_name);
                 let pattern = string_indexing::regex_pattern(&mode)
                     .unwrap_or("")
                     .to_string();
                 companion_hash_fields_map.insert(
                     companion_name.clone(),
                     CompanionFieldInfo {
-                        original_field_name: tantivy_name.to_string(),
+                        original_field_name: tantivy_name.clone(),
                         regex_pattern: pattern,
                     },
                 );
             }
-            string_indexing_modes.insert(tantivy_name.to_string(), mode);
+            string_indexing_modes.insert(tantivy_name, mode);
         }
     }
 
@@ -427,6 +466,31 @@ pub async fn create_split_from_parquet(
     let mut cumulative_row_offset: u64 = 0;
     let mut total_rows: u64 = 0;
 
+    // Column projection (E1): only the columns we actually index (present in
+    // column_mapping — every skipped or unsupported-type column is excluded).
+    // Reading, decompressing and Arrow-decoding all N columns of a wide table
+    // when we index only a handful is ~95% wasted I/O/CPU. Compute the arrow
+    // top-level field indices to keep once (schema is validated consistent
+    // across files) and apply ProjectionMask::roots per file below.
+    let indexed_parquet_cols: std::collections::HashSet<&str> = column_mapping.iter()
+        .map(|m| m.parquet_column_name.as_str())
+        .collect();
+    let projection_indices: Vec<usize> = arrow_schema.fields().iter().enumerate()
+        .filter_map(|(i, f)| {
+            if indexed_parquet_cols.contains(f.name().as_str()) { Some(i) } else { None }
+        })
+        .collect();
+    // Only project when it is a proper, non-empty subset — a full or empty mask
+    // gains nothing and the empty case is a degenerate no-columns read.
+    let apply_projection =
+        !projection_indices.is_empty() && projection_indices.len() < arrow_schema.fields().len();
+    if apply_projection {
+        debug_println!(
+            "🏗️ CREATE_FROM_PARQUET: projecting {} of {} parquet columns during indexing",
+            projection_indices.len(), arrow_schema.fields().len()
+        );
+    }
+
     for file_path in parquet_files {
         let file = std::fs::File::open(file_path)
             .with_context(|| format!("Failed to open parquet file: {}", file_path))?;
@@ -448,11 +512,16 @@ pub async fn create_split_from_parquet(
         // Files WITH a native offset index don't need page locations stored in the
         // manifest — the CachedParquetReader will load the offset index directly
         // from the footer at read time via PageIndexPolicy::Optional.
-        let has_native_offset_index = pq_metadata.row_groups().first()
-            .map(|rg| rg.columns().first()
-                .map(|col| col.offset_index_offset().is_some())
-                .unwrap_or(false))
-            .unwrap_or(false);
+        //
+        // Per-column offset-index presence is legal per the parquet spec, so
+        // require EVERY column of EVERY row group to carry an offset index before
+        // treating the file as natively indexed; otherwise a column without one
+        // would be unreadable at page granularity (L4).
+        let has_native_offset_index = !pq_metadata.row_groups().is_empty()
+            && pq_metadata.row_groups().iter().all(|rg| {
+                !rg.columns().is_empty()
+                    && rg.columns().iter().all(|col| col.offset_index_offset().is_some())
+            });
 
         // Open a separate file handle for page location scanning (only needed
         // for files that lack a native offset index in their footer).
@@ -553,14 +622,26 @@ pub async fn create_split_from_parquet(
 
         // Reuse the reader_builder (which already holds the file handle) instead
         // of re-reading the file from disk.
-        let reader = reader_builder
-            .with_batch_size(parquet_config.reader_batch_size)
+        let mut builder = reader_builder.with_batch_size(parquet_config.reader_batch_size);
+        if apply_projection {
+            // Root-level indices: arrow top-level field position == parquet root
+            // field index (nested types stay whole). Matches build_column_projection.
+            let mask = parquet::arrow::ProjectionMask::roots(
+                pq_metadata.file_metadata().schema_descr(),
+                projection_indices.iter().cloned(),
+            );
+            builder = builder.with_projection(mask);
+        }
+        let reader = builder
             .build()
             .context("Failed to build parquet reader")?;
 
         let mut row_in_file: u64 = 0;
         for batch_result in reader {
             let batch = batch_result.context("Failed to read record batch")?;
+            // Decode Dictionary-encoded columns to their value type so the
+            // per-type extraction below downcasts to a concrete array (M3).
+            let batch = decode_dictionary_columns(batch)?;
             let batch_schema = batch.schema();
 
             // Resolve column → tantivy field once per batch (batch-invariant work),
@@ -937,7 +1018,11 @@ pub(crate) fn add_arrow_value_to_doc(
             let val = arr.value(row_idx);
             doc.add_u64(field, val);
             if let Some(acc) = accumulators.get_mut(field_name) {
-                acc.observe_i64(val as i64);
+                // Saturate rather than `as i64` (which wraps u64 > i64::MAX to a
+                // negative min/max — L1). Query bounds are i64, so a saturated
+                // max of i64::MAX is safe (no i64 query can exceed it), and small
+                // values still set an accurate min.
+                acc.observe_i64(i64::try_from(val).unwrap_or(i64::MAX));
             }
         }
 
@@ -1212,26 +1297,30 @@ fn add_json_string_value(
     json_str: &str,
     field_name: &str,
 ) -> Result<()> {
-    let parsed: serde_json::Value = serde_json::from_str(json_str)
+    // Char-safe preview for error messages — slicing `&json_str[..100]` panics
+    // when byte 100 lands inside a multi-byte UTF-8 character (L2).
+    let preview = |s: &str| -> String { s.chars().take(100).collect() };
+
+    // Parse once directly into OwnedValue rather than parsing to serde_json::Value
+    // and then re-parsing (E8): an object becomes OwnedValue::Object, anything
+    // else is rejected below.
+    let owned: tantivy::schema::OwnedValue = serde_json::from_str(json_str)
         .with_context(|| format!(
             "Failed to parse JSON string for field '{}': '{}'",
             field_name,
-            if json_str.len() > 100 { &json_str[..100] } else { json_str }
+            preview(json_str)
         ))?;
-    match parsed {
-        serde_json::Value::Object(_) => {
-            let owned: tantivy::schema::OwnedValue = serde_json::from_str(json_str)?;
-            if let tantivy::schema::OwnedValue::Object(obj) = owned {
-                let json_map: std::collections::BTreeMap<String, tantivy::schema::OwnedValue> =
-                    obj.into_iter().collect();
-                doc.add_object(field, json_map);
-            }
+    match owned {
+        tantivy::schema::OwnedValue::Object(obj) => {
+            let json_map: std::collections::BTreeMap<String, tantivy::schema::OwnedValue> =
+                obj.into_iter().collect();
+            doc.add_object(field, json_map);
         }
         _ => {
             anyhow::bail!(
                 "JSON field '{}' contains non-object value. JSON fields must contain JSON objects, got: {}",
                 field_name,
-                if json_str.len() > 100 { &json_str[..100] } else { json_str }
+                preview(json_str)
             );
         }
     }
@@ -1595,6 +1684,42 @@ fn build_column_mapping(
     mappings
 }
 
+/// Decode any Dictionary-encoded columns in a batch to their value type.
+///
+/// Non-dictionary columns are returned unchanged; when the batch has no
+/// dictionary columns the input is returned as-is (no allocation). This lets the
+/// per-type value extraction (which downcasts to concrete arrays like
+/// `StringArray`) handle pandas/pyarrow categorical columns instead of silently
+/// dropping them (M3).
+pub(crate) fn decode_dictionary_columns(batch: RecordBatch) -> Result<RecordBatch> {
+    let has_dict = batch.schema().fields().iter()
+        .any(|f| matches!(f.data_type(), DataType::Dictionary(_, _)));
+    if !has_dict {
+        return Ok(batch);
+    }
+
+    let schema = batch.schema();
+    let mut new_fields: Vec<Arc<arrow_schema::Field>> = Vec::with_capacity(batch.num_columns());
+    let mut new_cols: Vec<ArrayRef> = Vec::with_capacity(batch.num_columns());
+    for (i, field) in schema.fields().iter().enumerate() {
+        let col = batch.column(i);
+        if let DataType::Dictionary(_, value_type) = field.data_type() {
+            let decoded = arrow::compute::cast(col.as_ref(), value_type)
+                .with_context(|| format!("Failed to decode dictionary column '{}'", field.name()))?;
+            new_fields.push(Arc::new(arrow_schema::Field::new(
+                field.name(), value_type.as_ref().clone(), field.is_nullable(),
+            )));
+            new_cols.push(decoded);
+        } else {
+            new_fields.push(field.clone());
+            new_cols.push(col.clone());
+        }
+    }
+    let new_schema = Arc::new(ArrowSchema::new(new_fields));
+    RecordBatch::try_new(new_schema, new_cols)
+        .context("Failed to rebuild record batch after dictionary decode")
+}
+
 /// Compute relative path from table_root.
 fn compute_relative_path(file_path: &str, table_root: &str) -> String {
     if table_root.is_empty() {
@@ -1602,12 +1727,15 @@ fn compute_relative_path(file_path: &str, table_root: &str) -> String {
     }
 
     let root = table_root.trim_end_matches('/');
-    if file_path.starts_with(root) {
-        let relative = &file_path[root.len()..];
-        relative.trim_start_matches('/').to_string()
-    } else {
-        file_path.to_string()
+    // Only strip when `root` is a full path-segment prefix: the remainder must be
+    // empty or begin with '/'. Otherwise `/data/tablex/...` would be wrongly
+    // treated as living under root `/data/table` (L3).
+    if let Some(rest) = file_path.strip_prefix(root) {
+        if rest.is_empty() || rest.starts_with('/') {
+            return rest.trim_start_matches('/').to_string();
+        }
     }
+    file_path.to_string()
 }
 
 #[cfg(test)]
@@ -1632,6 +1760,17 @@ mod tests {
         assert_eq!(
             compute_relative_path("file.parquet", ""),
             "file.parquet"
+        );
+        // L3: a sibling directory sharing the root as a string prefix but not a
+        // path-segment prefix must NOT be stripped.
+        assert_eq!(
+            compute_relative_path("/data/tablex/part.parquet", "/data/table"),
+            "/data/tablex/part.parquet"
+        );
+        // Exact match → empty relative path.
+        assert_eq!(
+            compute_relative_path("/data/table", "/data/table"),
+            ""
         );
     }
 

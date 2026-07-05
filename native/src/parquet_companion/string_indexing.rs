@@ -103,16 +103,31 @@ pub fn needs_companion_field(mode: &StringIndexingMode) -> bool {
     )
 }
 
-/// Strip all regex matches from text, collapsing multiple whitespace to single spaces.
+/// Strip all regex matches from text.
+///
+/// When at least one match is replaced, the resulting text has its whitespace
+/// collapsed (multiple whitespace runs → single spaces) and trimmed, to tidy up
+/// the gaps left by removed matches.
+///
+/// When the regex does NOT match (the dominant case for UUID-mode fields), the
+/// input is returned byte-for-byte unchanged — no re-tokenizing, no reallocation,
+/// and importantly no whitespace collapsing. Collapsing on no-match rows would
+/// make the indexed text diverge from the source text even though nothing was
+/// stripped.
 pub fn strip_pattern(text: &str, compiled_regex: &regex::Regex) -> String {
-    let stripped = compiled_regex.replace_all(text, " ");
-    // Collapse multiple whitespace and trim
-    let mut collapsed = String::new();
-    for (i, word) in stripped.split_whitespace().enumerate() {
-        if i > 0 { collapsed.push(' '); }
-        collapsed.push_str(word);
+    match compiled_regex.replace_all(text, " ") {
+        // No replacement occurred: return the input unchanged.
+        std::borrow::Cow::Borrowed(_) => text.to_string(),
+        // A match was replaced: collapse whitespace and trim.
+        std::borrow::Cow::Owned(stripped) => {
+            let mut collapsed = String::new();
+            for (i, word) in stripped.split_whitespace().enumerate() {
+                if i > 0 { collapsed.push(' '); }
+                collapsed.push_str(word);
+            }
+            collapsed
+        }
     }
-    collapsed
 }
 
 /// Extract all regex matches from text, returning (stripped_text, matches).
@@ -274,6 +289,18 @@ mod tests {
         let text = "no uuids here";
         let result = strip_pattern(text, &re);
         assert_eq!(result, "no uuids here");
+    }
+
+    #[test]
+    fn test_strip_pattern_no_match_byte_identical() {
+        // When the regex never matches, the input must be returned unchanged,
+        // including any tabs, newlines, leading/trailing and repeated whitespace.
+        // Collapsing on a no-match row would make indexed text differ from source.
+        let re = regex::Regex::new(UUID_REGEX).unwrap();
+        let text = "  leading\tand\ttabs\nand   multiple   spaces  ";
+        let result = strip_pattern(text, &re);
+        assert_eq!(result, text);
+        assert_eq!(result.as_bytes(), text.as_bytes());
     }
 
     #[test]

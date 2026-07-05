@@ -81,12 +81,15 @@ pub fn combine_parquet_manifests(
     for (i, dir) in source_dirs.iter().enumerate() {
         let meta_path = dir.join("meta.json");
         if !meta_path.exists() {
-            crate::debug_println!(
-                "⚠️ PARQUET_MERGE: Missing meta.json in source split[{}] ({:?}), \
-                 skipping deletion check",
+            // A companion split always carries a meta.json; its absence means
+            // the extracted split is corrupt. Skipping the deletion check here
+            // could let a split with deletions through and corrupt doc→row
+            // mapping, so fail instead of silently continuing (L11).
+            anyhow::bail!(
+                "Cannot merge: source split[{}] ({:?}) is missing meta.json; \
+                 unable to verify it has no deletions.",
                 i, dir
             );
-            continue;
         }
         let meta_bytes = std::fs::read(&meta_path)
             .with_context(|| format!("Failed to read meta.json from {:?}", meta_path))?;
@@ -129,6 +132,26 @@ pub fn combine_parquet_manifests(
                      split[0] has {} mappings, split[{}] has {} mappings. \
                      All splits must be built from the same parquet schema.",
                     base_mapping.len(), i, manifest.column_mapping.len()
+                );
+            }
+        }
+    }
+
+    // Validate: all manifests share the same storage_config (M8).
+    // The combined manifest keeps only split[0]'s storage_config; if split[1]
+    // was built over a different bucket/endpoint, its relative paths would then
+    // resolve against the wrong storage after merge (wrong rows if a same-named
+    // file exists there). Reject the merge rather than silently mis-resolve.
+    if manifests.len() > 1 {
+        let base_storage = &manifests[0].storage_config;
+        for (i, manifest) in manifests.iter().enumerate().skip(1) {
+            if manifest.storage_config != *base_storage {
+                anyhow::bail!(
+                    "Cannot merge splits with incompatible storage_config: split[0] \
+                     and split[{}] were built over different storage backends. Only \
+                     split[0]'s storage_config is retained after merge, so relative \
+                     paths from other splits would resolve against the wrong backend.",
+                    i
                 );
             }
         }
@@ -202,22 +225,23 @@ pub fn combine_parquet_manifests(
         num_rows: cumulative_rows,
     }];
 
-    // Union string_hash_fields from all manifests (they should be identical for same-schema splits).
+    // Union string_hash_fields from all manifests. A hash-field-name mismatch for
+    // the same tantivy field means the splits hash that field differently, which
+    // would corrupt hash-based aggregation reads on the merged split — reject it
+    // with a hard error rather than a release-mode no-op debug_assert (D3).
     let mut combined_hash_fields = manifests[0].string_hash_fields.clone();
     for (i, manifest) in manifests.iter().enumerate().skip(1) {
         for (k, v) in &manifest.string_hash_fields {
             if let Some(existing) = combined_hash_fields.get(k) {
-                debug_assert_eq!(existing, v,
-                    "string_hash_fields mismatch during merge for field {}", k);
+                if existing != v {
+                    anyhow::bail!(
+                        "Cannot merge: string_hash_fields mismatch for field '{}' \
+                         between split[0] ({}) and split[{}] ({})",
+                        k, existing, i, v
+                    );
+                }
             }
             combined_hash_fields.insert(k.clone(), v.clone());
-        }
-        if manifest.string_hash_fields != manifests[0].string_hash_fields {
-            debug_println!(
-                "⚠️ MERGE_MANIFEST: string_hash_fields differ between split[0] and split[{}]; \
-                 using union (this may indicate schema inconsistency)",
-                i
-            );
         }
     }
 
@@ -294,6 +318,16 @@ pub fn combine_parquet_manifests(
 mod tests {
     use super::*;
 
+    /// Write a minimal no-deletion meta.json into a source split dir, matching
+    /// what a real extracted companion split always carries. Required because
+    /// combine_parquet_manifests now hard-fails on a missing meta.json (L11).
+    fn write_no_deletion_meta(dir: &Path) {
+        let meta = serde_json::json!({
+            "segments": [{ "segment_id": "seg", "max_doc": 1, "deletes": serde_json::Value::Null }]
+        });
+        std::fs::write(dir.join("meta.json"), serde_json::to_string(&meta).unwrap()).unwrap();
+    }
+
     fn make_test_manifest(table_root: &str, files: Vec<(&str, u64, u64)>) -> ParquetManifest {
         let mut parquet_files = Vec::new();
         let mut offset = 0u64;
@@ -357,6 +391,7 @@ mod tests {
         let m = make_test_manifest("s3://bucket/table", vec![("part1.parquet", 100, 1024)]);
         let serialized = serialize_manifest(&m).unwrap();
         std::fs::write(dir1.path().join(MANIFEST_FILENAME), &serialized).unwrap();
+        write_no_deletion_meta(dir1.path());
 
         let result = combine_parquet_manifests(
             &[dir1.path(), dir2.path()],
@@ -380,7 +415,9 @@ mod tests {
         m2.fast_field_mode = FastFieldMode::Hybrid;
 
         std::fs::write(dir1.path().join(MANIFEST_FILENAME), serialize_manifest(&m1).unwrap()).unwrap();
+        write_no_deletion_meta(dir1.path());
         std::fs::write(dir2.path().join(MANIFEST_FILENAME), serialize_manifest(&m2).unwrap()).unwrap();
+        write_no_deletion_meta(dir2.path());
 
         let result = combine_parquet_manifests(
             &[dir1.path(), dir2.path()],
@@ -402,7 +439,9 @@ mod tests {
         let m2 = make_test_manifest("s3://bucket", vec![("p2.parquet", 200, 2048)]);
 
         std::fs::write(dir1.path().join(MANIFEST_FILENAME), serialize_manifest(&m1).unwrap()).unwrap();
+        write_no_deletion_meta(dir1.path());
         std::fs::write(dir2.path().join(MANIFEST_FILENAME), serialize_manifest(&m2).unwrap()).unwrap();
+        write_no_deletion_meta(dir2.path());
 
         let result = combine_parquet_manifests(
             &[dir1.path(), dir2.path()],
@@ -440,8 +479,11 @@ mod tests {
         let m3 = make_test_manifest("s3://b", vec![("d.parquet", 100, 1024)]);
 
         std::fs::write(dir1.path().join(MANIFEST_FILENAME), serialize_manifest(&m1).unwrap()).unwrap();
+        write_no_deletion_meta(dir1.path());
         std::fs::write(dir2.path().join(MANIFEST_FILENAME), serialize_manifest(&m2).unwrap()).unwrap();
+        write_no_deletion_meta(dir2.path());
         std::fs::write(dir3.path().join(MANIFEST_FILENAME), serialize_manifest(&m3).unwrap()).unwrap();
+        write_no_deletion_meta(dir3.path());
 
         let result = combine_parquet_manifests(
             &[dir1.path(), dir2.path(), dir3.path()],
@@ -482,7 +524,9 @@ mod tests {
         let m2 = make_test_manifest("s3://bucket", vec![("p2.parquet", 200, 2048)]);
 
         std::fs::write(dir1.path().join(MANIFEST_FILENAME), serialize_manifest(&m1).unwrap()).unwrap();
+        write_no_deletion_meta(dir1.path());
         std::fs::write(dir2.path().join(MANIFEST_FILENAME), serialize_manifest(&m2).unwrap()).unwrap();
+        write_no_deletion_meta(dir2.path());
 
         // Write a meta.json with deletions in dir2, using tantivy's real shape:
         // deletions are nested under `deletes: {num_deleted_docs, opstamp}`.
@@ -520,7 +564,9 @@ mod tests {
         let m2 = make_test_manifest("s3://bucket", vec![("p2.parquet", 200, 2048)]);
 
         std::fs::write(dir1.path().join(MANIFEST_FILENAME), serialize_manifest(&m1).unwrap()).unwrap();
+        write_no_deletion_meta(dir1.path());
         std::fs::write(dir2.path().join(MANIFEST_FILENAME), serialize_manifest(&m2).unwrap()).unwrap();
+        write_no_deletion_meta(dir2.path());
 
         // Write meta.json with zero deletions — should pass
         let meta_no_deletions = serde_json::json!({
@@ -578,7 +624,9 @@ mod tests {
         }];
 
         std::fs::write(dir1.path().join(MANIFEST_FILENAME), serialize_manifest(&m1).unwrap()).unwrap();
+        write_no_deletion_meta(dir1.path());
         std::fs::write(dir2.path().join(MANIFEST_FILENAME), serialize_manifest(&m2).unwrap()).unwrap();
+        write_no_deletion_meta(dir2.path());
 
         let result = combine_parquet_manifests(
             &[dir1.path(), dir2.path()],
@@ -616,7 +664,9 @@ mod tests {
         });
 
         std::fs::write(dir1.path().join(MANIFEST_FILENAME), serialize_manifest(&m1).unwrap()).unwrap();
+        write_no_deletion_meta(dir1.path());
         std::fs::write(dir2.path().join(MANIFEST_FILENAME), serialize_manifest(&m2).unwrap()).unwrap();
+        write_no_deletion_meta(dir2.path());
 
         let result = combine_parquet_manifests(
             &[dir1.path(), dir2.path()],
@@ -649,7 +699,9 @@ mod tests {
         m2.string_indexing_modes.insert("field_a".to_string(), StringIndexingMode::TextUuidStrip);
 
         std::fs::write(dir1.path().join(MANIFEST_FILENAME), serialize_manifest(&m1).unwrap()).unwrap();
+        write_no_deletion_meta(dir1.path());
         std::fs::write(dir2.path().join(MANIFEST_FILENAME), serialize_manifest(&m2).unwrap()).unwrap();
+        write_no_deletion_meta(dir2.path());
 
         let result = combine_parquet_manifests(
             &[dir1.path(), dir2.path()],
@@ -682,7 +734,9 @@ mod tests {
         m2.column_mapping = mapping;
 
         std::fs::write(dir1.path().join(MANIFEST_FILENAME), serialize_manifest(&m1).unwrap()).unwrap();
+        write_no_deletion_meta(dir1.path());
         std::fs::write(dir2.path().join(MANIFEST_FILENAME), serialize_manifest(&m2).unwrap()).unwrap();
+        write_no_deletion_meta(dir2.path());
 
         let result = combine_parquet_manifests(
             &[dir1.path(), dir2.path()],

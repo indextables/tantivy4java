@@ -843,6 +843,25 @@ pub(crate) fn arrow_json_value(array: &ArrayRef, row_idx: usize) -> serde_json::
             }
             serde_json::Value::Array(arr)
         }
+        DataType::LargeList(_) => {
+            let list = array.as_any().downcast_ref::<LargeListArray>().expect("Expected LargeListArray array");
+            let values = list.value(row_idx);
+            let mut arr = Vec::new();
+            for i in 0..values.len() {
+                arr.push(arrow_json_value(&values, i));
+            }
+            serde_json::Value::Array(arr)
+        }
+        DataType::FixedSizeList(_, _) => {
+            // e.g. embedding vectors — serialize element-wise as a JSON array (M12).
+            let list = array.as_any().downcast_ref::<FixedSizeListArray>().expect("Expected FixedSizeListArray array");
+            let values = list.value(row_idx);
+            let mut arr = Vec::new();
+            for i in 0..values.len() {
+                arr.push(arrow_json_value(&values, i));
+            }
+            serde_json::Value::Array(arr)
+        }
         DataType::Struct(_) => {
             let struct_arr = array.as_any().downcast_ref::<StructArray>().expect("Expected StructArray array");
             let mut map = serde_json::Map::new();
@@ -867,6 +886,14 @@ pub(crate) fn arrow_json_value(array: &ArrayRef, row_idx: usize) -> serde_json::
                 }
             }
             serde_json::Value::Object(map)
+        }
+        DataType::Dictionary(_, value_type) => {
+            // Decode categorical columns to their value type rather than yielding
+            // null (M3). Cast the whole array once; callers are per-row.
+            match arrow::compute::cast(array.as_ref(), value_type) {
+                Ok(decoded) => arrow_json_value(&decoded, row_idx),
+                Err(_) => serde_json::Value::Null,
+            }
         }
         _ => {
             // Leaf types

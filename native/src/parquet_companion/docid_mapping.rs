@@ -60,34 +60,44 @@ pub fn locate_row_in_file(
         ));
     }
 
-    // Binary search: find the last file whose row_offset <= global_row
-    let file_idx = match manifest
+    // Find the file whose half-open range [row_offset, row_offset + num_rows)
+    // contains global_row. We search on the *end* offset (row_offset + num_rows)
+    // rather than the start offset so the resolution is deterministic even when a
+    // zero-row file shares its row_offset with the following file: a zero-row
+    // file's range is empty (end == start) so `partition_point` never selects it.
+    //
+    // Files are stored in row order and are contiguous, so the end offsets are
+    // non-decreasing and this predicate is true for a prefix then false — the
+    // requirement for `partition_point`.
+    let file_idx = manifest
         .parquet_files
-        .binary_search_by_key(&global_row, |f| f.row_offset)
-    {
-        Ok(idx) => idx,
-        Err(idx) => {
-            // idx is where global_row would be inserted; the file is at idx - 1
-            if idx == 0 {
-                return Err(format!(
-                    "Global row {} is before first file offset {}",
-                    global_row, manifest.parquet_files[0].row_offset
-                ));
-            }
-            idx - 1
-        }
-    };
+        .partition_point(|f| f.row_offset + f.num_rows <= global_row);
+
+    // Because files cover [0, total_rows) contiguously and global_row <
+    // total_rows, partition_point always yields a valid, non-empty file. Guard
+    // defensively against a malformed manifest that slips past validation.
+    if file_idx >= manifest.parquet_files.len() {
+        return Err(format!(
+            "Global row {} could not be located in any parquet file \
+             (manifest may be malformed)",
+            global_row
+        ));
+    }
 
     let file = &manifest.parquet_files[file_idx];
-    let row_in_file = global_row - file.row_offset;
+    let row_in_file = global_row.checked_sub(file.row_offset).ok_or_else(|| {
+        format!(
+            "Global row {} precedes file[{}] offset {} (manifest may be malformed)",
+            global_row, file_idx, file.row_offset
+        )
+    })?;
 
-    debug_assert!(
-        row_in_file < file.num_rows,
-        "row_in_file {} >= num_rows {} for file[{}]",
-        row_in_file,
-        file.num_rows,
-        file_idx
-    );
+    if row_in_file >= file.num_rows {
+        return Err(format!(
+            "row_in_file {} >= num_rows {} for file[{}] (manifest may be malformed)",
+            row_in_file, file.num_rows, file_idx
+        ));
+    }
 
     Ok(FileRowLocation {
         file_idx,
@@ -284,6 +294,86 @@ mod tests {
     fn test_locate_out_of_range() {
         let manifest = make_multi_file_manifest();
         assert!(locate_row_in_file(3000, &manifest).is_err());
+    }
+
+    fn make_entry(path: &str, row_offset: u64, num_rows: u64) -> ParquetFileEntry {
+        ParquetFileEntry {
+            relative_path: path.to_string(),
+            file_size_bytes: 1024,
+            row_offset,
+            num_rows,
+            has_offset_index: false,
+            row_groups: vec![],
+        }
+    }
+
+    fn manifest_with_files(files: Vec<ParquetFileEntry>) -> ParquetManifest {
+        let total: u64 = files.iter().map(|f| f.num_rows).sum();
+        let mut m = make_multi_file_manifest();
+        m.parquet_files = files;
+        m.total_rows = total;
+        m.segment_row_ranges = vec![SegmentRowRange { segment_ord: 0, row_offset: 0, num_rows: total }];
+        m
+    }
+
+    #[test]
+    fn test_locate_skips_leading_zero_row_file() {
+        // A zero-row file shares row_offset 0 with the following real file.
+        // Every lookup must resolve to the real (non-empty) file, never the
+        // zero-row one.
+        let manifest = manifest_with_files(vec![
+            make_entry("empty.parquet", 0, 0),
+            make_entry("real.parquet", 0, 1000),
+        ]);
+
+        let loc = locate_row_in_file(0, &manifest).unwrap();
+        assert_eq!(loc.file_idx, 1, "row 0 must map to the real file, not the zero-row file");
+        assert_eq!(loc.row_in_file, 0);
+
+        let loc = locate_row_in_file(999, &manifest).unwrap();
+        assert_eq!(loc.file_idx, 1);
+        assert_eq!(loc.row_in_file, 999);
+    }
+
+    #[test]
+    fn test_locate_skips_interior_zero_row_file() {
+        // real(0..1000), zero-row(1000..1000), real2(1000..2000).
+        // The zero-row file shares row_offset 1000 with real2 and must never
+        // be selected.
+        let manifest = manifest_with_files(vec![
+            make_entry("a.parquet", 0, 1000),
+            make_entry("empty.parquet", 1000, 0),
+            make_entry("b.parquet", 1000, 1000),
+        ]);
+
+        let loc = locate_row_in_file(999, &manifest).unwrap();
+        assert_eq!(loc.file_idx, 0);
+        assert_eq!(loc.row_in_file, 999);
+
+        // Boundary row 1000 belongs to real2 (index 2), not the zero-row file.
+        let loc = locate_row_in_file(1000, &manifest).unwrap();
+        assert_eq!(loc.file_idx, 2, "boundary row must map to the real file at that offset");
+        assert_eq!(loc.row_in_file, 0);
+
+        let loc = locate_row_in_file(1999, &manifest).unwrap();
+        assert_eq!(loc.file_idx, 2);
+        assert_eq!(loc.row_in_file, 999);
+    }
+
+    #[test]
+    fn test_locate_trailing_zero_row_file() {
+        // A trailing zero-row file must not affect resolution of real rows.
+        let manifest = manifest_with_files(vec![
+            make_entry("real.parquet", 0, 1000),
+            make_entry("empty.parquet", 1000, 0),
+        ]);
+
+        let loc = locate_row_in_file(999, &manifest).unwrap();
+        assert_eq!(loc.file_idx, 0);
+        assert_eq!(loc.row_in_file, 999);
+
+        // row 1000 is out of range (total_rows == 1000).
+        assert!(locate_row_in_file(1000, &manifest).is_err());
     }
 
     #[test]

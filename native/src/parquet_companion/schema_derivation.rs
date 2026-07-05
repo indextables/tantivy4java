@@ -382,11 +382,17 @@ fn add_field_for_arrow_type(
         }
 
         DataType::Binary | DataType::LargeBinary | DataType::FixedSizeBinary(_) => {
+            // Bytes must consult should_add_fast so the Disabled "fast for ALL"
+            // contract holds and meta.json fast promotion is backed by real
+            // native data (bytes are not transcode-serviceable from parquet) — M4.
+            let mut opts = BytesOptions::default().set_indexed();
             if config.store_fields {
-                builder.add_bytes_field(name, INDEXED | STORED);
-            } else {
-                builder.add_bytes_field(name, INDEXED);
+                opts = opts.set_stored();
             }
+            if should_add_fast(config, name, data_type) {
+                opts = opts.set_fast();
+            }
+            builder.add_bytes_field(name, opts);
         }
 
         DataType::Timestamp(_, _) | DataType::Date32 | DataType::Date64 => {
@@ -420,6 +426,14 @@ fn add_field_for_arrow_type(
             builder.add_json_field(name, opts);
         }
 
+        DataType::Dictionary(_, value_type) => {
+            // Dictionary-encoded (pandas/pyarrow categorical) columns: derive the
+            // field by the DECODED value type so they are searchable instead of
+            // being silently dropped as an "Unknown" column (M3). Batches are
+            // decoded to the value type before indexing/retrieval.
+            return add_field_for_arrow_type(builder, name, value_type, config, all_field_names);
+        }
+
         _ => {
             debug_println!(
                 "⚠️ SCHEMA_DERIVE: Unsupported type {:?} for field '{}', skipping",
@@ -442,16 +456,26 @@ fn add_field_for_arrow_type(
 /// so the reader sees all fields as fast. The ParquetAugmentedDirectory then intercepts
 /// .fast file reads for fields that have no native data and serves from parquet.
 fn should_add_fast(config: &SchemaDerivationConfig, field_name: &str, data_type: &DataType) -> bool {
+    // Types the transcode path cannot reconstruct from the parquet column (it has
+    // no IpAddr/Bytes/Decimal256 arm) must ALWAYS get native fast data, in every
+    // mode — otherwise meta.json promotes them to fast but reads find no native
+    // data and no parquet fallback, so aggregations silently return empty (IP in
+    // ParquetOnly) or hard-error at query time (Decimal256/FixedSizeBinary in
+    // Hybrid) — M4. IP fields arrive as Utf8 columns declared via config.
+    let non_parquet_serviceable = config.ip_address_fields.contains(field_name)
+        || matches!(data_type,
+            DataType::Binary | DataType::LargeBinary | DataType::FixedSizeBinary(_)
+            | DataType::Decimal256(_, _)
+        );
+
     match config.fast_field_mode {
         FastFieldMode::Disabled => true, // All native fast fields
         FastFieldMode::Hybrid => {
-            // IP address fields are treated as native fast fields in hybrid mode,
-            // even though they come from Utf8 Arrow columns.
-            if config.ip_address_fields.contains(field_name) {
+            if non_parquet_serviceable {
                 return true;
             }
-            // Only numeric/bool/date get native fast fields in hybrid mode
-            // Text fields are served from parquet at read time
+            // Numeric/bool/date get native fast fields in hybrid mode; raw text
+            // fields are served from parquet at read time (transcode-serviceable).
             matches!(data_type,
                 DataType::Boolean
                 | DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
@@ -461,7 +485,9 @@ fn should_add_fast(config: &SchemaDerivationConfig, field_name: &str, data_type:
                 | DataType::Timestamp(_, _) | DataType::Date32 | DataType::Date64
             )
         }
-        FastFieldMode::ParquetOnly => false, // No native fast fields
+        // ParquetOnly serves everything from parquet EXCEPT the non-serviceable
+        // types, which still need native fast data.
+        FastFieldMode::ParquetOnly => non_parquet_serviceable,
     }
 }
 
@@ -547,12 +573,19 @@ pub fn arrow_type_to_tantivy_type(data_type: &DataType) -> &'static str {
         DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => "I64",
         DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 => "U64",
         DataType::Float32 | DataType::Float64 => "F64",
+        // Decimal128 → F64 is a deliberate, lossy design point: values above 2^53
+        // or with non-zero scale lose precision, but index and retrieval share the
+        // same f64 round-trip so they stay mutually consistent (L10). Decimal256
+        // is kept as text to avoid exceeding f64 range entirely.
         DataType::Decimal128(_, _) => "F64",
         DataType::Decimal256(_, _) => "Str",
         DataType::Utf8 | DataType::LargeUtf8 => "Str",
         DataType::Binary | DataType::LargeBinary | DataType::FixedSizeBinary(_) => "Bytes",
         DataType::Timestamp(_, _) | DataType::Date32 | DataType::Date64 => "Date",
-        DataType::List(_) | DataType::LargeList(_) | DataType::Map(_, _) | DataType::Struct(_) => "Json",
+        DataType::List(_) | DataType::LargeList(_) | DataType::FixedSizeList(_, _)
+            | DataType::Map(_, _) | DataType::Struct(_) => "Json",
+        // Dictionary-encoded columns map by their decoded value type (M3).
+        DataType::Dictionary(_, value_type) => arrow_type_to_tantivy_type(value_type),
         _ => "Unknown",
     }
 }
@@ -574,6 +607,8 @@ pub fn arrow_type_to_parquet_type(data_type: &DataType) -> &'static str {
         DataType::Timestamp(_, _) => "INT64",
         DataType::Date32 => "INT32",
         DataType::Date64 => "INT64",
+        // Dictionary-encoded columns map by their decoded value type (M3).
+        DataType::Dictionary(_, value_type) => arrow_type_to_parquet_type(value_type),
         _ => "BYTE_ARRAY",
     }
 }
@@ -866,7 +901,7 @@ mod tests {
     }
 
     #[test]
-    fn test_ip_address_field_parquet_only_not_fast() {
+    fn test_ip_address_field_parquet_only_is_fast() {
         let arrow = ArrowSchema::new(vec![
             Field::new("src_ip", DataType::Utf8, true),
         ]);
@@ -876,9 +911,11 @@ mod tests {
 
         let schema = derive_tantivy_schema(&arrow, &config).unwrap();
 
+        // IP fields have no parquet transcode arm, so they must be NATIVE fast
+        // even in ParquetOnly — otherwise IP aggregations silently return empty (M4).
         let src_ip_field = schema.get_field("src_ip").unwrap();
         let src_ip_entry = schema.get_field_entry(src_ip_field);
-        assert!(!src_ip_entry.is_fast(), "IP fields should NOT be fast in ParquetOnly mode");
+        assert!(src_ip_entry.is_fast(), "IP fields must be fast even in ParquetOnly mode");
     }
 
     #[test]
