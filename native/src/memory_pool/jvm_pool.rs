@@ -321,11 +321,17 @@ impl MemoryPool for JvmMemoryPool {
             let want = std::cmp::max(deficit, self.config.acquire_increment);
 
             match self.jni_acquire(want) {
-                Ok(acquired) if acquired >= size => {
+                // Success requires covering the DEFICIT, not this call's `size`: the
+                // existing grant already backs `new_used - deficit`, so acquiring
+                // `deficit` more makes `granted == new_used`. Checking against `size`
+                // here would spuriously deny whenever prior grant already covered part
+                // of the usage (deficit < size). When deficit == 0 (a high-watermark
+                // headroom top-up while still within grant) any result is fine.
+                Ok(acquired) if acquired >= deficit => {
                     self.jvm_granted.fetch_add(acquired, Relaxed);
                 }
                 Ok(acquired) => {
-                    // JVM gave us less than we need — release what we got, undo, fail
+                    // JVM gave us less than the deficit — release what we got, undo, fail
                     if acquired > 0 {
                         let _ = self.jni_release(acquired);
                     }
