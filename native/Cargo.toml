@@ -94,7 +94,7 @@ url = "2"
 iceberg = "0.8"
 iceberg-catalog-rest = "0.8"
 iceberg-catalog-glue = "0.8"
-iceberg-catalog-hms = "0.8"
+iceberg-catalog-hms = "0.9"
 
 [build-dependencies]
 jni = "0.21.1"
