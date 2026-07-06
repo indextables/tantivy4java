@@ -86,7 +86,7 @@ parking_lot = "0.12"
 moka = { version = "0.12", features = ["sync"] }
 
 # Delta Lake table file listing via delta-kernel-rs
-delta_kernel = { version = "0.19", features = ["default-engine-rustls", "arrow"] }
+delta_kernel = { version = "0.24", features = ["default-engine-rustls", "arrow"] }
 object_store = { version = "0.12", features = ["aws", "azure"] }
 url = "2"
 
