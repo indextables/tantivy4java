@@ -67,7 +67,7 @@ sstable = { git = "https://github.com/indextables/tantivy", rev = "d491895f1cd54
 common = { git = "https://github.com/indextables/tantivy", rev = "d491895f1cd54d166c8010469d4625ae81c636f3", package = "tantivy-common" }
 
 # Parquet companion mode - enables minimal splits referencing external parquet files
-parquet = { version = "57", default-features = false, features = ["async", "arrow", "zstd", "lz4", "snap", "flate2", "flate2-rust_backened"] }
+parquet = { version = "59", default-features = false, features = ["async", "arrow", "zstd", "lz4", "snap", "flate2", "flate2-rust_backened"] }
 arrow = { version = "57", default-features = false, features = ["ffi"] }
 arrow-schema = "57"
 arrow-array = "57"
