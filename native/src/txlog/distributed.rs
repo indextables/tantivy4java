@@ -54,8 +54,16 @@ pub(crate) fn parse_metadata_json(json_str: &str) -> Option<MetadataAction> {
     serde_json::from_value(inner.clone()).ok()
 }
 
-/// Read multiple version files concurrently, silently ignoring all errors
-/// (including NotFound). Returns (version, actions) pairs sorted ascending.
+/// Read multiple version files concurrently. Returns (version, actions) pairs
+/// sorted ascending.
+///
+/// A **NotFound** on any version is tolerated (skipped) — this handles benign
+/// TRUNCATE/PURGE races where a version file was legitimately removed. Any other
+/// error (transient S3/Azure throttle, network failure, corrupt file) is
+/// **propagated**, because silently dropping such a version would produce a
+/// snapshot/checkpoint that is missing committed adds or removes. See the sibling
+/// `read_post_checkpoint_changes` which uses the same NotFound-skip / else-propagate
+/// discipline.
 ///
 /// `max_concurrent` bounds the number of in-flight object-store GETs to prevent
 /// S3/Azure rate-limit throttling on large catch-up reads.
@@ -63,24 +71,29 @@ async fn read_versions_concurrent(
     storage: &TxLogStorage,
     versions: impl IntoIterator<Item = i64>,
     max_concurrent: usize,
-) -> Vec<(i64, Vec<Action>)> {
+) -> Result<Vec<(i64, Vec<Action>)>> {
     let versions: Vec<i64> = versions.into_iter().collect();
     let futures = versions.into_iter().map(|v| {
         let storage = storage; // copy &TxLogStorage (references are Copy)
         async move {
             match version_file::read_version(storage, v).await {
-                Ok(actions) => Some((v, actions)),
-                Err(_) => None,
+                Ok(actions) => Ok(Some((v, actions))),
+                Err(e) if is_not_found_error(&e) => Ok(None), // benign TRUNCATE/PURGE race
+                Err(e) => Err(e),                             // transient/real I/O error → propagate
             }
         }
     });
     let mut results: Vec<(i64, Vec<Action>)> = stream::iter(futures)
         .buffer_unordered(max_concurrent)
-        .filter_map(|opt| async move { opt })
-        .collect()
-        .await;
+        .collect::<Vec<Result<Option<(i64, Vec<Action>)>>>>()
+        .await
+        .into_iter()
+        .collect::<Result<Vec<Option<(i64, Vec<Action>)>>>>()?
+        .into_iter()
+        .flatten()
+        .collect();
     results.sort_by_key(|(v, _)| *v);
-    results
+    Ok(results)
 }
 
 /// Run up to `max_concurrent` futures concurrently, collecting results in order.
@@ -112,7 +125,14 @@ where
 
 /// Returns true if the error represents a "not found" condition from
 /// any object store backend (S3, Azure, local filesystem).
+///
+/// Prefers the structural `TxLogError::NotFound` variant (produced by
+/// `TxLogStorage::get`); falls back to substring matching only for errors that
+/// still flatten a NotFound into a formatted message from another code path.
 fn is_not_found_error(e: &TxLogError) -> bool {
+    if matches!(e, TxLogError::NotFound { .. }) {
+        return true;
+    }
     let s = e.to_string();
     s.contains("not found") || s.contains("NotFound")
         || s.contains("No such file") || s.contains("404")
@@ -133,6 +153,12 @@ pub struct TxLogSnapshotInfo {
     pub state_dir: String,
     /// Tombstones from the checkpoint's StateManifest (paths of removed files).
     pub tombstones: Vec<String>,
+    /// Post-checkpoint version actions already parsed while building this snapshot
+    /// (for protocol/metadata override). When `Some`, `list_files` reuses these
+    /// instead of re-fetching the same version files — eliminating a 2× GET per
+    /// query on tables with post-checkpoint commits (TXLOG_MODULE_REVIEW E1).
+    /// `None` means "not captured; fall back to reading `post_checkpoint_version_paths`".
+    pub post_checkpoint_actions: Option<Vec<(i64, Vec<Action>)>>,
 }
 
 #[derive(Debug, Clone)]
@@ -213,19 +239,23 @@ pub async fn get_txlog_snapshot_info_with_cache(
 
                 // If there are post-checkpoint versions, read them for potential
                 // protocol/metadata overrides. This is critical for concurrent
-                // metadata updates — the cached metadata may be stale.
+                // metadata updates — the cached metadata may be stale. The parsed
+                // actions are captured and reused by list_files (E1: no re-fetch).
+                let mut captured_actions: Option<Vec<(i64, Vec<Action>)>> = None;
                 let (effective_protocol, mut effective_metadata) = if post_cp_paths.is_empty() {
                     (Some(cached_meta.0.clone()), cached_meta.1.clone())
                 } else {
                     let post_cp_versions: Vec<i64> = all_versions.iter().copied()
                         .filter(|&v| v > cached_cp.version)
                         .collect();
-                    let post_cp_actions = read_versions_concurrent(&storage, post_cp_versions, max_concurrent).await;
+                    let post_cp_actions = read_versions_concurrent(&storage, post_cp_versions, max_concurrent).await?;
                     let (post_protocol, post_metadata) = log_replay::extract_metadata(&[], &post_cp_actions);
-                    (
+                    let result = (
                         post_protocol.or(Some(cached_meta.0.clone())),
                         post_metadata.unwrap_or_else(|| cached_meta.1.clone()),
-                    )
+                    );
+                    captured_actions = Some(post_cp_actions);
+                    result
                 };
 
                 // Bug 2b fix: Merge schema_registry into effective_metadata.configuration
@@ -245,6 +275,7 @@ pub async fn get_txlog_snapshot_info_with_cache(
                     metadata: effective_metadata,
                     state_dir,
                     tombstones: state_manifest.tombstones.clone(),
+                    post_checkpoint_actions: captured_actions,
                 });
             }
         }
@@ -302,7 +333,7 @@ async fn snapshot_from_checkpoint(
     let post_cp_paths: Vec<String> = post_cp_versions.iter()
         .map(|v| TxLogStorage::version_path(*v))
         .collect();
-    let all_version_actions = read_versions_concurrent(storage, post_cp_versions.clone(), max_concurrent).await;
+    let all_version_actions = read_versions_concurrent(storage, post_cp_versions.clone(), max_concurrent).await?;
 
     // Source protocol/metadata from the checkpoint's cached JSON first,
     // then override with any updates from post-checkpoint version files.
@@ -431,6 +462,8 @@ async fn snapshot_from_checkpoint(
         metadata,
         state_dir,
         tombstones: state_manifest.tombstones.clone(),
+        // Reuse the already-parsed post-checkpoint actions in list_files (E1).
+        post_checkpoint_actions: Some(all_version_actions),
     })
 }
 
@@ -451,7 +484,7 @@ async fn snapshot_from_version_scan(
     }
 
     // Read ALL version files to extract protocol/metadata — concurrently
-    let all_version_actions = read_versions_concurrent(storage, all_versions.iter().copied(), max_concurrent).await;
+    let all_version_actions = read_versions_concurrent(storage, all_versions.iter().copied(), max_concurrent).await?;
 
     // Extract protocol/metadata from all versions
     let v0_actions = all_version_actions.iter()
@@ -488,6 +521,8 @@ async fn snapshot_from_version_scan(
         metadata,
         state_dir: String::new(),
         tombstones: vec![],
+        // All version files were already read here; reuse them in list_files (E1).
+        post_checkpoint_actions: Some(all_version_actions),
     })
 }
 
@@ -608,6 +643,40 @@ pub async fn read_post_checkpoint_changes(
     })
 }
 
+/// Build `TxLogChanges` from post-checkpoint version actions that were already
+/// parsed while constructing the snapshot (E1) — avoids re-fetching the same
+/// version files in `list_files`. Mirrors the action processing in
+/// `read_post_checkpoint_changes`.
+pub fn changes_from_versioned_actions(
+    versioned: &[(i64, Vec<Action>)],
+    metadata_config: &HashMap<String, String>,
+) -> TxLogChanges {
+    let max_version = versioned.iter().map(|(v, _)| *v).max().unwrap_or(0);
+    let mut added = Vec::new();
+    let mut removed = Vec::new();
+    let mut skips = Vec::new();
+    for (version, actions) in versioned {
+        for action in actions {
+            match action {
+                Action::Add(add) => {
+                    let mut add = add.clone();
+                    schema_dedup::restore_schemas_on_adds(std::slice::from_mut(&mut add), metadata_config);
+                    let timestamp = add.modification_time;
+                    added.push(FileEntry {
+                        add,
+                        added_at_version: *version,
+                        added_at_timestamp: timestamp,
+                    });
+                }
+                Action::Remove(r) => removed.push(r.path.clone()),
+                Action::MergeSkip(s) => skips.push(s.clone()),
+                _ => {}
+            }
+        }
+    }
+    TxLogChanges { added_files: added, removed_paths: removed, skip_actions: skips, max_version }
+}
+
 // ============================================================================
 // Executor-side primitive: read_manifest
 // ============================================================================
@@ -674,6 +743,36 @@ pub struct WriteResult {
     pub conflicted_versions: Vec<i64>,
 }
 
+/// Flag (via debug log) any path that is both Added and Removed in the same batch
+/// of actions — a violation of the never-re-added invariant that would break the
+/// unordered add/remove merge in list_files. O(n), no I/O.
+///
+/// The whole scan is a diagnostic whose only output is a debug log, so it is skipped
+/// entirely unless debug logging is enabled — no HashSet allocation or scan on the
+/// hot write path in production (TANTIVY4JAVA_DEBUG off).
+fn detect_readd_within_batch(actions: &[Action]) {
+    if !*crate::debug::DEBUG_ENABLED {
+        return;
+    }
+    let added: std::collections::HashSet<&str> = actions.iter()
+        .filter_map(|a| match a { Action::Add(add) => Some(add.path.as_str()), _ => None })
+        .collect();
+    if added.is_empty() {
+        return;
+    }
+    for a in actions {
+        if let Action::Remove(r) = a {
+            if added.contains(r.path.as_str()) {
+                debug_println!(
+                    "⚠️ DISTRIBUTED: never-re-added invariant violated — path is both Added and Removed \
+                     in the same version batch: {}. Unordered add/remove merging assumes this never happens.",
+                    r.path
+                );
+            }
+        }
+    }
+}
+
 /// Write a new version file with automatic conflict retry.
 pub async fn write_version(
     table_path: &str,
@@ -682,6 +781,14 @@ pub async fn write_version(
     retry_config: RetryConfig,
 ) -> Result<WriteResult> {
     let storage = TxLogStorage::new(table_path, config)?;
+
+    // Cheap enforcement of the never-re-added invariant (TXLOG_MODULE_REVIEW C1):
+    // detect a path that is both Added and Removed within this same batch. A true
+    // cross-version check would require reading the current tombstone set on every
+    // write (not cheap), so we only flag the free, in-batch contradiction here. The
+    // unordered add/remove merge in list_files relies on this never happening.
+    detect_readd_within_batch(&actions);
+
     let mut conflicted = Vec::new();
     // On the first attempt we LIST to find the current version. On each conflict
     // the correct next candidate is last_conflict + 1 — no re-LIST needed.
@@ -721,11 +828,15 @@ pub async fn write_version(
             retry_config.base_delay_ms * (1 << attempt.min(10)),
             retry_config.max_delay_ms,
         );
-        // Add ±25% jitter
+        // Add ±25% jitter. Mix the process id into the seed so contending processes
+        // at the same attempt number get *different* delays — without it, every
+        // process computes an identical jitter and the thundering herd is not
+        // decorrelated at all. (No `rand` dependency needed.)
         let jitter_range = base_delay / 4;
         let jitter = if jitter_range > 0 {
-            // Simple deterministic jitter based on attempt number to avoid rand dependency
-            (attempt as u64 * 7919) % (jitter_range * 2) // pseudo-random spread
+            let seed = (attempt as u64).wrapping_mul(7919)
+                .wrapping_add((std::process::id() as u64).wrapping_mul(2_654_435_761));
+            seed % (jitter_range * 2) // pseudo-random spread, per-process
         } else {
             0
         };
@@ -817,24 +928,36 @@ pub async fn initialize_table(
 // Auto-checkpoint support (GAP-10)
 // ============================================================================
 
-/// Check if auto-checkpoint is enabled. Disabled when checkpoint_interval=0.
-fn is_auto_checkpoint_enabled(config_map: &HashMap<String, String>) -> bool {
-    let val_str = config_map.get("checkpoint_interval")
-        .or_else(|| config_map.get("checkpoint.interval"));
-    match val_str {
-        Some(s) => {
-            let interval: i64 = s.parse().unwrap_or(1);
-            interval > 0
-        }
-        None => true, // enabled by default
-    }
+/// Resolve the configured checkpoint interval.
+///
+/// - Missing / unparseable → 1 (checkpoint after every commit — the default).
+/// - `0` (or negative)     → 0, which disables auto-checkpointing entirely.
+/// - `N > 0`               → checkpoint only on versions where `version % N == 0`.
+fn checkpoint_interval(config_map: &HashMap<String, String>) -> i64 {
+    config_map.get("checkpoint_interval")
+        .or_else(|| config_map.get("checkpoint.interval"))
+        .and_then(|s| s.parse::<i64>().ok())
+        .map(|n| n.max(0))
+        .unwrap_or(1)
 }
 
-/// Create a checkpoint (state directory + _last_checkpoint) after every write.
+/// Whether a checkpoint should be written at `written_version`, honoring the
+/// configured interval. Interval `N` means "checkpoint every N commits", so a
+/// checkpoint is only written when `written_version` is a multiple of `N`.
+/// Interval `0` disables checkpointing.
+fn should_checkpoint_at(config_map: &HashMap<String, String>, written_version: i64) -> bool {
+    let interval = checkpoint_interval(config_map);
+    interval > 0 && written_version >= 0 && written_version % interval == 0
+}
+
+/// Create a checkpoint (state directory + _last_checkpoint) when `written_version`
+/// lands on a checkpoint boundary — i.e. every `checkpoint_interval` commits
+/// (`written_version % interval == 0`; default interval 1 = every write). See
+/// `should_checkpoint_at`.
 ///
-/// Matches Scala behavior: uses incremental writes when a previous checkpoint exists
-/// (reusing existing manifest references and accumulating tombstones), falling back to
-/// compacted writes when no checkpoint exists or tombstone ratio is high.
+/// Uses incremental writes when a previous checkpoint exists (reusing existing
+/// manifest references and accumulating tombstones), falling back to compacted writes
+/// when no checkpoint exists or the tombstone ratio is high.
 /// Set checkpoint_interval=0 to disable entirely.
 /// Failures are logged but never fail the write operation.
 pub async fn maybe_auto_checkpoint(
@@ -843,7 +966,7 @@ pub async fn maybe_auto_checkpoint(
     config_map: &HashMap<String, String>,
     written_version: i64,
 ) {
-    if written_version < 0 || !is_auto_checkpoint_enabled(config_map) {
+    if !should_checkpoint_at(config_map, written_version) {
         return;
     }
     let max_concurrent = extract_max_concurrent(config_map);
@@ -877,7 +1000,16 @@ pub async fn maybe_auto_checkpoint(
             let post_cp_versions: Vec<i64> = all_versions.iter().copied()
                 .filter(|&v| v > cp_version && v <= written_version)
                 .collect();
-            let post_cp_actions = read_versions_concurrent(&storage, post_cp_versions, max_concurrent).await;
+            // Abort (rather than persist a lossy checkpoint) if any version read
+            // fails with a non-NotFound error. Auto-checkpoint is best-effort; a
+            // transient read error here must not drop committed adds/removes.
+            let post_cp_actions = match read_versions_concurrent(&storage, post_cp_versions, max_concurrent).await {
+                Ok(a) => a,
+                Err(e) => {
+                    debug_println!("⚠️ DISTRIBUTED: auto-checkpoint aborted, read_versions_concurrent failed: {}", e);
+                    return;
+                }
+            };
 
             // Extract new adds and removes from post-checkpoint versions
             let mut new_adds: Vec<FileEntry> = Vec::new();
@@ -910,129 +1042,52 @@ pub async fn maybe_auto_checkpoint(
             use super::tombstone_distributor;
 
             if tombstone_distributor::needs_compaction(&base_manifest, removed_paths.len()) {
-                // Compaction needed — try selective first, fall back to full
-                let partition_columns = metadata.partition_columns.clone();
-                let all_tombstones: std::collections::HashSet<String> = base_manifest.tombstones.iter()
-                    .chain(removed_paths.iter())
-                    .cloned()
+                // Full compaction — read every manifest, apply tombstones, replay, write fresh.
+                //
+                // NOTE: a "selective" compaction path previously lived here but read the
+                // dirty manifests AND all clean manifests and then wrote a fully compacted
+                // checkpoint anyway — producing an output identical to full compaction while
+                // adding a second manifest fan-out and a path-based partition heuristic. It
+                // was collapsed into full compaction (TXLOG_MODULE_REVIEW E3). A genuine
+                // selective compaction would reuse kept manifest refs (via
+                // write_incremental_state_directory) rather than re-reading and rewriting
+                // them; until that exists, one code path is correct and cheaper.
+                debug_println!("📊 DISTRIBUTED: full compaction ({} base tombstones + {} new removes)",
+                    base_manifest.tombstones.len(), removed_paths.len());
+                let state_dir = cp_info.state_dir.unwrap_or_else(|| TxLogStorage::state_dir_name(cp_version));
+                let metadata_config = base_manifest.schema_registry.clone();
+                // Read all checkpoint manifests concurrently (bounded).
+                let cp_futs: Vec<_> = base_manifest.manifests.iter()
+                    .map(|mi| super::avro::state_reader::read_single_manifest(
+                        &storage, &state_dir, &mi.path, &metadata_config,
+                    ))
                     .collect();
-
-                let manifests_with_tombstones = tombstone_distributor::distribute_tombstones_to_manifests(
-                    &base_manifest.manifests, &all_tombstones, &partition_columns,
-                );
-                let (keep, rewrite) = tombstone_distributor::selective_partition(
-                    &manifests_with_tombstones, tombstone_distributor::COMPACTION_TOMBSTONE_THRESHOLD,
-                );
-
-                if tombstone_distributor::is_selective_compaction_beneficial(&keep, &rewrite) {
-                    debug_println!("📊 DISTRIBUTED: selective compaction: keeping {} clean, rewriting {} dirty manifests",
-                        keep.len(), rewrite.len());
-
-                    // Read only dirty manifests, filter tombstones, write new
-                    let state_dir = cp_info.state_dir.clone()
-                        .unwrap_or_else(|| TxLogStorage::state_dir_name(cp_version));
-                    let metadata_config = base_manifest.schema_registry.clone();
-                    // Read dirty manifests concurrently (bounded); filter tombstones after.
-                    let rewrite_futs: Vec<_> = rewrite.iter()
-                        .map(|mi| super::avro::state_reader::read_single_manifest(
-                            &storage, &state_dir, &mi.path, &metadata_config,
-                        ))
-                        .collect();
-                    let rewrite_results = stream::iter(rewrite_futs)
-                        .buffer_unordered(max_concurrent)
-                        .collect::<Vec<super::error::Result<Vec<FileEntry>>>>().await;
-                    let rewritten_entries: Vec<FileEntry> = match rewrite_results
-                        .into_iter()
-                        .collect::<super::error::Result<Vec<Vec<FileEntry>>>>()
-                    {
-                        Err(e) => {
-                            debug_println!("⚠️ DISTRIBUTED: selective compaction aborted — dirty manifest read failed: {}", e);
-                            return;
-                        }
-                        Ok(nested) => nested.into_iter()
-                            .flat_map(|entries| entries.into_iter()
-                                .filter(|e| !all_tombstones.contains(&e.add.path)))
-                            .collect(),
-                    };
-                    // Combine: new adds (filtered against removes) + rewritten live entries
-                    let mut all_live = rewritten_entries;
-                    all_live.extend(new_adds.iter()
-                        .filter(|e| !all_tombstones.contains(&e.add.path))
-                        .cloned());
-
-                    // Clean manifests are reused; write new manifest for rewritten + new
-                    // For simplicity, do a compacted write with all live files from
-                    // kept manifests + rewritten entries + new adds.
-                    // A full selective compaction would reuse kept manifest refs, but
-                    // that requires state_writer changes beyond scope here.
-                    // Instead, read kept manifest entries too for a clean compacted write.
-                    // Read clean manifests concurrently (bounded).
-                    let keep_futs: Vec<_> = keep.iter()
-                        .map(|mi| super::avro::state_reader::read_single_manifest(
-                            &storage, &state_dir, &mi.path, &metadata_config,
-                        ))
-                        .collect();
-                    let keep_results = stream::iter(keep_futs)
-                        .buffer_unordered(max_concurrent)
-                        .collect::<Vec<super::error::Result<Vec<FileEntry>>>>().await;
-                    let keep_live: Vec<FileEntry> = match keep_results
-                        .into_iter()
-                        .collect::<super::error::Result<Vec<Vec<FileEntry>>>>()
-                    {
-                        Err(e) => {
-                            debug_println!("⚠️ DISTRIBUTED: selective compaction aborted — clean manifest read failed: {}", e);
-                            return;
-                        }
-                        Ok(nested) => nested.into_iter()
-                            .flat_map(|entries| entries.into_iter()
-                                .filter(|e| !all_tombstones.contains(&e.add.path)))
-                            .collect(),
-                    };
-                    all_live.extend(keep_live);
-                    all_live.sort_by(|a, b| a.add.path.cmp(&b.add.path));
-
-                    match write_checkpoint_at_version(table_path, config, all_live, metadata, protocol, written_version).await {
-                        Ok(info) => debug_println!("✅ DISTRIBUTED: selective compaction at v{}, {} files", info.version, info.num_files),
-                        Err(e) => debug_println!("⚠️ DISTRIBUTED: selective compaction failed (non-fatal): {}", e),
+                let cp_results = stream::iter(cp_futs)
+                    .buffer_unordered(max_concurrent)
+                    .collect::<Vec<super::error::Result<Vec<FileEntry>>>>().await;
+                let mut cp_entries: Vec<FileEntry> = match cp_results
+                    .into_iter()
+                    .collect::<super::error::Result<Vec<Vec<FileEntry>>>>()
+                {
+                    Err(e) => {
+                        debug_println!("⚠️ DISTRIBUTED: full compaction aborted — manifest read failed: {}", e);
+                        return;
                     }
-                } else {
-                    // Full compaction — read everything, apply tombstones, replay, write fresh
-                    debug_println!("📊 DISTRIBUTED: full compaction (selective not beneficial)");
-                    let state_dir = cp_info.state_dir.unwrap_or_else(|| TxLogStorage::state_dir_name(cp_version));
-                    let metadata_config = base_manifest.schema_registry.clone();
-                    // Read all checkpoint manifests concurrently (bounded).
-                    let cp_futs: Vec<_> = base_manifest.manifests.iter()
-                        .map(|mi| super::avro::state_reader::read_single_manifest(
-                            &storage, &state_dir, &mi.path, &metadata_config,
-                        ))
-                        .collect();
-                    let cp_results = stream::iter(cp_futs)
-                        .buffer_unordered(max_concurrent)
-                        .collect::<Vec<super::error::Result<Vec<FileEntry>>>>().await;
-                    let mut cp_entries: Vec<FileEntry> = match cp_results
-                        .into_iter()
-                        .collect::<super::error::Result<Vec<Vec<FileEntry>>>>()
-                    {
-                        Err(e) => {
-                            debug_println!("⚠️ DISTRIBUTED: full compaction aborted — manifest read failed: {}", e);
-                            return;
-                        }
-                        Ok(nested) => nested.into_iter().flatten().collect(),
-                    };
-                    // Filter out tombstoned entries from base checkpoint before replay
-                    if !base_manifest.tombstones.is_empty() {
-                        let tombstone_set: std::collections::HashSet<&str> =
-                            base_manifest.tombstones.iter().map(|s| s.as_str()).collect();
-                        let before = cp_entries.len();
-                        cp_entries.retain(|e| !tombstone_set.contains(e.add.path.as_str()));
-                        debug_println!("📖 DISTRIBUTED: Applied {} base tombstones during compaction, {} → {} entries",
-                            base_manifest.tombstones.len(), before, cp_entries.len());
-                    }
-                    let replay_result = log_replay::replay(cp_entries, post_cp_actions);
-                    match write_checkpoint_at_version(table_path, config, replay_result.files, metadata, protocol, written_version).await {
-                        Ok(info) => debug_println!("✅ DISTRIBUTED: full compaction at v{}, {} files", info.version, info.num_files),
-                        Err(e) => debug_println!("⚠️ DISTRIBUTED: full compaction failed (non-fatal): {}", e),
-                    }
+                    Ok(nested) => nested.into_iter().flatten().collect(),
+                };
+                // Filter out tombstoned entries from base checkpoint before replay
+                if !base_manifest.tombstones.is_empty() {
+                    let tombstone_set: std::collections::HashSet<&str> =
+                        base_manifest.tombstones.iter().map(|s| s.as_str()).collect();
+                    let before = cp_entries.len();
+                    cp_entries.retain(|e| !tombstone_set.contains(e.add.path.as_str()));
+                    debug_println!("📖 DISTRIBUTED: Applied {} base tombstones during compaction, {} → {} entries",
+                        base_manifest.tombstones.len(), before, cp_entries.len());
+                }
+                let replay_result = log_replay::replay(cp_entries, post_cp_actions);
+                match write_checkpoint_at_version(table_path, config, replay_result.files, metadata, protocol, written_version).await {
+                    Ok(info) => debug_println!("✅ DISTRIBUTED: full compaction at v{}, {} files", info.version, info.num_files),
+                    Err(e) => debug_println!("⚠️ DISTRIBUTED: full compaction failed (non-fatal): {}", e),
                 }
             } else {
                 // Low tombstone ratio — incremental write (reuse existing manifests)
@@ -1060,7 +1115,14 @@ pub async fn maybe_auto_checkpoint(
             let versions_to_read: Vec<i64> = all_versions.iter().copied()
                 .filter(|&v| v <= written_version)
                 .collect();
-            let versioned_actions = read_versions_concurrent(&storage, versions_to_read, max_concurrent).await;
+            // Abort rather than persist a lossy checkpoint on transient read errors.
+            let versioned_actions = match read_versions_concurrent(&storage, versions_to_read, max_concurrent).await {
+                Ok(a) => a,
+                Err(e) => {
+                    debug_println!("⚠️ DISTRIBUTED: auto-checkpoint aborted, read_versions_concurrent failed: {}", e);
+                    return;
+                }
+            };
             let v0_actions = versioned_actions.iter()
                 .find(|(v, _)| *v == 0)
                 .map(|(_, a)| a.clone())
@@ -1091,8 +1153,13 @@ pub async fn write_checkpoint(
     protocol: ProtocolAction,
 ) -> Result<LastCheckpointInfo> {
     let storage = TxLogStorage::new(table_path, config)?;
-    let version = storage.list_versions().await?
-        .last().copied().unwrap_or(0);
+    // On an uninitialized table there are no version files; writing a checkpoint for
+    // a phantom version 0 would produce a checkpoint referencing a commit that does
+    // not exist. Refuse rather than persist that inconsistency.
+    let version = match storage.list_versions().await?.last().copied() {
+        Some(v) => v,
+        None => return Err(TxLogError::NotInitialized { path: table_path.to_string() }),
+    };
 
     match super::avro::state_writer::write_state_checkpoint(
         &storage, version, &entries, &protocol, &metadata,
@@ -1230,6 +1297,19 @@ pub(crate) async fn probe_versions_since(
             }
         }
 
+        // Non-contiguous frontier: a version beyond the contiguous run still exists,
+        // meaning a mid-sequence version file was deleted (operator error / partial
+        // delete). Contiguity probing would stop at the gap and hide every later
+        // commit until TTL expiry, so recover them now with a full LIST. The batch
+        // results already told us a later version exists.
+        if results.iter().any(|(pv, exists)| *exists && *pv > v) {
+            debug_println!("⚠️ DISTRIBUTED: probe_versions_since found gap before an existing version at v{}, falling back to list_versions", v);
+            let all = storage.list_versions().await?;
+            let remaining: Vec<i64> = all.into_iter().filter(|&x| x >= v).collect();
+            versions.extend(remaining);
+            break;
+        }
+
         if !any_hit {
             break; // No newer version exists
         }
@@ -1337,8 +1417,77 @@ async fn read_previous_checkpoint(
 
     let protocol: Option<ProtocolAction> = manifest.protocol_json.as_ref()
         .and_then(|s| serde_json::from_str(s).ok());
-    let metadata: Option<MetadataAction> = manifest.metadata.as_ref()
+    let mut metadata: Option<MetadataAction> = manifest.metadata.as_ref()
         .and_then(|s| parse_metadata_json(s));
 
+    // Merge the checkpoint's schema_registry into metadata.configuration so the
+    // registry survives into incrementally-written checkpoints. Scala-written
+    // checkpoints keep the registry only in StateManifest.schemaRegistry (not in
+    // metadata.configuration); without this merge, write_incremental_state_directory
+    // rebuilds the registry from metadata.configuration alone and silently drops
+    // those entries, breaking later doc_mapping_ref → doc_mapping_json resolution.
+    // Mirrors the same merge in snapshot_from_checkpoint().
+    if let Some(m) = metadata.as_mut() {
+        for (k, v) in &manifest.schema_registry {
+            m.configuration.entry(k.clone()).or_insert_with(|| v.clone());
+        }
+    }
+
     Some((cp_info, manifest, protocol, metadata))
+}
+
+#[cfg(test)]
+mod checkpoint_interval_tests {
+    use super::*;
+
+    fn cfg(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    #[test]
+    fn test_default_interval_checkpoints_every_commit() {
+        // No config → interval 1 → every version checkpoints.
+        let c = cfg(&[]);
+        assert_eq!(checkpoint_interval(&c), 1);
+        for v in 0..5 {
+            assert!(should_checkpoint_at(&c, v), "v{} should checkpoint by default", v);
+        }
+    }
+
+    #[test]
+    fn test_zero_disables_checkpointing() {
+        let c = cfg(&[("checkpoint_interval", "0")]);
+        assert_eq!(checkpoint_interval(&c), 0);
+        for v in 0..5 {
+            assert!(!should_checkpoint_at(&c, v));
+        }
+    }
+
+    #[test]
+    fn test_interval_is_honored_not_boolean() {
+        // interval 10 must NOT behave like 1 — only multiples of 10 checkpoint.
+        let c = cfg(&[("checkpoint_interval", "10")]);
+        assert_eq!(checkpoint_interval(&c), 10);
+        assert!(should_checkpoint_at(&c, 0));
+        assert!(!should_checkpoint_at(&c, 1));
+        assert!(!should_checkpoint_at(&c, 9));
+        assert!(should_checkpoint_at(&c, 10));
+        assert!(!should_checkpoint_at(&c, 15));
+        assert!(should_checkpoint_at(&c, 20));
+    }
+
+    #[test]
+    fn test_negative_version_never_checkpoints() {
+        let c = cfg(&[("checkpoint_interval", "1")]);
+        assert!(!should_checkpoint_at(&c, -1));
+    }
+
+    #[test]
+    fn test_dotted_key_alias_and_unparseable_default() {
+        assert_eq!(checkpoint_interval(&cfg(&[("checkpoint.interval", "5")])), 5);
+        // Unparseable falls back to the default of 1.
+        assert_eq!(checkpoint_interval(&cfg(&[("checkpoint_interval", "nonsense")])), 1);
+        // Negative clamps to 0 (disabled).
+        assert_eq!(checkpoint_interval(&cfg(&[("checkpoint_interval", "-3")])), 0);
+    }
 }

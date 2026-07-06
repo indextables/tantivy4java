@@ -18,6 +18,24 @@ use arrow::record_batch::RecordBatch;
 use super::actions::FileEntry;
 use super::error::{TxLogError, Result};
 
+/// Convert a time-range stat value to epoch milliseconds for the Int64 Arrow column.
+///
+/// `AddAction::time_range_{start,end}` is stored as a String that may be either the
+/// legacy integer form (already epoch millis) or the Scala ISO-8601 form. Parsing
+/// with `i64::from_str` alone drops ISO-8601 values to null, losing time-range
+/// pruning data for Scala-written logs (TXLOG_MODULE_REVIEW D6).
+///
+/// The datetime-string formats (RFC 3339, bare datetime, date-only) are parsed by
+/// the shared `partition_pruning::parse_datetime_string_to_micros` so this and the
+/// stats-comparison path accept exactly the same set of formats.
+fn time_range_to_epoch_millis(s: &str) -> Option<i64> {
+    if let Ok(v) = s.parse::<i64>() {
+        return Some(v); // legacy epoch millis
+    }
+    // Shared parser returns micros; scale to the Int64 column's millisecond unit.
+    super::partition_pruning::parse_datetime_string_to_micros(s).map(|micros| micros / 1_000)
+}
+
 /// Build the Arrow schema dynamically based on partition columns and options.
 ///
 /// Base schema has 20 fixed columns. Additional columns are appended:
@@ -129,8 +147,8 @@ pub fn file_entries_to_record_batch(
         delete_opstamp_builder.append_option(add.delete_opstamp);
         num_merge_ops_builder.append_option(add.num_merge_ops);
         uncomp_size_builder.append_option(add.uncompressed_size_bytes);
-        time_start_builder.append_option(add.time_range_start.as_ref().and_then(|s| s.parse::<i64>().ok()));
-        time_end_builder.append_option(add.time_range_end.as_ref().and_then(|s| s.parse::<i64>().ok()));
+        time_start_builder.append_option(add.time_range_start.as_deref().and_then(time_range_to_epoch_millis));
+        time_end_builder.append_option(add.time_range_end.as_deref().and_then(time_range_to_epoch_millis));
         comp_delta_ver_builder.append_option(add.companion_delta_version);
 
         match &add.doc_mapping_json {
