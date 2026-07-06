@@ -70,7 +70,7 @@ common = { git = "https://github.com/indextables/tantivy", rev = "d491895f1cd54d
 parquet = { version = "57", default-features = false, features = ["async", "arrow", "zstd", "lz4", "snap", "flate2", "flate2-rust_backened"] }
 arrow = { version = "57", default-features = false, features = ["ffi"] }
 arrow-schema = "57"
-arrow-array = "57"
+arrow-array = "59"
 arrow-buffer = "57"
 zstd = "0.13"
 bytes = "1"
