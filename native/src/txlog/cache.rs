@@ -109,10 +109,10 @@ impl CacheConfig {
             cfg.file_list_capacity = n;
         }
 
-        // Concurrency
-        if let Some(n) = map.get("max_concurrent_reads").and_then(|s| s.parse::<usize>().ok()) {
-            cfg.max_concurrent_reads = if n == 0 { 32 } else { n };
-        }
+        // Concurrency — single source of truth for parsing this key, shared with
+        // the direct callers in distributed.rs (prevents the default/semantics from
+        // drifting between the two parse sites; see TXLOG_MODULE_REVIEW E4).
+        cfg.max_concurrent_reads = super::distributed::extract_max_concurrent(map);
 
         // Kill-switch
         if map.get("cache.enabled").map(|s| s.as_str()) == Some("false") {
@@ -500,6 +500,23 @@ pub fn get_or_create_cache(table_path: &str, config: CacheConfig) -> Arc<TxLogCa
     // Double-check after acquiring write lock
     if let Some(cache) = registry.get(&key) {
         return cache.clone();
+    }
+
+    // Reclaim idle registry entries so a long-running JVM that touches many distinct
+    // tables over time doesn't accumulate TxLogCache instances forever (each holds up
+    // to `snapshot_capacity` snapshots of Vec<FileEntry>). Once past the soft cap, drop
+    // entries no longer referenced by any live caller — `strong_count == 1` means only
+    // the registry holds it, so evicting is safe (it is recreated on the next access).
+    //
+    // This is a best-effort reclaim of *idle* tables, NOT a hard cap: if more than
+    // MAX_REGISTRY_ENTRIES tables are being queried concurrently, every entry has
+    // strong_count > 1 and nothing is freed. Bounding that case would require evicting
+    // live entries (causing duplicate caches for the same table) or a real LRU; the
+    // idle-reclaim covers the realistic "many tables over a long lifetime" pattern.
+    // See TXLOG_MODULE_REVIEW E4.
+    const MAX_REGISTRY_ENTRIES: usize = 256;
+    if registry.len() >= MAX_REGISTRY_ENTRIES {
+        registry.retain(|_, cache| Arc::strong_count(cache) > 1);
     }
 
     let cache = Arc::new(TxLogCache::new(config));

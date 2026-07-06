@@ -464,9 +464,14 @@ async fn test_probe_versions_since_finds_contiguous() {
     assert_eq!(versions, vec![3, 4, 5], "should find versions 3, 4, 5");
 }
 
-/// Verify probe_versions_since stops at a gap (version 4 missing).
+/// Verify probe_versions_since recovers versions past a gap (version 4 missing).
+///
+/// A mid-sequence gap indicates an operator-deleted version file. Naively stopping
+/// at the gap would hide every later commit until TTL expiry; instead the probe
+/// falls back to a full LIST when it sees an existing version beyond the gap, so
+/// version 5 is still recovered.
 #[tokio::test]
-async fn test_probe_versions_since_stops_at_gap() {
+async fn test_probe_versions_since_recovers_past_gap() {
     use crate::txlog::storage::TxLogStorage;
     use crate::delta_reader::engine::DeltaStorageConfig;
 
@@ -485,5 +490,5 @@ async fn test_probe_versions_since_stops_at_gap() {
     let storage = TxLogStorage::new(&table_path, &config).unwrap();
 
     let versions = super::distributed::probe_versions_since(&storage, 2).await.unwrap();
-    assert_eq!(versions, vec![3], "should stop at gap — only version 3");
+    assert_eq!(versions, vec![3, 5], "should recover version 5 past the gap at 4");
 }
