@@ -1,0 +1,738 @@
+# MEASUREMENT ONLY - this is not the project's CI.
+#
+# Question it answers: do the steps of this repository's CI (ci.yml:
+# ./scripts/setup.sh, make compile, make test, cargo test) fit on GitHub's
+# standard hosted runners, on Linux x86_64 and on macOS arm64, and how long
+# does each step take there? The real CI result is the `CI` workflow
+# (ci.yml), which this file does not replace or modify.
+#
+# Shape:
+#   - Same steps as ci.yml, with Java 11 from setup-java in place of the fixed
+#     JAVA_HOME paths ci.yml uses, on standard hosted runners only. Never use
+#     a larger-runner label here: those are billed.
+#   - Cold run on purpose: no dependency caching, so the numbers are the
+#     worst case. A cached variant can be added later.
+#   - Each phase is timed and sampled (free disk, memory, swap, Java RSS, Rust
+#     toolchain RSS) by a small helper that this workflow writes to
+#     $RUNNER_TEMP; project scripts, the Makefile, the pom and the native
+#     crate are used unchanged. Results go to the job summary and to a
+#     `measure-data-*` artifact.
+#   - Runs on workflow_dispatch, and on pull requests that touch this file
+#     only, so it never appears as a check on ordinary PRs.
+#
+# The helper is the one from the same workflow in indextables/indextables_spark
+# (samplers, phase runner, table format), so the two repositories' numbers are
+# comparable. Differences: the phase log is timestamped by perl instead of a
+# bash loop with a `date` fork per line (surefire prints every test's output
+# to the console here), a Rust toolchain RSS column is sampled, and the facts
+# and summary sections describe this repository's build.
+name: "Measurement: hosted-runner fit (not CI)"
+
+on:
+  workflow_dispatch:
+    inputs:
+      cargo_jobs_linux:
+        description: "cargo jobs for both cargo builds on ubuntu-24.04 (empty = cargo default, one per core)"
+        required: false
+        type: string
+        default: ''
+      cargo_jobs_macos:
+        description: "cargo jobs for both cargo builds on macos-15 (empty = release build: one per core, Rust test build: 2)"
+        required: false
+        type: string
+        default: ''
+  pull_request:
+    paths:
+      - .github/workflows/ci-hosted-measure.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    # Explicit so every run: block gets `bash -eo pipefail`.
+    shell: bash
+
+env:
+  # cargo jobs for the Rust unit-test build (`cargo test`, dev profile with
+  # full debug info) on macos-15 (3 vCPU / 7 GB) when no input is given.
+  #
+  # The release build keeps cargo's default of one job per core on both
+  # runners: the same `cargo build --release` of this crate (v0.34.4) has been
+  # measured on macos-15 at 3 jobs, peaking at about 5.5 GB of 7 GB used with
+  # no swap. The dev-profile test build has no such measurement, and it
+  # compiles the whole dependency tree a second time with debuginfo, so it
+  # starts at 2 jobs: fewer rustc processes side by side while dependencies
+  # compile, at the cost of a longer build. A slower run that completes is
+  # worth more here than a faster one that exhausts memory. Linux (4 vCPU /
+  # 16 GB) keeps the cargo default for both builds.
+  #
+  # Java tests have no knob to set: the pom runs surefire with forkCount=1 and
+  # reuseForks=false (one forked test JVM at a time, a new one per test class)
+  # and no -Xmx, so the JVM default heap (a quarter of RAM) applies.
+  DEFAULT_CARGO_TEST_JOBS_MACOS: '2'
+
+jobs:
+  measure:
+    name: measure-only (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    # Backstop only. The per-phase step timeouts below are sized so that a
+    # stuck phase fails its own step first and the summary still gets written.
+    # Hosted jobs are capped at 360 minutes.
+    timeout-minutes: ${{ matrix.job-timeout }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Standard (free for public repos) labels only.
+        #   ubuntu-24.04: x86_64, 4 vCPU / 16 GB
+        #   macos-15:     arm64 (M1), 3 vCPU / 7 GB
+        os: [ubuntu-24.04, macos-15]
+        include:
+          # Linux: the cold release build (opt-level z, thin LTO, one codegen
+          # unit) has not been timed on a hosted x86_64 runner; 120 minutes is
+          # several times the expected duration.
+          - os: ubuntu-24.04
+            job-timeout: 345
+            setup-timeout: 20
+            compile-timeout: 120
+            test-timeout: 90
+            rust-test-timeout: 90
+          # macOS: the release build has been measured at about 17 minutes on
+          # this runner type; setup includes `brew install protobuf`.
+          - os: macos-15
+            job-timeout: 315
+            setup-timeout: 20
+            compile-timeout: 90
+            test-timeout: 90
+            rust-test-timeout: 90
+    env:
+      MATRIX_OS: ${{ matrix.os }}
+
+    steps:
+      - name: Install measurement helper and start the clock
+        run: |
+          mkdir -p "$RUNNER_TEMP/measure"
+          echo "MEASURE_DIR=$RUNNER_TEMP/measure" >> "$GITHUB_ENV"
+          echo "MEASURE=$RUNNER_TEMP/measure.sh" >> "$GITHUB_ENV"
+          cat > "$RUNNER_TEMP/measure.sh" <<'MEASURE_EOF'
+          #!/usr/bin/env bash
+          # Measurement helper for .github/workflows/ci-hosted-measure.yml.
+          # Kept bash 3.2 compatible (macOS system bash). Every value is written to a
+          # small file under $MEASURE_DIR as soon as it is known, so the summary can
+          # still be rendered when a phase fails, times out or is cancelled.
+          set -uo pipefail
+
+          MEASURE_DIR="${MEASURE_DIR:?MEASURE_DIR is not set}"
+          WORKSPACE="${GITHUB_WORKSPACE:-$PWD}"
+          OS_NAME="$(uname -s)"
+          SAMPLE_INTERVAL="${SAMPLE_INTERVAL:-5}"
+          mkdir -p "$MEASURE_DIR"
+
+          put() { printf '%s\n' "$2" > "$MEASURE_DIR/$1"; }
+          get() { if [[ -f "$MEASURE_DIR/$1" ]]; then cat "$MEASURE_DIR/$1"; fi; }
+
+          # --- samplers ---------------------------------------------------------------
+          # Free space (MB) on the volume holding the workspace (same volume as $HOME,
+          # ~/.cargo and the temp dir on both hosted images).
+          free_disk_mb() { df -Pk "$WORKSPACE" | awk 'NR==2 {printf "%d", $4/1024}'; }
+
+          # Prints "<used_mb> <swap_used_mb>" for the whole machine.
+          #   Linux: MemTotal - MemAvailable (reclaimable page cache is not counted).
+          #   macOS: active + wired + compressor pages (approximates "Memory Used").
+          mem_sample() {
+              local used swap
+              case "$OS_NAME" in
+                  Linux)
+                      awk '/^MemTotal:/ {t=$2} /^MemAvailable:/ {a=$2}
+                           /^SwapTotal:/ {st=$2} /^SwapFree:/ {sf=$2}
+                           END {printf "%d %d", (t-a)/1024, (st-sf)/1024}' /proc/meminfo
+                      ;;
+                  Darwin)
+                      used="$(vm_stat | awk '
+                          /page size of/ {for (i = 1; i <= NF; i++) if ($i == "of") ps = $(i+1)}
+                          /^Pages active:/ {v = $3; sub(/\.$/, "", v); a = v}
+                          /^Pages wired down:/ {v = $4; sub(/\.$/, "", v); w = v}
+                          /^Pages occupied by compressor:/ {v = $5; sub(/\.$/, "", v); c = v}
+                          END {printf "%d", (a + w + c) * ps / 1048576}')"
+                      swap="$(sysctl -n vm.swapusage 2>/dev/null | awk '
+                          {for (i = 1; i <= NF; i++) if ($i == "used") {v = $(i+2); sub(/M$/, "", v); printf "%d", v}}')"
+                      printf '%s %s' "${used:-0}" "${swap:-0}"
+                      ;;
+                  *) printf '0 0' ;;
+              esac
+          }
+
+          # Prints "<total_java_rss_mb> <java_process_count>".
+          java_sample() {
+              ps -eo rss=,comm= 2>/dev/null \
+                  | awk '$NF ~ /(^|\/)java$/ {s += $1; n++} END {printf "%d %d", s/1024, n}'
+          }
+
+          # Prints "<total_rss_mb> <process_count>" for the native build: cargo, rustc,
+          # the linker and C compiler they start, build scripts, and the Rust test
+          # binary (tantivy4java-<hash>; Linux truncates process names to 15 chars).
+          rust_sample() {
+              ps -eo rss=,comm= 2>/dev/null \
+                  | awk '{name = $NF; sub(/.*\//, "", name)}
+                         name ~ /^(cargo|rustc|rust-lld|lld|ld|ld\.[a-z]+|collect2|cc1|cc1plus|clang|build-script-[a-z-]*|tantivy4java-[0-9a-f]*)$/ {s += $1; n++}
+                         END {printf "%d %d", s/1024, n}'
+          }
+
+          # Background sampler. Columns:
+          #   epoch free_disk_mb used_mb swap_mb java_rss_mb java_count rust_rss_mb rust_count
+          # Exits by itself if the helper process that started it goes away.
+          sampler() {
+              local out="$MEASURE_DIR/$1.samples"
+              while kill -0 "$$" 2>/dev/null; do
+                  printf '%s %s %s %s %s\n' "$(date +%s)" "$(free_disk_mb)" "$(mem_sample)" "$(java_sample)" "$(rust_sample)" >> "$out"
+                  sleep "$SAMPLE_INTERVAL"
+              done
+          }
+
+          # --- phase runner -----------------------------------------------------------
+          # cmd_phase <name> <command...>: runs the command unchanged, streams its
+          # output (stdout and stderr merged) to the step log, keeps an epoch-prefixed
+          # copy in <name>.log and returns the command's exit status.
+          cmd_phase() {
+              local phase="$1"
+              shift
+              local log="$MEASURE_DIR/$phase.log" rc=0 spid lpid line i base
+              # The FIFO lives outside $MEASURE_DIR so it can never end up in the
+              # uploaded artifact directory if the step is killed.
+              local fifo="${RUNNER_TEMP:-${TMPDIR:-/tmp}}/measure-$phase.fifo"
+              : > "$log"
+              rm -f "$fifo"
+              mkfifo "$fifo"
+              put "$phase.cmd" "$*"
+              put "$phase.disk_before" "$(free_disk_mb)"
+              put "$phase.start" "$(date +%s)"
+              sampler "$phase" > /dev/null 2>&1 &
+              spid=$!
+              # The logger must not throttle the command being measured: surefire prints
+              # every test's output to the console. A bash `read` loop manages only a
+              # few thousand lines per second on a pipe (and a few hundred with a `date`
+              # fork per line), so perl does the copying where it exists (both hosted
+              # images). The bash loop is the fallback; its epoch comes from SECONDS.
+              if [[ -z "${MEASURE_BASH_LOGGER:-}" ]] && command -v perl > /dev/null 2>&1; then
+                  perl -e '
+                      $| = 1;
+                      open(my $log, ">>", $ARGV[0]) or die "cannot open $ARGV[0]: $!";
+                      select((select($log), $| = 1)[0]);
+                      while (my $line = <STDIN>) {
+                          print $line;
+                          chomp $line;
+                          print $log time(), " ", $line, "\n";
+                      }' "$log" < "$fifo" &
+              else
+                  base=$(($(date +%s) - SECONDS))
+                  while IFS= read -r line || [[ -n "$line" ]]; do
+                      printf '%s\n' "$line"
+                      printf '%s %s\n' "$((base + SECONDS))" "$line" >> "$log"
+                  done < "$fifo" &
+              fi
+              lpid=$!
+              "$@" > "$fifo" 2>&1
+              rc=$?
+              # Timing stops when the command exits, as it would for a plain step.
+              put "$phase.end" "$(date +%s)"
+              put "$phase.rc" "$rc"
+              put "$phase.disk_after" "$(free_disk_mb)"
+              kill "$spid" 2> /dev/null
+              wait "$spid" 2> /dev/null
+              # Let the logger drain, but do not wait for EOF: a leftover child of the
+              # command can hold the pipe open, which would hang the step.
+              i=0
+              while kill -0 "$lpid" 2> /dev/null && [[ "$i" -lt 25 ]]; do
+                  sleep 0.2
+                  i=$((i + 1))
+              done
+              kill "$lpid" 2> /dev/null
+              wait "$lpid" 2> /dev/null
+              rm -f "$fifo"
+              return "$rc"
+          }
+
+          # --- runner facts and parallelism decision ----------------------------------
+          # Selected settings of one cargo profile, as written in native/Cargo.toml.
+          profile_line() {
+              awk -v want="[profile.$1]" '
+                  $0 == want {f = 1; next}
+                  /^\[/ {f = 0}
+                  f && /^(opt-level|lto|codegen-units|debug|incremental) *=/ {
+                      sub(/ *#.*$/, ""); gsub(/ +/, " "); printf "%s%s", sep, $0; sep = "; "
+                  }' native/Cargo.toml 2>/dev/null
+          }
+
+          cmd_facts() {
+              local cores ram_mb swap_mb cpu_model jobs_input cargo_default
+              local jobs_build jobs_test src_build src_test want
+              case "$OS_NAME" in
+                  Linux)
+                      cores="$(nproc)"
+                      ram_mb="$(awk '/^MemTotal:/ {printf "%d", $2/1024}' /proc/meminfo)"
+                      swap_mb="$(awk '/^SwapTotal:/ {printf "%d", $2/1024}' /proc/meminfo)"
+                      cpu_model="$(awk -F': *' '/^model name/ {print $2; exit}' /proc/cpuinfo)"
+                      jobs_input="${CARGO_JOBS_INPUT_LINUX:-}"
+                      ;;
+                  Darwin)
+                      cores="$(sysctl -n hw.ncpu)"
+                      ram_mb="$(($(sysctl -n hw.memsize) / 1048576))"
+                      swap_mb="$(sysctl -n vm.swapusage 2>/dev/null | awk '
+                          {for (i = 1; i <= NF; i++) if ($i == "total") {v = $(i+2); sub(/M$/, "", v); printf "%d", v}}')"
+                      cpu_model="$(sysctl -n machdep.cpu.brand_string 2>/dev/null || echo unknown)"
+                      jobs_input="${CARGO_JOBS_INPUT_MACOS:-}"
+                      ;;
+                  *)
+                      echo "::error::Unsupported OS for this measurement: $OS_NAME"
+                      return 1
+                      ;;
+              esac
+
+              # cargo's default for build.jobs is the number of logical CPUs. The value
+              # is always passed explicitly (CARGO_BUILD_JOBS) so the log shows it.
+              cargo_default="$cores"
+              jobs_build="$cargo_default"
+              jobs_test="$cargo_default"
+              src_build="same as the cargo default (one job per core)"
+              src_test="same as the cargo default (one job per core)"
+              if [[ -n "$jobs_input" ]]; then
+                  if ! [[ "$jobs_input" =~ ^[1-9][0-9]*$ ]]; then
+                      echo "::error::cargo jobs override must be a positive integer, got '$jobs_input'"
+                      return 1
+                  fi
+                  jobs_build="$jobs_input"
+                  jobs_test="$jobs_input"
+                  src_build="workflow_dispatch input"
+                  src_test="workflow_dispatch input"
+              elif [[ "$OS_NAME" == "Darwin" ]]; then
+                  want="${DEFAULT_CARGO_TEST_JOBS_MACOS:-2}"
+                  if [[ "$want" =~ ^[1-9][0-9]*$ && "$want" -lt "$cores" ]]; then
+                      jobs_test="$want"
+                      src_test="workflow default for macOS, deliberately below the cargo default (rationale below)"
+                  fi
+              fi
+
+              # Surefire settings and heap cap, read from the pom rather than assumed.
+              local fork_count reuse_forks xmx jvm_heap_mb
+              fork_count="$(sed -n 's/.*<forkCount>\(.*\)<\/forkCount>.*/\1/p' pom.xml | head -1)"
+              reuse_forks="$(sed -n 's/.*<reuseForks>\(.*\)<\/reuseForks>.*/\1/p' pom.xml | head -1)"
+              xmx="$(grep -o -- '-Xmx[0-9]*[gGmM]' pom.xml | sort -u | tr '\n' ' ' | sed 's/ *$//')"
+              # What the JVM itself picks as max heap on this machine when no -Xmx is given.
+              jvm_heap_mb="$(java -XX:+PrintFlagsFinal -version 2>/dev/null \
+                  | awk '$2 == "MaxHeapSize" {printf "%d", $4 / 1048576}')"
+
+              put facts.uname "$(uname -sm)"
+              put facts.image "${ImageOS:-unknown} ${ImageVersion:-}"
+              put facts.cores "$cores"
+              put facts.cpu_model "${cpu_model:-unknown}"
+              put facts.ram_mb "$ram_mb"
+              put facts.swap_mb "${swap_mb:-0}"
+              put facts.disk_free_mb "$(free_disk_mb)"
+              put facts.commit "$(git rev-parse --short=12 HEAD 2>/dev/null || echo unknown)"
+              put facts.cargo_default_jobs "$cargo_default"
+              put facts.cargo_jobs_build "$jobs_build"
+              put facts.cargo_jobs_build_source "$src_build"
+              put facts.cargo_jobs_test "$jobs_test"
+              put facts.cargo_jobs_test_source "$src_test"
+              put facts.fork_count "${fork_count:-not set in pom.xml}"
+              put facts.reuse_forks "${reuse_forks:-not set in pom.xml}"
+              put facts.xmx "${xmx:-none}"
+              put facts.jvm_heap_mb "$jvm_heap_mb"
+              put facts.profile_release "$(profile_line release)"
+              put facts.profile_dev "$(profile_line dev)"
+              put facts.java "$(java -version 2>&1 | head -1)"
+              put facts.maven "$(mvn --version 2>/dev/null | head -1)"
+              put facts.rustc "$(rustc --version 2>/dev/null || echo 'not preinstalled')"
+              put facts.cargo "$(cargo --version 2>/dev/null || echo 'not preinstalled')"
+              put facts.protoc "$(protoc --version 2>/dev/null || echo 'not preinstalled')"
+
+              if [[ -n "${GITHUB_ENV:-}" ]]; then
+                  echo "CARGO_JOBS_BUILD=$jobs_build" >> "$GITHUB_ENV"
+                  echo "CARGO_JOBS_TEST=$jobs_test" >> "$GITHUB_ENV"
+              fi
+
+              echo "cores=$cores ram_mb=$ram_mb swap_mb=${swap_mb:-0} free_disk_mb=$(free_disk_mb)"
+              echo "cargo default jobs=$cargo_default"
+              echo "release build: CARGO_BUILD_JOBS=$jobs_build ($src_build)"
+              echo "Rust test build: CARGO_BUILD_JOBS=$jobs_test ($src_test)"
+              echo "surefire forkCount=${fork_count:-?} reuseForks=${reuse_forks:-?} -Xmx in pom: ${xmx:-none}; JVM default max heap: ${jvm_heap_mb:-?} MB"
+              echo "--- df -h"
+              df -h
+          }
+
+          # --- summary ----------------------------------------------------------------
+          fmt_dur() {
+              if [[ -z "${1:-}" ]]; then printf 'n/a'; else printf '%dm %02ds' "$(($1 / 60))" "$(($1 % 60))"; fi
+          }
+          fmt_gb() {
+              if [[ -z "${1:-}" ]]; then printf 'n/a'; else awk -v m="$1" 'BEGIN {printf "%.1f GB", m / 1024}'; fi
+          }
+          # col_stat <file> <column> <min|max>
+          col_stat() {
+              if [[ ! -s "$1" ]]; then return 0; fi
+              awk -v c="$2" -v op="$3" '
+                  NR == 1 {v = $c}
+                  op == "min" && $c < v {v = $c}
+                  op == "max" && $c > v {v = $c}
+                  END {if (NR > 0) printf "%d", v}' "$1"
+          }
+          # First epoch at which a line matching <regex> was logged in <file>.
+          log_epoch() {
+              if [[ ! -f "$1" ]]; then return 0; fi
+              grep -E -m1 -- "$2" "$1" | awk '{print $1}'
+          }
+          # span <from_epoch> <to_epoch>: duration between two epochs, n/a if either is missing.
+          span() {
+              if [[ -n "${1:-}" && -n "${2:-}" && "$2" -ge "$1" ]]; then fmt_dur "$(($2 - $1))"; else printf 'n/a'; fi
+          }
+          # Size (MB) of a path, empty if it does not exist.
+          dir_mb() {
+              if [[ -e "$1" ]]; then du -sk "$1" 2>/dev/null | awk '{printf "%d", $1/1024}'; fi
+          }
+          # cargo's own "Finished ... in <time>" figure from a phase log (first one).
+          cargo_finished() {
+              if [[ ! -f "$1" ]]; then return 0; fi
+              sed -n -E 's/^[0-9]+ +Finished .*target\(s\) in (.*)$/\1/p' "$1" | head -1
+          }
+          crates_compiled() {
+              if [[ ! -f "$1" ]]; then printf '0'; return 0; fi
+              grep -c -E '^[0-9]+ +Compiling ' "$1"
+          }
+
+          phase_row() {
+              local phase="$1" label="$2" start end rc result dur last samples jvms rust
+              start="$(get "$phase.start")"
+              end="$(get "$phase.end")"
+              rc="$(get "$phase.rc")"
+              samples="$MEASURE_DIR/$phase.samples"
+              if [[ -z "$start" ]]; then
+                  echo "| $label | not run | - | - | - | - | - | - | - | - |"
+                  return 0
+              fi
+              if [[ -n "$end" ]]; then
+                  dur="$(fmt_dur "$((end - start))")"
+                  if [[ "$rc" == "0" ]]; then
+                      result="ok"
+                  elif [[ "$rc" =~ ^[0-9]+$ && "$rc" -gt 128 ]]; then
+                      result="KILLED (signal $((rc - 128)); step timeout or cancel)"
+                  else
+                      result="FAILED (exit $rc)"
+                  fi
+              else
+                  last="$(col_stat "$samples" 1 max)"
+                  dur="at least $(fmt_dur "$((${last:-$start} - start))")"
+                  result="DID NOT FINISH (timed out or cancelled)"
+              fi
+              jvms="$(col_stat "$samples" 6 max)"
+              if [[ -n "$jvms" ]]; then
+                  jvms="$(fmt_gb "$(col_stat "$samples" 5 max)"), up to $jvms JVMs"
+              else
+                  jvms="n/a"
+              fi
+              rust="$(col_stat "$samples" 8 max)"
+              if [[ -n "$rust" ]]; then
+                  rust="$(fmt_gb "$(col_stat "$samples" 7 max)"), up to $rust processes"
+              else
+                  rust="n/a"
+              fi
+              echo "| $label | $result | $dur | $(fmt_gb "$(get "$phase.disk_before")") | $(fmt_gb "$(col_stat "$samples" 2 min)") | $(fmt_gb "$(get "$phase.disk_after")") | $(fmt_gb "$(col_stat "$samples" 3 max)") | $(fmt_gb "$(col_stat "$samples" 4 max)") | $jvms | $rust |"
+          }
+
+          render_summary() {
+              local ram_mb cores now job_start jobs_build jobs_test
+              ram_mb="$(get facts.ram_mb)"
+              cores="$(get facts.cores)"
+              jobs_build="$(get facts.cargo_jobs_build)"
+              jobs_test="$(get facts.cargo_jobs_test)"
+              now="$(date +%s)"
+              job_start="$(get job.start)"
+
+              echo "## Hosted-runner measurement (not a CI result): ${MATRIX_OS:-?}"
+              echo ""
+              echo "> Measurement only. This job answers \"do this repository's CI steps fit on a free standard hosted runner, and how long do they take\". It is not the project's CI verdict; that is the \`CI\` workflow."
+              echo ">"
+              echo "> **Cold run:** no dependency caching. \`~/.cargo\` (registry and git checkouts), both cargo target directories, \`~/.m2\` and Homebrew downloads all start from the stock runner image. A cached run would be faster in the build phases."
+              echo ""
+
+              # Toolchain as it is after setup.sh (protoc is installed by setup.sh).
+              local protoc_now cc_now libc_now
+              protoc_now="$(protoc --version 2>/dev/null || echo 'not found')"
+              cc_now="$(cc --version 2>/dev/null | head -1)"
+              libc_now=""
+              if [[ "$OS_NAME" == "Linux" ]]; then libc_now="$(ldd --version 2>/dev/null | head -1)"; fi
+
+              echo "### Runner and configuration"
+              echo ""
+              echo "| Item | Value |"
+              echo "|---|---|"
+              echo "| Runner label | \`${MATRIX_OS:-?}\` (image: $(get facts.image)) |"
+              echo "| OS / arch | $(get facts.uname) |"
+              echo "| CPU reported | ${cores:-?} cores ($(get facts.cpu_model)) |"
+              echo "| RAM reported | $(fmt_gb "$ram_mb") (swap configured: $(fmt_gb "$(get facts.swap_mb)")) |"
+              echo "| Free disk at job start | $(fmt_gb "$(get facts.disk_free_mb)") |"
+              echo "| Commit measured | \`$(get facts.commit)\` |"
+              echo "| cargo jobs, release build | **${jobs_build:-?}** of ${cores:-?} cores: $(get facts.cargo_jobs_build_source). Used by \`make compile\` and by the cargo re-check inside \`make test\`. |"
+              echo "| cargo jobs, Rust test build | **${jobs_test:-?}** of ${cores:-?} cores: $(get facts.cargo_jobs_test_source). Used by \`cargo test --lib --tests\`; the tests themselves run on the libtest default of one thread per core. |"
+              echo "| Java test JVMs | surefire \`forkCount=$(get facts.fork_count)\`, \`reuseForks=$(get facts.reuse_forks)\` (from pom.xml): one forked test JVM at a time, a new one per test class, next to the Maven JVM. \`-Xmx\` in pom.xml: $(get facts.xmx); JVM default max heap on this runner: $(fmt_gb "$(get facts.jvm_heap_mb)") of $(fmt_gb "$ram_mb") RAM. |"
+              echo "| cargo profiles (native/Cargo.toml) | release: \`$(get facts.profile_release)\`; dev, used by \`cargo test\`: \`$(get facts.profile_dev)\` |"
+              echo "| Toolchain at job start | $(get facts.java); $(get facts.maven); $(get facts.rustc); $(get facts.cargo); protoc: $(get facts.protoc) |"
+              echo "| Toolchain after setup.sh | protoc: $protoc_now; C compiler: ${cc_now:-not found}${libc_now:+; libc: $libc_now} |"
+              echo "| Dependency cache | none (cold run) |"
+              if [[ -n "$job_start" ]]; then
+                  echo "| Measured wall time, job start to this summary | $(fmt_dur "$((now - job_start))") |"
+              fi
+              echo ""
+              echo "Parallelism rationale: the heavy part of this build is native. \`cargo build --release\` runs with cargo's default of one job per core on both runners; the same release build of this crate has been measured on the standard macOS runner (nominally 3 vCPU / 7 GB) at 3 jobs, peaking at about 5.5 GB used with no swap. The Rust test build uses the dev profile with full debug info and compiles the dependency tree a second time; it has not been measured on a 7 GB machine, so on macOS it defaults to 2 jobs (fewer rustc processes side by side, longer build). The standard Linux runner (nominally 4 vCPU / 16 GB) keeps the cargo default for both. Java tests cannot be tuned without changing the pom: one forked test JVM at a time with the JVM default heap. The cargo settings can be overridden with the workflow_dispatch inputs."
+              echo ""
+
+              echo "### Phases"
+              echo ""
+              echo "| Phase | Result | Wall time | Free disk before | Lowest free disk during | Free disk after | Peak memory used | Peak swap used | Peak total Java RSS | Peak total Rust toolchain RSS |"
+              echo "|---|---|---|---|---|---|---|---|---|---|"
+              phase_row setup "setup: \`./scripts/setup.sh\`"
+              phase_row compile "build: \`make compile\` (javac + \`cargo build --release\`, jobs=${jobs_build:-?})"
+              phase_row test "Java tests: \`make test\`"
+              phase_row rusttest "Rust tests: \`cargo test --lib --tests\` (jobs=${jobs_test:-?})"
+              echo ""
+              echo "Memory, swap, disk, Java RSS and Rust toolchain RSS (cargo, rustc, linker, C compiler, Rust test binary) are sampled every ${SAMPLE_INTERVAL}s machine-wide, so short spikes can be missed. The Rust tests run even when the Java tests fail, so that both are measured."
+              echo ""
+
+              # Split of the phases, from the epoch-prefixed phase logs.
+              local c_log="$MEASURE_DIR/compile.log" t_log="$MEASURE_DIR/test.log" r_log="$MEASURE_DIR/rusttest.log"
+              local c_start c_javac c_cargo c_done t_start t_end t_sf r_start r_end r_run
+              c_start="$(get compile.start)"
+              c_javac="$(log_epoch "$c_log" '\] --- .*compiler.*:compile ')"
+              c_cargo="$(log_epoch "$c_log" '\] --- .*exec.*:exec \(build-rust\)')"
+              c_done="$(log_epoch "$c_log" '^[0-9]+ +Finished .*target\(s\) in ')"
+              t_start="$(get test.start)"
+              t_end="$(get test.end)"
+              t_sf="$(log_epoch "$t_log" '\] --- .*surefire.*:test ')"
+              r_start="$(get rusttest.start)"
+              r_end="$(get rusttest.end)"
+              r_run="$(log_epoch "$r_log" '^[0-9]+ +Running ')"
+
+              echo "### Inside the phases (from the phase logs)"
+              echo ""
+              echo "| Part | Wall time | Notes |"
+              echo "|---|---|---|"
+              echo "| build: Maven start-up, clean, plugin and dependency downloads | $(span "$c_start" "$c_javac") | before the compiler plugin starts |"
+              echo "| build: Java compile | $(span "$c_javac" "$c_cargo") | compiler plugin start to cargo start |"
+              echo "| build: native release build | $(span "$c_cargo" "$c_done") | cargo's own figure: $(cargo_finished "$c_log" | grep . || echo 'n/a (did not finish)'); $(crates_compiled "$c_log") crates compiled |"
+              echo "| Java tests: before surefire | $(span "$t_start" "$t_sf") | cargo re-check (cargo's own figure: $(cargo_finished "$t_log" | grep . || echo 'n/a'); $(crates_compiled "$t_log") crates recompiled), copy of the native library, test compile |"
+              echo "| Java tests: surefire | $(span "$t_sf" "$t_end") | test execution, one JVM per test class |"
+              echo "| Rust tests: dev-profile build of the test binary | $(span "$r_start" "$r_run") | cargo's own figure: $(cargo_finished "$r_log" | grep . || echo 'n/a (did not finish)'); $(crates_compiled "$r_log") crates compiled |"
+              echo "| Rust tests: execution | $(span "$r_run" "$r_end") | |"
+              echo ""
+
+              # Java test results as printed by surefire.
+              local classes="$MEASURE_DIR/java-test-classes.txt" totals sums
+              local n_cls s_run s_fail s_err s_skip s_time t_run t_fail t_err t_skip
+              echo "### Java test results (surefire output of \`make test\`)"
+              echo ""
+              if [[ ! -s "$t_log" ]]; then
+                  echo "The Java test phase produced no output (it did not run, or failed before printing anything)."
+                  echo ""
+              else
+                  # One line per finished test class: seconds|class|run|failures|errors|skipped
+                  sed -n -E 's/^[0-9]+ \[[A-Z]+\] +Tests run: ([0-9]+), Failures: ([0-9]+), Errors: ([0-9]+), Skipped: ([0-9]+), Time elapsed: ([0-9.,]+) s.* in ([^ ]+)$/\5|\6|\1|\2|\3|\4/p' "$t_log" \
+                      | tr -d ',' > "$classes"
+                  sums="$(awk -F'|' '{c++; r += $3; f += $4; e += $5; s += $6; t += $1}
+                      END {printf "%d %d %d %d %d %d", c, r, f, e, s, t}' "$classes")"
+                  read -r n_cls s_run s_fail s_err s_skip s_time <<< "$sums"
+                  totals="$(grep -E '^[0-9]+ \[[A-Z]+\] +Tests run: [0-9]+, Failures: [0-9]+, Errors: [0-9]+, Skipped: [0-9]+ *$' "$t_log" \
+                      | tail -1 | sed -E 's/^[0-9]+ \[[A-Z]+\] +//')"
+                  if [[ -n "$totals" ]]; then
+                      read -r t_run t_fail t_err t_skip <<< "$(printf '%s' "$totals" | tr -dc '0-9 ')"
+                      echo "| Tests run | Passed | Failures | Errors | Skipped | Test classes reported | Maven total time |"
+                      echo "|---|---|---|---|---|---|---|"
+                      echo "| $t_run | $((t_run - t_fail - t_err - t_skip)) | $t_fail | $t_err | $t_skip | $n_cls | $(sed -n 's/^[0-9]* \[INFO\] Total time: *//p' "$t_log" | tail -1) |"
+                      echo ""
+                      echo "Surefire's final line: \`$totals\`."
+                  else
+                      echo "**The run did not reach surefire's final totals.** Finished before it stopped: $n_cls test classes, $s_run tests run, $s_fail failures, $s_err errors, $s_skip skipped."
+                  fi
+                  echo ""
+                  if [[ "$n_cls" -gt 0 ]]; then
+                      echo "Sum of per-class \"Time elapsed\": $(fmt_dur "$s_time") across $n_cls classes. The difference from the surefire wall time above is JVM start-up (a new JVM per class) and Maven overhead."
+                      echo ""
+                      echo "<details><summary>Ten slowest test classes</summary>"
+                      echo ""
+                      echo "| Class | Time elapsed | Tests | Failures + errors |"
+                      echo "|---|---|---|---|"
+                      sort -t'|' -k1,1nr "$classes" | head -10 | while IFS='|' read -r dur name run fail err _skip; do
+                          echo "| ${name##*.} | ${dur} s | $run | $((fail + err)) |"
+                      done
+                      echo ""
+                      echo "</details>"
+                      echo ""
+                  fi
+                  if [[ "$((s_fail + s_err))" -gt 0 ]]; then
+                      echo "<details><summary>Test classes with failures or errors (first 40)</summary>"
+                      echo ""
+                      awk -F'|' '$4 + $5 > 0 {printf "- `%s` (%d failures, %d errors)\n", $2, $4, $5}' "$classes" | head -40
+                      echo ""
+                      echo "</details>"
+                      echo ""
+                  fi
+              fi
+
+              # Rust test results as printed by cargo test (one "test result:" line per binary).
+              local rt n_ok n_bad
+              echo "### Rust test results (output of \`cargo test --lib --tests\`)"
+              echo ""
+              if [[ ! -s "$r_log" ]]; then
+                  echo "The Rust test phase produced no output (it did not run, or failed before printing anything)."
+                  echo ""
+              else
+                  rt="$(sed -n -E 's/^[0-9]+ .*test result: ([A-Za-z]+)\. ([0-9]+) passed; ([0-9]+) failed; ([0-9]+) ignored; ([0-9]+) measured; ([0-9]+) filtered out; finished in ([0-9.]+)s.*$/\1 \2 \3 \4 \7/p' "$r_log" \
+                      | awk '{n++; p += $2; f += $3; i += $4; t += $5; if ($1 != "ok") bad++}
+                          END {if (n > 0) printf "| %d (%d not ok) | %d | %d | %d | %.1f s |", n, bad, p, f, i, t}')"
+                  if [[ -n "$rt" ]]; then
+                      echo "| Test binaries | Passed | Failed | Ignored | libtest \"finished in\", summed |"
+                      echo "|---|---|---|---|---|"
+                      echo "$rt"
+                  else
+                      n_ok="$(grep -c -E '^[0-9]+ test .* \.\.\. ok$' "$r_log")"
+                      n_bad="$(grep -c -E '^[0-9]+ test .* \.\.\. FAILED$' "$r_log")"
+                      echo "**No \`test result:\` line was printed** (the build failed, or the run stopped before the tests finished). Individual results seen before it stopped: $n_ok ok, $n_bad FAILED."
+                  fi
+                  echo ""
+                  if grep -q -E '^[0-9]+ test .* \.\.\. FAILED$' "$r_log"; then
+                      echo "<details><summary>Failed Rust tests (first 40)</summary>"
+                      echo ""
+                      sed -n -E 's/^[0-9]+ test (.*) \.\.\. FAILED$/- `\1`/p' "$r_log" | head -40
+                      echo ""
+                      echo "</details>"
+                      echo ""
+                  fi
+              fi
+
+              # What the build left on disk (sizing input for a cached variant).
+              local cargo_home="${CARGO_HOME:-$HOME/.cargo}" parent lib glibc_floor
+              parent="$(dirname "$WORKSPACE")"
+              echo "### Disk used at the end of the job"
+              echo ""
+              echo "| Path | Size |"
+              echo "|---|---|"
+              echo "| \`target/rust\` (release build, written by \`make compile\`) | $(fmt_gb "$(dir_mb "$WORKSPACE/target/rust")") |"
+              echo "| \`native/target\` (dev-profile build, written by \`cargo test\`) | $(fmt_gb "$(dir_mb "$WORKSPACE/native/target")") |"
+              echo "| cargo registry (\`registry/\` under the cargo home) | $(fmt_gb "$(dir_mb "$cargo_home/registry")") |"
+              echo "| cargo git checkouts (\`git/\` under the cargo home) | $(fmt_gb "$(dir_mb "$cargo_home/git")") |"
+              echo "| \`~/.m2/repository\` | $(fmt_gb "$(dir_mb "$HOME/.m2/repository")") |"
+              echo "| \`../quickwit\` and \`../tantivy\` (cloned by setup.sh) | $(fmt_gb "$(dir_mb "$parent/quickwit")") and $(fmt_gb "$(dir_mb "$parent/tantivy")") |"
+              for lib in "$WORKSPACE"/target/rust/release/libtantivy4java.so "$WORKSPACE"/target/rust/release/libtantivy4java.dylib; do
+                  if [[ -f "$lib" ]]; then
+                      glibc_floor=""
+                      if [[ "$OS_NAME" == "Linux" ]] && command -v objdump > /dev/null 2>&1; then
+                          glibc_floor="$(objdump -T "$lib" 2>/dev/null | grep -o 'GLIBC_[0-9][0-9.]*' | sort -u -t. -k1,1 -k2,2n -k3,3n | tail -1)"
+                      fi
+                      echo "| \`target/rust/release/$(basename "$lib")\` | $(du -k "$lib" | awk '{printf "%.1f MB", $1/1024}')${glibc_floor:+; newest glibc symbol version required: $glibc_floor} |"
+                  fi
+              done
+              echo ""
+              return 0
+          }
+
+          cmd_summary() {
+              render_summary > "$MEASURE_DIR/summary.md"
+              cat "$MEASURE_DIR/summary.md"
+              if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
+                  cat "$MEASURE_DIR/summary.md" >> "$GITHUB_STEP_SUMMARY"
+              fi
+              return 0
+          }
+
+          command="${1:-}"
+          if [[ $# -gt 0 ]]; then shift; fi
+          case "$command" in
+              start) put job.start "$(date +%s)" ;;
+              facts) cmd_facts ;;
+              phase) cmd_phase "$@" ;;
+              summary) cmd_summary ;;
+              *)
+                  echo "usage: measure.sh {start|facts|phase <name> <command...>|summary}" >&2
+                  exit 2
+                  ;;
+          esac
+          exit $?
+          MEASURE_EOF
+          MEASURE_DIR="$RUNNER_TEMP/measure" bash "$RUNNER_TEMP/measure.sh" start
+
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      # Java 11 is what setup.sh requires and what ci.yml points JAVA_HOME at.
+      # No `cache:` input on purpose: this is the cold measurement.
+      - name: Set up Java 11
+        uses: actions/setup-java@v5
+        with:
+          distribution: 'temurin'
+          java-version: '11'
+
+      - name: Runner facts and parallelism decision
+        env:
+          CARGO_JOBS_INPUT_LINUX: ${{ inputs.cargo_jobs_linux }}
+          CARGO_JOBS_INPUT_MACOS: ${{ inputs.cargo_jobs_macos }}
+        timeout-minutes: 5
+        run: bash "$MEASURE" facts
+
+      # Verifies Java, Maven and Rust (already on the image), installs protoc
+      # and clones the quickwit and tantivy sibling repositories next to the
+      # workspace.
+      - name: "Phase: setup (./scripts/setup.sh)"
+        id: setup
+        timeout-minutes: ${{ matrix.setup-timeout }}
+        run: bash "$MEASURE" phase setup ./scripts/setup.sh
+
+      # `mvn clean compile`: javac, then `cargo build --release` through the
+      # exec plugin. CARGO_BUILD_JOBS is inherited by that cargo process.
+      - name: "Phase: build (make compile)"
+        timeout-minutes: ${{ matrix.compile-timeout }}
+        run: CARGO_BUILD_JOBS="$CARGO_JOBS_BUILD" bash "$MEASURE" phase compile make compile
+
+      # `mvn test`: re-checks the cargo build (expected to be a no-op), copies
+      # the native library, compiles and runs the Java tests.
+      - name: "Phase: Java tests (make test)"
+        timeout-minutes: ${{ matrix.test-timeout }}
+        run: CARGO_BUILD_JOBS="$CARGO_JOBS_BUILD" bash "$MEASURE" phase test make test
+
+      # Independent of the Maven build (own target directory, dev profile), so
+      # it is measured even when the build or the Java tests failed.
+      - name: "Phase: Rust tests (cargo test --lib --tests)"
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        timeout-minutes: ${{ matrix.rust-test-timeout }}
+        run: CARGO_BUILD_JOBS="$CARGO_JOBS_TEST" bash "$MEASURE" phase rusttest bash -c 'cd native && cargo test --lib --tests'
+
+      - name: Write measurement summary
+        if: always() && env.MEASURE != ''
+        timeout-minutes: 10
+        run: bash "$MEASURE" summary
+
+      - name: Upload measurement data
+        if: always() && env.MEASURE_DIR != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: measure-data-${{ matrix.os }}
+          path: ${{ env.MEASURE_DIR }}/
+          if-no-files-found: warn
+          retention-days: 14
+
+      # Per-class surefire reports and JVM crash logs, only when something
+      # went wrong. The console output of every phase is already in the
+      # measurement data artifact.
+      - name: Upload surefire reports
+        if: failure() || cancelled()
+        uses: actions/upload-artifact@v7
+        with:
+          name: measure-surefire-reports-${{ matrix.os }}
+          path: |
+            target/surefire-reports/
+            hs_err_pid*.log
+          if-no-files-found: ignore
+          retention-days: 7
