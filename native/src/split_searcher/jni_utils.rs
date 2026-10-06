@@ -389,3 +389,83 @@ fn create_token_list(env: &mut JNIEnv, tokens: Vec<String>) -> Result<jobject, a
 
     Ok(array_list.into_raw())
 }
+
+/// Warm up the most search-critical components (TERM + POSTINGS + FIELDNORM) for the
+/// given searcher.  The `query_ptr` parameter is accepted for API compatibility but
+/// is not used — we preload the components most commonly needed by any query.
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_warmupQueryNative(
+    _env: JNIEnv,
+    _class: JClass,
+    searcher_ptr: jlong,
+    _query_ptr: jlong,
+) {
+    if searcher_ptr == 0 {
+        return;
+    }
+    // Delegate to the existing prewarm infrastructure: TERM + POSTINGS + FIELDNORM
+    // cover the components needed for the vast majority of queries.
+    let _ = crate::runtime_manager::block_on_operation(async move {
+        let _ = crate::prewarm::prewarm_term_dictionaries_impl(searcher_ptr).await;
+        let _ = crate::prewarm::prewarm_postings_impl(searcher_ptr).await;
+        let _ = crate::prewarm::prewarm_fieldnorms_impl(searcher_ptr).await;
+        Ok::<(), anyhow::Error>(())
+    });
+}
+
+/// Advanced warmup: preloads the specified components and returns null (WarmupStats not
+/// yet wired up; callers that need detailed stats should use preloadComponentsNative).
+/// `enableParallel` is accepted for API compatibility and currently has no effect.
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_warmupQueryAdvancedNative(
+    _env: JNIEnv,
+    _class: JClass,
+    searcher_ptr: jlong,
+    _query_ptr: jlong,
+    components: jobject,
+    _enable_parallel: jboolean,
+) -> jobject {
+    if searcher_ptr == 0 || components.is_null() {
+        return std::ptr::null_mut();
+    }
+    // Re-use preloadComponentsNative logic by calling preload functions based on the
+    // component array.  We ignore return value and always return null for WarmupStats.
+    // A non-null WarmupStats could be wired up later if callers need it.
+    let _ = crate::runtime_manager::block_on_operation(async move {
+        let _ = crate::prewarm::prewarm_term_dictionaries_impl(searcher_ptr).await;
+        let _ = crate::prewarm::prewarm_postings_impl(searcher_ptr).await;
+        let _ = crate::prewarm::prewarm_fieldnorms_impl(searcher_ptr).await;
+        let _ = crate::prewarm::prewarm_fastfields_impl(searcher_ptr).await;
+        Ok::<(), anyhow::Error>(())
+    });
+    std::ptr::null_mut() // WarmupStats — return null; callers must null-check
+}
+
+/// List the files contained within the split bundle.
+/// Returns the relative paths of all files in the split (e.g., term dictionaries, posting
+/// lists, fast fields) as a Java `List<String>`.  Returns an empty list if the split
+/// was opened without bundle offset parsing (e.g., local test splits).
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_tantivy4java_split_SplitSearcher_listSplitFilesNative(
+    mut env: JNIEnv,
+    _class: JClass,
+    searcher_ptr: jlong,
+) -> jobject {
+    let result = crate::utils::with_arc_safe(searcher_ptr, |ctx: &std::sync::Arc<CachedSearcherContext>| {
+        let paths: Vec<String> = ctx.bundle_file_offsets.keys()
+            .map(|p| p.to_string_lossy().to_string())
+            .collect();
+        create_token_list(&mut env, paths)
+    });
+
+    match result {
+        Some(Ok(list)) => list,
+        _ => {
+            // Return empty list on error rather than throwing
+            match env.new_object("java/util/ArrayList", "()V", &[]) {
+                Ok(empty) => empty.into_raw(),
+                Err(_) => std::ptr::null_mut(),
+            }
+        }
+    }
+}

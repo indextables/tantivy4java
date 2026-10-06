@@ -26,11 +26,32 @@ use futures::stream::{self, StreamExt};
 
 /// Extract the maximum concurrent read limit from a config map.
 /// Key: `max_concurrent_reads` (integer, default 32, 0 → default).
-fn extract_max_concurrent(config_map: &HashMap<String, String>) -> usize {
+pub(crate) fn extract_max_concurrent(config_map: &HashMap<String, String>) -> usize {
     config_map.get("max_concurrent_reads")
         .and_then(|s| s.parse::<usize>().ok())
         .map(|n| if n == 0 { 32 } else { n })
         .unwrap_or(32)
+}
+
+/// Parse a cached metadata JSON string, handling both formats:
+/// - Rust-written (bare):    `{"id":"...", "schemaString":"...", ...}`
+/// - Scala-written (wrapped): `{"metaData": {"id":"...", ...}}`
+///
+/// Scala's `CheckpointCommand.scala` wraps the metadata before serialising:
+/// ```scala
+/// val metadataWrapper = Map("metaData" -> metadata)
+/// ```
+/// The `.ok()` fallback means a parse failure is silent, which previously
+/// caused `getSchema()` to return `None` when no version files were available.
+pub(crate) fn parse_metadata_json(json_str: &str) -> Option<MetadataAction> {
+    // Fast path: bare format written by Rust
+    if let Ok(m) = serde_json::from_str::<MetadataAction>(json_str) {
+        return Some(m);
+    }
+    // Slow path: Scala-written envelope {"metaData": {...}}
+    let value: serde_json::Value = serde_json::from_str(json_str).ok()?;
+    let inner = value.get("metaData")?;
+    serde_json::from_value(inner.clone()).ok()
 }
 
 /// Read multiple version files concurrently, silently ignoring all errors
@@ -60,6 +81,33 @@ async fn read_versions_concurrent(
         .await;
     results.sort_by_key(|(v, _)| *v);
     results
+}
+
+/// Run up to `max_concurrent` futures concurrently, collecting results in order.
+///
+/// Uses `buffer_unordered` for bounded parallelism (same pattern as
+/// `read_versions_concurrent`). Results are returned in the original
+/// iterator order, not completion order.
+pub(crate) async fn join_all_bounded<F, T>(
+    futures: Vec<F>,
+    max_concurrent: usize,
+) -> Result<Vec<T>>
+where
+    F: std::future::Future<Output = Result<T>>,
+{
+    // Wrap each future with its index so we can restore insertion order
+    // after buffer_unordered processes them in completion order.
+    let indexed = futures.into_iter().enumerate().map(|(i, f)| async move {
+        f.await.map(|v| (i, v))
+    });
+    let mut results: Vec<(usize, T)> = stream::iter(indexed)
+        .buffer_unordered(max_concurrent)
+        .collect::<Vec<Result<(usize, T)>>>()
+        .await
+        .into_iter()
+        .collect::<Result<Vec<(usize, T)>>>()?;
+    results.sort_by_key(|(i, _)| *i);
+    Ok(results.into_iter().map(|(_, v)| v).collect())
 }
 
 /// Returns true if the error represents a "not found" condition from
@@ -122,11 +170,34 @@ pub async fn get_txlog_snapshot_info_with_cache(
                 let state_dir = cached_cp.state_dir.clone()
                     .unwrap_or_else(|| TxLogStorage::state_dir_name(cached_cp.version));
 
-                // We still need to read the state manifest for manifest paths,
-                // but we can use the cached protocol/metadata
+                // Use per-table caches to avoid S3 calls on every query:
+                // - state_manifests: immutable per checkpoint, cached indefinitely
+                // - version_list: cached with version_ttl (default 5 min)
+                // TxLogStorage::new() is cheap (no I/O), so always create it;
+                // the S3 calls below are guarded by the cache checks.
                 let storage = TxLogStorage::new(table_path, config)?;
-                let state_manifest = super::avro::state_reader::read_state_manifest(&storage, &state_dir).await?;
-                let all_versions = storage.list_versions().await?;
+
+                let state_manifest = if let Some(cached_sm) = c.get_state_manifest(&state_dir) {
+                    debug_println!("📊 DISTRIBUTED: state_manifest cache hit for {}", state_dir);
+                    cached_sm
+                } else {
+                    let m = super::avro::state_reader::read_state_manifest(&storage, &state_dir).await?;
+                    c.put_state_manifest(&state_dir, m.clone());
+                    m
+                };
+
+                let all_versions = if let Some(cached_vl) = c.get_version_list() {
+                    debug_println!("📊 DISTRIBUTED: version_list cache hit for {}", table_path);
+                    cached_vl
+                } else {
+                    // Probe for post-checkpoint versions using HEAD requests instead of LIST.
+                    // For a stable table (no new commits) this costs 1 HEAD (~50ms) vs
+                    // 1 LIST (~500–1000ms).
+                    let versions = probe_versions_since(&storage, cached_cp.version).await?;
+                    c.put_version_list(versions.clone());
+                    versions
+                };
+
                 let post_cp_paths: Vec<String> = all_versions.iter()
                     .filter(|v| **v > cached_cp.version)
                     .map(|v| TxLogStorage::version_path(*v))
@@ -143,7 +214,7 @@ pub async fn get_txlog_snapshot_info_with_cache(
                 // If there are post-checkpoint versions, read them for potential
                 // protocol/metadata overrides. This is critical for concurrent
                 // metadata updates — the cached metadata may be stale.
-                let (effective_protocol, effective_metadata) = if post_cp_paths.is_empty() {
+                let (effective_protocol, mut effective_metadata) = if post_cp_paths.is_empty() {
                     (Some(cached_meta.0.clone()), cached_meta.1.clone())
                 } else {
                     let post_cp_versions: Vec<i64> = all_versions.iter().copied()
@@ -156,6 +227,12 @@ pub async fn get_txlog_snapshot_info_with_cache(
                         post_metadata.unwrap_or_else(|| cached_meta.1.clone()),
                     )
                 };
+
+                // Bug 2b fix: Merge schema_registry into effective_metadata.configuration
+                // (same as non-cached path — see snapshot_from_checkpoint()).
+                for (k, v) in &state_manifest.schema_registry {
+                    effective_metadata.configuration.entry(k.clone()).or_insert_with(|| v.clone());
+                }
 
                 debug_println!("📊 DISTRIBUTED: snapshot_info from CACHE: checkpoint v{}, {} manifests, {} post-cp versions",
                     cached_cp.version, manifest_paths.len(), post_cp_paths.len());
@@ -182,7 +259,11 @@ pub async fn get_txlog_snapshot_info_with_cache(
         Ok(checkpoint_data) => {
             // Normal path: checkpoint exists — verify version hint isn't stale
             let mut last_cp: LastCheckpointInfo = serde_json::from_slice(&checkpoint_data)?;
+            let _t_verify = std::time::Instant::now();
             let verified_version = verify_checkpoint_version(&storage, last_cp.version).await;
+            if crate::ffi_profiler::is_enabled() {
+                crate::ffi_profiler::record(crate::ffi_profiler::Section::TxLogCheckpointVerify, _t_verify.elapsed().as_nanos() as u64);
+            }
             if verified_version > last_cp.version {
                 debug_println!("⚠️ DISTRIBUTED: _last_checkpoint stale: hint={}, actual={}",
                     last_cp.version, verified_version);
@@ -214,18 +295,14 @@ async fn snapshot_from_checkpoint(
     // Read state manifest
     let state_manifest = super::avro::state_reader::read_state_manifest(storage, &state_dir).await?;
 
-    // List post-checkpoint version files
-    let all_versions = storage.list_versions().await?;
-    let post_cp_paths: Vec<String> = all_versions.iter()
-        .filter(|v| **v > last_cp.version)
+    // Find post-checkpoint version files by probing with HEAD requests instead of LIST.
+    // Cost: O(n) HEADs where n = post-checkpoint commits + 1 miss; for a stable table
+    // that is exactly 1 HEAD (~50ms) vs 1 LIST (~500–1000ms).
+    let post_cp_versions = probe_versions_since(storage, last_cp.version).await?;
+    let post_cp_paths: Vec<String> = post_cp_versions.iter()
         .map(|v| TxLogStorage::version_path(*v))
         .collect();
-
-    // Read post-checkpoint versions for potential protocol/metadata updates
-    let post_cp_versions: Vec<i64> = all_versions.iter().copied()
-        .filter(|&v| v > last_cp.version)
-        .collect();
-    let all_version_actions = read_versions_concurrent(storage, post_cp_versions, max_concurrent).await;
+    let all_version_actions = read_versions_concurrent(storage, post_cp_versions.clone(), max_concurrent).await;
 
     // Source protocol/metadata from the checkpoint's cached JSON first,
     // then override with any updates from post-checkpoint version files.
@@ -233,14 +310,93 @@ async fn snapshot_from_checkpoint(
     let cp_protocol: Option<ProtocolAction> = state_manifest.protocol_json.as_ref()
         .and_then(|s| serde_json::from_str(s).ok());
     let cp_metadata: Option<MetadataAction> = state_manifest.metadata.as_ref()
-        .and_then(|s| serde_json::from_str(s).ok());
+        .and_then(|s| parse_metadata_json(s));
 
     // Check post-checkpoint versions for overrides
     let (post_protocol, post_metadata) = log_replay::extract_metadata(&[], &all_version_actions);
 
     // Post-checkpoint overrides checkpoint
     let protocol_opt = post_protocol.or(cp_protocol);
-    let metadata = post_metadata.or(cp_metadata).unwrap_or_else(MetadataAction::empty);
+    let mut metadata = post_metadata.or(cp_metadata).unwrap_or_else(MetadataAction::empty);
+
+    // Bug 1 fix: Backward-probing fallback — if the current checkpoint has null metadata
+    // (schema_string is empty), walk earlier checkpoints to find one that has it.
+    // Mirrors the Scala reader's getMetadata() fallback (OptimizedTransactionLog.scala:1321-1330),
+    // which scans backwards through version files.  After TRUNCATE TIME TRAVEL the version files
+    // are gone, but a previous checkpoint's state manifest may still carry the cached metadata.
+    //
+    // Issue #153: Batched concurrent probes — probe BATCH_SIZE versions at a time
+    // instead of one-at-a-time to amortize S3/Azure round-trip latency.
+    //
+    // Semantic improvement over the original sequential code: the old code stopped
+    // probing on the first missing state directory (Err), meaning a gap at version N
+    // would prevent finding valid metadata at version N-1.  The batched version
+    // tolerates gaps — it issues all probes in a batch concurrently and skips
+    // individual failures, which is more resilient after partial GC or failed
+    // checkpoint writes.
+    if metadata.schema_string.is_empty() && last_cp.version > 0 {
+        let _t_backward = std::time::Instant::now();
+        const BACKWARD_BATCH: i64 = 4;
+        let mut probe_ceiling = last_cp.version - 1;
+
+        'outer: while metadata.schema_string.is_empty() && probe_ceiling >= 0 {
+            let probe_floor = std::cmp::max(0, probe_ceiling - BACKWARD_BATCH + 1);
+            // N.B. `.rev()` makes join_all return results in DESCENDING version order,
+            // so the loop below processes newest-first and takes the first valid match.
+            let probe_futs: Vec<_> = (probe_floor..=probe_ceiling).rev().map(|v| {
+                let dir = TxLogStorage::state_dir_name(v);
+                async move {
+                    (v, super::avro::state_reader::read_state_manifest(storage, &dir).await)
+                }
+            }).collect();
+
+            let results = futures::future::join_all(probe_futs).await;
+
+            // Results are in descending version order (due to .rev() above).
+            // Take the first (newest) version that carries valid metadata.
+            for (v, result) in results {
+                match result {
+                    Ok(prev_manifest) => {
+                        if let Some(ref md_str) = prev_manifest.metadata {
+                            if let Some(m) = parse_metadata_json(md_str) {
+                                if !m.schema_string.is_empty() {
+                                    metadata = m;
+                                    for (k, val) in &prev_manifest.schema_registry {
+                                        metadata.configuration.entry(k.clone())
+                                            .or_insert_with(|| val.clone());
+                                    }
+                                    break 'outer;
+                                }
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        // State directory doesn't exist at this version — skip
+                        // and continue checking earlier versions in the batch.
+                        // This is intentionally more resilient than the old sequential
+                        // code which stopped on the first gap.
+                        debug_println!("⚠️ DISTRIBUTED: backward probe: state dir missing at v{}", v);
+                    }
+                }
+            }
+
+            if probe_floor == 0 { break; }
+            probe_ceiling = probe_floor - 1;
+        }
+        if crate::ffi_profiler::is_enabled() {
+            crate::ffi_profiler::record(crate::ffi_profiler::Section::TxLogBackwardProbe, _t_backward.elapsed().as_nanos() as u64);
+        }
+    }
+
+    // Bug 2a fix: Merge the current checkpoint's schema_registry into metadata.configuration
+    // so that doc_mapping_ref → doc_mapping_json resolution works in list_files.rs.
+    // The Scala reader passes stateManifest.schemaRegistry separately to toAddActions()
+    // (TransactionLogCheckpoint.scala:669); we merge it into the configuration map that
+    // list_files.rs line 95 uses for restore_schemas().  Use or_insert_with to avoid
+    // overwriting prefixed entries already present in metadata.configuration.
+    for (k, v) in &state_manifest.schema_registry {
+        metadata.configuration.entry(k.clone()).or_insert_with(|| v.clone());
+    }
 
     let manifest_paths: Vec<ManifestPathInfo> = state_manifest.manifests.iter()
         .map(|m| ManifestPathInfo {
@@ -255,12 +411,16 @@ async fn snapshot_from_checkpoint(
 
     let checkpoint_version = last_cp.version;
 
-    // Populate cache (use v4 default for cache since it needs a concrete value)
+    // Populate cache (use v4 default for cache since it needs a concrete value).
+    // Also cache state_manifest and version_list so the next query's cache-hit path
+    // can skip both the S3 GET (_manifest.avro) and the S3 LIST (version files).
     if cache_cfg.enabled {
         let c = cache::get_or_create_cache(table_path, cache_cfg);
         let cache_protocol = protocol_opt.clone().unwrap_or_else(ProtocolAction::v4);
         c.put_metadata(cache_protocol, metadata.clone());
         c.put_last_checkpoint(last_cp);
+        c.put_state_manifest(&state_dir, state_manifest.clone());
+        c.put_version_list(post_cp_versions);
     }
 
     Ok(TxLogSnapshotInfo {
@@ -1008,34 +1168,147 @@ async fn read_existing_checkpoint_info(
 }
 
 // ============================================================================
+// Post-checkpoint version probing
+// ============================================================================
+
+/// Find version JSON files (incremental commits) newer than `since_version` by
+/// probing with HEAD requests rather than an S3 LIST.
+///
+/// **Why probe instead of LIST?**
+/// - S3 LIST scans the entire `_delta_log/` prefix → ~500–1000 ms
+/// - HEAD per file → ~30–50 ms each
+/// - For the common case (no commits since checkpoint), cost is 1 HEAD → ~50 ms
+///
+/// Uses batched concurrent probes (issue #153): issues BATCH_SIZE HEAD requests
+/// at a time.  If every probe in a batch hits, we advance and issue another
+/// batch.  The first batch with any miss tells us the frontier.
+///
+/// Falls back to a full LIST once the probe count exceeds `MAX_PROBE` (100) to
+/// avoid issuing thousands of HEADs on a very stale table.
+pub(crate) async fn probe_versions_since(
+    storage: &TxLogStorage,
+    since_version: i64,
+) -> Result<Vec<i64>> {
+    const MAX_PROBE: i64 = 100;
+    const BATCH_SIZE: i64 = 8;
+
+    let mut versions = Vec::new();
+    let mut v = since_version + 1;
+
+    loop {
+        let probed_so_far = v - (since_version + 1);
+        if probed_so_far >= MAX_PROBE {
+            // Fell off the fast path — too many versions; switch to a full LIST
+            debug_println!("⚠️ DISTRIBUTED: probe_versions_since hit limit at v{}, falling back to list_versions", v);
+            let all = storage.list_versions().await?;
+            let remaining: Vec<i64> = all.into_iter().filter(|&x| x >= v).collect();
+            versions.extend(remaining);
+            break;
+        }
+
+        let batch_end = std::cmp::min(BATCH_SIZE, MAX_PROBE - probed_so_far);
+        let probe_futs: Vec<_> = (0..batch_end).map(|offset| {
+            let probe_v = v + offset;
+            let path = TxLogStorage::version_path(probe_v);
+            async move {
+                (probe_v, storage.exists(&path).await.unwrap_or(false))
+            }
+        }).collect();
+
+        let results = futures::future::join_all(probe_futs).await;
+
+        // Results are in ascending version order (matching 0..batch_end iterator).
+        // Find the highest contiguous version that exists.
+        let mut any_hit = false;
+        for (probe_v, exists) in &results {
+            if *exists && *probe_v == v {
+                versions.push(v);
+                v += 1;
+                any_hit = true;
+            } else {
+                break;
+            }
+        }
+
+        if !any_hit {
+            break; // No newer version exists
+        }
+
+        // If not all probes in the batch hit, we found the frontier
+        if results.iter().any(|(_, exists)| !exists) {
+            break;
+        }
+    }
+
+    Ok(versions)
+}
+
+// ============================================================================
 // Stale checkpoint detection
 // ============================================================================
 
 /// Verify a checkpoint version hint by probing for newer state directories.
 ///
-/// Matches Scala's `verifyCheckpointVersion`: sequentially checks for state-v(N+1),
-/// state-v(N+2), etc. until no more exist. Returns the actual latest version.
+/// Uses batched concurrent probes (issue #153): instead of sequential HEAD
+/// requests, issues BATCH_SIZE probes at a time.  Each batch checks versions
+/// [base+1, base+BATCH_SIZE] concurrently via HEAD requests (`storage.exists`).
+/// If every probe in a batch hits, we advance and issue another batch.
+/// The first batch with any miss tells us the frontier — the highest
+/// contiguous version is the answer.
+///
+/// Batch size of 4 balances between:
+/// - Common case (0-1 stale): 3-4 wasted HEAD probes (cheap)
+/// - Stale case (many versions behind): 4× fewer round-trips than sequential
 async fn verify_checkpoint_version(
     storage: &TxLogStorage,
     hint_version: i64,
 ) -> i64 {
     const MAX_VERSION_PROBE: i64 = 1000;
+    const BATCH_SIZE: i64 = 4;
+
     let mut version = hint_version;
-    let mut probed = 0i64;
+    let mut total_probed: i64 = 0;
+
     loop {
-        if probed >= MAX_VERSION_PROBE {
+        if total_probed >= MAX_VERSION_PROBE {
             debug_println!("⚠️ DISTRIBUTED: verify_checkpoint_version hit probe limit ({}) at v{}", MAX_VERSION_PROBE, version);
             break;
         }
-        let next_dir = TxLogStorage::state_dir_name(version + 1);
-        let next_manifest = format!("{}/{}", next_dir, STATE_MANIFEST_FILENAME);
-        match storage.get(&next_manifest).await {
-            Ok(_) => {
-                version += 1;
-                probed += 1;
-                debug_println!("📊 DISTRIBUTED: _last_checkpoint regression: found state at v{}", version);
+
+        let batch_end = std::cmp::min(BATCH_SIZE, MAX_VERSION_PROBE - total_probed);
+        let probe_futs: Vec<_> = (1..=batch_end).map(|offset| {
+            let v = version + offset;
+            let next_dir = TxLogStorage::state_dir_name(v);
+            let next_manifest = format!("{}/{}", next_dir, STATE_MANIFEST_FILENAME);
+            async move {
+                // Use HEAD (exists) instead of GET to avoid downloading manifest bodies.
+                (v, storage.exists(&next_manifest).await.unwrap_or(false))
             }
-            Err(_) => break,
+        }).collect();
+
+        let results = futures::future::join_all(probe_futs).await;
+
+        // Results are in ascending version order (matching the (1..=batch_end) iterator).
+        // Find the highest contiguous version that exists.
+        let mut advanced = false;
+        for (v, exists) in &results {
+            if *exists && *v == version + 1 {
+                version = *v;
+                total_probed += 1;
+                advanced = true;
+                debug_println!("📊 DISTRIBUTED: _last_checkpoint regression: found state at v{}", version);
+            } else {
+                break;
+            }
+        }
+
+        if !advanced {
+            break; // No newer version exists
+        }
+
+        // If not all probes in the batch hit, we found the frontier
+        if results.iter().any(|(_, exists)| !exists) {
+            break;
         }
     }
     version
@@ -1065,7 +1338,7 @@ async fn read_previous_checkpoint(
     let protocol: Option<ProtocolAction> = manifest.protocol_json.as_ref()
         .and_then(|s| serde_json::from_str(s).ok());
     let metadata: Option<MetadataAction> = manifest.metadata.as_ref()
-        .and_then(|s| serde_json::from_str(s).ok());
+        .and_then(|s| parse_metadata_json(s));
 
     Some((cp_info, manifest, protocol, metadata))
 }

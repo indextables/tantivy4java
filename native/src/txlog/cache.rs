@@ -175,11 +175,18 @@ pub struct TxLogCache {
     versions: MokaCache<i64, Vec<super::actions::Action>>,
     snapshots: MokaCache<i64, Arc<Vec<FileEntry>>>,
     file_lists: MokaCache<FileListKey, Arc<Vec<FileEntry>>>,
-    // metadata and last_checkpoint are single-entry, infrequently accessed —
-    // kept as RwLock<Option<Timed<...>>> rather than a moka cache.
+    // State manifests are immutable per checkpoint version — cached with no TTL using
+    // a moka LRU (capacity 100). Key is the state_dir string (e.g. "state-v000...042").
+    state_manifests: MokaCache<String, super::actions::StateManifest>,
+    // metadata, last_checkpoint, and version_list are single-entry, infrequently
+    // updated — kept as RwLock<Option<Timed<...>>> rather than a moka cache.
     metadata: RwLock<Option<Timed<Arc<(ProtocolAction, MetadataAction)>>>>,
     last_checkpoint: RwLock<Option<Timed<LastCheckpointInfo>>>,
+    /// Cached result of storage.list_versions() — avoids the expensive S3 LIST call on
+    /// every query when metadata/checkpoint are already cached.  TTL matches version_ttl.
+    version_list: RwLock<Option<Timed<Vec<i64>>>>,
     metadata_ttl: Duration,
+    version_ttl: Duration,
     config: CacheConfig,
     // Hit/miss counters for statistics. Evictions are tracked by moka internally
     // but not exposed without an eviction listener; returning 0 is acceptable
@@ -202,13 +209,21 @@ impl TxLogCache {
             .max_capacity(config.file_list_capacity as u64)
             .time_to_live(config.file_list_ttl)
             .build();
+        // State manifests are immutable — no TTL, bounded by capacity.
+        let state_manifests = MokaCache::builder()
+            .max_capacity(100)
+            .build();
+        let version_ttl = config.version_ttl;
         Self {
             versions,
             snapshots,
             file_lists,
+            state_manifests,
             metadata: RwLock::new(None),
             last_checkpoint: RwLock::new(None),
+            version_list: RwLock::new(None),
             metadata_ttl: config.metadata_ttl,
+            version_ttl,
             config,
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
@@ -270,6 +285,30 @@ impl TxLogCache {
         None
     }
 
+    /// Returns the cached state manifest for `state_dir` if present.
+    /// State manifests are immutable per checkpoint — safe to cache indefinitely.
+    pub fn get_state_manifest(&self, state_dir: &str) -> Option<super::actions::StateManifest> {
+        if !self.config.enabled { return None; }
+        match self.state_manifests.get(state_dir) {
+            Some(v) => { self.hits.fetch_add(1, Ordering::Relaxed); Some(v) }
+            None    => { self.misses.fetch_add(1, Ordering::Relaxed); None }
+        }
+    }
+
+    /// Returns the cached version list if present and within TTL.
+    pub fn get_version_list(&self) -> Option<Vec<i64>> {
+        if !self.config.enabled { return None; }
+        let inner = self.version_list.read();
+        if let Some(ref entry) = *inner {
+            if entry.inserted_at.elapsed() < self.version_ttl {
+                self.hits.fetch_add(1, Ordering::Relaxed);
+                return Some(entry.value.clone());
+            }
+        }
+        self.misses.fetch_add(1, Ordering::Relaxed);
+        None
+    }
+
     // -- Write / Cache --
 
     pub fn put_version(&self, version: i64, actions: Vec<super::actions::Action>) {
@@ -304,20 +343,37 @@ impl TxLogCache {
         });
     }
 
+    pub fn put_state_manifest(&self, state_dir: &str, manifest: super::actions::StateManifest) {
+        if !self.config.enabled { return; }
+        self.state_manifests.insert(state_dir.to_string(), manifest);
+    }
+
+    pub fn put_version_list(&self, versions: Vec<i64>) {
+        if !self.config.enabled { return; }
+        *self.version_list.write() = Some(Timed {
+            value: versions,
+            inserted_at: Instant::now(),
+        });
+    }
+
     // -- Invalidate --
 
     pub fn invalidate_all(&self) {
         self.versions.invalidate_all();
         self.snapshots.invalidate_all();
         self.file_lists.invalidate_all();
+        self.state_manifests.invalidate_all();
         *self.metadata.write() = None;
         *self.last_checkpoint.write() = None;
+        *self.version_list.write() = None;
     }
 
     pub fn invalidate_mutable(&self) {
         self.versions.invalidate_all();
         self.snapshots.invalidate_all();
         self.file_lists.invalidate_all();
+        // version_list may be stale after a write; state_manifests are immutable so kept.
+        *self.version_list.write() = None;
     }
 
     // -- Stats --
@@ -510,6 +566,17 @@ pub fn hash_snapshot_key(checkpoint_version: i64, post_cp_count: usize) -> i64 {
 mod tests {
     use super::*;
 
+    // Tests that touch the process-wide cache registry or the global manifest
+    // cache (especially the destructive `clear_all_caches()`) race with each
+    // other under cargo's parallel test runner. Serialize them on a shared
+    // mutex. `into_inner()` keeps the lock usable after a test panics (a failed
+    // assertion would otherwise poison it and cascade failures into later tests).
+    static GLOBAL_STATE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn lock_global_state() -> std::sync::MutexGuard<'static, ()> {
+        GLOBAL_STATE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     #[test]
     fn test_cache_disabled() {
         let config = CacheConfig { enabled: false, ..Default::default() };
@@ -548,6 +615,7 @@ mod tests {
 
     #[test]
     fn test_global_manifest_cache() {
+        let _guard = lock_global_state();
         let entries = Arc::new(vec![]);
         put_cached_manifest("test-manifest.avro", entries.clone());
         let cached = get_cached_manifest("test-manifest.avro");
@@ -590,6 +658,7 @@ mod tests {
 
     #[test]
     fn test_get_or_create_cache_reuse() {
+        let _guard = lock_global_state();
         let config = CacheConfig { version_ttl: Duration::from_secs(60), ..Default::default() };
         let c1 = get_or_create_cache("test://table1-moka", config.clone());
         let c2 = get_or_create_cache("test://table1-moka", config);
@@ -599,6 +668,7 @@ mod tests {
 
     #[test]
     fn test_invalidate_table_cache() {
+        let _guard = lock_global_state();
         let c = get_or_create_cache("test://table_inv_moka", CacheConfig::default());
         c.put_version(1, vec![]);
         assert!(c.get_version(1).is_some());
@@ -608,6 +678,7 @@ mod tests {
 
     #[test]
     fn test_global_cache_stats() {
+        let _guard = lock_global_state();
         let c = get_or_create_cache("test://table_stats_moka", CacheConfig::default());
         c.get_version(99); // miss
         c.put_version(99, vec![]);
@@ -615,6 +686,41 @@ mod tests {
         let stats = global_cache_stats();
         assert!(stats.hits >= 1);
         assert!(stats.misses >= 1);
+    }
+
+    #[test]
+    fn test_clear_all_caches_removes_all_entries() {
+        let _guard = lock_global_state();
+        // Populate caches for two distinct tables
+        let c1 = get_or_create_cache("test://table_clear1_moka", CacheConfig::default());
+        let c2 = get_or_create_cache("test://table_clear2_moka", CacheConfig::default());
+        c1.put_version(1, vec![]);
+        c2.put_version(2, vec![]);
+
+        // Also populate the global manifest cache
+        let entries = Arc::new(vec![]);
+        put_cached_manifest("test://table_clear1_moka/manifest.avro", entries);
+
+        // Global clear
+        clear_all_caches();
+
+        // Both table caches must be empty (registry was cleared)
+        assert!(c1.get_version(1).is_none());
+        assert!(c2.get_version(2).is_none());
+
+        // Global manifest cache must also be cleared
+        assert!(get_cached_manifest("test://table_clear1_moka/manifest.avro").is_none());
+    }
+
+    #[test]
+    fn test_clear_all_caches_then_repopulate() {
+        let _guard = lock_global_state();
+        // Verify the registry is usable after a global clear
+        clear_all_caches();
+
+        let c = get_or_create_cache("test://table_repop_moka", CacheConfig::default());
+        c.put_version(5, vec![]);
+        assert!(c.get_version(5).is_some());
     }
 
     #[test]

@@ -108,7 +108,11 @@ pub async fn write_state_directory(
     }
 
     let now = current_timestamp_ms();
-    let metadata_json_cached = serde_json::to_string(metadata).ok();
+    // Wrap in {"metaData": {...}} to match Scala's CheckpointCommand serialisation format.
+    // Scala reads it back via `jsonNode.get("metaData")` and the bare format silently
+    // produces None there, breaking cross-language checkpoint compatibility.
+    let metadata_json_cached = serde_json::to_value(metadata).ok()
+        .map(|v| serde_json::json!({"metaData": v}).to_string());
 
     // Build schema registry from metadata configuration
     let schema_registry: HashMap<String, String> = metadata.configuration.iter()
@@ -241,7 +245,9 @@ pub async fn write_incremental_state_directory(
     let total_manifest_entries: i64 = manifest_infos.iter().map(|m| m.file_count).sum();
     let live_file_count = total_manifest_entries - tombstones.len() as i64;
 
-    let metadata_json_cached = serde_json::to_string(metadata).ok();
+    // Wrap in {"metaData": {...}} — see comment in write_state_manifest_full().
+    let metadata_json_cached = serde_json::to_value(metadata).ok()
+        .map(|v| serde_json::json!({"metaData": v}).to_string());
 
     let schema_registry: HashMap<String, String> = metadata.configuration.iter()
         .filter(|(k, _)| k.starts_with("docMappingSchema."))

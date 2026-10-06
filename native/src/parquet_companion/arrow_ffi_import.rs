@@ -33,7 +33,7 @@ use crate::quickwit_split::{
     SplitConfig, QuickwitSplitMetadata, FooterOffsets,
     default_split_config, create_quickwit_split,
 };
-use crate::quickwit_split::json_discovery::extract_doc_mapping_from_index;
+use crate::quickwit_split::json_discovery::{extract_doc_mapping_from_index, write_doc_mapping_to_dir};
 
 /// Context for streaming Arrow FFI split creation.
 /// Wrapped in Arc<Mutex<>> at the JNI layer (IndexWriter is !Sync).
@@ -898,8 +898,15 @@ async fn finalize_partition_writer_into_split(
         skipped_splits: Vec::new(),
     };
 
-    if let Ok(doc_mapping_json) = extract_doc_mapping_from_index(&pw.index) {
-        metadata.doc_mapping_json = Some(doc_mapping_json);
+    match extract_doc_mapping_from_index(&pw.index) {
+        Ok(doc_mapping_json) => {
+            // Persist so future merges recover JSON sub-fields from file instead of re-sampling.
+            write_doc_mapping_to_dir(&index_dir_path, &doc_mapping_json)?;
+            metadata.doc_mapping_json = Some(doc_mapping_json);
+        }
+        Err(e) => {
+            debug_println!("⚠️ ARROW_FFI: Failed to extract doc_mapping from index: {}. Split will have no doc_mapping.", e);
+        }
     }
 
     let footer = create_quickwit_split(

@@ -66,6 +66,7 @@ pub async unsafe fn list_files_arrow_ffi(
     schema_addrs: &[i64],
     cache_manager: Option<&Arc<GlobalSplitCacheManager>>,
 ) -> Result<ListFilesResult> {
+    let max_concurrent = distributed::extract_max_concurrent(config_map);
     // 1. Get snapshot info (cached by table_path + TTL)
     let _t_snapshot = std::time::Instant::now();
     let snapshot = distributed::get_txlog_snapshot_info_with_cache(
@@ -144,15 +145,18 @@ pub async unsafe fn list_files_arrow_ffi(
         crate::ffi_profiler::record(crate::ffi_profiler::Section::TxLogManifestPrune, _t_prune.elapsed().as_nanos() as u64);
     }
 
-    // 3. Read manifests (executors would do this in Spark)
+    // 3. Read manifests concurrently (parallelized — issue #153)
     let _t_read = std::time::Instant::now();
-    let mut checkpoint_entries: Vec<FileEntry> = Vec::new();
-    for manifest in &surviving_manifests {
-        let entries = distributed::read_manifest(
-            table_path, config, &snapshot.state_dir, &manifest.path, &metadata_config,
-        ).await?;
-        checkpoint_entries.extend(entries);
-    }
+    let mut checkpoint_entries: Vec<FileEntry> = {
+        let manifest_futs: Vec<_> = surviving_manifests.iter().map(|manifest| {
+            distributed::read_manifest(
+                table_path, config, &snapshot.state_dir, &manifest.path, &metadata_config,
+            )
+        }).collect();
+
+        let results = distributed::join_all_bounded(manifest_futs, max_concurrent).await?;
+        results.into_iter().flatten().collect()
+    };
 
     // 3b. Apply checkpoint tombstones (from incremental checkpoints)
     if !snapshot.tombstones.is_empty() {

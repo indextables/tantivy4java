@@ -153,6 +153,14 @@ impl GlobalSplitCacheManager {
         self.file_field_stats.lock().unwrap().get(file_path).cloned()
     }
 
+    /// Invalidate all file_field_stats entries whose path starts with the given table prefix.
+    /// Called by nativeInvalidateCache so that stale range-filter statistics don't survive
+    /// a TRUNCATE / PURGE operation and cause incorrect file pruning on the next query.
+    pub fn invalidate_file_field_stats_for_table(&self, table_path: &str) {
+        let mut stats = self.file_field_stats.lock().unwrap();
+        stats.retain(|path, _| !path.starts_with(table_path));
+    }
+
     pub fn get_managed_split_count(&self) -> usize {
         self.managed_splits.lock().unwrap().len()
     }

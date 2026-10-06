@@ -209,6 +209,19 @@ pub fn extract_split_to_directory_impl(split_path: &Path, output_dir: &Path) -> 
         copied_files += 1;
     }
 
+    // Copy _doc_mapping.json if present (used at merge time for JSON sub-field recovery)
+    let doc_mapping_path = Path::new(super::json_discovery::DOC_MAPPING_FILENAME);
+    if bundle_directory.exists(doc_mapping_path)? {
+        debug_log!("📦 DOC_MAPPING: Copying {} from split bundle", super::json_discovery::DOC_MAPPING_FILENAME);
+        let bytes = streaming_copy_file(
+            bundle_directory.as_ref(),
+            &output_directory,
+            doc_mapping_path
+        )?;
+        total_bytes += bytes;
+        copied_files += 1;
+    }
+
     debug_log!("✅ Successfully extracted split to directory (copied {} files, {} bytes total)", copied_files, total_bytes);
     Ok(())
 }

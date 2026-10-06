@@ -217,6 +217,7 @@ mod tests {
             cache.flush_blocking();
 
             cache.sync_manifest().unwrap();
+            cache.flush_blocking();
         }
 
         let manifest_path = cache_path.join(CACHE_SUBDIR).join("manifest.json");

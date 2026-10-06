@@ -935,6 +935,33 @@ pub extern "system" fn Java_io_indextables_jni_txlog_TransactionLogReader_native
     super::cache::invalidate_table_cache(&path);
     // Also clear the global manifest cache for this table
     super::cache::invalidate_manifest_cache_for_table(&path);
+    // Also clear per-file range-filter statistics from all split cache managers.
+    // These are keyed by split file path and must not outlive a TRUNCATE/PURGE.
+    {
+        use crate::split_cache_manager::CACHE_MANAGERS;
+        let managers = CACHE_MANAGERS.lock().unwrap();
+        for manager in managers.values() {
+            manager.invalidate_file_field_stats_for_table(&path);
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_io_indextables_jni_txlog_TransactionLogReader_nativeInvalidateCacheGlobal(
+    _env: JNIEnv,
+    _class: JClass,
+) {
+    // Clear the global snapshot/manifest cache registry entirely.
+    super::cache::clear_all_caches();
+    // Clear per-file range-filter stats from all split cache managers.
+    // Empty prefix matches all paths, so this clears everything.
+    {
+        use crate::split_cache_manager::CACHE_MANAGERS;
+        let managers = CACHE_MANAGERS.lock().unwrap();
+        for manager in managers.values() {
+            manager.invalidate_file_field_stats_for_table("");
+        }
+    }
 }
 
 // ============================================================================
