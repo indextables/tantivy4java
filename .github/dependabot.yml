@@ -1,3 +1,12 @@
+# One grouped PR per ecosystem per week: each ecosystem's catch-all group below takes
+# every version update (major, minor and patch) into a single PR. Dependabot assigns a
+# dependency to the first matching group and gives anything unmatched its own PR, so the
+# "*" pattern must stay in place. The previous test-dependencies (Maven) and
+# tantivy-ecosystem (Cargo) groups are folded in: their members still move together,
+# now alongside everything else. A bump that breaks CI should be dropped from the PR
+# with "@dependabot ignore <dependency>" rather than splitting the group.
+# Security updates are raised on advisory publication, not the weekly schedule, so each
+# ecosystem also gets a security-updates group to keep them out of the weekly PR.
 version: 2
 updates:
   - package-ecosystem: maven
@@ -7,8 +16,14 @@ updates:
       day: monday
     open-pull-requests-limit: 10
     groups:
-      test-dependencies:
-        dependency-type: development
+      all-maven-updates:
+        applies-to: version-updates
+        patterns:
+          - "*"
+      maven-security-updates:
+        applies-to: security-updates
+        patterns:
+          - "*"
 
   - package-ecosystem: cargo
     directory: /native
@@ -17,10 +32,14 @@ updates:
       day: monday
     open-pull-requests-limit: 10
     groups:
-      tantivy-ecosystem:
+      all-cargo-updates:
+        applies-to: version-updates
         patterns:
-          - "tantivy*"
-          - "quickwit*"
+          - "*"
+      cargo-security-updates:
+        applies-to: security-updates
+        patterns:
+          - "*"
 
   - package-ecosystem: github-actions
     directory: /
@@ -28,3 +47,12 @@ updates:
       interval: weekly
       day: monday
     open-pull-requests-limit: 5
+    groups:
+      all-github-actions-updates:
+        applies-to: version-updates
+        patterns:
+          - "*"
+      github-actions-security-updates:
+        applies-to: security-updates
+        patterns:
+          - "*"
