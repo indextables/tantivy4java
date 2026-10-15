@@ -171,6 +171,8 @@ jobs:
       - name: "Rust tests: run"
         id: rust-tests
         continue-on-error: true
+        env:
+          RUST_BACKTRACE: '1'
         run: cd native && cargo test --lib --tests
 
       # Makes the advisory failure visible: a warning annotation on the run
@@ -341,6 +343,7 @@ jobs:
         id: rust-tests
         env:
           CARGO_BUILD_JOBS: '2'
+          RUST_BACKTRACE: '1'
         run: cd native && cargo test --lib --tests
 
       # See the linux job for what is removed and when the entry is saved.
