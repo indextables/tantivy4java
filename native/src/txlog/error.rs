@@ -19,6 +19,9 @@ pub enum TxLogError {
     #[error("Checkpoint corrupted at version {version}: {detail}")]
     CorruptedCheckpoint { version: i64, detail: String },
 
+    #[error("Not found: {path}")]
+    NotFound { path: String },
+
     #[error("Storage error: {0}")]
     Storage(anyhow::Error),
 

@@ -50,7 +50,12 @@ impl TxLogStorage {
         let path = self.full_path(relative_path);
         debug_println!("📖 TXLOG_STORAGE: get {}", path);
         let result = self.store.get(&path).await
-            .map_err(|e| TxLogError::Storage(anyhow::anyhow!("GET {}: {}", path, e)))?;
+            .map_err(|e| match e {
+                // Preserve NotFound structurally so callers can match on the variant
+                // instead of substring-matching the message (TXLOG_MODULE_REVIEW D4).
+                object_store::Error::NotFound { .. } => TxLogError::NotFound { path: path.to_string() },
+                other => TxLogError::Storage(anyhow::anyhow!("GET {}: {}", path, other)),
+            })?;
         result.bytes().await
             .map_err(|e| TxLogError::Storage(anyhow::anyhow!("Read bytes {}: {}", path, e)))
     }

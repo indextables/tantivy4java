@@ -107,9 +107,12 @@ pub async unsafe fn list_files_arrow_ffi(
     // Extract field types from the table schema for type-aware data skipping.
     // The Rust layer owns the schema — field types are ALWAYS derived from
     // MetadataAction.schema_string, never passed from the JVM.
+    // Clamp to a char boundary — a byte-index slice would panic if byte 200 lands
+    // in the middle of a multi-byte UTF-8 sequence.
+    let schema_preview: String = snapshot.metadata.schema_string.chars().take(200).collect();
     crate::debug_println!("LIST_FILES: schema_string length={}, first 200 chars: {}",
         snapshot.metadata.schema_string.len(),
-        &snapshot.metadata.schema_string[..std::cmp::min(200, snapshot.metadata.schema_string.len())]);
+        schema_preview);
     let field_types = extract_field_types_from_schema(&snapshot.metadata.schema_string);
     crate::debug_println!("LIST_FILES: extracted field_types: {:?}", field_types);
 
@@ -167,12 +170,26 @@ pub async unsafe fn list_files_arrow_ffi(
             snapshot.tombstones.len(), before, checkpoint_entries.len());
     }
 
-    // 4. Read post-checkpoint changes and merge
-    let changes = distributed::read_post_checkpoint_changes(
-        table_path, config, &snapshot.post_checkpoint_version_paths, &metadata_config,
-    ).await?;
+    // 4. Compute post-checkpoint changes and merge.
+    //    Reuse the version actions the snapshot already parsed when available (E1):
+    //    the snapshot-info path reads these same files for protocol/metadata override,
+    //    so re-fetching them here would be a 2× GET per query. Fall back to a fresh
+    //    read only when the snapshot didn't capture them.
+    let changes = match &snapshot.post_checkpoint_actions {
+        Some(actions) => distributed::changes_from_versioned_actions(actions, &metadata_config),
+        None => distributed::read_post_checkpoint_changes(
+            table_path, config, &snapshot.post_checkpoint_version_paths, &metadata_config,
+        ).await?,
+    };
 
-    // Apply adds/removes to checkpoint state
+    // Apply adds/removes to checkpoint state.
+    //
+    // INVARIANT: a removed path is never re-added. Splits are immutable and new data
+    // always gets a fresh path, so applying all adds and then all removes (without
+    // interleaving them by version) is correct — no add here can resurrect a path
+    // that a later remove intends to delete. If that invariant were ever violated,
+    // an add followed by a same-batch remove of the same path would incorrectly drop
+    // a live file (or vice versa). See TXLOG_MODULE_REVIEW (C1).
     let mut file_map: HashMap<String, FileEntry> = HashMap::new();
     for entry in checkpoint_entries {
         file_map.insert(entry.add.path.clone(), entry);

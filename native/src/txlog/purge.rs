@@ -3,7 +3,7 @@
 // Provides retention-based version/state expiration and retained file enumeration
 // for the Spark-side anti-join purge algorithm.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use parking_lot::Mutex;
 
@@ -80,9 +80,14 @@ pub async fn list_retained_versions(
                     let version_ts = actions.iter().find_map(|a| match a {
                         Action::Add(add) => Some(add.modification_time),
                         _ => None,
-                    }).unwrap_or(0);
-                    if now_ms - version_ts < retention_ms {
-                        retained.push(*v);
+                    });
+                    match version_ts {
+                        // Version carries an Add timestamp → use it to judge age.
+                        Some(ts) if now_ms - ts < retention_ms => retained.push(*v),
+                        Some(_) => { /* older than retention → drop from cursor */ }
+                        // No Add (only removes/metadata) → age is unknown; keep (safe
+                        // default, consistent with the parse/read-failure branches).
+                        None => retained.push(*v),
                     }
                 } else {
                     // Can't parse → keep (safe default)
@@ -144,7 +149,13 @@ pub async fn open_retained_files_cursor(
                 }
             }
 
-            // Apply post-checkpoint changes from retained versions
+            // Apply post-checkpoint changes from retained versions.
+            // Accumulate removes into a set and apply them in a single pass at the
+            // end rather than an O(entries) `retain` per Remove action — that was
+            // O(entries × removes) on large tables (TXLOG_MODULE_REVIEW E4). Applying
+            // all removes together is correct under the never-re-added invariant (a
+            // removed path is never re-added, so remove-after-add ordering is moot).
+            let mut removed_paths: HashSet<String> = HashSet::new();
             for v in &retained_versions {
                 if *v > cp.version {
                     if let Ok(actions) = version_file::read_version(&storage, *v).await {
@@ -159,13 +170,16 @@ pub async fn open_retained_files_cursor(
                                     });
                                 }
                                 Action::Remove(r) => {
-                                    all_entries.retain(|e| e.add.path != r.path);
+                                    removed_paths.insert(r.path);
                                 }
                                 _ => {}
                             }
                         }
                     }
                 }
+            }
+            if !removed_paths.is_empty() {
+                all_entries.retain(|e| !removed_paths.contains(&e.add.path));
             }
         }
     } else {
@@ -180,7 +194,11 @@ pub async fn open_retained_files_cursor(
         all_entries = replay_result.files;
     }
 
-    // Deduplicate by path (keep latest version)
+    // Deduplicate by path. `retain(|e| seen.insert(...))` keeps the FIRST occurrence
+    // of each path (entries are accumulated in ascending version order). This relies
+    // on the module invariant that a path is never re-added once removed — splits are
+    // immutable and new data always gets a fresh path — so no genuine duplicates exist
+    // here and first-vs-last is moot. See the invariant note in TXLOG_MODULE_REVIEW (C1).
     let mut seen = std::collections::HashSet::new();
     all_entries.retain(|e| seen.insert(e.add.path.clone()));
 

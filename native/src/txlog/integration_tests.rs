@@ -821,6 +821,7 @@ fn test_serialize_snapshot_info() {
         metadata: make_metadata("snapshot-test"),
         state_dir: "state-v42".to_string(),
         tombstones: vec![],
+        post_checkpoint_actions: None,
     };
 
     let buf = serialization::serialize_snapshot_info(&info);

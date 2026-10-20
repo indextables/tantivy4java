@@ -1677,10 +1677,16 @@ public class TransactionLogIntegrationTest {
                 ", manifestPaths=" + snap2.getManifestPaths().size() +
                 ", postCheckpointPaths=" + snap2.getPostCheckpointPaths().size());
 
-            // Step 5: Write (append) AFTER purge — this is what triggers the bug
-            // Use the exact config from the Scala test: checkpoint_interval=10, cache.ttl.ms=300000
+            // Step 5: Write (append) AFTER purge — this is what triggers the bug.
+            // checkpoint_interval is honored as a real interval (checkpoint every N
+            // commits, version % N == 0), so we set it to 1 here to force an
+            // auto-checkpoint on THIS append — step 6b/6c below specifically verify that
+            // the auto-checkpoint carries forward metadata and file entries from the
+            // previous checkpoint. (The reproduced Scala test used interval=10, which
+            // under modulo semantics would not checkpoint at version 13 and so would
+            // not exercise the carry-forward path this test targets.)
             Map<String, String> writeConfig = new HashMap<>(config);
-            writeConfig.put("checkpoint_interval", "10");
+            writeConfig.put("checkpoint_interval", "1");
             writeConfig.put("cache.ttl.ms", "300000");
             String appendAdds = MAPPER.writeValueAsString(List.of(
                 makeAddAction("split-13.split", 1000, 1)));

@@ -60,12 +60,18 @@ impl PartitionFilter {
                 })
             }
             PartitionFilter::Neq { column, value } => {
+                // NOTE: diverges from SQL NULL semantics. A missing partition value
+                // returns `true` here (SQL would evaluate `NULL != x` as NULL, i.e.
+                // filtered out). This errs toward INCLUDING files, so results remain
+                // correct as long as the query engine re-filters rows after listing.
                 partition_values.get(column).map_or(true, |v| v != value)
             }
             PartitionFilter::In { column, values } => {
                 partition_values.get(column).map_or(false, |v| values.contains(v))
             }
             PartitionFilter::IsNull { column } => {
+                // Proxies "null" as the empty string — a missing value or an empty
+                // value both count as null. Errs toward including files.
                 partition_values.get(column).map_or(true, |v| v.is_empty())
             }
             PartitionFilter::IsNotNull { column } => {
@@ -209,13 +215,20 @@ impl PartitionFilter {
     ) -> bool {
         match self {
             PartitionFilter::Eq { column, value } => {
-                // Skip if value < min OR value > max
+                // Skip if value < min OR value > max.
+                // Min side needs no truncation guard: string stats are truncated to a
+                // prefix, so the actual min is >= the stored min; value < stored min ⇒
+                // value < actual min ⇒ safe to skip. The max side DOES need a guard,
+                // since the actual max may extend past the stored (truncated) max.
                 if let Some(min_val) = min_values.get(column) {
                     if compare_values(value, min_val) == std::cmp::Ordering::Less {
                         return true;
                     }
                 }
                 if let Some(max_val) = max_values.get(column) {
+                    if value.len() > max_val.len() && value.starts_with(max_val.as_str()) {
+                        return false; // max may be truncated; actual max could be >= value
+                    }
                     if compare_values(value, max_val) == std::cmp::Ordering::Greater {
                         return true;
                     }
@@ -232,8 +245,13 @@ impl PartitionFilter {
                 }
             }
             PartitionFilter::Gt { column, value } => {
-                // Skip if max <= value (no value in file is > value)
+                // Skip if max <= value (no value in file is > value).
+                // Truncation guard: the stored max may be a prefix of a larger actual
+                // max, so don't skip when value is a proper prefix-extension of max.
                 if let Some(max_val) = max_values.get(column) {
+                    if value.len() > max_val.len() && value.starts_with(max_val.as_str()) {
+                        return false; // max may be truncated
+                    }
                     return compare_values(max_val, value) != std::cmp::Ordering::Greater;
                 }
                 false
@@ -336,53 +354,78 @@ impl PartitionFilter {
     ) -> bool {
         match self {
             PartitionFilter::Eq { column, value } => {
+                use std::cmp::Ordering;
                 let ftype = ft.get(column).map(|s| s.as_str());
                 if let Some(min_val) = min_values.get(column) {
-                    if compare_values_typed(value, min_val, ftype, tz_offset_secs) == std::cmp::Ordering::Less {
+                    // Skip if value < min. Unknown (None) → don't skip.
+                    if compare_values_typed(value, min_val, ftype, tz_offset_secs) == Some(Ordering::Less) {
                         return true;
                     }
                 }
                 if let Some(max_val) = max_values.get(column) {
-                    if compare_values_typed(value, max_val, ftype, tz_offset_secs) == std::cmp::Ordering::Greater {
+                    // Truncation guard on the max side (string stats only).
+                    if value.len() > max_val.len() && value.starts_with(max_val.as_str()) {
+                        return false; // max may be truncated
+                    }
+                    // Skip if value > max. Unknown (None) → don't skip.
+                    if compare_values_typed(value, max_val, ftype, tz_offset_secs) == Some(Ordering::Greater) {
                         return true;
                     }
                 }
                 false
             }
             PartitionFilter::Gt { column, value } => {
+                use std::cmp::Ordering;
                 let ftype = ft.get(column).map(|s| s.as_str());
                 if let Some(max_val) = max_values.get(column) {
-                    return compare_values_typed(max_val, value, ftype, tz_offset_secs) != std::cmp::Ordering::Greater;
+                    // Truncation guard: stored max may be a prefix of a larger actual max.
+                    if value.len() > max_val.len() && value.starts_with(max_val.as_str()) {
+                        return false; // max may be truncated
+                    }
+                    // Skip if max <= value (no value in file is > value). Unknown → don't skip.
+                    return matches!(
+                        compare_values_typed(max_val, value, ftype, tz_offset_secs),
+                        Some(Ordering::Less) | Some(Ordering::Equal)
+                    );
                 }
                 false
             }
             PartitionFilter::Gte { column, value } => {
+                use std::cmp::Ordering;
                 let ftype = ft.get(column).map(|s| s.as_str());
                 if let Some(max_val) = max_values.get(column) {
                     if value.len() > max_val.len() && value.starts_with(max_val.as_str()) {
                         return false;
                     }
-                    return compare_values_typed(max_val, value, ftype, tz_offset_secs) == std::cmp::Ordering::Less;
+                    // Skip if max < value. Unknown → don't skip.
+                    return compare_values_typed(max_val, value, ftype, tz_offset_secs) == Some(Ordering::Less);
                 }
                 false
             }
             PartitionFilter::Lt { column, value } => {
+                use std::cmp::Ordering;
                 let ftype = ft.get(column).map(|s| s.as_str());
                 if let Some(min_val) = min_values.get(column) {
                     if value.len() > min_val.len() && value.starts_with(min_val.as_str()) {
                         return false;
                     }
-                    return compare_values_typed(min_val, value, ftype, tz_offset_secs) != std::cmp::Ordering::Less;
+                    // Skip if min >= value (no value in file is < value). Unknown → don't skip.
+                    return matches!(
+                        compare_values_typed(min_val, value, ftype, tz_offset_secs),
+                        Some(Ordering::Greater) | Some(Ordering::Equal)
+                    );
                 }
                 false
             }
             PartitionFilter::Lte { column, value } => {
+                use std::cmp::Ordering;
                 let ftype = ft.get(column).map(|s| s.as_str());
                 if let Some(min_val) = min_values.get(column) {
                     if value.len() > min_val.len() && value.starts_with(min_val.as_str()) {
                         return false;
                     }
-                    return compare_values_typed(min_val, value, ftype, tz_offset_secs) == std::cmp::Ordering::Greater;
+                    // Skip if min > value. Unknown → don't skip.
+                    return compare_values_typed(min_val, value, ftype, tz_offset_secs) == Some(Ordering::Greater);
                 }
                 false
             }
@@ -427,13 +470,17 @@ pub fn prune_manifests<'a>(
 /// - "date": converts date strings ("2024-01-15") to epoch days for comparison with
 ///   stat values stored as epoch day integers or epoch microseconds
 /// - "timestamp": converts timestamp strings to epoch microseconds using the session
-///   timezone offset. If no timezone offset is provided, falls back to conservative
-///   comparison (Ordering::Equal = never skip).
+///   timezone offset. If no timezone offset is provided, the comparison is *unknown*
+///   and returns `None` so callers can fail safe (never skip).
 /// - For all other types (or when field_type is None): falls through to `compare_values`
+///
+/// Returns `None` when the comparison cannot be determined (e.g. a bare datetime
+/// filter value with no session timezone available). A sentinel value in a total
+/// order cannot express uncertainty, so callers MUST treat `None` as "don't skip".
 ///
 /// `tz_offset_seconds`: session timezone as seconds east of UTC (e.g., -18000 for EST).
 /// Passed from JVM via config map key "session.timezone.offset.seconds".
-pub fn compare_values_typed(a: &str, b: &str, field_type: Option<&str>, tz_offset_secs: Option<i32>) -> std::cmp::Ordering {
+pub fn compare_values_typed(a: &str, b: &str, field_type: Option<&str>, tz_offset_secs: Option<i32>) -> Option<std::cmp::Ordering> {
     match field_type {
         Some("date") => {
             // Try to normalize both values to epoch days for comparison.
@@ -441,10 +488,10 @@ pub fn compare_values_typed(a: &str, b: &str, field_type: Option<&str>, tz_offse
             let a_days = parse_as_epoch_days(a);
             let b_days = parse_as_epoch_days(b);
             if let (Some(ad), Some(bd)) = (a_days, b_days) {
-                return ad.cmp(&bd);
+                return Some(ad.cmp(&bd));
             }
             // Fallback to default comparison if either fails to parse
-            compare_values(a, b)
+            Some(compare_values(a, b))
         }
         Some("timestamp") | Some("timestamp_ntz") => {
             // Stats are stored as epoch micros. Filter values may be bare datetime
@@ -453,7 +500,7 @@ pub fn compare_values_typed(a: &str, b: &str, field_type: Option<&str>, tz_offse
             //
             // When both sides are numeric, compare directly as epoch micros.
             // When a filter is a datetime string, use tz_offset_secs to convert.
-            // Without a timezone offset, be conservative (don't skip).
+            // Without a timezone offset, the answer is unknown (return None).
             let a_is_numeric = a.parse::<i64>().is_ok();
             let b_is_numeric = b.parse::<i64>().is_ok();
 
@@ -461,7 +508,7 @@ pub fn compare_values_typed(a: &str, b: &str, field_type: Option<&str>, tz_offse
                 let a_micros = parse_as_epoch_micros(a);
                 let b_micros = parse_as_epoch_micros(b);
                 if let (Some(am), Some(bm)) = (a_micros, b_micros) {
-                    return am.cmp(&bm);
+                    return Some(am.cmp(&bm));
                 }
             }
 
@@ -475,7 +522,7 @@ pub fn compare_values_typed(a: &str, b: &str, field_type: Option<&str>, tz_offse
                 let a_micros = parse_as_epoch_micros(a);
                 let b_micros = parse_as_epoch_micros(b);
                 if let (Some(am), Some(bm)) = (a_micros, b_micros) {
-                    return am.cmp(&bm);
+                    return Some(am.cmp(&bm));
                 }
             }
 
@@ -484,14 +531,14 @@ pub fn compare_values_typed(a: &str, b: &str, field_type: Option<&str>, tz_offse
                 let a_micros = parse_as_epoch_micros_with_tz(a, tz_offset);
                 let b_micros = parse_as_epoch_micros_with_tz(b, tz_offset);
                 if let (Some(am), Some(bm)) = (a_micros, b_micros) {
-                    return am.cmp(&bm);
+                    return Some(am.cmp(&bm));
                 }
             }
 
-            // No timezone available — conservative (never skip)
-            std::cmp::Ordering::Equal
+            // No timezone available — comparison is unknown; caller must not skip.
+            None
         }
-        _ => compare_values(a, b),
+        _ => Some(compare_values(a, b)),
     }
 }
 
@@ -547,7 +594,12 @@ fn parse_as_epoch_days(s: &str) -> Option<i64> {
 /// This matches Spark's convention: stats are stored as epoch microseconds,
 /// filter values may be epoch seconds or millis depending on the Spark version.
 fn parse_as_epoch_micros(s: &str) -> Option<i64> {
-    // Try integer first — determine unit by magnitude
+    // Try integer first — determine unit by magnitude.
+    // NOTE: the magnitude heuristic only works for positive epoch values. Spark
+    // stores timestamp stats as epoch MICROSECONDS, so a negative value is a
+    // pre-1970 timestamp already in micros — pass it through rather than collapsing
+    // all pre-epoch timestamps to 0 (which would make them compare equal and
+    // produce wrong skips for historical data).
     if let Ok(v) = s.parse::<i64>() {
         if v > 1_000_000_000_000_000 {
             return Some(v); // Microseconds
@@ -555,27 +607,40 @@ fn parse_as_epoch_micros(s: &str) -> Option<i64> {
             return Some(v * 1_000); // Milliseconds → microseconds
         } else if v > 0 {
             return Some(v * 1_000_000); // Seconds → microseconds
+        } else if v == 0 {
+            return Some(0); // Exactly the epoch
         }
-        return Some(0); // Zero or negative — epoch start
+        return Some(v); // Negative → pre-1970 epoch micros (Spark's storage unit)
     }
-    // Try full ISO-8601 with timezone (RFC 3339):
-    //   "2023-11-07T05:00:00Z"
-    //   "2023-11-07T05:00:00+05:00"
-    //   "2023-11-07T05:00:00.123456Z"
+    // Non-integer: delegate to the shared datetime-string parser.
+    parse_datetime_string_to_micros(s)
+}
+
+/// Parse a non-integer datetime string to epoch microseconds (UTC).
+///
+/// Handles, in order:
+/// - RFC 3339 / ISO-8601 with an explicit zone ("2023-11-07T05:00:00Z", "…+05:00")
+/// - Bare datetime, no zone ("2023-11-07 05:00:00", "2023-11-07T05:00:00", with
+///   optional fractional seconds) — treated as UTC
+/// - Date-only ("2023-11-07") — midnight UTC
+///
+/// Zoneless values are treated as UTC (no session timezone is available at the
+/// stats/export layer). Shared by `parse_as_epoch_micros` here and
+/// `arrow_ffi::time_range_to_epoch_millis` so the accepted-format list can't drift
+/// between the two (TXLOG_MODULE_REVIEW follow-up: de-dup + date-only coverage).
+pub(crate) fn parse_datetime_string_to_micros(s: &str) -> Option<i64> {
     if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
         return Some(dt.timestamp_micros());
     }
-
-    // Try JDBC / Spark format (no timezone — treated as UTC):
-    //   "2023-11-07 05:00:00"
-    //   "2023-11-07T05:00:00"
     let normalized = s.replace('T', " ");
-    if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(&normalized, "%Y-%m-%d %H:%M:%S") {
+    if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(&normalized, "%Y-%m-%d %H:%M:%S")
+        .or_else(|_| chrono::NaiveDateTime::parse_from_str(&normalized, "%Y-%m-%d %H:%M:%S%.f"))
+    {
         return Some(dt.and_utc().timestamp_micros());
     }
-    // With fractional seconds
-    if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(&normalized, "%Y-%m-%d %H:%M:%S%.f") {
-        return Some(dt.and_utc().timestamp_micros());
+    // Date-only → midnight UTC.
+    if let Ok(d) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+        return Some(d.and_hms_opt(0, 0, 0)?.and_utc().timestamp_micros());
     }
     None
 }
@@ -1324,6 +1389,54 @@ mod tests {
         let ft: HashMap<String, String> = HashMap::new();
         let f = PartitionFilter::Eq { column: "d".into(), value: "19403".into() };
         assert!(!f.can_skip_by_stats_typed(&min, &max, &ft, None));
+    }
+
+    // ------------------------------------------------------------------------
+    // C4 regression: an *unknown* typed comparison (bare-datetime filter with no
+    // session timezone) must never cause a file to be skipped. Before the
+    // Option<Ordering> fix, `compare_values_typed` returned Ordering::Equal as a
+    // sentinel and Gt/Lt inverted it into "skip everything".
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn test_timestamp_gt_bare_datetime_no_tz_does_not_skip() {
+        // Stats stored as epoch micros; filter is a bare datetime string with no
+        // session timezone available. The comparison is unknown → must NOT skip.
+        let (min, max) = stats(&[("ts", "1699315200000000")], &[("ts", "1699401600000000")]);
+        let ft: HashMap<String, String> = [("ts".into(), "timestamp".into())].into();
+        let f = PartitionFilter::Gt { column: "ts".into(), value: "2023-11-07 05:00:00".into() };
+        assert!(
+            !f.can_skip_by_stats_typed(&min, &max, &ft, None),
+            "Gt with unknown comparison must not skip live files"
+        );
+    }
+
+    #[test]
+    fn test_timestamp_lt_bare_datetime_no_tz_does_not_skip() {
+        let (min, max) = stats(&[("ts", "1699315200000000")], &[("ts", "1699401600000000")]);
+        let ft: HashMap<String, String> = [("ts".into(), "timestamp".into())].into();
+        let f = PartitionFilter::Lt { column: "ts".into(), value: "2023-11-07 05:00:00".into() };
+        assert!(
+            !f.can_skip_by_stats_typed(&min, &max, &ft, None),
+            "Lt with unknown comparison must not skip live files"
+        );
+    }
+
+    #[test]
+    fn test_timestamp_gt_bare_datetime_with_tz_skips_correctly() {
+        // Once a session timezone is supplied, the bare-datetime filter can be
+        // resolved and data skipping works. Stats span 2023-11-07..2023-11-08 UTC;
+        // filter ts > 2023-11-09 00:00:00 UTC (tz_offset 0) → max < filter → skip.
+        let (min, max) = stats(&[("ts", "1699315200000000")], &[("ts", "1699401600000000")]);
+        let ft: HashMap<String, String> = [("ts".into(), "timestamp".into())].into();
+        let f = PartitionFilter::Gt { column: "ts".into(), value: "2023-11-09 00:00:00".into() };
+        assert!(
+            f.can_skip_by_stats_typed(&min, &max, &ft, Some(0)),
+            "with a session tz, a filter beyond max should skip"
+        );
+        // And a filter below max must not skip.
+        let f2 = PartitionFilter::Gt { column: "ts".into(), value: "2023-11-06 00:00:00".into() };
+        assert!(!f2.can_skip_by_stats_typed(&min, &max, &ft, Some(0)));
     }
 
     // ========================================================================
