@@ -440,8 +440,11 @@ if command -v ruby > /dev/null 2>&1; then
   check "workflow: the verdict job tells report.sh whether Dependabot opened the pull request" is "$(wf '.jobs.verdict.steps[] | select(.id == "report") | .env.OPENED_BY_DEPENDABOT')" "\${{ github.event.pull_request.user.login == 'dependabot[bot]' }}"
   check "workflow: nothing is uploaded" is "$(wf '[.jobs[].steps[] | .uses // empty | select(test("upload-artifact"))] | length')" 0
   check "workflow: header no longer suggests reusing the credential as a Dependabot secret" test -z "$(grep -F 'makes this workflow work unchanged' "$workflow")"
-  check "workflow: header warns against pull-request-defined uses of the credential" grep -qF 'pull_request_review_comment' "$workflow"
-  check "workflow: header states that confinement is untested on Linux" grep -qF 'been exercised on a Linux runner' "$workflow"
+  check "workflow: header says the first run does not test the read confinement" grep -qF 'does not test the reviewer'"'"'s read confinement' "$workflow"
+  check "workflow: header says confinement on a Linux runner remains unobserved" grep -qF 'remains unobserved' "$workflow"
+  check "workflow: header says the scope depends on deleting the repository-level secret" grep -qF 'repository-level secret of the same name has been' "$workflow"
+  check "workflow: review job takes the credential from the claude environment, without deployments" is "$(wf '.jobs.review.environment | tojson')" '{"name":"claude","deployment":false}'
+  check "workflow: verdict job references no environment" is "$(wf '.jobs.verdict | has("environment")')" false
 
   # The last step turns the verdict into the job conclusion: only "pass" exits 0.
   enforce="$(wf '.jobs.verdict.steps[-1].run')"
@@ -454,17 +457,24 @@ if command -v ruby > /dev/null 2>&1; then
   check "workflow: the verdict step is the last step and is not conditional" is "$(wf '.jobs.verdict.steps[-1] | [.name, has("if"), has("continue-on-error")] | join(",")')" 'Enforce the verdict,false,false'
   check "workflow: only the comment step may fail without failing the job" is "$(wf '[.jobs[].steps[] | select(.["continue-on-error"] == true) | .name] | join(",")')" 'Post or update the pull request comment'
 
-  # No workflow defined by a pull request (plain pull_request trigger) may use the credential.
-  leak=""
+  # Every workflow that uses the Claude credential, whichever file it is in:
+  #   * may only be started by events that run the default branch's definition
+  #     (a pull request cannot redefine it), and
+  #   * must take the credential, in every job that references it, from the
+  #     `claude` environment, so that the environment's branch rule applies.
+  wrong_trigger=""; wrong_scope=""; users=""
   for f in "$here"/../../workflows/*.yml "$here"/../../workflows/*.yaml; do
     [ -f "$f" ] || continue
-    if ruby -ryaml -rjson -e 'puts JSON.generate(YAML.load_file(ARGV[0]))' "$f" 2> /dev/null |
-       jq -e '((.on // .["true"]) | if type == "object" then has("pull_request") elif type == "array" then index("pull_request") != null else . == "pull_request" end)
-              and (tostring | test("CLAUDE_CODE_OAUTH_TOKEN"))' > /dev/null 2>&1; then
-      leak="$leak $(basename "$f")"
-    fi
+    ruby -ryaml -rjson -e 'puts JSON.generate(YAML.load_file(ARGV[0]))' "$f" > "$T/any.json" 2> /dev/null || { wrong_scope="$wrong_scope $(basename "$f")(unparsed)"; continue; }
+    jq -e 'tostring | test("CLAUDE_CODE_OAUTH_TOKEN")' "$T/any.json" > /dev/null 2>&1 || continue
+    users="$users $(basename "$f")"
+    jq -e '((.on // .["true"]) | if type == "object" then keys elif type == "array" then . else [.] end)
+           - ["pull_request_target", "issue_comment"] == []' "$T/any.json" > /dev/null 2>&1 || wrong_trigger="$wrong_trigger $(basename "$f")"
+    jq -e '[.jobs[] | select(tostring | test("CLAUDE_CODE_OAUTH_TOKEN")) | .environment == {"name": "claude", "deployment": false}] | length > 0 and all' "$T/any.json" > /dev/null 2>&1 || wrong_scope="$wrong_scope $(basename "$f")"
   done
-  check "workflows: none triggered by pull_request references the Claude credential" test -z "$leak"
+  check "workflows: the credential is used only by the review workflow" is "$users" ' claude-review.yml'
+  check "workflows: none that uses the credential can be redefined by a pull request" test -z "$wrong_trigger"
+  check "workflows: every job that uses the credential takes it from the claude environment" test -z "$wrong_scope"
 elif [ "${REQUIRE_WORKFLOW_CHECKS:-0}" = "1" ]; then
   bad "workflow: checks could not run (ruby not available)"
 else
