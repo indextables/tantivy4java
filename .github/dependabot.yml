@@ -1,12 +1,18 @@
-# One grouped PR per ecosystem per week: each ecosystem's catch-all group below takes
-# every version update (major, minor and patch) into a single PR. Dependabot assigns a
-# dependency to the first matching group and gives anything unmatched its own PR, so the
-# "*" pattern must stay in place. The previous test-dependencies (Maven) and
-# tantivy-ecosystem (Cargo) groups are folded in: their members still move together,
-# now alongside everything else. A bump that breaks CI should be dropped from the PR
-# with "@dependabot ignore <dependency>" rather than splitting the group.
+# Weekly grouped updates, split by risk. Each ecosystem's catch-all group takes only
+# minor and patch version updates, so they land in one low-risk PR per ecosystem per
+# week. Major bumps are deliberately left out of the group: Dependabot raises each as
+# its own PR, so a single breaking major no longer blocks the dozens of safe updates
+# bundled with it. This reverses the earlier "all majors in the one weekly PR, drop
+# breakers with @dependabot ignore" design (#214), which failed in practice:
+#   - Grouped Cargo PR #221 bundled 40 updates and would not compile: arrow 57->60 while
+#     parquet only reached 59, plus jni 0.21->0.22, delta_kernel 0.19->0.24, iceberg
+#     0.8->0.9. One major broke the whole batch.
+#   - Grouped Maven PR #217 failed because junit-jupiter 5.12.2->6.1.3 ships Java 17 class
+#     files (this project targets Java 11), and it also dragged scala-library 2.13.12->3.10.0.
+# Dependabot assigns a dependency to the FIRST matching group and gives anything unmatched
+# its own PR, so the "*" catch-all must stay last within each ecosystem.
 # Security updates are raised on advisory publication, not the weekly schedule, so each
-# ecosystem also gets a security-updates group to keep them out of the weekly PR.
+# ecosystem keeps a security-updates group to hold them out of the weekly PR.
 version: 2
 updates:
   - package-ecosystem: maven
@@ -18,12 +24,24 @@ updates:
     groups:
       all-maven-updates:
         applies-to: version-updates
+        update-types:
+          - minor
+          - patch
         patterns:
           - "*"
       maven-security-updates:
         applies-to: security-updates
         patterns:
           - "*"
+    ignore:
+      # junit-jupiter 6.x compiles to Java 17 bytecode; this project builds for Java 11
+      # (maven.compiler.release=11). Hold at 5.x until the Java baseline moves to 17.
+      - dependency-name: "org.junit.jupiter:*"
+        versions: [">=6"]
+      # Scala 3 is a separate language line, not an in-place upgrade of 2.13. scala-library
+      # is a test-only dependency (S3Mock) pinned to 2.13.12; stay on the 2.13.x line.
+      - dependency-name: "org.scala-lang:scala-library"
+        versions: [">=3.0.0"]
 
   - package-ecosystem: cargo
     directory: /native
@@ -32,8 +50,28 @@ updates:
       day: monday
     open-pull-requests-limit: 10
     groups:
+      # The arrow-rs stack must share one arrow major. parquet and the arrow-* crates are
+      # released in lockstep on the same version, and delta_kernel and iceberg each build
+      # against a specific arrow major, so bumping any of them apart from the others fails
+      # to compile (this is exactly how #221 broke: arrow reached a major ahead of parquet).
+      # object_store is included because delta_kernel and iceberg re-export its public types,
+      # so it must resolve to one major alongside them rather than being split out. Group
+      # them so their majors always move together in one PR instead of splitting. Listed
+      # before the catch-all because Dependabot assigns each dependency to the first matching
+      # group; all update types so majors stay grouped too.
+      arrow-ecosystem:
+        applies-to: version-updates
+        patterns:
+          - "arrow*"
+          - "parquet"
+          - "delta_kernel"
+          - "iceberg*"
+          - "object_store"
       all-cargo-updates:
         applies-to: version-updates
+        update-types:
+          - minor
+          - patch
         patterns:
           - "*"
       cargo-security-updates:
@@ -50,6 +88,9 @@ updates:
     groups:
       all-github-actions-updates:
         applies-to: version-updates
+        update-types:
+          - minor
+          - patch
         patterns:
           - "*"
       github-actions-security-updates:
