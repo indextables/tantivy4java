@@ -151,7 +151,7 @@ where
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(env))) {
         Ok(Ok(value)) => Ok(value),
         Ok(Err(error)) => {
-            let _ = env.throw_new("java/lang/RuntimeException", error.to_string());
+            let _ = env.throw_new("java/lang/RuntimeException", format!("{:?}", error));
             Err(error)
         }
         Err(panic_info) => {
