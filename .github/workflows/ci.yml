@@ -60,7 +60,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           persist-credentials: false
 
@@ -141,7 +141,7 @@ jobs:
       # Restore only: see "Save cargo dependencies" at the end of the job.
       - name: Restore cargo dependencies and their build outputs
         id: cargo-cache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v6
         with:
           path: |
             ~/.cargo/registry
@@ -226,7 +226,7 @@ jobs:
       # that is on main.
       - name: Save cargo dependencies and their build outputs
         if: ${{ !cancelled() && steps.prune.outputs.ok == 'true' }}
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v6
         with:
           path: |
             ~/.cargo/registry
@@ -272,7 +272,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           persist-credentials: false
 
@@ -315,7 +315,7 @@ jobs:
       # See the linux job for how this entry is keyed, restored and saved.
       - name: Restore cargo dependencies and their build outputs
         id: cargo-cache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v6
         with:
           path: |
             ~/.cargo/registry
@@ -368,7 +368,7 @@ jobs:
 
       - name: Save cargo dependencies and their build outputs
         if: ${{ !cancelled() && steps.prune.outputs.ok == 'true' }}
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v6
         with:
           path: |
             ~/.cargo/registry
